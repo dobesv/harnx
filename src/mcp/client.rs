@@ -180,13 +180,6 @@ impl McpManager {
         client.connect().await
     }
 
-    pub async fn connect_all(&self) -> Result<()> {
-        let clients: Vec<_> = self.clients.read().values().cloned().collect();
-        for client in clients {
-            client.connect().await?;
-        }
-        Ok(())
-    }
 
     pub async fn disconnect(&self, server_name: &str) -> Result<()> {
         let client = self
@@ -198,13 +191,6 @@ impl McpManager {
         client.disconnect().await
     }
 
-    pub async fn disconnect_all(&self) -> Result<()> {
-        let clients: Vec<_> = self.clients.read().values().cloned().collect();
-        for client in clients {
-            client.disconnect().await?;
-        }
-        Ok(())
-    }
 
     pub async fn get_all_tools(&self) -> Vec<FunctionDeclaration> {
         let clients: Vec<_> = self.clients.read().values().cloned().collect();
@@ -257,17 +243,6 @@ impl McpManager {
         Ok(client.get_tools())
     }
 
-    pub fn get_server_tools_blocking(&self, server_name: &str) -> Result<Vec<FunctionDeclaration>> {
-        if let Ok(handle) = Handle::try_current() {
-            tokio::task::block_in_place(|| handle.block_on(self.get_server_tools(server_name)))
-        } else {
-            let runtime = Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("Failed to create Tokio runtime for MCP server connection")?;
-            runtime.block_on(self.get_server_tools(server_name))
-        }
-    }
 
     pub async fn call_tool(&self, prefixed_name: &str, arguments: Value) -> Result<Value> {
         let tool_name = prefixed_name

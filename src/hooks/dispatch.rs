@@ -16,16 +16,6 @@ pub async fn dispatch_hooks(
     dispatch_hooks_with_count(event, hooks, session_id, cwd, 0, None).await
 }
 
-pub async fn dispatch_hooks_with_manager(
-    event: &HookEvent,
-    hooks: &[HookConfig],
-    session_id: &str,
-    cwd: &Path,
-    async_manager: Option<&AsyncHookManager>,
-) -> HookOutcome {
-    dispatch_hooks_with_count_and_manager(event, hooks, session_id, cwd, 0, async_manager, None)
-        .await
-}
 
 pub async fn dispatch_hooks_with_managers(
     event: &HookEvent,
