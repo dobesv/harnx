@@ -1,0 +1,434 @@
+# ---- llm ----
+model: openai:gpt-4o             # Specify the LLM to use
+temperature: null                # Set default temperature parameter (0, 1)
+top_p: null                      # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
+
+# ---- behavior ----
+stream: true                     # Controls whether to use the stream-style API.
+save: true                       # Indicates whether to persist the message
+keybindings: emacs               # Choose keybinding style (emacs, vi)
+editor: null                     # Specifies the command used to edit input buffer or session. (e.g. vim, emacs, nano).
+wrap: no                         # Controls text wrapping (no, auto, <max-width>)
+wrap_code: false                 # Enables or disables wrapping of code blocks
+
+# ---- function-calling ----
+# Visit https://github.com/sigoden/llm-functions for setup instructions
+function_calling: true           # Enables or disables function calling (Globally).
+mapping_tools:                   # Alias for a tool or toolset
+  fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
+use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search')
+
+# ---- mcp servers ----
+# MCP (Model Context Protocol) servers provide external tools.
+# function_calling must be true for MCP tools to work.
+# mcp_servers:
+#   - name: filesystem                 # Unique server name
+#     command: npx                     # Command to start the server
+#     args:                            # Arguments for the command
+#       - "-y"
+#       - "@modelcontextprotocol/server-filesystem"
+#       - "/tmp"
+#     enabled: true                    # Auto-connect on startup (default: true)
+#     description: "File system operations"
+#   - name: git
+#     command: npx
+#     args:
+#       - "-y"
+#       - "@modelcontextprotocol/server-git"
+#     enabled: true
+#     description: "Git repository operations"
+#   - name: bash
+#     command: npx
+#     args:
+#       - "-y"
+#       - "@artinet/bash-mcp"
+#     enabled: true
+#     description: "Execute bash commands"
+#   - name: custom
+#     command: /path/to/custom-mcp-server
+#     args:
+#       - "--config"
+#       - "/path/to/config.json"
+#     env:
+#       API_KEY: "your-api-key-here"
+#     enabled: false
+#     description: "Custom MCP server"
+mcp_servers: []
+
+# ---- prelude ----
+repl_prelude: null               # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
+cmd_prelude: null                # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)
+agent_prelude: null              # Set a session to use when starting a agent (e.g. temp, default)
+
+# ---- session ----
+# Controls the persistence of the session. if true, auto save; if false, not save; if null, asking the user
+save_session: null
+# Compress session when token count reaches or exceeds this threshold
+compress_threshold: 4000
+# Text prompt used for creating a concise summary of session message
+summarize_prompt: 'Summarize the discussion briefly in 200 words or less to use as a prompt for future context.'
+# Text prompt used for including the summary of the entire session
+summary_prompt: 'This is a summary of the chat history as a recap: '
+
+# ---- RAG ----
+# See [RAG-Guide](https://github.com/dobesv/harnx/wiki/RAG-Guide) for more details.
+rag_embedding_model: null        # Specifies the embedding model used for context retrieval
+rag_reranker_model: null         # Specifies the reranker model used for sorting retrieved documents
+rag_top_k: 5                     # Specifies the number of documents to retrieve for answering queries
+rag_chunk_size: null             # Defines the size of chunks for document processing in characters
+rag_chunk_overlap: null          # Defines the overlap between chunks
+# Defines the query structure using variables like __CONTEXT__ and __INPUT__ to tailor searches to specific needs
+rag_template: |
+  Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
+
+  <context>
+  __CONTEXT__
+  </context>
+
+  <rules>
+  - If you don't know, just say so.
+  - If you are not sure, ask for clarification.
+  - Answer in the same language as the user query.
+  - If the context appears unreadable or of poor quality, tell the user then answer as best as you can.
+  - If the answer is not in the context but you think you know the answer, explain that to the user then answer with your own knowledge.
+  - Answer directly and without using xml tags.
+  </rules>
+
+  <user_query>
+  __INPUT__
+  </user_query>
+
+# Define document loaders to control how RAG and `.file`/`--file` load files of specific formats.
+document_loaders:
+  # You can add custom loaders using the following syntax:
+  #   <file-extension>: <command-to-load-the-file>
+  # Note: Use `$1` for input file and `$2` for output file. If `$2` is omitted, use stdout as output.
+  pdf: 'pdftotext $1 -'                         # Load .pdf file, see https://poppler.freedesktop.org to set up pdftotext
+  docx: 'pandoc --to plain $1'                  # Load .docx file, see https://pandoc.org to set up pandoc
+
+# ---- apperence ----
+highlight: true                  # Controls syntax highlighting
+light_theme: false               # Activates a light color theme when true. env: HARNX_LIGHT_THEME
+# Custom REPL left/right prompts, see https://github.com/dobesv/harnx/wiki/Custom-REPL-Prompt for more details
+left_prompt:
+  '{color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
+right_prompt:
+  '{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}'
+
+# ---- misc ----
+serve_addr: 127.0.0.1:8000                  # Server listening address 
+user_agent: null                            # Set User-Agent HTTP header, use `auto` for harnx/<current-version>
+save_shell_history: true                    # Whether to save shell execution command to the history file
+# URL to sync model changes from, e.g., https://cdn.jsdelivr.net/gh/dobesv/harnx@main/models.yaml
+sync_models_url: https://raw.githubusercontent.com/dobesv/harnx/refs/heads/main/models.yaml
+
+# ---- clients ----
+clients:
+  # All clients have the following configuration:
+  # - type: xxxx
+  #   name: xxxx                                      # Only use it to distinguish clients with the same client type. Optional
+  #   models:
+  #     - name: xxxx                                  # Chat model
+  #       max_input_tokens: 100000
+  #       supports_vision: true
+  #       supports_function_calling: true
+  #     - name: xxxx                                  # Embedding model
+  #       type: embedding
+  #       default_chunk_size: 1500                        
+  #       max_batch_size: 100
+  #     - name: xxxx                                  # Reranker model
+  #       type: reranker 
+  #   patch:                                          # Patch api
+  #     chat_completions:                             # Api type, possible values: chat_completions, embeddings, and rerank
+  #       <regex>:                                    # The regex to match model names, e.g. '.*' 'gpt-4o' 'gpt-4o|gpt-4-.*'
+  #         url: ''                                   # Patch request url
+  #         body:                                     # Patch request body
+  #           <json>
+  #         headers:                                  # Patch request headers
+  #           <key>: <value>
+   #   extra:
+   #     proxy: socks5://127.0.0.1:1080                # Set proxy
+   #     connect_timeout: 10                           # Set timeout in seconds for connect to api
+   #     accept_invalid_certs: false                   # Accept self-signed or invalid TLS certificates
+   #     ca_cert: /path/to/ca.pem                      # Path to a custom CA certificate (PEM format)
+   #     client_cert: /path/to/client-cert.pem         # Path to client certificate for mTLS (PEM format)
+   #     client_key: /path/to/client-key.pem           # Path to client private key for mTLS (PEM format); omit if client_cert contains both
+   #   system_prompt_prefix:                           # Prepend system prompt parts (each as own content block)
+   #     - "You are Claude Code, Anthropic's official CLI for Claude."
+   #     - "Additional context or instructions..."
+   #   api_key: xxx                                    # Optional if the matching <CLIENT_NAME>_API_KEY env var is set
+   #                                                 # Examples: OPENAI_API_KEY, CLAUDE_API_KEY, OLLAMA_API_KEY
+
+  # See https://platform.openai.com/docs/quickstart
+  - type: openai
+    api_base: https://api.openai.com/v1               # Optional
+    api_key: xxx
+    organization_id: org-xxx                          # Optional
+
+  # For any platform compatible with OpenAI's API
+  - type: openai-compatible
+    name: ollama
+    api_base: http://localhost:11434/v1
+    api_key: xxx                                      # Optional
+    models:
+      - name: deepseek-r1
+        max_input_tokens: 131072
+      - name: llama3.1
+        max_input_tokens: 128000
+        supports_function_calling: true
+      - name: llama3.2-vision
+        max_input_tokens: 131072
+        supports_vision: true
+      - name: nomic-embed-text
+        type: embedding
+        default_chunk_size: 1000
+        max_batch_size: 50
+
+  # See https://ai.google.dev/docs
+  - type: gemini
+    api_base: https://generativelanguage.googleapis.com/v1beta
+    api_key: xxx
+    patch:
+      chat_completions:
+        '.*':
+          body:
+            safetySettings:
+              - category: HARM_CATEGORY_HARASSMENT
+                threshold: BLOCK_NONE
+              - category: HARM_CATEGORY_HATE_SPEECH
+                threshold: BLOCK_NONE
+              - category: HARM_CATEGORY_SEXUALLY_EXPLICIT
+                threshold: BLOCK_NONE
+              - category: HARM_CATEGORY_DANGEROUS_CONTENT
+                threshold: BLOCK_NONE
+
+  # See https://docs.anthropic.com/claude/reference/getting-started-with-the-api
+  - type: claude
+    api_base: https://api.anthropic.com/v1            # Optional
+    api_key: xxx
+
+  # Example: Anthropic OAuth API keys (sk-ant-oat-*)
+  # OAuth tokens require specific headers and a system prompt identity string.
+  # Patch header values support $VAR and ${VAR} interpolation:
+  #   Built-in: $HARNX_MODEL (model name), $HARNX_CLIENT (client name)
+  #   Environment: Any env var via $ENV_VAR or ${ENV_VAR}
+  #   Unresolved variables cause an error (not silently passed through)
+  # Note: Set 'user_agent: null' in global config when using custom user-agent in patch headers
+  # - type: claude
+  #   api_key: sk-ant-oat-xxxxx
+  #   system_prompt_prefix:
+  #     - "You are Claude Code, Anthropic's official CLI for Claude."
+  #   patch:
+  #     chat_completions:
+  #       '.*':
+  #         headers:
+  #           x-anthropic-billing-header: 'cc_version=2.1.80.$HARNX_MODEL; cc_entrypoint=cli; cch=00000;'
+  #           x-app: cli
+  #           user-agent: 'claude-cli/2.1.80 (external, cli)'
+  #           anthropic-beta: 'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05'
+
+  # See https://docs.mistral.ai/
+  - type: openai-compatible
+    name: mistral
+    api_base: https://api.mistral.ai/v1
+    api_key: xxx
+
+  # See https://docs.x.ai/docs
+  - type: openai-compatible
+    name: xai
+    api_base: https://api.x.ai/v1
+    api_key: xxx
+
+  # See https://docs.ai21.com/docs/quickstart
+  - type: openai-compatible
+    name: ai12
+    api_base: https://api.ai21.com/studio/v1
+    api_key: xxx
+
+  # See https://docs.cohere.com/docs/the-cohere-platform
+  - type: cohere
+    api_base: https://api.cohere.ai/v2                # Optional
+    api_key: xxx
+
+  # See https://docs.perplexity.ai/docs/getting-started
+  - type: openai-compatible
+    name: perplexity
+    api_base: https://api.perplexity.ai
+    api_key: xxx
+
+  # See https://console.groq.com/docs/quickstart
+  - type: openai-compatible
+    name: groq
+    api_base: https://api.groq.com/openai/v1
+    api_key: xxx
+
+  # See https://learn.microsoft.com/en-us/azure/ai-services/openai/chatgpt-quickstart
+  - type: azure-openai
+    api_base: https://{RESOURCE}.openai.azure.com
+    api_key: xxx
+    models:
+      - name: gpt-4o                                  # Model deployment name
+        max_input_tokens: 128000
+        supports_vision: true
+        supports_function_calling: true
+
+  # See https://cloud.google.com/vertex-ai
+  - type: vertexai
+    project_id: xxx
+    location: xxx
+    # Specifies a application-default-credentials (adc) file
+    # Run `gcloud auth application-default login` to init the adc file
+    # see https://cloud.google.com/docs/authentication/external/set-up-adc
+    adc_file: <gcloud-config-dir>/application_default_credentials.json>  # Optional field
+    patch:
+      chat_completions:
+        'gemini-.*':
+          body:
+            safetySettings:
+              - category: HARM_CATEGORY_HARASSMENT
+                threshold: BLOCK_ONLY_HIGH
+              - category: HARM_CATEGORY_HATE_SPEECH
+                threshold: BLOCK_ONLY_HIGH
+              - category: HARM_CATEGORY_SEXUALLY_EXPLICIT
+                threshold: BLOCK_ONLY_HIGH
+              - category: HARM_CATEGORY_DANGEROUS_CONTENT
+                threshold: BLOCK_ONLY_HIGH
+
+  # See https://docs.aws.amazon.com/bedrock/latest/userguide/
+  - type: bedrock
+    access_key_id: xxx
+    secret_access_key: xxx
+    region: xxx
+    session_token: xxx  # Optional, only needed for temporary credentials
+
+  # See https://developers.cloudflare.com/workers-ai/
+  - type: openai-compatible
+    name: cloudflare
+    api_base: https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
+    api_key: xxx
+
+  # See https://cloud.baidu.com/doc/WENXINWORKSHOP/index.html
+  - type: openai-compatible
+    name: ernie
+    api_base: https://qianfan.baidubce.com/v2
+    api_key: xxx
+
+  # See https://dashscope.aliyun.com/
+  - type: openai-compatible
+    name: qianwen
+    api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key: xxx
+
+  # See https://cloud.tencent.com/product/hunyuan
+  - type: openai-compatible
+    name: hunyuan
+    api_base: https://api.hunyuan.cloud.tencent.com/v1
+    api_key: xxx
+
+  # See https://platform.moonshot.cn/docs/intro
+  - type: openai-compatible
+    name: moonshot
+    api_base: https://api.moonshot.cn/v1
+    api_key: xxx
+
+  # See https://platform.deepseek.com/api-docs/
+  - type: openai-compatible
+    name: deepseek
+    api_base: https://api.deepseek.com
+    api_key: xxx
+
+  # See https://open.bigmodel.cn/dev/howuse/introduction
+  - type: openai-compatible
+    name: zhipuai
+    api_base: https://open.bigmodel.cn/api/paas/v4
+    api_key: xxx
+
+  # See https://platform.minimaxi.com/document/Fast%20access
+  - type: openai-compatible
+    name: minimax
+    api_base: https://api.minimax.chat/v1
+    api_key: xxx
+
+  # See https://openrouter.ai/docs#quick-start
+  - type: openai-compatible
+    name: openrouter
+    api_base: https://openrouter.ai/api/v1
+    api_key: xxx
+
+  # See https://github.com/marketplace/models
+  - type: openai-compatible
+    name: github
+    api_base: https://models.inference.ai.azure.com
+    api_key: xxx
+
+  # See https://deepinfra.com/docs
+  - type: openai-compatible
+    name: deepinfra
+    api_base: https://api.deepinfra.com/v1/openai
+    api_key: xxx
+
+
+  # ----- RAG dedicated -----
+
+  # See https://jina.ai
+  - type: openai-compatible
+    name: jina
+    api_base: https://api.jina.ai/v1
+    api_key: xxx
+
+  # See https://docs.voyageai.com/docs/introduction
+  - type: openai-compatible
+    name: voyageai
+    api_base: https://api.voyageai.com/v1
+    api_key: xxx
+
+# ---- hooks ----
+# hooks:                              # Hook configuration (Claude Code compatible)
+#   max_resume: 5                     # Max resume turns (default: 5)
+#   entries:
+#   - event: Stop                     # Fire after LLM responds
+#     type: claude-command            # Hook type (required)
+#     command: "/path/to/hook.sh"     # Shell command to execute
+#     timeout: 30                     # Timeout in seconds (default: 30)
+#   - event: PreToolUse               # Block access to sensitive files
+#     type: claude-command
+#     matcher: "fs_cat|fs_write|fs_patch|fs_rm|execute_command"
+#     command: "grep -q /etc/passwd && echo 'Blocked: sensitive file' >&2 && exit 2; true"
+#   - event: PostToolUse              # Fire after tool execution
+#     type: claude-command
+#     matcher: "Write|Edit"           # Match file-editing tools
+#     command: "/path/to/run-tests.sh"
+#     async: true                     # Run in background without blocking
+#     timeout: 120                    # Longer timeout for async hooks
+#   - event: Stop                     # Fire after LLM responds
+#     type: claude-command-persistent  # Long-running JSONL hook process
+#     command: "/path/to/persistent-hook.sh"
+#     timeout: 30                     # Timeout per event (default: 30)
+#   - event: SessionStart             # Fire at session start
+#     type: claude-command
+#     command: "echo 'Session started'"
+#
+#   ## Example: rtk (https://github.com/rtk-ai/rtk)
+#   ## Token compression proxy - rewrites commands to rtk equivalents for 60-90% token savings.
+#   ## Install: brew install rtk  (or cargo install --git https://github.com/rtk-ai/rtk)
+#   ## Setup:  rtk init -g
+#   ## rtk registers its own PreToolUse hook that transparently rewrites Bash
+#   ## commands (e.g. "git status" → "rtk git status") before execution.
+#   ## No manual harnx config is needed if you use `rtk init`; shown here for reference:
+#   # - event: PreToolUse
+#   #   type: claude-command
+#   #   matcher: "execute_command"
+#   #   command: "rtk hook claude"     # rtk's built-in hook handler
+#
+#   ## Example: dcg (https://github.com/Dicklesworthstone/destructive_command_guard)
+#   ## Blocks destructive commands (rm -rf, git reset --hard, DROP TABLE, etc.)
+#   ## Install: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh | bash -s -- --easy-mode
+#   # - event: PreToolUse
+#   #   type: claude-command
+#   #   matcher: "execute_command"
+#   #   command: "dcg"                 # dcg reads the hook payload from stdin
+#
+#   ## Example: hookSpecificOutput with permissionDecision
+#   ## Hooks can return structured JSON to allow, deny, or ask for confirmation:
+#   ## echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"Blocked by policy"}}'
+#   ## permissionDecision values: "allow" (proceed), "deny" (block), "ask" (prompt user)
