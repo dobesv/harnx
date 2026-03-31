@@ -115,6 +115,7 @@ impl McpClient {
         self.tools.read().clone()
     }
 
+    #[allow(clippy::await_holding_lock)]
     pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<Value> {
         if !self.is_connected() {
             self.connect().await?;
@@ -132,8 +133,8 @@ impl McpClient {
         };
 
         let result = {
-            let service = self.service.read();
-            let service = service
+            let service_guard = self.service.read();
+            let service = service_guard
                 .as_ref()
                 .ok_or_else(|| anyhow!("MCP server '{}' is not connected", self.name))?;
 

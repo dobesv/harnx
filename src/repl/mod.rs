@@ -953,6 +953,7 @@ Commands:
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[async_recursion::async_recursion]
 async fn ask(
     config: &GlobalConfig,
@@ -978,6 +979,7 @@ async fn ask(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 #[async_recursion::async_recursion]
 async fn ask_inner(
     config: &GlobalConfig,
