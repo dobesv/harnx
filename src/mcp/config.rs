@@ -18,4 +18,3 @@ pub struct McpServerConfig {
     #[serde(default)]
     pub description: Option<String>,
 }
-

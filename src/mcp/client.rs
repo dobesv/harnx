@@ -181,7 +181,6 @@ impl McpManager {
         client.connect().await
     }
 
-
     pub async fn disconnect(&self, server_name: &str) -> Result<()> {
         let client = self
             .clients
@@ -191,7 +190,6 @@ impl McpManager {
             .ok_or_else(|| anyhow!("Unknown MCP server '{}'", server_name))?;
         client.disconnect().await
     }
-
 
     pub async fn get_all_tools(&self) -> Vec<FunctionDeclaration> {
         let clients: Vec<_> = self.clients.read().values().cloned().collect();
@@ -243,7 +241,6 @@ impl McpManager {
 
         Ok(client.get_tools())
     }
-
 
     pub async fn call_tool(&self, prefixed_name: &str, arguments: Value) -> Result<Value> {
         let tool_name = prefixed_name
