@@ -161,6 +161,46 @@ Harnx supports custom dark and light themes, which highlight response text and c
 - [Custom REPL Prompt](https://github.com/dobesv/harnx/wiki/Custom-REPL-Prompt)
 - [FAQ](https://github.com/dobesv/harnx/wiki/FAQ)
 
+## Contributing
+
+### Conventional Commits
+We use [Conventional Commits](https://www.conventionalcommits.org/) to automate our release process and changelog generation. Please follow the convention for all your commit messages.
+
+Common types:
+- `feat`: A new feature
+- `fix`: A bug fix
+- `docs`: Documentation only changes
+- `style`: Changes that do not affect the meaning of the code (white-space, formatting, etc)
+- `refactor`: A code change that neither fixes a bug nor adds a feature
+- `perf`: A code change that improves performance
+- `test`: Adding missing tests or correcting existing tests
+- `chore`: Changes to the build process or auxiliary tools and libraries such as documentation generation
+
+### Changeset Files
+When you make a change that should be included in the changelog, please create a "changeset" file in the `.changesets/` directory. These are Markdown files that describe the change.
+
+Example `.changesets/new-feature.md`:
+```markdown
+---
+harnx: minor
+---
+Added a new feature to the CLI.
+```
+
+The YAML front matter specifies the package and the type of version bump (`patch`, `minor`, or `major`).
+
+### Releasing
+To trigger a new release:
+1. Ensure all changesets and conventional commits are merged into `main`.
+2. Install [knope](https://knope.tech/installation/).
+3. Run `knope release` locally (or via a GitHub Action if configured).
+4. Knope will:
+   - Calculate the new version based on changesets and conventional commits.
+   - Update `Cargo.toml`.
+   - Update `CHANGELOG.md`.
+   - Create a git tag.
+   - Push the tag to GitHub, which triggers the release workflow.
+
 ## License
 
 Copyright (c) 2023-2025 harnx-developers.
