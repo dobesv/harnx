@@ -285,6 +285,15 @@ mod tests {
         value.replace('\'', "''")
     }
 
+    #[cfg(windows)]
+    fn encode_powershell_script(script: &str) -> String {
+        let utf16: Vec<u8> = script
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        crate::utils::base64_encode(utf16)
+    }
+
     #[cfg(unix)]
     fn write_script(dir: &Path, name: &str, body: &str) -> String {
         let id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -299,14 +308,9 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn write_script(dir: &Path, name: &str, body: &str) -> String {
-        let id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!("{name}-{id}.ps1"));
-        fs::write(&path, body).expect("write powershell script");
-        format!(
-            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& '{}'\"",
-            powershell_quote(&path.display().to_string())
-        )
+    fn write_script(_dir: &Path, _name: &str, body: &str) -> String {
+        let encoded = encode_powershell_script(body);
+        format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}")
     }
 
     #[cfg(unix)]
