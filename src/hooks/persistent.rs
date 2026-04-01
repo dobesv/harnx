@@ -245,8 +245,15 @@ mod tests {
     use super::{PersistentHookManager, PersistentHookProcess};
     use crate::hooks::{HookEvent, HookPayload, HookResultControl};
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     fn test_payload(cwd: &Path) -> HookPayload {
         HookPayload {
@@ -271,44 +278,109 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', r#"'\''"#))
+    }
+
+    #[cfg(windows)]
+    fn powershell_quote(value: &str) -> String {
+        value.replace('\'', "''")
+    }
+
+    #[cfg(windows)]
+    fn encode_powershell_script(script: &str) -> String {
+        let utf16: Vec<u8> = script
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        crate::utils::base64_encode(utf16)
+    }
+
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> String {
+        let id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{name}-{id}.sh"));
+        fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write shell script");
+
+        let mut permissions = fs::metadata(&path).expect("script metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("set shell script permissions");
+
+        shell_quote(&path.display().to_string())
+    }
+
+    #[cfg(windows)]
+    fn write_script(_dir: &Path, _name: &str, body: &str) -> String {
+        let wrapped = format!("$ProgressPreference = 'SilentlyContinue'\n{body}");
+        let encoded = encode_powershell_script(&wrapped);
+        format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}")
+    }
+
+    #[cfg(unix)]
     fn extract_id_snippet() -> &'static str {
         r#"id=${line#*\"id\":\"}; id=${id%%\"*}"#
     }
 
     #[cfg(unix)]
-    fn respond_command(marker: Option<&Path>, additional_context: &str) -> String {
+    fn respond_command(dir: &Path, marker: Option<&Path>, additional_context: &str) -> String {
         let startup = marker
-            .map(|path| format!("printf '%s\\n' 'spawned' >> '{}' ; ", path.display()))
+            .map(|path| {
+                format!(
+                    "printf '%s\\n' {} >> {}\n",
+                    shell_quote("spawned"),
+                    shell_quote(&path.display().to_string())
+                )
+            })
             .unwrap_or_default();
 
-        format!(
-            "{startup}while IFS= read -r line; do {}; printf '{{\"id\":\"%s\",\"additionalContext\":\"{}\"}}\\n' \"$id\"; done",
-            extract_id_snippet(),
-            additional_context.replace('"', "\\\"")
+        write_script(
+            dir,
+            "respond",
+            &format!(
+                "{startup}while IFS= read -r line; do {}; printf '{{\"id\":\"%s\",\"additionalContext\":\"{}\"}}\\n' \"$id\"; done",
+                extract_id_snippet(),
+                additional_context.replace('"', "\\\"")
+            ),
         )
     }
 
     #[cfg(windows)]
-    fn respond_command(marker: Option<&Path>, additional_context: &str) -> String {
+    fn respond_command(dir: &Path, marker: Option<&Path>, additional_context: &str) -> String {
         let startup = marker
-            .map(|path| format!("Add-Content -Path '{}' -Value 'spawned'; ", path.display()))
+            .map(|path| {
+                format!(
+                    "Add-Content -Path '{}' -Value 'spawned'\n",
+                    powershell_quote(&path.display().to_string())
+                )
+            })
             .unwrap_or_default();
 
-        format!(
-            "powershell -Command \"{}while (($line = [Console]::In.ReadLine()) -ne $null) {{ if ($line -match '\\\"id\\\":\\\"([^\\\"]+)\\\"') {{ $id = $Matches[1]; [Console]::Out.WriteLine('{{\\\"id\\\":\\\"' + $id + '\\\",\\\"additionalContext\\\":\\\"{}\\\"}}') }} }}\"",
-            startup,
-            additional_context.replace('"', "`\"")
+        write_script(
+            dir,
+            "respond",
+            &format!(
+                "{startup}while (($line = [Console]::In.ReadLine()) -ne $null) {{\n    if ($line -match '\"id\":\"([^\"]+)\"') {{\n        $id = $Matches[1]\n        $output = @{{ id = $id; additionalContext = '{}' }} | ConvertTo-Json -Compress\n        [Console]::Out.WriteLine($output)\n    }}\n}}\n",
+                powershell_quote(additional_context)
+            ),
         )
     }
 
     #[cfg(unix)]
-    fn timeout_command() -> String {
-        "while IFS= read -r _line; do sleep 60; done".to_string()
+    fn timeout_command(dir: &Path) -> String {
+        write_script(
+            dir,
+            "timeout",
+            "while IFS= read -r _line; do sleep 60; done",
+        )
     }
 
     #[cfg(windows)]
-    fn timeout_command() -> String {
-        "powershell -Command \"while (($line = [Console]::In.ReadLine()) -ne $null) { Start-Sleep -Seconds 60 }\"".to_string()
+    fn timeout_command(dir: &Path) -> String {
+        write_script(
+            dir,
+            "timeout",
+            "while (($line = [Console]::In.ReadLine()) -ne $null) {\n    Start-Sleep -Seconds 60\n}\n",
+        )
     }
 
     #[tokio::test]
@@ -316,7 +388,7 @@ mod tests {
         let cwd = temp_test_dir("send-and-receive");
         let payload = test_payload(&cwd);
         let mut process =
-            PersistentHookProcess::spawn(&respond_command(None, "persistent response"))
+            PersistentHookProcess::spawn(&respond_command(&cwd, None, "persistent response"))
                 .expect("spawn persistent hook");
 
         let outcome = process
@@ -336,7 +408,7 @@ mod tests {
         let cwd = temp_test_dir("reuse-process");
         let marker = cwd.join("persistent-spawns.txt");
         let payload = test_payload(&cwd);
-        let command = respond_command(Some(&marker), "persistent response");
+        let command = respond_command(&cwd, Some(&marker), "persistent response");
         let mut manager = PersistentHookManager::new();
 
         let first = manager.send_event(&command, &payload, Some(5)).await;
@@ -356,7 +428,7 @@ mod tests {
         let cwd = temp_test_dir("timeout");
         let payload = test_payload(&cwd);
         let mut process =
-            PersistentHookProcess::spawn(&timeout_command()).expect("spawn timeout hook");
+            PersistentHookProcess::spawn(&timeout_command(&cwd)).expect("spawn timeout hook");
         let start = tokio::time::Instant::now();
 
         let outcome = process

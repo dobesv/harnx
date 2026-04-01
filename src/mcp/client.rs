@@ -115,6 +115,7 @@ impl McpClient {
         self.tools.read().clone()
     }
 
+    #[allow(clippy::await_holding_lock)]
     pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<Value> {
         if !self.is_connected() {
             self.connect().await?;
@@ -132,8 +133,8 @@ impl McpClient {
         };
 
         let result = {
-            let service = self.service.read();
-            let service = service
+            let service_guard = self.service.read();
+            let service = service_guard
                 .as_ref()
                 .ok_or_else(|| anyhow!("MCP server '{}' is not connected", self.name))?;
 
@@ -180,14 +181,6 @@ impl McpManager {
         client.connect().await
     }
 
-    pub async fn connect_all(&self) -> Result<()> {
-        let clients: Vec<_> = self.clients.read().values().cloned().collect();
-        for client in clients {
-            client.connect().await?;
-        }
-        Ok(())
-    }
-
     pub async fn disconnect(&self, server_name: &str) -> Result<()> {
         let client = self
             .clients
@@ -196,14 +189,6 @@ impl McpManager {
             .cloned()
             .ok_or_else(|| anyhow!("Unknown MCP server '{}'", server_name))?;
         client.disconnect().await
-    }
-
-    pub async fn disconnect_all(&self) -> Result<()> {
-        let clients: Vec<_> = self.clients.read().values().cloned().collect();
-        for client in clients {
-            client.disconnect().await?;
-        }
-        Ok(())
     }
 
     pub async fn get_all_tools(&self) -> Vec<FunctionDeclaration> {
@@ -255,18 +240,6 @@ impl McpManager {
         }
 
         Ok(client.get_tools())
-    }
-
-    pub fn get_server_tools_blocking(&self, server_name: &str) -> Result<Vec<FunctionDeclaration>> {
-        if let Ok(handle) = Handle::try_current() {
-            tokio::task::block_in_place(|| handle.block_on(self.get_server_tools(server_name)))
-        } else {
-            let runtime = Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("Failed to create Tokio runtime for MCP server connection")?;
-            runtime.block_on(self.get_server_tools(server_name))
-        }
     }
 
     pub async fn call_tool(&self, prefixed_name: &str, arguments: Value) -> Result<Value> {

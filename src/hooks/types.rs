@@ -50,8 +50,6 @@ pub enum HookEvent {
         tool_use_id: String,
         error: String,
     },
-    InstructionsLoaded {},
-    CwdChanged {},
 }
 
 impl HookEvent {
@@ -65,8 +63,6 @@ impl HookEvent {
             Self::PreToolUse { .. } => "PreToolUse",
             Self::PostToolUse { .. } => "PostToolUse",
             Self::PostToolUseFailure { .. } => "PostToolUseFailure",
-            Self::InstructionsLoaded { .. } => "InstructionsLoaded",
-            Self::CwdChanged { .. } => "CwdChanged",
         }
     }
 
@@ -94,8 +90,6 @@ pub struct HookSpecificOutput {
     pub permission_decision: Option<String>,
     #[serde(default)]
     pub permission_decision_reason: Option<String>,
-    #[serde(default)]
-    pub hook_event_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -105,8 +99,6 @@ pub struct HookResult {
     pub additional_context: Option<String>,
     #[serde(default)]
     pub resume: Option<bool>,
-    #[serde(default)]
-    pub updated_input: Option<Value>,
     #[serde(default)]
     pub system_message: Option<String>,
     #[serde(default, rename = "hookSpecificOutput")]
@@ -161,7 +153,6 @@ mod tests {
 
         assert_eq!(result.resume, Some(true));
         assert_eq!(result.additional_context.as_deref(), Some("keep going"));
-        assert!(result.updated_input.is_none());
     }
 
     #[test]
@@ -170,7 +161,6 @@ mod tests {
 
         assert!(result.additional_context.is_none());
         assert!(result.resume.is_none());
-        assert!(result.updated_input.is_none());
     }
 
     #[test]
@@ -235,8 +225,6 @@ mod tests {
                 },
                 "PostToolUseFailure",
             ),
-            (HookEvent::InstructionsLoaded {}, "InstructionsLoaded"),
-            (HookEvent::CwdChanged {}, "CwdChanged"),
         ];
 
         for (event, expected_name) in events {
@@ -256,7 +244,6 @@ mod tests {
             output.permission_decision_reason.as_deref(),
             Some("blocked")
         );
-        assert_eq!(output.hook_event_name.as_deref(), Some("PreToolUse"));
     }
 
     #[test]
@@ -266,7 +253,6 @@ mod tests {
 
         assert_eq!(output.permission_decision.as_deref(), Some("ask"));
         assert!(output.permission_decision_reason.is_none());
-        assert!(output.hook_event_name.is_none());
     }
 
     #[test]

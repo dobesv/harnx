@@ -301,6 +301,7 @@ async fn start_directive(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 #[async_recursion::async_recursion]
 async fn start_directive_inner(
     config: &GlobalConfig,

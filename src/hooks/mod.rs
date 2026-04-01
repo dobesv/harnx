@@ -62,7 +62,7 @@ pub use config::{HookConfig, HooksConfig};
 #[allow(unused_imports)]
 pub use dispatch::{
     dispatch_hooks, dispatch_hooks_with_count, dispatch_hooks_with_count_and_manager,
-    dispatch_hooks_with_manager, dispatch_hooks_with_managers,
+    dispatch_hooks_with_managers,
 };
 #[allow(unused_imports)]
 pub use executor::execute_command_hook;

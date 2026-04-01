@@ -269,7 +269,6 @@ mod tests {
         assert!(matches!(outcome.control, HookResultControl::Continue));
         assert!(outcome.result.additional_context.is_none());
         assert!(outcome.result.resume.is_none());
-        assert!(outcome.result.updated_input.is_none());
     }
 
     #[tokio::test]
