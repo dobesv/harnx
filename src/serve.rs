@@ -1,4 +1,4 @@
-use crate::{client::*, config::*, function::*, rag::*, utils::*};
+use crate::{client::*, config::*, rag::*, tool::*, utils::*};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
@@ -74,7 +74,7 @@ struct Server {
 impl Server {
     fn new(config: &GlobalConfig) -> Self {
         let mut config = config.read().clone();
-        config.functions = Functions::default();
+        config.tools = Tools::default();
         let mut models = list_all_models(&config);
         let mut default_model = config.model.clone();
         default_model.data_mut().name = DEFAULT_MODEL_NAME.into();
@@ -913,7 +913,7 @@ fn parse_messages(message: Vec<Value>) -> Result<Vec<Message>> {
     Ok(output)
 }
 
-fn parse_tools(tools: Option<Vec<Value>>) -> Result<Option<Vec<FunctionDeclaration>>> {
+fn parse_tools(tools: Option<Vec<Value>>) -> Result<Option<Vec<ToolDeclaration>>> {
     let tools = match tools {
         Some(v) => v,
         None => return Ok(None),

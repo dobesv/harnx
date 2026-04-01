@@ -4,7 +4,7 @@ use crate::client::{
     init_client, patch_messages, ChatCompletionsData, Client, ImageUrl, Message, MessageContent,
     MessageContentPart, MessageContentToolCalls, MessageRole, Model,
 };
-use crate::function::ToolResult;
+use crate::tool::ToolResult;
 use crate::utils::{base64_encode, is_loader_protocol, sha256, AbortSignal};
 
 use anyhow::{bail, Context, Result};
@@ -239,7 +239,7 @@ impl Input {
         patch_messages(&mut messages, model);
         model.guard_max_input_tokens(&messages)?;
         let (temperature, top_p) = (self.role().temperature(), self.role().top_p());
-        let functions = self.config.read().select_functions(self.role());
+        let functions = self.config.read().select_tools(self.role());
         Ok(ChatCompletionsData {
             messages,
             temperature,

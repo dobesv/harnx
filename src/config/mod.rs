@@ -14,12 +14,12 @@ use crate::client::{
     create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
     Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
 };
-use crate::function::{FunctionDeclaration, Functions, ToolResult};
 use crate::hooks::{AsyncHookManager, HooksConfig};
 use crate::mcp::{McpManager, McpServerConfig};
 use crate::rag::Rag;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::repl::{run_repl_command, split_args_text};
+use crate::tool::{ToolDeclaration, ToolResult, Tools};
 use crate::utils::*;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -58,9 +58,9 @@ const ENV_FILE_NAME: &str = ".env";
 const MESSAGES_FILE_NAME: &str = "messages.md";
 const SESSIONS_DIR_NAME: &str = "sessions";
 const RAGS_DIR_NAME: &str = "rags";
-const FUNCTIONS_DIR_NAME: &str = "functions";
-const FUNCTIONS_FILE_NAME: &str = "functions.json";
-const FUNCTIONS_BIN_DIR_NAME: &str = "bin";
+const TOOLS_DIR_NAME: &str = "tools";
+const TOOLS_FILE_NAME: &str = "tools.json";
+const TOOLS_BIN_DIR_NAME: &str = "bin";
 const AGENTS_DIR_NAME: &str = "agents";
 
 const CLIENTS_FIELD: &str = "clients";
@@ -115,7 +115,7 @@ pub struct Config {
     pub wrap: Option<String>,
     pub wrap_code: bool,
 
-    pub function_calling: bool,
+    pub tool_use: bool,
     pub mapping_tools: IndexMap<String, String>,
     pub use_tools: Option<String>,
 
@@ -167,7 +167,7 @@ pub struct Config {
     #[serde(skip)]
     pub model: Model,
     #[serde(skip)]
-    pub functions: Functions,
+    pub tools: Tools,
     #[serde(skip)]
     pub mcp_manager: Option<Arc<McpManager>>,
     #[serde(skip)]
@@ -200,7 +200,7 @@ impl Default for Config {
             wrap: None,
             wrap_code: false,
 
-            function_calling: true,
+            tool_use: true,
             mapping_tools: Default::default(),
             use_tools: None,
 
@@ -242,7 +242,7 @@ impl Default for Config {
             agent_variables: None,
 
             model: Default::default(),
-            functions: Default::default(),
+            tools: Default::default(),
             mcp_manager: None,
             working_mode: WorkingMode::Cmd,
             last_message: None,
@@ -288,7 +288,7 @@ impl Config {
             }
 
             config.init_mcp_manager();
-            config.load_functions()?;
+            config.load_tools()?;
 
             config.setup_model()?;
             config.setup_document_loaders();
@@ -380,19 +380,19 @@ impl Config {
         }
     }
 
-    pub fn functions_dir() -> PathBuf {
-        match env::var(get_env_name("functions_dir")) {
+    pub fn tools_dir() -> PathBuf {
+        match env::var(get_env_name("tools_dir")) {
             Ok(value) => PathBuf::from(value),
-            Err(_) => Self::local_path(FUNCTIONS_DIR_NAME),
+            Err(_) => Self::local_path(TOOLS_DIR_NAME),
         }
     }
 
-    pub fn functions_file() -> PathBuf {
-        Self::functions_dir().join(FUNCTIONS_FILE_NAME)
+    pub fn tools_file() -> PathBuf {
+        Self::tools_dir().join(TOOLS_FILE_NAME)
     }
 
-    pub fn functions_bin_dir() -> PathBuf {
-        Self::functions_dir().join(FUNCTIONS_BIN_DIR_NAME)
+    pub fn tools_bin_dir() -> PathBuf {
+        Self::tools_dir().join(TOOLS_BIN_DIR_NAME)
     }
 
     pub fn session_file(&self, name: &str) -> PathBuf {
@@ -431,14 +431,14 @@ impl Config {
         Self::agent_data_dir(agent_name).join(format!("{rag_name}.yaml"))
     }
 
-    pub fn agents_functions_dir() -> PathBuf {
-        Self::functions_dir().join(AGENTS_DIR_NAME)
+    pub fn agents_tools_dir() -> PathBuf {
+        Self::tools_dir().join(AGENTS_DIR_NAME)
     }
 
-    pub fn agent_functions_dir(name: &str) -> PathBuf {
-        match env::var(format!("{}_FUNCTIONS_DIR", normalize_env_name(name))) {
+    pub fn agent_tools_dir(name: &str) -> PathBuf {
+        match env::var(format!("{}_TOOLS_DIR", normalize_env_name(name))) {
             Ok(value) => PathBuf::from(value),
-            Err(_) => Self::agents_functions_dir().join(name),
+            Err(_) => Self::agents_tools_dir().join(name),
         }
     }
 
@@ -624,7 +624,7 @@ impl Config {
             ),
             ("rag_top_k", rag_top_k.to_string()),
             ("dry_run", self.dry_run.to_string()),
-            ("function_calling", self.function_calling.to_string()),
+            ("tool_use", self.tool_use.to_string()),
             ("stream", self.stream.to_string()),
             ("save", self.save.to_string()),
             ("keybindings", self.keybindings.clone()),
@@ -638,7 +638,7 @@ impl Config {
             ("sessions_dir", display_path(&self.sessions_dir())),
             ("rags_dir", display_path(&Self::rags_dir())),
             ("macros_dir", display_path(&Self::macros_dir())),
-            ("functions_dir", display_path(&Self::functions_dir())),
+            ("tools_dir", display_path(&Self::tools_dir())),
             ("messages_file", display_path(&self.messages_file())),
         ];
         if let Some(hooks) = &self.hooks {
@@ -699,12 +699,12 @@ impl Config {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 config.write().dry_run = value;
             }
-            "function_calling" => {
+            "tool_use" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
-                if value && config.write().functions.is_empty() {
-                    bail!("Function calling cannot be enabled because no functions are installed.")
+                if value && config.write().tools.is_empty() {
+                    bail!("Tool use cannot be enabled because no tools are installed.")
                 }
-                config.write().function_calling = value;
+                config.write().tool_use = value;
             }
             "stream" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
@@ -1161,7 +1161,7 @@ impl Config {
             let mut markdown_render = MarkdownRender::init(render_options)?;
             let agent_info: Option<(String, Vec<String>)> = self.agent.as_ref().map(|agent| {
                 let functions = agent
-                    .functions()
+                    .tools()
                     .declarations()
                     .iter()
                     .filter_map(|v| if v.agent { Some(v.name.clone()) } else { None })
@@ -1520,8 +1520,8 @@ impl Config {
         session_name: Option<&str>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
-        if !config.read().function_calling {
-            bail!("Please enable function calling before using the agent.");
+        if !config.read().tool_use {
+            bail!("Please enable tool use before using the agent.");
         }
         if config.read().agent.is_some() {
             bail!("Already in a agent, please run '.exit agent' first to exit the current agent.");
@@ -1678,11 +1678,11 @@ impl Config {
         Ok(())
     }
 
-    pub fn select_functions(&self, role: &Role) -> Option<Vec<FunctionDeclaration>> {
+    pub fn select_tools(&self, role: &Role) -> Option<Vec<ToolDeclaration>> {
         let mut functions = vec![];
-        if self.function_calling {
+        if self.tool_use {
             if let Some(use_tools) = role.use_tools() {
-                let declarations = self.function_declarations_for_use_tools(Some(&use_tools));
+                let declarations = self.tool_declarations_for_use_tools(Some(&use_tools));
                 let mut tool_names: HashSet<String> = Default::default();
                 let declaration_names: HashSet<String> =
                     declarations.iter().map(|v| v.name.to_string()).collect();
@@ -1716,7 +1716,7 @@ impl Config {
             }
 
             if let Some(agent) = &self.agent {
-                let mut agent_functions = agent.functions().declarations();
+                let mut agent_functions = agent.tools().declarations();
                 let tool_names: HashSet<String> = agent_functions
                     .iter()
                     .filter_map(|v| {
@@ -1811,7 +1811,7 @@ impl Config {
                         "rag_top_k",
                         "max_output_tokens",
                         "dry_run",
-                        "function_calling",
+                        "tool_use",
                         "stream",
                         "save",
                         "highlight",
@@ -1836,7 +1836,7 @@ impl Config {
                 "dry_run" => complete_bool(self.dry_run),
                 "stream" => complete_bool(self.stream),
                 "save" => complete_bool(self.save),
-                "function_calling" => complete_bool(self.function_calling),
+                "tool_use" => complete_bool(self.tool_use),
                 "use_tools" => {
                     let mut prefix = String::new();
                     let mut ignores = HashSet::new();
@@ -1849,7 +1849,7 @@ impl Config {
                         values.push("all".to_string());
                     }
                     values.extend(
-                        self.function_declarations_for_use_tools(Some("all"))
+                        self.tool_declarations_for_use_tools(Some("all"))
                             .iter()
                             .map(|v| v.name.clone()),
                     );
@@ -2315,8 +2315,8 @@ impl Config {
             self.wrap_code = v;
         }
 
-        if let Some(Some(v)) = read_env_bool(&get_env_name("function_calling")) {
-            self.function_calling = v;
+        if let Some(Some(v)) = read_env_bool(&get_env_name("tool_use")) {
+            self.tool_use = v;
         }
         if let Ok(v) = env::var(get_env_name("mapping_tools")) {
             if let Ok(v) = serde_json::from_str(&v) {
@@ -2415,8 +2415,8 @@ impl Config {
         }
     }
 
-    fn load_functions(&mut self) -> Result<()> {
-        self.functions = Functions::init(&Self::functions_file(), None)?;
+    fn load_tools(&mut self) -> Result<()> {
+        self.tools = Tools::init(&Self::tools_file(), None)?;
         Ok(())
     }
 
@@ -2443,11 +2443,8 @@ impl Config {
         })
     }
 
-    fn function_declarations_for_use_tools(
-        &self,
-        use_tools: Option<&str>,
-    ) -> Vec<FunctionDeclaration> {
-        let mut declarations = self.functions.declarations();
+    fn tool_declarations_for_use_tools(&self, use_tools: Option<&str>) -> Vec<ToolDeclaration> {
+        let mut declarations = self.tools.declarations();
         if let Some(use_tools) = use_tools {
             if self.needs_mcp_tools(use_tools) {
                 if let Some(manager) = &self.mcp_manager {

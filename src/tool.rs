@@ -141,17 +141,14 @@ impl ToolResult {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Functions {
-    declarations: Vec<FunctionDeclaration>,
-    mcp_declarations: Vec<FunctionDeclaration>,
+pub struct Tools {
+    declarations: Vec<ToolDeclaration>,
+    mcp_declarations: Vec<ToolDeclaration>,
 }
 
-impl Functions {
-    pub fn init(
-        declarations_path: &Path,
-        mcp_tools: Option<Vec<FunctionDeclaration>>,
-    ) -> Result<Self> {
-        let declarations: Vec<FunctionDeclaration> = if declarations_path.exists() {
+impl Tools {
+    pub fn init(declarations_path: &Path, mcp_tools: Option<Vec<ToolDeclaration>>) -> Result<Self> {
+        let declarations: Vec<ToolDeclaration> = if declarations_path.exists() {
             let ctx = || {
                 format!(
                     "Failed to load functions at {}",
@@ -170,14 +167,14 @@ impl Functions {
         })
     }
 
-    pub fn init_from_mcp(mcp_tools: Option<Vec<FunctionDeclaration>>) -> Self {
+    pub fn init_from_mcp(mcp_tools: Option<Vec<ToolDeclaration>>) -> Self {
         Self {
             declarations: vec![],
             mcp_declarations: mcp_tools.unwrap_or_default(),
         }
     }
 
-    pub fn find(&self, name: &str) -> Option<&FunctionDeclaration> {
+    pub fn find(&self, name: &str) -> Option<&ToolDeclaration> {
         self.declarations
             .iter()
             .chain(self.mcp_declarations.iter())
@@ -189,7 +186,7 @@ impl Functions {
             || self.mcp_declarations.iter().any(|v| v.name == name)
     }
 
-    pub fn declarations(&self) -> Vec<FunctionDeclaration> {
+    pub fn declarations(&self) -> Vec<ToolDeclaration> {
         self.declarations
             .iter()
             .chain(self.mcp_declarations.iter())
@@ -203,7 +200,7 @@ impl Functions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionDeclaration {
+pub struct ToolDeclaration {
     pub name: String,
     pub description: String,
     pub parameters: JsonSchema,
@@ -299,7 +296,7 @@ impl ToolCall {
 
         cmd_args.push(json_data.to_string());
 
-        let output = match run_llm_function(cmd_name, cmd_args, envs)? {
+        let output = match run_llm_tool(cmd_name, cmd_args, envs)? {
             Some(contents) => serde_json::from_str(&contents)
                 .ok()
                 .unwrap_or_else(|| json!({"output": contents})),
@@ -359,7 +356,7 @@ impl ToolCall {
         agent: &Agent,
     ) -> Result<CallConfig> {
         let function_name = self.name.clone();
-        match agent.functions().find(&function_name) {
+        match agent.tools().find(&function_name) {
             Some(function) => {
                 let agent_name = agent.name().to_string();
                 if function.agent {
@@ -384,7 +381,7 @@ impl ToolCall {
 
     fn extract_call_config_from_config(&self, config: &GlobalConfig) -> Result<CallConfig> {
         let function_name = self.name.clone();
-        match config.read().functions.contains(&function_name) {
+        match config.read().tools.contains(&function_name) {
             true => Ok((
                 function_name.clone(),
                 function_name,
@@ -396,7 +393,7 @@ impl ToolCall {
     }
 }
 
-pub fn run_llm_function(
+pub fn run_llm_tool(
     cmd_name: String,
     cmd_args: Vec<String>,
     mut envs: HashMap<String, String>,
@@ -405,12 +402,12 @@ pub fn run_llm_function(
 
     let mut bin_dirs: Vec<PathBuf> = vec![];
     if cmd_args.len() > 1 {
-        let dir = Config::agent_functions_dir(&cmd_name).join("bin");
+        let dir = Config::agent_tools_dir(&cmd_name).join("bin");
         if dir.exists() {
             bin_dirs.push(dir);
         }
     }
-    bin_dirs.push(Config::functions_bin_dir());
+    bin_dirs.push(Config::tools_bin_dir());
     let current_path = std::env::var("PATH").context("No PATH environment variable")?;
     let prepend_path = bin_dirs
         .iter()

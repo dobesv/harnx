@@ -11,16 +11,16 @@ editor: null                     # Specifies the command used to edit input buff
 wrap: no                         # Controls text wrapping (no, auto, <max-width>)
 wrap_code: false                 # Enables or disables wrapping of code blocks
 
-# ---- function-calling ----
+# ---- tool-use ----
 # Visit https://github.com/sigoden/llm-functions for setup instructions
-function_calling: true           # Enables or disables function calling (Globally).
+tool_use: true                   # Enables or disables tool use (Globally).
 mapping_tools:                   # Alias for a tool or toolset
   fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
 use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search')
 
 # ---- mcp servers ----
 # MCP (Model Context Protocol) servers provide external tools.
-# function_calling must be true for MCP tools to work.
+# tool_use must be true for MCP tools to work.
 # mcp_servers:
 #   - name: filesystem                 # Unique server name
 #     command: npx                     # Command to start the server
@@ -131,7 +131,7 @@ clients:
   #     - name: xxxx                                  # Chat model
   #       max_input_tokens: 100000
   #       supports_vision: true
-  #       supports_function_calling: true
+  #       supports_tool_use: true
   #     - name: xxxx                                  # Embedding model
   #       type: embedding
   #       default_chunk_size: 1500                        
@@ -175,7 +175,7 @@ clients:
         max_input_tokens: 131072
       - name: llama3.1
         max_input_tokens: 128000
-        supports_function_calling: true
+        supports_tool_use: true
       - name: llama3.2-vision
         max_input_tokens: 131072
         supports_vision: true
@@ -270,7 +270,7 @@ clients:
       - name: gpt-4o                                  # Model deployment name
         max_input_tokens: 128000
         supports_vision: true
-        supports_function_calling: true
+        supports_tool_use: true
 
   # See https://cloud.google.com/vertex-ai
   - type: vertexai
