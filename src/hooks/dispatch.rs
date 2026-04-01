@@ -240,7 +240,8 @@ mod tests {
 
     #[cfg(windows)]
     fn write_script(_dir: &Path, _name: &str, body: &str) -> String {
-        let encoded = encode_powershell_script(body);
+        let wrapped = format!("$ProgressPreference = 'SilentlyContinue'\n{body}");
+        let encoded = encode_powershell_script(&wrapped);
         format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}")
     }
 
