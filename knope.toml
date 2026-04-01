@@ -1,0 +1,14 @@
+[[packages]]
+name = "harnx"
+version_file = "Cargo.toml"
+changelog = "CHANGELOG.md"
+tag_prefix = "v"
+
+[[workflows]]
+name = "release"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+
+[[workflows.steps]]
+type = "Release"
