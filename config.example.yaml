@@ -71,7 +71,7 @@ summarize_prompt: 'Summarize the discussion briefly in 200 words or less to use 
 summary_prompt: 'This is a summary of the chat history as a recap: '
 
 # ---- RAG ----
-# See [RAG-Guide](https://github.com/dobesv/harnx/wiki/RAG-Guide) for more details.
+# See docs/rag-guide.md for more details.
 rag_embedding_model: null        # Specifies the embedding model used for context retrieval
 rag_reranker_model: null         # Specifies the reranker model used for sorting retrieved documents
 rag_top_k: 5                     # Specifies the number of documents to retrieve for answering queries
@@ -109,7 +109,7 @@ document_loaders:
 # ---- apperence ----
 highlight: true                  # Controls syntax highlighting
 light_theme: false               # Activates a light color theme when true. env: HARNX_LIGHT_THEME
-# Custom REPL left/right prompts, see https://github.com/dobesv/harnx/wiki/Custom-REPL-Prompt for more details
+# Custom REPL left/right prompts, see docs/custom-repl-prompt.md for more details
 left_prompt:
   '{color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
 right_prompt:
