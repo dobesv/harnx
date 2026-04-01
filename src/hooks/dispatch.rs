@@ -185,9 +185,14 @@ mod tests {
     use crate::hooks::{AsyncHookManager, HookConfig, HookEvent, HookResultControl};
     use serde_json::json;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     fn temp_test_dir(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
@@ -197,6 +202,40 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("harnx-dispatch-tests-{name}-{suffix}"));
         fs::create_dir_all(&dir).expect("create temp dispatch dir");
         dir
+    }
+
+    #[cfg(unix)]
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', r#"'\''"#))
+    }
+
+    #[cfg(windows)]
+    fn powershell_quote(value: &str) -> String {
+        value.replace('\'', "''")
+    }
+
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> String {
+        let id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{name}-{id}.sh"));
+        fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write shell script");
+
+        let mut permissions = fs::metadata(&path).expect("script metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("set shell script permissions");
+
+        shell_quote(&path.display().to_string())
+    }
+
+    #[cfg(windows)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> String {
+        let id = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{name}-{id}.ps1"));
+        fs::write(&path, body).expect("write powershell script");
+        format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+            path.display()
+        )
     }
 
     fn pre_tool_use_event(tool_name: &str) -> HookEvent {
@@ -230,53 +269,128 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_line_command(path: &Path, line: &str) -> String {
-        format!("printf '%s\\n' '{line}' >> '{}'", path.display())
-    }
-
-    #[cfg(windows)]
-    fn write_line_command(path: &Path, line: &str) -> String {
-        format!("echo {line}>>{}", path.display())
-    }
-
-    #[cfg(unix)]
-    fn block_command(path: &Path) -> String {
-        format!(
-            "printf '%s\\n' 'blocked' > '{}' && echo 'blocked' >&2 && exit 2",
-            path.display()
+    fn write_line_command(dir: &Path, path: &Path, line: &str) -> String {
+        write_script(
+            dir,
+            "write-line",
+            &format!(
+                "printf '%s\\n' {} >> {}",
+                shell_quote(line),
+                shell_quote(&path.display().to_string())
+            ),
         )
     }
 
     #[cfg(windows)]
-    fn block_command(path: &Path) -> String {
-        format!(
-            "echo blocked>{} && echo blocked 1>&2 && exit 2",
-            path.display()
-        )
-    }
-
-    #[cfg(unix)]
-    fn ask_json_command(reason: &str) -> String {
-        format!(
-            "echo '{{\"hookSpecificOutput\":{{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"{reason}\"}}}}'"
-        )
-    }
-
-    #[cfg(windows)]
-    fn ask_json_command(reason: &str) -> String {
-        format!(
-            "echo {{\"hookSpecificOutput\":{{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"{reason}\"}}}}"
+    fn write_line_command(dir: &Path, path: &Path, line: &str) -> String {
+        write_script(
+            dir,
+            "write-line",
+            &format!(
+                "Add-Content -Path '{}' -Value '{}'\n",
+                powershell_quote(&path.display().to_string()),
+                powershell_quote(line)
+            ),
         )
     }
 
     #[cfg(unix)]
-    fn allow_json_command() -> String {
-        "echo '{\"hookSpecificOutput\":{\"permissionDecision\":\"allow\"}}'".to_string()
+    fn block_command(dir: &Path, path: &Path) -> String {
+        write_script(
+            dir,
+            "block",
+            &format!(
+                "printf '%s\\n' {} > {}\necho {} >&2\nexit 2",
+                shell_quote("blocked"),
+                shell_quote(&path.display().to_string()),
+                shell_quote("blocked")
+            ),
+        )
     }
 
     #[cfg(windows)]
-    fn allow_json_command() -> String {
-        "echo {\"hookSpecificOutput\":{\"permissionDecision\":\"allow\"}}".to_string()
+    fn block_command(dir: &Path, path: &Path) -> String {
+        write_script(
+            dir,
+            "block",
+            &format!(
+                "Set-Content -Path '{}' -Value 'blocked'\n[Console]::Error.WriteLine('blocked')\nexit 2\n",
+                powershell_quote(&path.display().to_string())
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn ask_json_command(dir: &Path, reason: &str) -> String {
+        let output = json!({
+            "hookSpecificOutput": {
+                "permissionDecision": "ask",
+                "permissionDecisionReason": reason,
+            }
+        })
+        .to_string();
+        write_script(
+            dir,
+            "ask-json",
+            &format!("printf '%s\\n' {}", shell_quote(&output)),
+        )
+    }
+
+    #[cfg(windows)]
+    fn ask_json_command(dir: &Path, reason: &str) -> String {
+        write_script(
+            dir,
+            "ask-json",
+            &format!(
+                "$output = @{{ hookSpecificOutput = @{{ permissionDecision = 'ask'; permissionDecisionReason = '{}' }} }} | ConvertTo-Json -Compress\n[Console]::Out.WriteLine($output)\n",
+                powershell_quote(reason)
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn allow_json_command(dir: &Path) -> String {
+        let output = json!({
+            "hookSpecificOutput": {
+                "permissionDecision": "allow",
+            }
+        })
+        .to_string();
+        write_script(
+            dir,
+            "allow-json",
+            &format!("printf '%s\\n' {}", shell_quote(&output)),
+        )
+    }
+
+    #[cfg(windows)]
+    fn allow_json_command(dir: &Path) -> String {
+        write_script(
+            dir,
+            "allow-json",
+            "$output = @{ hookSpecificOutput = @{ permissionDecision = 'allow' } } | ConvertTo-Json -Compress\n[Console]::Out.WriteLine($output)\n",
+        )
+    }
+
+    #[cfg(unix)]
+    fn payload_dump_command(dir: &Path, path: &Path) -> String {
+        write_script(
+            dir,
+            "payload-dump",
+            &format!("cat > {}", shell_quote(&path.display().to_string())),
+        )
+    }
+
+    #[cfg(windows)]
+    fn payload_dump_command(dir: &Path, path: &Path) -> String {
+        write_script(
+            dir,
+            "payload-dump",
+            &format!(
+                "$content = [Console]::In.ReadToEnd()\n[System.IO.File]::WriteAllText('{}', $content)\n",
+                powershell_quote(&path.display().to_string())
+            ),
+        )
     }
 
     #[tokio::test]
@@ -284,8 +398,11 @@ mod tests {
         let cwd = temp_test_dir("filter-by-event");
         let marker = cwd.join("hook-runs.txt");
         let hooks = vec![
-            hook_config("PreToolUse", write_line_command(&marker, "pre-tool")),
-            hook_config("SessionStart", write_line_command(&marker, "session-start")),
+            hook_config("PreToolUse", write_line_command(&cwd, &marker, "pre-tool")),
+            hook_config(
+                "SessionStart",
+                write_line_command(&cwd, &marker, "session-start"),
+            ),
         ];
 
         let outcome = dispatch_hooks(&pre_tool_use_event("shell"), &hooks, "session-1", &cwd).await;
@@ -301,8 +418,11 @@ mod tests {
         let blocked_marker = cwd.join("blocked.txt");
         let second_marker = cwd.join("second.txt");
         let hooks = vec![
-            hook_config("PreToolUse", block_command(&blocked_marker)),
-            hook_config("PreToolUse", write_line_command(&second_marker, "second")),
+            hook_config("PreToolUse", block_command(&cwd, &blocked_marker)),
+            hook_config(
+                "PreToolUse",
+                write_line_command(&cwd, &second_marker, "second"),
+            ),
         ];
 
         let outcome = dispatch_hooks(&pre_tool_use_event("shell"), &hooks, "session-2", &cwd).await;
@@ -321,8 +441,11 @@ mod tests {
         let cwd = temp_test_dir("ask-short-circuit");
         let second_marker = cwd.join("second.txt");
         let hooks = vec![
-            hook_config("PreToolUse", ask_json_command("confirm this")),
-            hook_config("PreToolUse", write_line_command(&second_marker, "second")),
+            hook_config("PreToolUse", ask_json_command(&cwd, "confirm this")),
+            hook_config(
+                "PreToolUse",
+                write_line_command(&cwd, &second_marker, "second"),
+            ),
         ];
 
         let outcome =
@@ -343,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_ask_explicit_allow() {
         let cwd = temp_test_dir("ask-explicit-allow");
-        let hooks = vec![hook_config("PreToolUse", allow_json_command())];
+        let hooks = vec![hook_config("PreToolUse", allow_json_command(&cwd))];
 
         let outcome =
             dispatch_hooks(&pre_tool_use_event("shell"), &hooks, "session-allow", &cwd).await;
@@ -357,7 +480,7 @@ mod tests {
         let marker = cwd.join("payload.json");
         let hooks = vec![hook_config(
             "PreToolUse",
-            format!("python -c \"import sys, pathlib; pathlib.Path(r'{}').write_text(sys.stdin.read())\"", marker.display()),
+            payload_dump_command(&cwd, &marker),
         )];
 
         let outcome = dispatch_hooks_with_count(
