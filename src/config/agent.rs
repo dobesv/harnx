@@ -2,7 +2,7 @@ use super::*;
 
 use crate::{
     client::Model,
-    function::{run_llm_function, Functions},
+    tool::{run_llm_tool, Tools},
 };
 
 use anyhow::{Context, Result};
@@ -24,7 +24,7 @@ pub struct Agent {
     session_variables: Option<AgentVariables>,
     shared_dynamic_instructions: Option<String>,
     session_dynamic_instructions: Option<String>,
-    functions: Functions,
+    tools: Tools,
     rag: Option<Arc<Rag>>,
     model: Model,
 }
@@ -35,12 +35,12 @@ impl Agent {
         name: &str,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        let functions_dir = Config::agent_functions_dir(name);
+        let functions_dir = Config::agent_tools_dir(name);
         let definition_file_path = functions_dir.join("index.yaml");
         if !definition_file_path.exists() {
             bail!("Unknown agent `{name}`");
         }
-        let functions_file_path = functions_dir.join("functions.json");
+        let functions_file_path = functions_dir.join("tools.json");
         let rag_path = Config::agent_rag_file(name, DEFAULT_AGENT_NAME);
         let config_path = Config::agent_config_file(name);
         let mut agent_config = if config_path.exists() {
@@ -59,9 +59,9 @@ impl Agent {
             None
         };
         let functions = if functions_file_path.exists() {
-            Functions::init(&functions_file_path, mcp_tools)?
+            Tools::init(&functions_file_path, mcp_tools)?
         } else {
-            Functions::init_from_mcp(mcp_tools)
+            Tools::init_from_mcp(mcp_tools)
         };
         definition.replace_tools_placeholder(&functions);
 
@@ -121,7 +121,7 @@ impl Agent {
             session_variables: None,
             shared_dynamic_instructions: None,
             session_dynamic_instructions: None,
-            functions,
+            tools: functions,
             rag,
             model,
         })
@@ -200,7 +200,7 @@ impl Agent {
         let mut definition = self.definition.clone();
         definition.instructions = self.interpolated_instructions();
         value["definition"] = json!(definition);
-        value["functions_dir"] = Config::agent_functions_dir(&self.name)
+        value["tools_dir"] = Config::agent_tools_dir(&self.name)
             .display()
             .to_string()
             .into();
@@ -228,8 +228,8 @@ impl Agent {
         &self.config
     }
 
-    pub fn functions(&self) -> &Functions {
-        &self.functions
+    pub fn tools(&self) -> &Tools {
+        &self.tools
     }
 
     pub fn rag(&self) -> Option<Arc<Rag>> {
@@ -325,7 +325,7 @@ impl Agent {
     }
 
     fn run_instructions_fn(&self) -> Result<String> {
-        let value = run_llm_function(
+        let value = run_llm_tool(
             self.name().to_string(),
             vec!["_instructions".into(), "{}".into()],
             self.variable_envs(),
@@ -503,7 +503,7 @@ impl AgentDefinition {
         )
     }
 
-    fn replace_tools_placeholder(&mut self, functions: &Functions) {
+    fn replace_tools_placeholder(&mut self, functions: &Tools) {
         let tools_placeholder: &str = "{{__tools__}}";
         if self.instructions.contains(tools_placeholder) {
             let tools = functions
@@ -535,7 +535,7 @@ pub struct AgentVariable {
 }
 
 pub fn list_agents() -> Vec<String> {
-    let agents_file = Config::functions_dir().join("agents.txt");
+    let agents_file = Config::tools_dir().join("agents.txt");
     let contents = match read_to_string(agents_file) {
         Ok(v) => v,
         Err(_) => return vec![],
@@ -554,7 +554,7 @@ pub fn list_agents() -> Vec<String> {
 }
 
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
-    let index_path = Config::agent_functions_dir(agent_name).join("index.yaml");
+    let index_path = Config::agent_tools_dir(agent_name).join("index.yaml");
     if !index_path.exists() {
         return vec![];
     }

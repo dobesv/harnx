@@ -1,13 +1,13 @@
 mod cli;
 mod client;
 mod config;
-mod function;
 mod hooks;
 mod mcp;
 mod rag;
 mod render;
 mod repl;
 mod serve;
+mod tool;
 #[macro_use]
 mod utils;
 

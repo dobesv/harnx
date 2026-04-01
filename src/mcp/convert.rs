@@ -1,16 +1,16 @@
-use crate::function::{FunctionDeclaration, JsonSchema};
+use crate::tool::{JsonSchema, ToolDeclaration};
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use serde_json::Value;
 
-pub fn mcp_tool_to_function(
+pub fn mcp_tool_to_declaration(
     server_name: &str,
     tool_name: &str,
     tool_description: &str,
     input_schema: &Value,
-) -> Result<FunctionDeclaration> {
-    Ok(FunctionDeclaration {
+) -> Result<ToolDeclaration> {
+    Ok(ToolDeclaration {
         name: format!("mcp__{server_name}__{tool_name}"),
         description: tool_description.to_string(),
         parameters: convert_json_schema(input_schema)?,
@@ -100,7 +100,7 @@ fn convert_json_schema(schema: &Value) -> Result<JsonSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_json_schema, mcp_tool_to_function};
+    use super::{convert_json_schema, mcp_tool_to_declaration};
     use serde_json::json;
 
     #[test]
@@ -182,7 +182,7 @@ mod tests {
         });
 
         let function =
-            mcp_tool_to_function("filesystem", "read_file", "Read a file from disk", &schema)
+            mcp_tool_to_declaration("filesystem", "read_file", "Read a file from disk", &schema)
                 .expect("convert tool");
 
         assert_eq!(function.name, "mcp__filesystem__read_file");

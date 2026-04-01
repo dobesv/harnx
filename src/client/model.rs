@@ -135,7 +135,7 @@ impl Model {
                     input_price,
                     output_price,
                     supports_vision,
-                    supports_function_calling,
+                    supports_tool_use,
                     ..
                 } = &self.data;
                 let max_input_tokens = stringify_option_value(max_input_tokens);
@@ -146,7 +146,7 @@ impl Model {
                 if *supports_vision {
                     capabilities.push('👁');
                 };
-                if *supports_function_calling {
+                if *supports_tool_use {
                     capabilities.push('⚒');
                 };
                 let capabilities: String = capabilities
@@ -316,7 +316,7 @@ pub struct ModelData {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_vision: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub supports_function_calling: bool,
+    pub supports_tool_use: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     no_stream: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

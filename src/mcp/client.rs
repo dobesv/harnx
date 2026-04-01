@@ -1,5 +1,5 @@
-use super::{mcp_tool_to_function, McpServerConfig};
-use crate::function::FunctionDeclaration;
+use super::{mcp_tool_to_declaration, McpServerConfig};
+use crate::tool::ToolDeclaration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::RwLock;
@@ -14,7 +14,7 @@ use tokio::runtime::{Builder, Handle};
 pub struct McpClient {
     name: String,
     config: McpServerConfig,
-    tools: Arc<RwLock<Vec<FunctionDeclaration>>>,
+    tools: Arc<RwLock<Vec<ToolDeclaration>>>,
     connected: Arc<RwLock<bool>>,
     service: Arc<RwLock<Option<RunningService<RoleClient, ()>>>>,
 }
@@ -79,7 +79,7 @@ impl McpClient {
             .into_iter()
             .map(|tool| {
                 let input_schema = Value::Object((*tool.input_schema).clone());
-                mcp_tool_to_function(
+                mcp_tool_to_declaration(
                     &self.name,
                     tool.name.as_ref(),
                     tool.description.as_deref().unwrap_or_default(),
@@ -111,7 +111,7 @@ impl McpClient {
         Ok(())
     }
 
-    pub fn get_tools(&self) -> Vec<FunctionDeclaration> {
+    pub fn get_tools(&self) -> Vec<ToolDeclaration> {
         self.tools.read().clone()
     }
 
@@ -191,7 +191,7 @@ impl McpManager {
         client.disconnect().await
     }
 
-    pub async fn get_all_tools(&self) -> Vec<FunctionDeclaration> {
+    pub async fn get_all_tools(&self) -> Vec<ToolDeclaration> {
         let clients: Vec<_> = self.clients.read().values().cloned().collect();
         for client in &clients {
             if !client.is_connected() {
@@ -213,7 +213,7 @@ impl McpManager {
         tools
     }
 
-    pub fn get_all_tools_blocking(&self) -> Vec<FunctionDeclaration> {
+    pub fn get_all_tools_blocking(&self) -> Vec<ToolDeclaration> {
         if let Ok(handle) = Handle::try_current() {
             tokio::task::block_in_place(|| handle.block_on(self.get_all_tools()))
         } else {
@@ -227,7 +227,7 @@ impl McpManager {
         }
     }
 
-    pub async fn get_server_tools(&self, server_name: &str) -> Result<Vec<FunctionDeclaration>> {
+    pub async fn get_server_tools(&self, server_name: &str) -> Result<Vec<ToolDeclaration>> {
         let client = self
             .clients
             .read()

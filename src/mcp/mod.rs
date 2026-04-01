@@ -8,7 +8,7 @@ pub use client::McpManager;
 pub use config::McpServerConfig;
 
 #[allow(unused_imports)]
-use convert::mcp_tool_to_function;
+use convert::mcp_tool_to_declaration;
 
 pub fn is_mcp_tool(name: &str) -> bool {
     name.starts_with("mcp__")
