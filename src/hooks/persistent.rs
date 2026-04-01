@@ -304,8 +304,8 @@ mod tests {
         let path = dir.join(format!("{name}-{id}.ps1"));
         fs::write(&path, body).expect("write powershell script");
         format!(
-            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
-            path.display()
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& '{}'\"",
+            powershell_quote(&path.display().to_string())
         )
     }
 
