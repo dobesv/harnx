@@ -150,16 +150,16 @@ Harnx supports custom dark and light themes, which highlight response text and c
 
 ## Documentation
 
-- [Chat-REPL Guide](https://github.com/dobesv/harnx/wiki/Chat-REPL-Guide)
-- [Command-Line Guide](https://github.com/dobesv/harnx/wiki/Command-Line-Guide)
-- [Role Guide](https://github.com/dobesv/harnx/wiki/Role-Guide)
-- [Macro Guide](https://github.com/dobesv/harnx/wiki/Macro-Guide)
-- [RAG Guide](https://github.com/dobesv/harnx/wiki/RAG-Guide)
-- [Environment Variables](https://github.com/dobesv/harnx/wiki/Environment-Variables)
-- [Configuration Guide](https://github.com/dobesv/harnx/wiki/Configuration-Guide)
-- [Custom Theme](https://github.com/dobesv/harnx/wiki/Custom-Theme)
-- [Custom REPL Prompt](https://github.com/dobesv/harnx/wiki/Custom-REPL-Prompt)
-- [FAQ](https://github.com/dobesv/harnx/wiki/FAQ)
+- [Chat-REPL Guide](docs/chat-repl-guide.md)
+- [Command-Line Guide](docs/command-line-guide.md)
+- [Role Guide](docs/role-guide.md)
+- [Macro Guide](docs/macro-guide.md)
+- [RAG Guide](docs/rag-guide.md)
+- [Environment Variables](docs/environment-variables.md)
+- [Configuration Guide](docs/configuration-guide.md)
+- [Custom Theme](docs/custom-theme.md)
+- [Custom REPL Prompt](docs/custom-repl-prompt.md)
+- [FAQ](docs/faq.md)
 
 ## Contributing
 
