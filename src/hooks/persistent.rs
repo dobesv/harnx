@@ -248,9 +248,11 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    #[cfg(unix)]
     static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     fn test_payload(cwd: &Path) -> HookPayload {
