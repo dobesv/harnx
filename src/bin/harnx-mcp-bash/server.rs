@@ -1,4 +1,6 @@
-use harnx::mcp_safety::{format_size, sanitize_output_text, truncate_output, TruncateOpts};
+use harnx::mcp_safety::{
+    file_uri_to_path, format_size, sanitize_output_text, truncate_output, TruncateOpts,
+};
 
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
@@ -85,7 +87,7 @@ impl BashServer {
         let roots = result
             .roots
             .into_iter()
-            .map(|root| root_uri_to_path(root.uri.as_ref()))
+            .map(|root| file_uri_to_path(root.uri.as_ref()))
             .collect::<Vec<_>>();
 
         let mut guard = self.roots.write().await;
@@ -307,7 +309,12 @@ impl ServerHandler for BashServer {
         request: CallToolRequestParam,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let _ = self.ensure_roots_initialized(&context.peer).await;
+        if let Err(err) = self.ensure_roots_initialized(&context.peer).await {
+            eprintln!(
+                "harnx-mcp-bash: failed to initialize roots: {}",
+                err.message
+            );
+        }
 
         match request.name.as_ref() {
             "exec" => {
@@ -350,16 +357,6 @@ fn tool_error(msg: impl Into<String>) -> Result<CallToolResult, ErrorData> {
 
 fn internal_error(msg: impl Into<Cow<'static, str>>) -> ErrorData {
     ErrorData::internal_error(msg, None)
-}
-
-fn root_uri_to_path(uri: &str) -> PathBuf {
-    if let Some(path) = uri.strip_prefix("file://localhost") {
-        return PathBuf::from(path);
-    }
-    if let Some(path) = uri.strip_prefix("file://") {
-        return PathBuf::from(path);
-    }
-    PathBuf::from(uri)
 }
 
 fn object_schema(properties: Vec<(&str, Schema)>, required: &[&str]) -> Schema {

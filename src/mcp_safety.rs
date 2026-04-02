@@ -9,6 +9,59 @@ pub const DEFAULT_GREP_LIMIT: usize = 100;
 pub const DEFAULT_FIND_LIMIT: usize = 1000;
 pub const DEFAULT_LS_LIMIT: usize = 500;
 pub const LS_SCAN_HARD_LIMIT: usize = 20_000;
+pub const SEARCH_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Convert an absolute path to a proper `file://` URI.
+/// Handles Windows extended-length paths (`\\?\`) and backslash → forward-slash conversion.
+pub fn path_to_file_uri(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    let s = s.replace('\\', "/");
+    if s.starts_with('/') {
+        format!("file://{s}")
+    } else {
+        format!("file:///{s}")
+    }
+}
+
+/// Convert a `file://` URI back to a PathBuf, with percent-decoding.
+pub fn file_uri_to_path(uri: &str) -> PathBuf {
+    let path_str = uri
+        .strip_prefix("file://localhost")
+        .or_else(|| uri.strip_prefix("file://"))
+        .unwrap_or(uri);
+    let decoded = percent_decode(path_str);
+    PathBuf::from(decoded)
+}
+
+/// Simple percent-decoding for file URIs.
+fn percent_decode(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next().and_then(hex_val);
+            let lo = chars.next().and_then(hex_val);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                result.push((h << 4 | l) as char);
+            } else {
+                result.push('%');
+            }
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 pub struct TruncationResult {

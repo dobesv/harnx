@@ -42,7 +42,15 @@ fn parse_args() -> Vec<PathBuf> {
                     let raw = &args[i + 1];
                     let path = PathBuf::from(raw);
                     if path.exists() {
-                        roots.push(path.canonicalize().unwrap_or(path));
+                        match path.canonicalize() {
+                            Ok(canonical) => roots.push(canonical),
+                            Err(err) => {
+                                eprintln!(
+                                    "warning: failed to canonicalize root '{}': {}",
+                                    raw, err
+                                );
+                            }
+                        }
                     } else {
                         eprintln!("harnx-mcp-bash: warning: root path does not exist: {}", raw);
                     }

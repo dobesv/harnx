@@ -2,6 +2,7 @@ use super::{mcp_tool_to_declaration, McpServerConfig};
 use crate::tool::ToolDeclaration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use harnx::mcp_safety::path_to_file_uri;
 use parking_lot::RwLock;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
@@ -64,14 +65,16 @@ impl ClientHandler for McpClientHandler {
         let roots = self.roots.read();
         let roots = roots
             .iter()
-            .map(|r| {
+            .filter_map(|r| {
                 let path = Path::new(r);
-                let uri = if let Ok(canonical) = path.canonicalize() {
-                    format!("file://{}", canonical.to_string_lossy())
-                } else {
-                    format!("file://{}", r)
-                };
-                Root { uri, name: None }
+                let abs = path
+                    .canonicalize()
+                    .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(path)))
+                    .ok()?;
+                Some(Root {
+                    uri: path_to_file_uri(&abs),
+                    name: None,
+                })
             })
             .collect();
         Ok(ListRootsResult { roots })
@@ -447,10 +450,7 @@ mod tests {
         );
 
         let expected_path = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let expected_uri = format!("file://{}", expected_path.to_string_lossy());
-        // Note: canonicalize might add \\?\ prefix on Windows, but we are on Linux.
-        // Also it should have three slashes for absolute paths: file:///path/to/dir
-        // format!("file://{}", path) where path is /path/to/dir gives file:///path/to/dir
+        let expected_uri = path_to_file_uri(&expected_path);
         assert_eq!(uri, expected_uri);
     }
 }

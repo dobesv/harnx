@@ -1,8 +1,9 @@
 use harnx::mcp_safety::{
-    format_size, is_binary_content, sanitize_output_text, truncate_line, truncate_output,
-    validate_path, validate_write_path, TruncateOpts, DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT,
-    DEFAULT_LS_LIMIT, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH,
-    LS_SCAN_HARD_LIMIT, READ_MAX_FILE_BYTES, WRITE_MAX_BYTES,
+    file_uri_to_path, format_size, is_binary_content, sanitize_output_text, truncate_line,
+    truncate_output, validate_path, validate_write_path, TruncateOpts, DEFAULT_FIND_LIMIT,
+    DEFAULT_GREP_LIMIT, DEFAULT_LS_LIMIT, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
+    GREP_MAX_LINE_LENGTH, LS_SCAN_HARD_LIMIT, READ_MAX_FILE_BYTES, SEARCH_FILE_MAX_BYTES,
+    WRITE_MAX_BYTES,
 };
 
 use fancy_regex::Regex;
@@ -236,7 +237,7 @@ impl FsServer {
         let roots = result
             .roots
             .into_iter()
-            .map(|root| root_uri_to_path(root.uri.as_ref()))
+            .map(|root| file_uri_to_path(root.uri.as_ref()))
             .collect::<Vec<_>>();
 
         let mut guard = self.roots.write().await;
@@ -634,6 +635,12 @@ impl FsServer {
         drop(roots);
 
         let max_results = params.max_results.unwrap_or(DEFAULT_FIND_LIMIT);
+        if params.pattern.contains("..") {
+            return Err(ErrorData::invalid_params(
+                "glob pattern must not contain '..' path components",
+                None,
+            ));
+        }
         let full_pattern = format!("{}/{}", search_path.display(), params.pattern);
         let glob_results = glob::glob(&full_pattern).map_err(|err| {
             ErrorData::invalid_params(format!("invalid glob pattern: {err}"), None)
@@ -732,7 +739,9 @@ impl ServerHandler for FsServer {
         request: CallToolRequestParam,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let _ = self.ensure_roots_initialized(&context.peer).await;
+        if let Err(err) = self.ensure_roots_initialized(&context.peer).await {
+            eprintln!("harnx-mcp-fs: failed to initialize roots: {}", err.message);
+        }
 
         match request.name.as_ref() {
             "read" => {
@@ -820,16 +829,6 @@ fn default_search_path(roots: &[PathBuf]) -> PathBuf {
         .first()
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-}
-
-fn root_uri_to_path(uri: &str) -> PathBuf {
-    if let Some(path) = uri.strip_prefix("file://localhost") {
-        return PathBuf::from(path);
-    }
-    if let Some(path) = uri.strip_prefix("file://") {
-        return PathBuf::from(path);
-    }
-    PathBuf::from(uri)
 }
 
 fn object_schema(properties: Vec<(&str, Schema)>, required: &[&str]) -> Schema {
@@ -1002,14 +1001,10 @@ fn search_file(
         return;
     }
 
-    let metadata = match std::fs::metadata(file) {
-        Ok(metadata) if metadata.len() <= READ_MAX_FILE_BYTES => metadata,
+    let _metadata = match std::fs::metadata(file) {
+        Ok(metadata) if metadata.len() <= SEARCH_FILE_MAX_BYTES => metadata,
         _ => return,
     };
-
-    if metadata.len() > 5 * 1024 * 1024 {
-        return;
-    }
 
     let content = match std::fs::read(file) {
         Ok(content) => content,

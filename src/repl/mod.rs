@@ -780,8 +780,12 @@ pub async fn run_repl_command(
                     let name_and_root = name_and_root.map(|n| n.trim()).unwrap_or("");
                     if let Some((name, root)) = name_and_root.split_once(' ') {
                         let (name, root) = (name.trim(), root.trim());
-                        Config::mcp_add_root(config, name, root).await?;
-                        println!("Added root '{}' to MCP server '{}'", root, name);
+                        if name.is_empty() || root.is_empty() {
+                            println!("Usage: .mcp add-root <server> <root>");
+                        } else {
+                            Config::mcp_add_root(config, name, root).await?;
+                            println!("Added root '{}' to MCP server '{}'", root, name);
+                        }
                     } else {
                         println!("Usage: .mcp add-root <server> <root>");
                     }
@@ -790,8 +794,12 @@ pub async fn run_repl_command(
                     let name_and_root = name_and_root.map(|n| n.trim()).unwrap_or("");
                     if let Some((name, root)) = name_and_root.split_once(' ') {
                         let (name, root) = (name.trim(), root.trim());
-                        Config::mcp_remove_root(config, name, root).await?;
-                        println!("Removed root '{}' from MCP server '{}'", root, name);
+                        if name.is_empty() || root.is_empty() {
+                            println!("Usage: .mcp remove-root <server> <root>");
+                        } else {
+                            Config::mcp_remove_root(config, name, root).await?;
+                            println!("Removed root '{}' from MCP server '{}'", root, name);
+                        }
                     } else {
                         println!("Usage: .mcp remove-root <server> <root>");
                     }
