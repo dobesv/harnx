@@ -507,7 +507,12 @@ mod tests {
     #[tokio::test]
     async fn test_mcp_manager_has_tool() {
         let manager = McpManager::new();
-        manager.initialize(vec![test_mcp_config("fs")]);
+        let client = Arc::new(McpClient::new(test_mcp_config("fs")));
+        *client.tools.write() = vec![
+            mcp_tool_to_declaration("fs", "read", "Read", &json!({})).unwrap(),
+            mcp_tool_to_declaration("fs", "write", "Write", &json!({})).unwrap(),
+        ];
+        manager.clients.write().insert("fs".to_string(), client);
 
         assert!(manager.has_tool("fs_read"));
         assert!(manager.has_tool("fs_write"));
@@ -539,10 +544,11 @@ mod tests {
 
         let client = Arc::new(McpClient::new(test_mcp_config("fs")));
         *client.connected.write() = true;
-        *client.tools.write() = vec![
-            mcp_tool_to_declaration("fs", "read", "Read mock file contents.", &json!({}))
-                .unwrap(),
-        ];
+        *client.tools.write() =
+            vec![
+                mcp_tool_to_declaration("fs", "read", "Read mock file contents.", &json!({}))
+                    .unwrap(),
+            ];
         *client.service.write() = Some(client_service);
 
         let manager = McpManager::new();
@@ -678,30 +684,36 @@ impl McpManager {
         Ok(client.get_tools())
     }
 
-    pub fn has_tool(&self, prefixed_name: &str) -> bool {
-        let Some((server_name, _)) = prefixed_name.split_once('_') else {
-            return false;
-        };
-        self.clients.read().contains_key(server_name)
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.clients
+            .read()
+            .values()
+            .any(|c| c.tools.read().iter().any(|t| t.name == name))
     }
 
-    pub async fn call_tool(&self, prefixed_name: &str, arguments: Value) -> Result<Value> {
-        let (server_name, tool_name) = prefixed_name
-            .split_once('_')
-            .ok_or_else(|| anyhow!("Invalid MCP tool name '{}'", prefixed_name))?;
-
-        let client = self
-            .clients
-            .read()
-            .get(server_name)
-            .cloned()
-            .ok_or_else(|| anyhow!("Unknown MCP server '{}'", server_name))?;
+    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
+        let (client, server_tool_name) = self
+            .find_client_for_tool(name)
+            .ok_or_else(|| anyhow!("Unknown MCP tool '{}'", name))?;
 
         if !client.is_connected() {
             client.connect().await?;
         }
 
-        client.call_tool(tool_name, arguments).await
+        client.call_tool(&server_tool_name, arguments).await
+    }
+
+    fn find_client_for_tool(&self, name: &str) -> Option<(Arc<McpClient>, String)> {
+        for client in self.clients.read().values() {
+            for tool in client.tools.read().iter() {
+                if tool.name == name {
+                    if let Some(ref server_tool_name) = tool.mcp_tool_name {
+                        return Some((client.clone(), server_tool_name.clone()));
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn list_servers(&self) -> Vec<String> {

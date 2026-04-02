@@ -210,7 +210,8 @@ pub struct ToolDeclaration {
     pub parameters: JsonSchema,
     #[serde(skip_serializing, default)]
     pub agent: bool,
-
+    #[serde(skip, default)]
+    pub mcp_tool_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
