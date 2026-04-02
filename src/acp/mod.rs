@@ -1,5 +1,8 @@
+#![allow(dead_code)]
+
 mod client;
 mod config;
+mod server;
 
 use crate::tool::{JsonSchema, ToolDeclaration};
 
@@ -230,7 +233,10 @@ fn expect_object(arguments: Value) -> Result<serde_json::Map<String, Value>> {
     }
 }
 
-fn required_string<'a>(arguments: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a str> {
+fn required_string<'a>(
+    arguments: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<&'a str> {
     arguments
         .get(key)
         .and_then(Value::as_str)
@@ -250,3 +256,214 @@ fn optional_string<'a>(
 
 pub use client::AcpClient;
 pub use config::AcpServerConfig;
+#[allow(unused_imports)]
+pub use server::HarnxAgent;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn run_async<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(future)
+    }
+
+    fn test_config(name: &str) -> AcpServerConfig {
+        AcpServerConfig {
+            name: name.to_string(),
+            command: "dummy".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            enabled: true,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn test_acp_config_deserialize_full() {
+        let yaml = r#"
+name: test-agent
+command: /usr/bin/test
+args: ["--verbose"]
+env:
+  KEY: value
+enabled: true
+description: A test agent
+"#;
+
+        let config: AcpServerConfig =
+            serde_yaml::from_str(yaml).expect("deserialize full ACP config");
+
+        assert_eq!(config.name, "test-agent");
+        assert_eq!(config.command, "/usr/bin/test");
+        assert_eq!(config.args, vec!["--verbose"]);
+        assert_eq!(config.env.get("KEY").map(String::as_str), Some("value"));
+        assert!(config.enabled);
+        assert_eq!(config.description.as_deref(), Some("A test agent"));
+    }
+
+    #[test]
+    fn test_acp_config_deserialize_defaults() {
+        let yaml = r#"
+name: minimal
+command: agent
+"#;
+
+        let config: AcpServerConfig =
+            serde_yaml::from_str(yaml).expect("deserialize minimal ACP config");
+
+        assert_eq!(config.name, "minimal");
+        assert_eq!(config.command, "agent");
+        assert!(config.args.is_empty());
+        assert!(config.env.is_empty());
+        assert!(config.enabled);
+        assert!(config.description.is_none());
+    }
+
+    #[test]
+    fn test_acp_config_disabled() {
+        let yaml = r#"
+name: disabled-agent
+command: agent
+enabled: false
+"#;
+
+        let config: AcpServerConfig =
+            serde_yaml::from_str(yaml).expect("deserialize disabled ACP config");
+
+        assert!(!config.enabled);
+    }
+
+    #[test]
+    fn test_generate_acp_tools() {
+        let tools = generate_acp_tools("myagent");
+
+        assert_eq!(tools.len(), 4);
+
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert!(names.contains(&"myagent_session_new"));
+        assert!(names.contains(&"myagent_session_prompt"));
+        assert!(names.contains(&"myagent_session_load"));
+        assert!(names.contains(&"myagent_session_cancel"));
+    }
+
+    #[test]
+    fn test_session_prompt_tool_has_message_param() {
+        let tools = generate_acp_tools("agent1");
+        let prompt_tool = tools
+            .iter()
+            .find(|tool| tool.name == "agent1_session_prompt")
+            .expect("find prompt tool");
+
+        let props = prompt_tool
+            .parameters
+            .properties
+            .as_ref()
+            .expect("prompt tool properties");
+        assert!(props.contains_key("message"));
+        assert!(props.contains_key("session_id"));
+
+        let required = prompt_tool
+            .parameters
+            .required
+            .as_ref()
+            .expect("prompt tool required list");
+        assert!(required.contains(&"message".to_string()));
+    }
+
+    #[test]
+    fn test_session_cancel_tool_requires_session_id() {
+        let tools = generate_acp_tools("agent1");
+        let cancel_tool = tools
+            .iter()
+            .find(|tool| tool.name == "agent1_session_cancel")
+            .expect("find cancel tool");
+
+        let required = cancel_tool
+            .parameters
+            .required
+            .as_ref()
+            .expect("cancel tool required list");
+        assert!(required.contains(&"session_id".to_string()));
+    }
+
+    #[test]
+    fn test_find_client_for_tool_matches() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("myserver")]);
+
+        let result = manager.find_client_for_tool("myserver_session_new");
+
+        assert!(result.is_some());
+        let (client, method) = result.expect("matched client for tool");
+        assert_eq!(client.name(), "myserver");
+        assert_eq!(method, "session_new");
+    }
+
+    #[test]
+    fn test_find_client_for_tool_no_match() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![]);
+
+        assert!(manager
+            .find_client_for_tool("unknown_session_new")
+            .is_none());
+    }
+
+    #[test]
+    fn test_find_client_for_tool_wrong_method() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("srv")]);
+
+        assert!(manager.find_client_for_tool("srv_unknown_method").is_none());
+    }
+
+    #[test]
+    fn test_get_all_tools_blocking_multiple_servers() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("a"), test_config("b")]);
+
+        let tools = manager.get_all_tools_blocking();
+
+        assert_eq!(tools.len(), 8);
+    }
+
+    #[test]
+    fn test_disabled_server_not_initialized() {
+        let manager = AcpManager::new();
+        let mut config = test_config("disabled");
+        config.enabled = false;
+        manager.initialize(vec![config]);
+
+        assert!(manager.get_client("disabled").is_none());
+        assert_eq!(manager.get_all_tools_blocking().len(), 0);
+    }
+
+    #[test]
+    fn test_call_tool_session_prompt_validates_message_argument() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("srv")]);
+
+        let err =
+            run_async(manager.call_tool("srv_session_prompt", json!({ "session_id": "abc" })))
+                .expect_err("missing message should fail before ACP subprocess work");
+
+        assert!(err.to_string().contains("message"));
+    }
+
+    #[test]
+    fn test_call_tool_session_cancel_validates_session_id_argument_type() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("srv")]);
+
+        let err = run_async(manager.call_tool("srv_session_cancel", json!({ "session_id": 123 })))
+            .expect_err("invalid session_id type should fail before ACP subprocess work");
+
+        assert!(err.to_string().contains("session_id"));
+    }
+}

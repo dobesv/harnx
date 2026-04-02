@@ -7,11 +7,11 @@ pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
 
+use crate::acp::{AcpManager, AcpServerConfig};
 use crate::client::{
     create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
     Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
 };
-use crate::acp::{AcpManager, AcpServerConfig};
 use crate::hooks::{AsyncHookManager, HooksConfig};
 use crate::mcp::{McpManager, McpServerConfig};
 use crate::rag::Rag;
@@ -639,7 +639,9 @@ impl Config {
         if let Some(hooks) = &self.hooks {
             items.push(("hooks", hooks.entries.len().to_string()));
         }
-        if let Ok((_, Some(log_path))) = Self::log_config(self.working_mode.is_serve()) {
+        if let Ok((_, Some(log_path))) =
+            Self::log_config(self.working_mode.is_serve() || self.working_mode.is_acp())
+        {
             items.push(("log_path", display_path(&log_path)));
         }
         let output = items
@@ -1623,6 +1625,7 @@ impl Config {
             WorkingMode::Repl => self.repl_default_session.as_ref(),
             WorkingMode::Cmd => self.cmd_default_session.as_ref(),
             WorkingMode::Serve => return Ok(()),
+            WorkingMode::Acp(_) => return Ok(()),
         };
         let default_session = match default_session {
             Some(v) => {
@@ -2434,6 +2437,11 @@ impl Config {
                 declarations.extend(manager.get_all_tools_blocking());
             }
         }
+        if use_tools.is_some() && self.acp_manager.is_some() {
+            if let Some(manager) = &self.acp_manager {
+                declarations.extend(manager.get_all_tools_blocking());
+            }
+        }
 
         let mut seen = HashSet::new();
         declarations.retain(|declaration| seen.insert(declaration.name.clone()));
@@ -2471,7 +2479,9 @@ impl Config {
         if self.acp_servers.is_empty() {
             return;
         }
-        // TODO: Initialize AcpManager with configs (T7)
+        let manager = AcpManager::new();
+        manager.initialize(self.acp_servers.clone());
+        self.acp_manager = Some(Arc::new(manager));
     }
 
     pub fn mcp_list_servers(config: &GlobalConfig) -> Vec<String> {
@@ -2603,22 +2613,26 @@ pub fn load_env_file() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkingMode {
     Cmd,
     Repl,
     Serve,
+    Acp(String),
 }
 
 impl WorkingMode {
     pub fn is_cmd(&self) -> bool {
-        *self == WorkingMode::Cmd
+        matches!(self, WorkingMode::Cmd)
     }
     pub fn is_repl(&self) -> bool {
-        *self == WorkingMode::Repl
+        matches!(self, WorkingMode::Repl)
     }
     pub fn is_serve(&self) -> bool {
-        *self == WorkingMode::Serve
+        matches!(self, WorkingMode::Serve)
+    }
+    pub fn is_acp(&self) -> bool {
+        matches!(self, WorkingMode::Acp(_))
     }
 }
 

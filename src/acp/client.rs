@@ -5,14 +5,13 @@ use anyhow::{anyhow, Context, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::process::Stdio;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::thread;
 use std::task::{Context as TaskContext, Poll};
+use std::thread;
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, BufReader,
-    ReadBuf,
+    AsyncBufReadExt, AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, BufReader, ReadBuf,
 };
 use tokio::process::{Child, Command};
 use tokio::runtime::Builder;
@@ -125,7 +124,9 @@ impl acp::Client for AcpNotificationClient {
     }
 
     async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
-        if let acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) = args.update {
+        if let acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) =
+            args.update
+        {
             let chunk = content_block_to_text(&content);
             if !chunk.is_empty() {
                 let session_id = args.session_id.0.to_string();
@@ -247,7 +248,10 @@ impl AcpClient {
             Err(_) => {
                 *self.connection_failed.write().await = true;
                 join_worker(worker.join).await;
-                Err(anyhow!("ACP server '{}' stopped during initialization", self.name))
+                Err(anyhow!(
+                    "ACP server '{}' stopped during initialization",
+                    self.name
+                ))
             }
         }
     }
@@ -304,9 +308,12 @@ impl AcpClient {
         })
         .map_err(|_| anyhow!("ACP server '{}' is not connected", self.name))?;
 
-        response_rx
-            .await
-            .map_err(|_| anyhow!("ACP server '{}' disconnected during session/prompt", self.name))?
+        response_rx.await.map_err(|_| {
+            anyhow!(
+                "ACP server '{}' disconnected during session/prompt",
+                self.name
+            )
+        })?
     }
 
     pub async fn session_load(&self, session_id: &str) -> Result<()> {
@@ -320,9 +327,12 @@ impl AcpClient {
         })
         .map_err(|_| anyhow!("ACP server '{}' is not connected", self.name))?;
 
-        response_rx
-            .await
-            .map_err(|_| anyhow!("ACP server '{}' disconnected during session/load", self.name))?
+        response_rx.await.map_err(|_| {
+            anyhow!(
+                "ACP server '{}' disconnected during session/load",
+                self.name
+            )
+        })?
     }
 
     pub async fn session_cancel(&self, session_id: &str) -> Result<()> {
@@ -336,9 +346,12 @@ impl AcpClient {
         })
         .map_err(|_| anyhow!("ACP server '{}' is not connected", self.name))?;
 
-        response_rx
-            .await
-            .map_err(|_| anyhow!("ACP server '{}' disconnected during session/cancel", self.name))?
+        response_rx.await.map_err(|_| {
+            anyhow!(
+                "ACP server '{}' disconnected during session/cancel",
+                self.name
+            )
+        })?
     }
 
     async fn ensure_connected(&self) -> Result<()> {
@@ -480,7 +493,10 @@ async fn worker_main(
                                 format!("Failed to create ACP session on '{}'", server_name)
                             })?;
                         let session_id = response.session_id.0.to_string();
-                        sessions.write().await.insert(session_id.clone(), SessionState::default());
+                        sessions
+                            .write()
+                            .await
+                            .insert(session_id.clone(), SessionState::default());
                         Ok(session_id)
                     }
                     .await;
@@ -511,7 +527,10 @@ async fn worker_main(
                             ))
                             .await
                             .with_context(|| {
-                                format!("Failed to send ACP prompt to session '{}' on '{}'", session_id, server_name)
+                                format!(
+                                    "Failed to send ACP prompt to session '{}' on '{}'",
+                                    session_id, server_name
+                                )
                             })?;
 
                         let mut sessions = sessions.write().await;
@@ -538,7 +557,10 @@ async fn worker_main(
                         ))
                         .await
                         .with_context(|| {
-                            format!("Failed to load ACP session '{}' on '{}'", session_id, server_name)
+                            format!(
+                                "Failed to load ACP session '{}' on '{}'",
+                                session_id, server_name
+                            )
                         })?;
 
                         sessions.write().await.entry(session_id).or_default();
@@ -559,7 +581,10 @@ async fn worker_main(
                         .cancel(acp::CancelNotification::new(session_id.clone()))
                         .await
                         .with_context(|| {
-                            format!("Failed to cancel ACP session '{}' on '{}'", session_id, server_name)
+                            format!(
+                                "Failed to cancel ACP session '{}' on '{}'",
+                                session_id, server_name
+                            )
                         });
                     let _ = respond_to.send(result);
                 });

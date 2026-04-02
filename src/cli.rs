@@ -39,6 +39,9 @@ pub struct Cli {
     /// Serve the LLM API and WebAPP
     #[clap(long, value_name = "ADDRESS")]
     pub serve: Option<Option<String>>,
+    /// Serve as an ACP agent over stdio
+    #[clap(long, value_name = "AGENT")]
+    pub acp: Option<String>,
     /// Include files, directories, or URLs
     #[clap(short = 'f', long, value_name = "FILE")]
     pub file: Vec<String>,
