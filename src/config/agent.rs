@@ -32,8 +32,6 @@ remote-work-productivity-tips
 video-game-development-insights"#;
 
 const DEFAULT_AGENT_NAME: &str = "rag";
-const TOOLS_PLACEHOLDER: &str = "{{__tools__}}";
-
 pub type AgentVariables = IndexMap<String, String>;
 
 pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
@@ -164,16 +162,11 @@ impl Agent {
         let mcp_manager = config.read().mcp_manager.clone();
         agent.mcp_manager = mcp_manager.clone();
 
-        let mcp_tools = if agent.contains_tools_placeholder() {
-            match &mcp_manager {
-                Some(manager) => Some(manager.get_all_tools().await),
-                None => None,
-            }
-        } else {
-            None
+        let mcp_tools = match &mcp_manager {
+            Some(manager) => Some(manager.get_all_tools().await),
+            None => None,
         };
-        agent.tools = Tools::init_from_mcp(mcp_tools.clone());
-        agent.replace_tools_placeholder();
+        agent.tools = Tools::init_from_mcp(mcp_tools);
 
         let model = {
             let config = config.read();
@@ -385,31 +378,68 @@ impl Agent {
 
     pub fn echo_messages(&self, input: &Input) -> String {
         let prompt = self.interpolated_instructions();
+        let tools_text = self.tools_text();
         let input_markdown = input.render();
-        if prompt.is_empty() {
-            input_markdown
+
+        let base = if prompt.is_empty() {
+            if let Some(tools) = &tools_text {
+                format!("{tools}\n\n{input_markdown}")
+            } else {
+                input_markdown
+            }
         } else if prompt.contains(INPUT_PLACEHOLDER) {
-            prompt.replace(INPUT_PLACEHOLDER, &input_markdown)
+            let replaced = prompt.replace(INPUT_PLACEHOLDER, &input_markdown);
+            if let Some(tools) = &tools_text {
+                format!("{tools}\n\n{replaced}")
+            } else {
+                replaced
+            }
+        } else if let Some(tools) = &tools_text {
+            format!("{prompt}\n\n{tools}\n\n{input_markdown}")
         } else {
             format!("{}\n\n{}", prompt, input_markdown)
-        }
+        };
+        base
     }
 
     pub fn build_messages(&self, input: &Input) -> Vec<Message> {
         let prompt = self.interpolated_instructions();
+        let tools_text = self.tools_text();
         let mut content = input.message_content();
         let mut messages = if prompt.is_empty() {
-            vec![Message::new(MessageRole::User, content)]
+            let mut messages = vec![];
+            if let Some(tools_text) = &tools_text {
+                messages.push(Message::new(
+                    MessageRole::System,
+                    MessageContent::Text(tools_text.clone()),
+                ));
+            }
+            messages.push(Message::new(MessageRole::User, content));
+            messages
         } else if prompt.contains(INPUT_PLACEHOLDER) {
             content.merge_prompt(|v: &str| prompt.replace(INPUT_PLACEHOLDER, v));
-            vec![Message::new(MessageRole::User, content)]
+            let mut messages = vec![];
+            if let Some(tools_text) = &tools_text {
+                messages.push(Message::new(
+                    MessageRole::System,
+                    MessageContent::Text(tools_text.clone()),
+                ));
+            }
+            messages.push(Message::new(MessageRole::User, content));
+            messages
         } else {
             let mut messages = vec![];
             let (system, cases) = parse_structure_prompt(&prompt);
-            if !system.is_empty() {
+            let system_text = match (&tools_text, system.is_empty()) {
+                (Some(tools), false) => format!("{system}\n\n{tools}"),
+                (Some(tools), true) => tools.clone(),
+                (None, false) => system.to_string(),
+                (None, true) => String::new(),
+            };
+            if !system_text.is_empty() {
                 messages.push(Message::new(
                     MessageRole::System,
-                    MessageContent::Text(system.to_string()),
+                    MessageContent::Text(system_text),
                 ));
             }
             if !cases.is_empty() {
@@ -486,40 +516,25 @@ impl Agent {
     pub fn exit_session(&mut self) {
         self.session_variables = None;
     }
-    fn contains_tools_placeholder(&self) -> bool {
-        self.prompt.contains(TOOLS_PLACEHOLDER)
-            || self
-                .instructions
-                .as_deref()
-                .is_some_and(|value| value.contains(TOOLS_PLACEHOLDER))
-    }
 
-    fn replace_tools_placeholder(&mut self) {
-        if !self.contains_tools_placeholder() {
-            return;
+    fn tools_text(&self) -> Option<String> {
+        let declarations = self.tools.declarations();
+        if declarations.is_empty() {
+            return None;
         }
-        let tools = self
-            .tools
-            .declarations()
+        let tools = declarations
             .iter()
             .enumerate()
             .map(|(i, v)| {
                 let description = match v.description.split_once('\n') {
-                    Some((v, _)) => v,
+                    Some((first_line, _)) => first_line,
                     None => &v.description,
                 };
                 format!("{}. {}: {description}", i + 1, v.name)
             })
             .collect::<Vec<String>>()
             .join("\n");
-        if self.prompt.contains(TOOLS_PLACEHOLDER) {
-            self.prompt = self.prompt.replace(TOOLS_PLACEHOLDER, &tools);
-        }
-        if let Some(instructions) = self.instructions.as_mut() {
-            if instructions.contains(TOOLS_PLACEHOLDER) {
-                *instructions = instructions.replace(TOOLS_PLACEHOLDER, &tools);
-            }
-        }
+        Some(tools)
     }
 }
 
@@ -702,6 +717,22 @@ fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
 mod tests {
     use super::*;
 
+    fn make_tool_declaration(name: &str, description: &str) -> crate::tool::ToolDeclaration {
+        crate::tool::ToolDeclaration {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters: Default::default(),
+            mcp_tool_name: None,
+        }
+    }
+
+    fn make_agent_with_tools(prompt: &str, tools: Vec<crate::tool::ToolDeclaration>) -> Agent {
+        let mut agent = Agent::from_markdown("test", prompt);
+        agent.tools =
+            crate::tool::Tools::init_from_mcp(if tools.is_empty() { None } else { Some(tools) });
+        agent
+    }
+
     #[test]
     fn test_parse_structure_prompt1() {
         let prompt = r#"
@@ -815,5 +846,59 @@ Input 1
         let content = "---\nuse_tools: fs:all,bash_exec\n---\nHelp with files.";
         let agent = Agent::from_markdown("tools-agent", content);
         assert_eq!(agent.use_tools(), Some("fs:all,bash_exec".to_string()));
+    }
+
+    #[test]
+    fn test_tools_text_with_tools() {
+        let agent = make_agent_with_tools(
+            "prompt",
+            vec![
+                make_tool_declaration("tool_a", "Description A"),
+                make_tool_declaration("tool_b", "Description B"),
+            ],
+        );
+
+        let text = agent.tools_text();
+
+        assert_eq!(
+            text,
+            Some("1. tool_a: Description A\n2. tool_b: Description B".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tools_text_without_tools() {
+        let agent = make_agent_with_tools("prompt", vec![]);
+
+        assert_eq!(agent.tools_text(), None);
+    }
+
+    #[test]
+    fn test_tools_text_multiline_description() {
+        let agent = make_agent_with_tools(
+            "prompt",
+            vec![make_tool_declaration(
+                "tool_x",
+                "First line\nSecond line\nThird line",
+            )],
+        );
+
+        let text = agent.tools_text();
+
+        assert_eq!(text, Some("1. tool_x: First line".to_string()));
+    }
+
+    #[test]
+    fn test_export_does_not_contain_tool_text() {
+        let agent = make_agent_with_tools(
+            "You are a helpful assistant.",
+            vec![make_tool_declaration("my_tool", "Tool description")],
+        );
+
+        let exported = agent.export().unwrap();
+
+        assert!(!exported.contains("my_tool"));
+        assert!(!exported.contains("Tool description"));
+        assert!(exported.contains("You are a helpful assistant."));
     }
 }

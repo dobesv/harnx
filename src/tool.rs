@@ -152,7 +152,7 @@ pub struct ToolDeclaration {
     pub mcp_tool_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JsonSchema {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub type_value: Option<String>,
