@@ -84,7 +84,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         return Ok(());
     }
     if cli.list_roles {
-        let roles = Config::list_roles(true).join("\n");
+        let roles = list_agents().join("\n");
         println!("{roles}");
         return Ok(());
     }
@@ -129,11 +129,11 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         if let Some(prompt) = &cli.prompt {
             config.write().use_prompt(prompt)?;
         } else if let Some(name) = &cli.role {
-            config.write().use_role(name)?;
+            config.write().use_agent_by_name(name)?;
         } else if cli.execute {
-            config.write().use_role(SHELL_ROLE)?;
+            config.write().use_agent_by_name(SHELL_ROLE)?;
         } else if cli.code {
-            config.write().use_role(CODE_ROLE)?;
+            config.write().use_agent_by_name(CODE_ROLE)?;
         }
         if let Some(session) = &cli.session {
             config
@@ -574,8 +574,8 @@ async fn shell_execute(
                     return shell_execute(config, shell, input, abort_signal.clone()).await;
                 }
                 'd' => {
-                    let role = config.read().retrieve_role(EXPLAIN_SHELL_ROLE)?;
-                    let input = Input::from_str(config, &eval_str, Some(role));
+                    let agent = config.read().retrieve_agent(EXPLAIN_SHELL_ROLE)?;
+                    let input = Input::from_str(config, &eval_str, Some(agent));
                     if input.stream() {
                         call_chat_completions_streaming(
                             &input,

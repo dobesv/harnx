@@ -27,15 +27,15 @@ pub struct Input {
     medias: Vec<String>,
     data_urls: HashMap<String, String>,
     tool_calls: Option<MessageContentToolCalls>,
-    role: Role,
+    agent: Agent,
     rag_name: Option<String>,
     with_session: bool,
     with_agent: bool,
 }
 
 impl Input {
-    pub fn from_str(config: &GlobalConfig, text: &str, role: Option<Role>) -> Self {
-        let (role, with_session, with_agent) = resolve_role(&config.read(), role);
+    pub fn from_str(config: &GlobalConfig, text: &str, agent: Option<Agent>) -> Self {
+        let (agent, with_session, with_agent) = resolve_agent(&config.read(), agent);
         Self {
             config: config.clone(),
             text: text.to_string(),
@@ -47,7 +47,7 @@ impl Input {
             medias: Default::default(),
             data_urls: Default::default(),
             tool_calls: None,
-            role,
+            agent,
             rag_name: None,
             with_session,
             with_agent,
@@ -58,7 +58,7 @@ impl Input {
         config: &GlobalConfig,
         raw_text: &str,
         paths: Vec<String>,
-        role: Option<Role>,
+        agent: Option<Agent>,
     ) -> Result<Self> {
         let loaders = config.read().document_loaders.clone();
         let (raw_paths, local_paths, remote_urls, external_cmds, protocol_paths, with_last_reply) =
@@ -102,7 +102,7 @@ impl Input {
                 ));
             }
         }
-        let (role, with_session, with_agent) = resolve_role(&config.read(), role);
+        let (agent, with_session, with_agent) = resolve_agent(&config.read(), agent);
         Ok(Self {
             config: config.clone(),
             text: texts.join("\n"),
@@ -114,7 +114,7 @@ impl Input {
             medias,
             data_urls,
             tool_calls: Default::default(),
-            role,
+            agent,
             rag_name: None,
             with_session,
             with_agent,
@@ -125,11 +125,11 @@ impl Input {
         config: &GlobalConfig,
         raw_text: &str,
         paths: Vec<String>,
-        role: Option<Role>,
+        agent: Option<Agent>,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
         abortable_run_with_spinner(
-            Input::from_files(config, raw_text, paths, role),
+            Input::from_files(config, raw_text, paths, agent),
             "Loading files",
             abort_signal,
         )
@@ -164,7 +164,7 @@ impl Input {
     }
 
     pub fn stream(&self) -> bool {
-        self.config.read().stream && !self.role().model().no_stream()
+        self.config.read().stream && !self.agent().model().no_stream()
     }
 
     pub fn continue_output(&self) -> Option<&str> {
@@ -184,9 +184,9 @@ impl Input {
     }
 
     pub fn set_regenerate(&mut self) {
-        let role = self.config.read().extract_role();
-        if role.name() == self.role().name() {
-            self.role = role;
+        let agent = self.config.read().extract_agent();
+        if agent.name() == self.agent().name() {
+            self.agent = agent;
         }
         self.regenerate = true;
         self.tool_calls = None;
@@ -220,7 +220,7 @@ impl Input {
     }
 
     pub fn create_client(&self) -> Result<Box<dyn Client>> {
-        init_client(&self.config, Some(self.role().model().clone()))
+        init_client(&self.config, Some(self.agent().model().clone()))
     }
 
     pub async fn fetch_chat_text(&self) -> Result<String> {
@@ -238,8 +238,8 @@ impl Input {
         let mut messages = self.build_messages()?;
         patch_messages(&mut messages, model);
         model.guard_max_input_tokens(&messages)?;
-        let (temperature, top_p) = (self.role().temperature(), self.role().top_p());
-        let functions = self.config.read().select_tools(self.role());
+        let (temperature, top_p) = (self.agent().temperature(), self.agent().top_p());
+        let functions = self.config.read().select_tools(self.agent());
         Ok(ChatCompletionsData {
             messages,
             temperature,
@@ -253,7 +253,7 @@ impl Input {
         let mut messages = if let Some(session) = self.session(&self.config.read().session) {
             session.build_messages(self)
         } else {
-            self.role().build_messages(self)
+            self.agent().build_messages(self)
         };
         if let Some(tool_calls) = &self.tool_calls {
             messages.push(Message::new(
@@ -268,12 +268,12 @@ impl Input {
         if let Some(session) = self.session(&self.config.read().session) {
             session.echo_messages(self)
         } else {
-            self.role().echo_messages(self)
+            self.agent().echo_messages(self)
         }
     }
 
-    pub fn role(&self) -> &Role {
-        &self.role
+    pub fn agent(&self) -> &Agent {
+        &self.agent
     }
 
     pub fn session<'a>(&self, session: &'a Option<Session>) -> Option<&'a Session> {
@@ -374,11 +374,11 @@ impl Input {
     }
 }
 
-fn resolve_role(config: &Config, role: Option<Role>) -> (Role, bool, bool) {
-    match role {
+fn resolve_agent(config: &Config, agent: Option<Agent>) -> (Agent, bool, bool) {
+    match agent {
         Some(v) => (v, false, false),
         None => (
-            config.extract_role(),
+            config.extract_agent(),
             config.session.is_some(),
             config.agent.is_some(),
         ),

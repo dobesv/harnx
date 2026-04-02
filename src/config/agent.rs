@@ -381,6 +381,22 @@ impl Agent {
         &self.prompt
     }
 
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    pub fn temperature(&self) -> Option<f64> {
+        self.temperature
+    }
+
+    pub fn top_p(&self) -> Option<f64> {
+        self.top_p
+    }
+
+    pub fn use_tools(&self) -> Option<String> {
+        self.use_tools.clone()
+    }
+
     pub fn is_empty_prompt(&self) -> bool {
         self.instructions_or_prompt().is_empty()
     }
@@ -391,6 +407,27 @@ impl Agent {
 
     pub fn has_args(&self) -> bool {
         self.name.contains('#')
+    }
+
+    pub fn set_model(&mut self, model: Model) {
+        self.model_id = Some(model.id());
+        self.model = model;
+        self.sync_compat_config();
+    }
+
+    pub fn set_temperature(&mut self, value: Option<f64>) {
+        self.temperature = value;
+        self.sync_compat_config();
+    }
+
+    pub fn set_top_p(&mut self, value: Option<f64>) {
+        self.top_p = value;
+        self.sync_compat_config();
+    }
+
+    pub fn set_use_tools(&mut self, value: Option<String>) {
+        self.use_tools = value;
+        self.sync_compat_config();
     }
 
     pub fn echo_messages(&self, input: &Input) -> String {
@@ -632,52 +669,6 @@ impl Agent {
                 *instructions = instructions.replace(TOOLS_PLACEHOLDER, &tools);
             }
         }
-        self.sync_compat_config();
-    }
-}
-
-impl RoleLike for Agent {
-    fn to_role(&self) -> Role {
-        let prompt = self.interpolated_instructions();
-        let mut role = Role::new("", &prompt);
-        role.sync(self);
-        role
-    }
-
-    fn model(&self) -> &Model {
-        &self.model
-    }
-
-    fn temperature(&self) -> Option<f64> {
-        self.temperature
-    }
-
-    fn top_p(&self) -> Option<f64> {
-        self.top_p
-    }
-
-    fn use_tools(&self) -> Option<String> {
-        self.use_tools.clone()
-    }
-
-    fn set_model(&mut self, model: Model) {
-        self.model_id = Some(model.id());
-        self.model = model;
-        self.sync_compat_config();
-    }
-
-    fn set_temperature(&mut self, value: Option<f64>) {
-        self.temperature = value;
-        self.sync_compat_config();
-    }
-
-    fn set_top_p(&mut self, value: Option<f64>) {
-        self.top_p = value;
-        self.sync_compat_config();
-    }
-
-    fn set_use_tools(&mut self, value: Option<String>) {
-        self.use_tools = value;
         self.sync_compat_config();
     }
 }

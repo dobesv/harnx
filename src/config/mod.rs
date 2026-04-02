@@ -4,10 +4,9 @@ mod role;
 mod session;
 
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
+pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
-pub use self::role::{
-    Role, RoleLike, CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE,
-};
+pub use self::role::{Role, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE};
 use self::session::Session;
 
 use crate::client::{
@@ -43,7 +42,6 @@ use std::{
 use syntect::highlighting::ThemeSet;
 use terminal_colorsaurus::{color_scheme, ColorScheme, QueryOptions};
 
-pub const TEMP_ROLE_NAME: &str = "%%";
 pub const TEMP_RAG_NAME: &str = "temp";
 pub const TEMP_SESSION_NAME: &str = "temp";
 
@@ -52,7 +50,6 @@ const DARK_THEME: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bi
 const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.theme.bin");
 
 const CONFIG_FILE_NAME: &str = "config.yaml";
-const ROLES_DIR_NAME: &str = "roles";
 const MACROS_DIR_NAME: &str = "macros";
 const ENV_FILE_NAME: &str = ".env";
 const MESSAGES_FILE_NAME: &str = "messages.md";
@@ -93,7 +90,7 @@ __CONTEXT__
 __INPUT__
 </user_query>"#;
 
-const LEFT_PROMPT: &str = "{color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} ";
+const LEFT_PROMPT: &str = "{color.green}{?session {?agent {agent}>}{session}{?agent /}}{!session {?agent {agent}>}}{agent}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} ";
 const RIGHT_PROMPT: &str = "{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}";
 
 static EDITOR: OnceLock<Option<String>> = OnceLock::new();
@@ -221,8 +218,6 @@ pub struct Config {
     pub last_message: Option<LastMessage>,
 
     #[serde(skip)]
-    pub role: Option<Role>,
-    #[serde(skip)]
     pub session: Option<Session>,
     #[serde(skip)]
     pub rag: Option<Arc<Rag>>,
@@ -293,7 +288,6 @@ impl Default for Config {
             working_mode: WorkingMode::Cmd,
             last_message: None,
 
-            role: None,
             session: None,
             rag: None,
             agent: None,
@@ -382,17 +376,6 @@ impl Config {
             Ok(value) => PathBuf::from(value),
             Err(_) => Self::local_path(CONFIG_FILE_NAME),
         }
-    }
-
-    pub fn roles_dir() -> PathBuf {
-        match env::var(get_env_name("roles_dir")) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::local_path(ROLES_DIR_NAME),
-        }
-    }
-
-    pub fn role_file(name: &str) -> PathBuf {
-        Self::roles_dir().join(format!("{name}.md"))
     }
 
     pub fn macros_dir() -> PathBuf {
@@ -491,6 +474,10 @@ impl Config {
         Self::agent_data_dir(agent_name).join(format!("{rag_name}.yaml"))
     }
 
+    pub fn agent_file(name: &str) -> PathBuf {
+        Self::agents_data_dir().join(format!("{name}.md"))
+    }
+
     pub fn agents_tools_dir() -> PathBuf {
         Self::tools_dir().join(AGENTS_DIR_NAME)
     }
@@ -514,11 +501,9 @@ impl Config {
             } else {
                 flags |= StateFlags::SESSION;
             }
-            if session.role_name().is_some() {
-                flags |= StateFlags::ROLE;
+            if session.agent_name().is_some() {
+                flags |= StateFlags::AGENT;
             }
-        } else if self.role.is_some() {
-            flags |= StateFlags::ROLE;
         }
         if self.agent.is_some() {
             flags |= StateFlags::AGENT;
@@ -580,41 +565,23 @@ impl Config {
             session.model()
         } else if let Some(agent) = self.agent.as_ref() {
             agent.model()
-        } else if let Some(role) = self.role.as_ref() {
-            role.model()
         } else {
             &self.model
         }
     }
 
-    pub fn role_like_mut(&mut self) -> Option<&mut dyn RoleLike> {
-        if let Some(session) = self.session.as_mut() {
-            Some(session)
-        } else if let Some(agent) = self.agent.as_mut() {
-            Some(agent)
-        } else if let Some(role) = self.role.as_mut() {
-            Some(role)
-        } else {
-            None
-        }
-    }
-
-    pub fn extract_role(&self) -> Role {
+    pub fn extract_agent(&self) -> Agent {
         if let Some(session) = self.session.as_ref() {
-            session.to_role()
+            session.to_agent()
         } else if let Some(agent) = self.agent.as_ref() {
-            agent.to_role()
-        } else if let Some(role) = self.role.as_ref() {
-            role.clone()
+            agent.clone()
         } else {
-            let mut role = Role::default();
-            role.batch_set(
-                &self.model,
-                self.temperature,
-                self.top_p,
-                self.use_tools.clone(),
-            );
-            role
+            let mut agent = Agent::from_prompt("");
+            agent.set_model(self.model.clone());
+            agent.set_temperature(self.temperature);
+            agent.set_top_p(self.top_p);
+            agent.set_use_tools(self.use_tools.clone());
+            agent
         }
     }
 
@@ -644,8 +611,6 @@ impl Config {
             }
         } else if let Some(session) = &self.session {
             session.export()
-        } else if let Some(role) = &self.role {
-            Ok(role.export())
         } else if let Some(rag) = &self.rag {
             rag.export()
         } else {
@@ -663,15 +628,15 @@ impl Config {
             Some(rag) => rag.get_config(),
             None => (self.rag_reranker_model.clone(), self.rag_top_k),
         };
-        let role = self.extract_role();
+        let agent = self.extract_agent();
         let mut items = vec![
-            ("model", role.model().id()),
-            ("temperature", format_option_value(&role.temperature())),
-            ("top_p", format_option_value(&role.top_p())),
-            ("use_tools", format_option_value(&role.use_tools())),
+            ("model", agent.model().id()),
+            ("temperature", format_option_value(&agent.temperature())),
+            ("top_p", format_option_value(&agent.top_p())),
+            ("use_tools", format_option_value(&agent.use_tools())),
             (
                 "max_output_tokens",
-                role.model()
+                agent.model()
                     .max_tokens_param()
                     .map(|v| format!("{v} (current model)"))
                     .unwrap_or_else(|| "null".into()),
@@ -694,7 +659,6 @@ impl Config {
             ("theme", format_option_value(&self.theme)),
             ("config_file", display_path(&Self::config_file())),
             ("env_file", display_path(&Self::env_file())),
-            ("roles_dir", display_path(&Self::roles_dir())),
             ("sessions_dir", display_path(&self.sessions_dir())),
             ("rags_dir", display_path(&Self::rags_dir())),
             ("macros_dir", display_path(&Self::macros_dir())),
@@ -785,7 +749,7 @@ impl Config {
 
     pub fn delete(config: &GlobalConfig, kind: &str) -> Result<()> {
         let (dir, file_ext) = match kind {
-            "role" => (Self::roles_dir(), Some(".md")),
+            "agent" => (Self::agents_data_dir(), Some(".md")),
             "session" => (config.read().sessions_dir(), Some(".yaml")),
             "rag" => (Self::rags_dir(), Some(".yaml")),
             "macro" => (Self::macros_dir(), Some(".yaml")),
@@ -853,29 +817,38 @@ impl Config {
     }
 
     pub fn set_temperature(&mut self, value: Option<f64>) {
-        match self.role_like_mut() {
-            Some(role_like) => role_like.set_temperature(value),
-            None => self.temperature = value,
+        if let Some(session) = self.session.as_mut() {
+            session.set_temperature(value);
+        } else if let Some(agent) = self.agent.as_mut() {
+            agent.set_temperature(value);
+        } else {
+            self.temperature = value;
         }
     }
 
     pub fn set_top_p(&mut self, value: Option<f64>) {
-        match self.role_like_mut() {
-            Some(role_like) => role_like.set_top_p(value),
-            None => self.top_p = value,
+        if let Some(session) = self.session.as_mut() {
+            session.set_top_p(value);
+        } else if let Some(agent) = self.agent.as_mut() {
+            agent.set_top_p(value);
+        } else {
+            self.top_p = value;
         }
     }
 
     pub fn set_use_tools(&mut self, value: Option<String>) {
-        match self.role_like_mut() {
-            Some(role_like) => role_like.set_use_tools(value),
-            None => self.use_tools = value,
+        if let Some(session) = self.session.as_mut() {
+            session.set_use_tools(value);
+        } else if let Some(agent) = self.agent.as_mut() {
+            agent.set_use_tools(value);
+        } else {
+            self.use_tools = value;
         }
     }
 
     pub fn active_tool_names(&self) -> HashSet<String> {
-        let role = self.extract_role();
-        let use_tools = match role.use_tools() {
+        let agent = self.extract_agent();
+        let use_tools = match agent.use_tools() {
             Some(v) => v,
             None => return HashSet::new(),
         };
@@ -971,176 +944,191 @@ impl Config {
     }
 
     pub fn set_max_output_tokens(&mut self, value: Option<isize>) {
-        match self.role_like_mut() {
-            Some(role_like) => {
-                let mut model = role_like.model().clone();
-                model.set_max_tokens(value, true);
-                role_like.set_model(model);
-            }
-            None => {
-                self.model.set_max_tokens(value, true);
-            }
+        if let Some(session) = self.session.as_mut() {
+            let mut model = session.model().clone();
+            model.set_max_tokens(value, true);
+            session.set_model(model);
+        } else if let Some(agent) = self.agent.as_mut() {
+            let mut model = agent.model().clone();
+            model.set_max_tokens(value, true);
+            agent.set_model(model);
+        } else {
+            self.model.set_max_tokens(value, true);
         };
     }
 
     pub fn set_model(&mut self, model_id: &str) -> Result<()> {
         let model = Model::retrieve_model(self, model_id, ModelType::Chat)?;
-        match self.role_like_mut() {
-            Some(role_like) => role_like.set_model(model),
-            None => {
-                self.model = model;
-            }
+        if let Some(session) = self.session.as_mut() {
+            session.set_model(model);
+        } else if let Some(agent) = self.agent.as_mut() {
+            agent.set_model(model);
+        } else {
+            self.model = model;
         }
         Ok(())
     }
 
     pub fn use_prompt(&mut self, prompt: &str) -> Result<()> {
-        let mut role = Role::new(TEMP_ROLE_NAME, prompt);
-        role.set_model(self.current_model().clone());
-        self.use_role_obj(role)
-    }
-
-    pub fn use_role(&mut self, name: &str) -> Result<()> {
-        let role = self.retrieve_role(name)?;
-        self.use_role_obj(role)
-    }
-
-    pub fn use_role_obj(&mut self, role: Role) -> Result<()> {
-        if self.agent.is_some() {
-            bail!("Cannot perform this operation because you are using a agent")
+        let mut agent = Agent::from_prompt(prompt);
+        agent.set_model(self.current_model().clone());
+        if agent.temperature().is_none() {
+            agent.set_temperature(self.temperature);
         }
-        if let Some(session) = self.session.as_mut() {
-            session.guard_empty()?;
-            session.set_role(role);
-        } else {
-            self.role = Some(role);
+        if agent.top_p().is_none() {
+            agent.set_top_p(self.top_p);
         }
-        Ok(())
+        if agent.use_tools().is_none() {
+            agent.set_use_tools(self.use_tools.clone());
+        }
+        self.use_agent_obj(agent)
     }
 
-    pub fn role_info(&self) -> Result<String> {
-        if let Some(session) = &self.session {
-            if session.role_name().is_some() {
-                let role = session.to_role();
-                Ok(role.export())
-            } else {
-                bail!("No session role")
-            }
-        } else if let Some(role) = &self.role {
-            Ok(role.export())
-        } else {
-            bail!("No role")
-        }
-    }
-
-    pub fn exit_role(&mut self) -> Result<()> {
-        if let Some(session) = self.session.as_mut() {
-            session.guard_empty()?;
-            session.clear_role();
-        } else if self.role.is_some() {
-            self.role = None;
-        }
-        Ok(())
-    }
-
-    pub fn retrieve_role(&self, name: &str) -> Result<Role> {
-        let names = Self::list_roles(false);
-        let mut role = if names.contains(&name.to_string()) {
-            let path = Self::role_file(name);
+    pub fn retrieve_agent(&self, name: &str) -> Result<Agent> {
+        let path = Self::agent_file(name);
+        let mut agent = if path.exists() {
+            Agent::load(&path)?
+        } else if let Ok(path) = Self::legacy_role_file(name) {
             let content = read_to_string(&path)?;
-            Role::new(name, &content)
+            Agent::from_markdown(name, &content)
         } else {
-            Role::builtin(name)?
+            match Role::builtin(name) {
+                Ok(role) => Agent::from_markdown(name, &role.export()),
+                Err(_) => Agent::builtin(name)?,
+            }
         };
         let current_model = self.current_model().clone();
-        match role.model_id() {
+        match agent.config().model_id.as_deref() {
             Some(model_id) => {
                 if current_model.id() != model_id {
                     let model = Model::retrieve_model(self, model_id, ModelType::Chat)?;
-                    role.set_model(model);
+                    agent.set_model(model);
                 } else {
-                    role.set_model(current_model);
+                    agent.set_model(current_model);
                 }
             }
             None => {
-                role.set_model(current_model);
-                if role.temperature().is_none() {
-                    role.set_temperature(self.temperature);
+                agent.set_model(current_model);
+                if agent.temperature().is_none() {
+                    agent.set_temperature(self.temperature);
                 }
-                if role.top_p().is_none() {
-                    role.set_top_p(self.top_p);
+                if agent.top_p().is_none() {
+                    agent.set_top_p(self.top_p);
+                }
+                if agent.use_tools().is_none() {
+                    agent.set_use_tools(self.use_tools.clone());
                 }
             }
         }
-        Ok(role)
+        Ok(agent)
     }
 
-    pub fn new_role(&mut self, name: &str) -> Result<()> {
-        if self.macro_flag {
-            bail!("No role");
-        }
-        let ans = Confirm::new("Create a new role?")
-            .with_default(true)
-            .prompt()?;
-        if ans {
-            self.upsert_role(name)?;
+    pub fn use_agent_by_name(&mut self, name: &str) -> Result<()> {
+        let agent = self.retrieve_agent(name)?;
+        self.use_agent_obj(agent)
+    }
+
+    pub fn use_agent_obj(&mut self, agent: Agent) -> Result<()> {
+        if let Some(session) = self.session.as_mut() {
+            session.guard_empty()?;
+            session.set_agent(&agent);
         } else {
-            bail!("No role");
+            self.agent = Some(agent);
         }
         Ok(())
     }
 
-    pub fn edit_role(&mut self) -> Result<()> {
-        let role_name;
+    pub fn current_agent_info(&self) -> Result<String> {
+        if let Some(session) = &self.session {
+            if session.agent_name().is_some() {
+                let agent = session.to_agent();
+                Ok(agent.export()?)
+            } else {
+                bail!("No session agent")
+            }
+        } else if let Some(agent) = &self.agent {
+            Ok(agent.export()?)
+        } else {
+            bail!("No agent")
+        }
+    }
+
+    pub fn clear_agent_selection(&mut self) -> Result<()> {
+        if let Some(session) = self.session.as_mut() {
+            session.guard_empty()?;
+            session.clear_agent();
+        } else if self.agent.is_some() {
+            self.agent = None;
+        }
+        Ok(())
+    }
+
+    pub fn new_agent(&mut self, name: &str) -> Result<()> {
+        if self.macro_flag {
+            bail!("No agent");
+        }
+        let ans = Confirm::new("Create a new agent?")
+            .with_default(true)
+            .prompt()?;
+        if ans {
+            self.upsert_agent(name)?;
+        } else {
+            bail!("No agent");
+        }
+        Ok(())
+    }
+
+    pub fn edit_agent_prompt(&mut self) -> Result<()> {
+        let agent_name;
         if let Some(session) = self.session.as_ref() {
-            if let Some(name) = session.role_name().map(|v| v.to_string()) {
+            if let Some(name) = session.agent_name().map(|v| v.to_string()) {
                 if session.is_empty() {
-                    role_name = Some(name);
+                    agent_name = Some(name);
                 } else {
                     bail!("Cannot perform this operation because you are in a non-empty session")
                 }
             } else {
-                bail!("No role")
+                bail!("No agent")
             }
         } else {
-            role_name = self.role.as_ref().map(|v| v.name().to_string());
+            agent_name = self.agent.as_ref().map(|v| v.name().to_string());
         }
-        let name = role_name.ok_or_else(|| anyhow!("No role"))?;
-        self.upsert_role(&name)?;
-        self.use_role(&name)
+        let name = agent_name.ok_or_else(|| anyhow!("No agent"))?;
+        self.upsert_agent(&name)?;
+        self.use_agent_by_name(&name)
     }
 
-    pub fn upsert_role(&mut self, name: &str) -> Result<()> {
-        let role_path = Self::role_file(name);
-        ensure_parent_exists(&role_path)?;
+    pub fn upsert_agent(&mut self, name: &str) -> Result<()> {
+        let agent_path = Self::agent_file(name);
+        ensure_parent_exists(&agent_path)?;
         let editor = self.editor()?;
-        edit_file(&editor, &role_path)?;
+        edit_file(&editor, &agent_path)?;
         if self.working_mode.is_repl() {
-            println!("✓ Saved the role to '{}'.", role_path.display());
+            println!("✓ Saved the agent to '{}'.", agent_path.display());
         }
         Ok(())
     }
 
-    pub fn save_role(&mut self, name: Option<&str>) -> Result<()> {
-        let mut role_name = match &self.role {
-            Some(role) => {
-                if role.has_args() {
-                    bail!("Unable to save the role with arguments (whose name contains '#')")
+    pub fn save_agent(&mut self, name: Option<&str>) -> Result<()> {
+        let mut agent_name = match &self.agent {
+            Some(agent) => {
+                if agent.has_args() {
+                    bail!("Unable to save the agent with arguments (whose name contains '#')")
                 }
                 match name {
                     Some(v) => v.to_string(),
-                    None => role.name().to_string(),
+                    None => agent.name().to_string(),
                 }
             }
-            None => bail!("No role"),
+            None => bail!("No agent"),
         };
-        if role_name == TEMP_ROLE_NAME {
-            role_name = Text::new("Role name:")
+        if agent_name == TEMP_AGENT_NAME {
+            agent_name = Text::new("Agent name:")
                 .with_validator(|input: &str| {
                     let input = input.trim();
                     if input.is_empty() {
                         Ok(Validation::Invalid("This name is required".into()))
-                    } else if input == TEMP_ROLE_NAME {
+                    } else if input == TEMP_AGENT_NAME {
                         Ok(Validation::Invalid("This name is reserved".into()))
                     } else {
                         Ok(Validation::Valid)
@@ -1148,55 +1136,66 @@ impl Config {
                 })
                 .prompt()?;
         }
-        let role_path = Self::role_file(&role_name);
-        if let Some(role) = self.role.as_mut() {
-            role.save(&role_name, &role_path, self.working_mode.is_repl())?;
+        let agent_path = Self::agent_file(&agent_name);
+        if let Some(agent) = self.agent.as_mut() {
+            let content = agent.export()?;
+            ensure_parent_exists(&agent_path)?;
+            std::fs::write(&agent_path, content).with_context(|| {
+                format!("Failed to write agent '{}' to '{}'", agent.name(), agent_path.display())
+            })?;
+            if self.working_mode.is_repl() {
+                println!("✓ Saved the agent to '{}'.", agent_path.display());
+            }
         }
 
         Ok(())
     }
 
-    pub fn all_roles() -> Vec<Role> {
-        let mut roles: HashMap<String, Role> = Role::list_builtin_roles()
-            .iter()
-            .map(|v| (v.name().to_string(), v.clone()))
-            .collect();
-        let names = Self::list_roles(false);
-        for name in names {
-            if let Ok(content) = read_to_string(Self::role_file(&name)) {
-                let role = Role::new(&name, &content);
-                roles.insert(name, role);
-            }
-        }
-        let mut roles: Vec<_> = roles.into_values().collect();
-        roles.sort_unstable_by(|a, b| a.name().cmp(b.name()));
-        roles
+    pub fn has_agent(name: &str) -> bool {
+        let names = list_agents();
+        names.contains(&name.to_string())
     }
 
-    pub fn list_roles(with_builtin: bool) -> Vec<String> {
-        let mut names = HashSet::new();
-        if let Ok(rd) = read_dir(Self::roles_dir()) {
-            for entry in rd.flatten() {
-                if let Some(name) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|v| v.strip_suffix(".md"))
-                {
-                    names.insert(name.to_string());
+    pub fn all_agents() -> Vec<Agent> {
+        let mut agents: HashMap<String, Agent> = HashMap::new();
+        for name in list_agents() {
+            let path = Self::agent_file(&name);
+            if let Ok(agent) = Agent::load(&path) {
+                agents.insert(name, agent);
+            }
+        }
+        let legacy_roles_dir = Self::local_path("roles");
+        if let Ok(entries) = read_dir(legacy_roles_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let (Some("md"), Some(name)) = (
+                    path.extension().and_then(|value| value.to_str()),
+                    path.file_stem().and_then(|value| value.to_str()),
+                ) {
+                    if let Ok(content) = read_to_string(&path) {
+                        agents.insert(name.to_string(), Agent::from_markdown(name, &content));
+                    }
                 }
             }
         }
-        if with_builtin {
-            names.extend(Role::list_builtin_role_names());
+        for role in Role::list_builtin_roles() {
+            agents.insert(
+                role.name().to_string(),
+                Agent::from_markdown(role.name(), &role.export()),
+            );
         }
-        let mut names: Vec<_> = names.into_iter().collect();
-        names.sort_unstable();
-        names
+        let mut agents: Vec<_> = agents.into_values().collect();
+        agents.sort_unstable_by(|a, b| a.name().cmp(b.name()));
+        agents
     }
 
-    pub fn has_role(name: &str) -> bool {
-        let names = Self::list_roles(true);
-        names.contains(&name.to_string())
+    fn legacy_role_file(name: &str) -> Result<PathBuf> {
+        let path = Self::local_path("roles").join(format!("{name}.md"));
+        if path.exists() {
+            Ok(path)
+        } else {
+            bail!("Unknown agent '{name}'")
+        }
     }
 
     pub fn use_session(&mut self, session_name: Option<&str>) -> Result<()> {
@@ -1457,8 +1456,8 @@ impl Config {
             Some(v) => v,
             None => bail!("No chat history"),
         };
-        let role = config.read().retrieve_role(CREATE_TITLE_ROLE)?;
-        let input = Input::from_str(config, &text, Some(role));
+        let agent = config.read().retrieve_agent(CREATE_TITLE_AGENT)?;
+        let input = Input::from_str(config, &text, Some(agent));
         let text = input.fetch_chat_text().await?;
         if let Some(session) = config.write().session.as_mut() {
             session.set_autoname(&text);
@@ -1759,15 +1758,15 @@ impl Config {
         let err_msg = || format!("Invalid default session '{default_session}'");
         match default_session.split_once(':') {
             Some(("role", name)) => {
-                self.use_role(name).with_context(err_msg)?;
+                self.use_agent_by_name(name).with_context(err_msg)?;
             }
             Some(("session", name)) => {
                 self.use_session(Some(name)).with_context(err_msg)?;
             }
-            Some((session_name, role_name)) => {
+            Some((session_name, agent_name)) => {
                 self.use_session(Some(session_name)).with_context(err_msg)?;
                 if let Some(true) = self.session.as_ref().map(|v| v.is_empty()) {
-                    self.use_role(role_name).with_context(err_msg)?;
+                    self.use_agent_by_name(agent_name).with_context(err_msg)?;
                 }
             }
             _ => {
@@ -1777,10 +1776,10 @@ impl Config {
         Ok(())
     }
 
-    pub fn select_tools(&self, role: &Role) -> Option<Vec<ToolDeclaration>> {
+    pub fn select_tools(&self, agent: &Agent) -> Option<Vec<ToolDeclaration>> {
         let mut functions = vec![];
         if self.tool_use {
-            if let Some(use_tools) = role.use_tools() {
+            if let Some(use_tools) = agent.use_tools() {
                 let declarations = self.tool_declarations_for_use_tools(Some(&use_tools));
                 let mut tool_names: HashSet<String> = Default::default();
                 let declaration_names: HashSet<String> =
@@ -1876,7 +1875,7 @@ impl Config {
         let filter = args.last().unwrap_or(&"");
         if args.len() == 1 {
             values = match cmd {
-                ".role" => map_completion_values(Self::list_roles(true)),
+                ".role" => map_completion_values(list_agents()),
                 ".model" => list_models(self, ModelType::Chat)
                     .into_iter()
                     .map(|v| (v.id(), Some(v.description())))
@@ -1941,7 +1940,7 @@ impl Config {
                         .collect()
                 }
                 ".delete" => {
-                    map_completion_values(vec!["role", "session", "rag", "macro", "agent-data"])
+                    map_completion_values(vec!["agent", "session", "rag", "macro", "agent-data"])
                 }
                 _ => vec![],
             };
@@ -2013,8 +2012,8 @@ impl Config {
                 .map(|v| (v, None))
                 .collect();
         } else if cmd == ".drop" && args.len() == 2 && args[0] == "tool" {
-            let role = self.extract_role();
-            let current = role.use_tools().unwrap_or_default();
+            let agent = self.extract_agent();
+            let current = agent.use_tools().unwrap_or_default();
             values = current
                 .split(',')
                 .map(str::trim)
@@ -2148,23 +2147,23 @@ impl Config {
 
     fn generate_prompt_context(&self) -> HashMap<&str, String> {
         let mut output = HashMap::new();
-        let role = self.extract_role();
-        output.insert("model", role.model().id());
-        output.insert("client_name", role.model().client_name().to_string());
-        output.insert("model_name", role.model().name().to_string());
+        let agent = self.extract_agent();
+        output.insert("model", agent.model().id());
+        output.insert("client_name", agent.model().client_name().to_string());
+        output.insert("model_name", agent.model().name().to_string());
         output.insert(
             "max_input_tokens",
-            role.model()
+            agent.model()
                 .max_input_tokens()
                 .unwrap_or_default()
                 .to_string(),
         );
-        if let Some(temperature) = role.temperature() {
+        if let Some(temperature) = agent.temperature() {
             if temperature != 0.0 {
                 output.insert("temperature", temperature.to_string());
             }
         }
-        if let Some(top_p) = role.top_p() {
+        if let Some(top_p) = agent.top_p() {
             if top_p != 0.0 {
                 output.insert("top_p", top_p.to_string());
             }
@@ -2183,8 +2182,8 @@ impl Config {
                 output.insert("wrap", wrap.clone());
             }
         }
-        if !role.is_derived() {
-            output.insert("role", role.name().to_string());
+        if agent.name() != TEMP_AGENT_NAME {
+            output.insert("agent", agent.name().to_string());
         }
         if let Some(session) = &self.session {
             output.insert("session", session.name().to_string());
@@ -2275,14 +2274,14 @@ impl Config {
         let summary = input.summary();
         let raw_input = input.raw();
         let scope = if self.agent.is_none() {
-            let role_name = if input.role().is_derived() {
-                None
-            } else {
-                Some(input.role().name())
+            let agent_name = match input.agent().name() {
+                TEMP_AGENT_NAME => None,
+                "" => None,
+                name => Some(name),
             };
-            match (role_name, input.rag_name()) {
-                (Some(role), Some(rag_name)) => format!(" ({role}#{rag_name})"),
-                (Some(role), _) => format!(" ({role})"),
+            match (agent_name, input.rag_name()) {
+                (Some(agent), Some(rag_name)) => format!(" ({agent}#{rag_name})"),
+                (Some(agent), _) => format!(" ({agent})"),
                 (None, Some(rag_name)) => format!(" (#{rag_name})"),
                 _ => String::new(),
             }
@@ -2775,14 +2774,13 @@ pub async fn macro_execute(
     let variables = macro_value
         .resolve_variables(&new_args)
         .map_err(|err| anyhow!("{err}. Usage: {}", macro_value.usage(name)))?;
-    let role = config.read().extract_role();
+    let agent = config.read().extract_agent();
     let mut config = config.read().clone();
-    config.temperature = role.temperature();
-    config.top_p = role.top_p();
-    config.use_tools = role.use_tools().clone();
+    config.temperature = agent.temperature();
+    config.top_p = agent.top_p();
+    config.use_tools = agent.use_tools();
     config.macro_flag = true;
-    config.model = role.model().clone();
-    config.role = None;
+    config.model = agent.model().clone();
     config.session = None;
     config.rag = None;
     config.agent = None;
@@ -2900,11 +2898,10 @@ impl LastMessage {
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct StateFlags: u32 {
-        const ROLE = 1 << 0;
-        const SESSION_EMPTY = 1 << 1;
-        const SESSION = 1 << 2;
-        const RAG = 1 << 3;
-        const AGENT = 1 << 4;
+        const SESSION_EMPTY = 1 << 0;
+        const SESSION = 1 << 1;
+        const RAG = 1 << 2;
+        const AGENT = 1 << 3;
     }
 }
 

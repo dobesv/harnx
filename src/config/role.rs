@@ -12,8 +12,6 @@ use std::sync::LazyLock;
 pub const SHELL_ROLE: &str = "%shell%";
 pub const EXPLAIN_SHELL_ROLE: &str = "%explain-shell%";
 pub const CODE_ROLE: &str = "%code%";
-pub const CREATE_TITLE_ROLE: &str = "%create-title%";
-
 pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
 
 #[derive(Embed)]
@@ -22,18 +20,6 @@ struct RolesAsset;
 
 static RE_METADATA: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap());
-
-pub trait RoleLike {
-    fn to_role(&self) -> Role;
-    fn model(&self) -> &Model;
-    fn temperature(&self) -> Option<f64>;
-    fn top_p(&self) -> Option<f64>;
-    fn use_tools(&self) -> Option<String>;
-    fn set_model(&mut self, model: Model);
-    fn set_temperature(&mut self, value: Option<f64>);
-    fn set_top_p(&mut self, value: Option<f64>);
-    fn set_use_tools(&mut self, value: Option<String>);
-}
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Role {
@@ -160,14 +146,6 @@ impl Role {
         Ok(())
     }
 
-    pub fn sync<T: RoleLike>(&mut self, role_like: &T) {
-        let model = role_like.model();
-        let temperature = role_like.temperature();
-        let top_p = role_like.top_p();
-        let use_tools = role_like.use_tools();
-        self.batch_set(model, temperature, top_p, use_tools);
-    }
-
     pub fn batch_set(
         &mut self,
         model: &Model,
@@ -199,6 +177,22 @@ impl Role {
         self.model_id.as_deref()
     }
 
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    pub fn temperature(&self) -> Option<f64> {
+        self.temperature
+    }
+
+    pub fn top_p(&self) -> Option<f64> {
+        self.top_p
+    }
+
+    pub fn use_tools(&self) -> Option<String> {
+        self.use_tools.clone()
+    }
+
     pub fn prompt(&self) -> &str {
         &self.prompt
     }
@@ -209,6 +203,25 @@ impl Role {
 
     pub fn is_embedded_prompt(&self) -> bool {
         self.prompt.contains(INPUT_PLACEHOLDER)
+    }
+
+    pub fn set_model(&mut self, model: Model) {
+        if !self.model().id().is_empty() {
+            self.model_id = Some(model.id().to_string());
+        }
+        self.model = model;
+    }
+
+    pub fn set_temperature(&mut self, value: Option<f64>) {
+        self.temperature = value;
+    }
+
+    pub fn set_top_p(&mut self, value: Option<f64>) {
+        self.top_p = value;
+    }
+
+    pub fn set_use_tools(&mut self, value: Option<String>) {
+        self.use_tools = value;
     }
 
     pub fn echo_messages(&self, input: &Input) -> String {
@@ -256,47 +269,6 @@ impl Role {
             ));
         }
         messages
-    }
-}
-
-impl RoleLike for Role {
-    fn to_role(&self) -> Role {
-        self.clone()
-    }
-
-    fn model(&self) -> &Model {
-        &self.model
-    }
-
-    fn temperature(&self) -> Option<f64> {
-        self.temperature
-    }
-
-    fn top_p(&self) -> Option<f64> {
-        self.top_p
-    }
-
-    fn use_tools(&self) -> Option<String> {
-        self.use_tools.clone()
-    }
-
-    fn set_model(&mut self, model: Model) {
-        if !self.model().id().is_empty() {
-            self.model_id = Some(model.id().to_string());
-        }
-        self.model = model;
-    }
-
-    fn set_temperature(&mut self, value: Option<f64>) {
-        self.temperature = value;
-    }
-
-    fn set_top_p(&mut self, value: Option<f64>) {
-        self.top_p = value;
-    }
-
-    fn set_use_tools(&mut self, value: Option<String>) {
-        self.use_tools = value;
     }
 }
 

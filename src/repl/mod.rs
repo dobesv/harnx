@@ -8,7 +8,7 @@ use self::prompt::ReplPrompt;
 
 use crate::client::{call_chat_completions, call_chat_completions_streaming};
 use crate::config::{
-    macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage, RoleLike,
+    macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage,
     StateFlags,
 };
 use crate::hooks::{
@@ -74,25 +74,25 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 40]> = LazyLock::new(|| {
         ReplCommand::new(
             ".info role",
             "Show role info",
-            AssertState::True(StateFlags::ROLE),
+            AssertState::True(StateFlags::AGENT),
         ),
         ReplCommand::new(
             ".edit role",
             "Modify current role",
-            AssertState::TrueFalse(StateFlags::ROLE, StateFlags::SESSION),
+            AssertState::TrueFalse(StateFlags::AGENT, StateFlags::SESSION),
         ),
         ReplCommand::new(
             ".save role",
             "Save current role to file",
             AssertState::TrueFalse(
-                StateFlags::ROLE,
+                StateFlags::AGENT,
                 StateFlags::SESSION_EMPTY | StateFlags::SESSION,
             ),
         ),
         ReplCommand::new(
             ".exit role",
             "Exit active role",
-            AssertState::TrueFalse(StateFlags::ROLE, StateFlags::SESSION),
+            AssertState::TrueFalse(StateFlags::AGENT, StateFlags::SESSION),
         ),
         ReplCommand::new(
             ".session",
@@ -476,7 +476,7 @@ pub async fn run_repl_command(
             }
             ".info" => match args {
                 Some("role") => {
-                    let info = config.read().role_info()?;
+                    let info = config.read().current_agent_info()?;
                     print!("{info}");
                 }
                 Some("session") => {
@@ -534,8 +534,8 @@ pub async fn run_repl_command(
             ".role" => match args {
                 Some(args) => match args.split_once(['\n', ' ']) {
                     Some((name, text)) => {
-                        let role = config.read().retrieve_role(name.trim())?;
-                        let input = Input::from_str(config, text, Some(role));
+                        let agent = config.read().retrieve_agent(name.trim())?;
+                        let input = Input::from_str(config, text, Some(agent));
                         ask(
                             config,
                             abort_signal.clone(),
@@ -550,10 +550,10 @@ pub async fn run_repl_command(
                     }
                     None => {
                         let name = args;
-                        if !Config::has_role(name) {
-                            config.write().new_role(name)?;
+                        if !Config::has_agent(name) {
+                            config.write().new_agent(name)?;
                         }
-                        config.write().use_role(name)?;
+                        config.write().use_agent_by_name(name)?;
                     }
                 },
                 None => println!(
@@ -636,7 +636,7 @@ pub async fn run_repl_command(
             },
             ".save" => match split_first_arg(args) {
                 Some(("role", name)) => {
-                    config.write().save_role(name)?;
+                    config.write().save_agent(name)?;
                 }
                 Some(("session", name)) => {
                     config.write().save_session(name)?;
@@ -654,7 +654,7 @@ pub async fn run_repl_command(
                         config.read().edit_config()?;
                     }
                     Some("role") => {
-                        config.write().edit_role()?;
+                        config.write().edit_agent_prompt()?;
                     }
                     Some("session") => {
                         config.write().edit_session()?;
@@ -922,7 +922,7 @@ Commands:
                             println!("Usage: .use tool <name>  (tool name, toolset name, or <server>:all)");
                         } else {
                             let mut conf = config.write();
-                            let current = conf.extract_role().use_tools().unwrap_or_default();
+                            let current = conf.extract_agent().use_tools().unwrap_or_default();
                             let items: Vec<&str> = if current.is_empty() {
                                 vec![]
                             } else {
@@ -949,7 +949,7 @@ Commands:
                         println!("Usage: .drop tool <name>");
                     } else {
                         let mut conf = config.write();
-                        let current = conf.extract_role().use_tools().unwrap_or_default();
+                        let current = conf.extract_agent().use_tools().unwrap_or_default();
                         let items: Vec<&str> = current
                             .split(',')
                             .map(str::trim)
@@ -985,7 +985,7 @@ Commands:
                     Config::delete(config, args)?;
                 }
                 _ => {
-                    println!("Usage: .delete <role|session|rag|macro|agent-data>")
+                    println!("Usage: .delete <agent|session|rag|macro|agent-data>")
                 }
             },
             ".copy" => {
@@ -1003,7 +1003,7 @@ Commands:
             }
             ".exit" => match args {
                 Some("role") => {
-                    config.write().exit_role()?;
+                    config.write().clear_agent_selection()?;
                 }
                 Some("session") => {
                     if config.read().agent.is_some() {

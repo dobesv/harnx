@@ -67,7 +67,7 @@ pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
 struct Server {
     config: Config,
     models: Vec<Value>,
-    roles: Vec<Role>,
+    roles: Vec<Agent>,
     rags: Vec<String>,
 }
 
@@ -101,7 +101,7 @@ impl Server {
         Self {
             config,
             models,
-            roles: Config::all_roles(),
+            roles: Config::all_agents(),
             rags: Config::list_rags(),
         }
     }
