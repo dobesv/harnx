@@ -724,11 +724,8 @@ mod tests {
 
     fn make_agent_with_tools(prompt: &str, tools: Vec<crate::tool::ToolDeclaration>) -> Agent {
         let mut agent = Agent::from_markdown("test", prompt);
-        agent.tools = crate::tool::Tools::init_from_mcp(if tools.is_empty() {
-            None
-        } else {
-            Some(tools)
-        });
+        agent.tools =
+            crate::tool::Tools::init_from_mcp(if tools.is_empty() { None } else { Some(tools) });
         agent
     }
 
