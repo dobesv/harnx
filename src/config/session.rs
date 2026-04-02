@@ -32,7 +32,7 @@ pub struct Session {
     compress_threshold: Option<usize>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    role_name: Option<String>,
+    agent_name: Option<String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     agent_variables: AgentVariables,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -47,7 +47,7 @@ pub struct Session {
     #[serde(skip)]
     model: Model,
     #[serde(skip)]
-    role_prompt: String,
+    agent_prompt: String,
     #[serde(skip)]
     name: String,
     #[serde(skip)]
@@ -66,13 +66,13 @@ pub struct Session {
 
 impl Session {
     pub fn new(config: &Config, name: &str) -> Self {
-        let role = config.extract_role();
+        let agent = config.extract_agent();
         let mut session = Self {
             name: name.to_string(),
             save_session: config.save_session,
             ..Default::default()
         };
-        session.set_role(role);
+        session.set_agent(&agent);
         session.dirty = false;
         session
     }
@@ -96,9 +96,10 @@ impl Session {
             session.path = Some(path.display().to_string());
         }
 
-        if let Some(role_name) = &session.role_name {
-            if let Ok(role) = config.retrieve_role(role_name) {
-                session.role_prompt = role.prompt().to_string();
+        session.agent_prompt = session.agent_instructions.clone();
+        if let Some(agent_name) = &session.agent_name {
+            if let Ok(agent) = config.retrieve_agent(agent_name) {
+                session.agent_prompt = agent.interpolated_instructions();
             }
         }
 
@@ -115,8 +116,8 @@ impl Session {
         &self.name
     }
 
-    pub fn role_name(&self) -> Option<&str> {
-        self.role_name.as_deref()
+    pub fn agent_name(&self) -> Option<&str> {
+        self.agent_name.as_deref()
     }
 
     pub fn dirty(&self) -> bool {
@@ -267,36 +268,29 @@ impl Session {
         (tokens, percent)
     }
 
-    pub fn set_role(&mut self, role: Role) {
-        self.model_id = role.model().id();
-        self.temperature = role.temperature();
-        self.top_p = role.top_p();
-        self.use_tools = role.use_tools();
-        self.model = role.model().clone();
-        self.role_name = convert_option_string(role.name());
-        self.role_prompt = role.prompt().to_string();
+    pub fn set_agent(&mut self, agent: &Agent) {
+        self.model_id = agent.model().id();
+        self.temperature = agent.temperature();
+        self.top_p = agent.top_p();
+        self.use_tools = agent.use_tools();
+        self.model = agent.model().clone();
+        self.agent_name = convert_option_string(agent.name());
+        self.agent_prompt = agent.interpolated_instructions();
+        self.agent_variables = agent.variables().clone();
+        self.agent_instructions = self.agent_prompt.clone();
         self.dirty = true;
         self.update_tokens();
     }
 
-    pub fn clear_role(&mut self) {
-        self.role_name = None;
-        self.role_prompt.clear();
-    }
-
     pub fn sync_agent(&mut self, agent: &Agent) {
-        self.role_name = None;
-        self.role_prompt = agent.interpolated_instructions();
+        self.agent_name = convert_option_string(agent.name());
+        self.agent_prompt = agent.interpolated_instructions();
         self.agent_variables = agent.variables().clone();
-        self.agent_instructions = self.role_prompt.clone();
+        self.agent_instructions = self.agent_prompt.clone();
     }
 
     pub fn agent_variables(&self) -> &AgentVariables {
         &self.agent_variables
-    }
-
-    pub fn agent_instructions(&self) -> &str {
-        &self.agent_instructions
     }
 
     pub fn set_save_session(&mut self, value: Option<bool>) {
@@ -486,7 +480,7 @@ impl Session {
                     let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
                     self.autoname = Some(AutoName::new_from_chat_history(chat_history));
                 }
-                self.messages.extend(input.role().build_messages(input));
+                self.messages.extend(input.agent().build_messages(input));
             } else {
                 self.messages
                     .push(Message::new(MessageRole::User, input.message_content()));
@@ -539,7 +533,7 @@ impl Session {
         let mut need_add_msg = true;
         let len = messages.len();
         if len == 0 {
-            messages = input.role().build_messages(input);
+            messages = input.agent().build_messages(input);
             need_add_msg = false;
         } else if len == 1 && self.compressed_messages.len() >= 2 {
             if let Some(index) = self
@@ -557,31 +551,40 @@ impl Session {
     }
 }
 
-impl RoleLike for Session {
-    fn to_role(&self) -> Role {
-        let role_name = self.role_name.as_deref().unwrap_or_default();
-        let mut role = Role::new(role_name, &self.role_prompt);
-        role.sync(self);
-        role
+impl Session {
+    pub fn to_agent(&self) -> Agent {
+        let agent_name = self.agent_name.as_deref().unwrap_or(TEMP_AGENT_NAME);
+        let prompt = if self.agent_prompt.is_empty() {
+            self.agent_instructions.as_str()
+        } else {
+            self.agent_prompt.as_str()
+        };
+        let mut agent = Agent::from_markdown(agent_name, prompt);
+        agent.set_model(self.model.clone());
+        agent.set_temperature(self.temperature);
+        agent.set_top_p(self.top_p);
+        agent.set_use_tools(self.use_tools.clone());
+        agent.set_shared_variables(self.agent_variables.clone());
+        agent
     }
 
-    fn model(&self) -> &Model {
+    pub fn model(&self) -> &Model {
         &self.model
     }
 
-    fn temperature(&self) -> Option<f64> {
+    pub fn temperature(&self) -> Option<f64> {
         self.temperature
     }
 
-    fn top_p(&self) -> Option<f64> {
+    pub fn top_p(&self) -> Option<f64> {
         self.top_p
     }
 
-    fn use_tools(&self) -> Option<String> {
+    pub fn use_tools(&self) -> Option<String> {
         self.use_tools.clone()
     }
 
-    fn set_model(&mut self, model: Model) {
+    pub fn set_model(&mut self, model: Model) {
         if self.model().id() != model.id() {
             self.model_id = model.id();
             self.model = model;
@@ -590,21 +593,21 @@ impl RoleLike for Session {
         }
     }
 
-    fn set_temperature(&mut self, value: Option<f64>) {
+    pub fn set_temperature(&mut self, value: Option<f64>) {
         if self.temperature != value {
             self.temperature = value;
             self.dirty = true;
         }
     }
 
-    fn set_top_p(&mut self, value: Option<f64>) {
+    pub fn set_top_p(&mut self, value: Option<f64>) {
         if self.top_p != value {
             self.top_p = value;
             self.dirty = true;
         }
     }
 
-    fn set_use_tools(&mut self, value: Option<String>) {
+    pub fn set_use_tools(&mut self, value: Option<String>) {
         if self.use_tools != value {
             self.use_tools = value;
             self.dirty = true;

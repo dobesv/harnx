@@ -142,13 +142,13 @@ mod tests {
 
     #[test]
     fn test_render() {
-        let prompt = "{?session {session}{?role /}}{role}{?session )}{!session >}";
+        let prompt = "{?session {session}{?agent /}}{agent}{?session )}{!session >}";
         assert_render!(prompt, [], ">");
-        assert_render!(prompt, [("role", "coder"),], "coder>");
+        assert_render!(prompt, [("agent", "coder"),], "coder>");
         assert_render!(prompt, [("session", "temp"),], "temp)");
         assert_render!(
             prompt,
-            [("session", "temp"), ("role", "coder"),],
+            [("session", "temp"), ("agent", "coder"),],
             "temp/coder)"
         );
     }

@@ -53,9 +53,9 @@ Visit [https://github.com/sigoden/llm-functions](https://github.com/sigoden/llm-
 
 ## Default Session
 
-These fields accept a session spec that automatically loads a role or session when entering a mode. The spec format is `role:<name>`, `session:<name>`, or `<session>:<role>` (load a session and apply a role if the session is empty).
+These fields accept a session spec that automatically loads a session or agent when entering a mode. The spec format is `agent:<name>`, `session:<name>`, or `<session>:<agent>` (load a session and apply an agent if the session is empty).
 
-- **repl_default_session**: Session spec applied when entering REPL mode (e.g. `role:code`, `session:default`, `temp:code`).
+- **repl_default_session**: Session spec applied when entering REPL mode (e.g. `agent:coder`, `session:default`, `temp:coder`).
 - **cmd_default_session**: Session spec applied when entering CMD mode.
 - **agent_default_session**: Session identifier used when starting an agent (e.g. `temp`, `default`).
 

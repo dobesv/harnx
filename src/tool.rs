@@ -1,24 +1,15 @@
 use crate::{
-    config::{Agent, Config, GlobalConfig},
+    config::GlobalConfig,
     hooks::{dispatch::dispatch_hooks, HookEvent, HookResultControl},
     utils::*,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::{Path, PathBuf},
-};
+use std::collections::HashSet;
 use tokio::runtime::Handle;
-
-#[cfg(windows)]
-const PATH_SEP: &str = ";";
-#[cfg(not(windows))]
-const PATH_SEP: &str = ":";
 
 pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Result<Vec<ToolResult>> {
     let mut output = vec![];
@@ -72,16 +63,7 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
             }
         }
 
-        let is_mcp = config
-            .read()
-            .mcp_manager
-            .as_ref()
-            .is_some_and(|m| m.has_tool(&call.name));
-        let eval_result = if is_mcp {
-            call.eval_mcp(config)
-        } else {
-            call.eval(config)
-        };
+        let eval_result = call.eval_mcp(config);
         match eval_result {
             Ok(mut result) => {
                 let post_event = HookEvent::PostToolUse {
@@ -147,59 +129,17 @@ impl ToolResult {
 #[derive(Debug, Clone, Default)]
 pub struct Tools {
     declarations: Vec<ToolDeclaration>,
-    mcp_declarations: Vec<ToolDeclaration>,
 }
 
 impl Tools {
-    pub fn init(declarations_path: &Path, mcp_tools: Option<Vec<ToolDeclaration>>) -> Result<Self> {
-        let declarations: Vec<ToolDeclaration> = if declarations_path.exists() {
-            let ctx = || {
-                format!(
-                    "Failed to load functions at {}",
-                    declarations_path.display()
-                )
-            };
-            let content = fs::read_to_string(declarations_path).with_context(ctx)?;
-            serde_json::from_str(&content).with_context(ctx)?
-        } else {
-            vec![]
-        };
-
-        Ok(Self {
-            declarations,
-            mcp_declarations: mcp_tools.unwrap_or_default(),
-        })
-    }
-
     pub fn init_from_mcp(mcp_tools: Option<Vec<ToolDeclaration>>) -> Self {
         Self {
-            declarations: vec![],
-            mcp_declarations: mcp_tools.unwrap_or_default(),
+            declarations: mcp_tools.unwrap_or_default(),
         }
     }
 
-    pub fn find(&self, name: &str) -> Option<&ToolDeclaration> {
-        self.declarations
-            .iter()
-            .chain(self.mcp_declarations.iter())
-            .find(|v| v.name == name)
-    }
-
-    pub fn contains(&self, name: &str) -> bool {
-        self.declarations.iter().any(|v| v.name == name)
-            || self.mcp_declarations.iter().any(|v| v.name == name)
-    }
-
     pub fn declarations(&self) -> Vec<ToolDeclaration> {
-        self.declarations
-            .iter()
-            .chain(self.mcp_declarations.iter())
-            .cloned()
-            .collect()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.declarations.is_empty() && self.mcp_declarations.is_empty()
+        self.declarations.clone()
     }
 }
 
@@ -208,8 +148,6 @@ pub struct ToolDeclaration {
     pub name: String,
     pub description: String,
     pub parameters: JsonSchema,
-    #[serde(skip_serializing, default)]
-    pub agent: bool,
     #[serde(skip, default)]
     pub mcp_tool_name: Option<String>,
 }
@@ -250,8 +188,6 @@ pub struct ToolCall {
     pub id: Option<String>,
 }
 
-type CallConfig = (String, String, Vec<String>, HashMap<String, String>);
-
 impl ToolCall {
     pub fn dedup(calls: Vec<Self>) -> Vec<Self> {
         let mut new_calls = vec![];
@@ -280,38 +216,6 @@ impl ToolCall {
         }
     }
 
-    pub fn eval(&self, config: &GlobalConfig) -> Result<Value> {
-        let (call_name, cmd_name, mut cmd_args, envs) = match &config.read().agent {
-            Some(agent) => self.extract_call_config_from_agent(config, agent)?,
-            None => self.extract_call_config_from_config(config)?,
-        };
-
-        let json_data = if self.arguments.is_object() {
-            self.arguments.clone()
-        } else if let Some(arguments) = self.arguments.as_str() {
-            let arguments: Value = serde_json::from_str(arguments).map_err(|_| {
-                anyhow!("The call '{call_name}' has invalid arguments: {arguments}")
-            })?;
-            arguments
-        } else {
-            bail!(
-                "The call '{call_name}' has invalid arguments: {}",
-                self.arguments
-            );
-        };
-
-        cmd_args.push(json_data.to_string());
-
-        let output = match run_llm_tool(cmd_name, cmd_args, envs)? {
-            Some(contents) => serde_json::from_str(&contents)
-                .ok()
-                .unwrap_or_else(|| json!({"output": contents})),
-            None => Value::Null,
-        };
-
-        Ok(output)
-    }
-
     fn eval_mcp(&self, config: &GlobalConfig) -> Result<Value> {
         let mcp_manager = config.read().mcp_manager.clone();
         let manager = match mcp_manager {
@@ -319,7 +223,9 @@ impl ToolCall {
             None => bail!("MCP is not configured"),
         };
 
-        let json_data = if self.arguments.is_object() {
+        let json_data = if self.arguments.is_null() {
+            Value::Null
+        } else if self.arguments.is_object() {
             self.arguments.clone()
         } else if let Some(arguments) = self.arguments.as_str() {
             serde_json::from_str(arguments).map_err(|_| {
@@ -355,109 +261,4 @@ impl ToolCall {
 
         Ok(result)
     }
-
-    fn extract_call_config_from_agent(
-        &self,
-        config: &GlobalConfig,
-        agent: &Agent,
-    ) -> Result<CallConfig> {
-        let function_name = self.name.clone();
-        match agent.tools().find(&function_name) {
-            Some(function) => {
-                let agent_name = agent.name().to_string();
-                if function.agent {
-                    Ok((
-                        format!("{agent_name}-{function_name}"),
-                        agent_name,
-                        vec![function_name],
-                        agent.variable_envs(),
-                    ))
-                } else {
-                    Ok((
-                        function_name.clone(),
-                        function_name,
-                        vec![],
-                        Default::default(),
-                    ))
-                }
-            }
-            None => self.extract_call_config_from_config(config),
-        }
-    }
-
-    fn extract_call_config_from_config(&self, config: &GlobalConfig) -> Result<CallConfig> {
-        let function_name = self.name.clone();
-        match config.read().tools.contains(&function_name) {
-            true => Ok((
-                function_name.clone(),
-                function_name,
-                vec![],
-                Default::default(),
-            )),
-            false => bail!("Unexpected call: {function_name} {}", self.arguments),
-        }
-    }
-}
-
-pub fn run_llm_tool(
-    cmd_name: String,
-    cmd_args: Vec<String>,
-    mut envs: HashMap<String, String>,
-) -> Result<Option<String>> {
-    let prompt = format!("Call {cmd_name} {}", cmd_args.join(" "));
-
-    let mut bin_dirs: Vec<PathBuf> = vec![];
-    if cmd_args.len() > 1 {
-        let dir = Config::agent_tools_dir(&cmd_name).join("bin");
-        if dir.exists() {
-            bin_dirs.push(dir);
-        }
-    }
-    bin_dirs.push(Config::tools_bin_dir());
-    let current_path = std::env::var("PATH").context("No PATH environment variable")?;
-    let prepend_path = bin_dirs
-        .iter()
-        .map(|v| format!("{}{PATH_SEP}", v.display()))
-        .collect::<Vec<_>>()
-        .join("");
-    envs.insert("PATH".into(), format!("{prepend_path}{current_path}"));
-
-    let temp_file = temp_file("-eval-", "");
-    envs.insert("LLM_OUTPUT".into(), temp_file.display().to_string());
-
-    #[cfg(windows)]
-    let cmd_name = polyfill_cmd_name(&cmd_name, &bin_dirs);
-    if *IS_STDOUT_TERMINAL {
-        println!("{}", dimmed_text(&prompt));
-    }
-    let exit_code = run_command(&cmd_name, &cmd_args, Some(envs))
-        .map_err(|err| anyhow!("Unable to run {cmd_name}, {err}"))?;
-    if exit_code != 0 {
-        bail!("Tool call exit with {exit_code}");
-    }
-    let mut output = None;
-    if temp_file.exists() {
-        let contents =
-            fs::read_to_string(temp_file).context("Failed to retrieve tool call output")?;
-        if !contents.is_empty() {
-            output = Some(contents);
-        }
-    };
-    Ok(output)
-}
-
-#[cfg(windows)]
-fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
-    let cmd_name = cmd_name.to_string();
-    if let Ok(exts) = std::env::var("PATHEXT") {
-        for name in exts.split(';').map(|ext| format!("{cmd_name}{ext}")) {
-            for dir in bin_dir {
-                let path = dir.as_ref().join(&name);
-                if path.exists() {
-                    return name.to_string();
-                }
-            }
-        }
-    }
-    cmd_name
 }

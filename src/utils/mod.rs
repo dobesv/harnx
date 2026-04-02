@@ -3,7 +3,6 @@ mod clipboard;
 mod command;
 mod crypto;
 mod html_to_md;
-mod input;
 mod loader;
 mod path;
 mod render_prompt;
@@ -16,7 +15,6 @@ pub use self::clipboard::set_text;
 pub use self::command::*;
 pub use self::crypto::*;
 pub use self::html_to_md::*;
-pub use self::input::*;
 pub use self::loader::*;
 pub use self::path::*;
 pub use self::render_prompt::render_prompt;
@@ -48,10 +46,6 @@ pub static NO_COLOR: LazyLock<bool> = LazyLock::new(|| {
 
 pub fn now() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-}
-
-pub fn now_timestamp() -> i64 {
-    chrono::Local::now().timestamp()
 }
 
 pub fn get_env_name(key: &str) -> String {

@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mcp_manager_has_tool() {
+    async fn test_mcp_manager_find_client_for_tool() {
         let manager = McpManager::new();
         let client = Arc::new(McpClient::new(test_mcp_config("fs")));
         *client.tools.write() = vec![
@@ -522,10 +522,10 @@ mod tests {
         ];
         manager.clients.write().insert("fs".to_string(), client);
 
-        assert!(manager.has_tool("fs_read"));
-        assert!(manager.has_tool("fs_write"));
-        assert!(!manager.has_tool("unknown_tool"));
-        assert!(!manager.has_tool("noprefix"));
+        assert!(manager.find_client_for_tool("fs_read").is_some());
+        assert!(manager.find_client_for_tool("fs_write").is_some());
+        assert!(manager.find_client_for_tool("unknown_tool").is_none());
+        assert!(manager.find_client_for_tool("noprefix").is_none());
     }
 
     #[tokio::test]
@@ -692,13 +692,6 @@ impl McpManager {
         }
 
         Ok(client.get_tools())
-    }
-
-    pub fn has_tool(&self, name: &str) -> bool {
-        self.clients
-            .read()
-            .values()
-            .any(|c| c.tools.read().iter().any(|t| t.name == name))
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {

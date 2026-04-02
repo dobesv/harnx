@@ -67,7 +67,7 @@ pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
 struct Server {
     config: Config,
     models: Vec<Value>,
-    roles: Vec<Role>,
+    agents: Vec<Agent>,
     rags: Vec<String>,
 }
 
@@ -101,7 +101,7 @@ impl Server {
         Self {
             config,
             models,
-            roles: Config::all_roles(),
+            agents: Config::all_agents(),
             rags: Config::list_rags(),
         }
     }
@@ -163,8 +163,8 @@ impl Server {
             self.rerank(req).await
         } else if path == "/v1/models" {
             self.list_models()
-        } else if path == "/v1/roles" {
-            self.list_roles()
+        } else if path == "/v1/agents" {
+            self.list_agents()
         } else if path == "/v1/rags" {
             self.list_rags()
         } else if path == "/v1/rags/search" {
@@ -217,8 +217,8 @@ impl Server {
         Ok(res)
     }
 
-    fn list_roles(&self) -> Result<AppResponse> {
-        let data = json!({ "data": self.roles });
+    fn list_agents(&self) -> Result<AppResponse> {
+        let data = json!({ "data": self.agents });
         let res = Response::builder()
             .header("Content-Type", "application/json; charset=utf-8")
             .body(Full::new(Bytes::from(data.to_string())).boxed())?;

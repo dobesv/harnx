@@ -1,17 +1,8 @@
 use super::*;
 
-use std::{
-    collections::HashMap,
-    env,
-    ffi::OsStr,
-    fs::OpenOptions,
-    io::{self, Write},
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{collections::HashMap, env, ffi::OsStr, path::Path, process::Command};
 
 use anyhow::{anyhow, bail, Context, Result};
-use dirs::home_dir;
 use std::sync::LazyLock;
 
 pub static SHELL: LazyLock<Shell> = LazyLock::new(detect_shell);
@@ -158,72 +149,4 @@ pub fn edit_file(editor: &str, path: &Path) -> Result<()> {
     let mut child = Command::new(editor).arg(path).spawn()?;
     child.wait()?;
     Ok(())
-}
-
-pub fn append_to_shell_history(shell: &str, command: &str, exit_code: i32) -> io::Result<()> {
-    if let Some(history_file) = get_history_file(shell) {
-        let command = command.replace('\n', " ");
-        let now = now_timestamp();
-        let history_txt = if shell == "fish" {
-            format!("- cmd: {command}\n  when: {now}")
-        } else if shell == "zsh" {
-            format!(": {now}:{exit_code};{command}",)
-        } else {
-            command
-        };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&history_file)?;
-        writeln!(file, "{history_txt}")?;
-    }
-    Ok(())
-}
-
-fn get_history_file(shell: &str) -> Option<PathBuf> {
-    match shell {
-        "bash" | "sh" => env::var("HISTFILE")
-            .ok()
-            .map(PathBuf::from)
-            .or(Some(home_dir()?.join(".bash_history"))),
-        "zsh" => env::var("HISTFILE")
-            .ok()
-            .map(PathBuf::from)
-            .or(Some(home_dir()?.join(".zsh_history"))),
-        "nushell" => Some(dirs::config_dir()?.join("nushell").join("history.txt")),
-        "fish" => Some(
-            home_dir()?
-                .join(".local")
-                .join("share")
-                .join("fish")
-                .join("fish_history"),
-        ),
-        "powershell" | "pwsh" => {
-            #[cfg(not(windows))]
-            {
-                Some(
-                    home_dir()?
-                        .join(".local")
-                        .join("share")
-                        .join("powershell")
-                        .join("PSReadLine")
-                        .join("ConsoleHost_history.txt"),
-                )
-            }
-            #[cfg(windows)]
-            {
-                Some(
-                    dirs::data_dir()?
-                        .join("Microsoft")
-                        .join("Windows")
-                        .join("PowerShell")
-                        .join("PSReadLine")
-                        .join("ConsoleHost_history.txt"),
-                )
-            }
-        }
-        "ksh" => Some(home_dir()?.join(".ksh_history")),
-        "tcsh" => Some(home_dir()?.join(".history")),
-        _ => None,
-    }
 }

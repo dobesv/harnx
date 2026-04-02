@@ -1,19 +1,15 @@
 # Custom REPL Prompt
 
-The REPL prompt displays context information about the active role, session, RAG, and agent.
+The REPL prompt displays context information about the active agent, session, and RAG.
 
 ## Prompt States
 
 The prompt adapts to show relevant context depending on what's active:
 
 - none
-- role
-- session
 - agent
+- session
 - rag
-- session + role
-- session + rag
-- session + role + rag
 - agent + session
 - agent + rag
 - agent + session + rag
@@ -25,7 +21,7 @@ Edit `left_prompt` and `right_prompt` in your config file to customize the REPL 
 ### Default left_prompt
 
 ```
-'{color.green}{?session {?agent {agent}>}{session}{?role /}}{!session {?agent {agent}>}}{role}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
+'{color.green}{?session {?agent {agent}>}{session}}{!session {?agent {agent}>}}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} '
 ```
 
 ### Default right_prompt
@@ -56,14 +52,13 @@ Edit `left_prompt` and `right_prompt` in your config file to customize the REPL 
 | `stream` | Stream mode |
 | `save` | Save mode |
 | `wrap` | Wrap mode |
-| `role` | Active role |
+| `agent` | Active agent |
 | `session` | Active session |
 | `dirty` | Session dirty flag |
 | `consume_tokens` | Consumed tokens |
 | `consume_percent` | Consumed token percentage |
 | `user_messages_len` | Number of user messages |
 | `rag` | Active RAG |
-| `agent` | Active agent |
 
 ## Color Variables
 

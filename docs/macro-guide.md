@@ -55,5 +55,5 @@ steps:
 
 When a Macro is executed, it runs in an **isolated context**:
 
-- It does **not** inherit any pre-existing role, session, RAG, or agent state.
+- It does **not** inherit any pre-existing agent, session, or RAG state.
 - Executing a Macro will **not** affect your current context. This ensures that your workflow remains clean and unaffected by Macro operations.
