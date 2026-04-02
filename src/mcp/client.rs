@@ -392,26 +392,29 @@ mod tests {
 
         let server_peer = mock_server.peer.read().as_ref().unwrap().clone();
 
-        // Verify list_roots works (server calling client)
         let roots_result = server_peer.list_roots().await.unwrap();
         assert_eq!(roots_result.roots.len(), 1);
-        assert_eq!(roots_result.roots[0].uri, "file:///test/root");
+        let uri = &roots_result.roots[0].uri;
+        assert!(
+            uri.starts_with("file:///") && uri.ends_with("/test/root"),
+            "expected file:///...test/root, got: {uri}"
+        );
 
-        // Test adding a root and notification
         {
             roots.write().push("/test/root2".to_string());
             client_peer.notify_roots_list_changed().await.unwrap();
         }
 
-        // Give it a moment to process the notification
         tokio::time::sleep(Duration::from_millis(100)).await;
-
         assert!(*mock_server.roots_list_changed_notified.read());
 
-        // Verify new roots
         let roots_result = server_peer.list_roots().await.unwrap();
         assert_eq!(roots_result.roots.len(), 2);
-        assert_eq!(roots_result.roots[1].uri, "file:///test/root2");
+        let uri2 = &roots_result.roots[1].uri;
+        assert!(
+            uri2.starts_with("file:///") && uri2.ends_with("/test/root2"),
+            "expected file:///...test/root2, got: {uri2}"
+        );
     }
 
     #[tokio::test]

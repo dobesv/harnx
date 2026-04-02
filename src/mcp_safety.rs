@@ -25,33 +25,33 @@ pub fn path_to_file_uri(path: &Path) -> String {
 }
 
 /// Convert a `file://` URI back to a PathBuf, with percent-decoding.
-pub fn file_uri_to_path(uri: &str) -> PathBuf {
+/// Returns None if the URI doesn't have a `file://` scheme.
+pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let path_str = uri
         .strip_prefix("file://localhost")
-        .or_else(|| uri.strip_prefix("file://"))
-        .unwrap_or(uri);
+        .or_else(|| uri.strip_prefix("file://"))?;
     let decoded = percent_decode(path_str);
-    PathBuf::from(decoded)
+    Some(PathBuf::from(decoded))
 }
 
 /// Simple percent-decoding for file URIs.
 fn percent_decode(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.bytes();
-    while let Some(b) = chars.next() {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut iter = input.bytes();
+    while let Some(b) = iter.next() {
         if b == b'%' {
-            let hi = chars.next().and_then(hex_val);
-            let lo = chars.next().and_then(hex_val);
+            let hi = iter.next().and_then(hex_val);
+            let lo = iter.next().and_then(hex_val);
             if let (Some(h), Some(l)) = (hi, lo) {
-                result.push((h << 4 | l) as char);
+                bytes.push(h << 4 | l);
             } else {
-                result.push('%');
+                bytes.push(b'%');
             }
         } else {
-            result.push(b as char);
+            bytes.push(b);
         }
     }
-    result
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn hex_val(b: u8) -> Option<u8> {

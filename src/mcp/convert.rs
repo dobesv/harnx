@@ -15,6 +15,7 @@ pub fn mcp_tool_to_declaration(
         description: tool_description.to_string(),
         parameters: convert_json_schema(input_schema)?,
         agent: false,
+        mcp: true,
     })
 }
 

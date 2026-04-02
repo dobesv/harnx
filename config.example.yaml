@@ -417,27 +417,27 @@ clients:
 #     type: claude-command
 #     command: "echo 'Session started'"
 #
-#   ## Example: rtk (https://github.com/rtk-ai/rtk)
-#   ## Token compression proxy - rewrites commands to rtk equivalents for 60-90% token savings.
-#   ## Install: brew install rtk  (or cargo install --git https://github.com/rtk-ai/rtk)
-#   ## Setup:  rtk init -g
-#   ## rtk registers its own PreToolUse hook that transparently rewrites Bash
-#   ## commands (e.g. "git status" → "rtk git status") before execution.
-#   ## No manual harnx config is needed if you use `rtk init`; shown here for reference:
-#   # - event: PreToolUse
-#   #   type: claude-command
-#   #   matcher: "execute_command"
-#   #   command: "rtk hook claude"     # rtk's built-in hook handler
+#   # Example: rtk (https://github.com/rtk-ai/rtk)
+#   # Token compression proxy - rewrites commands to rtk equivalents for 60-90% token savings.
+#   # Install: brew install rtk  (or cargo install --git https://github.com/rtk-ai/rtk)
+#   # Setup:  rtk init -g
+#   # rtk registers its own PreToolUse hook that transparently rewrites Bash
+#   # commands (e.g. "git status" → "rtk git status") before execution.
+#   # No manual harnx config is needed if you use `rtk init`; shown here for reference:
+#   - event: PreToolUse
+#     type: claude-command
+#     matcher: "bash_exec"
+#     command: "rtk hook claude"     # rtk's built-in hook handler
 #
-#   ## Example: dcg (https://github.com/Dicklesworthstone/destructive_command_guard)
-#   ## Blocks destructive commands (rm -rf, git reset --hard, DROP TABLE, etc.)
-#   ## Install: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh | bash -s -- --easy-mode
-#   # - event: PreToolUse
-#   #   type: claude-command
-#   #   matcher: "execute_command"
-#   #   command: "dcg"                 # dcg reads the hook payload from stdin
+#   # Example: dcg (https://github.com/Dicklesworthstone/destructive_command_guard)
+#   # Blocks destructive commands (rm -rf, git reset --hard, DROP TABLE, etc.)
+#   # Install: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh | bash -s -- --easy-mode
+#   - event: PreToolUse
+#     type: claude-command
+#     matcher: "bash_exec"
+#     command: "dcg"                 # dcg reads the hook payload from stdin
 #
-#   ## Example: hookSpecificOutput with permissionDecision
-#   ## Hooks can return structured JSON to allow, deny, or ask for confirmation:
-#   ## echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"Blocked by policy"}}'
-#   ## permissionDecision values: "allow" (proceed), "deny" (block), "ask" (prompt user)
+#   # Example: hookSpecificOutput with permissionDecision
+#   # Hooks can return structured JSON to allow, deny, or ask for confirmation:
+#   # echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"Blocked by policy"}}'
+#   # permissionDecision values: "allow" (proceed), "deny" (block), "ask" (prompt user)

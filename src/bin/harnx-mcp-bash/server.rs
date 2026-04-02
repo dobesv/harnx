@@ -87,7 +87,7 @@ impl BashServer {
         let roots = result
             .roots
             .into_iter()
-            .map(|root| file_uri_to_path(root.uri.as_ref()))
+            .filter_map(|root| file_uri_to_path(root.uri.as_ref()))
             .collect::<Vec<_>>();
 
         let mut guard = self.roots.write().await;

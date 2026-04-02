@@ -2568,32 +2568,15 @@ impl Config {
         Ok(())
     }
 
-    fn needs_mcp_tools(&self, use_tools: &str) -> bool {
-        if self.mcp_manager.is_none() {
-            return false;
-        }
-        if use_tools == "all" {
-            return true;
-        }
-
-        use_tools.split(',').map(str::trim).any(|item| {
-            crate::mcp::is_mcp_tool(item)
-                || item.ends_with(":all")
-                || self
-                    .toolsets
-                    .get(item)
-                    .map(|values| values.iter().any(|v| crate::mcp::is_mcp_tool(v)))
-                    .unwrap_or(false)
-        })
+    fn needs_mcp_tools(&self) -> bool {
+        self.mcp_manager.is_some()
     }
 
     pub fn tool_declarations_for_use_tools(&self, use_tools: Option<&str>) -> Vec<ToolDeclaration> {
         let mut declarations = self.tools.declarations();
-        if let Some(use_tools) = use_tools {
-            if self.needs_mcp_tools(use_tools) {
-                if let Some(manager) = &self.mcp_manager {
-                    declarations.extend(manager.get_all_tools_blocking());
-                }
+        if use_tools.is_some() && self.needs_mcp_tools() {
+            if let Some(manager) = &self.mcp_manager {
+                declarations.extend(manager.get_all_tools_blocking());
             }
         }
 
