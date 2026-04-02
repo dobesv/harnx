@@ -2,6 +2,7 @@ mod cli;
 mod client;
 mod config;
 mod hooks;
+mod acp;
 mod mcp;
 mod rag;
 mod render;
