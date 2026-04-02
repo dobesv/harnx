@@ -302,8 +302,12 @@ impl McpClient {
 mod tests {
     use super::*;
     use rmcp::handler::server::ServerHandler;
-    use rmcp::model::{InitializeResult, ListToolsResult, ServerCapabilities};
-    use rmcp::service::{serve_server, NotificationContext};
+    use rmcp::model::{
+        CallToolRequestParam, CallToolResult, Content, InitializeResult, ListToolsResult,
+        ServerCapabilities, Tool,
+    };
+    use rmcp::service::{serve_server, NotificationContext, RoleServer};
+    use serde_json::{json, Map};
     use std::time::Duration;
     use tokio::io::duplex;
 
@@ -312,6 +316,8 @@ mod tests {
         initialized_params: Arc<RwLock<Option<InitializeRequestParam>>>,
         roots_list_changed_notified: Arc<RwLock<bool>>,
         peer: Arc<RwLock<Option<rmcp::service::Peer<rmcp::service::RoleServer>>>>,
+        tools: Arc<RwLock<Vec<Tool>>>,
+        last_tool_call: Arc<RwLock<Option<(String, Value)>>>,
     }
 
     impl ServerHandler for MockServerHandler {
@@ -346,13 +352,54 @@ mod tests {
             _cx: RequestContext<rmcp::service::RoleServer>,
         ) -> Result<ListToolsResult, rmcp::model::ErrorData> {
             Ok(ListToolsResult {
-                tools: vec![],
+                tools: self.tools.read().clone(),
                 next_cursor: None,
             })
         }
 
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParam,
+            _cx: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+            let arguments = request
+                .arguments
+                .clone()
+                .map(Value::Object)
+                .unwrap_or(Value::Null);
+            *self.last_tool_call.write() = Some((request.name.to_string(), arguments.clone()));
+
+            match request.name.as_ref() {
+                "read" => {
+                    let path = arguments
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<missing>");
+                    Ok(CallToolResult::success(vec![Content::text(format!(
+                        "mock contents from {path}"
+                    ))]))
+                }
+                other => Err(rmcp::model::ErrorData::invalid_params(
+                    format!("unknown tool: {other}"),
+                    None,
+                )),
+            }
+        }
+
         async fn on_roots_list_changed(&self, _cx: NotificationContext<rmcp::service::RoleServer>) {
             *self.roots_list_changed_notified.write() = true;
+        }
+    }
+
+    fn test_mcp_config(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: "mock-mcp".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            roots: vec![],
+            enabled: true,
+            description: None,
         }
     }
 
@@ -455,6 +502,71 @@ mod tests {
         let expected_path = std::env::current_dir().unwrap().canonicalize().unwrap();
         let expected_uri = path_to_file_uri(&expected_path);
         assert_eq!(uri, expected_uri);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_manager_has_tool() {
+        let manager = McpManager::new();
+        manager.initialize(vec![test_mcp_config("fs")]);
+
+        assert!(manager.has_tool("fs_read"));
+        assert!(manager.has_tool("fs_write"));
+        assert!(!manager.has_tool("unknown_tool"));
+        assert!(!manager.has_tool("noprefix"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_manager_call_tool_routes_prefixed_names() {
+        let (client_transport, server_transport) = duplex(1024);
+        let mock_server = MockServerHandler {
+            tools: Arc::new(RwLock::new(vec![Tool::new(
+                "read",
+                "Read mock file contents.",
+                Map::new(),
+            )])),
+            ..Default::default()
+        };
+
+        let server_handler = mock_server.clone();
+        let client_handler = McpClientHandler::new(Arc::new(RwLock::new(vec![])));
+        let (server_res, client_res) = tokio::join!(
+            serve_server(server_handler, server_transport),
+            rmcp::service::serve_client(client_handler, client_transport)
+        );
+
+        let _server_service = server_res.unwrap();
+        let client_service = client_res.unwrap();
+
+        let client = Arc::new(McpClient::new(test_mcp_config("fs")));
+        *client.connected.write() = true;
+        *client.tools.write() = vec![
+            mcp_tool_to_declaration("fs", "read", "Read mock file contents.", &json!({}))
+                .unwrap(),
+        ];
+        *client.service.write() = Some(client_service);
+
+        let manager = McpManager::new();
+        manager.clients.write().insert("fs".to_string(), client);
+
+        let result = manager
+            .call_tool("fs_read", json!({ "path": "test.txt" }))
+            .await
+            .unwrap();
+
+        let result_text = result.to_string();
+        assert!(result_text.contains("mock contents from test.txt"));
+        assert!(!result_text.contains("Unexpected call"));
+
+        let last_tool_call = mock_server.last_tool_call.read().clone();
+        assert_eq!(
+            last_tool_call,
+            Some((
+                "read".to_string(),
+                json!({
+                    "path": "test.txt"
+                }),
+            ))
+        );
     }
 }
 
@@ -564,6 +676,13 @@ impl McpManager {
         }
 
         Ok(client.get_tools())
+    }
+
+    pub fn has_tool(&self, prefixed_name: &str) -> bool {
+        let Some((server_name, _)) = prefixed_name.split_once('_') else {
+            return false;
+        };
+        self.clients.read().contains_key(server_name)
     }
 
     pub async fn call_tool(&self, prefixed_name: &str, arguments: Value) -> Result<Value> {

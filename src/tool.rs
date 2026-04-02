@@ -72,7 +72,12 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
             }
         }
 
-        let eval_result = if config.read().tools.is_mcp_tool(&call.name) {
+        let is_mcp = config
+            .read()
+            .mcp_manager
+            .as_ref()
+            .is_some_and(|m| m.has_tool(&call.name));
+        let eval_result = if is_mcp {
             call.eval_mcp(config)
         } else {
             call.eval(config)
@@ -193,10 +198,6 @@ impl Tools {
             .collect()
     }
 
-    pub fn is_mcp_tool(&self, name: &str) -> bool {
-        self.mcp_declarations.iter().any(|d| d.name == name)
-    }
-
     pub fn is_empty(&self) -> bool {
         self.declarations.is_empty() && self.mcp_declarations.is_empty()
     }
@@ -209,9 +210,7 @@ pub struct ToolDeclaration {
     pub parameters: JsonSchema,
     #[serde(skip_serializing, default)]
     pub agent: bool,
-    #[serde(skip_serializing, default)]
-    #[allow(dead_code)]
-    pub mcp: bool,
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
