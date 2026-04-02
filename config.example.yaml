@@ -427,7 +427,7 @@ clients:
 #   # No manual harnx config is needed if you use `rtk init`; shown here for reference:
 #   - event: PreToolUse
 #     type: claude-command
-#     matcher: "bash_exec"
+#     matcher: "Bash"
 #     command: "rtk hook claude"     # rtk's built-in hook handler
 #
 #   # Example: dcg (https://github.com/Dicklesworthstone/destructive_command_guard)
@@ -435,7 +435,7 @@ clients:
 #   # Install: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh | bash -s -- --easy-mode
 #   - event: PreToolUse
 #     type: claude-command
-#     matcher: "bash_exec"
+#     matcher: "Bash"
 #     command: "dcg"                 # dcg reads the hook payload from stdin
 #
 #   # Example: hookSpecificOutput with permissionDecision
