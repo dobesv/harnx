@@ -6,7 +6,7 @@ mod session;
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
-pub use self::role::{Role, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE};
+pub use self::role::Role;
 use self::session::Session;
 
 use crate::client::{
@@ -23,7 +23,9 @@ use crate::utils::*;
 
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
-use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
+use inquire::{
+    list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text,
+};
 use parking_lot::RwLock;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
@@ -1038,46 +1040,6 @@ impl Config {
         Ok(())
     }
 
-    pub fn current_agent_info(&self) -> Result<String> {
-        if let Some(session) = &self.session {
-            if session.agent_name().is_some() {
-                let agent = session.to_agent();
-                Ok(agent.export()?)
-            } else {
-                bail!("No session agent")
-            }
-        } else if let Some(agent) = &self.agent {
-            Ok(agent.export()?)
-        } else {
-            bail!("No agent")
-        }
-    }
-
-    pub fn clear_agent_selection(&mut self) -> Result<()> {
-        if let Some(session) = self.session.as_mut() {
-            session.guard_empty()?;
-            session.clear_agent();
-        } else if self.agent.is_some() {
-            self.agent = None;
-        }
-        Ok(())
-    }
-
-    pub fn new_agent(&mut self, name: &str) -> Result<()> {
-        if self.macro_flag {
-            bail!("No agent");
-        }
-        let ans = Confirm::new("Create a new agent?")
-            .with_default(true)
-            .prompt()?;
-        if ans {
-            self.upsert_agent(name)?;
-        } else {
-            bail!("No agent");
-        }
-        Ok(())
-    }
-
     pub fn edit_agent_prompt(&mut self) -> Result<()> {
         let agent_name;
         if let Some(session) = self.session.as_ref() {
@@ -1149,11 +1111,6 @@ impl Config {
         }
 
         Ok(())
-    }
-
-    pub fn has_agent(name: &str) -> bool {
-        let names = list_agents();
-        names.contains(&name.to_string())
     }
 
     pub fn all_agents() -> Vec<Agent> {
@@ -1659,29 +1616,6 @@ impl Config {
         }
     }
 
-    pub fn edit_agent_config(&self) -> Result<()> {
-        let agent_name = match &self.agent {
-            Some(agent) => agent.name(),
-            None => bail!("No agent"),
-        };
-        let agent_config_path = Config::agent_config_file(agent_name);
-        ensure_parent_exists(&agent_config_path)?;
-        if !agent_config_path.exists() {
-            std::fs::write(
-                &agent_config_path,
-                "# see https://github.com/dobesv/harnx/blob/main/config.agent.example.yaml\n",
-            )
-            .with_context(|| format!("Failed to write to '{}'", agent_config_path.display()))?;
-        }
-        let editor = self.editor()?;
-        edit_file(&editor, &agent_config_path)?;
-        println!(
-            "NOTE: Remember to reload the agent if there are changes made to '{}'",
-            agent_config_path.display()
-        );
-        Ok(())
-    }
-
     pub fn exit_agent(&mut self) -> Result<()> {
         self.exit_session()?;
         if self.agent.take().is_some() {
@@ -1875,7 +1809,6 @@ impl Config {
         let filter = args.last().unwrap_or(&"");
         if args.len() == 1 {
             values = match cmd {
-                ".role" => map_completion_values(list_agents()),
                 ".model" => list_models(self, ModelType::Chat)
                     .into_iter()
                     .map(|v| (v.id(), Some(v.description())))
@@ -1896,7 +1829,7 @@ impl Config {
                 ".rag" => map_completion_values(Self::list_rags()),
                 ".agent" => map_completion_values(list_agents()),
                 ".macro" => map_completion_values(Self::list_macros()),
-                ".info" => map_completion_values(vec!["role", "session", "agent", "rag", "tools"]),
+                ".info" => map_completion_values(vec!["session", "agent", "rag", "tools"]),
                 ".mcp" => map_completion_values(vec![
                     "list",
                     "connect",

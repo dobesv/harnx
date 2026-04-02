@@ -147,10 +147,13 @@ fn split_line(line: &str) -> Vec<(&str, usize)> {
 
 #[test]
 fn test_split_line() {
-    assert_eq!(split_line(".role coder"), vec![(".role", 0), ("coder", 6)],);
     assert_eq!(
-        split_line(" .role   coder"),
-        vec![(".role", 1), ("coder", 9)],
+        split_line(".agent coder"),
+        vec![(".agent", 0), ("coder", 7)],
+    );
+    assert_eq!(
+        split_line(" .agent   coder"),
+        vec![(".agent", 1), ("coder", 10)],
     );
     assert_eq!(
         split_line(".set highlight "),

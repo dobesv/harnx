@@ -12,9 +12,6 @@ pub struct Cli {
     /// Use the system prompt
     #[clap(long)]
     pub prompt: Option<String>,
-    /// Select a role
-    #[clap(short, long)]
-    pub role: Option<String>,
     /// Start or join a session
     #[clap(short = 's', long)]
     pub session: Option<Option<String>>,
@@ -42,12 +39,6 @@ pub struct Cli {
     /// Serve the LLM API and WebAPP
     #[clap(long, value_name = "ADDRESS")]
     pub serve: Option<Option<String>>,
-    /// Execute commands in natural language
-    #[clap(short = 'e', long)]
-    pub execute: bool,
-    /// Output code only
-    #[clap(short = 'c', long)]
-    pub code: bool,
     /// Include files, directories, or URLs
     #[clap(short = 'f', long, value_name = "FILE")]
     pub file: Vec<String>,
@@ -66,9 +57,6 @@ pub struct Cli {
     /// List all available chat models
     #[clap(long)]
     pub list_models: bool,
-    /// List all roles
-    #[clap(long)]
-    pub list_roles: bool,
     /// List all sessions
     #[clap(long)]
     pub list_sessions: bool,

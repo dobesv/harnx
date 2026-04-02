@@ -36,7 +36,7 @@ use std::{env, process};
 
 const MENU_NAME: &str = "completion_menu";
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 40]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -63,36 +63,21 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 40]> = LazyLock::new(|| {
         ReplCommand::new(".model", "Switch LLM model", AssertState::pass()),
         ReplCommand::new(
             ".prompt",
-            "Set a temporary role using a prompt",
+            "Set a temporary agent using a prompt",
             AssertState::False(StateFlags::SESSION | StateFlags::AGENT),
         ),
         ReplCommand::new(
-            ".role",
-            "Create or switch to a role",
-            AssertState::False(StateFlags::SESSION | StateFlags::AGENT),
-        ),
-        ReplCommand::new(
-            ".info role",
-            "Show role info",
-            AssertState::True(StateFlags::AGENT),
-        ),
-        ReplCommand::new(
-            ".edit role",
-            "Modify current role",
+            ".edit agent",
+            "Modify current agent",
             AssertState::TrueFalse(StateFlags::AGENT, StateFlags::SESSION),
         ),
         ReplCommand::new(
-            ".save role",
-            "Save current role to file",
+            ".save agent",
+            "Save current agent to file",
             AssertState::TrueFalse(
                 StateFlags::AGENT,
                 StateFlags::SESSION_EMPTY | StateFlags::SESSION,
             ),
-        ),
-        ReplCommand::new(
-            ".exit role",
-            "Exit active role",
-            AssertState::TrueFalse(StateFlags::AGENT, StateFlags::SESSION),
         ),
         ReplCommand::new(
             ".session",
@@ -133,11 +118,6 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 40]> = LazyLock::new(|| {
         ReplCommand::new(
             ".starter",
             "Use a conversation starter",
-            AssertState::True(StateFlags::AGENT),
-        ),
-        ReplCommand::new(
-            ".edit agent-config",
-            "Modify agent configuration file",
             AssertState::True(StateFlags::AGENT),
         ),
         ReplCommand::new(
@@ -201,7 +181,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 40]> = LazyLock::new(|| {
         ReplCommand::new(".set", "Modify runtime settings", AssertState::pass()),
         ReplCommand::new(
             ".delete",
-            "Delete roles, sessions, RAGs, or agents",
+            "Delete agents, sessions, RAGs, or macros",
             AssertState::pass(),
         ),
         ReplCommand::new(".exit", "Exit REPL", AssertState::pass()),
@@ -475,10 +455,6 @@ pub async fn run_repl_command(
                 dump_repl_help();
             }
             ".info" => match args {
-                Some("role") => {
-                    let info = config.read().current_agent_info()?;
-                    print!("{info}");
-                }
                 Some("session") => {
                     let info = config.read().session_info()?;
                     print!("{info}");
@@ -530,37 +506,6 @@ pub async fn run_repl_command(
                     config.write().use_prompt(text)?;
                 }
                 None => println!("Usage: .prompt <text>..."),
-            },
-            ".role" => match args {
-                Some(args) => match args.split_once(['\n', ' ']) {
-                    Some((name, text)) => {
-                        let agent = config.read().retrieve_agent(name.trim())?;
-                        let input = Input::from_str(config, text, Some(agent));
-                        ask(
-                            config,
-                            abort_signal.clone(),
-                            input,
-                            false,
-                            async_manager,
-                            persistent_manager,
-                            pending_async_context,
-                            max_resume,
-                        )
-                        .await?;
-                    }
-                    None => {
-                        let name = args;
-                        if !Config::has_agent(name) {
-                            config.write().new_agent(name)?;
-                        }
-                        config.write().use_agent_by_name(name)?;
-                    }
-                },
-                None => println!(
-                    r#"Usage:
-    .role <name>                    # If the role exists, switch to it; otherwise, create a new role
-    .role <name> [text]...          # Temporarily switch to the role, send the text, and switch back"#
-                ),
             },
             ".session" => {
                 config.write().use_session(args)?;
@@ -635,14 +580,14 @@ pub async fn run_repl_command(
                 }
             },
             ".save" => match split_first_arg(args) {
-                Some(("role", name)) => {
+                Some(("agent", name)) => {
                     config.write().save_agent(name)?;
                 }
                 Some(("session", name)) => {
                     config.write().save_session(name)?;
                 }
                 _ => {
-                    println!(r#"Usage: .save <role|session> [name]"#)
+                    println!(r#"Usage: .save <agent|session> [name]"#)
                 }
             },
             ".edit" => {
@@ -653,7 +598,7 @@ pub async fn run_repl_command(
                     Some("config") => {
                         config.read().edit_config()?;
                     }
-                    Some("role") => {
+                    Some("agent") => {
                         config.write().edit_agent_prompt()?;
                     }
                     Some("session") => {
@@ -662,11 +607,8 @@ pub async fn run_repl_command(
                     Some("rag-docs") => {
                         Config::edit_rag_docs(config, abort_signal.clone()).await?;
                     }
-                    Some("agent-config") => {
-                        config.write().edit_agent_config()?;
-                    }
                     _ => {
-                        println!(r#"Usage: .edit <config|role|session|rag-docs|agent-config>"#)
+                        println!(r#"Usage: .edit <config|agent|session|rag-docs>"#)
                     }
                 }
             }
@@ -1002,9 +944,6 @@ Commands:
                 set_text(&output).context("Failed to copy the last chat response")?;
             }
             ".exit" => match args {
-                Some("role") => {
-                    config.write().clear_agent_selection()?;
-                }
                 Some("session") => {
                     if config.read().agent.is_some() {
                         config.write().exit_agent_session()?;
@@ -1425,8 +1364,8 @@ mod tests {
     #[test]
     fn test_process_command_line() {
         assert_eq!(parse_command(" ."), Some((".", None)));
-        assert_eq!(parse_command(" .role"), Some((".role", None)));
-        assert_eq!(parse_command(" .role  "), Some((".role", None)));
+        assert_eq!(parse_command(" .agent"), Some((".agent", None)));
+        assert_eq!(parse_command(" .agent  "), Some((".agent", None)));
         assert_eq!(
             parse_command(" .set dry_run true"),
             Some((".set", Some("dry_run true")))
