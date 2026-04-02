@@ -736,4 +736,65 @@ Input 1
 "#;
         assert_eq!(parse_structure_prompt(prompt), (prompt, vec![]));
     }
+
+    #[test]
+    fn test_agent_from_markdown_full() {
+        let content = "---\nmodel: openai:gpt-4o\ntemperature: 0.7\ntop_p: 0.9\nuse_tools: fs,web_search\ndescription: A test agent\nversion: '1.0'\n---\nYou are a helpful test agent.";
+        let agent = Agent::from_markdown("test-agent", content);
+        assert_eq!(agent.name(), "test-agent");
+        assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
+        assert_eq!(agent.temperature(), Some(0.7));
+        assert_eq!(agent.top_p(), Some(0.9));
+        assert_eq!(agent.use_tools(), Some("fs,web_search".to_string()));
+        assert!(agent.interpolated_instructions().contains("You are a helpful test agent"));
+    }
+
+    #[test]
+    fn test_agent_from_markdown_minimal() {
+        let content = "Just instructions, no front-matter.";
+        let agent = Agent::from_markdown("minimal", content);
+        assert_eq!(agent.name(), "minimal");
+        assert!(agent.model_id().is_none());
+        assert!(agent.temperature().is_none());
+        assert_eq!(agent.interpolated_instructions(), "Just instructions, no front-matter.");
+    }
+
+    #[test]
+    fn test_agent_from_markdown_empty_body() {
+        let content = "---\nmodel: openai:gpt-4o\ntemperature: 0.5\n---\n";
+        let agent = Agent::from_markdown("empty-body", content);
+        assert_eq!(agent.name(), "empty-body");
+        assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
+        assert!(agent.interpolated_instructions().is_empty());
+    }
+
+    #[test]
+    fn test_agent_from_prompt() {
+        let agent = Agent::from_prompt("You are a pirate");
+        assert_eq!(agent.name(), "%%");
+        assert!(agent.interpolated_instructions().contains("You are a pirate"));
+        assert!(agent.model_id().is_none());
+        assert!(agent.temperature().is_none());
+    }
+
+    #[test]
+    fn test_agent_builtin_create_title() {
+        let agent = Agent::builtin("%create-title%").unwrap();
+        assert_eq!(agent.name(), "%create-title%");
+        assert!(!agent.interpolated_instructions().is_empty());
+        assert!(agent.interpolated_instructions().contains("concise"));
+    }
+
+    #[test]
+    fn test_agent_builtin_unknown() {
+        let result = Agent::builtin("unknown-agent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_agent_from_markdown_with_use_tools() {
+        let content = "---\nuse_tools: fs:all,bash_exec\n---\nHelp with files.";
+        let agent = Agent::from_markdown("tools-agent", content);
+        assert_eq!(agent.use_tools(), Some("fs:all,bash_exec".to_string()));
+    }
 }
