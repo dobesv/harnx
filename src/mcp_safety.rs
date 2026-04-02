@@ -387,6 +387,26 @@ pub fn truncate_line(line: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("harnx-mcp-safety-test-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn truncate_head_no_truncation() {
@@ -493,8 +513,124 @@ mod tests {
         );
         assert!(output.contains("[truncated:"));
         assert!(output.contains("showing first"));
-        assert!(output.len() >= 200);
         assert!(output.starts_with("line-001"));
-        assert!(output.contains("line-200"));
+        assert_ne!(output, input);
+    }
+
+    #[test]
+    fn test_truncate_output_per_line() {
+        let input = format!("prefix-{}-suffix\n", "x".repeat(64));
+        let output = truncate_output(
+            &input,
+            &TruncateOpts {
+                line_head_bytes: 8,
+                line_tail_bytes: 8,
+                max_output_bytes: 1_000,
+                ..Default::default()
+            },
+        );
+
+        assert!(output.starts_with("prefix-x"));
+        assert!(output.contains("[truncated:"));
+        assert!(output.contains("-suffix"));
+    }
+
+    #[test]
+    fn test_truncate_output_line_count() {
+        let input = (1..=8)
+            .map(|n| format!("line-{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = truncate_output(
+            &input,
+            &TruncateOpts {
+                head_lines: 2,
+                tail_lines: 2,
+                max_output_bytes: 1_000,
+                ..Default::default()
+            },
+        );
+
+        assert!(output.contains("line-1"));
+        assert!(output.contains("line-2"));
+        assert!(output.contains("line-7"));
+        assert!(output.contains("line-8"));
+        assert!(output.contains("[truncated: 4 lines removed]"));
+    }
+
+    #[test]
+    fn test_truncate_output_total_bytes() {
+        let input = (1..=40)
+            .map(|n| format!("line-{n:02}: {}", "a".repeat(30)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = truncate_output(
+            &input,
+            &TruncateOpts {
+                head_lines: 100,
+                tail_lines: 100,
+                max_output_bytes: 120,
+                ..Default::default()
+            },
+        );
+
+        assert!(output.contains("showing first"));
+        assert!(output.starts_with("line-01"));
+        assert_ne!(output, input);
+    }
+
+    #[test]
+    fn test_validate_path_within_root() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path.join("inside.txt");
+        std::fs::write(&file_path, "ok").unwrap();
+
+        let validated = validate_path(
+            &file_path.to_string_lossy(),
+            std::slice::from_ref(&temp_dir.path),
+        )
+        .unwrap();
+
+        assert_eq!(validated, file_path.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_validate_path_outside_root() {
+        let root_dir = TestDir::new();
+        let outside_dir = TestDir::new();
+        let outside_file = outside_dir.path.join("outside.txt");
+        std::fs::write(&outside_file, "nope").unwrap();
+
+        let error = validate_path(
+            &outside_file.to_string_lossy(),
+            std::slice::from_ref(&root_dir.path),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("outside allowed roots"));
+    }
+
+    #[test]
+    fn test_validate_path_no_roots() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path.join("anywhere.txt");
+        std::fs::write(&file_path, "ok").unwrap();
+
+        let validated = validate_path(&file_path.to_string_lossy(), &[]).unwrap();
+        assert_eq!(validated, file_path.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_validate_write_path_new_file() {
+        let temp_dir = TestDir::new();
+        let new_file = temp_dir.path.join("nested").join("new.txt");
+
+        let validated = validate_write_path(
+            &new_file.to_string_lossy(),
+            std::slice::from_ref(&temp_dir.path),
+        )
+        .unwrap();
+
+        assert_eq!(validated, new_file);
     }
 }

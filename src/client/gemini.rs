@@ -65,6 +65,8 @@ fn prepare_chat_completions(
     let mut request_data = RequestData::new(url, body);
 
     request_data.header("x-goog-api-key", api_key);
+    request_data.header("Content-Type", "application/json");
+    request_data.header("Content-Type", "application/json");
 
     Ok(request_data)
 }
@@ -76,33 +78,20 @@ fn prepare_embeddings(self_: &GeminiClient, data: &EmbeddingsData) -> Result<Req
         .unwrap_or_else(|_| API_BASE.to_string());
 
     let url = format!(
-        "{}/models/{}:batchEmbedContents?key={}",
+        "{}/models/{}:embedContent?key={}",
         api_base.trim_end_matches('/'),
         self_.model.real_name(),
         api_key
     );
 
-    let model_id = format!("models/{}", self_.model.real_name());
-
-    let requests: Vec<_> = data
-        .texts
-        .iter()
-        .map(|text| {
-            json!({
-                "model": model_id,
-                "content": {
-                    "parts": [
-                        {
-                            "text": text
-                        }
-                    ]
-                },
-            })
-        })
-        .collect();
-
     let body = json!({
-        "requests": requests,
+        "content": {
+            "parts": [
+                {
+                    "text": data.try_get_text()?
+                }
+            ]
+        },
     });
 
     let request_data = RequestData::new(url, body);
@@ -122,7 +111,7 @@ async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<Embedding
     let output = res_body
         .embeddings
         .into_iter()
-        .map(|embedding| embedding.values)
+        .map(|v| v.values)
         .collect();
     Ok(output)
 }

@@ -12,10 +12,14 @@ wrap: no                         # Controls text wrapping (no, auto, <max-width>
 wrap_code: false                 # Enables or disables wrapping of code blocks
 
 # ---- tool-use ----
-# Visit https://github.com/sigoden/llm-functions for setup instructions
 tool_use: true                   # Enables or disables tool use (Globally).
-mapping_tools:                   # Alias for a tool or toolset
-  fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
+toolsets:
+  fs:
+    - fs:read
+    - fs:write
+    - fs:search
+    - fs:find
+    - fs_write
 use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search')
 
 # ---- mcp servers ----
@@ -42,6 +46,14 @@ mcp_servers:
      #  - "/home/user/projects"
      description: >-
        Allow the agent to run commands or script snippets
+   - name: time
+     command: harnx-mcp-time             # Shell command execution
+     # For the bash tool, the roots specify additional directories that can be used as the working
+     # directory for a command in addition to the working directory the harness was started in
+     # roots:
+     #  - "/home/user/projects"
+     description: >-
+       Allow the agent to check the time or wait for a period of time
 #   - name: custom
 #     command: /path/to/custom-mcp-server
 #     args:
@@ -52,10 +64,10 @@ mcp_servers:
 #     enabled: false
 #     description: "Custom MCP server"
 
-# ---- prelude ----
-repl_prelude: null               # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
-cmd_prelude: null                # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)
-agent_prelude: null              # Set a session to use when starting a agent (e.g. temp, default)
+# ---- default session ----
+repl_default_session: null        # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
+cmd_default_session: null         # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)
+agent_default_session: null       # Set a session to use when starting a agent (e.g. temp, default)
 
 # ---- session ----
 # Controls the persistence of the session. if true, auto save; if false, not save; if null, asking the user

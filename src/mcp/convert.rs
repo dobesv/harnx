@@ -11,7 +11,7 @@ pub fn mcp_tool_to_declaration(
     input_schema: &Value,
 ) -> Result<ToolDeclaration> {
     Ok(ToolDeclaration {
-        name: format!("mcp__{server_name}__{tool_name}"),
+        name: format!("{server_name}_{tool_name}"),
         description: tool_description.to_string(),
         parameters: convert_json_schema(input_schema)?,
         agent: false,
@@ -185,7 +185,7 @@ mod tests {
             mcp_tool_to_declaration("filesystem", "read_file", "Read a file from disk", &schema)
                 .expect("convert tool");
 
-        assert_eq!(function.name, "mcp__filesystem__read_file");
+        assert_eq!(function.name, "filesystem_read_file");
         assert_eq!(function.description, "Read a file from disk");
         assert!(!function.agent);
         assert_eq!(function.parameters.type_value.as_deref(), Some("object"));

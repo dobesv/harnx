@@ -1,8 +1,8 @@
 use harnx::mcp_safety::{format_size, sanitize_output_text, truncate_output, TruncateOpts};
 
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation,
-    ListToolsResult, PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
+    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
@@ -77,15 +77,9 @@ impl BashServer {
         }
     }
 
-    async fn refresh_roots(
-        &self,
-        peer: &rmcp::service::Peer<RoleServer>,
-    ) -> Result<(), ErrorData> {
+    async fn refresh_roots(&self, peer: &rmcp::service::Peer<RoleServer>) -> Result<(), ErrorData> {
         let result = peer.list_roots().await.map_err(|err| {
-            ErrorData::internal_error(
-                format!("failed to fetch roots from peer: {err}"),
-                None,
-            )
+            ErrorData::internal_error(format!("failed to fetch roots from peer: {err}"), None)
         })?;
 
         let roots = result
@@ -128,7 +122,9 @@ impl BashServer {
             return Err(ErrorData::invalid_params("command cannot be empty", None));
         }
 
-        let working_dir = self.resolve_working_dir(params.working_dir.as_deref()).await?;
+        let working_dir = self
+            .resolve_working_dir(params.working_dir.as_deref())
+            .await?;
         let timeout_secs = params.timeout_secs.unwrap_or(120);
         let default_opts = TruncateOpts::default();
         let truncate_opts = TruncateOpts {
@@ -136,7 +132,9 @@ impl BashServer {
             tail_lines: params.tail_lines.unwrap_or(default_opts.tail_lines),
             line_head_bytes: default_opts.line_head_bytes,
             line_tail_bytes: default_opts.line_tail_bytes,
-            max_output_bytes: params.max_output_bytes.unwrap_or(default_opts.max_output_bytes),
+            max_output_bytes: params
+                .max_output_bytes
+                .unwrap_or(default_opts.max_output_bytes),
         };
 
         let mut child = Command::new("bash")
@@ -188,8 +186,16 @@ impl BashServer {
                 let _ = writeln!(output, "exit_code: {exit_code}");
                 let _ = writeln!(output, "working_dir: {}", working_dir.display());
                 let _ = writeln!(output, "total_lines: {total_lines}");
-                let _ = writeln!(output, "total_bytes: {total_bytes} ({})", format_size(total_bytes));
-                let _ = write!(output, "\n{}", render_output_block(&sanitized_output, &truncated_output));
+                let _ = writeln!(
+                    output,
+                    "total_bytes: {total_bytes} ({})",
+                    format_size(total_bytes)
+                );
+                let _ = write!(
+                    output,
+                    "\n{}",
+                    render_output_block(&sanitized_output, &truncated_output)
+                );
                 Ok(CallToolResult::success(vec![Content::text(output)]))
             }
             None => tool_error(render_timeout_message(
@@ -224,14 +230,20 @@ impl BashServer {
 
         let canonical = resolved.canonicalize().map_err(|err| {
             ErrorData::invalid_params(
-                format!("cannot resolve working directory '{}': {err}", resolved.display()),
+                format!(
+                    "cannot resolve working directory '{}': {err}",
+                    resolved.display()
+                ),
                 None,
             )
         })?;
 
         if !canonical.is_dir() {
             return Err(ErrorData::invalid_params(
-                format!("working directory '{}' is not a directory", canonical.display()),
+                format!(
+                    "working directory '{}' is not a directory",
+                    canonical.display()
+                ),
                 None,
             ));
         }
@@ -244,7 +256,10 @@ impl BashServer {
             })
         {
             return Err(ErrorData::invalid_params(
-                format!("working directory '{}' is outside allowed roots", canonical.display()),
+                format!(
+                    "working directory '{}' is outside allowed roots",
+                    canonical.display()
+                ),
                 None,
             ));
         }
@@ -265,46 +280,44 @@ impl ServerHandler for BashServer {
                 website_url: None,
                 icons: None,
             },
-            instructions: Some("Local shell command MCP server with output truncation.".to_string()),
+            instructions: Some(
+                "Local shell command MCP server with output truncation.".to_string(),
+            ),
         }
     }
 
-    fn list_tools(
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        async move {
-            Ok(ListToolsResult {
-                tools: vec![Tool::new(
-                    "exec_command",
-                    "Execute a local shell command in a validated working directory and return truncated combined output.",
-                    Map::new(),
-                )
-                .with_input_schema::<ExecCommandParams>()],
-                next_cursor: None,
-            })
-        }
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult {
+            tools: vec![Tool::new(
+                "exec",
+                "Execute a local bash command and return truncated combined stdout/stderr.",
+                Map::new(),
+            )
+            .with_input_schema::<ExecCommandParams>()],
+            next_cursor: None,
+        })
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParam,
         context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
-        async move {
-            let _ = self.ensure_roots_initialized(&context.peer).await;
+    ) -> Result<CallToolResult, ErrorData> {
+        let _ = self.ensure_roots_initialized(&context.peer).await;
 
-            match request.name.as_ref() {
-                "exec_command" => {
-                    let params = parse_arguments::<ExecCommandParams>(request.arguments)?;
-                    self.exec_command_impl(params).await
-                }
-                other => Err(ErrorData::invalid_params(
-                    format!("unknown tool: {other}"),
-                    None,
-                )),
+        match request.name.as_ref() {
+            "exec" => {
+                let params = parse_arguments::<ExecCommandParams>(request.arguments)?;
+                self.exec_command_impl(params).await
             }
+            other => Err(ErrorData::invalid_params(
+                format!("unknown tool: {other}"),
+                None,
+            )),
         }
     }
 
@@ -312,27 +325,14 @@ impl ServerHandler for BashServer {
         &self,
         context: NotificationContext<RoleServer>,
     ) -> impl Future<Output = ()> + Send + '_ {
+        let this = self.clone();
         async move {
-            if let Err(err) = self.refresh_roots(&context.peer).await {
-                eprintln!(
-                    "harnx-mcp-bash: failed to refresh roots for {:?}: {}",
-                    context.peer, err.message
-                );
-            }
-        }
-    }
-
-    fn on_initialized(
-        &self,
-        context: NotificationContext<RoleServer>,
-    ) -> impl Future<Output = ()> + Send + '_ {
-        async move {
-            if let Err(err) = self.refresh_roots(&context.peer).await {
-                eprintln!(
-                    "harnx-mcp-bash: failed to initialize roots for {:?}: {}",
-                    context.peer, err.message
-                );
-            }
+            let peer = context.peer.clone();
+            tokio::spawn(async move {
+                if let Err(err) = this.refresh_roots(&peer).await {
+                    eprintln!("harnx-mcp-bash: failed to refresh roots: {}", err.message);
+                }
+            });
         }
     }
 }
@@ -340,9 +340,8 @@ impl ServerHandler for BashServer {
 fn parse_arguments<T: DeserializeOwned>(
     arguments: Option<Map<String, Value>>,
 ) -> Result<T, ErrorData> {
-    serde_json::from_value(Value::Object(arguments.unwrap_or_default())).map_err(|err| {
-        ErrorData::invalid_params(format!("invalid tool arguments: {err}"), None)
-    })
+    serde_json::from_value(Value::Object(arguments.unwrap_or_default()))
+        .map_err(|err| ErrorData::invalid_params(format!("invalid tool arguments: {err}"), None))
 }
 
 fn tool_error(msg: impl Into<String>) -> Result<CallToolResult, ErrorData> {
@@ -464,7 +463,257 @@ fn render_timeout_message(
     );
     let _ = writeln!(output, "working_dir: {}", working_dir.display());
     let _ = writeln!(output, "total_lines: {total_lines}");
-    let _ = writeln!(output, "total_bytes: {total_bytes} ({})", format_size(total_bytes));
+    let _ = writeln!(
+        output,
+        "total_bytes: {total_bytes} ({})",
+        format_size(total_bytes)
+    );
     let _ = write!(output, "\n{}", render_output_block(original, truncated));
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rmcp::handler::client::ClientHandler;
+    use rmcp::model::{
+        CallToolRequestParam, ClientCapabilities, InitializeRequestParam, ListRootsResult,
+        ProtocolVersion, Root,
+    };
+    use rmcp::service::{
+        serve_client, serve_server, RequestContext, RoleClient, RoleServer, RunningService,
+    };
+    use tokio::io::duplex;
+    use uuid::Uuid;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("harnx-mcp-bash-test-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestClientHandler {
+        roots: Vec<PathBuf>,
+    }
+
+    impl TestClientHandler {
+        fn new(roots: Vec<PathBuf>) -> Self {
+            Self { roots }
+        }
+    }
+
+    impl ClientHandler for TestClientHandler {
+        fn get_info(&self) -> InitializeRequestParam {
+            InitializeRequestParam {
+                protocol_version: ProtocolVersion::default(),
+                capabilities: ClientCapabilities::builder()
+                    .enable_roots()
+                    .enable_roots_list_changed()
+                    .build(),
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "0.1".to_string(),
+                    ..Default::default()
+                },
+            }
+        }
+
+        async fn list_roots(
+            &self,
+            _cx: RequestContext<RoleClient>,
+        ) -> Result<ListRootsResult, ErrorData> {
+            Ok(ListRootsResult {
+                roots: self
+                    .roots
+                    .iter()
+                    .map(|root| Root {
+                        uri: format!("file://{}", root.canonicalize().unwrap().display()),
+                        name: None,
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    struct TestConnection {
+        _server_service: RunningService<RoleServer, BashServer>,
+        client_service: RunningService<RoleClient, TestClientHandler>,
+    }
+
+    async fn connect_server(server: BashServer, roots: Vec<PathBuf>) -> TestConnection {
+        let (client_transport, server_transport) = duplex(65_536);
+        let server_fut = serve_server(server, server_transport);
+        let client_fut = serve_client(TestClientHandler::new(roots), client_transport);
+        let (server_res, client_res) = tokio::join!(server_fut, client_fut);
+        TestConnection {
+            _server_service: server_res.unwrap(),
+            client_service: client_res.unwrap(),
+        }
+    }
+
+    fn text_content(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .find_map(|content| content.raw.as_text().map(|text| text.text.clone()))
+            .unwrap()
+    }
+
+    fn tool_args(value: Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn test_bash_server_list_tools() {
+        let temp_dir = TestDir::new();
+        let TestConnection {
+            _server_service,
+            client_service,
+        } = connect_server(
+            BashServer::new(vec![temp_dir.path().to_path_buf()]),
+            vec![temp_dir.path().to_path_buf()],
+        )
+        .await;
+        let peer = client_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        let tools = peer.list_tools(Default::default()).await.unwrap();
+        let names = tools
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["exec"]);
+    }
+
+    #[tokio::test]
+    async fn test_bash_server_exec_echo() {
+        let temp_dir = TestDir::new();
+        let TestConnection {
+            _server_service,
+            client_service,
+        } = connect_server(
+            BashServer::new(vec![temp_dir.path().to_path_buf()]),
+            vec![temp_dir.path().to_path_buf()],
+        )
+        .await;
+        let peer = client_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        let result = peer
+            .call_tool(CallToolRequestParam {
+                name: "exec".into(),
+                arguments: Some(tool_args(serde_json::json!({
+                    "command": "echo hello",
+                    "working_dir": temp_dir.path().to_string_lossy().to_string()
+                }))),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_server_exec_exit_code() {
+        let temp_dir = TestDir::new();
+        let TestConnection {
+            _server_service,
+            client_service,
+        } = connect_server(
+            BashServer::new(vec![temp_dir.path().to_path_buf()]),
+            vec![temp_dir.path().to_path_buf()],
+        )
+        .await;
+        let peer = client_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        let result = peer
+            .call_tool(CallToolRequestParam {
+                name: "exec".into(),
+                arguments: Some(tool_args(serde_json::json!({
+                    "command": "exit 1",
+                    "working_dir": temp_dir.path().to_string_lossy().to_string()
+                }))),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("exit_code: 1"));
+    }
+
+    #[tokio::test]
+    async fn test_exec_basic_command() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "echo test".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("test"));
+    }
+
+    #[tokio::test]
+    async fn test_exec_timeout() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "sleep 10".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(1),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(true));
+        assert!(text.contains("command timed out after 1s and was terminated"));
+    }
 }

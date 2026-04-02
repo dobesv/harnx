@@ -8,7 +8,6 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
-use std::future::Future;
 
 #[derive(Clone)]
 pub struct TimeServer {
@@ -22,9 +21,9 @@ impl TimeServer {
     }
 
     fn get_current_time_impl(&self, timezone: &str) -> Result<CallToolResult, ErrorData> {
-        let tz: Tz = timezone
-            .parse()
-            .map_err(|_| ErrorData::invalid_params(format!("Invalid timezone: {timezone}"), None))?;
+        let tz: Tz = timezone.parse().map_err(|_| {
+            ErrorData::invalid_params(format!("Invalid timezone: {timezone}"), None)
+        })?;
 
         let now = Utc::now().with_timezone(&tz);
         let current_offset = now.offset().fix().local_minus_utc();
@@ -60,12 +59,12 @@ impl TimeServer {
         time_str: &str,
         target_tz: &str,
     ) -> Result<CallToolResult, ErrorData> {
-        let source: Tz = source_tz
-            .parse()
-            .map_err(|_| ErrorData::invalid_params(format!("Invalid source timezone: {source_tz}"), None))?;
-        let target: Tz = target_tz
-            .parse()
-            .map_err(|_| ErrorData::invalid_params(format!("Invalid target timezone: {target_tz}"), None))?;
+        let source: Tz = source_tz.parse().map_err(|_| {
+            ErrorData::invalid_params(format!("Invalid source timezone: {source_tz}"), None)
+        })?;
+        let target: Tz = target_tz.parse().map_err(|_| {
+            ErrorData::invalid_params(format!("Invalid target timezone: {target_tz}"), None)
+        })?;
 
         let parts: Vec<&str> = time_str.split(':').collect();
         if parts.len() != 2 {
@@ -158,15 +157,12 @@ impl TimeServer {
         time_str: &str,
         timezone: Option<&str>,
     ) -> Result<CallToolResult, ErrorData> {
-        let tz: Tz = timezone
-            .unwrap_or(&self.local_tz)
-            .parse()
-            .map_err(|_| {
-                ErrorData::invalid_params(
-                    format!("Invalid timezone: {}", timezone.unwrap_or(&self.local_tz)),
-                    None,
-                )
-            })?;
+        let tz: Tz = timezone.unwrap_or(&self.local_tz).parse().map_err(|_| {
+            ErrorData::invalid_params(
+                format!("Invalid timezone: {}", timezone.unwrap_or(&self.local_tz)),
+                None,
+            )
+        })?;
 
         let now = Utc::now().with_timezone(&tz);
 
@@ -174,7 +170,9 @@ impl TimeServer {
             .or_else(|_| chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%dT%H:%M"))
             .or_else(|_| {
                 // HH:MM — assume today (or tomorrow if already passed)
-                time_str.parse::<chrono::NaiveTime>().map(|t| now.date_naive().and_time(t))
+                time_str
+                    .parse::<chrono::NaiveTime>()
+                    .map(|t| now.date_naive().and_time(t))
             })
             .map_err(|_| {
                 ErrorData::invalid_params(
@@ -193,7 +191,7 @@ impl TimeServer {
 
         // If HH:MM was given and the time already passed today, target tomorrow
         let wait_duration = if wait_duration < chrono::Duration::zero() && !time_str.contains('-') {
-            actual_target = actual_target + chrono::Duration::days(1);
+            actual_target += chrono::Duration::days(1);
             actual_target.signed_duration_since(now)
         } else {
             wait_duration
@@ -255,150 +253,147 @@ impl ServerHandler for TimeServer {
         }
     }
 
-    fn list_tools(
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        async move {
-            let read_only = ToolAnnotations::new()
-                .read_only(true)
-                .destructive(false)
-                .idempotent(true)
-                .open_world(false);
+    ) -> Result<ListToolsResult, ErrorData> {
+        let read_only = ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false);
 
-            let local_tz = &self.local_tz;
+        let local_tz = &self.local_tz;
 
-            let tools = vec![
-                Tool::new(
-                    "get_current_time",
-                    "Get current time in a specific timezone",
-                    schema_object(
-                        vec![(
+        let tools = vec![
+            Tool::new(
+                "get_current_time",
+                "Get current time in a specific timezone",
+                schema_object(
+                    vec![(
+                        "timezone",
+                        "string",
+                        Some(format!(
+                            "IANA timezone name (e.g. 'America/New_York', 'Europe/London'). \
+                             Use '{local_tz}' for local timezone if none specified."
+                        )),
+                    )],
+                    &["timezone"],
+                ),
+            )
+            .annotate(read_only.clone()),
+            Tool::new(
+                "convert_time",
+                "Convert time between timezones",
+                schema_object(
+                    vec![
+                        (
+                            "source_timezone",
+                            "string",
+                            Some(format!(
+                                "Source IANA timezone name. Use '{local_tz}' for local timezone."
+                            )),
+                        ),
+                        (
+                            "time",
+                            "string",
+                            Some("Time in 24-hour format (HH:MM)".to_string()),
+                        ),
+                        (
+                            "target_timezone",
+                            "string",
+                            Some(format!(
+                                "Target IANA timezone name. Use '{local_tz}' for local timezone."
+                            )),
+                        ),
+                    ],
+                    &["source_timezone", "time", "target_timezone"],
+                ),
+            )
+            .annotate(read_only.clone()),
+            Tool::new(
+                "wait",
+                "Wait/sleep for a specified number of seconds (max 3600). Useful for polling or rate-limiting.",
+                schema_object(
+                    vec![(
+                        "seconds",
+                        "number",
+                        Some("Duration to wait in seconds (max 3600)".to_string()),
+                    )],
+                    &["seconds"],
+                ),
+            )
+            .annotate(
+                ToolAnnotations::new()
+                    .read_only(true)
+                    .destructive(false)
+                    .idempotent(false)
+                    .open_world(false),
+            ),
+            Tool::new(
+                "wait_until",
+                "Wait until a specific time. Accepts HH:MM (today/tomorrow), or full datetime YYYY-MM-DDTHH:MM. Max 24 hours.",
+                schema_object(
+                    vec![
+                        (
+                            "time",
+                            "string",
+                            Some("Target time: HH:MM (today, or tomorrow if past), YYYY-MM-DDTHH:MM, or YYYY-MM-DDTHH:MM:SS".to_string()),
+                        ),
+                        (
                             "timezone",
                             "string",
                             Some(format!(
-                                "IANA timezone name (e.g. 'America/New_York', 'Europe/London'). \
-                                 Use '{local_tz}' for local timezone if none specified."
+                                "IANA timezone for the target time. Defaults to '{local_tz}'."
                             )),
-                        )],
-                        &["timezone"],
-                    ),
-                )
-                .annotate(read_only.clone()),
-                Tool::new(
-                    "convert_time",
-                    "Convert time between timezones",
-                    schema_object(
-                        vec![
-                            (
-                                "source_timezone",
-                                "string",
-                                Some(format!(
-                                    "Source IANA timezone name. Use '{local_tz}' for local timezone."
-                                )),
-                            ),
-                            (
-                                "time",
-                                "string",
-                                Some("Time in 24-hour format (HH:MM)".to_string()),
-                            ),
-                            (
-                                "target_timezone",
-                                "string",
-                                Some(format!(
-                                    "Target IANA timezone name. Use '{local_tz}' for local timezone."
-                                )),
-                            ),
-                        ],
-                        &["source_timezone", "time", "target_timezone"],
-                    ),
-                )
-                .annotate(read_only.clone()),
-                Tool::new(
-                    "wait",
-                    "Wait/sleep for a specified number of seconds (max 3600). Useful for polling or rate-limiting.",
-                    schema_object(
-                        vec![(
-                            "seconds",
-                            "number",
-                            Some("Duration to wait in seconds (max 3600)".to_string()),
-                        )],
-                        &["seconds"],
-                    ),
-                )
-                .annotate(
-                    ToolAnnotations::new()
-                        .read_only(true)
-                        .destructive(false)
-                        .idempotent(false)
-                        .open_world(false),
+                        ),
+                    ],
+                    &["time"],
                 ),
-                Tool::new(
-                    "wait_until",
-                    "Wait until a specific time. Accepts HH:MM (today/tomorrow), or full datetime YYYY-MM-DDTHH:MM. Max 24 hours.",
-                    schema_object(
-                        vec![
-                            (
-                                "time",
-                                "string",
-                                Some("Target time: HH:MM (today, or tomorrow if past), YYYY-MM-DDTHH:MM, or YYYY-MM-DDTHH:MM:SS".to_string()),
-                            ),
-                            (
-                                "timezone",
-                                "string",
-                                Some(format!(
-                                    "IANA timezone for the target time. Defaults to '{local_tz}'."
-                                )),
-                            ),
-                        ],
-                        &["time"],
-                    ),
-                )
-                .annotate(
-                    ToolAnnotations::new()
-                        .read_only(true)
-                        .destructive(false)
-                        .idempotent(false)
-                        .open_world(false),
-                ),
-            ];
+            )
+            .annotate(
+                ToolAnnotations::new()
+                    .read_only(true)
+                    .destructive(false)
+                    .idempotent(false)
+                    .open_world(false),
+            ),
+        ];
 
-            Ok(ListToolsResult {
-                tools,
-                next_cursor: None,
-            })
-        }
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+        })
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParam,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
-        async move {
-            match request.name.as_ref() {
-                "get_current_time" => {
-                    let args = parse_arguments::<GetCurrentTimeParams>(request.arguments)?;
-                    self.get_current_time_impl(&args.timezone)
-                }
-                "convert_time" => {
-                    let args = parse_arguments::<ConvertTimeParams>(request.arguments)?;
-                    self.convert_time_impl(&args.source_timezone, &args.time, &args.target_timezone)
-                }
-                "wait" => {
-                    let args = parse_arguments::<WaitParams>(request.arguments)?;
-                    self.wait_impl(args.seconds).await
-                }
-                "wait_until" => {
-                    let args = parse_arguments::<WaitUntilParams>(request.arguments)?;
-                    self.wait_until_impl(&args.time, args.timezone.as_deref()).await
-                }
-                other => Err(ErrorData::invalid_params(
-                    format!("unknown tool: {other}"),
-                    None,
-                )),
+    ) -> Result<CallToolResult, ErrorData> {
+        match request.name.as_ref() {
+            "get_current_time" => {
+                let args = parse_arguments::<GetCurrentTimeParams>(request.arguments)?;
+                self.get_current_time_impl(&args.timezone)
             }
+            "convert_time" => {
+                let args = parse_arguments::<ConvertTimeParams>(request.arguments)?;
+                self.convert_time_impl(&args.source_timezone, &args.time, &args.target_timezone)
+            }
+            "wait" => {
+                let args = parse_arguments::<WaitParams>(request.arguments)?;
+                self.wait_impl(args.seconds).await
+            }
+            "wait_until" => {
+                let args = parse_arguments::<WaitUntilParams>(request.arguments)?;
+                self.wait_until_impl(&args.time, args.timezone.as_deref())
+                    .await
+            }
+            other => Err(ErrorData::invalid_params(
+                format!("unknown tool: {other}"),
+                None,
+            )),
         }
     }
 }
@@ -430,9 +425,8 @@ struct WaitUntilParams {
 fn parse_arguments<T: DeserializeOwned>(
     arguments: Option<Map<String, Value>>,
 ) -> Result<T, ErrorData> {
-    serde_json::from_value(Value::Object(arguments.unwrap_or_default())).map_err(|err| {
-        ErrorData::invalid_params(format!("invalid tool arguments: {err}"), None)
-    })
+    serde_json::from_value(Value::Object(arguments.unwrap_or_default()))
+        .map_err(|err| ErrorData::invalid_params(format!("invalid tool arguments: {err}"), None))
 }
 
 fn schema_object(
@@ -464,4 +458,149 @@ fn schema_object(
     );
 
     schema
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rmcp::handler::client::ClientHandler;
+    use rmcp::model::{ClientCapabilities, InitializeRequestParam, ProtocolVersion};
+    use rmcp::service::{serve_client, serve_server, RoleClient, RoleServer, RunningService};
+    use tokio::io::duplex;
+
+    #[derive(Clone, Default)]
+    struct TestClientHandler;
+
+    impl ClientHandler for TestClientHandler {
+        fn get_info(&self) -> InitializeRequestParam {
+            InitializeRequestParam {
+                protocol_version: ProtocolVersion::default(),
+                capabilities: ClientCapabilities::builder()
+                    .enable_roots()
+                    .enable_roots_list_changed()
+                    .build(),
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "0.1".to_string(),
+                    ..Default::default()
+                },
+            }
+        }
+    }
+
+    struct TestConnection {
+        _server_service: RunningService<RoleServer, TimeServer>,
+        client_service: RunningService<RoleClient, TestClientHandler>,
+    }
+
+    async fn connect_server(server: TimeServer) -> TestConnection {
+        let (client_transport, server_transport) = duplex(65_536);
+        let server_fut = serve_server(server, server_transport);
+        let client_fut = serve_client(TestClientHandler, client_transport);
+        let (server_res, client_res) = tokio::join!(server_fut, client_fut);
+        TestConnection {
+            _server_service: server_res.unwrap(),
+            client_service: client_res.unwrap(),
+        }
+    }
+
+    fn text_content(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .find_map(|content| content.raw.as_text().map(|text| text.text.clone()))
+            .unwrap()
+    }
+
+    fn tool_args(value: Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn test_time_server_list_tools() {
+        let TestConnection {
+            _server_service,
+            client_service,
+        } = connect_server(TimeServer::new()).await;
+        let peer = client_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        let tools = peer.list_tools(Default::default()).await.unwrap();
+        let names = tools
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec!["get_current_time", "convert_time", "wait", "wait_until"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_time_server_get_current_time() {
+        let TestConnection {
+            _server_service,
+            client_service,
+        } = connect_server(TimeServer::new()).await;
+        let peer = client_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        let result = peer
+            .call_tool(CallToolRequestParam {
+                name: "get_current_time".into(),
+                arguments: Some(tool_args(serde_json::json!({ "timezone": "UTC" }))),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("\"timezone\": \"UTC\""));
+    }
+
+    #[test]
+    fn test_get_current_time_utc() {
+        let server = TimeServer::new();
+        let result = server.get_current_time_impl("UTC").unwrap();
+        let text = text_content(&result);
+        let json: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["timezone"], "UTC");
+        assert!(json["datetime"].as_str().unwrap().ends_with("+00:00"));
+    }
+
+    #[test]
+    fn test_convert_time_basic() {
+        let server = TimeServer::new();
+        let result = server
+            .convert_time_impl("UTC", "12:30", "America/New_York")
+            .unwrap();
+        let text = text_content(&result);
+        let json: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["source"]["timezone"], "UTC");
+        assert_eq!(json["target"]["timezone"], "America/New_York");
+        assert!(json["time_difference"].as_str().unwrap().ends_with('h'));
+    }
+
+    #[tokio::test]
+    async fn test_wait_until_past_date_rejected() {
+        let server = TimeServer::new();
+        let past = (Utc::now() - chrono::Duration::minutes(1))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+
+        let error = server
+            .wait_until_impl(&past, Some("UTC"))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("is in the past"));
+    }
 }

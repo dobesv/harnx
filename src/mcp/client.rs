@@ -5,13 +5,16 @@ use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::RwLock;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CallToolRequestParam, ClientCapabilities, ErrorData, Implementation, ListRootsResult, Root,
-    ProtocolVersion, InitializeRequestParam,
+    CallToolRequestParam, ClientCapabilities, ErrorData, Implementation, InitializeRequestParam,
+    ListRootsResult, ProtocolVersion, Root,
 };
 use rmcp::service::{RequestContext, RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
+use std::process::Stdio;
+use std::time::Duration;
 use std::{collections::HashMap, fmt, path::Path, sync::Arc};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::runtime::{Builder, Handle};
 
@@ -21,6 +24,7 @@ pub struct McpClient {
     tools: Arc<RwLock<Vec<ToolDeclaration>>>,
     roots: Arc<RwLock<Vec<String>>>,
     connected: Arc<RwLock<bool>>,
+    connection_failed: Arc<RwLock<bool>>,
     service: Arc<RwLock<Option<RunningService<RoleClient, McpClientHandler>>>>,
 }
 
@@ -67,10 +71,7 @@ impl ClientHandler for McpClientHandler {
                 } else {
                     format!("file://{}", r)
                 };
-                Root {
-                    uri: uri.into(),
-                    name: None,
-                }
+                Root { uri, name: None }
             })
             .collect();
         Ok(ListRootsResult { roots })
@@ -106,6 +107,7 @@ impl McpClient {
             tools: Arc::new(RwLock::new(Vec::new())),
             roots: Arc::new(RwLock::new(roots)),
             connected: Arc::new(RwLock::new(false)),
+            connection_failed: Arc::new(RwLock::new(false)),
             service: Arc::new(RwLock::new(None)),
         }
     }
@@ -118,42 +120,79 @@ impl McpClient {
         *self.connected.read()
     }
 
+    fn connection_failed(&self) -> bool {
+        *self.connection_failed.read()
+    }
+
     pub async fn connect(&self) -> Result<()> {
+        *self.connection_failed.write() = false;
         if self.is_connected() {
             return Ok(());
         }
 
+        match self.connect_inner().await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                *self.connection_failed.write() = true;
+                Err(err)
+            }
+        }
+    }
+
+    async fn connect_inner(&self) -> Result<()> {
         let mut command = Command::new(&self.config.command);
         command.args(&self.config.args);
         command.envs(&self.config.env);
 
-        let transport = TokioChildProcess::new(command)
+        let (transport, stderr) = TokioChildProcess::builder(command)
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("Failed to spawn MCP server '{}'", self.name))?;
 
-        let handler = McpClientHandler::new(self.roots.clone());
-        let service = rmcp::service::serve_client(handler, transport)
-            .await
-            .with_context(|| {
-                format!("Failed to initialize MCP client for server '{}'", self.name)
-            })?;
+        if let Some(stderr) = stderr {
+            let server_name = self.name.clone();
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    log::debug!("[mcp:{}] {}", server_name, line);
+                }
+            });
+        }
 
-        let functions = service
-            .peer()
-            .list_tools(Default::default())
-            .await
-            .with_context(|| format!("Failed to list tools for MCP server '{}'", self.name))?
-            .tools
-            .into_iter()
-            .map(|tool| {
-                let input_schema = Value::Object((*tool.input_schema).clone());
-                mcp_tool_to_declaration(
-                    &self.name,
-                    tool.name.as_ref(),
-                    tool.description.as_deref().unwrap_or_default(),
-                    &input_schema,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let handler = McpClientHandler::new(self.roots.clone());
+        let service = tokio::time::timeout(
+            Duration::from_secs(30),
+            rmcp::service::serve_client(handler, transport),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "MCP server '{}' timed out during initialization (30s)",
+                self.name
+            )
+        })?
+        .with_context(|| format!("Failed to initialize MCP client for server '{}'", self.name))?;
+
+        let functions = tokio::time::timeout(
+            Duration::from_secs(10),
+            service.peer().list_tools(Default::default()),
+        )
+        .await
+        .map_err(|_| anyhow!("MCP server '{}' timed out listing tools (10s)", self.name))?
+        .with_context(|| format!("Failed to list tools for MCP server '{}'", self.name))?
+        .tools
+        .into_iter()
+        .map(|tool| {
+            let input_schema = Value::Object((*tool.input_schema).clone());
+            mcp_tool_to_declaration(
+                &self.name,
+                tool.name.as_ref(),
+                tool.description.as_deref().unwrap_or_default(),
+                &input_schema,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
 
         *self.tools.write() = functions;
         *self.connected.write() = true;
@@ -260,12 +299,10 @@ impl McpClient {
 mod tests {
     use super::*;
     use rmcp::handler::server::ServerHandler;
-    use rmcp::model::{
-        InitializeResult, ListToolsResult, ServerCapabilities,
-    };
+    use rmcp::model::{InitializeResult, ListToolsResult, ServerCapabilities};
     use rmcp::service::{serve_server, NotificationContext};
-    use tokio::io::duplex;
     use std::time::Duration;
+    use tokio::io::duplex;
 
     #[derive(Clone, Default, Debug)]
     struct MockServerHandler {
@@ -311,10 +348,7 @@ mod tests {
             })
         }
 
-        async fn on_roots_list_changed(
-            &self,
-            _cx: NotificationContext<rmcp::service::RoleServer>,
-        ) {
+        async fn on_roots_list_changed(&self, _cx: NotificationContext<rmcp::service::RoleServer>) {
             *self.roots_list_changed_notified.write() = true;
         }
     }
@@ -339,7 +373,7 @@ mod tests {
 
         // Run client in background
         let _client_task = tokio::spawn(async move {
-             let _ = _client_service.waiting().await;
+            let _ = _client_service.waiting().await;
         });
 
         // Verify roots in initialize params
@@ -347,7 +381,10 @@ mod tests {
             let params = mock_server.initialized_params.read();
             let params = params.as_ref().unwrap();
             assert!(params.capabilities.roots.is_some());
-            assert_eq!(params.capabilities.roots.as_ref().unwrap().list_changed, Some(true));
+            assert_eq!(
+                params.capabilities.roots.as_ref().unwrap().list_changed,
+                Some(true)
+            );
         }
 
         let server_peer = mock_server.peer.read().as_ref().unwrap().clone();
@@ -392,7 +429,7 @@ mod tests {
 
         // Run client in background
         let _client_task = tokio::spawn(async move {
-             let _ = _client_service.waiting().await;
+            let _ = _client_service.waiting().await;
         });
 
         let server_peer = mock_server.peer.read().as_ref().unwrap().clone();
@@ -401,10 +438,14 @@ mod tests {
         let roots_result = server_peer.list_roots().await.unwrap();
         assert_eq!(roots_result.roots.len(), 1);
         let uri = roots_result.roots[0].uri.clone();
-        
+
         // It should be an absolute path
-        assert!(uri.starts_with("file:///"), "URI should be an absolute file URI, got: {}", uri);
-        
+        assert!(
+            uri.starts_with("file:///"),
+            "URI should be an absolute file URI, got: {}",
+            uri
+        );
+
         let expected_path = std::env::current_dir().unwrap().canonicalize().unwrap();
         let expected_uri = format!("file://{}", expected_path.to_string_lossy());
         // Note: canonicalize might add \\?\ prefix on Windows, but we are on Linux.
@@ -461,17 +502,29 @@ impl McpManager {
 
     pub async fn get_all_tools(&self) -> Vec<ToolDeclaration> {
         let clients: Vec<_> = self.clients.read().values().cloned().collect();
-        for client in &clients {
-            if !client.is_connected() {
-                if let Err(err) = client.connect().await {
-                    log::warn!(
-                        "Failed to connect to MCP server '{}': {}",
-                        client.name(),
-                        err
-                    );
+        let connect_futures: Vec<_> = clients
+            .iter()
+            .filter(|c| !c.is_connected() && !c.connection_failed())
+            .map(|client| {
+                let client = client.clone();
+                async move {
+                    if let Err(err) = client.connect().await {
+                        eprintln!(
+                            "Warning: MCP server '{}' failed to connect: {}. Use '.mcp connect {}' to retry.",
+                            client.name(),
+                            err,
+                            client.name(),
+                        );
+                        log::warn!(
+                            "MCP server '{}' connection failed: {}",
+                            client.name(),
+                            err,
+                        );
+                    }
                 }
-            }
-        }
+            })
+            .collect();
+        futures_util::future::join_all(connect_futures).await;
 
         let mut tools: Vec<_> = clients
             .iter()
@@ -511,11 +564,8 @@ impl McpManager {
     }
 
     pub async fn call_tool(&self, prefixed_name: &str, arguments: Value) -> Result<Value> {
-        let tool_name = prefixed_name
-            .strip_prefix("mcp__")
-            .ok_or_else(|| anyhow!("Invalid MCP tool name '{}'", prefixed_name))?;
-        let (server_name, tool_name) = tool_name
-            .split_once("__")
+        let (server_name, tool_name) = prefixed_name
+            .split_once('_')
             .ok_or_else(|| anyhow!("Invalid MCP tool name '{}'", prefixed_name))?;
 
         let client = self

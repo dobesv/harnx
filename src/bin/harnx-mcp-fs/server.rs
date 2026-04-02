@@ -1,15 +1,14 @@
 use harnx::mcp_safety::{
     format_size, is_binary_content, sanitize_output_text, truncate_line, truncate_output,
     validate_path, validate_write_path, TruncateOpts, DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT,
-    DEFAULT_LS_LIMIT, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, LS_SCAN_HARD_LIMIT,
-    READ_MAX_FILE_BYTES, WRITE_MAX_BYTES,
+    DEFAULT_LS_LIMIT, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH,
+    LS_SCAN_HARD_LIMIT, READ_MAX_FILE_BYTES, WRITE_MAX_BYTES,
 };
 
 use fancy_regex::Regex;
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation,
-    ListToolsResult, PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool,
-    ToolAnnotations,
+    CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
+    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
@@ -165,10 +164,7 @@ impl JsonSchema for ListDirectoryParams {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let path = generator.subschema_for::<String>();
         let recursive = generator.subschema_for::<Option<bool>>();
-        object_schema(
-            vec![("path", path), ("recursive", recursive)],
-            &["path"],
-        )
+        object_schema(vec![("path", path), ("recursive", recursive)], &["path"])
     }
 }
 
@@ -232,15 +228,9 @@ impl FsServer {
         }
     }
 
-    async fn refresh_roots(
-        &self,
-        peer: &rmcp::service::Peer<RoleServer>,
-    ) -> Result<(), ErrorData> {
+    async fn refresh_roots(&self, peer: &rmcp::service::Peer<RoleServer>) -> Result<(), ErrorData> {
         let result = peer.list_roots().await.map_err(|err| {
-            ErrorData::internal_error(
-                format!("failed to fetch roots from peer: {err}"),
-                None,
-            )
+            ErrorData::internal_error(format!("failed to fetch roots from peer: {err}"), None)
         })?;
 
         let roots = result
@@ -577,8 +567,9 @@ impl FsServer {
             params.pattern.clone()
         };
 
-        let regex = Regex::new(&pattern)
-            .map_err(|err| ErrorData::invalid_params(format!("invalid regex '{}': {err}", params.pattern), None))?;
+        let regex = Regex::new(&pattern).map_err(|err| {
+            ErrorData::invalid_params(format!("invalid regex '{}': {err}", params.pattern), None)
+        })?;
 
         let include_glob = match params.include.as_deref() {
             Some(pattern) => Some(glob::Pattern::new(pattern).map_err(|err| {
@@ -644,8 +635,9 @@ impl FsServer {
 
         let max_results = params.max_results.unwrap_or(DEFAULT_FIND_LIMIT);
         let full_pattern = format!("{}/{}", search_path.display(), params.pattern);
-        let glob_results = glob::glob(&full_pattern)
-            .map_err(|err| ErrorData::invalid_params(format!("invalid glob pattern: {err}"), None))?;
+        let glob_results = glob::glob(&full_pattern).map_err(|err| {
+            ErrorData::invalid_params(format!("invalid glob pattern: {err}"), None)
+        })?;
 
         let mut paths = Vec::new();
         for entry in glob_results {
@@ -704,77 +696,73 @@ impl ServerHandler for FsServer {
         }
     }
 
-    fn list_tools(
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        async move {
-            let read_only = ToolAnnotations::new().read_only(true);
-            let tools = vec![
-                Tool::new("read_file", "Read a text file with numbering, pagination, grep, and truncation.", Map::new())
+    ) -> Result<ListToolsResult, ErrorData> {
+        let read_only = ToolAnnotations::new().read_only(true);
+        let tools = vec![
+                Tool::new("read", "Read a text file with line numbers, pagination, grep filtering, and smart truncation.", Map::new())
                     .with_input_schema::<ReadFileParams>()
                     .annotate(read_only.clone()),
-                Tool::new("write_file", "Write or create a file, replacing its contents.", Map::new())
+                Tool::new("write", "Write or create a file, replacing its contents.", Map::new())
                     .with_input_schema::<WriteFileParams>(),
-                Tool::new("edit_file", "Replace exact text within an existing file.", Map::new())
+                Tool::new("edit", "Replace exact text within an existing file.", Map::new())
                     .with_input_schema::<EditFileParams>(),
-                Tool::new("list_directory", "List directory contents, optionally recursively.", Map::new())
+                Tool::new("ls", "List directory contents, optionally recursively.", Map::new())
                     .with_input_schema::<ListDirectoryParams>()
                     .annotate(read_only.clone()),
-                Tool::new("search_files", "Search file contents with regex and optional context lines.", Map::new())
+                Tool::new("grep", "Search file contents with regex and optional context lines.", Map::new())
                     .with_input_schema::<SearchFilesParams>()
                     .annotate(read_only.clone()),
-                Tool::new("find_files", "Find files by glob pattern.", Map::new())
+                Tool::new("find", "Find files by glob pattern.", Map::new())
                     .with_input_schema::<FindFilesParams>()
                     .annotate(read_only),
             ];
 
-            Ok(ListToolsResult {
-                tools,
-                next_cursor: None,
-            })
-        }
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+        })
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParam,
         context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
-        async move {
-            let _ = self.ensure_roots_initialized(&context.peer).await;
+    ) -> Result<CallToolResult, ErrorData> {
+        let _ = self.ensure_roots_initialized(&context.peer).await;
 
-            match request.name.as_ref() {
-                "read_file" => {
-                    let params = parse_arguments::<ReadFileParams>(request.arguments)?;
-                    self.read_file_impl(params).await
-                }
-                "write_file" => {
-                    let params = parse_arguments::<WriteFileParams>(request.arguments)?;
-                    self.write_file_impl(params).await
-                }
-                "edit_file" => {
-                    let params = parse_arguments::<EditFileParams>(request.arguments)?;
-                    self.edit_file_impl(params).await
-                }
-                "list_directory" => {
-                    let params = parse_arguments::<ListDirectoryParams>(request.arguments)?;
-                    self.list_directory_impl(params).await
-                }
-                "search_files" => {
-                    let params = parse_arguments::<SearchFilesParams>(request.arguments)?;
-                    self.search_files_impl(params).await
-                }
-                "find_files" => {
-                    let params = parse_arguments::<FindFilesParams>(request.arguments)?;
-                    self.find_files_impl(params).await
-                }
-                other => Err(ErrorData::invalid_params(
-                    format!("unknown tool: {other}"),
-                    None,
-                )),
+        match request.name.as_ref() {
+            "read" => {
+                let params = parse_arguments::<ReadFileParams>(request.arguments)?;
+                self.read_file_impl(params).await
             }
+            "write" => {
+                let params = parse_arguments::<WriteFileParams>(request.arguments)?;
+                self.write_file_impl(params).await
+            }
+            "edit" => {
+                let params = parse_arguments::<EditFileParams>(request.arguments)?;
+                self.edit_file_impl(params).await
+            }
+            "ls" => {
+                let params = parse_arguments::<ListDirectoryParams>(request.arguments)?;
+                self.list_directory_impl(params).await
+            }
+            "grep" => {
+                let params = parse_arguments::<SearchFilesParams>(request.arguments)?;
+                self.search_files_impl(params).await
+            }
+            "find" => {
+                let params = parse_arguments::<FindFilesParams>(request.arguments)?;
+                self.find_files_impl(params).await
+            }
+            other => Err(ErrorData::invalid_params(
+                format!("unknown tool: {other}"),
+                None,
+            )),
         }
     }
 
@@ -782,27 +770,14 @@ impl ServerHandler for FsServer {
         &self,
         context: NotificationContext<RoleServer>,
     ) -> impl Future<Output = ()> + Send + '_ {
+        let this = self.clone();
         async move {
-            if let Err(err) = self.refresh_roots(&context.peer).await {
-                eprintln!(
-                    "harnx-mcp-fs: failed to refresh roots for {:?}: {}",
-                    context.peer, err.message
-                );
-            }
-        }
-    }
-
-    fn on_initialized(
-        &self,
-        context: NotificationContext<RoleServer>,
-    ) -> impl Future<Output = ()> + Send + '_ {
-        async move {
-            if let Err(err) = self.refresh_roots(&context.peer).await {
-                eprintln!(
-                    "harnx-mcp-fs: failed to initialize roots for {:?}: {}",
-                    context.peer, err.message
-                );
-            }
+            let peer = context.peer.clone();
+            tokio::spawn(async move {
+                if let Err(err) = this.refresh_roots(&peer).await {
+                    eprintln!("harnx-mcp-fs: failed to refresh roots: {}", err.message);
+                }
+            });
         }
     }
 }
@@ -824,9 +799,8 @@ const SKIP_DIRS: &[&str] = &[
 fn parse_arguments<T: DeserializeOwned>(
     arguments: Option<Map<String, Value>>,
 ) -> Result<T, ErrorData> {
-    serde_json::from_value(Value::Object(arguments.unwrap_or_default())).map_err(|err| {
-        ErrorData::invalid_params(format!("invalid tool arguments: {err}"), None)
-    })
+    serde_json::from_value(Value::Object(arguments.unwrap_or_default()))
+        .map_err(|err| ErrorData::invalid_params(format!("invalid tool arguments: {err}"), None))
 }
 
 fn tool_error(msg: impl Into<String>) -> Result<CallToolResult, ErrorData> {
@@ -909,12 +883,7 @@ fn walk_dir_flat(dir: &Path, entries: &mut Vec<String>, scan_count: &mut usize) 
     }
 }
 
-fn walk_dir_recursive(
-    base: &Path,
-    dir: &Path,
-    entries: &mut Vec<String>,
-    scan_count: &mut usize,
-) {
+fn walk_dir_recursive(base: &Path, dir: &Path, entries: &mut Vec<String>, scan_count: &mut usize) {
     if *scan_count >= LS_SCAN_HARD_LIMIT {
         return;
     }
@@ -994,7 +963,15 @@ fn search_recursive(
 
         if file_type.is_dir() {
             if !SKIP_DIRS.contains(&name.as_str()) {
-                search_recursive(base, &path, regex, context_lines, max_results, include_glob, results);
+                search_recursive(
+                    base,
+                    &path,
+                    regex,
+                    context_lines,
+                    max_results,
+                    include_glob,
+                    results,
+                );
             }
             continue;
         }
@@ -1082,14 +1059,470 @@ fn search_file(
         if block_index > 0 {
             results.push("--".to_string());
         }
-        for index in *start..=*end {
-            let line = truncate_line(lines[index], GREP_MAX_LINE_LENGTH);
-            let line_number = index + 1;
-            let sep = if match_indices.contains(&index) { ":" } else { "-" };
-            results.push(format!("{}{}{}{} {}", relative, sep, line_number, sep, line));
+        for (index, line_content) in lines[*start..=*end].iter().enumerate() {
+            let abs_index = start + index;
+            let line = truncate_line(line_content, GREP_MAX_LINE_LENGTH);
+            let line_number = abs_index + 1;
+            let sep = if match_indices.contains(&abs_index) {
+                ":"
+            } else {
+                "-"
+            };
+            results.push(format!(
+                "{}{}{}{} {}",
+                relative, sep, line_number, sep, line
+            ));
             if results.len() >= max_results {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rmcp::handler::client::ClientHandler;
+    use rmcp::model::{
+        CallToolRequestParam, ClientCapabilities, InitializeRequestParam, ListRootsResult,
+        ProtocolVersion, Root,
+    };
+    use rmcp::service::{
+        serve_client, serve_server, RequestContext, RoleClient, RoleServer, RunningService,
+    };
+    use std::path::Path;
+    use tokio::io::duplex;
+    use uuid::Uuid;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("harnx-mcp-fs-test-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TestClientHandler {
+        roots: Vec<PathBuf>,
+    }
+
+    impl TestClientHandler {
+        fn new(roots: Vec<PathBuf>) -> Self {
+            Self { roots }
+        }
+    }
+
+    impl ClientHandler for TestClientHandler {
+        fn get_info(&self) -> InitializeRequestParam {
+            InitializeRequestParam {
+                protocol_version: ProtocolVersion::default(),
+                capabilities: ClientCapabilities::builder()
+                    .enable_roots()
+                    .enable_roots_list_changed()
+                    .build(),
+                client_info: Implementation {
+                    name: "test".to_string(),
+                    version: "0.1".to_string(),
+                    ..Default::default()
+                },
+            }
+        }
+
+        async fn list_roots(
+            &self,
+            _cx: RequestContext<RoleClient>,
+        ) -> Result<ListRootsResult, ErrorData> {
+            Ok(ListRootsResult {
+                roots: self
+                    .roots
+                    .iter()
+                    .map(|root| Root {
+                        uri: format!("file://{}", root.canonicalize().unwrap().display()),
+                        name: None,
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    struct TestConnection {
+        _server_service: RunningService<RoleServer, FsServer>,
+        client_service: RunningService<RoleClient, TestClientHandler>,
+    }
+
+    async fn connect_server(server: FsServer, roots: Vec<PathBuf>) -> TestConnection {
+        let (client_transport, server_transport) = duplex(65_536);
+        let server_fut = serve_server(server, server_transport);
+        let client_fut = serve_client(TestClientHandler::new(roots), client_transport);
+        let (server_res, client_res) = tokio::join!(server_fut, client_fut);
+        TestConnection {
+            _server_service: server_res.unwrap(),
+            client_service: client_res.unwrap(),
+        }
+    }
+
+    fn text_content(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .find_map(|content| content.raw.as_text().map(|text| text.text.clone()))
+            .unwrap()
+    }
+
+    fn tool_args(value: Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn test_fs_server_list_tools() {
+        let temp_dir = TestDir::new();
+        let TestConnection {
+            _server_service,
+            client_service,
+        } = connect_server(
+            FsServer::new(vec![temp_dir.path().to_path_buf()]),
+            vec![temp_dir.path().to_path_buf()],
+        )
+        .await;
+        let peer = client_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        let tools = peer.list_tools(Default::default()).await.unwrap();
+        let names = tools
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["read", "write", "edit", "ls", "grep", "find"]);
+    }
+
+    #[tokio::test]
+    async fn test_fs_server_read_file() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("notes.txt");
+        std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
+
+        let TestConnection {
+            _server_service,
+            client_service,
+        } = connect_server(
+            FsServer::new(vec![temp_dir.path().to_path_buf()]),
+            vec![temp_dir.path().to_path_buf()],
+        )
+        .await;
+        let peer = client_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        let result = peer
+            .call_tool(CallToolRequestParam {
+                name: "read".into(),
+                arguments: Some(tool_args(serde_json::json!({
+                    "path": file_path.to_string_lossy().to_string()
+                }))),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("1: alpha"));
+        assert!(text.contains("2: beta"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_server_write_and_read() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("written.txt");
+
+        let TestConnection {
+            _server_service,
+            client_service,
+        } = connect_server(
+            FsServer::new(vec![temp_dir.path().to_path_buf()]),
+            vec![temp_dir.path().to_path_buf()],
+        )
+        .await;
+        let peer = client_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        let write_result = peer
+            .call_tool(CallToolRequestParam {
+                name: "write".into(),
+                arguments: Some(tool_args(serde_json::json!({
+                    "path": file_path.to_string_lossy().to_string(),
+                    "content": "hello\nworld\n"
+                }))),
+            })
+            .await
+            .unwrap();
+        assert_eq!(write_result.is_error, Some(false));
+
+        let read_result = peer
+            .call_tool(CallToolRequestParam {
+                name: "read".into(),
+                arguments: Some(tool_args(serde_json::json!({
+                    "path": file_path.to_string_lossy().to_string()
+                }))),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&read_result);
+        assert!(text.contains("1: hello"));
+        assert!(text.contains("2: world"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_server_edit_file() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("edit.txt");
+        std::fs::write(&file_path, "old value\n").unwrap();
+
+        let TestConnection {
+            _server_service,
+            client_service,
+        } = connect_server(
+            FsServer::new(vec![temp_dir.path().to_path_buf()]),
+            vec![temp_dir.path().to_path_buf()],
+        )
+        .await;
+        let peer = client_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        let edit_result = peer
+            .call_tool(CallToolRequestParam {
+                name: "edit".into(),
+                arguments: Some(tool_args(serde_json::json!({
+                    "path": file_path.to_string_lossy().to_string(),
+                    "old_text": "old value",
+                    "new_text": "new value"
+                }))),
+            })
+            .await
+            .unwrap();
+        assert_eq!(edit_result.is_error, Some(false));
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "new value\n");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_offset_limit() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("offset.txt");
+        std::fs::write(&file_path, "one\ntwo\nthree\nfour\n").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .read_file_impl(ReadFileParams {
+                path: file_path.to_string_lossy().to_string(),
+                offset: Some(2),
+                limit: Some(2),
+                tail: None,
+                grep: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(text.contains("2: two"));
+        assert!(text.contains("3: three"));
+        assert!(text.contains("Use offset=4 to continue"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_grep() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("grep.txt");
+        std::fs::write(&file_path, "alpha\nmatch-one\nbeta\nmatch-two\n").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .read_file_impl(ReadFileParams {
+                path: file_path.to_string_lossy().to_string(),
+                offset: None,
+                limit: None,
+                tail: None,
+                grep: Some("match".to_string()),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(text.contains("2: match-one"));
+        assert!(text.contains("4: match-two"));
+        assert!(!text.contains("1: alpha"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_with_tail() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("tail.txt");
+        std::fs::write(&file_path, "one\ntwo\nthree\nfour\n").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .read_file_impl(ReadFileParams {
+                path: file_path.to_string_lossy().to_string(),
+                offset: None,
+                limit: None,
+                tail: Some(2),
+                grep: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(text.contains("3: three"));
+        assert!(text.contains("4: four"));
+        assert!(text.contains("showing last 2 of 4 matching lines"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_binary_detection() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("binary.bin");
+        std::fs::write(&file_path, b"hello\0world").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .read_file_impl(ReadFileParams {
+                path: file_path.to_string_lossy().to_string(),
+                offset: None,
+                limit: None,
+                tail: None,
+                grep: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_content(&result).contains("appears to be a binary file"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_unique_match() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("unique.txt");
+        std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .edit_file_impl(EditFileParams {
+                path: file_path.to_string_lossy().to_string(),
+                old_text: "beta".to_string(),
+                new_text: "gamma".to_string(),
+                replace_all: Some(false),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "alpha\ngamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_multiple_matches() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("multiple.txt");
+        std::fs::write(&file_path, "value\nvalue\n").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .edit_file_impl(EditFileParams {
+                path: file_path.to_string_lossy().to_string(),
+                old_text: "value".to_string(),
+                new_text: "updated".to_string(),
+                replace_all: Some(false),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_content(&result).contains("Found 2 matches"));
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_flat() {
+        let temp_dir = TestDir::new();
+        std::fs::create_dir_all(temp_dir.path().join("nested")).unwrap();
+        std::fs::write(temp_dir.path().join("root.txt"), "root").unwrap();
+        std::fs::write(temp_dir.path().join("nested").join("child.txt"), "child").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .list_directory_impl(ListDirectoryParams {
+                path: temp_dir.path().to_string_lossy().to_string(),
+                recursive: Some(false),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(text.contains("nested/"));
+        assert!(text.contains("root.txt"));
+        assert!(!text.contains("child.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_search_files_basic() {
+        let temp_dir = TestDir::new();
+        std::fs::write(temp_dir.path().join("one.txt"), "alpha\nneedle\nomega\n").unwrap();
+        std::fs::write(temp_dir.path().join("two.txt"), "nothing here\n").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .search_files_impl(SearchFilesParams {
+                pattern: "needle".to_string(),
+                path: Some(temp_dir.path().to_string_lossy().to_string()),
+                include: Some("*.txt".to_string()),
+                context_lines: Some(0),
+                ignore_case: Some(false),
+                max_results: Some(10),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(text.contains("one.txt:2: needle"));
+        assert!(!text.contains("two.txt"));
     }
 }

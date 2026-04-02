@@ -152,6 +152,20 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     if let Some(model_id) = &cli.model {
         config.write().set_model(model_id)?;
     }
+    if !cli.tool.is_empty() {
+        let existing = config.read().use_tools.clone().unwrap_or_default();
+        let mut tools: Vec<&str> = if existing.is_empty() {
+            vec![]
+        } else {
+            existing.split(',').map(str::trim).collect()
+        };
+        for t in &cli.tool {
+            if !tools.contains(&t.as_str()) {
+                tools.push(t.as_str());
+            }
+        }
+        config.write().use_tools = Some(tools.join(","));
+    }
     if cli.no_stream {
         config.write().stream = false;
     }
@@ -185,7 +199,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         shell_execute(&config, &SHELL, input, abort_signal.clone()).await?;
         return Ok(());
     }
-    config.write().apply_prelude()?;
+    config.write().apply_default_session()?;
     match is_repl {
         false => {
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
