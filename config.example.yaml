@@ -47,11 +47,7 @@ mcp_servers:
      description: >-
        Allow the agent to run commands or script snippets
    - name: time
-     command: harnx-mcp-time             # Shell command execution
-     # For the bash tool, the roots specify additional directories that can be used as the working
-     # directory for a command in addition to the working directory the harness was started in
-     # roots:
-     #  - "/home/user/projects"
+     command: harnx-mcp-time             # Time utilities: current time, convert, wait, wait_until
      description: >-
        Allow the agent to check the time or wait for a period of time
 #   - name: custom

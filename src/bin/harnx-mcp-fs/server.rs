@@ -458,6 +458,10 @@ impl FsServer {
             ));
         }
 
+        if params.old_text.is_empty() {
+            return tool_error("old_text must not be empty".to_string());
+        }
+
         let replace_all = params.replace_all.unwrap_or(false);
         let match_count = content.matches(&params.old_text).count();
 
@@ -475,6 +479,17 @@ impl FsServer {
             ));
         }
 
+        let replacements = if replace_all { match_count } else { 1 };
+        let size_delta = replacements * params.new_text.len().saturating_sub(params.old_text.len());
+        let projected_size = content.len() + size_delta;
+        if projected_size > WRITE_MAX_BYTES {
+            return tool_error(format!(
+                "Replacement would produce a file too large ({}, max {})",
+                format_size(projected_size),
+                format_size(WRITE_MAX_BYTES)
+            ));
+        }
+
         let new_content = if replace_all {
             content.replace(&params.old_text, &params.new_text)
         } else {
@@ -483,8 +498,6 @@ impl FsServer {
 
         std::fs::write(&path, new_content)
             .map_err(|err| internal_error(format!("failed to write '{}': {err}", params.path)))?;
-
-        let replacements = if replace_all { match_count } else { 1 };
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Edited {} ({} replacement{})",
             params.path,

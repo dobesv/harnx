@@ -9,7 +9,7 @@
 //! Usage:
 //!   harnx-mcp-fs [--root <path>]...
 //!
-//! If no roots are specified, all filesystem paths are accessible.
+//! If no roots are specified (via CLI or MCP client), all operations are denied.
 
 mod server;
 
@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
         "harnx-mcp-fs v{}: starting ({} root{})",
         env!("CARGO_PKG_VERSION"),
         if roots.is_empty() {
-            "unrestricted".to_string()
+            "no CLI roots, awaiting client roots".to_string()
         } else {
             roots.len().to_string()
         },
@@ -84,7 +84,7 @@ fn parse_args() -> Vec<PathBuf> {
                 eprintln!("  --help, -h         Show this help message");
                 eprintln!();
                 eprintln!("The server communicates via stdio using the MCP protocol.");
-                eprintln!("If no roots are specified, all filesystem paths are accessible.");
+                eprintln!("If no roots are specified, operations are denied until the client provides roots.");
                 eprintln!("Roots can also be provided dynamically by the MCP client.");
                 std::process::exit(0);
             }

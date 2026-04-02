@@ -53,11 +53,11 @@ Visit [https://github.com/sigoden/llm-functions](https://github.com/sigoden/llm-
 
 ## Default Session
 
-Default session settings allow you to automatically load a role or session when entering a mode.
+These fields accept a session spec that automatically loads a role or session when entering a mode. The spec format is `role:<name>`, `session:<name>`, or `<session>:<role>` (load a session and apply a role if the session is empty).
 
-- **repl_default_session**: Commands to run when entering REPL mode.
-- **cmd_default_session**: Commands to run when entering CMD mode.
-- **agent_default_session**: Session to use when starting an agent.
+- **repl_default_session**: Session spec applied when entering REPL mode (e.g. `role:code`, `session:default`, `temp:code`).
+- **cmd_default_session**: Session spec applied when entering CMD mode.
+- **agent_default_session**: Session identifier used when starting an agent (e.g. `temp`, `default`).
 
 ## Session
 

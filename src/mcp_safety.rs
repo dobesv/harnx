@@ -349,7 +349,7 @@ pub fn validate_path(path_str: &str, roots: &[PathBuf]) -> Result<PathBuf, Strin
         .map_err(|e| format!("Cannot resolve path '{}': {}", path_str, e))?;
 
     if roots.is_empty() {
-        return Ok(canonical);
+        return Err("No roots configured — all filesystem access is denied".to_string());
     }
 
     for root in roots {
@@ -401,15 +401,16 @@ pub fn validate_write_path(path_str: &str, roots: &[PathBuf]) -> Result<PathBuf,
             .canonicalize()
             .map_err(|e| format!("Cannot resolve ancestor: {}", e))?;
 
-        if !roots.is_empty() {
-            let in_root = roots.iter().any(|root| {
-                root.canonicalize()
-                    .map(|cr| canonical_ancestor.starts_with(&cr))
-                    .unwrap_or(false)
-            });
-            if !in_root {
-                return Err(format!("Path '{}' is outside allowed roots", path_str));
-            }
+        if roots.is_empty() {
+            return Err("No roots configured — all filesystem access is denied".to_string());
+        }
+        let in_root = roots.iter().any(|root| {
+            root.canonicalize()
+                .map(|cr| canonical_ancestor.starts_with(&cr))
+                .unwrap_or(false)
+        });
+        if !in_root {
+            return Err(format!("Path '{}' is outside allowed roots", path_str));
         }
         return Ok(resolved);
     }
@@ -418,15 +419,16 @@ pub fn validate_write_path(path_str: &str, roots: &[PathBuf]) -> Result<PathBuf,
         .canonicalize()
         .map_err(|e| format!("Cannot resolve parent directory: {}", e))?;
 
-    if !roots.is_empty() {
-        let in_root = roots.iter().any(|root| {
-            root.canonicalize()
-                .map(|cr| canonical_parent.starts_with(&cr))
-                .unwrap_or(false)
-        });
-        if !in_root {
-            return Err(format!("Path '{}' is outside allowed roots", path_str));
-        }
+    if roots.is_empty() {
+        return Err("No roots configured — all filesystem access is denied".to_string());
+    }
+    let in_root = roots.iter().any(|root| {
+        root.canonicalize()
+            .map(|cr| canonical_parent.starts_with(&cr))
+            .unwrap_or(false)
+    });
+    if !in_root {
+        return Err(format!("Path '{}' is outside allowed roots", path_str));
     }
 
     Ok(canonical_parent.join(resolved.file_name().unwrap_or_default()))
@@ -687,13 +689,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_path_no_roots() {
+    fn test_validate_path_no_roots_denies_access() {
         let temp_dir = TestDir::new();
         let file_path = temp_dir.path.join("anywhere.txt");
         std::fs::write(&file_path, "ok").unwrap();
 
-        let validated = validate_path(&file_path.to_string_lossy(), &[]).unwrap();
-        assert_eq!(validated, file_path.canonicalize().unwrap());
+        let err = validate_path(&file_path.to_string_lossy(), &[]).unwrap_err();
+        assert!(err.contains("No roots configured"));
     }
 
     #[test]

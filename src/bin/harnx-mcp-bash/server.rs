@@ -250,8 +250,8 @@ impl BashServer {
             ));
         }
 
-        if !roots.is_empty()
-            && !roots.iter().any(|root| {
+        if roots.is_empty()
+            || !roots.iter().any(|root| {
                 root.canonicalize()
                     .map(|canonical_root| canonical.starts_with(&canonical_root))
                     .unwrap_or(false)
