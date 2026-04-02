@@ -3075,6 +3075,7 @@ mod tests {
             roots: vec!["/existing".to_string()],
             enabled: true,
             description: None,
+            rename_tools: HashMap::new(),
         };
         config.mcp_servers = vec![server];
         config.mcp_root = vec!["/extra".to_string()];

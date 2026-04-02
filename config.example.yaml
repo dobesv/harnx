@@ -31,21 +31,26 @@ use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_
 #          The current working directory is added automatically as the first root.
 mcp_servers:
    - name: fs
-     command: harnx-mcp-fs               # Filesystem tools: read, write, edit, list, search, find
-     # For the filesystem MCP server, roots determines the folders the agent may access in addition
-     # to the working directory of the harness
+     command: harnx-mcp-fs               # Filesystem tools: read, write, edit, ls, grep, find
      # roots:
      #   - "/home/user/projects"
      description: >-
        Agent filesystem access
+     rename_tools:
+       read: Read
+       write: Write
+       edit: Edit
+       ls: ListDirectory
+       grep: Grep
+       find: Glob
    - name: bash
      command: harnx-mcp-bash             # Shell command execution
-     # For the bash tool, the roots specify additional directories that can be used as the working
-     # directory for a command in addition to the working directory the harness was started in
      # roots:
      #  - "/home/user/projects"
      description: >-
        Allow the agent to run commands or script snippets
+     rename_tools:
+       exec: Bash
    - name: time
      command: harnx-mcp-time             # Time utilities: current time, convert, wait, wait_until
      description: >-

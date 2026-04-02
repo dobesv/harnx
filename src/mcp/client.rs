@@ -188,9 +188,16 @@ impl McpClient {
         .into_iter()
         .map(|tool| {
             let input_schema = Value::Object((*tool.input_schema).clone());
+            let server_tool_name = tool.name.to_string();
+            let final_name =
+                if let Some(renamed) = self.config.rename_tools.get(server_tool_name.as_str()) {
+                    renamed.clone()
+                } else {
+                    format!("{}_{}", self.name, server_tool_name)
+                };
             mcp_tool_to_declaration(
-                &self.name,
-                tool.name.as_ref(),
+                &final_name,
+                &server_tool_name,
                 tool.description.as_deref().unwrap_or_default(),
                 &input_schema,
             )
@@ -400,6 +407,7 @@ mod tests {
             roots: vec![],
             enabled: true,
             description: None,
+            rename_tools: HashMap::new(),
         }
     }
 
@@ -509,8 +517,8 @@ mod tests {
         let manager = McpManager::new();
         let client = Arc::new(McpClient::new(test_mcp_config("fs")));
         *client.tools.write() = vec![
-            mcp_tool_to_declaration("fs", "read", "Read", &json!({})).unwrap(),
-            mcp_tool_to_declaration("fs", "write", "Write", &json!({})).unwrap(),
+            mcp_tool_to_declaration("fs_read", "read", "Read", &json!({})).unwrap(),
+            mcp_tool_to_declaration("fs_write", "write", "Write", &json!({})).unwrap(),
         ];
         manager.clients.write().insert("fs".to_string(), client);
 
@@ -544,11 +552,13 @@ mod tests {
 
         let client = Arc::new(McpClient::new(test_mcp_config("fs")));
         *client.connected.write() = true;
-        *client.tools.write() =
-            vec![
-                mcp_tool_to_declaration("fs", "read", "Read mock file contents.", &json!({}))
-                    .unwrap(),
-            ];
+        *client.tools.write() = vec![mcp_tool_to_declaration(
+            "fs_read",
+            "read",
+            "Read mock file contents.",
+            &json!({}),
+        )
+        .unwrap()];
         *client.service.write() = Some(client_service);
 
         let manager = McpManager::new();

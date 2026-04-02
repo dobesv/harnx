@@ -19,4 +19,6 @@ pub struct McpServerConfig {
     pub enabled: bool,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub rename_tools: HashMap<String, String>,
 }
