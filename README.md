@@ -3,7 +3,9 @@
 [![CI](https://github.com/dobesv/harnx/actions/workflows/ci.yaml/badge.svg)](https://github.com/dobesv/harnx/actions/workflows/ci.yaml)
 [![Discord](https://img.shields.io/discord/1226737085453701222?label=Discord)](https://discord.gg/mr3ZZUB9hG)
 
-Harnx is an all-in-one LLM CLI tool featuring Shell Assistant, CMD & REPL Mode, RAG, AI Tools & Agents, and More.
+Harnx is a modular command-line LLM agent harness that lets you build your own agents
+from the ground up, giving you total control over the prompt, tools, model, and sub-agents.
+
 
 > **Lineage:** Harnx began as an independently continued derivative of [aichat](https://github.com/sigoden/aichat). This repository keeps that lineage explicit while moving forward as its own project.
 

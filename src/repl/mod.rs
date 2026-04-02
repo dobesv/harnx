@@ -723,15 +723,54 @@ pub async fn run_repl_command(
                         println!("MCP is not configured");
                     }
                 }
+                Some(("roots", name)) => {
+                    let name = name.map(|n| n.trim()).unwrap_or("");
+                    if name.is_empty() {
+                        println!("Usage: .mcp roots <server>");
+                    } else {
+                        let roots = Config::mcp_get_roots(config, name)?;
+                        if roots.is_empty() {
+                            println!("No roots for MCP server '{}'", name);
+                        } else {
+                            println!("MCP Roots for '{}':", name);
+                            for root in roots {
+                                println!("  {}", root);
+                            }
+                        }
+                    }
+                }
+                Some(("add-root", name_and_root)) => {
+                    let name_and_root = name_and_root.map(|n| n.trim()).unwrap_or("");
+                    if let Some((name, root)) = name_and_root.split_once(' ') {
+                        let (name, root) = (name.trim(), root.trim());
+                        Config::mcp_add_root(config, name, root).await?;
+                        println!("Added root '{}' to MCP server '{}'", root, name);
+                    } else {
+                        println!("Usage: .mcp add-root <server> <root>");
+                    }
+                }
+                Some(("remove-root", name_and_root)) => {
+                    let name_and_root = name_and_root.map(|n| n.trim()).unwrap_or("");
+                    if let Some((name, root)) = name_and_root.split_once(' ') {
+                        let (name, root) = (name.trim(), root.trim());
+                        Config::mcp_remove_root(config, name, root).await?;
+                        println!("Removed root '{}' from MCP server '{}'", root, name);
+                    } else {
+                        println!("Usage: .mcp remove-root <server> <root>");
+                    }
+                }
                 _ => {
                     println!(
                         r#"Usage: .mcp <command>
 
 Commands:
-  .mcp list                  - List configured MCP servers
-  .mcp connect <server>      - Connect to an MCP server
-  .mcp disconnect <server>   - Disconnect from an MCP server
-  .mcp tools [server]        - List available MCP tools"#
+  .mcp list                    - List configured MCP servers
+  .mcp connect <server>        - Connect to an MCP server
+  .mcp disconnect <server>     - Disconnect from an MCP server
+  .mcp tools [server]          - List available MCP tools
+  .mcp roots <server>          - List roots for an MCP server
+  .mcp add-root <server> <root> - Add a root to an MCP server
+  .mcp remove-root <server> <root> - Remove a root from an MCP server"#
                     );
                 }
             },

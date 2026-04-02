@@ -21,29 +21,27 @@ use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_
 # ---- mcp servers ----
 # MCP (Model Context Protocol) servers provide external tools.
 # tool_use must be true for MCP tools to work.
-# mcp_servers:
-#   - name: filesystem                 # Unique server name
-#     command: npx                     # Command to start the server
-#     args:                            # Arguments for the command
-#       - "-y"
-#       - "@modelcontextprotocol/server-filesystem"
-#       - "/tmp"
-#     enabled: true                    # Auto-connect on startup (default: true)
-#     description: "File system operations"
-#   - name: git
-#     command: npx
-#     args:
-#       - "-y"
-#       - "@modelcontextprotocol/server-git"
-#     enabled: true
-#     description: "Git repository operations"
-#   - name: bash
-#     command: npx
-#     args:
-#       - "-y"
-#       - "@artinet/bash-mcp"
-#     enabled: true
-#     description: "Execute bash commands"
+#
+# Each server supports: name, command, args, env, roots, enabled, description
+#   roots: Directories the server is allowed to access (sent via MCP roots protocol).
+#          The current working directory is added automatically as the first root.
+mcp_servers:
+   - name: fs
+     command: harnx-mcp-fs               # Filesystem tools: read, write, edit, list, search, find
+     # For the filesystem MCP server, roots determines the folders the agent may access in addition
+     # to the working directory of the harness
+     # roots:
+     #   - "/home/user/projects"
+     description: >-
+       Agent filesystem access
+   - name: bash
+     command: harnx-mcp-bash             # Shell command execution
+     # For the bash tool, the roots specify additional directories that can be used as the working
+     # directory for a command in addition to the working directory the harness was started in
+     # roots:
+     #  - "/home/user/projects"
+     description: >-
+       Allow the agent to run commands or script snippets
 #   - name: custom
 #     command: /path/to/custom-mcp-server
 #     args:
@@ -53,7 +51,6 @@ use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_
 #       API_KEY: "your-api-key-here"
 #     enabled: false
 #     description: "Custom MCP server"
-mcp_servers: []
 
 # ---- prelude ----
 repl_prelude: null               # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)

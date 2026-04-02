@@ -163,6 +163,8 @@ pub struct Config {
     pub info_flag: bool,
     #[serde(skip)]
     pub agent_variables: Option<AgentVariables>,
+    #[serde(skip)]
+    pub mcp_root: Vec<String>,
 
     #[serde(skip)]
     pub model: Model,
@@ -240,6 +242,7 @@ impl Default for Config {
             macro_flag: false,
             info_flag: false,
             agent_variables: None,
+            mcp_root: vec![],
 
             model: Default::default(),
             tools: Default::default(),
@@ -258,7 +261,11 @@ impl Default for Config {
 pub type GlobalConfig = Arc<RwLock<Config>>;
 
 impl Config {
-    pub async fn init(working_mode: WorkingMode, info_flag: bool) -> Result<Self> {
+    pub async fn init(
+        working_mode: WorkingMode,
+        info_flag: bool,
+        mut mcp_root: Vec<String>,
+    ) -> Result<Self> {
         let config_path = Self::config_file();
         let mut config = if !config_path.exists() {
             match env::var(get_env_name("provider"))
@@ -277,8 +284,18 @@ impl Config {
             Self::load_from_file(&config_path)?
         };
 
+        if let Ok(v) = env::var("HARNX_MCP_ROOTS") {
+            for root in v.split(',') {
+                let root = root.trim();
+                if !root.is_empty() && !mcp_root.contains(&root.to_string()) {
+                    mcp_root.push(root.to_string());
+                }
+            }
+        }
+
         config.working_mode = working_mode;
         config.info_flag = info_flag;
+        config.mcp_root = mcp_root;
 
         let setup = |config: &mut Self| -> Result<()> {
             config.load_envs();
@@ -1790,7 +1807,7 @@ impl Config {
                 ".rag" => map_completion_values(Self::list_rags()),
                 ".agent" => map_completion_values(list_agents()),
                 ".macro" => map_completion_values(Self::list_macros()),
-                ".mcp" => map_completion_values(vec!["list", "connect", "disconnect", "tools"]),
+                ".mcp" => map_completion_values(vec!["list", "connect", "disconnect", "tools", "roots", "add-root", "remove-root"]),
                 ".starter" => match &self.agent {
                     Some(agent) => agent
                         .conversation_staters()
@@ -1878,7 +1895,7 @@ impl Config {
             values = candidates.into_iter().map(|v| (v, None)).collect();
         } else if cmd == ".mcp" && args.len() == 2 {
             let subcmd = args[0];
-            if matches!(subcmd, "connect" | "disconnect" | "tools") {
+            if matches!(subcmd, "connect" | "disconnect" | "tools" | "roots" | "add-root" | "remove-root") {
                 let servers = Self::mcp_list_servers_from_config(self);
                 values = servers.into_iter().map(|v| (v, None)).collect();
             }
@@ -2462,8 +2479,26 @@ impl Config {
         if self.mcp_servers.is_empty() {
             return;
         }
+        let mut mcp_servers = self.mcp_servers.clone();
+        let mut extra_roots = self.mcp_root.clone();
+        if let Ok(cwd) = env::current_dir() {
+            if let Ok(cwd_str) = cwd.into_os_string().into_string() {
+                if !extra_roots.contains(&cwd_str) {
+                    extra_roots.insert(0, cwd_str);
+                }
+            }
+        }
+        if !extra_roots.is_empty() {
+            for server in mcp_servers.iter_mut() {
+                for root in extra_roots.iter().rev() {
+                    if !server.roots.contains(root) {
+                        server.roots.insert(0, root.clone());
+                    }
+                }
+            }
+        }
         let manager = McpManager::new();
-        manager.initialize(self.mcp_servers.clone());
+        manager.initialize(mcp_servers);
         self.mcp_manager = Some(Arc::new(manager));
     }
 
@@ -2494,6 +2529,53 @@ impl Config {
         let mcp_manager = config.read().mcp_manager.clone();
         match mcp_manager {
             Some(manager) => manager.disconnect(server_name).await,
+            None => bail!("MCP is not configured"),
+        }
+    }
+
+    pub fn mcp_get_roots(config: &GlobalConfig, server_name: &str) -> Result<Vec<String>> {
+        let mcp_manager = config.read().mcp_manager.clone();
+        match mcp_manager {
+            Some(manager) => {
+                let client = manager
+                    .get_client(server_name)
+                    .ok_or_else(|| anyhow!("MCP server '{}' not found", server_name))?;
+                Ok(client.get_roots())
+            }
+            None => bail!("MCP is not configured"),
+        }
+    }
+
+    pub async fn mcp_add_root(
+        config: &GlobalConfig,
+        server_name: &str,
+        root: &str,
+    ) -> Result<()> {
+        let mcp_manager = config.read().mcp_manager.clone();
+        match mcp_manager {
+            Some(manager) => {
+                let client = manager
+                    .get_client(server_name)
+                    .ok_or_else(|| anyhow!("MCP server '{}' not found", server_name))?;
+                client.add_root(root).await
+            }
+            None => bail!("MCP is not configured"),
+        }
+    }
+
+    pub async fn mcp_remove_root(
+        config: &GlobalConfig,
+        server_name: &str,
+        root: &str,
+    ) -> Result<()> {
+        let mcp_manager = config.read().mcp_manager.clone();
+        match mcp_manager {
+            Some(manager) => {
+                let client = manager
+                    .get_client(server_name)
+                    .ok_or_else(|| anyhow!("MCP server '{}' not found", server_name))?;
+                client.remove_root(root).await
+            }
             None => bail!("MCP is not configured"),
         }
     }
@@ -2869,5 +2951,39 @@ where
     match value {
         Some(value) => value.to_string(),
         None => "null".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_init_mcp_manager_with_roots() {
+        let mut config = Config::default();
+        let server = McpServerConfig {
+            name: "test".to_string(),
+            command: "ls".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            roots: vec!["/existing".to_string()],
+            enabled: true,
+            description: None,
+        };
+        config.mcp_servers = vec![server];
+        config.mcp_root = vec!["/extra".to_string()];
+
+        config.init_mcp_manager();
+
+        let manager = config.mcp_manager.expect("Manager should be initialized");
+        let client = manager.get_client("test").expect("Client should exist");
+        let roots = client.get_roots();
+
+        // Roots should be: [cwd, /extra, /existing]
+        assert_eq!(roots.len(), 3);
+        let cwd = env::current_dir().unwrap().into_os_string().into_string().unwrap();
+        assert_eq!(roots[0], cwd);
+        assert_eq!(roots[1], "/extra");
+        assert_eq!(roots[2], "/existing");
     }
 }

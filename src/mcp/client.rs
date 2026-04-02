@@ -3,11 +3,15 @@ use crate::tool::ToolDeclaration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::RwLock;
-use rmcp::model::CallToolRequestParam;
-use rmcp::service::{RoleClient, RunningService, ServiceExt};
+use rmcp::handler::client::ClientHandler;
+use rmcp::model::{
+    CallToolRequestParam, ClientCapabilities, ErrorData, Implementation, ListRootsResult, Root,
+    ProtocolVersion, InitializeRequestParam,
+};
+use rmcp::service::{RequestContext, RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, path::Path, sync::Arc};
 use tokio::process::Command;
 use tokio::runtime::{Builder, Handle};
 
@@ -15,8 +19,62 @@ pub struct McpClient {
     name: String,
     config: McpServerConfig,
     tools: Arc<RwLock<Vec<ToolDeclaration>>>,
+    roots: Arc<RwLock<Vec<String>>>,
     connected: Arc<RwLock<bool>>,
-    service: Arc<RwLock<Option<RunningService<RoleClient, ()>>>>,
+    service: Arc<RwLock<Option<RunningService<RoleClient, McpClientHandler>>>>,
+}
+
+#[derive(Clone)]
+pub struct McpClientHandler {
+    roots: Arc<RwLock<Vec<String>>>,
+}
+
+impl McpClientHandler {
+    pub fn new(roots: Arc<RwLock<Vec<String>>>) -> Self {
+        Self { roots }
+    }
+}
+
+impl ClientHandler for McpClientHandler {
+    fn get_info(&self) -> InitializeRequestParam {
+        InitializeRequestParam {
+            protocol_version: ProtocolVersion::default(),
+            capabilities: ClientCapabilities::builder()
+                .enable_roots()
+                .enable_roots_list_changed()
+                .build(),
+            client_info: Implementation {
+                name: "harnx".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                title: None,
+                website_url: None,
+                icons: None,
+            },
+        }
+    }
+
+    async fn list_roots(
+        &self,
+        _cx: RequestContext<RoleClient>,
+    ) -> Result<ListRootsResult, ErrorData> {
+        let roots = self.roots.read();
+        let roots = roots
+            .iter()
+            .map(|r| {
+                let path = Path::new(r);
+                let uri = if let Ok(canonical) = path.canonicalize() {
+                    format!("file://{}", canonical.to_string_lossy())
+                } else {
+                    format!("file://{}", r)
+                };
+                Root {
+                    uri: uri.into(),
+                    name: None,
+                }
+            })
+            .collect();
+        Ok(ListRootsResult { roots })
+    }
 }
 
 impl fmt::Debug for McpClient {
@@ -31,6 +89,7 @@ impl fmt::Debug for McpClient {
             .field("name", &self.name)
             .field("config", &self.config)
             .field("tools", &*self.tools.read())
+            .field("roots", &*self.roots.read())
             .field("connected", &*self.connected.read())
             .field("service", &service)
             .finish()
@@ -40,10 +99,12 @@ impl fmt::Debug for McpClient {
 impl McpClient {
     pub fn new(config: McpServerConfig) -> Self {
         let name = config.name.clone();
+        let roots = config.roots.clone();
         Self {
             name,
             config,
             tools: Arc::new(RwLock::new(Vec::new())),
+            roots: Arc::new(RwLock::new(roots)),
             connected: Arc::new(RwLock::new(false)),
             service: Arc::new(RwLock::new(None)),
         }
@@ -68,14 +129,20 @@ impl McpClient {
 
         let transport = TokioChildProcess::new(command)
             .with_context(|| format!("Failed to spawn MCP server '{}'", self.name))?;
-        let service = ().serve(transport).await.with_context(|| {
-            format!("Failed to initialize MCP client for server '{}'", self.name)
-        })?;
+
+        let handler = McpClientHandler::new(self.roots.clone());
+        let service = rmcp::service::serve_client(handler, transport)
+            .await
+            .with_context(|| {
+                format!("Failed to initialize MCP client for server '{}'", self.name)
+            })?;
 
         let functions = service
-            .list_all_tools()
+            .peer()
+            .list_tools(Default::default())
             .await
             .with_context(|| format!("Failed to list tools for MCP server '{}'", self.name))?
+            .tools
             .into_iter()
             .map(|tool| {
                 let input_schema = Value::Object((*tool.input_schema).clone());
@@ -115,6 +182,45 @@ impl McpClient {
         self.tools.read().clone()
     }
 
+    pub fn get_roots(&self) -> Vec<String> {
+        self.roots.read().clone()
+    }
+
+    pub async fn add_root(&self, root: &str) -> Result<()> {
+        let changed = {
+            let mut roots = self.roots.write();
+            if !roots.contains(&root.to_string()) {
+                roots.push(root.to_string());
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            let peer = self.service.read().as_ref().map(|s| s.peer().clone());
+            if let Some(peer) = peer {
+                let _ = peer.notify_roots_list_changed().await;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn remove_root(&self, root: &str) -> Result<()> {
+        let changed = {
+            let mut roots = self.roots.write();
+            let old_len = roots.len();
+            roots.retain(|r| r != root);
+            roots.len() < old_len
+        };
+        if changed {
+            let peer = self.service.read().as_ref().map(|s| s.peer().clone());
+            if let Some(peer) = peer {
+                let _ = peer.notify_roots_list_changed().await;
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::await_holding_lock)]
     pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<Value> {
         if !self.is_connected() {
@@ -150,6 +256,164 @@ impl McpClient {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::handler::server::ServerHandler;
+    use rmcp::model::{
+        InitializeResult, ListToolsResult, ServerCapabilities,
+    };
+    use rmcp::service::{serve_server, NotificationContext};
+    use tokio::io::duplex;
+    use std::time::Duration;
+
+    #[derive(Clone, Default, Debug)]
+    struct MockServerHandler {
+        initialized_params: Arc<RwLock<Option<InitializeRequestParam>>>,
+        roots_list_changed_notified: Arc<RwLock<bool>>,
+        peer: Arc<RwLock<Option<rmcp::service::Peer<rmcp::service::RoleServer>>>>,
+    }
+
+    impl ServerHandler for MockServerHandler {
+        fn get_info(&self) -> InitializeResult {
+            InitializeResult {
+                protocol_version: ProtocolVersion::default(),
+                capabilities: ServerCapabilities::default(),
+                server_info: Implementation {
+                    name: "mock-server".to_string(),
+                    version: "0.1.0".to_string(),
+                    title: None,
+                    website_url: None,
+                    icons: None,
+                },
+                instructions: None,
+            }
+        }
+
+        async fn initialize(
+            &self,
+            params: InitializeRequestParam,
+            cx: RequestContext<rmcp::service::RoleServer>,
+        ) -> Result<InitializeResult, rmcp::model::ErrorData> {
+            *self.initialized_params.write() = Some(params);
+            *self.peer.write() = Some(cx.peer.clone());
+            Ok(self.get_info())
+        }
+
+        async fn list_tools(
+            &self,
+            _params: Option<rmcp::model::PaginatedRequestParam>,
+            _cx: RequestContext<rmcp::service::RoleServer>,
+        ) -> Result<ListToolsResult, rmcp::model::ErrorData> {
+            Ok(ListToolsResult {
+                tools: vec![],
+                next_cursor: None,
+            })
+        }
+
+        async fn on_roots_list_changed(
+            &self,
+            _cx: NotificationContext<rmcp::service::RoleServer>,
+        ) {
+            *self.roots_list_changed_notified.write() = true;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mcp_roots_propagation() {
+        let (client_transport, server_transport) = duplex(1024);
+
+        let mock_server = MockServerHandler::default();
+        let server_handler = mock_server.clone();
+
+        // Client
+        let roots = Arc::new(RwLock::new(vec!["/test/root".to_string()]));
+        let handler = McpClientHandler::new(roots.clone());
+
+        let server_fut = serve_server(server_handler, server_transport);
+        let client_fut = rmcp::service::serve_client(handler, client_transport);
+
+        let (_server_res, client_res) = tokio::join!(server_fut, client_fut);
+        let _client_service = client_res.unwrap();
+        let client_peer = _client_service.peer().clone();
+
+        // Run client in background
+        let _client_task = tokio::spawn(async move {
+             let _ = _client_service.waiting().await;
+        });
+
+        // Verify roots in initialize params
+        {
+            let params = mock_server.initialized_params.read();
+            let params = params.as_ref().unwrap();
+            assert!(params.capabilities.roots.is_some());
+            assert_eq!(params.capabilities.roots.as_ref().unwrap().list_changed, Some(true));
+        }
+
+        let server_peer = mock_server.peer.read().as_ref().unwrap().clone();
+
+        // Verify list_roots works (server calling client)
+        let roots_result = server_peer.list_roots().await.unwrap();
+        assert_eq!(roots_result.roots.len(), 1);
+        assert_eq!(roots_result.roots[0].uri, "file:///test/root");
+
+        // Test adding a root and notification
+        {
+            roots.write().push("/test/root2".to_string());
+            client_peer.notify_roots_list_changed().await.unwrap();
+        }
+
+        // Give it a moment to process the notification
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(*mock_server.roots_list_changed_notified.read());
+
+        // Verify new roots
+        let roots_result = server_peer.list_roots().await.unwrap();
+        assert_eq!(roots_result.roots.len(), 2);
+        assert_eq!(roots_result.roots[1].uri, "file:///test/root2");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_roots_canonicalization() {
+        let (client_transport, server_transport) = duplex(1024);
+        let mock_server = MockServerHandler::default();
+        let server_handler = mock_server.clone();
+
+        // Client with a relative root
+        let roots = Arc::new(RwLock::new(vec![".".to_string()]));
+        let handler = McpClientHandler::new(roots.clone());
+
+        let server_fut = serve_server(server_handler, server_transport);
+        let client_fut = rmcp::service::serve_client(handler, client_transport);
+
+        let (_server_res, client_res) = tokio::join!(server_fut, client_fut);
+        let _client_service = client_res.unwrap();
+
+        // Run client in background
+        let _client_task = tokio::spawn(async move {
+             let _ = _client_service.waiting().await;
+        });
+
+        let server_peer = mock_server.peer.read().as_ref().unwrap().clone();
+
+        // Verify list_roots works (server calling client)
+        let roots_result = server_peer.list_roots().await.unwrap();
+        assert_eq!(roots_result.roots.len(), 1);
+        let uri = roots_result.roots[0].uri.clone();
+        
+        // It should be an absolute path
+        assert!(uri.starts_with("file:///"), "URI should be an absolute file URI, got: {}", uri);
+        
+        let expected_path = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let expected_uri = format!("file://{}", expected_path.to_string_lossy());
+        // Note: canonicalize might add \\?\ prefix on Windows, but we are on Linux.
+        // Also it should have three slashes for absolute paths: file:///path/to/dir
+        // format!("file://{}", path) where path is /path/to/dir gives file:///path/to/dir
+        assert_eq!(uri, expected_uri);
+    }
+}
+
 #[derive(Debug)]
 pub struct McpManager {
     clients: Arc<RwLock<HashMap<String, Arc<McpClient>>>>,
@@ -160,6 +424,10 @@ impl McpManager {
         Self {
             clients: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn get_client(&self, server_name: &str) -> Option<Arc<McpClient>> {
+        self.clients.read().get(server_name).cloned()
     }
 
     pub fn initialize(&self, configs: Vec<McpServerConfig>) {
