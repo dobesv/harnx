@@ -641,7 +641,8 @@ impl FsServer {
                 None,
             ));
         }
-        let full_pattern = format!("{}/{}", search_path.display(), params.pattern);
+        let escaped_base = glob::Pattern::escape(&search_path.display().to_string());
+        let full_pattern = format!("{escaped_base}/{}", params.pattern);
         let glob_results = glob::glob(&full_pattern).map_err(|err| {
             ErrorData::invalid_params(format!("invalid glob pattern: {err}"), None)
         })?;

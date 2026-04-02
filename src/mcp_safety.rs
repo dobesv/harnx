@@ -11,30 +11,53 @@ pub const DEFAULT_LS_LIMIT: usize = 500;
 pub const LS_SCAN_HARD_LIMIT: usize = 20_000;
 pub const SEARCH_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
-/// Convert an absolute path to a proper `file://` URI.
-/// Handles Windows extended-length paths (`\\?\`) and backslash → forward-slash conversion.
 pub fn path_to_file_uri(path: &Path) -> String {
     let s = path.to_string_lossy();
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
     let s = s.replace('\\', "/");
-    if s.starts_with('/') {
-        format!("file://{s}")
+    let encoded = percent_encode_path(&s);
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
     } else {
-        format!("file:///{s}")
+        format!("file:///{encoded}")
     }
 }
 
-/// Convert a `file://` URI back to a PathBuf, with percent-decoding.
-/// Returns None if the URI doesn't have a `file://` scheme.
 pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let path_str = uri
         .strip_prefix("file://localhost")
         .or_else(|| uri.strip_prefix("file://"))?;
     let decoded = percent_decode(path_str);
+    // On Windows, file:///C:/foo produces path_str="/C:/foo" — strip the leading slash.
+    #[cfg(windows)]
+    let decoded = decoded
+        .strip_prefix('/')
+        .filter(|s| s.len() >= 2 && s.as_bytes()[1] == b':')
+        .unwrap_or(&decoded)
+        .to_string();
     Some(PathBuf::from(decoded))
 }
 
-/// Simple percent-decoding for file URIs.
+fn percent_encode_path(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &b in input.as_bytes() {
+        match b {
+            // RFC 3986 unreserved + '/' (path separator) + ':' (drive letter)
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX_UPPER[(b >> 4) as usize] as char);
+                out.push(HEX_UPPER[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
 fn percent_decode(input: &str) -> String {
     let mut bytes = Vec::with_capacity(input.len());
     let mut iter = input.bytes();
@@ -685,5 +708,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(validated, new_file);
+    }
+
+    #[test]
+    fn file_uri_round_trip_simple() {
+        let path = Path::new("/home/user/project/file.txt");
+        let uri = path_to_file_uri(path);
+        assert_eq!(uri, "file:///home/user/project/file.txt");
+        assert_eq!(file_uri_to_path(&uri).unwrap(), path);
+    }
+
+    #[test]
+    fn file_uri_round_trip_spaces() {
+        let path = Path::new("/home/user/my project/file name.txt");
+        let uri = path_to_file_uri(path);
+        assert!(
+            uri.contains("%20"),
+            "spaces should be percent-encoded: {uri}"
+        );
+        assert_eq!(file_uri_to_path(&uri).unwrap(), path);
+    }
+
+    #[test]
+    fn file_uri_round_trip_hash_and_percent() {
+        let path = Path::new("/tmp/100%done#notes.txt");
+        let uri = path_to_file_uri(path);
+        assert!(uri.contains("%25"), "literal % should be encoded: {uri}");
+        assert!(uri.contains("%23"), "# should be encoded: {uri}");
+        assert_eq!(file_uri_to_path(&uri).unwrap(), path);
+    }
+
+    #[test]
+    fn file_uri_rejects_non_file_scheme() {
+        assert!(file_uri_to_path("https://example.com/foo").is_none());
+        assert!(file_uri_to_path("../../secrets").is_none());
+        assert!(file_uri_to_path("").is_none());
     }
 }
