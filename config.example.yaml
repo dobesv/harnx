@@ -65,6 +65,15 @@ mcp_servers:
 #     enabled: false
 #     description: "Custom MCP server"
 
+acp_servers:                        # ACP agent sub-servers
+  # - name: coder
+  #   command: harnx
+  #   args: ["--acp", "coder-agent"]
+  #   env:
+  #     API_KEY: "your-api-key"
+  #   enabled: true
+  #   description: "Code writing agent"
+
 # ---- default session ----
 repl_default_session: null        # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
 cmd_default_session: null         # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)

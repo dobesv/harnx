@@ -7,6 +7,7 @@ pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
 
+use crate::acp::{AcpManager, AcpServerConfig};
 use crate::client::{
     create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
     Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
@@ -189,6 +190,9 @@ pub struct Config {
     pub mcp_servers: Vec<McpServerConfig>,
 
     #[serde(default)]
+    pub acp_servers: Vec<AcpServerConfig>,
+
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksConfig>,
 
@@ -207,6 +211,8 @@ pub struct Config {
     pub tools: Tools,
     #[serde(skip)]
     pub mcp_manager: Option<Arc<McpManager>>,
+    #[serde(skip)]
+    pub acp_manager: Option<Arc<AcpManager>>,
     #[serde(skip)]
     pub working_mode: WorkingMode,
     #[serde(skip)]
@@ -269,6 +275,7 @@ impl Default for Config {
 
             clients: vec![],
             mcp_servers: vec![],
+            acp_servers: vec![],
 
             hooks: None,
 
@@ -280,6 +287,7 @@ impl Default for Config {
             model: Default::default(),
             tools: Default::default(),
             mcp_manager: None,
+            acp_manager: None,
             working_mode: WorkingMode::Cmd,
             last_message: None,
 
@@ -337,6 +345,7 @@ impl Config {
             }
 
             config.init_mcp_manager();
+            config.init_acp_manager();
             config.tools = Tools::init_from_mcp(None);
 
             config.setup_model()?;
@@ -630,7 +639,9 @@ impl Config {
         if let Some(hooks) = &self.hooks {
             items.push(("hooks", hooks.entries.len().to_string()));
         }
-        if let Ok((_, Some(log_path))) = Self::log_config(self.working_mode.is_serve()) {
+        if let Ok((_, Some(log_path))) =
+            Self::log_config(self.working_mode.is_serve() || self.working_mode.is_acp())
+        {
             items.push(("log_path", display_path(&log_path)));
         }
         let output = items
@@ -1614,6 +1625,7 @@ impl Config {
             WorkingMode::Repl => self.repl_default_session.as_ref(),
             WorkingMode::Cmd => self.cmd_default_session.as_ref(),
             WorkingMode::Serve => return Ok(()),
+            WorkingMode::Acp(_) => return Ok(()),
         };
         let default_session = match default_session {
             Some(v) => {
@@ -2425,6 +2437,11 @@ impl Config {
                 declarations.extend(manager.get_all_tools_blocking());
             }
         }
+        if use_tools.is_some() && self.acp_manager.is_some() {
+            if let Some(manager) = &self.acp_manager {
+                declarations.extend(manager.get_all_tools_blocking());
+            }
+        }
 
         let mut seen = HashSet::new();
         declarations.retain(|declaration| seen.insert(declaration.name.clone()));
@@ -2456,6 +2473,15 @@ impl Config {
         let manager = McpManager::new();
         manager.initialize(mcp_servers);
         self.mcp_manager = Some(Arc::new(manager));
+    }
+
+    fn init_acp_manager(&mut self) {
+        if self.acp_servers.is_empty() {
+            return;
+        }
+        let manager = AcpManager::new();
+        manager.initialize(self.acp_servers.clone());
+        self.acp_manager = Some(Arc::new(manager));
     }
 
     pub fn mcp_list_servers(config: &GlobalConfig) -> Vec<String> {
@@ -2587,22 +2613,26 @@ pub fn load_env_file() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkingMode {
     Cmd,
     Repl,
     Serve,
+    Acp(String),
 }
 
 impl WorkingMode {
     pub fn is_cmd(&self) -> bool {
-        *self == WorkingMode::Cmd
+        matches!(self, WorkingMode::Cmd)
     }
     pub fn is_repl(&self) -> bool {
-        *self == WorkingMode::Repl
+        matches!(self, WorkingMode::Repl)
     }
     pub fn is_serve(&self) -> bool {
-        *self == WorkingMode::Serve
+        matches!(self, WorkingMode::Serve)
+    }
+    pub fn is_acp(&self) -> bool {
+        matches!(self, WorkingMode::Acp(_))
     }
 }
 

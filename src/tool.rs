@@ -217,12 +217,6 @@ impl ToolCall {
     }
 
     fn eval_mcp(&self, config: &GlobalConfig) -> Result<Value> {
-        let mcp_manager = config.read().mcp_manager.clone();
-        let manager = match mcp_manager {
-            Some(m) => m,
-            None => bail!("MCP is not configured"),
-        };
-
         let json_data = if self.arguments.is_null() {
             Value::Null
         } else if self.arguments.is_object() {
@@ -246,6 +240,31 @@ impl ToolCall {
             let prompt = format!("Call {} {}", self.name, json_data);
             println!("{}", dimmed_text(&prompt));
         }
+
+        let acp_manager = config.read().acp_manager.clone();
+        if let Some(manager) = acp_manager {
+            if manager.find_client_for_tool(&self.name).is_some() {
+                let tool_name = self.name.clone();
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        tokio::select! {
+                            result = manager.call_tool(&tool_name, json_data) => result,
+                            _ = tokio::signal::ctrl_c() => {
+                                bail!("ACP tool call aborted by user")
+                            }
+                        }
+                    })
+                })?;
+
+                return Ok(result);
+            }
+        }
+
+        let mcp_manager = config.read().mcp_manager.clone();
+        let manager = match mcp_manager {
+            Some(m) => m,
+            None => bail!("No tool provider configured for '{}'", self.name),
+        };
 
         let tool_name = self.name.clone();
         let result = tokio::task::block_in_place(|| {
