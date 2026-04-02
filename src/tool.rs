@@ -223,7 +223,9 @@ impl ToolCall {
             None => bail!("MCP is not configured"),
         };
 
-        let json_data = if self.arguments.is_object() {
+        let json_data = if self.arguments.is_null() {
+            Value::Null
+        } else if self.arguments.is_object() {
             self.arguments.clone()
         } else if let Some(arguments) = self.arguments.as_str() {
             serde_json::from_str(arguments).map_err(|_| {
