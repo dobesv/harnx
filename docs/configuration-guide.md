@@ -46,18 +46,18 @@ Setting `model` to a client name (e.g., `openai`) uses that client's default mod
 Harnx supports tool use (renamed from "Function calling").
 
 - **tool_use**: Enable or disable tool use globally. (`true`/`false`)
-- **mapping_tools**: Map specific tools to specific models or roles.
+- **toolsets**: Define named groups of tools for use with `use_tools` or `-t/--tool`.
 - **use_tools**: Specify which tools to make available.
 
 Visit [https://github.com/sigoden/llm-functions](https://github.com/sigoden/llm-functions) for setup instructions and available tools.
 
-## Prelude
+## Default Session
 
-Prelude commands run automatically when entering a mode.
+These fields accept a session spec that automatically loads a role or session when entering a mode. The spec format is `role:<name>`, `session:<name>`, or `<session>:<role>` (load a session and apply a role if the session is empty).
 
-- **repl_prelude**: Commands to run when entering REPL mode.
-- **cmd_prelude**: Commands to run when entering CMD mode.
-- **agent_prelude**: Commands to run when entering an agent session.
+- **repl_default_session**: Session spec applied when entering REPL mode (e.g. `role:code`, `session:default`, `temp:code`).
+- **cmd_default_session**: Session spec applied when entering CMD mode.
+- **agent_default_session**: Session identifier used when starting an agent (e.g. `temp`, `default`).
 
 ## Session
 
@@ -108,7 +108,7 @@ Agent config files support the following properties:
 - **temperature**: Override the default temperature for this agent.
 - **top_p**: Override the default top_p for this agent.
 - **use_tools**: Specify which tools this agent can use.
-- **agent_prelude**: Commands to run when entering this agent's session.
+- **agent_default_session**: Session to use when starting this agent.
 - **instructions**: System prompt / instructions for the agent.
 - **variables**: Variables that can be interpolated into the agent's prompts.
 

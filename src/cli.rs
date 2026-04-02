@@ -81,6 +81,12 @@ pub struct Cli {
     /// List all macros
     #[clap(long)]
     pub list_macros: bool,
+    /// Add MCP roots
+    #[clap(long, value_name = "PATH", value_delimiter = ',')]
+    pub mcp_root: Vec<String>,
+    /// Enable tools or toolsets for this session (can be repeated, also accepts toolset names)
+    #[clap(short = 't', long = "tool", value_name = "TOOL")]
+    pub tool: Vec<String>,
     /// Input text
     #[clap(trailing_var_arg = true)]
     text: Vec<String>,

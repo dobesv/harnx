@@ -13,8 +13,12 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub roots: Vec<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub rename_tools: HashMap<String, String>,
 }

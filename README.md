@@ -1,11 +1,8 @@
-# Harnx: All-in-one LLM CLI Tool
+# Harnx: Your agents, your way
 
-[![CI](https://github.com/dobesv/harnx/actions/workflows/ci.yaml/badge.svg)](https://github.com/dobesv/harnx/actions/workflows/ci.yaml)
-[![Discord](https://img.shields.io/discord/1226737085453701222?label=Discord)](https://discord.gg/mr3ZZUB9hG)
+Harnx is a modular command-line LLM agent harness that lets you build your own agents
+from the ground up, giving you total control over the prompt, tools, model, and sub-agents.
 
-Harnx is an all-in-one LLM CLI tool featuring Shell Assistant, CMD & REPL Mode, RAG, AI Tools & Agents, and More.
-
-> **Lineage:** Harnx began as an independently continued derivative of [aichat](https://github.com/sigoden/aichat). This repository keeps that lineage explicit while moving forward as its own project.
 
 ## Install
 
@@ -205,6 +202,12 @@ To trigger a new release:
 
 Copyright (c) 2023-2025 harnx-developers.
 
-Harnx is made available under the terms of either the MIT License or the Apache License 2.0, at your option.
+Harnx is made available under the terms of either the MIT License or the 
+Apache License 2.0, at your option.
 
 See the LICENSE-APACHE and LICENSE-MIT files for license details.
+
+## Lineage
+
+Harnx began as an independently continued derivative of [aichat](https://github.com/sigoden/aichat).
+

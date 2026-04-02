@@ -5,16 +5,17 @@ use indexmap::IndexMap;
 use serde_json::Value;
 
 pub fn mcp_tool_to_declaration(
-    server_name: &str,
-    tool_name: &str,
+    display_name: &str,
+    server_tool_name: &str,
     tool_description: &str,
     input_schema: &Value,
 ) -> Result<ToolDeclaration> {
     Ok(ToolDeclaration {
-        name: format!("mcp__{server_name}__{tool_name}"),
+        name: display_name.to_string(),
         description: tool_description.to_string(),
         parameters: convert_json_schema(input_schema)?,
         agent: false,
+        mcp_tool_name: Some(server_tool_name.to_string()),
     })
 }
 
@@ -181,11 +182,15 @@ mod tests {
             }
         });
 
-        let function =
-            mcp_tool_to_declaration("filesystem", "read_file", "Read a file from disk", &schema)
-                .expect("convert tool");
+        let function = mcp_tool_to_declaration(
+            "filesystem_read_file",
+            "read_file",
+            "Read a file from disk",
+            &schema,
+        )
+        .expect("convert tool");
 
-        assert_eq!(function.name, "mcp__filesystem__read_file");
+        assert_eq!(function.name, "filesystem_read_file");
         assert_eq!(function.description, "Read a file from disk");
         assert!(!function.agent);
         assert_eq!(function.parameters.type_value.as_deref(), Some("object"));

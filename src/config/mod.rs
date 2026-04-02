@@ -26,7 +26,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
 use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use simplelog::LevelFilter;
 use std::collections::{HashMap, HashSet};
@@ -99,6 +99,46 @@ const RIGHT_PROMPT: &str = "{color.purple}{?session {?consume_tokens {consume_to
 static EDITOR: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ToolsetValue {
+    String(String),
+    Array(Vec<String>),
+}
+
+fn normalize_toolset_value(value: ToolsetValue) -> Vec<String> {
+    match value {
+        ToolsetValue::String(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect(),
+        ToolsetValue::Array(values) => values,
+    }
+}
+
+fn deserialize_toolsets<'de, D>(
+    deserializer: D,
+) -> std::result::Result<IndexMap<String, Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = IndexMap::<String, ToolsetValue>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .map(|(key, value)| (key, normalize_toolset_value(value)))
+        .collect())
+}
+
+fn parse_toolsets_json(value: &str) -> serde_json::Result<IndexMap<String, Vec<String>>> {
+    let values = serde_json::from_str::<IndexMap<String, ToolsetValue>>(value)?;
+    Ok(values
+        .into_iter()
+        .map(|(key, value)| (key, normalize_toolset_value(value)))
+        .collect())
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     #[serde(rename(serialize = "model", deserialize = "model"))]
@@ -116,12 +156,15 @@ pub struct Config {
     pub wrap_code: bool,
 
     pub tool_use: bool,
-    pub mapping_tools: IndexMap<String, String>,
+    #[serde(default)]
+    #[serde(alias = "mapping_tools")]
+    #[serde(deserialize_with = "deserialize_toolsets")]
+    pub toolsets: IndexMap<String, Vec<String>>,
     pub use_tools: Option<String>,
 
-    pub repl_prelude: Option<String>,
-    pub cmd_prelude: Option<String>,
-    pub agent_prelude: Option<String>,
+    pub repl_default_session: Option<String>,
+    pub cmd_default_session: Option<String>,
+    pub agent_default_session: Option<String>,
 
     pub save_session: Option<bool>,
     pub compress_threshold: usize,
@@ -163,6 +206,8 @@ pub struct Config {
     pub info_flag: bool,
     #[serde(skip)]
     pub agent_variables: Option<AgentVariables>,
+    #[serde(skip)]
+    pub mcp_root: Vec<String>,
 
     #[serde(skip)]
     pub model: Model,
@@ -201,12 +246,12 @@ impl Default for Config {
             wrap_code: false,
 
             tool_use: true,
-            mapping_tools: Default::default(),
+            toolsets: Default::default(),
             use_tools: None,
 
-            repl_prelude: None,
-            cmd_prelude: None,
-            agent_prelude: None,
+            repl_default_session: None,
+            cmd_default_session: None,
+            agent_default_session: None,
 
             save_session: None,
             compress_threshold: 4000,
@@ -240,6 +285,7 @@ impl Default for Config {
             macro_flag: false,
             info_flag: false,
             agent_variables: None,
+            mcp_root: vec![],
 
             model: Default::default(),
             tools: Default::default(),
@@ -258,7 +304,11 @@ impl Default for Config {
 pub type GlobalConfig = Arc<RwLock<Config>>;
 
 impl Config {
-    pub async fn init(working_mode: WorkingMode, info_flag: bool) -> Result<Self> {
+    pub async fn init(
+        working_mode: WorkingMode,
+        info_flag: bool,
+        mut mcp_root: Vec<String>,
+    ) -> Result<Self> {
         let config_path = Self::config_file();
         let mut config = if !config_path.exists() {
             match env::var(get_env_name("provider"))
@@ -277,8 +327,18 @@ impl Config {
             Self::load_from_file(&config_path)?
         };
 
+        if let Ok(v) = env::var("HARNX_MCP_ROOTS") {
+            for root in v.split(',') {
+                let root = root.trim();
+                if !root.is_empty() && !mcp_root.contains(&root.to_string()) {
+                    mcp_root.push(root.to_string());
+                }
+            }
+        }
+
         config.working_mode = working_mode;
         config.info_flag = info_flag;
+        config.mcp_root = mcp_root;
 
         let setup = |config: &mut Self| -> Result<()> {
             config.load_envs();
@@ -811,6 +871,46 @@ impl Config {
             Some(role_like) => role_like.set_use_tools(value),
             None => self.use_tools = value,
         }
+    }
+
+    pub fn active_tool_names(&self) -> HashSet<String> {
+        let role = self.extract_role();
+        let use_tools = match role.use_tools() {
+            Some(v) => v,
+            None => return HashSet::new(),
+        };
+        if use_tools == "all" {
+            return self
+                .tool_declarations_for_use_tools(Some("all"))
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
+        }
+        let declarations = self.tool_declarations_for_use_tools(Some(&use_tools));
+        let declaration_names: HashSet<String> =
+            declarations.iter().map(|d| d.name.clone()).collect();
+        let mut names = HashSet::new();
+        for item in use_tools.split(',').map(str::trim) {
+            if let Some(values) = self.toolsets.get(item) {
+                names.extend(
+                    values
+                        .iter()
+                        .filter(|v| declaration_names.contains(v.as_str()))
+                        .cloned(),
+                );
+            } else if let Some(server) = item.strip_suffix(":all") {
+                let prefix = format!("{server}_");
+                names.extend(
+                    declaration_names
+                        .iter()
+                        .filter(|n| n.starts_with(&prefix))
+                        .cloned(),
+                );
+            } else if declaration_names.contains(item) {
+                names.insert(item.to_string());
+            }
+        }
+        names
     }
 
     pub fn set_save_session(&mut self, value: Option<bool>) {
@@ -1531,7 +1631,7 @@ impl Config {
             if config.read().macro_flag {
                 None
             } else {
-                agent.agent_prelude().map(|v| v.to_string())
+                agent.agent_default_session().map(|v| v.to_string())
             }
         });
         config.write().rag = agent.rag();
@@ -1638,16 +1738,16 @@ impl Config {
         Ok(())
     }
 
-    pub fn apply_prelude(&mut self) -> Result<()> {
+    pub fn apply_default_session(&mut self) -> Result<()> {
         if self.macro_flag || !self.state().is_empty() {
             return Ok(());
         }
-        let prelude = match self.working_mode {
-            WorkingMode::Repl => self.repl_prelude.as_ref(),
-            WorkingMode::Cmd => self.cmd_prelude.as_ref(),
+        let default_session = match self.working_mode {
+            WorkingMode::Repl => self.repl_default_session.as_ref(),
+            WorkingMode::Cmd => self.cmd_default_session.as_ref(),
             WorkingMode::Serve => return Ok(()),
         };
-        let prelude = match prelude {
+        let default_session = match default_session {
             Some(v) => {
                 if v.is_empty() {
                     return Ok(());
@@ -1656,9 +1756,8 @@ impl Config {
             }
             None => return Ok(()),
         };
-
-        let err_msg = || format!("Invalid prelude '{prelude}");
-        match prelude.split_once(':') {
+        let err_msg = || format!("Invalid default session '{default_session}'");
+        match default_session.split_once(':') {
             Some(("role", name)) => {
                 self.use_role(name).with_context(err_msg)?;
             }
@@ -1691,13 +1790,21 @@ impl Config {
                 } else {
                     for item in use_tools.split(',') {
                         let item = item.trim();
-                        if let Some(values) = self.mapping_tools.get(item) {
+                        if let Some(values) = self.toolsets.get(item) {
                             tool_names.extend(
                                 values
-                                    .split(',')
-                                    .map(|v| v.to_string())
-                                    .filter(|v| declaration_names.contains(v)),
+                                    .iter()
+                                    .filter(|v| declaration_names.contains(v.as_str()))
+                                    .cloned(),
                             )
+                        } else if let Some(server) = item.strip_suffix(":all") {
+                            let prefix = format!("{server}_");
+                            tool_names.extend(
+                                declaration_names
+                                    .iter()
+                                    .filter(|name| name.starts_with(&prefix))
+                                    .cloned(),
+                            );
                         } else if declaration_names.contains(item) {
                             tool_names.insert(item.to_string());
                         }
@@ -1790,7 +1897,18 @@ impl Config {
                 ".rag" => map_completion_values(Self::list_rags()),
                 ".agent" => map_completion_values(list_agents()),
                 ".macro" => map_completion_values(Self::list_macros()),
-                ".mcp" => map_completion_values(vec!["list", "connect", "disconnect", "tools"]),
+                ".info" => map_completion_values(vec!["role", "session", "agent", "rag", "tools"]),
+                ".mcp" => map_completion_values(vec![
+                    "list",
+                    "connect",
+                    "disconnect",
+                    "tools",
+                    "roots",
+                    "add-root",
+                    "remove-root",
+                ]),
+                ".use" => map_completion_values(vec!["tool"]),
+                ".drop" => map_completion_values(vec!["tool"]),
                 ".starter" => match &self.agent {
                     Some(agent) => agent
                         .conversation_staters()
@@ -1853,7 +1971,7 @@ impl Config {
                             .iter()
                             .map(|v| v.name.clone()),
                     );
-                    values.extend(self.mapping_tools.keys().map(|v| v.to_string()));
+                    values.extend(self.toolsets.keys().map(|v| v.to_string()));
                     values
                         .into_iter()
                         .filter(|v| !ignores.contains(v.as_str()))
@@ -1876,9 +1994,39 @@ impl Config {
                 _ => vec![],
             };
             values = candidates.into_iter().map(|v| (v, None)).collect();
+        } else if cmd == ".use" && args.len() == 2 && args[0] == "tool" {
+            let mut candidates: Vec<String> = self
+                .tool_declarations_for_use_tools(Some("all"))
+                .iter()
+                .map(|v| v.name.clone())
+                .collect();
+            candidates.extend(self.toolsets.keys().map(|v| v.to_string()));
+            if let Some(manager) = &self.mcp_manager {
+                for name in manager.list_servers() {
+                    candidates.push(format!("{name}:all"));
+                }
+            }
+            let active = self.active_tool_names();
+            values = candidates
+                .into_iter()
+                .filter(|v| !active.contains(v))
+                .map(|v| (v, None))
+                .collect();
+        } else if cmd == ".drop" && args.len() == 2 && args[0] == "tool" {
+            let role = self.extract_role();
+            let current = role.use_tools().unwrap_or_default();
+            values = current
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| (s.to_string(), None))
+                .collect();
         } else if cmd == ".mcp" && args.len() == 2 {
             let subcmd = args[0];
-            if matches!(subcmd, "connect" | "disconnect" | "tools") {
+            if matches!(
+                subcmd,
+                "connect" | "disconnect" | "tools" | "roots" | "add-root" | "remove-root"
+            ) {
                 let servers = Self::mcp_list_servers_from_config(self);
                 values = servers.into_iter().map(|v| (v, None)).collect();
             }
@@ -2318,23 +2466,23 @@ impl Config {
         if let Some(Some(v)) = read_env_bool(&get_env_name("tool_use")) {
             self.tool_use = v;
         }
-        if let Ok(v) = env::var(get_env_name("mapping_tools")) {
-            if let Ok(v) = serde_json::from_str(&v) {
-                self.mapping_tools = v;
+        if let Ok(v) = env::var(get_env_name("toolsets")) {
+            if let Ok(v) = parse_toolsets_json(&v) {
+                self.toolsets = v;
             }
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("use_tools")) {
             self.use_tools = v;
         }
 
-        if let Some(v) = read_env_value::<String>(&get_env_name("repl_prelude")) {
-            self.repl_prelude = v;
+        if let Some(v) = read_env_value::<String>(&get_env_name("repl_default_session")) {
+            self.repl_default_session = v;
         }
-        if let Some(v) = read_env_value::<String>(&get_env_name("cmd_prelude")) {
-            self.cmd_prelude = v;
+        if let Some(v) = read_env_value::<String>(&get_env_name("cmd_default_session")) {
+            self.cmd_default_session = v;
         }
-        if let Some(v) = read_env_value::<String>(&get_env_name("agent_prelude")) {
-            self.agent_prelude = v;
+        if let Some(v) = read_env_value::<String>(&get_env_name("agent_default_session")) {
+            self.agent_default_session = v;
         }
 
         if let Some(v) = read_env_bool(&get_env_name("save_session")) {
@@ -2420,36 +2568,15 @@ impl Config {
         Ok(())
     }
 
-    fn needs_mcp_tools(&self, use_tools: &str) -> bool {
-        if self.mcp_manager.is_none() {
-            return false;
-        }
-        if use_tools == "all" {
-            return true;
-        }
-
-        use_tools.split(',').map(str::trim).any(|item| {
-            crate::mcp::is_mcp_tool(item)
-                || self
-                    .mapping_tools
-                    .get(item)
-                    .map(|values| {
-                        values
-                            .split(',')
-                            .map(str::trim)
-                            .any(crate::mcp::is_mcp_tool)
-                    })
-                    .unwrap_or(false)
-        })
+    fn needs_mcp_tools(&self) -> bool {
+        self.mcp_manager.is_some()
     }
 
-    fn tool_declarations_for_use_tools(&self, use_tools: Option<&str>) -> Vec<ToolDeclaration> {
+    pub fn tool_declarations_for_use_tools(&self, use_tools: Option<&str>) -> Vec<ToolDeclaration> {
         let mut declarations = self.tools.declarations();
-        if let Some(use_tools) = use_tools {
-            if self.needs_mcp_tools(use_tools) {
-                if let Some(manager) = &self.mcp_manager {
-                    declarations.extend(manager.get_all_tools_blocking());
-                }
+        if use_tools.is_some() && self.needs_mcp_tools() {
+            if let Some(manager) = &self.mcp_manager {
+                declarations.extend(manager.get_all_tools_blocking());
             }
         }
 
@@ -2462,8 +2589,26 @@ impl Config {
         if self.mcp_servers.is_empty() {
             return;
         }
+        let mut mcp_servers = self.mcp_servers.clone();
+        let mut extra_roots = self.mcp_root.clone();
+        if let Ok(cwd) = env::current_dir() {
+            if let Ok(cwd_str) = cwd.into_os_string().into_string() {
+                if !extra_roots.contains(&cwd_str) {
+                    extra_roots.insert(0, cwd_str);
+                }
+            }
+        }
+        if !extra_roots.is_empty() {
+            for server in mcp_servers.iter_mut() {
+                for root in extra_roots.iter().rev() {
+                    if !server.roots.contains(root) {
+                        server.roots.insert(0, root.clone());
+                    }
+                }
+            }
+        }
         let manager = McpManager::new();
-        manager.initialize(self.mcp_servers.clone());
+        manager.initialize(mcp_servers);
         self.mcp_manager = Some(Arc::new(manager));
     }
 
@@ -2494,6 +2639,49 @@ impl Config {
         let mcp_manager = config.read().mcp_manager.clone();
         match mcp_manager {
             Some(manager) => manager.disconnect(server_name).await,
+            None => bail!("MCP is not configured"),
+        }
+    }
+
+    pub fn mcp_get_roots(config: &GlobalConfig, server_name: &str) -> Result<Vec<String>> {
+        let mcp_manager = config.read().mcp_manager.clone();
+        match mcp_manager {
+            Some(manager) => {
+                let client = manager
+                    .get_client(server_name)
+                    .ok_or_else(|| anyhow!("MCP server '{}' not found", server_name))?;
+                Ok(client.get_roots())
+            }
+            None => bail!("MCP is not configured"),
+        }
+    }
+
+    pub async fn mcp_add_root(config: &GlobalConfig, server_name: &str, root: &str) -> Result<()> {
+        let mcp_manager = config.read().mcp_manager.clone();
+        match mcp_manager {
+            Some(manager) => {
+                let client = manager
+                    .get_client(server_name)
+                    .ok_or_else(|| anyhow!("MCP server '{}' not found", server_name))?;
+                client.add_root(root).await
+            }
+            None => bail!("MCP is not configured"),
+        }
+    }
+
+    pub async fn mcp_remove_root(
+        config: &GlobalConfig,
+        server_name: &str,
+        root: &str,
+    ) -> Result<()> {
+        let mcp_manager = config.read().mcp_manager.clone();
+        match mcp_manager {
+            Some(manager) => {
+                let client = manager
+                    .get_client(server_name)
+                    .ok_or_else(|| anyhow!("MCP server '{}' not found", server_name))?;
+                client.remove_root(root).await
+            }
             None => bail!("MCP is not configured"),
         }
     }
@@ -2869,5 +3057,44 @@ where
     match value {
         Some(value) => value.to_string(),
         None => "null".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_init_mcp_manager_with_roots() {
+        let mut config = Config::default();
+        let server = McpServerConfig {
+            name: "test".to_string(),
+            command: "ls".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            roots: vec!["/existing".to_string()],
+            enabled: true,
+            description: None,
+            rename_tools: HashMap::new(),
+        };
+        config.mcp_servers = vec![server];
+        config.mcp_root = vec!["/extra".to_string()];
+
+        config.init_mcp_manager();
+
+        let manager = config.mcp_manager.expect("Manager should be initialized");
+        let client = manager.get_client("test").expect("Client should exist");
+        let roots = client.get_roots();
+
+        // Roots should be: [cwd, /extra, /existing]
+        assert_eq!(roots.len(), 3);
+        let cwd = env::current_dir()
+            .unwrap()
+            .into_os_string()
+            .into_string()
+            .unwrap();
+        assert_eq!(roots[0], cwd);
+        assert_eq!(roots[1], "/extra");
+        assert_eq!(roots[2], "/existing");
     }
 }

@@ -1904,3 +1904,20 @@
       type: reranker
       max_input_tokens: 8000
       input_price: 0.02
+
+- provider: google
+  models:
+    - name: gemini-1.5-pro
+      max_input_tokens: 1000000
+      max_output_tokens: 8192
+      input_price: 0.0035 # Example price
+      output_price: 0.0105 # Example price
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-1.5-flash
+      max_input_tokens: 1000000
+      max_output_tokens: 8192
+      input_price: 0.00035 # Example price
+      output_price: 0.00105 # Example price
+      supports_vision: true
+      supports_tool_use: true

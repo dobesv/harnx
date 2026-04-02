@@ -12,38 +12,49 @@ wrap: no                         # Controls text wrapping (no, auto, <max-width>
 wrap_code: false                 # Enables or disables wrapping of code blocks
 
 # ---- tool-use ----
-# Visit https://github.com/sigoden/llm-functions for setup instructions
 tool_use: true                   # Enables or disables tool use (Globally).
-mapping_tools:                   # Alias for a tool or toolset
-  fs: 'fs_cat,fs_ls,fs_mkdir,fs_rm,fs_write'
+toolsets:
+  fs:
+    - fs:read
+    - fs:write
+    - fs:search
+    - fs:find
+    - fs_write
 use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search')
 
 # ---- mcp servers ----
 # MCP (Model Context Protocol) servers provide external tools.
 # tool_use must be true for MCP tools to work.
-# mcp_servers:
-#   - name: filesystem                 # Unique server name
-#     command: npx                     # Command to start the server
-#     args:                            # Arguments for the command
-#       - "-y"
-#       - "@modelcontextprotocol/server-filesystem"
-#       - "/tmp"
-#     enabled: true                    # Auto-connect on startup (default: true)
-#     description: "File system operations"
-#   - name: git
-#     command: npx
-#     args:
-#       - "-y"
-#       - "@modelcontextprotocol/server-git"
-#     enabled: true
-#     description: "Git repository operations"
-#   - name: bash
-#     command: npx
-#     args:
-#       - "-y"
-#       - "@artinet/bash-mcp"
-#     enabled: true
-#     description: "Execute bash commands"
+#
+# Each server supports: name, command, args, env, roots, enabled, description
+#   roots: Directories the server is allowed to access (sent via MCP roots protocol).
+#          The current working directory is added automatically as the first root.
+mcp_servers:
+   - name: fs
+     command: harnx-mcp-fs               # Filesystem tools: read, write, edit, ls, grep, find
+     # roots:
+     #   - "/home/user/projects"
+     description: >-
+       Agent filesystem access
+     rename_tools:
+       read: Read
+       write: Write
+       edit: Edit
+       ls: ListDirectory
+       grep: Grep
+       find: Glob
+   - name: bash
+     command: harnx-mcp-bash             # Shell command execution
+     # roots:
+     #  - "/home/user/projects"
+     description: >-
+       Allow the agent to run commands or script snippets
+     rename_tools:
+       exec: Bash
+   - name: time
+     command: harnx-mcp-time             # Time utilities: current time, convert, wait, wait_until
+     description: >-
+       Allow the agent to check the time or wait for a period of time
 #   - name: custom
 #     command: /path/to/custom-mcp-server
 #     args:
@@ -53,12 +64,11 @@ use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_
 #       API_KEY: "your-api-key-here"
 #     enabled: false
 #     description: "Custom MCP server"
-mcp_servers: []
 
-# ---- prelude ----
-repl_prelude: null               # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
-cmd_prelude: null                # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)
-agent_prelude: null              # Set a session to use when starting a agent (e.g. temp, default)
+# ---- default session ----
+repl_default_session: null        # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
+cmd_default_session: null         # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)
+agent_default_session: null       # Set a session to use when starting a agent (e.g. temp, default)
 
 # ---- session ----
 # Controls the persistence of the session. if true, auto save; if false, not save; if null, asking the user
@@ -408,27 +418,27 @@ clients:
 #     type: claude-command
 #     command: "echo 'Session started'"
 #
-#   ## Example: rtk (https://github.com/rtk-ai/rtk)
-#   ## Token compression proxy - rewrites commands to rtk equivalents for 60-90% token savings.
-#   ## Install: brew install rtk  (or cargo install --git https://github.com/rtk-ai/rtk)
-#   ## Setup:  rtk init -g
-#   ## rtk registers its own PreToolUse hook that transparently rewrites Bash
-#   ## commands (e.g. "git status" → "rtk git status") before execution.
-#   ## No manual harnx config is needed if you use `rtk init`; shown here for reference:
-#   # - event: PreToolUse
-#   #   type: claude-command
-#   #   matcher: "execute_command"
-#   #   command: "rtk hook claude"     # rtk's built-in hook handler
+#   # Example: rtk (https://github.com/rtk-ai/rtk)
+#   # Token compression proxy - rewrites commands to rtk equivalents for 60-90% token savings.
+#   # Install: brew install rtk  (or cargo install --git https://github.com/rtk-ai/rtk)
+#   # Setup:  rtk init -g
+#   # rtk registers its own PreToolUse hook that transparently rewrites Bash
+#   # commands (e.g. "git status" → "rtk git status") before execution.
+#   # No manual harnx config is needed if you use `rtk init`; shown here for reference:
+#   - event: PreToolUse
+#     type: claude-command
+#     matcher: "Bash"
+#     command: "rtk hook claude"     # rtk's built-in hook handler
 #
-#   ## Example: dcg (https://github.com/Dicklesworthstone/destructive_command_guard)
-#   ## Blocks destructive commands (rm -rf, git reset --hard, DROP TABLE, etc.)
-#   ## Install: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh | bash -s -- --easy-mode
-#   # - event: PreToolUse
-#   #   type: claude-command
-#   #   matcher: "execute_command"
-#   #   command: "dcg"                 # dcg reads the hook payload from stdin
+#   # Example: dcg (https://github.com/Dicklesworthstone/destructive_command_guard)
+#   # Blocks destructive commands (rm -rf, git reset --hard, DROP TABLE, etc.)
+#   # Install: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh | bash -s -- --easy-mode
+#   - event: PreToolUse
+#     type: claude-command
+#     matcher: "Bash"
+#     command: "dcg"                 # dcg reads the hook payload from stdin
 #
-#   ## Example: hookSpecificOutput with permissionDecision
-#   ## Hooks can return structured JSON to allow, deny, or ask for confirmation:
-#   ## echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"Blocked by policy"}}'
-#   ## permissionDecision values: "allow" (proceed), "deny" (block), "ask" (prompt user)
+#   # Example: hookSpecificOutput with permissionDecision
+#   # Hooks can return structured JSON to allow, deny, or ask for confirmation:
+#   # echo '{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"Blocked by policy"}}'
+#   # permissionDecision values: "allow" (proceed), "deny" (block), "ask" (prompt user)

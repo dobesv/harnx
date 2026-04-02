@@ -254,8 +254,8 @@ impl Agent {
         output
     }
 
-    pub fn agent_prelude(&self) -> Option<&str> {
-        self.config.agent_prelude.as_deref()
+    pub fn agent_default_session(&self) -> Option<&str> {
+        self.config.agent_default_session.as_deref()
     }
 
     pub fn variables(&self) -> &AgentVariables {
@@ -390,7 +390,7 @@ pub struct AgentConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_tools: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_prelude: Option<String>,
+    pub agent_default_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -404,7 +404,7 @@ impl AgentConfig {
     pub fn new(config: &Config) -> Self {
         Self {
             use_tools: config.use_tools.clone(),
-            agent_prelude: config.agent_prelude.clone(),
+            agent_default_session: config.agent_default_session.clone(),
             ..Default::default()
         }
     }
@@ -432,8 +432,8 @@ impl AgentConfig {
         if let Some(v) = read_env_value::<String>(&with_prefix("use_tools")) {
             self.use_tools = v;
         }
-        if let Some(v) = read_env_value::<String>(&with_prefix("agent_prelude")) {
-            self.agent_prelude = v;
+        if let Some(v) = read_env_value::<String>(&with_prefix("agent_default_session")) {
+            self.agent_default_session = v;
         }
         if let Some(v) = read_env_value::<String>(&with_prefix("instructions")) {
             self.instructions = v;

@@ -1,7 +1,6 @@
 use crate::{
     config::{Agent, Config, GlobalConfig},
     hooks::{dispatch::dispatch_hooks, HookEvent, HookResultControl},
-    mcp,
     utils::*,
 };
 
@@ -73,7 +72,12 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
             }
         }
 
-        let eval_result = if mcp::is_mcp_tool(&call.name) {
+        let is_mcp = config
+            .read()
+            .mcp_manager
+            .as_ref()
+            .is_some_and(|m| m.has_tool(&call.name));
+        let eval_result = if is_mcp {
             call.eval_mcp(config)
         } else {
             call.eval(config)
@@ -206,6 +210,8 @@ pub struct ToolDeclaration {
     pub parameters: JsonSchema,
     #[serde(skip_serializing, default)]
     pub agent: bool,
+    #[serde(skip, default)]
+    pub mcp_tool_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

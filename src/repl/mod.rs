@@ -8,7 +8,7 @@ use self::prompt::ReplPrompt;
 
 use crate::client::{call_chat_completions, call_chat_completions_streaming};
 use crate::config::{
-    macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage,
+    macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage, RoleLike,
     StateFlags,
 };
 use crate::hooks::{
@@ -36,10 +36,25 @@ use std::{env, process};
 
 const MENU_NAME: &str = "completion_menu";
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 40]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
+        ReplCommand::new(
+            ".info tools",
+            "List all available tools and their status",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".use tool",
+            "Add a tool or toolset to the active tools",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".drop tool",
+            "Remove a tool or toolset from the active tools",
+            AssertState::pass(),
+        ),
         ReplCommand::new(
             ".edit config",
             "Modify configuration file",
@@ -476,6 +491,28 @@ pub async fn run_repl_command(
                     let info = config.read().agent_info()?;
                     print!("{info}");
                 }
+                Some("tools") => {
+                    let conf = config.read();
+                    let declarations = conf.tool_declarations_for_use_tools(Some("all"));
+                    let active_tools = conf.active_tool_names();
+                    if declarations.is_empty() {
+                        println!("No tools available");
+                    } else {
+                        for decl in &declarations {
+                            let marker = if active_tools.contains(&decl.name) {
+                                "●"
+                            } else {
+                                "○"
+                            };
+                            println!("  {} {} - {}", marker, decl.name, decl.description);
+                        }
+                        let active_count = declarations
+                            .iter()
+                            .filter(|d| active_tools.contains(&d.name))
+                            .count();
+                        println!("\n{} active / {} total", active_count, declarations.len());
+                    }
+                }
                 Some(_) => unknown_command()?,
                 None => {
                     let output = config.read().sysinfo()?;
@@ -723,15 +760,62 @@ pub async fn run_repl_command(
                         println!("MCP is not configured");
                     }
                 }
+                Some(("roots", name)) => {
+                    let name = name.map(|n| n.trim()).unwrap_or("");
+                    if name.is_empty() {
+                        println!("Usage: .mcp roots <server>");
+                    } else {
+                        let roots = Config::mcp_get_roots(config, name)?;
+                        if roots.is_empty() {
+                            println!("No roots for MCP server '{}'", name);
+                        } else {
+                            println!("MCP Roots for '{}':", name);
+                            for root in roots {
+                                println!("  {}", root);
+                            }
+                        }
+                    }
+                }
+                Some(("add-root", name_and_root)) => {
+                    let name_and_root = name_and_root.map(|n| n.trim()).unwrap_or("");
+                    if let Some((name, root)) = name_and_root.split_once(' ') {
+                        let (name, root) = (name.trim(), root.trim());
+                        if name.is_empty() || root.is_empty() {
+                            println!("Usage: .mcp add-root <server> <root>");
+                        } else {
+                            Config::mcp_add_root(config, name, root).await?;
+                            println!("Added root '{}' to MCP server '{}'", root, name);
+                        }
+                    } else {
+                        println!("Usage: .mcp add-root <server> <root>");
+                    }
+                }
+                Some(("remove-root", name_and_root)) => {
+                    let name_and_root = name_and_root.map(|n| n.trim()).unwrap_or("");
+                    if let Some((name, root)) = name_and_root.split_once(' ') {
+                        let (name, root) = (name.trim(), root.trim());
+                        if name.is_empty() || root.is_empty() {
+                            println!("Usage: .mcp remove-root <server> <root>");
+                        } else {
+                            Config::mcp_remove_root(config, name, root).await?;
+                            println!("Removed root '{}' from MCP server '{}'", root, name);
+                        }
+                    } else {
+                        println!("Usage: .mcp remove-root <server> <root>");
+                    }
+                }
                 _ => {
                     println!(
                         r#"Usage: .mcp <command>
 
 Commands:
-  .mcp list                  - List configured MCP servers
-  .mcp connect <server>      - Connect to an MCP server
-  .mcp disconnect <server>   - Disconnect from an MCP server
-  .mcp tools [server]        - List available MCP tools"#
+  .mcp list                    - List configured MCP servers
+  .mcp connect <server>        - Connect to an MCP server
+  .mcp disconnect <server>     - Disconnect from an MCP server
+  .mcp tools [server]          - List available MCP tools
+  .mcp roots <server>          - List roots for an MCP server
+  .mcp add-root <server> <root> - Add a root to an MCP server
+  .mcp remove-root <server> <root> - Remove a root from an MCP server"#
                     );
                 }
             },
@@ -830,6 +914,64 @@ Commands:
                 )
                 .await?;
             }
+            ".use" => {
+                match split_first_arg(args) {
+                    Some(("tool", name)) => {
+                        let name = name.map(|n| n.trim()).unwrap_or("");
+                        if name.is_empty() {
+                            println!("Usage: .use tool <name>  (tool name, toolset name, or <server>:all)");
+                        } else {
+                            let mut conf = config.write();
+                            let current = conf.extract_role().use_tools().unwrap_or_default();
+                            let items: Vec<&str> = if current.is_empty() {
+                                vec![]
+                            } else {
+                                current.split(',').map(str::trim).collect()
+                            };
+                            if items.contains(&name) {
+                                println!("'{}' is already in use_tools", name);
+                            } else {
+                                let mut new_items: Vec<String> =
+                                    items.iter().map(|s| s.to_string()).collect();
+                                new_items.push(name.to_string());
+                                conf.set_use_tools(Some(new_items.join(",")));
+                                println!("Added '{}' to use_tools", name);
+                            }
+                        }
+                    }
+                    _ => println!("Usage: .use tool <name>"),
+                }
+            }
+            ".drop" => match split_first_arg(args) {
+                Some(("tool", name)) => {
+                    let name = name.map(|n| n.trim()).unwrap_or("");
+                    if name.is_empty() {
+                        println!("Usage: .drop tool <name>");
+                    } else {
+                        let mut conf = config.write();
+                        let current = conf.extract_role().use_tools().unwrap_or_default();
+                        let items: Vec<&str> = current
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s: &&str| !s.is_empty())
+                            .collect();
+                        if !items.contains(&name) {
+                            println!("'{}' is not in use_tools", name);
+                        } else {
+                            let remaining: Vec<&str> =
+                                items.into_iter().filter(|&i| i != name).collect();
+                            let new_value = if remaining.is_empty() {
+                                None
+                            } else {
+                                Some(remaining.join(","))
+                            };
+                            conf.set_use_tools(new_value);
+                            println!("Removed '{}' from use_tools", name);
+                        }
+                    }
+                }
+                _ => println!("Usage: .drop tool <name>"),
+            },
             ".set" => match args {
                 Some(args) => {
                     Config::update(config, args)?;

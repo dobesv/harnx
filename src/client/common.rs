@@ -403,6 +403,13 @@ impl EmbeddingsData {
     pub fn new(texts: Vec<String>, query: bool) -> Self {
         Self { texts, query }
     }
+
+    pub fn try_get_text(&self) -> Result<&str> {
+        if self.texts.len() != 1 {
+            bail!("EmbeddingsData must contain exactly one text");
+        }
+        Ok(&self.texts[0])
+    }
 }
 
 pub type EmbeddingsOutput = Vec<Vec<f32>>;
