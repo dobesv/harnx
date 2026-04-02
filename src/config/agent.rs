@@ -334,6 +334,10 @@ impl Agent {
         &self.name
     }
 
+    pub fn set_name(&mut self, name: &str) {
+        self.name = name.to_string();
+    }
+
     pub fn model(&self) -> &Model {
         &self.model
     }
@@ -771,6 +775,14 @@ Input 1
         assert_eq!(agent.name(), "empty-body");
         assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
         assert!(agent.interpolated_instructions().is_empty());
+    }
+
+    #[test]
+    fn test_agent_set_name() {
+        let mut agent = Agent::from_prompt("You are a test agent.");
+        assert_eq!(agent.name(), "%%");
+        agent.set_name("new-name");
+        assert_eq!(agent.name(), "new-name");
     }
 
     #[test]

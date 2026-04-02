@@ -1068,6 +1068,7 @@ impl Config {
                     agent_path.display()
                 )
             })?;
+            agent.set_name(&agent_name);
             if self.working_mode.is_repl() {
                 println!("✓ Saved the agent to '{}'.", agent_path.display());
             }
