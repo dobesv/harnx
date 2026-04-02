@@ -41,15 +41,16 @@ Several things can prevent tool calls from working:
 
 3. **Input not related to available tools.** The LLM won't call tools if your prompt doesn't relate to any of the registered tool functions.
 
-## What is the difference between agents and roles?
+## What is an agent?
 
-**Roles** are a prompt library. A role consists of instructions (a system prompt) and optional model configuration.
+An agent is a Markdown file that combines a system prompt with model configuration, tools, variables, documents, and more. Agents are stored at `<harnx-config-dir>/agents/<name>.md` and use YAML front-matter for configuration.
 
-**Agents** are like OpenAI GPTs. An agent is a superset of a role. In fact, a role is just an agent that only has instructions.
+A simple agent might only have a system prompt. A more advanced agent can include:
 
-Agents add these capabilities on top of roles:
-
+- **Model and parameter overrides** (model, temperature, top_p)
+- **MCP tools** for function calling
 - **Variables** for dynamic prompt templates
 - **Conversation starters** for guided interactions
 - **Documents** for RAG (retrieval-augmented generation)
-- **AI tools** for function calling
+
+See the [Agent Guide](agent-guide.md) for full details.

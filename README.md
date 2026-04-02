@@ -33,12 +33,6 @@ Experience an interactive Chat-REPL with features like tab autocompletion, multi
 
 ![harnx-repl](https://github.com/user-attachments/assets/218fab08-cdae-4c3b-bcf8-39b6651f1362)
 
-### Shell Assistant
-
-Elevate your command-line efficiency. Describe your tasks in natural language, and let Harnx transform them into precise shell commands. Harnx intelligently adjusts to your OS and shell environment.
-
-![harnx-execute](https://github.com/user-attachments/assets/0c77e901-0da2-4151-aefc-a2af96bbb004)
-
 ### Multi-Form Input
 
 Accept diverse input forms such as stdin, local files and directories, and remote URLs, allowing flexibility in data handling.
@@ -54,13 +48,13 @@ Accept diverse input forms such as stdin, local files and directories, and remot
 | External commands | ```harnx -f '`git diff`'```         | ```.file `git diff` ```          |
 | Combine Inputs    | `harnx -f dir/ -f data.txt explain` | `.file dir/ data.txt -- explain` |
 
-### Role
+### Agents
 
-Customize roles to tailor LLM behavior, enhancing interaction efficiency and boosting productivity.
+Customize agents to tailor LLM behavior, enhancing interaction efficiency and boosting productivity.
 
-![harnx-role](https://github.com/user-attachments/assets/023df6d2-409c-40bd-ac93-4174fd72f030)
+![harnx-agent](https://github.com/user-attachments/assets/023df6d2-409c-40bd-ac93-4174fd72f030)
 
-> The role consists of a prompt and model configuration.
+> An agent is a Markdown file combining a system prompt with model configuration, tools, variables, and documents.
 
 ### Session
 
@@ -149,7 +143,7 @@ Harnx supports custom dark and light themes, which highlight response text and c
 
 - [Chat-REPL Guide](docs/chat-repl-guide.md)
 - [Command-Line Guide](docs/command-line-guide.md)
-- [Role Guide](docs/role-guide.md)
+- [Agent Guide](docs/agent-guide.md)
 - [Macro Guide](docs/macro-guide.md)
 - [RAG Guide](docs/rag-guide.md)
 - [Environment Variables](docs/environment-variables.md)

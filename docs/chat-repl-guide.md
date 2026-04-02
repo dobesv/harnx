@@ -34,19 +34,9 @@ openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
 └─ model id
 ```
 
-### `.role` - role management
+### `.prompt` - set a temporary agent using a prompt
 
-```
-.role                    Create or switch to a role
-.info role               Show role info
-.edit role               Modify current role
-.save role               Save current role to file
-.exit role               Exit active role
-```
-
-### `.prompt` - set a temporary role using a prompt
-
-Compared to `.role`, `.prompt` does not persist to a file; it creates and switches to a temporary role.
+`.prompt` creates a temporary agent from an inline prompt without persisting it to a file.
 
 ### `.session` - session management
 
@@ -60,14 +50,15 @@ Compared to `.role`, `.prompt` does not persist to a file; it creates and switch
 .exit session            Exit active session
 ```
 
-### `.agent` - chat with AI agent
+### `.agent` - agent management
 
 ```
-.agent                   Use an agent
-.starter                 Use a conversation starter
-.edit agent-config       Modify agent configuration file
+.agent                   Switch to an agent
 .info agent              Show agent info
-.exit agent              Leave agent
+.edit agent              Edit agent .md file
+.save agent [name]       Save current agent to file
+.exit agent              Exit active agent
+.starter                 Use a conversation starter
 ```
 
 ### `.rag` - chat with documents
@@ -133,34 +124,31 @@ If the response is interrupted or unsatisfactory, you can regenerate it with `.r
 .set highlight true
 ```
 
-### `.edit` - modify config/role/session/agent-config/rag-docs
+### `.edit` - modify config/session/agent/rag-docs
 
 ```
 .edit config             Modify configuration file
-.edit role               Modify current role
 .edit session            Modify current session
-.edit agent-config       Modify agent configuration file
+.edit agent              Edit agent .md file
 .edit rag-docs           Add or remove documents from an existing RAG
 ```
 
-### `.delete` - delete roles/sessions/RAGs/agents
+### `.delete` - delete agents/sessions/RAGs
 
-### `.info` - display system/role/session/agent/RAG info
+### `.info` - display system/session/agent/RAG info
 
 ```
 .info                    Show system info
-.info role               Show role info
 .info session            Show session info
 .info agent              Show agent info
 .info rag                Show RAG info
 ```
 
-### `.exit` - exit role/session/RAG/agent/REPL
+### `.exit` - exit session/agent/RAG/REPL
 
 ```
-.exit role               Exit active role
 .exit session            Exit active session
-.exit agent              Leave agent
+.exit agent              Exit active agent
 .exit rag                Leave RAG
 .exit                    Exit REPL
 ```

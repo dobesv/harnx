@@ -43,7 +43,6 @@ Harnx can load environment variables from a `.env` file located in the configura
 - **HARNX_CONFIG_DIR**: The directory for configuration files.
 - **HARNX_ENV_FILE**: The path to the environment file.
 - **HARNX_CONFIG_FILE**: The path to the configuration file.
-- **HARNX_ROLES_DIR**: The directory for roles.
 - **HARNX_SESSIONS_DIR**: The directory for sessions.
 - **HARNX_RAGS_DIR**: The directory for RAG data.
 - **HARNX_FUNCTIONS_DIR**: The directory for functions.
