@@ -21,9 +21,7 @@ use crate::utils::*;
 
 use anyhow::{anyhow, bail, Context, Result};
 use indexmap::IndexMap;
-use inquire::{
-    list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text,
-};
+use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use parking_lot::RwLock;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
@@ -600,7 +598,8 @@ impl Config {
             ("use_tools", format_option_value(&agent.use_tools())),
             (
                 "max_output_tokens",
-                agent.model()
+                agent
+                    .model()
                     .max_tokens_param()
                     .map(|v| format!("{v} (current model)"))
                     .unwrap_or_else(|| "null".into()),
@@ -1063,7 +1062,11 @@ impl Config {
             let content = agent.export()?;
             ensure_parent_exists(&agent_path)?;
             std::fs::write(&agent_path, content).with_context(|| {
-                format!("Failed to write agent '{}' to '{}'", agent.name(), agent_path.display())
+                format!(
+                    "Failed to write agent '{}' to '{}'",
+                    agent.name(),
+                    agent_path.display()
+                )
             })?;
             if self.working_mode.is_repl() {
                 println!("✓ Saved the agent to '{}'.", agent_path.display());
@@ -2009,7 +2012,8 @@ impl Config {
         output.insert("model_name", agent.model().name().to_string());
         output.insert(
             "max_input_tokens",
-            agent.model()
+            agent
+                .model()
                 .max_input_tokens()
                 .unwrap_or_default()
                 .to_string(),

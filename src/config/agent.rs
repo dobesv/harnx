@@ -639,7 +639,7 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
                         None => v.description.clone(),
                     };
                     (format!("{}=", v.name), Some(description))
-            })
+                })
                 .collect();
         }
     }
@@ -746,7 +746,9 @@ Input 1
         assert_eq!(agent.temperature(), Some(0.7));
         assert_eq!(agent.top_p(), Some(0.9));
         assert_eq!(agent.use_tools(), Some("fs,web_search".to_string()));
-        assert!(agent.interpolated_instructions().contains("You are a helpful test agent"));
+        assert!(agent
+            .interpolated_instructions()
+            .contains("You are a helpful test agent"));
     }
 
     #[test]
@@ -756,7 +758,10 @@ Input 1
         assert_eq!(agent.name(), "minimal");
         assert!(agent.model_id().is_none());
         assert!(agent.temperature().is_none());
-        assert_eq!(agent.interpolated_instructions(), "Just instructions, no front-matter.");
+        assert_eq!(
+            agent.interpolated_instructions(),
+            "Just instructions, no front-matter."
+        );
     }
 
     #[test]
@@ -772,7 +777,9 @@ Input 1
     fn test_agent_from_prompt() {
         let agent = Agent::from_prompt("You are a pirate");
         assert_eq!(agent.name(), "%%");
-        assert!(agent.interpolated_instructions().contains("You are a pirate"));
+        assert!(agent
+            .interpolated_instructions()
+            .contains("You are a pirate"));
         assert!(agent.model_id().is_none());
         assert!(agent.temperature().is_none());
     }

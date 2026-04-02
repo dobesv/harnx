@@ -336,14 +336,8 @@ async fn start_directive_inner(
         HookResultControl::Continue => {}
     }
     let (output, tool_results) = if !input.stream() {
-        match call_chat_completions(
-            &input,
-            true,
-            false,
-            client.as_ref(),
-            abort_signal.clone(),
-        )
-        .await
+        match call_chat_completions(&input, true, false, client.as_ref(), abort_signal.clone())
+            .await
         {
             Ok(result) => result,
             Err(err) => {
