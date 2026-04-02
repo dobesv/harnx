@@ -1,12 +1,10 @@
 mod agent;
 mod input;
-mod role;
 mod session;
 
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
-pub use self::role::Role;
 use self::session::Session;
 
 use crate::client::{
@@ -57,9 +55,6 @@ const ENV_FILE_NAME: &str = ".env";
 const MESSAGES_FILE_NAME: &str = "messages.md";
 const SESSIONS_DIR_NAME: &str = "sessions";
 const RAGS_DIR_NAME: &str = "rags";
-const TOOLS_DIR_NAME: &str = "tools";
-const TOOLS_FILE_NAME: &str = "tools.json";
-const TOOLS_BIN_DIR_NAME: &str = "bin";
 const AGENTS_DIR_NAME: &str = "agents";
 
 const CLIENTS_FIELD: &str = "clients";
@@ -344,7 +339,7 @@ impl Config {
             }
 
             config.init_mcp_manager();
-            config.load_tools()?;
+            config.tools = Tools::init_from_mcp(None);
 
             config.setup_model()?;
             config.setup_document_loaders();
@@ -425,21 +420,6 @@ impl Config {
         }
     }
 
-    pub fn tools_dir() -> PathBuf {
-        match env::var(get_env_name("tools_dir")) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::local_path(TOOLS_DIR_NAME),
-        }
-    }
-
-    pub fn tools_file() -> PathBuf {
-        Self::tools_dir().join(TOOLS_FILE_NAME)
-    }
-
-    pub fn tools_bin_dir() -> PathBuf {
-        Self::tools_dir().join(TOOLS_BIN_DIR_NAME)
-    }
-
     pub fn session_file(&self, name: &str) -> PathBuf {
         match name.split_once("/") {
             Some((dir, name)) => self.sessions_dir().join(dir).join(format!("{name}.yaml")),
@@ -465,30 +445,12 @@ impl Config {
         }
     }
 
-    pub fn agent_config_file(name: &str) -> PathBuf {
-        match env::var(format!("{}_CONFIG_FILE", normalize_env_name(name))) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::agent_data_dir(name).join(CONFIG_FILE_NAME),
-        }
-    }
-
     pub fn agent_rag_file(agent_name: &str, rag_name: &str) -> PathBuf {
         Self::agent_data_dir(agent_name).join(format!("{rag_name}.yaml"))
     }
 
     pub fn agent_file(name: &str) -> PathBuf {
         Self::agents_data_dir().join(format!("{name}.md"))
-    }
-
-    pub fn agents_tools_dir() -> PathBuf {
-        Self::tools_dir().join(AGENTS_DIR_NAME)
-    }
-
-    pub fn agent_tools_dir(name: &str) -> PathBuf {
-        match env::var(format!("{}_TOOLS_DIR", normalize_env_name(name))) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::agents_tools_dir().join(name),
-        }
     }
 
     pub fn models_override_file() -> PathBuf {
@@ -590,7 +552,7 @@ impl Config {
     pub fn resolved_hooks(&self) -> HooksConfig {
         let global = self.hooks.clone().unwrap_or_default();
         if let Some(agent) = &self.agent {
-            if let Some(agent_hooks) = &agent.config().hooks {
+            if let Some(agent_hooks) = agent.hooks() {
                 return HooksConfig::merge(&global, agent_hooks);
             }
         }
@@ -664,7 +626,6 @@ impl Config {
             ("sessions_dir", display_path(&self.sessions_dir())),
             ("rags_dir", display_path(&Self::rags_dir())),
             ("macros_dir", display_path(&Self::macros_dir())),
-            ("tools_dir", display_path(&Self::tools_dir())),
             ("messages_file", display_path(&self.messages_file())),
         ];
         if let Some(hooks) = &self.hooks {
@@ -727,7 +688,12 @@ impl Config {
             }
             "tool_use" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
-                if value && config.write().tools.is_empty() {
+                if value
+                    && config
+                        .read()
+                        .tool_declarations_for_use_tools(Some("all"))
+                        .is_empty()
+                {
                     bail!("Tool use cannot be enabled because no tools are installed.")
                 }
                 config.write().tool_use = value;
@@ -990,17 +956,11 @@ impl Config {
         let path = Self::agent_file(name);
         let mut agent = if path.exists() {
             Agent::load(&path)?
-        } else if let Ok(path) = Self::legacy_role_file(name) {
-            let content = read_to_string(&path)?;
-            Agent::from_markdown(name, &content)
         } else {
-            match Role::builtin(name) {
-                Ok(role) => Agent::from_markdown(name, &role.export()),
-                Err(_) => Agent::builtin(name)?,
-            }
+            Agent::builtin(name)?
         };
         let current_model = self.current_model().clone();
-        match agent.config().model_id.as_deref() {
+        match agent.model_id() {
             Some(model_id) => {
                 if current_model.id() != model_id {
                     let model = Model::retrieve_model(self, model_id, ModelType::Chat)?;
@@ -1121,38 +1081,9 @@ impl Config {
                 agents.insert(name, agent);
             }
         }
-        let legacy_roles_dir = Self::local_path("roles");
-        if let Ok(entries) = read_dir(legacy_roles_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let (Some("md"), Some(name)) = (
-                    path.extension().and_then(|value| value.to_str()),
-                    path.file_stem().and_then(|value| value.to_str()),
-                ) {
-                    if let Ok(content) = read_to_string(&path) {
-                        agents.insert(name.to_string(), Agent::from_markdown(name, &content));
-                    }
-                }
-            }
-        }
-        for role in Role::list_builtin_roles() {
-            agents.insert(
-                role.name().to_string(),
-                Agent::from_markdown(role.name(), &role.export()),
-            );
-        }
         let mut agents: Vec<_> = agents.into_values().collect();
         agents.sort_unstable_by(|a, b| a.name().cmp(b.name()));
         agents
-    }
-
-    fn legacy_role_file(name: &str) -> Result<PathBuf> {
-        let path = Self::local_path("roles").join(format!("{name}.md"));
-        if path.exists() {
-            Ok(path)
-        } else {
-            bail!("Unknown agent '{name}'")
-        }
     }
 
     pub fn use_session(&mut self, session_name: Option<&str>) -> Result<()> {
@@ -1220,7 +1151,7 @@ impl Config {
                     .tools()
                     .declarations()
                     .iter()
-                    .filter_map(|v| if v.agent { Some(v.name.clone()) } else { None })
+                    .map(|v| v.name.clone())
                     .collect();
                 (agent.name().to_string(), functions)
             });
@@ -1757,16 +1688,8 @@ impl Config {
 
             if let Some(agent) = &self.agent {
                 let mut agent_functions = agent.tools().declarations();
-                let tool_names: HashSet<String> = agent_functions
-                    .iter()
-                    .filter_map(|v| {
-                        if v.agent {
-                            None
-                        } else {
-                            Some(v.name.to_string())
-                        }
-                    })
-                    .collect();
+                let tool_names: HashSet<String> =
+                    agent_functions.iter().map(|v| v.name.to_string()).collect();
                 agent_functions.extend(
                     functions
                         .into_iter()
@@ -2248,7 +2171,7 @@ impl Config {
             None => return Ok(()),
         };
         if !agent.defined_variables().is_empty() && agent.shared_variables().is_empty() {
-            let mut config_variables = agent.config_variables().clone();
+            let mut config_variables = AgentVariables::default();
             if let Some(v) = &self.agent_variables {
                 config_variables.extend(v.clone());
             }
@@ -2258,9 +2181,6 @@ impl Config {
                 self.info_flag,
             )?;
             agent.set_shared_variables(new_variables);
-        }
-        if !self.info_flag {
-            agent.update_shared_dynamic_instructions(false)?;
         }
         Ok(())
     }
@@ -2274,7 +2194,7 @@ impl Config {
             let shared_variables = agent.shared_variables().clone();
             let session_variables =
                 if !agent.defined_variables().is_empty() && shared_variables.is_empty() {
-                    let mut config_variables = agent.config_variables().clone();
+                    let mut config_variables = AgentVariables::default();
                     if let Some(v) = &self.agent_variables {
                         config_variables.extend(v.clone());
                     }
@@ -2289,16 +2209,10 @@ impl Config {
                     shared_variables
                 };
             agent.set_session_variables(session_variables);
-            if !self.info_flag {
-                agent.update_session_dynamic_instructions(None)?;
-            }
             session.sync_agent(agent);
         } else {
             let variables = session.agent_variables();
             agent.set_session_variables(variables.clone());
-            agent.update_session_dynamic_instructions(Some(
-                session.agent_instructions().to_string(),
-            ))?;
         }
         Ok(())
     }
@@ -2493,11 +2407,6 @@ impl Config {
         if let Some(v) = read_env_value::<String>(&get_env_name("sync_models_url")) {
             self.sync_models_url = v;
         }
-    }
-
-    fn load_tools(&mut self) -> Result<()> {
-        self.tools = Tools::init(&Self::tools_file(), None)?;
-        Ok(())
     }
 
     fn needs_mcp_tools(&self) -> bool {

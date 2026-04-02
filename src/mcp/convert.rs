@@ -14,7 +14,6 @@ pub fn mcp_tool_to_declaration(
         name: display_name.to_string(),
         description: tool_description.to_string(),
         parameters: convert_json_schema(input_schema)?,
-        agent: false,
         mcp_tool_name: Some(server_tool_name.to_string()),
     })
 }
@@ -192,7 +191,6 @@ mod tests {
 
         assert_eq!(function.name, "filesystem_read_file");
         assert_eq!(function.description, "Read a file from disk");
-        assert!(!function.agent);
         assert_eq!(function.parameters.type_value.as_deref(), Some("object"));
     }
 }

@@ -2,7 +2,7 @@ use super::*;
 
 use crate::{
     client::{Message, MessageContent, MessageRole, Model},
-    tool::{run_llm_tool, Tools},
+    tool::Tools,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -74,19 +74,11 @@ pub struct Agent {
     hooks: Option<HooksConfig>,
     #[serde(default)]
     prompt: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    dynamic_instructions: bool,
 
-    #[serde(skip, default)]
-    config_variables: AgentVariables,
     #[serde(skip, default)]
     shared_variables: AgentVariables,
     #[serde(skip, default)]
     session_variables: Option<AgentVariables>,
-    #[serde(skip, default)]
-    shared_dynamic_instructions: Option<String>,
-    #[serde(skip, default)]
-    session_dynamic_instructions: Option<String>,
     #[serde(skip, default)]
     tools: Tools,
     #[serde(skip, default)]
@@ -95,8 +87,6 @@ pub struct Agent {
     model: Model,
     #[serde(skip, default)]
     mcp_manager: Option<Arc<McpManager>>,
-    #[serde(skip, default)]
-    compat_config: AgentConfig,
 }
 
 impl Agent {
@@ -116,7 +106,7 @@ impl Agent {
         } else {
             serde_yaml::from_str::<AgentFrontMatter>(metadata).unwrap_or_default()
         };
-        let mut agent = Self {
+        Self {
             name: name.to_string(),
             model_id: frontmatter.model_id,
             temperature: frontmatter.temperature,
@@ -131,11 +121,8 @@ impl Agent {
             instructions: frontmatter.instructions,
             hooks: frontmatter.hooks,
             prompt,
-            dynamic_instructions: frontmatter.dynamic_instructions,
             ..Default::default()
-        };
-        agent.sync_compat_config();
-        agent
+        }
     }
 
     pub fn from_prompt(prompt: &str) -> Self {
@@ -167,41 +154,12 @@ impl Agent {
         name: &str,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        let agent_file_path = Config::agents_data_dir().join(format!("{name}.md"));
+        let agent_file_path = Config::agent_file(name);
         let mut agent = if agent_file_path.exists() {
             Self::load(&agent_file_path)?
         } else {
-            let functions_dir = Config::agent_tools_dir(name);
-            let definition_file_path = functions_dir.join("index.yaml");
-            if !definition_file_path.exists() {
-                bail!("Unknown agent `{name}`");
-            }
-            let definition = AgentDefinition::load(&definition_file_path)?;
-            let mut prompt = definition.instructions;
-            interpolate_variables(&mut prompt);
-            let mut agent = Self {
-                name: name.to_string(),
-                description: definition.description,
-                version: definition.version,
-                variables: definition.variables,
-                conversation_starters: definition.conversation_starters,
-                documents: definition.documents,
-                prompt,
-                dynamic_instructions: definition.dynamic_instructions,
-                ..Default::default()
-            };
-            agent.sync_compat_config();
-            agent
+            Self::builtin(name)?
         };
-
-        let config_path = Config::agent_config_file(name);
-        let mut compat_config = if config_path.exists() {
-            AgentConfig::load(&config_path)?
-        } else {
-            AgentConfig::new(&config.read())
-        };
-        compat_config.load_envs(name);
-        agent.apply_compat_config(compat_config);
 
         let mcp_manager = config.read().mcp_manager.clone();
         agent.mcp_manager = mcp_manager.clone();
@@ -233,7 +191,6 @@ impl Agent {
             }
         };
         agent.model = model;
-        agent.sync_compat_config();
 
         let rag_path = Config::agent_rag_file(name, DEFAULT_AGENT_NAME);
         let agent_dir = agent_file_path
@@ -377,10 +334,6 @@ impl Agent {
         &self.name
     }
 
-    pub fn prompt(&self) -> &str {
-        &self.prompt
-    }
-
     pub fn model(&self) -> &Model {
         &self.model
     }
@@ -393,16 +346,16 @@ impl Agent {
         self.top_p
     }
 
+    pub fn model_id(&self) -> Option<&str> {
+        self.model_id.as_deref()
+    }
+
     pub fn use_tools(&self) -> Option<String> {
         self.use_tools.clone()
     }
 
-    pub fn is_empty_prompt(&self) -> bool {
-        self.instructions_or_prompt().is_empty()
-    }
-
-    pub fn is_embedded_prompt(&self) -> bool {
-        self.instructions_or_prompt().contains(INPUT_PLACEHOLDER)
+    pub fn hooks(&self) -> Option<&HooksConfig> {
+        self.hooks.as_ref()
     }
 
     pub fn has_args(&self) -> bool {
@@ -412,22 +365,18 @@ impl Agent {
     pub fn set_model(&mut self, model: Model) {
         self.model_id = Some(model.id());
         self.model = model;
-        self.sync_compat_config();
     }
 
     pub fn set_temperature(&mut self, value: Option<f64>) {
         self.temperature = value;
-        self.sync_compat_config();
     }
 
     pub fn set_top_p(&mut self, value: Option<f64>) {
         self.top_p = value;
-        self.sync_compat_config();
     }
 
     pub fn set_use_tools(&mut self, value: Option<String>) {
         self.use_tools = value;
-        self.sync_compat_config();
     }
 
     pub fn echo_messages(&self, input: &Input) -> String {
@@ -479,10 +428,6 @@ impl Agent {
         messages
     }
 
-    pub fn config(&self) -> &AgentConfig {
-        &self.compat_config
-    }
-
     pub fn tools(&self) -> &Tools {
         &self.tools
     }
@@ -497,10 +442,8 @@ impl Agent {
 
     pub fn interpolated_instructions(&self) -> String {
         let mut output = self
-            .session_dynamic_instructions
+            .instructions
             .clone()
-            .or_else(|| self.shared_dynamic_instructions.clone())
-            .or_else(|| self.instructions.clone())
             .unwrap_or_else(|| self.prompt.clone());
         for (k, v) in self.variables() {
             output = output.replace(&format!("{{{{{k}}}}}"), v)
@@ -518,22 +461,6 @@ impl Agent {
             Some(variables) => variables,
             None => &self.shared_variables,
         }
-    }
-
-    pub fn variable_envs(&self) -> HashMap<String, String> {
-        self.variables()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    format!("LLM_AGENT_VAR_{}", normalize_env_name(k)),
-                    v.clone(),
-                )
-            })
-            .collect()
-    }
-
-    pub fn config_variables(&self) -> &AgentVariables {
-        &self.config_variables
     }
 
     pub fn shared_variables(&self) -> &AgentVariables {
@@ -554,87 +481,7 @@ impl Agent {
 
     pub fn exit_session(&mut self) {
         self.session_variables = None;
-        self.session_dynamic_instructions = None;
     }
-
-    pub fn is_dynamic_instructions(&self) -> bool {
-        self.dynamic_instructions
-    }
-
-    pub fn update_shared_dynamic_instructions(&mut self, force: bool) -> Result<()> {
-        if self.is_dynamic_instructions() && (force || self.shared_dynamic_instructions.is_none()) {
-            self.shared_dynamic_instructions = Some(self.run_instructions_fn()?);
-        }
-        Ok(())
-    }
-
-    pub fn update_session_dynamic_instructions(&mut self, value: Option<String>) -> Result<()> {
-        if self.is_dynamic_instructions() {
-            let value = match value {
-                Some(v) => v,
-                None => self.run_instructions_fn()?,
-            };
-            self.session_dynamic_instructions = Some(value);
-        }
-        Ok(())
-    }
-
-    fn run_instructions_fn(&self) -> Result<String> {
-        let value = run_llm_tool(
-            self.name().to_string(),
-            vec!["_instructions".into(), "{}".into()],
-            self.variable_envs(),
-        )?;
-        match value {
-            Some(v) => Ok(v),
-            _ => bail!("No return value from '_instructions' function"),
-        }
-    }
-
-    fn apply_compat_config(&mut self, compat_config: AgentConfig) {
-        if compat_config.model_id.is_some() {
-            self.model_id = compat_config.model_id.clone();
-        }
-        if compat_config.temperature.is_some() {
-            self.temperature = compat_config.temperature;
-        }
-        if compat_config.top_p.is_some() {
-            self.top_p = compat_config.top_p;
-        }
-        if compat_config.use_tools.is_some() {
-            self.use_tools = compat_config.use_tools.clone();
-        }
-        if compat_config.agent_default_session.is_some() {
-            self.agent_default_session = compat_config.agent_default_session.clone();
-        }
-        if compat_config.instructions.is_some() {
-            self.instructions = compat_config.instructions.clone();
-        }
-        if compat_config.hooks.is_some() {
-            self.hooks = compat_config.hooks.clone();
-        }
-        self.config_variables = compat_config.variables.clone();
-        self.compat_config = compat_config;
-        self.sync_compat_config();
-    }
-
-    fn sync_compat_config(&mut self) {
-        self.compat_config = AgentConfig {
-            model_id: self.model_id.clone(),
-            temperature: self.temperature,
-            top_p: self.top_p,
-            use_tools: self.use_tools.clone(),
-            agent_default_session: self.agent_default_session.clone(),
-            instructions: self.instructions.clone(),
-            variables: self.config_variables.clone(),
-            hooks: self.hooks.clone(),
-        };
-    }
-
-    fn instructions_or_prompt(&self) -> &str {
-        self.instructions.as_deref().unwrap_or(&self.prompt)
-    }
-
     fn contains_tools_placeholder(&self) -> bool {
         self.prompt.contains(TOOLS_PLACEHOLDER)
             || self
@@ -669,103 +516,6 @@ impl Agent {
                 *instructions = instructions.replace(TOOLS_PLACEHOLDER, &tools);
             }
         }
-        self.sync_compat_config();
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct AgentConfig {
-    #[serde(rename(serialize = "model", deserialize = "model"))]
-    pub model_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub use_tools: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_default_session: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-    pub variables: AgentVariables,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<HooksConfig>,
-}
-
-impl AgentConfig {
-    pub fn new(config: &Config) -> Self {
-        Self {
-            use_tools: config.use_tools.clone(),
-            agent_default_session: config.agent_default_session.clone(),
-            ..Default::default()
-        }
-    }
-
-    pub fn load(path: &Path) -> Result<Self> {
-        let contents = read_to_string(path)
-            .with_context(|| format!("Failed to read agent config file at '{}'", path.display()))?;
-        let config: Self = serde_yaml::from_str(&contents)
-            .with_context(|| format!("Failed to load agent config at '{}'", path.display()))?;
-        Ok(config)
-    }
-
-    fn load_envs(&mut self, name: &str) {
-        let with_prefix = |v: &str| normalize_env_name(&format!("{name}_{v}"));
-
-        if let Some(v) = read_env_value::<String>(&with_prefix("model")) {
-            self.model_id = v;
-        }
-        if let Some(v) = read_env_value::<f64>(&with_prefix("temperature")) {
-            self.temperature = v;
-        }
-        if let Some(v) = read_env_value::<f64>(&with_prefix("top_p")) {
-            self.top_p = v;
-        }
-        if let Some(v) = read_env_value::<String>(&with_prefix("use_tools")) {
-            self.use_tools = v;
-        }
-        if let Some(v) = read_env_value::<String>(&with_prefix("agent_default_session")) {
-            self.agent_default_session = v;
-        }
-        if let Some(v) = read_env_value::<String>(&with_prefix("instructions")) {
-            self.instructions = v;
-        }
-        if let Ok(v) = env::var(with_prefix("variables")) {
-            if let Ok(v) = serde_json::from_str(&v) {
-                self.variables = v;
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct AgentDefinition {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub version: String,
-    #[serde(default)]
-    pub instructions: String,
-    #[serde(default)]
-    pub dynamic_instructions: bool,
-    #[serde(default)]
-    pub variables: Vec<AgentVariable>,
-    #[serde(default)]
-    pub conversation_starters: Vec<String>,
-    #[serde(default)]
-    pub documents: Vec<String>,
-}
-
-impl AgentDefinition {
-    pub fn load(path: &Path) -> Result<Self> {
-        let contents = read_to_string(path)
-            .with_context(|| format!("Failed to read agent index file at '{}'", path.display()))?;
-        let definition: Self = serde_yaml::from_str(&contents)
-            .with_context(|| format!("Failed to load agent index at '{}'", path.display()))?;
-        Ok(definition)
     }
 }
 
@@ -799,8 +549,6 @@ struct AgentFrontMatter {
     instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hooks: Option<HooksConfig>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    dynamic_instructions: bool,
 }
 
 impl AgentFrontMatter {
@@ -818,7 +566,6 @@ impl AgentFrontMatter {
             agent_default_session: agent.agent_default_session.clone(),
             instructions: agent.instructions.clone(),
             hooks: agent.hooks.clone(),
-            dynamic_instructions: agent.dynamic_instructions,
         }
     }
 
@@ -835,12 +582,7 @@ impl AgentFrontMatter {
             && self.agent_default_session.is_none()
             && self.instructions.is_none()
             && self.hooks.is_none()
-            && !self.dynamic_instructions
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn serialize_frontmatter(frontmatter: &AgentFrontMatter) -> Result<String> {
@@ -879,27 +621,9 @@ pub fn list_agents() -> Vec<String> {
             .collect(),
         Err(_) => vec![],
     };
-    if !output.is_empty() {
-        output.sort();
-        output.dedup();
-        return output;
-    }
-    let agents_file = Config::tools_dir().join("agents.txt");
-    let contents = match read_to_string(agents_file) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    contents
-        .split('\n')
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                None
-            } else {
-                Some(line.to_string())
-            }
-        })
-        .collect()
+    output.sort();
+    output.dedup();
+    output
 }
 
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
@@ -915,29 +639,11 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
                         None => v.description.clone(),
                     };
                     (format!("{}=", v.name), Some(description))
-                })
+            })
                 .collect();
         }
     }
-
-    let index_path = Config::agent_tools_dir(agent_name).join("index.yaml");
-    if !index_path.exists() {
-        return vec![];
-    }
-    let Ok(definition) = AgentDefinition::load(&index_path) else {
-        return vec![];
-    };
-    definition
-        .variables
-        .iter()
-        .map(|v| {
-            let description = match &v.default {
-                Some(default) => format!("{} [default: {default}]", v.description),
-                None => v.description.clone(),
-            };
-            (format!("{}=", v.name), Some(description))
-        })
-        .collect()
+    vec![]
 }
 
 fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {

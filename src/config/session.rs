@@ -282,13 +282,6 @@ impl Session {
         self.update_tokens();
     }
 
-    pub fn clear_agent(&mut self) {
-        self.agent_name = None;
-        self.agent_prompt.clear();
-        self.agent_variables.clear();
-        self.agent_instructions.clear();
-    }
-
     pub fn sync_agent(&mut self, agent: &Agent) {
         self.agent_name = convert_option_string(agent.name());
         self.agent_prompt = agent.interpolated_instructions();
@@ -298,10 +291,6 @@ impl Session {
 
     pub fn agent_variables(&self) -> &AgentVariables {
         &self.agent_variables
-    }
-
-    pub fn agent_instructions(&self) -> &str {
-        &self.agent_instructions
     }
 
     pub fn set_save_session(&mut self, value: Option<bool>) {
