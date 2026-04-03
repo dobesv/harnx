@@ -104,9 +104,19 @@ impl fmt::Debug for McpClient {
 }
 
 impl McpClient {
+    fn expand_path(path: &str) -> String {
+        shellexpand::full(path)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|_| path.to_string())
+    }
+
     pub fn new(config: McpServerConfig) -> Self {
         let name = config.name.clone();
-        let roots = config.roots.clone();
+        let roots = config
+            .roots
+            .iter()
+            .map(|r| Self::expand_path(r))
+            .collect::<Vec<_>>();
         Self {
             name,
             config,
@@ -251,10 +261,11 @@ impl McpClient {
     }
 
     pub async fn add_root(&self, root: &str) -> Result<()> {
+        let root = Self::expand_path(root);
         let changed = {
             let mut roots = self.roots.write();
-            if !roots.contains(&root.to_string()) {
-                roots.push(root.to_string());
+            if !roots.contains(&root) {
+                roots.push(root);
                 true
             } else {
                 false
@@ -567,6 +578,33 @@ mod tests {
         let expected_path = std::env::current_dir().unwrap().canonicalize().unwrap();
         let expected_uri = path_to_file_uri(&expected_path);
         assert_eq!(uri, expected_uri);
+    }
+
+    #[test]
+    fn test_mcp_roots_expansion() {
+        let mut config = test_mcp_config("test");
+        std::env::set_var("TEST_ROOT", "/tmp/test");
+        config.roots = vec!["$TEST_ROOT/a".to_string(), "~/b".to_string()];
+
+        let client = McpClient::new(config);
+        let roots = client.get_roots();
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], "/tmp/test/a");
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(roots[1], format!("{}/b", home.to_string_lossy()));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_roots_add_expansion() {
+        let config = test_mcp_config("test");
+        std::env::set_var("ADD_TEST_ROOT", "/tmp/add_test");
+        let client = McpClient::new(config);
+
+        client.add_root("$ADD_TEST_ROOT/c").await.unwrap();
+        let roots = client.get_roots();
+
+        assert!(roots.contains(&"/tmp/add_test/c".to_string()));
     }
 
     #[tokio::test]
