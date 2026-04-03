@@ -565,7 +565,7 @@ impl TodoServer {
             })
             .filter(|t| {
                 if let Some(ref plan) = params.plan {
-                    t.front.plan.as_ref().map_or(false, |p| p.eq_ignore_ascii_case(plan))
+                    t.front.plan.as_ref().is_some_and(|p| p.eq_ignore_ascii_case(plan))
                 } else {
                     true
                 }
@@ -685,8 +685,10 @@ impl TodoServer {
     }
 
     fn handle_plan_read(&self, params: PlanReadParams) -> Result<CallToolResult, ErrorData> {
-        let plans_dir = self.dir.parent().unwrap_or(&self.dir).join("plans");
-        let path = plans_dir.join(format!("{}.md", params.name));
+        let path = match self.plan_path(&params.name) {
+            Ok(p) => p,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
         match std::fs::read_to_string(&path) {
             Ok(content) => Ok(CallToolResult::success(vec![Content::text(content)])),
             Err(_) => Ok(CallToolResult::error(vec![Content::text(format!(
@@ -697,13 +699,17 @@ impl TodoServer {
     }
 
     fn handle_plan_write(&self, params: PlanWriteParams) -> Result<CallToolResult, ErrorData> {
-        let plans_dir = self.dir.parent().unwrap_or(&self.dir).join("plans");
-        if let Err(e) = std::fs::create_dir_all(&plans_dir) {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to create plans directory: {e}"
-            ))]));
+        let path = match self.plan_path(&params.name) {
+            Ok(p) => p,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to create plans directory: {e}"
+                ))]));
+            }
         }
-        let path = plans_dir.join(format!("{}.md", params.name));
         if let Err(e) = std::fs::write(&path, &params.content) {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Failed to write plan: {e}"
@@ -716,9 +722,19 @@ impl TodoServer {
     }
 
     fn handle_plan_add_note(&self, params: PlanAddNoteParams) -> Result<CallToolResult, ErrorData> {
-        let plans_dir = self.dir.parent().unwrap_or(&self.dir).join("plans");
-        let path = plans_dir.join(format!("{}.md", params.name));
-        let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+        let path = match self.plan_path(&params.name) {
+            Ok(p) => p,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
+        let mut content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to read existing plan: {e}"
+                ))]))
+            }
+        };
         if !content.is_empty() && !content.ends_with('\n') {
             content.push('\n');
         }
@@ -726,10 +742,12 @@ impl TodoServer {
         content.push_str(&params.text);
         content.push('\n');
 
-        if let Err(e) = std::fs::create_dir_all(&plans_dir) {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to create plans directory: {e}"
-            ))]));
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to create plans directory: {e}"
+                ))]));
+            }
         }
         if let Err(e) = std::fs::write(&path, content) {
             return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -740,6 +758,18 @@ impl TodoServer {
             "Note added to plan '{}'",
             params.name
         ))]))
+    }
+
+    fn plan_path(&self, name: &str) -> Result<PathBuf, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Plan name cannot be empty".to_string());
+        }
+        if name.contains('/') || name.contains('\\') || name.contains("..") {
+            return Err("Invalid plan name".to_string());
+        }
+        let plans_dir = self.dir.parent().unwrap_or(&self.dir).join("plans");
+        Ok(plans_dir.join(format!("{name}.md")))
     }
 }
 
