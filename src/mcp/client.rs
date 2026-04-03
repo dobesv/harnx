@@ -236,6 +236,11 @@ impl McpClient {
         Ok(())
     }
 
+    fn invalidate_service(&self) {
+        self.service.write().take();
+        *self.connected.write() = false;
+    }
+
     pub fn get_tools(&self) -> Vec<ToolDeclaration> {
         self.tools.read().clone()
     }
@@ -733,6 +738,14 @@ impl McpManager {
         tools
     }
 
+    fn invalidate_all_services(&self) {
+        for client in self.clients.read().values() {
+            if client.is_connected() {
+                client.invalidate_service();
+            }
+        }
+    }
+
     pub fn get_all_tools_blocking(&self) -> Vec<ToolDeclaration> {
         if let Ok(handle) = Handle::try_current() {
             match handle.runtime_flavor() {
@@ -745,11 +758,13 @@ impl McpManager {
                     // dedicated thread with its own runtime instead.
                     std::thread::scope(|s| {
                         s.spawn(|| {
-                            Builder::new_current_thread()
+                            let rt = Builder::new_current_thread()
                                 .enable_all()
                                 .build()
-                                .expect("create runtime for MCP tool discovery")
-                                .block_on(self.get_all_tools())
+                                .expect("create runtime for MCP tool discovery");
+                            let tools = rt.block_on(self.get_all_tools());
+                            self.invalidate_all_services();
+                            tools
                         })
                         .join()
                         .expect("MCP tool discovery thread panicked")
@@ -758,7 +773,11 @@ impl McpManager {
             }
         } else {
             match Builder::new_current_thread().enable_all().build() {
-                Ok(runtime) => runtime.block_on(self.get_all_tools()),
+                Ok(runtime) => {
+                    let tools = runtime.block_on(self.get_all_tools());
+                    self.invalidate_all_services();
+                    tools
+                }
                 Err(err) => {
                     log::warn!("Failed to create Tokio runtime for MCP tool discovery: {err}");
                     vec![]
