@@ -1253,9 +1253,14 @@ impl Config {
             let extra_vars = std::collections::HashMap::from([
                 ("AGENT_NAME", agent.name()),
             ]);
-            agent.agent_default_session().map(|v| {
+            // Per-agent front-matter first, then global config fallback
+            let template = agent
+                .agent_default_session()
+                .map(|s| s.to_string())
+                .or_else(|| self.agent_default_session.clone());
+            template.map(|v| {
                 session_name::sanitize_session_name(
-                    &session_name::expand_session_variables_with(v, &extra_vars),
+                    &session_name::expand_session_variables_with(&v, &extra_vars),
                 )
             }).filter(|v| !v.is_empty())
         } else {
@@ -1576,13 +1581,19 @@ impl Config {
         }
         let agent = Agent::init(config, agent_name, abort_signal).await?;
         let extra_vars = std::collections::HashMap::from([("AGENT_NAME", agent.name())]);
+        let global_agent_session = config.read().agent_default_session.clone();
         let session = session_name.map(|v| v.to_string()).or_else(|| {
             if config.read().macro_flag {
                 None
             } else {
-                agent.agent_default_session().map(|v| {
+                // Per-agent front-matter first, then global config fallback
+                let template = agent
+                    .agent_default_session()
+                    .map(|s| s.to_string())
+                    .or_else(|| global_agent_session.clone());
+                template.map(|v| {
                     session_name::sanitize_session_name(
-                        &session_name::expand_session_variables_with(v, &extra_vars),
+                        &session_name::expand_session_variables_with(&v, &extra_vars),
                     )
                 }).filter(|v| !v.is_empty())
             }
