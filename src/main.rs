@@ -265,7 +265,7 @@ impl<T: TokioAsyncWrite + Unpin> futures_util::io::AsyncWrite for TokioCompat<T>
     }
 }
 
-async fn run_acp_server(_config: GlobalConfig, agent_name: String) -> Result<()> {
+async fn run_acp_server(config: GlobalConfig, agent_name: String) -> Result<()> {
     use tokio::task::LocalSet;
 
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -285,8 +285,8 @@ async fn run_acp_server(_config: GlobalConfig, agent_name: String) -> Result<()>
             };
 
             let local_set = LocalSet::new();
-            let result =
-                local_set.block_on(&runtime, async move { acp_server_main(agent_name).await });
+            let result = local_set
+                .block_on(&runtime, async move { acp_server_main(config, agent_name).await });
             let _ = result_tx.send(result);
         })
         .context("Failed to start ACP server thread")?;
@@ -297,12 +297,12 @@ async fn run_acp_server(_config: GlobalConfig, agent_name: String) -> Result<()>
     }
 }
 
-async fn acp_server_main(agent_name: String) -> Result<()> {
+async fn acp_server_main(config: GlobalConfig, agent_name: String) -> Result<()> {
     use crate::acp::HarnxAgent;
     use agent_client_protocol as acp;
     use std::rc::Rc;
 
-    let agent = Rc::new(HarnxAgent::new(agent_name));
+    let agent = Rc::new(HarnxAgent::new(agent_name, config));
     let agent_for_conn = Rc::clone(&agent);
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
