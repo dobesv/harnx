@@ -4,7 +4,9 @@ use crate::tool::ToolDeclaration;
 use anyhow::{anyhow, bail, Context, Result};
 use harnx::mcp_safety::path_to_file_uri;
 use parking_lot::RwLock;
-use process_wrap::tokio::{ProcessGroup, TokioCommandWrap};
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::TokioCommandWrap;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParam, ClientCapabilities, ErrorData, Implementation, InitializeRequestParam,
@@ -151,6 +153,7 @@ impl McpClient {
         // Spawn in a new process group so SIGINT (Ctrl+C) in the parent
         // terminal doesn't propagate to MCP server child processes.
         let mut wrap = TokioCommandWrap::from(command);
+        #[cfg(unix)]
         wrap.wrap(ProcessGroup::leader());
 
         let (transport, stderr) = TokioChildProcess::builder(wrap)
