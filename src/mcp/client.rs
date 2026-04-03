@@ -152,6 +152,7 @@ impl McpClient {
 
         // Spawn in a new process group so SIGINT (Ctrl+C) in the parent
         // terminal doesn't propagate to MCP server child processes.
+        #[allow(unused_mut)]
         let mut wrap = TokioCommandWrap::from(command);
         #[cfg(unix)]
         wrap.wrap(ProcessGroup::leader());
@@ -297,7 +298,7 @@ impl McpClient {
 
         let params = CallToolRequestParam {
             name: tool_name.to_string().into(),
-            arguments: arguments.clone(),
+            arguments,
         };
 
         let peer = {
@@ -327,40 +328,23 @@ impl McpClient {
                     *self.connected.write() = false;
                     self.service.write().take();
 
-                    self.connect().await.with_context(|| {
+                    // Heal the connection for future calls (best-effort)
+                    if let Err(reconnect_err) = self.connect().await {
+                        log::warn!(
+                            "Failed to reconnect to MCP server '{}' after transport error: {}",
+                            self.name,
+                            reconnect_err,
+                        );
+                    }
+
+                    // Return original transport error — do not retry since the
+                    // tool call may have had side effects on the server
+                    Err(anyhow::Error::from(err)).with_context(|| {
                         format!(
-                            "Failed to reconnect to MCP server '{}' after transport error",
-                            self.name
-                        )
-                    })?;
-
-                    let retry_params = CallToolRequestParam {
-                        name: tool_name.to_string().into(),
-                        arguments,
-                    };
-
-                    let peer = {
-                        let service_guard = self.service.read();
-                        service_guard
-                            .as_ref()
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "MCP server '{}' is not connected after reconnect",
-                                    self.name
-                                )
-                            })?
-                            .peer()
-                            .clone()
-                    };
-
-                    let result = peer.call_tool(retry_params).await.with_context(|| {
-                        format!(
-                            "Failed to call tool '{}' on MCP server '{}' (after reconnect)",
+                            "MCP tool '{}' on '{}' failed due to transport error",
                             tool_name, self.name
                         )
-                    })?;
-
-                    serde_json::to_value(result).context("Failed to serialize MCP tool result")
+                    })
                 }
                 other @ ServiceError::McpError(_) => {
                     Err(anyhow::Error::from(other)).with_context(|| {
