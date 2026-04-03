@@ -1250,9 +1250,12 @@ impl Config {
 
         // Re-create a session with freshly-expanded variables
         let new_session_name = if let Some(agent) = &self.agent {
+            let extra_vars = std::collections::HashMap::from([
+                ("AGENT_NAME", agent.name()),
+            ]);
             agent.agent_default_session().map(|v| {
                 session_name::sanitize_session_name(
-                    &session_name::expand_session_variables(v),
+                    &session_name::expand_session_variables_with(v, &extra_vars),
                 )
             }).filter(|v| !v.is_empty())
         } else {
@@ -1572,13 +1575,14 @@ impl Config {
             bail!("Already in a agent, please run '.exit agent' first to exit the current agent.");
         }
         let agent = Agent::init(config, agent_name, abort_signal).await?;
+        let extra_vars = std::collections::HashMap::from([("AGENT_NAME", agent.name())]);
         let session = session_name.map(|v| v.to_string()).or_else(|| {
             if config.read().macro_flag {
                 None
             } else {
                 agent.agent_default_session().map(|v| {
                     session_name::sanitize_session_name(
-                        &session_name::expand_session_variables(v),
+                        &session_name::expand_session_variables_with(v, &extra_vars),
                     )
                 }).filter(|v| !v.is_empty())
             }

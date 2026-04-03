@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::Command;
 
 /// Expand `$VAR` and `${VAR}` patterns in a session name template.
@@ -6,9 +7,21 @@ use std::process::Command;
 /// - `$GIT_BRANCH` → current git branch (via `git rev-parse --abbrev-ref HEAD`)
 /// - `$GIT_PATH`   → git-relative path of cwd (via `git rev-parse --show-prefix`, trailing `/` stripped)
 ///
+/// Additional context variables can be supplied via `extra_vars` (e.g. `AGENT_NAME`).
+///
 /// All other variable names are resolved from environment variables.
 /// Unresolved variables (env not set, git command fails) expand to empty string.
 pub fn expand_session_variables(template: &str) -> String {
+    expand_session_variables_with(template, &HashMap::new())
+}
+
+/// Like [`expand_session_variables`] but accepts extra key-value pairs that take
+/// precedence over environment variables (but not over the built-in computed
+/// variables `GIT_BRANCH` and `GIT_PATH`).
+pub fn expand_session_variables_with(
+    template: &str,
+    extra_vars: &HashMap<&str, &str>,
+) -> String {
     let mut result = String::with_capacity(template.len());
     let chars: Vec<char> = template.chars().collect();
     let len = chars.len();
@@ -20,7 +33,7 @@ pub fn expand_session_variables(template: &str) -> String {
                 // ${VAR} syntax
                 if let Some(end) = chars[i + 2..].iter().position(|&c| c == '}') {
                     let var_name: String = chars[i + 2..i + 2 + end].iter().collect();
-                    result.push_str(&resolve_variable(&var_name));
+                    result.push_str(&resolve_variable(&var_name, extra_vars));
                     i = i + 2 + end + 1; // skip past '}'
                 } else {
                     // No closing brace — emit literal
@@ -35,7 +48,7 @@ pub fn expand_session_variables(template: &str) -> String {
                     end += 1;
                 }
                 let var_name: String = chars[start..end].iter().collect();
-                result.push_str(&resolve_variable(&var_name));
+                result.push_str(&resolve_variable(&var_name, extra_vars));
                 i = end;
             } else {
                 // $ followed by something that's not a var name — emit literal
@@ -68,11 +81,17 @@ pub fn sanitize_session_name(name: &str) -> String {
     sanitized.trim_matches(|c: char| c == '-' || c == '_').to_string()
 }
 
-fn resolve_variable(name: &str) -> String {
+fn resolve_variable(name: &str, extra_vars: &HashMap<&str, &str>) -> String {
     match name {
         "GIT_BRANCH" => git_branch(),
         "GIT_PATH" => git_path(),
-        _ => std::env::var(name).unwrap_or_default(),
+        _ => {
+            if let Some(val) = extra_vars.get(name) {
+                val.to_string()
+            } else {
+                std::env::var(name).unwrap_or_default()
+            }
+        }
     }
 }
 
@@ -219,5 +238,45 @@ mod tests {
         let sanitized = sanitize_session_name(&expanded);
         assert_eq!(sanitized, "proj-feat-cool-thing");
         std::env::remove_var("HARNX_TEST_INTEG");
+    }
+
+    #[test]
+    fn test_expand_with_extra_vars() {
+        let extra = std::collections::HashMap::from([("AGENT_NAME", "coder")]);
+        assert_eq!(
+            expand_session_variables_with("$AGENT_NAME-session", &extra),
+            "coder-session"
+        );
+    }
+
+    #[test]
+    fn test_expand_with_extra_vars_braced() {
+        let extra = std::collections::HashMap::from([("AGENT_NAME", "my-agent")]);
+        assert_eq!(
+            expand_session_variables_with("proj-${AGENT_NAME}-$GIT_BRANCH", &extra),
+            format!("proj-my-agent-{}", git_branch())
+        );
+    }
+
+    #[test]
+    fn test_extra_vars_override_env() {
+        std::env::set_var("HARNX_TEST_OVERRIDE", "from-env");
+        let extra = std::collections::HashMap::from([("HARNX_TEST_OVERRIDE", "from-extra")]);
+        assert_eq!(
+            expand_session_variables_with("$HARNX_TEST_OVERRIDE", &extra),
+            "from-extra"
+        );
+        std::env::remove_var("HARNX_TEST_OVERRIDE");
+    }
+
+    #[test]
+    fn test_extra_vars_fallback_to_env() {
+        std::env::set_var("HARNX_TEST_ENVONLY", "env-val");
+        let extra = std::collections::HashMap::from([("AGENT_NAME", "agent")]);
+        assert_eq!(
+            expand_session_variables_with("$AGENT_NAME-$HARNX_TEST_ENVONLY", &extra),
+            "agent-env-val"
+        );
+        std::env::remove_var("HARNX_TEST_ENVONLY");
     }
 }
