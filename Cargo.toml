@@ -29,7 +29,7 @@ crossterm = "0.28.1"
 chrono = "0.4.23"
 chrono-tz = "0.10"
 iana-time-zone = "0.1"
-bincode = { version = "2.0.0", features = ["serde", "std"], default-features = false }
+bincode = { version = "3.0.0", features = ["serde", "std"], default-features = false }
 parking_lot = "0.12.1"
 fancy-regex = "0.17.0"
 base64 = "0.22.0"
