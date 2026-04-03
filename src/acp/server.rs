@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::client::{Client, SseEvent, SseHandler};
 use crate::config::{GlobalConfig, Input};
 use crate::tool::{ToolCall, ToolResult};
-use crate::utils::{AbortSignal, AbortSignalInner, wait_abort_signal};
+use crate::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
 
 use anyhow::bail;
 use serde_json::{json, Value};
@@ -40,11 +40,7 @@ impl HarnxAgent {
         self.connection.replace(Some(conn));
     }
 
-    async fn send_text_chunk(
-        &self,
-        session_id: &str,
-        text: &str,
-    ) -> acp::Result<()> {
+    async fn send_text_chunk(&self, session_id: &str, text: &str) -> acp::Result<()> {
         let connection = self.connection.borrow().clone();
         if let Some(connection) = connection {
             let notification = acp::SessionNotification::new(
@@ -80,9 +76,9 @@ impl HarnxAgent {
                             if let Some(ref conn) = connection {
                                 let notification = acp::SessionNotification::new(
                                     acp::SessionId::new(sid.clone()),
-                                    acp::SessionUpdate::AgentMessageChunk(
-                                        acp::ContentChunk::new(chunk.into()),
-                                    ),
+                                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                        chunk.into(),
+                                    )),
                                 );
                                 if let Err(e) = conn.session_notification(notification).await {
                                     warn!("ACP streaming notification failed: {e}");
@@ -212,25 +208,20 @@ impl acp::Agent for HarnxAgent {
 
             round += 1;
             if round > MAX_TOOL_CALL_ROUNDS {
-                self.send_text_chunk(
-                    &session_key,
-                    "\n[Error: maximum tool call rounds exceeded]",
-                )
-                .await?;
+                self.send_text_chunk(&session_key, "\n[Error: maximum tool call rounds exceeded]")
+                    .await?;
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
             }
 
-            let tool_results = match eval_tool_calls_async(&self.config, tool_calls, &abort_signal).await {
-                Ok(results) => results,
-                Err(e) => {
-                    self.send_text_chunk(
-                        &session_key,
-                        &format!("\n[Tool error: {e}]"),
-                    )
-                    .await?;
-                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
-                }
-            };
+            let tool_results =
+                match eval_tool_calls_async(&self.config, tool_calls, &abort_signal).await {
+                    Ok(results) => results,
+                    Err(e) => {
+                        self.send_text_chunk(&session_key, &format!("\n[Tool error: {e}]"))
+                            .await?;
+                        return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                    }
+                };
 
             input = input.merge_tool_results(output, tool_results);
         }

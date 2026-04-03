@@ -285,8 +285,9 @@ async fn run_acp_server(config: GlobalConfig, agent_name: String) -> Result<()> 
             };
 
             let local_set = LocalSet::new();
-            let result = local_set
-                .block_on(&runtime, async move { acp_server_main(config, agent_name).await });
+            let result = local_set.block_on(&runtime, async move {
+                acp_server_main(config, agent_name).await
+            });
             let _ = result_tx.send(result);
         })
         .context("Failed to start ACP server thread")?;
