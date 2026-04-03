@@ -10,7 +10,7 @@ use rmcp::model::{
     CallToolRequestParam, ClientCapabilities, ErrorData, Implementation, InitializeRequestParam,
     ListRootsResult, ProtocolVersion, Root,
 };
-use rmcp::service::{RequestContext, RoleClient, RunningService};
+use rmcp::service::{RequestContext, RoleClient, RunningService, ServiceError};
 use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
 use std::process::Stdio;
@@ -307,52 +307,65 @@ impl McpClient {
             Ok(result) => {
                 serde_json::to_value(result).context("Failed to serialize MCP tool result")
             }
-            Err(err) => {
-                log::warn!(
-                    "MCP tool '{}' on '{}' failed, attempting reconnect: {}",
-                    tool_name,
-                    self.name,
-                    err,
-                );
+            Err(err) => match err {
+                ServiceError::TransportSend(_) | ServiceError::TransportClosed => {
+                    log::warn!(
+                        "MCP tool '{}' on '{}' transport failed, attempting reconnect: {}",
+                        tool_name,
+                        self.name,
+                        err,
+                    );
 
-                *self.connected.write() = false;
-                self.service.write().take();
+                    *self.connected.write() = false;
+                    self.service.write().take();
 
-                self.connect().await.with_context(|| {
-                    format!(
-                        "Failed to reconnect to MCP server '{}' after transport error",
-                        self.name
-                    )
-                })?;
+                    self.connect().await.with_context(|| {
+                        format!(
+                            "Failed to reconnect to MCP server '{}' after transport error",
+                            self.name
+                        )
+                    })?;
 
-                let retry_params = CallToolRequestParam {
-                    name: tool_name.to_string().into(),
-                    arguments,
-                };
+                    let retry_params = CallToolRequestParam {
+                        name: tool_name.to_string().into(),
+                        arguments,
+                    };
 
-                let peer = {
-                    let service_guard = self.service.read();
-                    service_guard
-                        .as_ref()
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "MCP server '{}' is not connected after reconnect",
-                                self.name
-                            )
-                        })?
-                        .peer()
-                        .clone()
-                };
+                    let peer = {
+                        let service_guard = self.service.read();
+                        service_guard
+                            .as_ref()
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "MCP server '{}' is not connected after reconnect",
+                                    self.name
+                                )
+                            })?
+                            .peer()
+                            .clone()
+                    };
 
-                let result = peer.call_tool(retry_params).await.with_context(|| {
-                    format!(
-                        "Failed to call tool '{}' on MCP server '{}' (after reconnect)",
-                        tool_name, self.name
-                    )
-                })?;
+                    let result = peer.call_tool(retry_params).await.with_context(|| {
+                        format!(
+                            "Failed to call tool '{}' on MCP server '{}' (after reconnect)",
+                            tool_name, self.name
+                        )
+                    })?;
 
-                serde_json::to_value(result).context("Failed to serialize MCP tool result")
-            }
+                    serde_json::to_value(result).context("Failed to serialize MCP tool result")
+                }
+                other @ ServiceError::McpError(_) => {
+                    Err(anyhow::Error::from(other)).with_context(|| {
+                        format!(
+                            "MCP tool '{}' on '{}' returned application error",
+                            tool_name, self.name
+                        )
+                    })
+                }
+                other => Err(anyhow::Error::from(other)).with_context(|| {
+                    format!("MCP tool '{}' on '{}' returned error", tool_name, self.name)
+                }),
+            },
         }
     }
 }

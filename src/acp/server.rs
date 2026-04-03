@@ -216,7 +216,7 @@ impl acp::Agent for HarnxAgent {
             let tool_results = {
                 let acp_manager = self.config.read().acp_manager.clone();
                 let result = if let Some(ref manager) = acp_manager {
-                    let mut chunk_rx = manager.subscribe_chunks().await;
+                    let (mut chunk_rx, subscription_id) = manager.subscribe_chunks().await;
                     let connection = self.connection.borrow().clone();
                     let sid = session_key.clone();
 
@@ -239,7 +239,7 @@ impl acp::Agent for HarnxAgent {
                     let result =
                         eval_tool_calls_async(&self.config, tool_calls, &abort_signal).await;
 
-                    manager.unsubscribe_chunks().await;
+                    manager.unsubscribe_chunks(subscription_id).await;
                     let _ = forward_task.await;
 
                     result

@@ -28,7 +28,7 @@ pub struct AcpClient {
     initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     worker: Arc<Mutex<Option<AcpWorkerHandle>>>,
-    chunk_forwarder: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -67,7 +67,7 @@ enum WorkerCommand {
 
 struct AcpNotificationClient {
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
-    chunk_forwarder: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
 }
 
 struct TokioCompat<T> {
@@ -77,7 +77,7 @@ struct TokioCompat<T> {
 impl AcpNotificationClient {
     fn new(
         sessions: Arc<RwLock<HashMap<String, SessionState>>>,
-        chunk_forwarder: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+        chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
     ) -> Self {
         Self {
             sessions,
@@ -140,12 +140,23 @@ impl acp::Client for AcpNotificationClient {
         {
             let chunk = content_block_to_text(&content);
             if !chunk.is_empty() {
-                let forwarder = self.chunk_forwarder.read().await.clone();
-                if let Some(tx) = forwarder {
-                    let _ = tx.send(chunk.clone());
-                } else {
+                let mut delivered = false;
+                let mut forwarders = self.chunk_forwarder.write().await;
+                if forwarders.is_empty() {
                     eprint!("{}", chunk);
+                } else {
+                    forwarders.retain(|_, tx| match tx.send(chunk.clone()) {
+                        Ok(()) => {
+                            delivered = true;
+                            true
+                        }
+                        Err(_) => false,
+                    });
+                    if !delivered {
+                        eprint!("{}", chunk);
+                    }
                 }
+                drop(forwarders);
 
                 let session_id = args.session_id.0.to_string();
                 let mut sessions = self.sessions.write().await;
@@ -228,7 +239,7 @@ impl AcpClient {
             initialize_response: Arc::new(RwLock::new(None)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             worker: Arc::new(Mutex::new(None)),
-            chunk_forwarder: Arc::new(RwLock::new(None)),
+            chunk_forwarder: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -394,12 +405,12 @@ impl AcpClient {
             })?
     }
 
-    pub async fn set_chunk_forwarder(&self, tx: mpsc::UnboundedSender<String>) {
-        *self.chunk_forwarder.write().await = Some(tx);
+    pub async fn set_chunk_forwarder(&self, id: u64, tx: mpsc::UnboundedSender<String>) {
+        self.chunk_forwarder.write().await.insert(id, tx);
     }
 
-    pub async fn clear_chunk_forwarder(&self) {
-        *self.chunk_forwarder.write().await = None;
+    pub async fn clear_chunk_forwarder(&self, id: u64) {
+        self.chunk_forwarder.write().await.remove(&id);
     }
 
     async fn ensure_connected(&self) -> Result<()> {
@@ -424,7 +435,7 @@ fn spawn_worker(
     config: AcpServerConfig,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
-    chunk_forwarder: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
 ) -> Result<(AcpWorkerHandle, oneshot::Receiver<Result<()>>)> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -478,7 +489,7 @@ async fn worker_main(
     initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
     mut rx: mpsc::UnboundedReceiver<WorkerCommand>,
     ready_tx: oneshot::Sender<Result<()>>,
-    chunk_forwarder: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
     mut abort_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let mut cmd = Command::new(&config.command);

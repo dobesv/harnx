@@ -12,11 +12,13 @@ use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub struct AcpManager {
     clients: Arc<RwLock<HashMap<String, Arc<AcpClient>>>>,
+    next_subscription_id: AtomicU64,
 }
 
 impl fmt::Debug for AcpManager {
@@ -31,6 +33,7 @@ impl AcpManager {
     pub fn new() -> Self {
         Self {
             clients: Arc::new(RwLock::new(HashMap::new())),
+            next_subscription_id: AtomicU64::new(1),
         }
     }
 
@@ -56,19 +59,22 @@ impl AcpManager {
         tools
     }
 
-    pub async fn subscribe_chunks(&self) -> mpsc::UnboundedReceiver<String> {
+    pub async fn subscribe_chunks(&self) -> (mpsc::UnboundedReceiver<String>, u64) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let subscription_id = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
         let clients: Vec<_> = self.clients.read().values().cloned().collect();
         for client in clients {
-            client.set_chunk_forwarder(tx.clone()).await;
+            client
+                .set_chunk_forwarder(subscription_id, tx.clone())
+                .await;
         }
-        rx
+        (rx, subscription_id)
     }
 
-    pub async fn unsubscribe_chunks(&self) {
+    pub async fn unsubscribe_chunks(&self, subscription_id: u64) {
         let clients: Vec<_> = self.clients.read().values().cloned().collect();
         for client in clients {
-            client.clear_chunk_forwarder().await;
+            client.clear_chunk_forwarder(subscription_id).await;
         }
     }
 
