@@ -502,6 +502,7 @@ mod tests {
         Arc::new(RwLock::new(config))
     }
 
+    #[allow(clippy::type_complexity)]
     fn setup_roundtrip(
         agent_name: &str,
         config: GlobalConfig,

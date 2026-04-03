@@ -40,6 +40,7 @@ struct SessionState {
 struct AcpWorkerHandle {
     tx: mpsc::UnboundedSender<WorkerCommand>,
     join: thread::JoinHandle<()>,
+    abort_tx: oneshot::Sender<()>,
 }
 
 enum WorkerCommand {
@@ -263,12 +264,12 @@ impl AcpClient {
             }
             Ok(Ok(Err(err))) => {
                 *self.connection_failed.write().await = true;
-                join_worker(worker.join).await;
+                abort_and_join_worker(worker).await;
                 Err(err)
             }
             Ok(Err(_)) => {
                 *self.connection_failed.write().await = true;
-                join_worker(worker.join).await;
+                abort_and_join_worker(worker).await;
                 Err(anyhow!(
                     "ACP server '{}' stopped during initialization",
                     self.name
@@ -276,7 +277,7 @@ impl AcpClient {
             }
             Err(_) => {
                 *self.connection_failed.write().await = true;
-                join_worker(worker.join).await;
+                abort_and_join_worker(worker).await;
                 Err(anyhow!(
                     "ACP server '{}' timed out during initialization",
                     self.name
@@ -427,6 +428,7 @@ fn spawn_worker(
 ) -> Result<(AcpWorkerHandle, oneshot::Receiver<Result<()>>)> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = oneshot::channel();
+    let (abort_tx, abort_rx) = oneshot::channel();
     let thread_name = format!("acp-client-{name}");
     let config_name = config.name.clone();
 
@@ -454,6 +456,7 @@ fn spawn_worker(
                     rx,
                     ready_tx,
                     chunk_forwarder,
+                    abort_rx,
                 )
                 .await
             });
@@ -464,9 +467,10 @@ fn spawn_worker(
         })
         .with_context(|| format!("Failed to start ACP worker thread for '{}'", config_name))?;
 
-    Ok((AcpWorkerHandle { tx, join }, ready_rx))
+    Ok((AcpWorkerHandle { tx, join, abort_tx }, ready_rx))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker_main(
     name: String,
     config: AcpServerConfig,
@@ -475,6 +479,7 @@ async fn worker_main(
     mut rx: mpsc::UnboundedReceiver<WorkerCommand>,
     ready_tx: oneshot::Sender<Result<()>>,
     chunk_forwarder: Arc<RwLock<Option<mpsc::UnboundedSender<String>>>>,
+    mut abort_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
@@ -527,14 +532,25 @@ async fn worker_main(
         }
     });
 
-    let init = conn
-        .initialize(
+    let init = tokio::select! {
+        result = conn.initialize(
             acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
                 acp::Implementation::new("harnx", env!("CARGO_PKG_VERSION")).title("Harnx"),
             ),
-        )
-        .await
-        .with_context(|| format!("Failed to initialize ACP server '{}'", name))?;
+        ) => {
+            result.with_context(|| format!("Failed to initialize ACP server '{}'", name))?
+        }
+        _ = &mut abort_rx => {
+            if let Err(err) = child.kill().await {
+                if err.kind() != std::io::ErrorKind::InvalidInput {
+                    return Err(err).context("Failed to kill ACP subprocess");
+                }
+            }
+            let _ = child.wait().await;
+            let _ = ready_tx.send(Err(anyhow!("ACP server '{}' initialization aborted", name)));
+            return Ok(());
+        }
+    };
 
     *initialize_response.write().await = Some(init);
     let _ = ready_tx.send(Ok(()));
@@ -676,11 +692,30 @@ async fn shutdown_child(child: &Rc<RefCell<Option<Child>>>) -> Result<()> {
     Ok(())
 }
 
+async fn abort_and_join_worker(worker: AcpWorkerHandle) {
+    let AcpWorkerHandle { tx, join, abort_tx } = worker;
+    let _ = abort_tx.send(());
+    drop(tx);
+    join_worker(join).await;
+}
+
 async fn join_worker(join: thread::JoinHandle<()>) {
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = join.join();
-    })
+    let join_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            let _ = join.join();
+        }),
+    )
     .await;
+
+    match join_result {
+        Ok(blocking_result) => {
+            let _ = blocking_result;
+        }
+        Err(_) => {
+            log::warn!("Timed out waiting for ACP worker thread to exit");
+        }
+    }
 }
 
 fn content_block_to_text(content: &acp::ContentBlock) -> String {
