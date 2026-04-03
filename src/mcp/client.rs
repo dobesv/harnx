@@ -4,6 +4,7 @@ use crate::tool::ToolDeclaration;
 use anyhow::{anyhow, bail, Context, Result};
 use harnx::mcp_safety::path_to_file_uri;
 use parking_lot::RwLock;
+use process_wrap::tokio::{ProcessGroup, TokioCommandWrap};
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParam, ClientCapabilities, ErrorData, Implementation, InitializeRequestParam,
@@ -147,7 +148,12 @@ impl McpClient {
         command.args(&self.config.args);
         command.envs(&self.config.env);
 
-        let (transport, stderr) = TokioChildProcess::builder(command)
+        // Spawn in a new process group so SIGINT (Ctrl+C) in the parent
+        // terminal doesn't propagate to MCP server child processes.
+        let mut wrap = TokioCommandWrap::from(command);
+        wrap.wrap(ProcessGroup::leader());
+
+        let (transport, stderr) = TokioChildProcess::builder(wrap)
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("Failed to spawn MCP server '{}'", self.name))?;
@@ -270,7 +276,6 @@ impl McpClient {
         Ok(())
     }
 
-    #[allow(clippy::await_holding_lock)]
     pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<Value> {
         if !self.is_connected() {
             self.connect().await?;
@@ -284,24 +289,71 @@ impl McpClient {
 
         let params = CallToolRequestParam {
             name: tool_name.to_string().into(),
-            arguments,
+            arguments: arguments.clone(),
         };
 
-        let result = {
+        let peer = {
             let service_guard = self.service.read();
-            let service = service_guard
+            service_guard
                 .as_ref()
-                .ok_or_else(|| anyhow!("MCP server '{}' is not connected", self.name))?;
-
-            service.call_tool(params).await.with_context(|| {
-                format!(
-                    "Failed to call tool '{}' on MCP server '{}'",
-                    tool_name, self.name
-                )
-            })?
+                .ok_or_else(|| anyhow!("MCP server '{}' is not connected", self.name))?
+                .peer()
+                .clone()
         };
 
-        serde_json::to_value(result).context("Failed to serialize MCP tool result")
+        let result = peer.call_tool(params).await;
+
+        match result {
+            Ok(result) => {
+                serde_json::to_value(result).context("Failed to serialize MCP tool result")
+            }
+            Err(err) => {
+                log::warn!(
+                    "MCP tool '{}' on '{}' failed, attempting reconnect: {}",
+                    tool_name,
+                    self.name,
+                    err,
+                );
+
+                *self.connected.write() = false;
+                self.service.write().take();
+
+                self.connect().await.with_context(|| {
+                    format!(
+                        "Failed to reconnect to MCP server '{}' after transport error",
+                        self.name
+                    )
+                })?;
+
+                let retry_params = CallToolRequestParam {
+                    name: tool_name.to_string().into(),
+                    arguments,
+                };
+
+                let peer = {
+                    let service_guard = self.service.read();
+                    service_guard
+                        .as_ref()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "MCP server '{}' is not connected after reconnect",
+                                self.name
+                            )
+                        })?
+                        .peer()
+                        .clone()
+                };
+
+                let result = peer.call_tool(retry_params).await.with_context(|| {
+                    format!(
+                        "Failed to call tool '{}' on MCP server '{}' (after reconnect)",
+                        tool_name, self.name
+                    )
+                })?;
+
+                serde_json::to_value(result).context("Failed to serialize MCP tool result")
+            }
+        }
     }
 }
 

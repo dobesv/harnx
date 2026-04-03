@@ -213,15 +213,49 @@ impl acp::Agent for HarnxAgent {
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
             }
 
-            let tool_results =
-                match eval_tool_calls_async(&self.config, tool_calls, &abort_signal).await {
+            let tool_results = {
+                let acp_manager = self.config.read().acp_manager.clone();
+                let result = if let Some(ref manager) = acp_manager {
+                    let mut chunk_rx = manager.subscribe_chunks().await;
+                    let connection = self.connection.borrow().clone();
+                    let sid = session_key.clone();
+
+                    let forward_task = tokio::task::spawn_local(async move {
+                        while let Some(chunk) = chunk_rx.recv().await {
+                            if let Some(ref conn) = connection {
+                                let notification = acp::SessionNotification::new(
+                                    acp::SessionId::new(sid.clone()),
+                                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                        chunk.into(),
+                                    )),
+                                );
+                                if let Err(e) = conn.session_notification(notification).await {
+                                    warn!("ACP nested streaming notification failed: {e}");
+                                }
+                            }
+                        }
+                    });
+
+                    let result =
+                        eval_tool_calls_async(&self.config, tool_calls, &abort_signal).await;
+
+                    manager.unsubscribe_chunks().await;
+                    let _ = forward_task.await;
+
+                    result
+                } else {
+                    eval_tool_calls_async(&self.config, tool_calls, &abort_signal).await
+                };
+
+                match result {
                     Ok(results) => results,
                     Err(e) => {
                         self.send_text_chunk(&session_key, &format!("\n[Tool error: {e}]"))
                             .await?;
                         return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
                     }
-                };
+                }
+            };
 
             input = input.merge_tool_results(output, tool_results);
         }
