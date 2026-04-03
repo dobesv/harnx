@@ -2432,14 +2432,23 @@ impl Config {
 
     pub fn tool_declarations_for_use_tools(&self, use_tools: Option<&str>) -> Vec<ToolDeclaration> {
         let mut declarations = self.tools.declarations();
-        if use_tools.is_some() && self.needs_mcp_tools() {
-            if let Some(manager) = &self.mcp_manager {
-                declarations.extend(manager.get_all_tools_blocking());
+        if let Some(use_tools) = use_tools {
+            if self.needs_mcp_tools() {
+                if let Some(manager) = &self.mcp_manager {
+                    declarations.extend(manager.get_all_tools_blocking());
+                }
             }
-        }
-        if use_tools.is_some() && self.acp_manager.is_some() {
-            if let Some(manager) = &self.acp_manager {
-                declarations.extend(manager.get_all_tools_blocking());
+            if self.acp_manager.is_some() {
+                if let Some(manager) = &self.acp_manager {
+                    declarations.extend(manager.get_all_tools_blocking());
+                }
+            }
+            if use_tools == "all"
+                || use_tools
+                    .split(',')
+                    .any(|v| v.trim() == crate::tool::TRIGGER_AGENT_TOOL_NAME)
+            {
+                declarations.push(crate::tool::trigger_agent_tool_declaration());
             }
         }
 

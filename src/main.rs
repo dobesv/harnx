@@ -524,6 +524,31 @@ async fn start_directive_inner(
     };
 
     if !tool_results.is_empty() {
+        let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
+        if let Some(switch_agent) = switch_agent {
+            config.write().exit_agent()?;
+            crate::config::Config::use_agent(
+                config,
+                &switch_agent.agent,
+                None,
+                abort_signal.clone(),
+            )
+            .await?;
+            config.write().empty_session()?;
+            let new_input = Input::from_str(config, &switch_agent.prompt, None);
+            return Box::pin(start_directive_inner(
+                config,
+                new_input,
+                abort_signal,
+                async_manager,
+                persistent_manager,
+                pending_async_context,
+                0,
+                true,
+            ))
+            .await;
+        }
+
         return start_directive_inner(
             config,
             input.merge_tool_results(output, tool_results),
