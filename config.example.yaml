@@ -55,17 +55,16 @@ mcp_servers:
      command: harnx-mcp-time             # Time utilities: current time, convert, wait, wait_until
      description: >-
        Allow the agent to check the time or wait for a period of time
+   # Note: set EXA_API_KEY in the environment or in `.env` in the config folder
    - name: exa
      command: npx
      args:
        - "-y"
        - "exa-mcp-server"
-     env:
-       EXA_API_KEY: "${EXA_API_KEY}"
      enabled: true
      description: "Web search via Exa API"
    - name: wet
-     command: "uvx",
+     command: "uvx"
      args: [ "--python", "3.13", "wet-mcp" ]
      description: >
        Web Extended Toolkit. Uses SearXNG (a meta-search engine) to aggregate results from Google, Bing, DuckDuckGo, 
