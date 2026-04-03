@@ -45,7 +45,11 @@ use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, Read
 async fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
-    let text = cli.text()?;
+    let text = if cli.should_read_stdin() {
+        cli.text()?
+    } else {
+        None
+    };
     let working_mode = if let Some(ref agent_name) = cli.acp {
         WorkingMode::Acp(agent_name.clone())
     } else if cli.serve.is_some() {
@@ -306,6 +310,17 @@ async fn acp_server_main(config: GlobalConfig, agent_name: String) -> Result<()>
     let agent = Rc::new(HarnxAgent::new(agent_name, config));
     let agent_for_conn = Rc::clone(&agent);
     let stdin = tokio::io::stdin();
+    #[cfg(unix)]
+    let stdout = {
+        use std::os::fd::AsFd;
+
+        let owned_fd = std::io::stdout()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("Failed to duplicate stdout fd for ACP server")?;
+        tokio::fs::File::from_std(std::fs::File::from(owned_fd))
+    };
+    #[cfg(not(unix))]
     let stdout = tokio::io::stdout();
 
     let (conn, io_task) = acp::AgentSideConnection::new(

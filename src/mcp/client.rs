@@ -4,12 +4,15 @@ use crate::tool::ToolDeclaration;
 use anyhow::{anyhow, bail, Context, Result};
 use harnx::mcp_safety::path_to_file_uri;
 use parking_lot::RwLock;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::TokioCommandWrap;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParam, ClientCapabilities, ErrorData, Implementation, InitializeRequestParam,
     ListRootsResult, ProtocolVersion, Root,
 };
-use rmcp::service::{RequestContext, RoleClient, RunningService};
+use rmcp::service::{RequestContext, RoleClient, RunningService, ServiceError};
 use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
 use std::process::Stdio;
@@ -17,7 +20,7 @@ use std::time::Duration;
 use std::{collections::HashMap, fmt, path::Path, sync::Arc};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::runtime::{Builder, Handle};
+use tokio::runtime::{Builder, Handle, RuntimeFlavor};
 
 pub struct McpClient {
     name: String,
@@ -147,7 +150,14 @@ impl McpClient {
         command.args(&self.config.args);
         command.envs(&self.config.env);
 
-        let (transport, stderr) = TokioChildProcess::builder(command)
+        // Spawn in a new process group so SIGINT (Ctrl+C) in the parent
+        // terminal doesn't propagate to MCP server child processes.
+        #[allow(unused_mut)]
+        let mut wrap = TokioCommandWrap::from(command);
+        #[cfg(unix)]
+        wrap.wrap(ProcessGroup::leader());
+
+        let (transport, stderr) = TokioChildProcess::builder(wrap)
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("Failed to spawn MCP server '{}'", self.name))?;
@@ -227,6 +237,11 @@ impl McpClient {
         Ok(())
     }
 
+    fn invalidate_service(&self) {
+        self.service.write().take();
+        *self.connected.write() = false;
+    }
+
     pub fn get_tools(&self) -> Vec<ToolDeclaration> {
         self.tools.read().clone()
     }
@@ -270,7 +285,6 @@ impl McpClient {
         Ok(())
     }
 
-    #[allow(clippy::await_holding_lock)]
     pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<Value> {
         if !self.is_connected() {
             self.connect().await?;
@@ -287,21 +301,64 @@ impl McpClient {
             arguments,
         };
 
-        let result = {
+        let peer = {
             let service_guard = self.service.read();
-            let service = service_guard
+            service_guard
                 .as_ref()
-                .ok_or_else(|| anyhow!("MCP server '{}' is not connected", self.name))?;
-
-            service.call_tool(params).await.with_context(|| {
-                format!(
-                    "Failed to call tool '{}' on MCP server '{}'",
-                    tool_name, self.name
-                )
-            })?
+                .ok_or_else(|| anyhow!("MCP server '{}' is not connected", self.name))?
+                .peer()
+                .clone()
         };
 
-        serde_json::to_value(result).context("Failed to serialize MCP tool result")
+        let result = peer.call_tool(params).await;
+
+        match result {
+            Ok(result) => {
+                serde_json::to_value(result).context("Failed to serialize MCP tool result")
+            }
+            Err(err) => match err {
+                ServiceError::TransportSend(_) | ServiceError::TransportClosed => {
+                    log::warn!(
+                        "MCP tool '{}' on '{}' transport failed, attempting reconnect: {}",
+                        tool_name,
+                        self.name,
+                        err,
+                    );
+
+                    *self.connected.write() = false;
+                    self.service.write().take();
+
+                    // Heal the connection for future calls (best-effort)
+                    if let Err(reconnect_err) = self.connect().await {
+                        log::warn!(
+                            "Failed to reconnect to MCP server '{}' after transport error: {}",
+                            self.name,
+                            reconnect_err,
+                        );
+                    }
+
+                    // Return original transport error — do not retry since the
+                    // tool call may have had side effects on the server
+                    Err(anyhow::Error::from(err)).with_context(|| {
+                        format!(
+                            "MCP tool '{}' on '{}' failed due to transport error",
+                            tool_name, self.name
+                        )
+                    })
+                }
+                other @ ServiceError::McpError(_) => {
+                    Err(anyhow::Error::from(other)).with_context(|| {
+                        format!(
+                            "MCP tool '{}' on '{}' returned application error",
+                            tool_name, self.name
+                        )
+                    })
+                }
+                other => Err(anyhow::Error::from(other)).with_context(|| {
+                    format!("MCP tool '{}' on '{}' returned error", tool_name, self.name)
+                }),
+            },
+        }
     }
 }
 
@@ -665,12 +722,46 @@ impl McpManager {
         tools
     }
 
+    fn invalidate_all_services(&self) {
+        for client in self.clients.read().values() {
+            if client.is_connected() {
+                client.invalidate_service();
+            }
+        }
+    }
+
     pub fn get_all_tools_blocking(&self) -> Vec<ToolDeclaration> {
         if let Ok(handle) = Handle::try_current() {
-            tokio::task::block_in_place(|| handle.block_on(self.get_all_tools()))
+            match handle.runtime_flavor() {
+                RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(self.get_all_tools()))
+                }
+                _ => {
+                    // On a single-threaded runtime (e.g., the ACP server),
+                    // block_in_place panics. Run the async operation on a
+                    // dedicated thread with its own runtime instead.
+                    std::thread::scope(|s| {
+                        s.spawn(|| {
+                            let rt = Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("create runtime for MCP tool discovery");
+                            let tools = rt.block_on(self.get_all_tools());
+                            self.invalidate_all_services();
+                            tools
+                        })
+                        .join()
+                        .expect("MCP tool discovery thread panicked")
+                    })
+                }
+            }
         } else {
             match Builder::new_current_thread().enable_all().build() {
-                Ok(runtime) => runtime.block_on(self.get_all_tools()),
+                Ok(runtime) => {
+                    let tools = runtime.block_on(self.get_all_tools());
+                    self.invalidate_all_services();
+                    tools
+                }
                 Err(err) => {
                     log::warn!("Failed to create Tokio runtime for MCP tool discovery: {err}");
                     vec![]

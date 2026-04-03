@@ -5,6 +5,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_timeout() -> u64 {
+    300
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AcpServerConfig {
     pub name: String,
@@ -17,4 +21,6 @@ pub struct AcpServerConfig {
     pub enabled: bool,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
 }

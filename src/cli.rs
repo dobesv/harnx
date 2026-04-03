@@ -84,6 +84,10 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub fn should_read_stdin(&self) -> bool {
+        self.acp.is_none()
+    }
+
     pub fn text(&self) -> Result<Option<String>> {
         let mut stdin_text = String::new();
         if !stdin().is_terminal() {
@@ -122,5 +126,25 @@ impl Cli {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn test_acp_mode_skips_stdin_reads() {
+        let cli = Cli::parse_from(["harnx", "--acp", "explore"]);
+
+        assert!(!cli.should_read_stdin());
+    }
+
+    #[test]
+    fn test_non_acp_mode_still_reads_stdin() {
+        let cli = Cli::parse_from(["harnx", "hello"]);
+
+        assert!(cli.should_read_stdin());
     }
 }

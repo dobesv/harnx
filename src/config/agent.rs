@@ -690,7 +690,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("harnx-agent-test-{}-{timestamp}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "harnx-agent-test-{}-{timestamp}",
+            std::process::id()
+        ))
     }
 
     fn with_test_config_dir<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
@@ -1077,7 +1080,10 @@ You are a test agent.
         )
         .unwrap();
 
-        assert_eq!(agent.variables[0].default.as_deref(), Some("Loaded from file"));
+        assert_eq!(
+            agent.variables[0].default.as_deref(),
+            Some("Loaded from file")
+        );
     }
 
     #[test]
