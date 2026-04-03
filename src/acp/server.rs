@@ -376,8 +376,96 @@ async fn eval_mcp_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        client::{ClientConfig, Model, ModelType},
+        config::{Config, CREATE_TITLE_AGENT},
+    };
     use agent_client_protocol::Agent;
+    use std::{
+        cell::RefCell,
+        pin::Pin,
+        rc::Rc,
+        task::{Context as TaskContext, Poll},
+    };
+    use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, ReadBuf};
     use tokio::task::LocalSet;
+    use tokio::time::{timeout, Duration};
+
+    struct TokioCompat<T> {
+        inner: T,
+    }
+
+    impl<T> TokioCompat<T> {
+        fn new(inner: T) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl<T: TokioAsyncRead + Unpin> futures_util::io::AsyncRead for TokioCompat<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut read_buf = ReadBuf::new(buf);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl<T: TokioAsyncWrite + Unpin> futures_util::io::AsyncWrite for TokioCompat<T> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestClient {
+        chunks: Rc<RefCell<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl acp::Client for TestClient {
+        async fn request_permission(
+            &self,
+            _args: acp::RequestPermissionRequest,
+        ) -> acp::Result<acp::RequestPermissionResponse> {
+            Err(acp::Error::method_not_found())
+        }
+
+        async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
+            if let acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) =
+                args.update
+            {
+                let text = content_block_to_text(&content);
+                if !text.is_empty() {
+                    self.chunks.borrow_mut().push(text);
+                }
+            }
+            Ok(())
+        }
+    }
 
     fn run_local<F: std::future::Future>(future: F) -> F::Output {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -389,11 +477,71 @@ mod tests {
     }
 
     fn test_config() -> GlobalConfig {
-        use crate::config::Config;
         use parking_lot::RwLock;
         use std::sync::Arc;
 
-        Arc::new(RwLock::new(Config::default()))
+        let clients: Vec<ClientConfig> = serde_yaml::from_str(
+            r#"
+- type: openai
+  api_key: test-key
+  models:
+    - name: gpt-4o
+      type: chat
+      max_input_tokens: 128000
+      max_output_tokens: 8192
+"#,
+        )
+        .expect("parse test client config");
+
+        let mut config = Config::default();
+        config.clients = clients;
+        config.model = Model::retrieve_model(&config, "openai:gpt-4o", ModelType::Chat)
+            .expect("load test model");
+        config.dry_run = true;
+
+        Arc::new(RwLock::new(config))
+    }
+
+    fn setup_roundtrip(
+        agent_name: &str,
+        config: GlobalConfig,
+    ) -> (
+        acp::ClientSideConnection,
+        Rc<RefCell<Vec<String>>>,
+        tokio::task::JoinHandle<acp::Result<()>>,
+        tokio::task::JoinHandle<acp::Result<()>>,
+    ) {
+        let agent = Rc::new(HarnxAgent::new(agent_name.to_string(), config));
+        let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_stream);
+        let (client_reader, client_writer) = tokio::io::split(client_stream);
+
+        let (server_conn, server_io) = acp::AgentSideConnection::new(
+            Rc::clone(&agent),
+            TokioCompat::new(server_writer),
+            TokioCompat::new(server_reader),
+            |future| {
+                tokio::task::spawn_local(future);
+            },
+        );
+        agent.set_connection(Rc::new(server_conn));
+
+        let chunks = Rc::new(RefCell::new(Vec::new()));
+        let (client_conn, client_io) = acp::ClientSideConnection::new(
+            TestClient {
+                chunks: Rc::clone(&chunks),
+            },
+            TokioCompat::new(client_writer),
+            TokioCompat::new(client_reader),
+            |future| {
+                tokio::task::spawn_local(future);
+            },
+        );
+
+        let server_handle = tokio::task::spawn_local(server_io);
+        let client_handle = tokio::task::spawn_local(client_io);
+
+        (client_conn, chunks, server_handle, client_handle)
     }
 
     #[test]
@@ -455,6 +603,87 @@ mod tests {
                 .await;
 
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_acp_server_initialize_handshake() {
+        let config = test_config();
+
+        run_local(async move {
+            let (client_conn, _chunks, server_handle, client_handle) =
+                setup_roundtrip("test", config);
+
+            let response = timeout(
+                Duration::from_secs(5),
+                client_conn.initialize(
+                    acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
+                        acp::Implementation::new("test-client", "0.1.0").title("Test Client"),
+                    ),
+                ),
+            )
+            .await
+            .expect("initialize should not hang")
+            .expect("initialize should succeed");
+
+            assert_eq!(response.protocol_version, acp::ProtocolVersion::V1);
+            assert!(response.agent_info.is_some());
+
+            server_handle.abort();
+            client_handle.abort();
+        });
+    }
+
+    #[test]
+    fn test_acp_server_new_session_and_prompt_roundtrip() {
+        let config = test_config();
+
+        run_local(async move {
+            let (client_conn, chunks, server_handle, client_handle) =
+                setup_roundtrip(CREATE_TITLE_AGENT, config);
+
+            timeout(
+                Duration::from_secs(5),
+                client_conn.initialize(
+                    acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
+                        acp::Implementation::new("test-client", "0.1.0").title("Test Client"),
+                    ),
+                ),
+            )
+            .await
+            .expect("initialize should not hang")
+            .expect("initialize should succeed");
+
+            let session = timeout(
+                Duration::from_secs(5),
+                client_conn.new_session(acp::NewSessionRequest::new(
+                    std::env::current_dir().expect("current dir"),
+                )),
+            )
+            .await
+            .expect("new_session should not hang")
+            .expect("new_session should succeed");
+
+            let response = timeout(
+                Duration::from_secs(5),
+                client_conn.prompt(acp::PromptRequest::new(
+                    session.session_id.to_string(),
+                    vec![acp::ContentBlock::from("hello from client")],
+                )),
+            )
+            .await
+            .expect("prompt should not hang")
+            .expect("prompt should succeed");
+
+            assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+            assert!(
+                chunks.borrow().join("").contains("hello from client"),
+                "expected prompt roundtrip output, got {:?}",
+                chunks.borrow()
+            );
+
+            server_handle.abort();
+            client_handle.abort();
         });
     }
 }

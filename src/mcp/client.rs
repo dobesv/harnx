@@ -18,7 +18,7 @@ use std::time::Duration;
 use std::{collections::HashMap, fmt, path::Path, sync::Arc};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::runtime::{Builder, Handle};
+use tokio::runtime::{Builder, Handle, RuntimeFlavor};
 
 pub struct McpClient {
     name: String,
@@ -719,7 +719,27 @@ impl McpManager {
 
     pub fn get_all_tools_blocking(&self) -> Vec<ToolDeclaration> {
         if let Ok(handle) = Handle::try_current() {
-            tokio::task::block_in_place(|| handle.block_on(self.get_all_tools()))
+            match handle.runtime_flavor() {
+                RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(self.get_all_tools()))
+                }
+                _ => {
+                    // On a single-threaded runtime (e.g., the ACP server),
+                    // block_in_place panics. Run the async operation on a
+                    // dedicated thread with its own runtime instead.
+                    std::thread::scope(|s| {
+                        s.spawn(|| {
+                            Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("create runtime for MCP tool discovery")
+                                .block_on(self.get_all_tools())
+                        })
+                        .join()
+                        .expect("MCP tool discovery thread panicked")
+                    })
+                }
+            }
         } else {
             match Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime.block_on(self.get_all_tools()),
