@@ -32,8 +32,8 @@ use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_
 mcp_servers:
    - name: fs
      command: harnx-mcp-fs               # Filesystem tools: read, write, edit, ls, grep, find
-     # roots:
-     #   - "/home/user/projects"
+     roots:
+       - "$HOME"
      description: >-
        Agent filesystem access
      rename_tools:
@@ -45,8 +45,8 @@ mcp_servers:
        find: Glob
    - name: bash
      command: harnx-mcp-bash             # Shell command execution
-     # roots:
-     #  - "/home/user/projects"
+     roots:
+      - "$HOME"
      description: >-
        Allow the agent to run commands or script snippets
      rename_tools:
@@ -55,6 +55,23 @@ mcp_servers:
      command: harnx-mcp-time             # Time utilities: current time, convert, wait, wait_until
      description: >-
        Allow the agent to check the time or wait for a period of time
+   # Note: set EXA_API_KEY in the environment or in `.env` in the config folder
+   - name: exa
+     command: npx
+     args:
+       - "-y"
+       - "exa-mcp-server"
+     enabled: true
+     description: "Web search via Exa API"
+   - name: wet
+     command: "uvx"
+     args: [ "--python", "3.13", "wet-mcp" ]
+     description: >
+       Web Extended Toolkit. Uses SearXNG (a meta-search engine) to aggregate results from Google, Bing, DuckDuckGo, 
+       and Brave.  Converts web pages into clean Markdown/Text using Crawl4AI and Playwright. Performs multi-page 
+       BFS (Breadth-First Search) crawling with depth control.Media: Scans and downloads images, videos, and audio 
+       files. Includes stealth mode to bypass restrictions.
+     enabled: true
 #   - name: custom
 #     command: /path/to/custom-mcp-server
 #     args:
