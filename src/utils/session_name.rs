@@ -18,10 +18,7 @@ pub fn expand_session_variables(template: &str) -> String {
 /// Like [`expand_session_variables`] but accepts extra key-value pairs that take
 /// precedence over environment variables (but not over the built-in computed
 /// variables `GIT_BRANCH` and `GIT_PATH`).
-pub fn expand_session_variables_with(
-    template: &str,
-    extra_vars: &HashMap<&str, &str>,
-) -> String {
+pub fn expand_session_variables_with(template: &str, extra_vars: &HashMap<&str, &str>) -> String {
     let mut result = String::with_capacity(template.len());
     let chars: Vec<char> = template.chars().collect();
     let len = chars.len();
@@ -78,7 +75,9 @@ pub fn sanitize_session_name(name: &str) -> String {
             other => other,
         })
         .collect();
-    sanitized.trim_matches(|c: char| c == '-' || c == '_').to_string()
+    sanitized
+        .trim_matches(|c: char| c == '-' || c == '_')
+        .to_string()
 }
 
 fn resolve_variable(name: &str, extra_vars: &HashMap<&str, &str>) -> String {

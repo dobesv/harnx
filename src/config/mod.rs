@@ -1250,19 +1250,19 @@ impl Config {
 
         // Re-create a session with freshly-expanded variables
         let new_session_name = if let Some(agent) = &self.agent {
-            let extra_vars = std::collections::HashMap::from([
-                ("AGENT_NAME", agent.name()),
-            ]);
+            let extra_vars = std::collections::HashMap::from([("AGENT_NAME", agent.name())]);
             // Per-agent front-matter first, then global config fallback
             let template = agent
                 .agent_default_session()
                 .map(|s| s.to_string())
                 .or_else(|| self.agent_default_session.clone());
-            template.map(|v| {
-                session_name::sanitize_session_name(
-                    &session_name::expand_session_variables_with(&v, &extra_vars),
-                )
-            }).filter(|v| !v.is_empty())
+            template
+                .map(|v| {
+                    session_name::sanitize_session_name(
+                        &session_name::expand_session_variables_with(&v, &extra_vars),
+                    )
+                })
+                .filter(|v| !v.is_empty())
         } else {
             let default_session = match self.working_mode {
                 WorkingMode::Repl => self.repl_default_session.as_ref(),
@@ -1272,9 +1272,7 @@ impl Config {
             default_session
                 .filter(|v| !v.is_empty())
                 .map(|v| {
-                    session_name::sanitize_session_name(
-                        &session_name::expand_session_variables(v),
-                    )
+                    session_name::sanitize_session_name(&session_name::expand_session_variables(v))
                 })
                 .filter(|v| !v.is_empty())
         };
@@ -1591,11 +1589,13 @@ impl Config {
                     .agent_default_session()
                     .map(|s| s.to_string())
                     .or_else(|| global_agent_session.clone());
-                template.map(|v| {
-                    session_name::sanitize_session_name(
-                        &session_name::expand_session_variables_with(&v, &extra_vars),
-                    )
-                }).filter(|v| !v.is_empty())
+                template
+                    .map(|v| {
+                        session_name::sanitize_session_name(
+                            &session_name::expand_session_variables_with(&v, &extra_vars),
+                        )
+                    })
+                    .filter(|v| !v.is_empty())
             }
         });
         config.write().rag = agent.rag();
