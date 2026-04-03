@@ -321,7 +321,7 @@ impl ToolCall {
         };
 
         if *IS_STDOUT_TERMINAL {
-            let prompt = match json_data {
+            let prompt = match &json_data {
                 Value::Null => format!("Call {}", self.name),
                 _ => format!("Call {} {}", self.name, json_data),
             };
