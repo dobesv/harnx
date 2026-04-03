@@ -3,6 +3,7 @@ use crate::{
     hooks::{dispatch::dispatch_hooks, HookEvent, HookResultControl},
     utils::*,
 };
+use harnx::mcp_safety::{truncate_output, TruncateOpts};
 
 use anyhow::{anyhow, bail, Result};
 use indexmap::IndexMap;
@@ -81,6 +82,22 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                     ))
                 });
 
+                if *IS_STDOUT_TERMINAL {
+                    let mut opts = TruncateOpts::default();
+                    if let Ok((cols, rows)) = crossterm::terminal::size() {
+                        opts.head_lines = 5.max((rows / 2) as usize);
+                        opts.tail_lines = 0;
+                        opts.line_head_bytes = (cols as usize).saturating_sub(1);
+                        opts.line_tail_bytes = 0;
+                    }
+                    let output = match result {
+                        Value::String(ref s) => s.clone(),
+                        _ => result.to_string(),
+                    };
+                    let truncated = truncate_output(&output, &opts);
+                    println!("{}", dimmed_text(&format!("<= {}", truncated)));
+                }
+
                 if result.is_null() {
                     result = json!("DONE");
                 } else {
@@ -118,7 +135,12 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                     ))
                 });
 
-                return Err(err);
+                is_all_null = false;
+                let error_result = json!({
+                    "is_error": true,
+                    "error": err.to_string(),
+                });
+                output.push(ToolResult::new(call, error_result));
             }
         }
     }
@@ -297,7 +319,10 @@ impl ToolCall {
         };
 
         if *IS_STDOUT_TERMINAL {
-            let prompt = format!("Call {} {}", self.name, json_data);
+            let prompt = match json_data {
+                Value::Null => format!("Call {}", self.name),
+                _ => format!("Call {} {}", self.name, json_data),
+            };
             println!("{}", dimmed_text(&prompt));
         }
 
@@ -356,5 +381,52 @@ impl ToolCall {
         })?;
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_eval_tool_calls_error_handling() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let call = ToolCall::new("unknown_tool".to_string(), json!({}), Some("1".to_string()));
+        let calls = vec![call];
+
+        let result = eval_tool_calls(&config, calls).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].call.name, "unknown_tool");
+        assert!(result[0].output.is_object());
+        assert_eq!(result[0].output["is_error"], true);
+        assert!(result[0].output["error"]
+            .as_str()
+            .unwrap()
+            .contains("No tool provider configured"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_eval_tool_calls_partial_error_handling() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        // trigger_agent is handled internally and should succeed
+        let call1 = ToolCall::new(
+            TRIGGER_AGENT_TOOL_NAME.to_string(),
+            json!({"agent": "test", "prompt": "test"}),
+            Some("1".to_string()),
+        );
+        let call2 = ToolCall::new("unknown_tool".to_string(), json!({}), Some("2".to_string()));
+        let calls = vec![call1, call2];
+
+        let result = eval_tool_calls(&config, calls).unwrap();
+        assert_eq!(result.len(), 2);
+
+        assert_eq!(result[0].call.name, TRIGGER_AGENT_TOOL_NAME);
+        assert_eq!(result[0].output["action"], "switch_agent");
+
+        assert_eq!(result[1].call.name, "unknown_tool");
+        assert_eq!(result[1].output["is_error"], true);
     }
 }

@@ -102,6 +102,18 @@ rand = "0.9.0"
 name = "harnx-mcp-todo"
 path = "src/bin/harnx-mcp-todo/main.rs"
 
+[[bin]]
+name = "harnx-mcp-bash"
+path = "src/bin/harnx-mcp-bash/main.rs"
+
+[[bin]]
+name = "harnx-mcp-fs"
+path = "src/bin/harnx-mcp-fs/main.rs"
+
+[[bin]]
+name = "harnx-mcp-time"
+path = "src/bin/harnx-mcp-time/main.rs"
+
 [profile.release]
 lto = true
 strip = true
