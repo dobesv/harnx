@@ -34,8 +34,6 @@ video-game-development-insights"#;
 const DEFAULT_AGENT_NAME: &str = "rag";
 pub type AgentVariables = IndexMap<String, String>;
 
-pub const INPUT_PLACEHOLDER: &str = "__INPUT__";
-
 static RE_METADATA: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap());
 
@@ -387,13 +385,6 @@ impl Agent {
             } else {
                 input_markdown
             }
-        } else if prompt.contains(INPUT_PLACEHOLDER) {
-            let replaced = prompt.replace(INPUT_PLACEHOLDER, &input_markdown);
-            if let Some(tools) = &tools_text {
-                format!("{tools}\n\n{replaced}")
-            } else {
-                replaced
-            }
         } else if let Some(tools) = &tools_text {
             format!("{prompt}\n\n{tools}\n\n{input_markdown}")
         } else {
@@ -405,19 +396,8 @@ impl Agent {
     pub fn build_messages(&self, input: &Input) -> Vec<Message> {
         let prompt = self.interpolated_instructions();
         let tools_text = self.tools_text();
-        let mut content = input.message_content();
+        let content = input.message_content();
         let mut messages = if prompt.is_empty() {
-            let mut messages = vec![];
-            if let Some(tools_text) = &tools_text {
-                messages.push(Message::new(
-                    MessageRole::System,
-                    MessageContent::Text(tools_text.clone()),
-                ));
-            }
-            messages.push(Message::new(MessageRole::User, content));
-            messages
-        } else if prompt.contains(INPUT_PLACEHOLDER) {
-            content.merge_prompt(|v: &str| prompt.replace(INPUT_PLACEHOLDER, v));
             let mut messages = vec![];
             if let Some(tools_text) = &tools_text {
                 messages.push(Message::new(
@@ -429,11 +409,10 @@ impl Agent {
             messages
         } else {
             let mut messages = vec![];
-            let (system, cases) = parse_structure_prompt(&prompt);
-            let system_text = match (&tools_text, system.is_empty()) {
-                (Some(tools), false) => format!("{system}\n\n{tools}"),
+            let system_text = match (&tools_text, prompt.is_empty()) {
+                (Some(tools), false) => format!("{prompt}\n\n{tools}"),
                 (Some(tools), true) => tools.clone(),
-                (None, false) => system.to_string(),
+                (None, false) => prompt.to_string(),
                 (None, true) => String::new(),
             };
             if !system_text.is_empty() {
@@ -441,14 +420,6 @@ impl Agent {
                     MessageRole::System,
                     MessageContent::Text(system_text),
                 ));
-            }
-            if !cases.is_empty() {
-                messages.extend(cases.into_iter().flat_map(|(i, o)| {
-                    vec![
-                        Message::new(MessageRole::User, MessageContent::Text(i.to_string())),
-                        Message::new(MessageRole::Assistant, MessageContent::Text(o.to_string())),
-                    ]
-                }));
             }
             messages.push(Message::new(MessageRole::User, content));
             messages
@@ -619,7 +590,10 @@ pub struct AgentVariable {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
-    #[serde(skip_deserializing, default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[allow(dead_code)]
+    #[serde(skip_serializing, skip_deserializing, default)]
     pub value: String,
 }
 
@@ -665,57 +639,10 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
     vec![]
 }
 
-fn parse_structure_prompt(prompt: &str) -> (&str, Vec<(&str, &str)>) {
-    let mut text = prompt;
-    let mut search_input = true;
-    let mut system = None;
-    let mut parts = vec![];
-    loop {
-        let search = if search_input {
-            "### INPUT:"
-        } else {
-            "### OUTPUT:"
-        };
-        match text.find(search) {
-            Some(idx) => {
-                if system.is_none() {
-                    system = Some(&text[..idx])
-                } else {
-                    parts.push(&text[..idx])
-                }
-                search_input = !search_input;
-                text = &text[(idx + search.len())..];
-            }
-            None => {
-                if !text.is_empty() {
-                    if system.is_none() {
-                        system = Some(text)
-                    } else {
-                        parts.push(text)
-                    }
-                }
-                break;
-            }
-        }
-    }
-    let parts_len = parts.len();
-    if parts_len > 0 && parts_len % 2 == 0 {
-        let cases: Vec<(&str, &str)> = parts
-            .iter()
-            .step_by(2)
-            .zip(parts.iter().skip(1).step_by(2))
-            .map(|(i, o)| (i.trim(), o.trim()))
-            .collect();
-        let system = system.map(|v| v.trim()).unwrap_or_default();
-        return (system, cases);
-    }
-
-    (prompt, vec![])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GlobalConfig;
 
     fn make_tool_declaration(name: &str, description: &str) -> crate::tool::ToolDeclaration {
         crate::tool::ToolDeclaration {
@@ -731,45 +658,6 @@ mod tests {
         agent.tools =
             crate::tool::Tools::init_from_mcp(if tools.is_empty() { None } else { Some(tools) });
         agent
-    }
-
-    #[test]
-    fn test_parse_structure_prompt1() {
-        let prompt = r#"
-System message
-### INPUT:
-Input 1
-### OUTPUT:
-Output 1
-"#;
-        assert_eq!(
-            parse_structure_prompt(prompt),
-            ("System message", vec![("Input 1", "Output 1")])
-        );
-    }
-
-    #[test]
-    fn test_parse_structure_prompt2() {
-        let prompt = r#"
-### INPUT:
-Input 1
-### OUTPUT:
-Output 1
-"#;
-        assert_eq!(
-            parse_structure_prompt(prompt),
-            ("", vec![("Input 1", "Output 1")])
-        );
-    }
-
-    #[test]
-    fn test_parse_structure_prompt3() {
-        let prompt = r#"
-System message
-### INPUT:
-Input 1
-"#;
-        assert_eq!(parse_structure_prompt(prompt), (prompt, vec![]));
     }
 
     #[test]
@@ -900,5 +788,78 @@ Input 1
         assert!(!exported.contains("my_tool"));
         assert!(!exported.contains("Tool description"));
         assert!(exported.contains("You are a helpful assistant."));
+    }
+
+    #[test]
+    fn test_build_messages_always_uses_system_and_user_format() {
+        let config = GlobalConfig::default();
+        let agent = Agent::from_prompt(
+            "System message\n__INPUT__\n\n### INPUT:\nExample input\n### OUTPUT:\nExample output",
+        );
+        let input = Input::from_str(&config, "Real input", Some(agent));
+
+        let messages = input.agent().build_messages(&input);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert_eq!(messages[1].role, MessageRole::User);
+        assert_eq!(
+            messages[0].content.to_text(),
+            "System message\n__INPUT__\n\n### INPUT:\nExample input\n### OUTPUT:\nExample output"
+        );
+        assert_eq!(messages[1].content.to_text(), "Real input");
+    }
+
+    #[test]
+    fn test_agent_variable_path_deserialization() {
+        let yaml = r#"name: prompt
+description: Shared prompt
+path: shared/prompt.md
+"#;
+
+        let variable: AgentVariable = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(variable.name, "prompt");
+        assert_eq!(variable.description, "Shared prompt");
+        assert_eq!(variable.path.as_deref(), Some("shared/prompt.md"));
+        assert!(variable.default.is_none());
+        assert!(variable.value.is_empty());
+    }
+
+    #[test]
+    fn test_agent_variable_path_serialization() {
+        let variable = AgentVariable {
+            name: "prompt".to_string(),
+            description: "Shared prompt".to_string(),
+            default: None,
+            path: Some("shared/prompt.md".to_string()),
+            value: "runtime-only".to_string(),
+        };
+
+        let yaml = serde_yaml::to_string(&variable).unwrap();
+        let round_trip: AgentVariable = serde_yaml::from_str(&yaml).unwrap();
+
+        assert!(yaml.contains("path: shared/prompt.md"));
+        assert!(!yaml.contains("value:"));
+        assert_eq!(round_trip.name, "prompt");
+        assert_eq!(round_trip.description, "Shared prompt");
+        assert_eq!(round_trip.path.as_deref(), Some("shared/prompt.md"));
+        assert!(round_trip.default.is_none());
+        assert!(round_trip.value.is_empty());
+    }
+
+    #[test]
+    fn test_agent_variable_without_path() {
+        let yaml = r#"name: prompt
+description: Shared prompt
+"#;
+
+        let variable: AgentVariable = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(variable.name, "prompt");
+        assert_eq!(variable.description, "Shared prompt");
+        assert!(variable.path.is_none());
+        assert!(variable.default.is_none());
+        assert!(variable.value.is_empty());
     }
 }
