@@ -133,22 +133,6 @@ impl MessageContent {
         }
     }
 
-    pub fn merge_prompt(&mut self, replace_fn: impl Fn(&str) -> String) {
-        match self {
-            MessageContent::Text(text) => *text = replace_fn(text),
-            MessageContent::Array(list) => {
-                if list.is_empty() {
-                    list.push(MessageContentPart::Text {
-                        text: replace_fn(""),
-                    })
-                } else if let Some(MessageContentPart::Text { text }) = list.get_mut(0) {
-                    *text = replace_fn(text)
-                }
-            }
-            MessageContent::ToolCalls(_) => {}
-        }
-    }
-
     pub fn to_text(&self) -> String {
         match self {
             MessageContent::Text(text) => text.to_string(),
