@@ -55,7 +55,11 @@ fn prepare_chat_completions(
     let mut request_data = RequestData::new(url, body);
 
     request_data.header("anthropic-version", "2023-06-01");
-    request_data.header("x-api-key", api_key);
+    if api_key.starts_with("sk-ant-oat") {
+        request_data.bearer_auth(api_key);
+    } else {
+        request_data.header("x-api-key", api_key);
+    }
 
     Ok(request_data)
 }
