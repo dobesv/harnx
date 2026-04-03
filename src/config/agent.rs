@@ -188,6 +188,37 @@ impl Agent {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(Config::agents_data_dir);
+
+        for variable in &mut agent.variables {
+            if let Some(path_str) = &variable.path {
+                if variable.default.is_some() {
+                    log::warn!(
+                        "Variable '{}': both 'path' and 'default' set, using 'path'",
+                        variable.name
+                    );
+                }
+
+                let resolved_path = safe_join_path(&agent_dir, path_str).ok_or_else(|| {
+                    anyhow!(
+                        "Variable '{}': path '{}' is not allowed (must be relative, no '..' traversal)",
+                        variable.name,
+                        path_str
+                    )
+                })?;
+
+                let content = std::fs::read_to_string(&resolved_path).with_context(|| {
+                    format!(
+                        "Failed to load file '{}' (resolved to '{}') for variable '{}'",
+                        path_str,
+                        resolved_path.display(),
+                        variable.name
+                    )
+                })?;
+
+                variable.default = Some(content);
+            }
+        }
+
         agent.rag = if rag_path.exists() {
             Some(Arc::new(Rag::load(config, DEFAULT_AGENT_NAME, &rag_path)?))
         } else if !agent.documents.is_empty() && !config.read().info_flag {
@@ -643,6 +674,69 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
 mod tests {
     use super::*;
     use crate::config::GlobalConfig;
+    use crate::utils::create_abort_signal;
+    use std::{
+        fs,
+        path::Path,
+        path::PathBuf,
+        sync::Mutex,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TEST_CONFIG_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn unique_test_config_dir() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("harnx-agent-test-{}-{timestamp}", std::process::id()))
+    }
+
+    fn with_test_config_dir<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+        let _guard = TEST_CONFIG_DIR_LOCK.lock().unwrap();
+        let config_dir = unique_test_config_dir();
+        let agents_dir = config_dir.join("agents");
+        fs::create_dir_all(&agents_dir)?;
+
+        unsafe {
+            std::env::set_var("HARNX_CONFIG_DIR", &config_dir);
+        }
+        let result = f(&config_dir);
+        unsafe {
+            std::env::remove_var("HARNX_CONFIG_DIR");
+        }
+
+        let cleanup_result = fs::remove_dir_all(&config_dir);
+        match (result, cleanup_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(err)) => Err(err.into()),
+            (Err(err), Ok(())) => Err(err),
+            (Err(err), Err(cleanup_err)) => Err(err.context(format!(
+                "Additionally failed to clean up test config dir '{}': {cleanup_err}",
+                config_dir.display()
+            ))),
+        }
+    }
+
+    fn init_test_agent(agent_name: &str, content: &str, files: &[(&str, &str)]) -> Result<Agent> {
+        with_test_config_dir(|config_dir| {
+            let agents_dir = config_dir.join("agents");
+            fs::write(agents_dir.join(format!("{agent_name}.md")), content)?;
+
+            for (relative_path, file_content) in files {
+                let path = agents_dir.join(relative_path);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, file_content)?;
+            }
+
+            let config = GlobalConfig::default();
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(Agent::init(&config, agent_name, create_abort_signal()))
+        })
+    }
 
     fn make_tool_declaration(name: &str, description: &str) -> crate::tool::ToolDeclaration {
         crate::tool::ToolDeclaration {
@@ -861,5 +955,147 @@ description: Shared prompt
         assert!(variable.path.is_none());
         assert!(variable.default.is_none());
         assert!(variable.value.is_empty());
+    }
+
+    #[test]
+    fn test_agent_variable_with_path() {
+        let agent = init_test_agent(
+            "path-variable",
+            r#"---
+variables:
+  - name: prompt
+    description: Shared prompt
+    path: shared/prompt.md
+---
+You are a test agent.
+"#,
+            &[("shared/prompt.md", "Loaded prompt")],
+        )
+        .unwrap();
+
+        assert_eq!(agent.variables[0].default.as_deref(), Some("Loaded prompt"));
+    }
+
+    #[test]
+    fn test_agent_variable_path_missing_file() {
+        let error = init_test_agent(
+            "missing-path-variable",
+            r#"---
+variables:
+  - name: prompt
+    description: Shared prompt
+    path: shared/missing.md
+---
+You are a test agent.
+"#,
+            &[],
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("prompt"));
+        assert!(message.contains("shared/missing.md"));
+    }
+
+    #[test]
+    fn test_agent_variable_path_traversal_rejected() {
+        let error = init_test_agent(
+            "traversal-path-variable",
+            r#"---
+variables:
+  - name: prompt
+    description: Shared prompt
+    path: ../../../etc/passwd
+---
+You are a test agent.
+"#,
+            &[],
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("prompt"));
+        assert!(message.contains("../../../etc/passwd"));
+        assert!(message.contains("not allowed"));
+    }
+
+    #[test]
+    fn test_agent_variable_path_absolute_rejected() {
+        let error = init_test_agent(
+            "absolute-path-variable",
+            r#"---
+variables:
+  - name: prompt
+    description: Shared prompt
+    path: /etc/passwd
+---
+You are a test agent.
+"#,
+            &[],
+        )
+        .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("prompt"));
+        assert!(message.contains("/etc/passwd"));
+        assert!(message.contains("not allowed"));
+    }
+
+    #[test]
+    fn test_agent_variable_path_empty_file() {
+        let agent = init_test_agent(
+            "empty-path-variable",
+            r#"---
+variables:
+  - name: prompt
+    description: Shared prompt
+    path: shared/empty.md
+---
+You are a test agent.
+"#,
+            &[("shared/empty.md", "")],
+        )
+        .unwrap();
+
+        assert_eq!(agent.variables[0].default.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_agent_variable_path_and_default_uses_path() {
+        let agent = init_test_agent(
+            "path-and-default-variable",
+            r#"---
+variables:
+  - name: prompt
+    description: Shared prompt
+    default: Inline prompt
+    path: shared/prompt.md
+---
+You are a test agent.
+"#,
+            &[("shared/prompt.md", "Loaded from file")],
+        )
+        .unwrap();
+
+        assert_eq!(agent.variables[0].default.as_deref(), Some("Loaded from file"));
+    }
+
+    #[test]
+    fn test_agent_variable_path_nested_relative_file() {
+        let agent = init_test_agent(
+            "nested-relative-path-variable",
+            r#"---
+variables:
+  - name: prompt
+    description: Shared prompt
+    path: shared/nested/prompt.md
+---
+You are a test agent.
+"#,
+            &[("shared/nested/prompt.md", "Nested prompt")],
+        )
+        .unwrap();
+
+        assert_eq!(agent.variables[0].default.as_deref(), Some("Nested prompt"));
     }
 }
