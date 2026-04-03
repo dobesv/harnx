@@ -1235,6 +1235,49 @@ impl Config {
         Ok(())
     }
 
+    pub fn reset_session(&mut self) -> Result<()> {
+        // Capture current session name before exiting
+        let old_session_name = self.session.as_ref().map(|s| s.name().to_string());
+
+        // Discard the current session without saving
+        if let Some(session) = self.session.take() {
+            drop(session);
+            self.discontinuous_last_message();
+        }
+        if let Some(agent) = self.agent.as_mut() {
+            agent.exit_session();
+        }
+
+        // Re-create a session with freshly-expanded variables
+        let new_session_name = if let Some(agent) = &self.agent {
+            agent.agent_default_session().map(|v| {
+                session_name::sanitize_session_name(
+                    &session_name::expand_session_variables(v),
+                )
+            }).filter(|v| !v.is_empty())
+        } else {
+            let default_session = match self.working_mode {
+                WorkingMode::Repl => self.repl_default_session.as_ref(),
+                WorkingMode::Cmd => self.cmd_default_session.as_ref(),
+                WorkingMode::Serve | WorkingMode::Acp(_) => None,
+            };
+            default_session
+                .filter(|v| !v.is_empty())
+                .map(|v| {
+                    session_name::sanitize_session_name(
+                        &session_name::expand_session_variables(v),
+                    )
+                })
+                .filter(|v| !v.is_empty())
+        };
+
+        let session_name = new_session_name.or(old_session_name);
+        if let Some(name) = session_name {
+            self.use_session(Some(&name))?;
+        }
+        Ok(())
+    }
+
     pub fn set_save_session_this_time(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             session.set_save_session_this_time();
@@ -1533,7 +1576,11 @@ impl Config {
             if config.read().macro_flag {
                 None
             } else {
-                agent.agent_default_session().map(|v| v.to_string())
+                agent.agent_default_session().map(|v| {
+                    session_name::sanitize_session_name(
+                        &session_name::expand_session_variables(v),
+                    )
+                }).filter(|v| !v.is_empty())
             }
         });
         config.write().rag = agent.rag();
@@ -1636,23 +1683,11 @@ impl Config {
             }
             None => return Ok(()),
         };
-        let err_msg = || format!("Invalid default session '{default_session}'");
-        match default_session.split_once(':') {
-            Some(("role", name)) => {
-                self.use_agent_by_name(name).with_context(err_msg)?;
-            }
-            Some(("session", name)) => {
-                self.use_session(Some(name)).with_context(err_msg)?;
-            }
-            Some((session_name, agent_name)) => {
-                self.use_session(Some(session_name)).with_context(err_msg)?;
-                if let Some(true) = self.session.as_ref().map(|v| v.is_empty()) {
-                    self.use_agent_by_name(agent_name).with_context(err_msg)?;
-                }
-            }
-            _ => {
-                bail!("{}", err_msg())
-            }
+        let session_name = session_name::sanitize_session_name(
+            &session_name::expand_session_variables(&default_session),
+        );
+        if !session_name.is_empty() {
+            self.use_session(Some(&session_name))?;
         }
         Ok(())
     }

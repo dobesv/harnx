@@ -36,7 +36,7 @@ use std::{env, process};
 
 const MENU_NAME: &str = "completion_menu";
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -88,6 +88,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
             ".empty session",
             "Clear session messages",
             AssertState::True(StateFlags::SESSION),
+        ),
+        ReplCommand::new(
+            ".reset",
+            "Reset session to initial state (re-expands variables)",
+            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
         ),
         ReplCommand::new(
             ".compress session",
@@ -634,6 +639,9 @@ pub async fn run_repl_command(
                     println!(r#"Usage: .empty session"#)
                 }
             },
+            ".reset" => {
+                config.write().reset_session()?;
+            }
             ".rebuild" => match args {
                 Some("rag") => {
                     Config::rebuild_rag(config, abort_signal.clone()).await?;

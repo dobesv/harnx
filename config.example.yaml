@@ -92,9 +92,19 @@ acp_servers:                        # ACP agent sub-servers
   #   description: "Code writing agent"
 
 # ---- default session ----
-repl_default_session: null        # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
-cmd_default_session: null         # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)
-agent_default_session: null       # Set a session to use when starting a agent (e.g. temp, default)
+# Session name templates with variable expansion.
+# Supported variables: $VAR or ${VAR} syntax.
+#   Special computed variables:
+#     $GIT_BRANCH  - current git branch (via `git rev-parse --abbrev-ref HEAD`)
+#     $GIT_PATH    - git-relative path of cwd (via `git rev-parse --show-prefix`, trailing `/` stripped)
+#   All other variables are resolved from environment (e.g. $USER, $PWD, $HOME).
+#   Unresolved variables expand to empty string.
+# Sanitization: `/` → `-`, space → `_`, leading/trailing `-` and `_` stripped.
+# Examples: "project-$GIT_BRANCH", "$USER-session", "myproject-$GIT_BRANCH-$GIT_PATH"
+# Use `.reset` in REPL to re-expand variables after switching branches.
+repl_default_session: null        # Session name template for REPL mode
+cmd_default_session: null         # Session name template for CMD mode
+agent_default_session: null       # Session name template when starting an agent
 
 # ---- session ----
 # Controls the persistence of the session. if true, auto save; if false, not save; if null, asking the user
