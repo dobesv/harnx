@@ -92,11 +92,11 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                         opts.line_tail_bytes = 0;
                         opts.marker = Some(" [...] ".to_string());
                     }
-                    let output = match result {
-                        Value::String(ref s) => s.clone(),
+                    let output_str = match &result {
+                        Value::String(s) => s.clone(),
                         _ => result.to_string(),
                     };
-                    let truncated = truncate_output(&output, &opts);
+                    let truncated = truncate_output(&output_str, &opts);
                     println!("{}", dimmed_text(&format!("<= {}", truncated)));
                 }
 
