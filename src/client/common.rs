@@ -71,7 +71,7 @@ pub fn interpolate_patch_vars(value: &str, model_name: &str, client_name: &str) 
             let marker_start = start + "__UNRESOLVED__".len();
             if let Some(marker_end) = result[marker_start..].find("__") {
                 let var_name = &result[marker_start..marker_start + marker_end];
-                bail!("Unresolved variable '${var_name}' in patch header (not a built-in and not set in environment)");
+                bail!("Unresolved variable '${var_name}' in patch header.\n  Built-in variables: $HARNX_MODEL, $HARNX_CLIENT\n  Other names are resolved from environment variables.\n  To fix: use a built-in, or set the env var: export {var_name}=<value>");
             }
         }
     }
@@ -807,10 +807,10 @@ mod tests {
     fn test_interpolate_unknown_var_error() {
         let result = interpolate_patch_vars("$UNKNOWN_VAR", "gpt-4", "openai");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unresolved variable '$UNKNOWN_VAR'"));
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Unresolved variable '$UNKNOWN_VAR'"));
+        assert!(err_msg.contains("$HARNX_MODEL, $HARNX_CLIENT"));
+        assert!(err_msg.contains("export UNKNOWN_VAR="));
     }
 
     #[test]
