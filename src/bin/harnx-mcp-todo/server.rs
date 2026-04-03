@@ -509,6 +509,7 @@ fn todo_to_json(todo: &TodoRecord) -> Value {
     serde_json::json!({
         "id": display_id(&todo.front.id),
         "title": todo.front.title,
+        "plan": todo.front.plan,
         "tags": todo.front.tags,
         "status": todo.front.status,
         "created_at": todo.front.created_at,
@@ -737,7 +738,10 @@ impl TodoServer {
         if !content.is_empty() && !content.ends_with('\n') {
             content.push('\n');
         }
-        content.push_str("\n### Note\n\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str("### Note\n\n");
         content.push_str(&params.text);
         content.push('\n');
 
