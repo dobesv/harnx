@@ -15,6 +15,9 @@ variables:                       # Agent variables (prompted on first use)
   - name: project_dir
     description: The project directory
     default: "."
+  - name: system_context
+    description: Shared system prompt loaded from file
+    path: shared/system-prompt.md
 
 conversation_starters:           # Suggested starting prompts
   - What can you help me with?
