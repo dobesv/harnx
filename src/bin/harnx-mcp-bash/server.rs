@@ -137,6 +137,7 @@ impl BashServer {
             max_output_bytes: params
                 .max_output_bytes
                 .unwrap_or(default_opts.max_output_bytes),
+            ..default_opts
         };
 
         let mut child = Command::new("bash")

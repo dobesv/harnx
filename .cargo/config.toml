@@ -1,0 +1,17 @@
+# Cross-compilation configuration for building/testing Windows targets from Linux.
+#
+# Prerequisites (Ubuntu/Debian):
+#   sudo apt-get install -y gcc-mingw-w64-x86-64 wine wine-binfmt
+#   rustup target add x86_64-pc-windows-gnu
+#
+# Wine binfmt_misc must be enabled so that .exe files are auto-run via wine.
+# The wine-binfmt package usually handles this automatically.
+#
+# Usage:
+#   cargo build --target x86_64-pc-windows-gnu
+#   cargo test  --target x86_64-pc-windows-gnu
+#   cargo clippy --target x86_64-pc-windows-gnu --all --all-targets -- -D warnings
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+runner = "wine"

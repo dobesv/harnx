@@ -87,8 +87,10 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                     if let Ok((cols, rows)) = crossterm::terminal::size() {
                         opts.head_lines = 5.max((rows / 2) as usize);
                         opts.tail_lines = 0;
-                        opts.line_head_bytes = (cols as usize).saturating_sub(1);
+                        // Subtracting 4 for "<= " prefix and 1 to be safe
+                        opts.line_head_bytes = (cols as usize).saturating_sub(5);
                         opts.line_tail_bytes = 0;
+                        opts.marker = Some(" [...] ".to_string());
                     }
                     let output = match result {
                         Value::String(ref s) => s.clone(),

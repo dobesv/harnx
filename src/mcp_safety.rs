@@ -96,13 +96,14 @@ pub struct TruncationResult {
     pub output_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncateOpts {
     pub head_lines: usize,
     pub tail_lines: usize,
     pub line_head_bytes: usize,
     pub line_tail_bytes: usize,
     pub max_output_bytes: usize,
+    pub marker: Option<String>,
 }
 
 impl Default for TruncateOpts {
@@ -113,6 +114,7 @@ impl Default for TruncateOpts {
             line_head_bytes: 500,
             line_tail_bytes: 1500,
             max_output_bytes: 16_384,
+            marker: None,
         }
     }
 }
@@ -200,7 +202,7 @@ pub fn truncate_output(s: &str, opts: &TruncateOpts) -> String {
         return out;
     }
 
-    let opts = normalize_opts(*opts);
+    let opts = normalize_opts(opts.clone());
 
     let line_threshold = opts.line_head_bytes.saturating_add(opts.line_tail_bytes);
     if line_threshold > 0 {
@@ -220,7 +222,13 @@ pub fn truncate_output(s: &str, opts: &TruncateOpts) -> String {
                     .len()
                     .saturating_sub(head_len)
                     .saturating_sub(body.len().saturating_sub(tail_start));
-                let marker = format!("... [truncated: {removed} bytes removed from line] ...");
+
+                let marker = if let Some(ref m) = opts.marker {
+                    m.clone()
+                } else {
+                    format!("... [truncated: {removed} bytes removed from line] ...")
+                };
+
                 let mut rebuilt = String::with_capacity(
                     head_len + marker.len() + (body.len() - tail_start) + usize::from(had_newline),
                 );
@@ -244,7 +252,14 @@ pub fn truncate_output(s: &str, opts: &TruncateOpts) -> String {
         if opts.head_lines > 0 {
             kept.extend(lines.iter().take(opts.head_lines).cloned());
         }
-        kept.push(format!("... [truncated: {removed} lines removed] ...\n"));
+
+        let marker = if let Some(ref m) = opts.marker {
+            format!("{m}\n")
+        } else {
+            format!("... [truncated: {removed} lines removed] ...\n")
+        };
+        kept.push(marker);
+
         if opts.tail_lines > 0 {
             kept.extend(lines.iter().skip(lines.len() - opts.tail_lines).cloned());
         }
@@ -253,13 +268,18 @@ pub fn truncate_output(s: &str, opts: &TruncateOpts) -> String {
     }
 
     if out.len() > opts.max_output_bytes {
-        let approx_marker = format!(
-            "\n... [truncated: {} bytes removed, showing first {} + last {} bytes] ...\n",
-            out.len(),
-            opts.max_output_bytes / 4,
-            opts.max_output_bytes
-                .saturating_sub(opts.max_output_bytes / 4)
-        );
+        let approx_marker = if let Some(ref m) = opts.marker {
+            m.clone()
+        } else {
+            format!(
+                "\n... [truncated: {} bytes removed, showing first {} + last {} bytes] ...\n",
+                out.len(),
+                opts.max_output_bytes / 4,
+                opts.max_output_bytes
+                    .saturating_sub(opts.max_output_bytes / 4)
+            )
+        };
+
         let marker_budget = approx_marker
             .len()
             .min(opts.max_output_bytes.saturating_sub(1));
@@ -279,11 +299,17 @@ pub fn truncate_output(s: &str, opts: &TruncateOpts) -> String {
             .len()
             .saturating_sub(head_end)
             .saturating_sub(out.len().saturating_sub(tail_start));
-        let marker = format!(
-            "\n... [truncated: {removed} bytes removed, showing first {} + last {} bytes] ...\n",
-            head_end,
-            out.len() - tail_start
-        );
+
+        let marker = if let Some(ref m) = opts.marker {
+            m.clone()
+        } else {
+            format!(
+                "\n... [truncated: {removed} bytes removed, showing first {} + last {} bytes] ...\n",
+                head_end,
+                out.len() - tail_start
+            )
+        };
+
         out = format!("{}{}{}", &out[..head_end], marker, &out[tail_start..]);
     }
 
