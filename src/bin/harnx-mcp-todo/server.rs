@@ -23,6 +23,8 @@ struct TodoFrontMatter {
     title: String,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<String>,
     #[serde(default = "default_status")]
     status: String,
     #[serde(default)]
@@ -53,6 +55,9 @@ struct TodoListParams {
     /// Optional tag filter
     #[serde(default)]
     tag: Option<String>,
+    /// Optional plan filter
+    #[serde(default)]
+    plan: Option<String>,
 }
 
 fn default_filter() -> String {
@@ -72,6 +77,9 @@ struct TodoCreateParams {
     /// Optional tags
     #[serde(default)]
     tags: Vec<String>,
+    /// Optional plan association
+    #[serde(default)]
+    plan: Option<String>,
     /// Initial status (default: "open")
     #[serde(default)]
     status: Option<String>,
@@ -93,6 +101,9 @@ struct TodoUpdateParams {
     /// New tags (optional, replaces all)
     #[serde(default)]
     tags: Option<Vec<String>>,
+    /// New plan (optional)
+    #[serde(default)]
+    plan: Option<String>,
     /// New body (optional, replaces body)
     #[serde(default)]
     body: Option<String>,
@@ -110,6 +121,28 @@ struct TodoAppendParams {
 struct TodoDeleteParams {
     /// Todo ID
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanReadParams {
+    /// Plan name (8-char hex or descriptive name)
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanWriteParams {
+    /// Plan name
+    name: String,
+    /// Full plan markdown text
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanAddNoteParams {
+    /// Plan name
+    name: String,
+    /// Note text to append to the end of the plan
+    text: String,
 }
 
 // ── JsonSchema impls ────────────────────────────────────────────────────────
@@ -143,6 +176,11 @@ impl_json_schema!(
             "Optional tag to filter by",
             gen.subschema_for::<Option<String>>()
         ),
+        (
+            "plan",
+            "Optional plan name to filter by",
+            gen.subschema_for::<Option<String>>()
+        ),
     ],
     &[]
 );
@@ -171,6 +209,11 @@ impl_json_schema!(
             "tags",
             "Optional tags",
             gen.subschema_for::<Option<Vec<String>>>()
+        ),
+        (
+            "plan",
+            "Optional plan name/ID to associate with this todo",
+            gen.subschema_for::<Option<String>>()
         ),
         (
             "status",
@@ -207,6 +250,11 @@ impl_json_schema!(
             gen.subschema_for::<Option<Vec<String>>>()
         ),
         (
+            "plan",
+            "New plan name/ID (optional)",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
             "body",
             "New body (replaces, optional)",
             gen.subschema_for::<Option<String>>()
@@ -234,6 +282,41 @@ impl_json_schema!(
     "TodoDeleteParams",
     |gen: &mut SchemaGenerator| vec![("id", "Todo ID", gen.subschema_for::<String>()),],
     &["id"]
+);
+
+impl_json_schema!(
+    PlanReadParams,
+    "PlanReadParams",
+    |gen: &mut SchemaGenerator| vec![("name", "Plan name or ID", gen.subschema_for::<String>()),],
+    &["name"]
+);
+
+impl_json_schema!(
+    PlanWriteParams,
+    "PlanWriteParams",
+    |gen: &mut SchemaGenerator| vec![
+        ("name", "Plan name or ID", gen.subschema_for::<String>()),
+        (
+            "content",
+            "Full plan markdown text",
+            gen.subschema_for::<String>()
+        ),
+    ],
+    &["name", "content"]
+);
+
+impl_json_schema!(
+    PlanAddNoteParams,
+    "PlanAddNoteParams",
+    |gen: &mut SchemaGenerator| vec![
+        ("name", "Plan name or ID", gen.subschema_for::<String>()),
+        (
+            "text",
+            "Text to append as a note",
+            gen.subschema_for::<String>()
+        ),
+    ],
+    &["name", "text"]
 );
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -286,6 +369,7 @@ fn parse_todo_content(content: &str, id_fallback: &str) -> TodoRecord {
                 id: id_fallback.to_string(),
                 title: String::new(),
                 tags: vec![],
+                plan: None,
                 status: "open".to_string(),
                 created_at: String::new(),
                 updated_at: None,
@@ -301,6 +385,7 @@ fn parse_todo_content(content: &str, id_fallback: &str) -> TodoRecord {
                 id: id_fallback.to_string(),
                 title: String::new(),
                 tags: vec![],
+                plan: None,
                 status: "open".to_string(),
                 created_at: String::new(),
                 updated_at: None,
@@ -318,6 +403,7 @@ fn parse_todo_content(content: &str, id_fallback: &str) -> TodoRecord {
         id: id_fallback.to_string(),
         title: String::new(),
         tags: vec![],
+        plan: None,
         status: "open".to_string(),
         created_at: String::new(),
         updated_at: None,
@@ -423,6 +509,7 @@ fn todo_to_json(todo: &TodoRecord) -> Value {
     serde_json::json!({
         "id": display_id(&todo.front.id),
         "title": todo.front.title,
+        "plan": todo.front.plan,
         "tags": todo.front.tags,
         "status": todo.front.status,
         "created_at": todo.front.created_at,
@@ -473,6 +560,16 @@ impl TodoServer {
                     true
                 }
             })
+            .filter(|t| {
+                if let Some(ref plan) = params.plan {
+                    t.front
+                        .plan
+                        .as_ref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(plan))
+                } else {
+                    true
+                }
+            })
             .collect();
         let json = if params.filter == "all" {
             todo_list_to_json(&filtered)
@@ -507,6 +604,7 @@ impl TodoServer {
                 id: id.clone(),
                 title: params.title,
                 tags: params.tags,
+                plan: params.plan,
                 status: params.status.unwrap_or_else(|| "open".to_string()),
                 created_at: now_iso(),
                 updated_at: None,
@@ -534,6 +632,9 @@ impl TodoServer {
         }
         if let Some(tags) = params.tags {
             todo.front.tags = tags;
+        }
+        if let Some(plan) = params.plan {
+            todo.front.plan = Some(plan);
         }
         if let Some(body) = params.body {
             todo.body = body;
@@ -581,6 +682,97 @@ impl TodoServer {
             "{} deleted",
             display_id(&id)
         ))]))
+    }
+
+    fn handle_plan_read(&self, params: PlanReadParams) -> Result<CallToolResult, ErrorData> {
+        let path = match self.plan_path(&params.name) {
+            Ok(p) => p,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(content) => Ok(CallToolResult::success(vec![Content::text(content)])),
+            Err(_) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Plan '{}' not found",
+                params.name
+            ))])),
+        }
+    }
+
+    fn handle_plan_write(&self, params: PlanWriteParams) -> Result<CallToolResult, ErrorData> {
+        let path = match self.plan_path(&params.name) {
+            Ok(p) => p,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to create plans directory: {e}"
+                ))]));
+            }
+        }
+        if let Err(e) = std::fs::write(&path, &params.content) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to write plan: {e}"
+            ))]));
+        }
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Plan '{}' saved",
+            params.name
+        ))]))
+    }
+
+    fn handle_plan_add_note(&self, params: PlanAddNoteParams) -> Result<CallToolResult, ErrorData> {
+        let path = match self.plan_path(&params.name) {
+            Ok(p) => p,
+            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
+        };
+        let mut content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to read existing plan: {e}"
+                ))]))
+            }
+        };
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str("### Note\n\n");
+        content.push_str(&params.text);
+        content.push('\n');
+
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Ok(CallToolResult::error(vec![Content::text(format!(
+                    "Failed to create plans directory: {e}"
+                ))]));
+            }
+        }
+        if let Err(e) = std::fs::write(&path, content) {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to write plan: {e}"
+            ))]));
+        }
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Note added to plan '{}'",
+            params.name
+        ))]))
+    }
+
+    fn plan_path(&self, name: &str) -> Result<PathBuf, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Plan name cannot be empty".to_string());
+        }
+        if name.contains('/') || name.contains('\\') || name.contains("..") {
+            return Err("Invalid plan name".to_string());
+        }
+        let plans_dir = self.dir.parent().unwrap_or(&self.dir).join("plans");
+        Ok(plans_dir.join(format!("{name}.md")))
     }
 }
 
@@ -642,6 +834,20 @@ impl ServerHandler for TodoServer {
                 .with_input_schema::<TodoAppendParams>(),
                 Tool::new("todo_delete", "Delete a todo by ID.", Map::new())
                     .with_input_schema::<TodoDeleteParams>(),
+                Tool::new("read_plan", "Read a plan's content by name.", Map::new())
+                    .with_input_schema::<PlanReadParams>(),
+                Tool::new(
+                    "write_plan",
+                    "Write/update a plan's content by name.",
+                    Map::new(),
+                )
+                .with_input_schema::<PlanWriteParams>(),
+                Tool::new(
+                    "plan_add_note",
+                    "Add a note to an existing plan.",
+                    Map::new(),
+                )
+                .with_input_schema::<PlanAddNoteParams>(),
             ],
             next_cursor: None,
         })
@@ -676,6 +882,18 @@ impl ServerHandler for TodoServer {
             "todo_delete" => {
                 let params = parse_arguments::<TodoDeleteParams>(request.arguments)?;
                 self.handle_delete(params)
+            }
+            "read_plan" => {
+                let params = parse_arguments::<PlanReadParams>(request.arguments)?;
+                self.handle_plan_read(params)
+            }
+            "write_plan" => {
+                let params = parse_arguments::<PlanWriteParams>(request.arguments)?;
+                self.handle_plan_write(params)
+            }
+            "plan_add_note" => {
+                let params = parse_arguments::<PlanAddNoteParams>(request.arguments)?;
+                self.handle_plan_add_note(params)
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
