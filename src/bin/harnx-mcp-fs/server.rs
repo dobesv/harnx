@@ -390,6 +390,7 @@ impl FsServer {
             max_output_bytes: params
                 .max_output_bytes
                 .unwrap_or(default_opts.max_output_bytes.min(DEFAULT_MAX_BYTES)),
+            ..default_opts
         };
         let truncated_output = truncate_output(&raw_output, &truncate_opts);
 

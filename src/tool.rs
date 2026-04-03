@@ -3,6 +3,7 @@ use crate::{
     hooks::{dispatch::dispatch_hooks, HookEvent, HookResultControl},
     utils::*,
 };
+use harnx::mcp_safety::{truncate_output, TruncateOpts};
 
 use anyhow::{anyhow, bail, Result};
 use indexmap::IndexMap;
@@ -81,6 +82,24 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                     ))
                 });
 
+                if *IS_STDOUT_TERMINAL {
+                    let mut opts = TruncateOpts::default();
+                    if let Ok((cols, rows)) = crossterm::terminal::size() {
+                        opts.head_lines = 5.max((rows / 2) as usize);
+                        opts.tail_lines = 0;
+                        // Subtracting 4 for "<= " prefix and 1 to be safe
+                        opts.line_head_bytes = (cols as usize).saturating_sub(5);
+                        opts.line_tail_bytes = 0;
+                        opts.marker = Some(" [...] ".to_string());
+                    }
+                    let output_str = match &result {
+                        Value::String(s) => s.clone(),
+                        _ => result.to_string(),
+                    };
+                    let truncated = truncate_output(&output_str, &opts);
+                    println!("{}", dimmed_text(&format!("<= {}", truncated)));
+                }
+
                 if result.is_null() {
                     result = json!("DONE");
                 } else {
@@ -102,7 +121,7 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                 }
                 output.push(result_obj);
             }
-            Err(err) => {
+            Err(ToolError::Recoverable(err)) => {
                 let fail_event = HookEvent::PostToolUseFailure {
                     tool_name: call.name.clone(),
                     tool_input: tool_input.clone(),
@@ -118,8 +137,14 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                     ))
                 });
 
-                return Err(err);
+                is_all_null = false;
+                let error_result = json!({
+                    "is_error": true,
+                    "error": err.to_string(),
+                });
+                output.push(ToolResult::new(call, error_result));
             }
+            Err(ToolError::Fatal(err)) => return Err(err),
         }
     }
     if is_all_null {
@@ -184,6 +209,11 @@ impl ToolResult {
             switch_agent: None,
         }
     }
+}
+
+pub enum ToolError {
+    Recoverable(anyhow::Error),
+    Fatal(anyhow::Error),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -276,38 +306,41 @@ impl ToolCall {
         }
     }
 
-    fn eval_mcp(&self, config: &GlobalConfig) -> Result<Value> {
+    fn eval_mcp(&self, config: &GlobalConfig) -> Result<Value, ToolError> {
         let json_data = if self.arguments.is_null() {
             Value::Null
         } else if self.arguments.is_object() {
             self.arguments.clone()
         } else if let Some(arguments) = self.arguments.as_str() {
             serde_json::from_str(arguments).map_err(|_| {
-                anyhow!(
+                ToolError::Recoverable(anyhow!(
                     "The call '{}' has invalid arguments: {arguments}",
                     self.name
-                )
+                ))
             })?
         } else {
-            bail!(
+            return Err(ToolError::Recoverable(anyhow!(
                 "The call '{}' has invalid arguments: {}",
                 self.name,
                 self.arguments
-            );
+            )));
         };
 
         if *IS_STDOUT_TERMINAL {
-            let prompt = format!("Call {} {}", self.name, json_data);
+            let prompt = match &json_data {
+                Value::Null => format!("Call {}", self.name),
+                _ => format!("Call {} {}", self.name, json_data),
+            };
             println!("{}", dimmed_text(&prompt));
         }
 
         if self.name == TRIGGER_AGENT_TOOL_NAME {
-            let agent = json_data["agent"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Missing 'agent' argument for trigger_agent"))?;
-            let prompt = json_data["prompt"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Missing 'prompt' argument for trigger_agent"))?;
+            let agent = json_data["agent"].as_str().ok_or_else(|| {
+                ToolError::Recoverable(anyhow!("Missing 'agent' argument for trigger_agent"))
+            })?;
+            let prompt = json_data["prompt"].as_str().ok_or_else(|| {
+                ToolError::Recoverable(anyhow!("Missing 'prompt' argument for trigger_agent"))
+            })?;
 
             return Ok(json!({
                 "status": "success",
@@ -325,9 +358,9 @@ impl ToolCall {
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         tokio::select! {
-                            result = manager.call_tool(&tool_name, json_data) => result,
+                            result = manager.call_tool(&tool_name, json_data) => result.map_err(ToolError::Recoverable),
                             _ = tokio::signal::ctrl_c() => {
-                                bail!("ACP tool call aborted by user")
+                                Err(ToolError::Fatal(anyhow!("ACP tool call aborted by user")))
                             }
                         }
                     })
@@ -340,21 +373,73 @@ impl ToolCall {
         let mcp_manager = config.read().mcp_manager.clone();
         let manager = match mcp_manager {
             Some(m) => m,
-            None => bail!("No tool provider configured for '{}'", self.name),
+            None => {
+                return Err(ToolError::Recoverable(anyhow!(
+                    "No tool provider configured for '{}'",
+                    self.name
+                )))
+            }
         };
 
         let tool_name = self.name.clone();
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 tokio::select! {
-                    result = manager.call_tool(&tool_name, json_data) => result,
+                    result = manager.call_tool(&tool_name, json_data) => result.map_err(ToolError::Recoverable),
                     _ = tokio::signal::ctrl_c() => {
-                        bail!("MCP tool call aborted by user")
+                        Err(ToolError::Fatal(anyhow!("MCP tool call aborted by user")))
                     }
                 }
             })
         })?;
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_eval_tool_calls_error_handling() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let call = ToolCall::new("unknown_tool".to_string(), json!({}), Some("1".to_string()));
+        let calls = vec![call];
+
+        let result = eval_tool_calls(&config, calls).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].call.name, "unknown_tool");
+        assert!(result[0].output.is_object());
+        assert_eq!(result[0].output["is_error"], true);
+        assert!(result[0].output["error"]
+            .as_str()
+            .unwrap()
+            .contains("No tool provider configured"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_eval_tool_calls_partial_error_handling() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        // trigger_agent is handled internally and should succeed
+        let call1 = ToolCall::new(
+            TRIGGER_AGENT_TOOL_NAME.to_string(),
+            json!({"agent": "test", "prompt": "test"}),
+            Some("1".to_string()),
+        );
+        let call2 = ToolCall::new("unknown_tool".to_string(), json!({}), Some("2".to_string()));
+        let calls = vec![call1, call2];
+
+        let result = eval_tool_calls(&config, calls).unwrap();
+        assert_eq!(result.len(), 2);
+
+        assert_eq!(result[0].call.name, TRIGGER_AGENT_TOOL_NAME);
+        assert_eq!(result[0].output["action"], "switch_agent");
+
+        assert_eq!(result[1].call.name, "unknown_tool");
+        assert_eq!(result[1].output["is_error"], true);
     }
 }
