@@ -74,7 +74,7 @@ process-wrap = { version = "8", features = ["tokio1"] }
 agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk" }
 glob = "0.3"
 shellexpand = "3.1.0"
-schemars = "0.8"
+schemars = "0.9"
 
 [dependencies.reqwest]
 version = "0.12.0"
