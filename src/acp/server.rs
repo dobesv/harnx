@@ -364,20 +364,11 @@ mod tests {
     }
 
     fn test_config() -> GlobalConfig {
-        use crate::config::{Config, WorkingMode};
+        use crate::config::Config;
         use parking_lot::RwLock;
         use std::sync::Arc;
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build test runtime");
-        let config = rt.block_on(async {
-            Config::init(WorkingMode::Cmd, true, vec![])
-                .await
-                .expect("init test config")
-        });
-        Arc::new(RwLock::new(config))
+        Arc::new(RwLock::new(Config::default()))
     }
 
     #[test]
