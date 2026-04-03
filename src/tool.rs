@@ -86,7 +86,21 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                 } else {
                     is_all_null = false;
                 }
-                output.push(ToolResult::new(call, result));
+                let mut result_obj = ToolResult::new(call, result);
+                if let Some(obj) = result_obj.output.as_object() {
+                    if obj.get("action").and_then(|v| v.as_str()) == Some("switch_agent") {
+                        if let (Some(agent), Some(prompt)) = (
+                            obj.get("agent").and_then(|v| v.as_str()),
+                            obj.get("prompt").and_then(|v| v.as_str()),
+                        ) {
+                            result_obj.switch_agent = Some(SwitchAgentData {
+                                agent: agent.to_string(),
+                                prompt: prompt.to_string(),
+                            });
+                        }
+                    }
+                }
+                output.push(result_obj);
             }
             Err(err) => {
                 let fail_event = HookEvent::PostToolUseFailure {
@@ -114,15 +128,61 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
     Ok(output)
 }
 
+pub const TRIGGER_AGENT_TOOL_NAME: &str = "trigger_agent";
+
+pub fn trigger_agent_tool_declaration() -> ToolDeclaration {
+    let mut properties = IndexMap::new();
+    properties.insert(
+        "agent".to_string(),
+        JsonSchema {
+            type_value: Some("string".to_string()),
+            description: Some("The name of the agent to transfer the session to.".to_string()),
+            ..Default::default()
+        },
+    );
+    properties.insert(
+        "prompt".to_string(),
+        JsonSchema {
+            type_value: Some("string".to_string()),
+            description: Some("The new prompt to start the new agent with.".to_string()),
+            ..Default::default()
+        },
+    );
+    ToolDeclaration {
+        name: TRIGGER_AGENT_TOOL_NAME.to_string(),
+        description: "Transfer the session to another agent with a new prompt in an empty session."
+            .to_string(),
+        parameters: JsonSchema {
+            type_value: Some("object".to_string()),
+            properties: Some(properties),
+            required: Some(vec!["agent".to_string(), "prompt".to_string()]),
+            ..Default::default()
+        },
+        mcp_tool_name: None,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolResult {
     pub call: ToolCall,
     pub output: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_agent: Option<SwitchAgentData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwitchAgentData {
+    pub agent: String,
+    pub prompt: String,
 }
 
 impl ToolResult {
     pub fn new(call: ToolCall, output: Value) -> Self {
-        Self { call, output }
+        Self {
+            call,
+            output,
+            switch_agent: None,
+        }
     }
 }
 
@@ -239,6 +299,23 @@ impl ToolCall {
         if *IS_STDOUT_TERMINAL {
             let prompt = format!("Call {} {}", self.name, json_data);
             println!("{}", dimmed_text(&prompt));
+        }
+
+        if self.name == TRIGGER_AGENT_TOOL_NAME {
+            let agent = json_data["agent"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Missing 'agent' argument for trigger_agent"))?;
+            let prompt = json_data["prompt"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Missing 'prompt' argument for trigger_agent"))?;
+
+            return Ok(json!({
+                "status": "success",
+                "message": format!("Transferring session to agent '{}'...", agent),
+                "action": "switch_agent",
+                "agent": agent,
+                "prompt": prompt
+            }));
         }
 
         let acp_manager = config.read().acp_manager.clone();

@@ -98,6 +98,10 @@ arboard = { version = "3.3.0", default-features = false }
 pretty_assertions = "1.4.0"
 rand = "0.9.0"
 
+[[bin]]
+name = "harnx-mcp-todo"
+path = "src/bin/harnx-mcp-todo/main.rs"
+
 [profile.release]
 lto = true
 strip = true
