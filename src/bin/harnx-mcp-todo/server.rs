@@ -287,11 +287,7 @@ impl_json_schema!(
 impl_json_schema!(
     PlanReadParams,
     "PlanReadParams",
-    |gen: &mut SchemaGenerator| vec![(
-        "name",
-        "Plan name or ID",
-        gen.subschema_for::<String>()
-    ),],
+    |gen: &mut SchemaGenerator| vec![("name", "Plan name or ID", gen.subschema_for::<String>()),],
     &["name"]
 );
 
@@ -565,7 +561,10 @@ impl TodoServer {
             })
             .filter(|t| {
                 if let Some(ref plan) = params.plan {
-                    t.front.plan.as_ref().is_some_and(|p| p.eq_ignore_ascii_case(plan))
+                    t.front
+                        .plan
+                        .as_ref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(plan))
                 } else {
                     true
                 }
@@ -831,12 +830,8 @@ impl ServerHandler for TodoServer {
                 .with_input_schema::<TodoAppendParams>(),
                 Tool::new("todo_delete", "Delete a todo by ID.", Map::new())
                     .with_input_schema::<TodoDeleteParams>(),
-                Tool::new(
-                    "read_plan",
-                    "Read a plan's content by name.",
-                    Map::new(),
-                )
-                .with_input_schema::<PlanReadParams>(),
+                Tool::new("read_plan", "Read a plan's content by name.", Map::new())
+                    .with_input_schema::<PlanReadParams>(),
                 Tool::new(
                     "write_plan",
                     "Write/update a plan's content by name.",
