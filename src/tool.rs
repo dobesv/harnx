@@ -121,7 +121,7 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                 }
                 output.push(result_obj);
             }
-            Err(err) => {
+            Err(ToolError::Recoverable(err)) => {
                 let fail_event = HookEvent::PostToolUseFailure {
                     tool_name: call.name.clone(),
                     tool_input: tool_input.clone(),
@@ -144,6 +144,7 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                 });
                 output.push(ToolResult::new(call, error_result));
             }
+            Err(ToolError::Fatal(err)) => return Err(err),
         }
     }
     if is_all_null {
@@ -208,6 +209,11 @@ impl ToolResult {
             switch_agent: None,
         }
     }
+}
+
+pub enum ToolError {
+    Recoverable(anyhow::Error),
+    Fatal(anyhow::Error),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -300,24 +306,24 @@ impl ToolCall {
         }
     }
 
-    fn eval_mcp(&self, config: &GlobalConfig) -> Result<Value> {
+    fn eval_mcp(&self, config: &GlobalConfig) -> Result<Value, ToolError> {
         let json_data = if self.arguments.is_null() {
             Value::Null
         } else if self.arguments.is_object() {
             self.arguments.clone()
         } else if let Some(arguments) = self.arguments.as_str() {
             serde_json::from_str(arguments).map_err(|_| {
-                anyhow!(
+                ToolError::Recoverable(anyhow!(
                     "The call '{}' has invalid arguments: {arguments}",
                     self.name
-                )
+                ))
             })?
         } else {
-            bail!(
+            return Err(ToolError::Recoverable(anyhow!(
                 "The call '{}' has invalid arguments: {}",
                 self.name,
                 self.arguments
-            );
+            )));
         };
 
         if *IS_STDOUT_TERMINAL {
@@ -329,12 +335,12 @@ impl ToolCall {
         }
 
         if self.name == TRIGGER_AGENT_TOOL_NAME {
-            let agent = json_data["agent"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Missing 'agent' argument for trigger_agent"))?;
-            let prompt = json_data["prompt"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Missing 'prompt' argument for trigger_agent"))?;
+            let agent = json_data["agent"].as_str().ok_or_else(|| {
+                ToolError::Recoverable(anyhow!("Missing 'agent' argument for trigger_agent"))
+            })?;
+            let prompt = json_data["prompt"].as_str().ok_or_else(|| {
+                ToolError::Recoverable(anyhow!("Missing 'prompt' argument for trigger_agent"))
+            })?;
 
             return Ok(json!({
                 "status": "success",
@@ -352,9 +358,9 @@ impl ToolCall {
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         tokio::select! {
-                            result = manager.call_tool(&tool_name, json_data) => result,
+                            result = manager.call_tool(&tool_name, json_data) => result.map_err(ToolError::Recoverable),
                             _ = tokio::signal::ctrl_c() => {
-                                bail!("ACP tool call aborted by user")
+                                Err(ToolError::Fatal(anyhow!("ACP tool call aborted by user")))
                             }
                         }
                     })
@@ -367,16 +373,21 @@ impl ToolCall {
         let mcp_manager = config.read().mcp_manager.clone();
         let manager = match mcp_manager {
             Some(m) => m,
-            None => bail!("No tool provider configured for '{}'", self.name),
+            None => {
+                return Err(ToolError::Recoverable(anyhow!(
+                    "No tool provider configured for '{}'",
+                    self.name
+                )))
+            }
         };
 
         let tool_name = self.name.clone();
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 tokio::select! {
-                    result = manager.call_tool(&tool_name, json_data) => result,
+                    result = manager.call_tool(&tool_name, json_data) => result.map_err(ToolError::Recoverable),
                     _ = tokio::signal::ctrl_c() => {
-                        bail!("MCP tool call aborted by user")
+                        Err(ToolError::Fatal(anyhow!("MCP tool call aborted by user")))
                     }
                 }
             })
