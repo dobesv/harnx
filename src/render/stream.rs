@@ -36,7 +36,7 @@ pub async fn raw_stream(
     mut rx: UnboundedReceiver<SseEvent>,
     abort_signal: &AbortSignal,
 ) -> Result<()> {
-    let mut spinner = Some(spawn_spinner(""));
+    let mut spinner = Some(spawn_spinner("Generating"));
 
     loop {
         if abort_signal.aborted() {
@@ -75,7 +75,7 @@ async fn markdown_stream_inner(
 
     let columns = terminal::size()?.0;
 
-    let mut spinner = Some(spawn_spinner(""));
+    let mut spinner = Some(spawn_spinner("Generating"));
 
     'outer: loop {
         if abort_signal.aborted() {
