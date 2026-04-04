@@ -30,7 +30,11 @@ impl SpinnerInner {
         }
         let mut writer = stdout();
         let frame = Self::DATA[self.index % Self::DATA.len()];
-        let dots = ".".repeat((self.index / 5) % 4);
+        let dots = if self.message.is_empty() {
+            "".to_string()
+        } else {
+            ".".repeat((self.index / 5) % 4)
+        };
         let line = format!("{frame}{}{:<3}", self.message, dots);
         queue!(writer, cursor::MoveToColumn(0), style::Print(line),)?;
         if self.index == 0 {

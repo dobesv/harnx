@@ -508,7 +508,7 @@ pub async fn call_chat_completions(
 ) -> Result<(String, Vec<ToolResult>)> {
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
-        "Generating",
+        "",
         abort_signal,
     )
     .await;
