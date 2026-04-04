@@ -92,6 +92,22 @@ pub async fn claude_chat_completions_streaming(
         debug!("stream-data: {data}");
         if let Some(typ) = data["type"].as_str() {
             match typ {
+                "message_start" => {
+                    handler.set_usage(
+                        data["message"]["usage"]["input_tokens"].as_u64(),
+                        None,
+                        data["message"]["usage"]["cache_read_input_tokens"].as_u64(),
+                    );
+                }
+                "message_delta" => {
+                    // message_delta usage fields are cumulative and override
+                    // earlier values from message_start when present
+                    handler.set_usage(
+                        data["usage"]["input_tokens"].as_u64(),
+                        data["usage"]["output_tokens"].as_u64(),
+                        data["usage"]["cache_read_input_tokens"].as_u64(),
+                    );
+                }
                 "content_block_start" => {
                     if let (Some("tool_use"), Some(name), Some(id)) = (
                         data["content_block"]["type"].as_str(),
@@ -358,6 +374,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["output_tokens"].as_u64(),
+        cached_tokens: data["usage"]["cache_read_input_tokens"].as_u64(),
     };
     Ok(output)
 }

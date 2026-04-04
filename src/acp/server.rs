@@ -93,7 +93,7 @@ impl HarnxAgent {
 
         send_ret.map_err(|e| acp::Error::new(-32603, e.to_string()))?;
 
-        let (text, tool_calls) = handler.take();
+        let (text, tool_calls, _usage) = handler.take();
         Ok((text, tool_calls))
     }
 

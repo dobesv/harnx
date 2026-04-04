@@ -283,6 +283,13 @@ async fn chat_completions_streaming(
                                 ))?;
                             }
                         }
+                        "metadata" => {
+                            handler.set_usage(
+                                data["usage"]["inputTokens"].as_u64(),
+                                data["usage"]["outputTokens"].as_u64(),
+                                None,
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -526,6 +533,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         id: None,
         input_tokens: data["usage"]["inputTokens"].as_u64(),
         output_tokens: data["usage"]["outputTokens"].as_u64(),
+        cached_tokens: None,
     };
     Ok(output)
 }

@@ -18,11 +18,12 @@ pub async fn markdown_stream(
     rx: UnboundedReceiver<SseEvent>,
     render: &mut MarkdownRender,
     abort_signal: &AbortSignal,
+    spinner_message: &str,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
 
-    let ret = markdown_stream_inner(rx, render, abort_signal, &mut stdout).await;
+    let ret = markdown_stream_inner(rx, render, abort_signal, &mut stdout, spinner_message).await;
 
     disable_raw_mode()?;
 
@@ -35,8 +36,9 @@ pub async fn markdown_stream(
 pub async fn raw_stream(
     mut rx: UnboundedReceiver<SseEvent>,
     abort_signal: &AbortSignal,
+    spinner_message: &str,
 ) -> Result<()> {
-    let mut spinner = Some(spawn_spinner("Generating"));
+    let mut spinner = Some(spawn_spinner(spinner_message));
 
     loop {
         if abort_signal.aborted() {
@@ -69,13 +71,14 @@ async fn markdown_stream_inner(
     render: &mut MarkdownRender,
     abort_signal: &AbortSignal,
     writer: &mut Stdout,
+    spinner_message: &str,
 ) -> Result<()> {
     let mut buffer = String::new();
     let mut buffer_rows = 1;
 
     let columns = terminal::size()?.0;
 
-    let mut spinner = Some(spawn_spinner("Generating"));
+    let mut spinner = Some(spawn_spinner(spinner_message));
 
     'outer: loop {
         if abort_signal.aborted() {
