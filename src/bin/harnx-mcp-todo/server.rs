@@ -5,7 +5,7 @@
 
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
@@ -576,16 +576,30 @@ impl TodoServer {
         } else {
             serde_json::json!(filtered.iter().map(todo_to_json).collect::<Vec<_>>())
         };
+        let count = filtered.len();
         let text = serde_json::to_string_pretty(&json).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        let summary = format!("Found {count} todos");
+        Ok(CallToolResult::success(vec![
+            Content::text(text).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     fn handle_get(&self, params: TodoGetParams) -> Result<CallToolResult, ErrorData> {
         let id = normalize_id(&params.id);
         match read_todo(&self.dir, &id) {
             Ok(todo) => {
+                let summary = format!(
+                    "{}: {} [{}]",
+                    display_id(&todo.front.id),
+                    todo.front.title,
+                    todo.front.status
+                );
                 let text = serde_json::to_string_pretty(&todo_to_json(&todo)).unwrap_or_default();
-                Ok(CallToolResult::success(vec![Content::text(text)]))
+                Ok(CallToolResult::success(vec![
+                    Content::text(text).with_audience(vec![Role::Assistant]),
+                    Content::text(summary).with_audience(vec![Role::User]),
+                ]))
             }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
         }
@@ -614,8 +628,16 @@ impl TodoServer {
         if let Err(e) = write_todo(&self.dir, &todo) {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
+        let summary = format!(
+            "Created {}: {}",
+            display_id(&todo.front.id),
+            todo.front.title
+        );
         let text = serde_json::to_string_pretty(&todo_to_json(&todo)).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![
+            Content::text(text).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     fn handle_update(&self, params: TodoUpdateParams) -> Result<CallToolResult, ErrorData> {
@@ -643,8 +665,16 @@ impl TodoServer {
         if let Err(e) = write_todo(&self.dir, &todo) {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
+        let summary = format!(
+            "Updated {}: {}",
+            display_id(&todo.front.id),
+            todo.front.title
+        );
         let text = serde_json::to_string_pretty(&todo_to_json(&todo)).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![
+            Content::text(text).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     fn handle_append(&self, params: TodoAppendParams) -> Result<CallToolResult, ErrorData> {
@@ -663,8 +693,12 @@ impl TodoServer {
         if let Err(e) = write_todo(&self.dir, &todo) {
             return Ok(CallToolResult::error(vec![Content::text(e)]));
         }
+        let summary = format!("Appended to {}", display_id(&todo.front.id));
         let text = serde_json::to_string_pretty(&todo_to_json(&todo)).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![
+            Content::text(text).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     fn handle_delete(&self, params: TodoDeleteParams) -> Result<CallToolResult, ErrorData> {

@@ -2,7 +2,7 @@ use chrono::{Datelike, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
@@ -41,16 +41,20 @@ impl TimeServer {
         };
         let is_dst = current_offset != standard_offset;
 
+        let datetime_str = now.format("%Y-%m-%dT%H:%M:%S%:z").to_string();
         let result = serde_json::json!({
             "timezone": timezone,
-            "datetime": now.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+            "datetime": &datetime_str,
             "day_of_week": now.format("%A").to_string(),
             "is_dst": is_dst,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap_or_default(),
-        )]))
+        let full = serde_json::to_string_pretty(&result).unwrap_or_default();
+        let summary = format!("Current time in {timezone}: {datetime_str}");
+        Ok(CallToolResult::success(vec![
+            Content::text(full).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     fn convert_time_impl(
@@ -114,6 +118,8 @@ impl TimeServer {
             format!("{}h", s.trim_end_matches('0').trim_end_matches('.'))
         };
 
+        let source_time_str = source_dt.format("%H:%M %Z").to_string();
+        let target_time_str = target_dt.format("%H:%M %Z").to_string();
         let result = serde_json::json!({
             "source": {
                 "timezone": source_tz,
@@ -128,9 +134,12 @@ impl TimeServer {
             "time_difference": time_diff_str,
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap_or_default(),
-        )]))
+        let full = serde_json::to_string_pretty(&result).unwrap_or_default();
+        let summary = format!("{source_time_str} → {target_time_str} ({time_diff_str})");
+        Ok(CallToolResult::success(vec![
+            Content::text(full).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     async fn wait_impl(&self, seconds: f64) -> Result<CallToolResult, ErrorData> {
