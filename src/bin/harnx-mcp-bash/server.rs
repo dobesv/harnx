@@ -143,6 +143,7 @@ impl BashServer {
         let mut child = Command::new("bash")
             .args(["-c", &params.command])
             .current_dir(&working_dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
