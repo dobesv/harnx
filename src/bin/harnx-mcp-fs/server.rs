@@ -396,7 +396,7 @@ impl FsServer {
 
         if truncated_output != raw_output {
             notices.push(format!(
-                "output truncated from {} to {}",
+                "output truncated from {} to {}. Use head_lines, tail_lines, or max_output_bytes to see more",
                 format_size(raw_output.len()),
                 format_size(truncated_output.len())
             ));
@@ -641,7 +641,7 @@ impl FsServer {
         }
         if truncated_output != raw_output {
             notices.push(format!(
-                "output truncated from {} to {}",
+                "output truncated from {} to {}. Use max_results to increase the limit",
                 format_size(raw_output.len()),
                 format_size(truncated_output.len())
             ));

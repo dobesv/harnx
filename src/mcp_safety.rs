@@ -256,7 +256,7 @@ pub fn truncate_output(s: &str, opts: &TruncateOpts) -> String {
         let marker = if let Some(ref m) = opts.marker {
             format!("{m}\n")
         } else {
-            format!("... [truncated: {removed} lines removed] ...\n")
+            format!("... [truncated: {removed} lines removed. Use head_lines/tail_lines to show more] ...\n")
         };
         kept.push(marker);
 
@@ -272,7 +272,7 @@ pub fn truncate_output(s: &str, opts: &TruncateOpts) -> String {
             m.clone()
         } else {
             format!(
-                "\n... [truncated: {} bytes removed, showing first {} + last {} bytes] ...\n",
+                "\n... [truncated: {} bytes removed, showing first {} + last {} bytes. Use max_output_bytes to increase limit] ...\n",
                 out.len(),
                 opts.max_output_bytes / 4,
                 opts.max_output_bytes
@@ -304,7 +304,7 @@ pub fn truncate_output(s: &str, opts: &TruncateOpts) -> String {
             m.clone()
         } else {
             format!(
-                "\n... [truncated: {removed} bytes removed, showing first {} + last {} bytes] ...\n",
+                "\n... [truncated: {removed} bytes removed, showing first {} + last {} bytes. Use max_output_bytes to increase limit] ...\n",
                 head_end,
                 out.len() - tail_start
             )
@@ -593,7 +593,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(output.contains("[truncated: 5 lines removed]"));
+        assert!(
+            output.contains("[truncated: 5 lines removed. Use head_lines/tail_lines to show more]")
+        );
         assert!(output.contains("line-1"));
         assert!(output.contains("line-2"));
         assert!(output.contains("line-8"));
@@ -659,7 +661,9 @@ mod tests {
         assert!(output.contains("line-2"));
         assert!(output.contains("line-7"));
         assert!(output.contains("line-8"));
-        assert!(output.contains("[truncated: 4 lines removed]"));
+        assert!(
+            output.contains("[truncated: 4 lines removed. Use head_lines/tail_lines to show more]")
+        );
     }
 
     #[test]
@@ -673,12 +677,13 @@ mod tests {
             &TruncateOpts {
                 head_lines: 100,
                 tail_lines: 100,
-                max_output_bytes: 120,
+                max_output_bytes: 200,
                 ..Default::default()
             },
         );
 
         assert!(output.contains("showing first"));
+        assert!(output.contains("Use max_output_bytes to increase limit"));
         assert!(output.starts_with("line-01"));
         assert_ne!(output, input);
     }

@@ -1,5 +1,6 @@
 use super::AcpServerConfig;
 
+use crate::utils::dimmed_text;
 use agent_client_protocol::{self as acp, Agent as _};
 use anyhow::{anyhow, Context, Result};
 use std::cell::RefCell;
@@ -16,19 +17,24 @@ use tokio::io::{
 };
 use tokio::process::{Child, Command};
 use tokio::runtime::Builder;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::task::LocalSet;
+
+/// Timeout for the initial connection handshake with the ACP server.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct AcpClient {
     name: String,
     config: AcpServerConfig,
-    timeout: Duration,
+    idle_timeout: Duration,
+    operation_timeout: Duration,
     connected: Arc<RwLock<bool>>,
     connection_failed: Arc<RwLock<bool>>,
     initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     worker: Arc<Mutex<Option<AcpWorkerHandle>>>,
     chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
+    activity_tx: broadcast::Sender<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,6 +74,7 @@ enum WorkerCommand {
 struct AcpNotificationClient {
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
+    activity_tx: broadcast::Sender<String>,
 }
 
 struct TokioCompat<T> {
@@ -78,10 +85,12 @@ impl AcpNotificationClient {
     fn new(
         sessions: Arc<RwLock<HashMap<String, SessionState>>>,
         chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
+        activity_tx: broadcast::Sender<String>,
     ) -> Self {
         Self {
             sessions,
             chunk_forwarder,
+            activity_tx,
         }
     }
 }
@@ -135,30 +144,109 @@ impl acp::Client for AcpNotificationClient {
     }
 
     async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
-        if let acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) =
-            args.update
-        {
-            let chunk = content_block_to_text(&content);
-            if !chunk.is_empty() {
-                let mut delivered = false;
-                let mut forwarders = self.chunk_forwarder.write().await;
-                if forwarders.is_empty() {
-                    eprint!("{}", chunk);
-                } else {
-                    forwarders.retain(|_, tx| match tx.send(chunk.clone()) {
-                        Ok(()) => {
-                            delivered = true;
-                            true
-                        }
-                        Err(_) => false,
-                    });
-                    if !delivered {
-                        eprint!("{}", chunk);
-                    }
-                }
-                drop(forwarders);
+        let session_id = args.session_id.0.to_string();
+        let _ = self.activity_tx.send(session_id.clone());
 
-                let session_id = args.session_id.0.to_string();
+        let is_agent_message = matches!(args.update, acp::SessionUpdate::AgentMessageChunk(_));
+        let chunk = match args.update {
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) => {
+                content_block_to_text(&content)
+            }
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk { content, .. }) => {
+                let text = content_block_to_text(&content);
+                if text.is_empty() {
+                    String::new()
+                } else {
+                    format!("<think>{text}</think>")
+                }
+            }
+            acp::SessionUpdate::ToolCall(tc) => {
+                let input_str = tc
+                    .raw_input
+                    .as_ref()
+                    .map(|v| format!(" {v}"))
+                    .unwrap_or_default();
+                format!(
+                    "\n{}\n",
+                    dimmed_text(&format!("🛠️  {}{}", tc.title, input_str))
+                )
+            }
+            acp::SessionUpdate::ToolCallUpdate(tcu) => {
+                let mut parts = vec![];
+                if let Some(title) = &tcu.fields.title {
+                    parts.push(title.clone());
+                }
+                if let Some(status) = &tcu.fields.status {
+                    parts.push(
+                        serde_json::to_value(status)
+                            .ok()
+                            .and_then(|v| v.as_str().map(String::from))
+                            .unwrap_or_else(|| format!("{:?}", status)),
+                    );
+                }
+                if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}\n", dimmed_text(&parts.join(" ")))
+                }
+            }
+            acp::SessionUpdate::Plan(p) => {
+                let entries: Vec<String> = p
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        let status_str = serde_json::to_value(&e.status)
+                            .ok()
+                            .and_then(|v| v.as_str().map(String::from))
+                            .unwrap_or_else(|| format!("{:?}", e.status));
+                        format!("  [{}] {}", status_str, e.content)
+                    })
+                    .collect();
+                if entries.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\n{}\n",
+                        dimmed_text(&format!("Plan:\n{}", entries.join("\n")))
+                    )
+                }
+            }
+            // Explicitly list known-but-unhandled variants so new ones from
+            // future ACP SDK upgrades surface as compile warnings in the
+            // wildcard arm below.
+            acp::SessionUpdate::UserMessageChunk(_)
+            | acp::SessionUpdate::AvailableCommandsUpdate(_)
+            | acp::SessionUpdate::CurrentModeUpdate(_)
+            | acp::SessionUpdate::ConfigOptionUpdate(_)
+            | acp::SessionUpdate::SessionInfoUpdate(_) => String::new(),
+            // Required catch-all: SessionUpdate is #[non_exhaustive].
+            // Log so future variants aren't silently swallowed.
+            other => {
+                log::debug!("Unhandled ACP SessionUpdate variant: {:?}", other);
+                String::new()
+            }
+        };
+
+        if !chunk.is_empty() {
+            let mut delivered = false;
+            let mut forwarders = self.chunk_forwarder.write().await;
+            if forwarders.is_empty() {
+                eprint!("{}", chunk);
+            } else {
+                forwarders.retain(|_, tx| match tx.send(chunk.clone()) {
+                    Ok(()) => {
+                        delivered = true;
+                        true
+                    }
+                    Err(_) => false,
+                });
+                if !delivered {
+                    eprint!("{}", chunk);
+                }
+            }
+            drop(forwarders);
+
+            if is_agent_message {
                 let mut sessions = self.sessions.write().await;
                 let state = sessions.entry(session_id).or_default();
                 state.response_text.push_str(&chunk);
@@ -229,17 +317,21 @@ impl acp::Client for AcpNotificationClient {
 impl AcpClient {
     pub fn new(config: AcpServerConfig) -> Self {
         let name = config.name.clone();
-        let timeout = Duration::from_secs(config.timeout_secs);
+        let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
+        let operation_timeout = Duration::from_secs(config.operation_timeout_secs);
+        let (activity_tx, _) = broadcast::channel(256);
         Self {
             name,
             config,
-            timeout,
+            idle_timeout,
+            operation_timeout,
             connected: Arc::new(RwLock::new(false)),
             connection_failed: Arc::new(RwLock::new(false)),
             initialize_response: Arc::new(RwLock::new(None)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             worker: Arc::new(Mutex::new(None)),
             chunk_forwarder: Arc::new(RwLock::new(HashMap::new())),
+            activity_tx,
         }
     }
 
@@ -265,9 +357,10 @@ impl AcpClient {
             self.sessions.clone(),
             self.initialize_response.clone(),
             self.chunk_forwarder.clone(),
+            self.activity_tx.clone(),
         )?;
 
-        match tokio::time::timeout(self.timeout, ready_rx).await {
+        match tokio::time::timeout(CONNECT_TIMEOUT, ready_rx).await {
             Ok(Ok(Ok(()))) => {
                 *self.connected.write().await = true;
                 *worker_guard = Some(worker);
@@ -327,7 +420,7 @@ impl AcpClient {
         tx.send(WorkerCommand::NewSession { respond_to })
             .map_err(|_| anyhow!("ACP server '{}' is not connected", self.name))?;
 
-        tokio::time::timeout(self.timeout, response_rx)
+        tokio::time::timeout(self.idle_timeout, response_rx)
             .await
             .map_err(|_| anyhow!("ACP server '{}' timed out during session/new", self.name))?
             .map_err(|_| anyhow!("ACP server '{}' disconnected during session/new", self.name))?
@@ -344,21 +437,44 @@ impl AcpClient {
         let (respond_to, response_rx) = oneshot::channel();
         let tx = self.worker_sender().await?;
         tx.send(WorkerCommand::Prompt {
-            session_id,
+            session_id: session_id.clone(),
             message: message.to_owned(),
             respond_to,
         })
         .map_err(|_| anyhow!("ACP server '{}' is not connected", self.name))?;
 
-        tokio::time::timeout(self.timeout, response_rx)
-            .await
-            .map_err(|_| anyhow!("ACP server '{}' timed out during session/prompt", self.name))?
-            .map_err(|_| {
-                anyhow!(
-                    "ACP server '{}' disconnected during session/prompt",
-                    self.name
-                )
-            })?
+        let mut activity_rx = self.activity_tx.subscribe();
+        let overall_timeout = tokio::time::sleep(self.operation_timeout);
+        let idle_timeout = tokio::time::sleep(self.idle_timeout);
+        tokio::pin!(overall_timeout);
+        tokio::pin!(idle_timeout);
+        tokio::pin!(response_rx);
+
+        loop {
+            tokio::select! {
+                res = &mut response_rx => {
+                    return res.map_err(|_| {
+                        anyhow!(
+                            "ACP server '{}' disconnected during session/prompt",
+                            self.name
+                        )
+                    })?;
+                }
+                _ = &mut overall_timeout => {
+                    return Err(anyhow!("ACP server '{}' timed out during session/prompt (overall timeout)", self.name));
+                }
+                _ = &mut idle_timeout => {
+                    return Err(anyhow!("ACP server '{}' timed out during session/prompt (idle timeout)", self.name));
+                }
+                result = activity_rx.recv() => {
+                    if let Ok(sid) = result {
+                        if sid == session_id {
+                            idle_timeout.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub async fn session_load(&self, session_id: &str) -> Result<()> {
@@ -372,7 +488,7 @@ impl AcpClient {
         })
         .map_err(|_| anyhow!("ACP server '{}' is not connected", self.name))?;
 
-        tokio::time::timeout(self.timeout, response_rx)
+        tokio::time::timeout(self.idle_timeout, response_rx)
             .await
             .map_err(|_| anyhow!("ACP server '{}' timed out during session/load", self.name))?
             .map_err(|_| {
@@ -394,7 +510,7 @@ impl AcpClient {
         })
         .map_err(|_| anyhow!("ACP server '{}' is not connected", self.name))?;
 
-        tokio::time::timeout(self.timeout, response_rx)
+        tokio::time::timeout(self.idle_timeout, response_rx)
             .await
             .map_err(|_| anyhow!("ACP server '{}' timed out during session/cancel", self.name))?
             .map_err(|_| {
@@ -436,6 +552,7 @@ fn spawn_worker(
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
     chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
+    activity_tx: broadcast::Sender<String>,
 ) -> Result<(AcpWorkerHandle, oneshot::Receiver<Result<()>>)> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -468,6 +585,7 @@ fn spawn_worker(
                     ready_tx,
                     chunk_forwarder,
                     abort_rx,
+                    activity_tx,
                 )
                 .await
             });
@@ -491,6 +609,7 @@ async fn worker_main(
     ready_tx: oneshot::Sender<Result<()>>,
     chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
     mut abort_rx: oneshot::Receiver<()>,
+    activity_tx: broadcast::Sender<String>,
 ) -> Result<()> {
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
@@ -526,7 +645,7 @@ async fn worker_main(
         });
     }
 
-    let client = AcpNotificationClient::new(sessions.clone(), chunk_forwarder);
+    let client = AcpNotificationClient::new(sessions.clone(), chunk_forwarder, activity_tx);
     let (conn, handle_io) = acp::ClientSideConnection::new(
         client,
         TokioCompat::new(stdin),

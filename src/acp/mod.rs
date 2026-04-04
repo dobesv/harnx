@@ -304,7 +304,8 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             description: None,
-            timeout_secs: 300,
+            idle_timeout_secs: 300,
+            operation_timeout_secs: 3600,
         }
     }
 
@@ -318,7 +319,7 @@ env:
   KEY: value
 enabled: true
 description: A test agent
-timeout_secs: 42
+idle_timeout_secs: 42
 "#;
 
         let config: AcpServerConfig =
@@ -330,7 +331,8 @@ timeout_secs: 42
         assert_eq!(config.env.get("KEY").map(String::as_str), Some("value"));
         assert!(config.enabled);
         assert_eq!(config.description.as_deref(), Some("A test agent"));
-        assert_eq!(config.timeout_secs, 42);
+        assert_eq!(config.idle_timeout_secs, 42);
+        assert_eq!(config.operation_timeout_secs, 3600);
     }
 
     #[test]
@@ -349,7 +351,8 @@ command: agent
         assert!(config.env.is_empty());
         assert!(config.enabled);
         assert!(config.description.is_none());
-        assert_eq!(config.timeout_secs, 300);
+        assert_eq!(config.idle_timeout_secs, 300);
+        assert_eq!(config.operation_timeout_secs, 3600);
     }
 
     #[test]
