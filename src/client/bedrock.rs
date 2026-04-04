@@ -287,7 +287,7 @@ async fn chat_completions_streaming(
                             handler.set_usage(
                                 data["usage"]["inputTokens"].as_u64(),
                                 data["usage"]["outputTokens"].as_u64(),
-                                None,
+                                data["usage"]["cacheReadInputTokens"].as_u64(),
                             );
                         }
                         _ => {}
@@ -533,7 +533,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         id: None,
         input_tokens: data["usage"]["inputTokens"].as_u64(),
         output_tokens: data["usage"]["outputTokens"].as_u64(),
-        cached_tokens: None,
+        cached_tokens: data["usage"]["cacheReadInputTokens"].as_u64(),
     };
     Ok(output)
 }

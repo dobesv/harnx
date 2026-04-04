@@ -543,6 +543,17 @@ pub async fn create_openai_compatible_client_config(
     Ok(Some((model, clients)))
 }
 
+fn spinner_label(config: &GlobalConfig) -> String {
+    let config = config.read();
+    if let Some(session) = &config.session {
+        let su = session.completion_usage();
+        if !su.is_empty() {
+            return format!("Generating [{}]", su);
+        }
+    }
+    "Generating".to_string()
+}
+
 pub async fn call_chat_completions(
     input: &Input,
     print: bool,
@@ -550,19 +561,7 @@ pub async fn call_chat_completions(
     client: &dyn Client,
     abort_signal: AbortSignal,
 ) -> Result<(String, Vec<ToolResult>, CompletionTokenUsage)> {
-    let spinner_message = {
-        let config = client.global_config().read();
-        if let Some(session) = &config.session {
-            let su = session.completion_usage();
-            if !su.is_empty() {
-                format!("Generating [{}]", su)
-            } else {
-                "Generating".to_string()
-            }
-        } else {
-            "Generating".to_string()
-        }
-    };
+    let spinner_message = spinner_label(client.global_config());
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
         &spinner_message,
@@ -604,19 +603,7 @@ pub async fn call_chat_completions_streaming(
     client: &dyn Client,
     abort_signal: AbortSignal,
 ) -> Result<(String, Vec<ToolResult>, CompletionTokenUsage)> {
-    let spinner_message = {
-        let config = client.global_config().read();
-        if let Some(session) = &config.session {
-            let su = session.completion_usage();
-            if !su.is_empty() {
-                format!("Generating [{}]", su)
-            } else {
-                "Generating".to_string()
-            }
-        } else {
-            "Generating".to_string()
-        }
-    };
+    let spinner_message = spinner_label(client.global_config());
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
 

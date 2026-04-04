@@ -344,6 +344,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
     }
     if stream {
         body["stream"] = true.into();
+        body["stream_options"] = json!({"include_usage": true});
     }
     if let Some(functions) = functions {
         body["tools"] = functions

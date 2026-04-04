@@ -534,6 +534,7 @@ impl Session {
         self.compressed_messages.clear();
         self.data_urls.clear();
         self.autoname = None;
+        self.completion_usage = CompletionTokenUsage::default();
         self.dirty = true;
         self.update_tokens();
     }
