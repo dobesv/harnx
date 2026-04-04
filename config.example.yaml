@@ -243,26 +243,6 @@ clients:
     api_base: https://api.anthropic.com/v1            # Optional
     api_key: xxx
 
-  # Example: Anthropic OAuth API keys (sk-ant-oat-*)
-  # OAuth tokens require specific headers and a system prompt identity string.
-  # Patch header values support $VAR and ${VAR} interpolation:
-  #   Built-in: $HARNX_MODEL (model name), $HARNX_CLIENT (client name)
-  #   Environment: Any env var via $ENV_VAR or ${ENV_VAR}
-  #   Unresolved variables cause an error (not silently passed through)
-  # Note: Set 'user_agent: null' in global config when using custom user-agent in patch headers
-  # - type: claude
-  #   api_key: sk-ant-oat-xxxxx
-  #   system_prompt_prefix:
-  #     - "You are Claude Code, Anthropic's official CLI for Claude."
-  #   patch:
-  #     chat_completions:
-  #       '.*':
-  #         headers:
-  #           x-anthropic-billing-header: 'cc_version=2.1.80.$HARNX_MODEL; cc_entrypoint=cli; cch=00000;'
-  #           x-app: cli
-  #           user-agent: 'claude-cli/2.1.80 (external, cli)'
-  #           anthropic-beta: 'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05'
-
   # See https://docs.mistral.ai/
   - type: openai-compatible
     name: mistral
