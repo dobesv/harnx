@@ -1631,6 +1631,9 @@ impl Config {
         config.write().rag = agent.rag();
         config.write().agent = Some(agent);
         if let Some(session) = session {
+            // Exit any existing session (e.g. from repl_default_session) before
+            // switching to the agent's session.
+            config.write().exit_session()?;
             config.write().use_session(Some(&session))?;
         } else {
             config.write().init_agent_shared_variables()?;
