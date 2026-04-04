@@ -262,7 +262,7 @@ impl Default for Config {
             agent_default_session: None,
 
             save_session: None,
-            compress_threshold: 4000,
+            compress_threshold: 180000,
             summarize_prompt: None,
             summary_prompt: None,
 
