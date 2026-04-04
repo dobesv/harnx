@@ -1969,10 +1969,7 @@ impl Config {
         } else if cmd == ".drop" && args.len() == 2 && args[0] == "tool" {
             let agent = self.extract_agent();
             let current = agent.use_tools().unwrap_or_default();
-            values = current
-                .into_iter()
-                .map(|s| (s, None))
-                .collect();
+            values = current.into_iter().map(|s| (s, None)).collect();
         } else if cmd == ".mcp" && args.len() == 2 {
             let subcmd = args[0];
             if matches!(
@@ -2542,7 +2539,6 @@ impl Config {
                 declarations.push(crate::tool::trigger_agent_tool_declaration());
             }
         }
-
 
         let mut seen = HashSet::new();
         declarations.retain(|declaration| seen.insert(declaration.name.clone()));

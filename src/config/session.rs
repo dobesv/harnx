@@ -169,7 +169,10 @@ impl Session {
         }
         if let Some(use_tools) = self.use_tools() {
             data["use_tools"] = serde_json::Value::Array(
-                use_tools.into_iter().map(serde_json::Value::String).collect(),
+                use_tools
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
             );
         }
         if let Some(save_session) = self.save_session() {
