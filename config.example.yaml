@@ -92,6 +92,8 @@ acp_servers:                        # ACP agent sub-servers
   #     API_KEY: "your-api-key"
   #   enabled: true
   #   description: "Code writing agent"
+  #   idle_timeout_secs: 300       # Timeout if no activity is received (defaults to 300)
+  #   operation_timeout_secs: 3600 # Overall timeout for a single operation (defaults to 3600)
 
 # ---- default session ----
 # Session name templates with variable expansion.

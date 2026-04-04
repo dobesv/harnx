@@ -446,7 +446,7 @@ fn render_output_block(original: &str, truncated: &str) -> String {
         format!("output:\n{truncated}")
     } else {
         format!(
-            "output:\n{truncated}\n\n[output truncated from {} to {}]",
+            "output:\n{truncated}\n\n[output truncated from {} to {}. Use max_output_bytes, head_lines, or tail_lines to see more]",
             format_size(original.len()),
             format_size(truncated.len())
         )
