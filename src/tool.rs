@@ -100,7 +100,7 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                             _ => result.to_string(),
                         });
                     let truncated = truncate_output(&output_str, &opts);
-                    println!("{}", dimmed_text(&format!("<= {}", truncated)));
+                    println!("{}", dimmed_text(&truncated));
                 }
 
                 if result.is_null() {
@@ -331,8 +331,8 @@ impl ToolCall {
 
         if *IS_STDOUT_TERMINAL {
             let prompt = match &json_data {
-                Value::Null => format!("Call {}", self.name),
-                _ => format!("Call {} {}", self.name, json_data),
+                Value::Null => format!("🛠️  {}", self.name),
+                _ => format!("🛠️  {} {}", self.name, json_data),
             };
             println!("{}", dimmed_text(&prompt));
         }
