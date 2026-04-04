@@ -258,6 +258,18 @@ clients:
   - type: claude
     api_base: https://api.anthropic.com/v1            # Optional
     api_key: xxx
+    # Enable automatic prompt caching for Claude models.
+    # This adds "cache_control": {"type": "ephemeral"} at the top level of every
+    # Messages API request, which tells the API to automatically cache the prompt
+    # prefix up to the last cacheable block. Cached tokens are read at 10% of the
+    # normal input price on subsequent turns (within a 5-minute TTL window).
+    # See https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+    patch:
+      chat_completions:
+        '.*':
+          body:
+            cache_control:
+              type: ephemeral
 
   # See https://docs.mistral.ai/
   - type: openai-compatible
