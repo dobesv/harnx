@@ -873,18 +873,12 @@ Commands:
                         } else {
                             let mut conf = config.write();
                             let current = conf.extract_agent().use_tools().unwrap_or_default();
-                            let items: Vec<&str> = if current.is_empty() {
-                                vec![]
-                            } else {
-                                current.split(',').map(str::trim).collect()
-                            };
-                            if items.contains(&name) {
+                            if current.iter().any(|v| v == name) {
                                 println!("'{}' is already in use_tools", name);
                             } else {
-                                let mut new_items: Vec<String> =
-                                    items.iter().map(|s| s.to_string()).collect();
+                                let mut new_items = current;
                                 new_items.push(name.to_string());
-                                conf.set_use_tools(Some(new_items.join(",")));
+                                conf.set_use_tools(Some(new_items));
                                 println!("Added '{}' to use_tools", name);
                             }
                         }
@@ -900,20 +894,15 @@ Commands:
                     } else {
                         let mut conf = config.write();
                         let current = conf.extract_agent().use_tools().unwrap_or_default();
-                        let items: Vec<&str> = current
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|s: &&str| !s.is_empty())
-                            .collect();
-                        if !items.contains(&name) {
+                        if !current.iter().any(|v| v == name) {
                             println!("'{}' is not in use_tools", name);
                         } else {
-                            let remaining: Vec<&str> =
-                                items.into_iter().filter(|&i| i != name).collect();
+                            let remaining: Vec<String> =
+                                current.into_iter().filter(|i| i != name).collect();
                             let new_value = if remaining.is_empty() {
                                 None
                             } else {
-                                Some(remaining.join(","))
+                                Some(remaining)
                             };
                             conf.set_use_tools(new_value);
                             println!("Removed '{}' from use_tools", name);

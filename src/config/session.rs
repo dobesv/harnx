@@ -24,8 +24,12 @@ pub struct Session {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    use_tools: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_use_tools"
+    )]
+    use_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     save_session: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,7 +160,9 @@ impl Session {
             data["top_p"] = top_p.into();
         }
         if let Some(use_tools) = self.use_tools() {
-            data["use_tools"] = use_tools.into();
+            data["use_tools"] = serde_json::Value::Array(
+                use_tools.into_iter().map(serde_json::Value::String).collect(),
+            );
         }
         if let Some(save_session) = self.save_session() {
             data["save_session"] = save_session.into();
@@ -201,7 +207,7 @@ impl Session {
         }
 
         if let Some(use_tools) = self.use_tools() {
-            items.push(("use_tools", use_tools));
+            items.push(("use_tools", use_tools.join(",")));
         }
 
         if let Some(save_session) = self.save_session() {
@@ -580,7 +586,7 @@ impl Session {
         self.top_p
     }
 
-    pub fn use_tools(&self) -> Option<String> {
+    pub fn use_tools(&self) -> Option<Vec<String>> {
         self.use_tools.clone()
     }
 
@@ -607,7 +613,7 @@ impl Session {
         }
     }
 
-    pub fn set_use_tools(&mut self, value: Option<String>) {
+    pub fn set_use_tools(&mut self, value: Option<Vec<String>>) {
         if self.use_tools != value {
             self.use_tools = value;
             self.dirty = true;

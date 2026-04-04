@@ -5,7 +5,13 @@
 model: openai:gpt-4o             # Specify the LLM to use
 temperature: null                # Set default temperature parameter, range (0, 1)
 top_p: null                      # Set default top-p parameter
-use_tools: null                  # Which MCP tools to use (e.g. 'fs:all,bash_exec')
+use_tools:                       # Which MCP tools to use (e.g. 'fs:all,bash_exec')
+  - Bash
+  - Glob
+  - Grep
+  - ListDirectory
+  - Read
+  - Write
 description: ""                  # Short description of the agent
 version: ""                      # Agent version string
 agent_default_session: null      # Set a session to use when starting the agent

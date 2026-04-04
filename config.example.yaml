@@ -12,15 +12,17 @@ wrap: no                         # Controls text wrapping (no, auto, <max-width>
 wrap_code: false                 # Enables or disables wrapping of code blocks
 
 # ---- tool-use ----
-tool_use: true                   # Enables or disables tool use (Globally).
+tool_use: true                   # Set false to disable all tool use
 toolsets:
   fs:
-    - fs:read
-    - fs:write
-    - fs:search
-    - fs:find
-    - fs_write
-use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search')
+    - Read
+    - Write
+    - ListDirectory
+    - Grep
+    - Glob
+use_tools:                      # Which tools to use by default.
+  - Bash                        # Pick specific tool by name
+  - fs                          # Load all tools in fs toolset example above
 
 # ---- mcp servers ----
 # MCP (Model Context Protocol) servers provide external tools.

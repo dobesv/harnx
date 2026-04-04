@@ -131,6 +131,17 @@ fn parse_toolsets_json(value: &str) -> serde_json::Result<IndexMap<String, Vec<S
         .collect())
 }
 
+/// Deserializes `use_tools` accepting both a YAML list and a comma-separated string.
+fn deserialize_use_tools<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<ToolsetValue>::deserialize(deserializer)?;
+    Ok(value.map(normalize_toolset_value))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -153,7 +164,8 @@ pub struct Config {
     #[serde(alias = "mapping_tools")]
     #[serde(deserialize_with = "deserialize_toolsets")]
     pub toolsets: IndexMap<String, Vec<String>>,
-    pub use_tools: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_use_tools")]
+    pub use_tools: Option<Vec<String>>,
 
     pub repl_default_session: Option<String>,
     pub cmd_default_session: Option<String>,
@@ -604,7 +616,13 @@ impl Config {
             ("model", agent.model().id()),
             ("temperature", format_option_value(&agent.temperature())),
             ("top_p", format_option_value(&agent.top_p())),
-            ("use_tools", format_option_value(&agent.use_tools())),
+            (
+                "use_tools",
+                agent
+                    .use_tools()
+                    .map(|v| v.join(","))
+                    .unwrap_or_else(|| "null".into()),
+            ),
             (
                 "max_output_tokens",
                 agent
@@ -669,7 +687,18 @@ impl Config {
                 config.write().set_top_p(value);
             }
             "use_tools" => {
-                let value = parse_value(value)?;
+                let value: Option<Vec<String>> = if value == "null" {
+                    None
+                } else {
+                    Some(
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .collect(),
+                    )
+                };
                 config.write().set_use_tools(value);
             }
             "max_output_tokens" => {
@@ -814,7 +843,7 @@ impl Config {
         }
     }
 
-    pub fn set_use_tools(&mut self, value: Option<String>) {
+    pub fn set_use_tools(&mut self, value: Option<Vec<String>>) {
         if let Some(session) = self.session.as_mut() {
             session.set_use_tools(value);
         } else if let Some(agent) = self.agent.as_mut() {
@@ -830,18 +859,19 @@ impl Config {
             Some(v) => v,
             None => return HashSet::new(),
         };
-        if use_tools == "all" {
+        let use_tools_str = use_tools.join(",");
+        if use_tools.iter().any(|v| v == "all") {
             return self
                 .tool_declarations_for_use_tools(Some("all"))
                 .into_iter()
                 .map(|d| d.name)
                 .collect();
         }
-        let declarations = self.tool_declarations_for_use_tools(Some(&use_tools));
+        let declarations = self.tool_declarations_for_use_tools(Some(&use_tools_str));
         let declaration_names: HashSet<String> =
             declarations.iter().map(|d| d.name.clone()).collect();
         let mut names = HashSet::new();
-        for item in use_tools.split(',').map(str::trim) {
+        for item in use_tools.iter().map(|s| s.trim()) {
             if let Some(values) = self.toolsets.get(item) {
                 names.extend(
                     values
@@ -1711,15 +1741,15 @@ impl Config {
         let mut functions = vec![];
         if self.tool_use {
             if let Some(use_tools) = agent.use_tools() {
-                let declarations = self.tool_declarations_for_use_tools(Some(&use_tools));
+                let use_tools_str = use_tools.join(",");
+                let declarations = self.tool_declarations_for_use_tools(Some(&use_tools_str));
                 let mut tool_names: HashSet<String> = Default::default();
                 let declaration_names: HashSet<String> =
                     declarations.iter().map(|v| v.name.to_string()).collect();
-                if use_tools == "all" {
+                if use_tools.iter().any(|v| v == "all") {
                     tool_names.extend(declaration_names);
                 } else {
-                    for item in use_tools.split(',') {
-                        let item = item.trim();
+                    for item in use_tools.iter().map(|s| s.trim()) {
                         if let Some(values) = self.toolsets.get(item) {
                             tool_names.extend(
                                 values
@@ -1937,10 +1967,8 @@ impl Config {
             let agent = self.extract_agent();
             let current = agent.use_tools().unwrap_or_default();
             values = current
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| (s.to_string(), None))
+                .into_iter()
+                .map(|s| (s, None))
                 .collect();
         } else if cmd == ".mcp" && args.len() == 2 {
             let subcmd = args[0];
@@ -2384,8 +2412,18 @@ impl Config {
                 self.toolsets = v;
             }
         }
-        if let Some(v) = read_env_value::<String>(&get_env_name("use_tools")) {
-            self.use_tools = v;
+        if let Ok(v) = env::var(get_env_name("use_tools")) {
+            if v == "null" {
+                self.use_tools = None;
+            } else {
+                self.use_tools = Some(
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect(),
+                );
+            }
         }
 
         if let Some(v) = read_env_value::<String>(&get_env_name("repl_default_session")) {
@@ -2501,6 +2539,7 @@ impl Config {
                 declarations.push(crate::tool::trigger_agent_tool_declaration());
             }
         }
+
 
         let mut seen = HashSet::new();
         declarations.retain(|declaration| seen.insert(declaration.name.clone()));
