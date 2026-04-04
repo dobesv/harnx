@@ -23,7 +23,9 @@ Here's a complete example showing all available front-matter fields:
 model: openai:gpt-4o
 temperature: 0
 top_p: 0.9
-use_tools: fs:all,bash_exec
+use_tools:
+  - fs:all
+  - bash_exec
 description: A helpful coding assistant
 version: "1.0"
 agent_default_session: default
@@ -69,7 +71,7 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 | `model` | `string` | global default | LLM model ID (e.g. `openai:gpt-4o`, `claude:claude-3-5-sonnet`). If omitted, uses the globally configured model. |
 | `temperature` | `float` | global default | Controls randomness (0 = deterministic, 1 = creative). Inherited from global config when `model` is omitted. |
 | `top_p` | `float` | global default | Nucleus sampling parameter. Alternative to temperature. Inherited from global config when `model` is omitted. |
-| `use_tools` | `string` | none | Comma-separated tool specifiers. See [Tools](#tools). |
+| `use_tools` | `list` | none | YAML list of tool specifiers. Also accepts a comma-separated string for backward compatibility. See [Tools](#tools). |
 | `description` | `string` | `""` | Short description shown in agent listings. |
 | `version` | `string` | `""` | Version identifier for the agent. |
 | `variables` | `list` | `[]` | Variables prompted on first use. See [Variables](#variables). |
@@ -174,7 +176,7 @@ Both the body and `instructions` support `{{variable}}` and `{{__builtin__}}` in
 
 ## Tools
 
-The `use_tools` field controls which MCP tools the agent can access. Tools are specified as a comma-separated string.
+The `use_tools` field controls which MCP tools the agent can access. Tools are specified as a YAML list (a comma-separated string is also accepted for backward compatibility).
 
 ### Syntax
 
@@ -189,16 +191,24 @@ The `use_tools` field controls which MCP tools the agent can access. Tools are s
 
 ```yaml
 # Single tools
-use_tools: web_search,execute_command
+use_tools:
+  - web_search
+  - execute_command
 
 # All tools from a server
-use_tools: fs:all,git:all
+use_tools:
+  - fs:all
+  - git:all
 
 # Everything
-use_tools: all
+use_tools:
+  - all
 
 # Mix of patterns
-use_tools: fs:all,web_search,my_toolset
+use_tools:
+  - fs:all
+  - web_search
+  - my_toolset
 ```
 
 When tools are enabled, their declarations are injected into the system prompt as a numbered list appended after the prompt body.
@@ -323,7 +333,9 @@ An agent with access to filesystem and shell tools:
 ```markdown
 ---
 model: claude:claude-3-5-sonnet
-use_tools: fs:all,bash_exec
+use_tools:
+  - fs:all
+  - bash_exec
 description: Coding assistant with file and shell access
 ---
 You are an expert software engineer. You can read and write files,

@@ -36,7 +36,7 @@ use std::{env, process};
 
 const MENU_NAME: &str = "completion_menu";
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -88,6 +88,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 36]> = LazyLock::new(|| {
             ".empty session",
             "Clear session messages",
             AssertState::True(StateFlags::SESSION),
+        ),
+        ReplCommand::new(
+            ".reset repl",
+            "Reset session to initial state (re-expands variables)",
+            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
         ),
         ReplCommand::new(
             ".compress session",
@@ -634,6 +639,14 @@ pub async fn run_repl_command(
                     println!(r#"Usage: .empty session"#)
                 }
             },
+            ".reset" => match args {
+                Some("repl") => {
+                    config.write().reset_session()?;
+                }
+                _ => {
+                    println!(r#"Usage: .reset repl"#)
+                }
+            },
             ".rebuild" => match args {
                 Some("rag") => {
                     Config::rebuild_rag(config, abort_signal.clone()).await?;
@@ -865,18 +878,12 @@ Commands:
                         } else {
                             let mut conf = config.write();
                             let current = conf.extract_agent().use_tools().unwrap_or_default();
-                            let items: Vec<&str> = if current.is_empty() {
-                                vec![]
-                            } else {
-                                current.split(',').map(str::trim).collect()
-                            };
-                            if items.contains(&name) {
+                            if current.iter().any(|v| v == name) {
                                 println!("'{}' is already in use_tools", name);
                             } else {
-                                let mut new_items: Vec<String> =
-                                    items.iter().map(|s| s.to_string()).collect();
+                                let mut new_items = current;
                                 new_items.push(name.to_string());
-                                conf.set_use_tools(Some(new_items.join(",")));
+                                conf.set_use_tools(Some(new_items));
                                 println!("Added '{}' to use_tools", name);
                             }
                         }
@@ -892,20 +899,15 @@ Commands:
                     } else {
                         let mut conf = config.write();
                         let current = conf.extract_agent().use_tools().unwrap_or_default();
-                        let items: Vec<&str> = current
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|s: &&str| !s.is_empty())
-                            .collect();
-                        if !items.contains(&name) {
+                        if !current.iter().any(|v| v == name) {
                             println!("'{}' is not in use_tools", name);
                         } else {
-                            let remaining: Vec<&str> =
-                                items.into_iter().filter(|&i| i != name).collect();
+                            let remaining: Vec<String> =
+                                current.into_iter().filter(|i| i != name).collect();
                             let new_value = if remaining.is_empty() {
                                 None
                             } else {
-                                Some(remaining.join(","))
+                                Some(remaining)
                             };
                             conf.set_use_tools(new_value);
                             println!("Removed '{}' from use_tools", name);
@@ -1118,6 +1120,7 @@ async fn ask_inner(
                     Some(persistent_manager),
                 )
                 .await;
+                let _ = config.write().after_chat_completion(&input, "", &[]);
                 return Err(err);
             }
         }
@@ -1140,6 +1143,7 @@ async fn ask_inner(
                     Some(persistent_manager),
                 )
                 .await;
+                let _ = config.write().after_chat_completion(&input, "", &[]);
                 return Err(err);
             }
         }

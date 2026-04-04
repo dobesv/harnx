@@ -7,6 +7,7 @@ mod loader;
 mod path;
 mod render_prompt;
 mod request;
+pub mod session_name;
 mod spinner;
 mod variables;
 

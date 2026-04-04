@@ -50,8 +50,12 @@ pub struct Agent {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    use_tools: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_use_tools"
+    )]
+    use_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "String::is_empty")]
     description: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -376,7 +380,7 @@ impl Agent {
         self.model_id.as_deref()
     }
 
-    pub fn use_tools(&self) -> Option<String> {
+    pub fn use_tools(&self) -> Option<Vec<String>> {
         self.use_tools.clone()
     }
 
@@ -401,7 +405,7 @@ impl Agent {
         self.top_p = value;
     }
 
-    pub fn set_use_tools(&mut self, value: Option<String>) {
+    pub fn set_use_tools(&mut self, value: Option<Vec<String>>) {
         self.use_tools = value;
     }
 
@@ -552,8 +556,12 @@ struct AgentFrontMatter {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    use_tools: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::deserialize_use_tools"
+    )]
+    use_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "String::is_empty")]
     description: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -765,7 +773,10 @@ mod tests {
         assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
         assert_eq!(agent.temperature(), Some(0.7));
         assert_eq!(agent.top_p(), Some(0.9));
-        assert_eq!(agent.use_tools(), Some("fs,web_search".to_string()));
+        assert_eq!(
+            agent.use_tools(),
+            Some(vec!["fs".to_string(), "web_search".to_string()])
+        );
         assert!(agent
             .interpolated_instructions()
             .contains("You are a helpful test agent"));
@@ -830,7 +841,10 @@ mod tests {
     fn test_agent_from_markdown_with_use_tools() {
         let content = "---\nuse_tools: fs:all,bash_exec\n---\nHelp with files.";
         let agent = Agent::from_markdown("tools-agent", content);
-        assert_eq!(agent.use_tools(), Some("fs:all,bash_exec".to_string()));
+        assert_eq!(
+            agent.use_tools(),
+            Some(vec!["fs:all".to_string(), "bash_exec".to_string()])
+        );
     }
 
     #[test]

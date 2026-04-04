@@ -12,15 +12,17 @@ wrap: no                         # Controls text wrapping (no, auto, <max-width>
 wrap_code: false                 # Enables or disables wrapping of code blocks
 
 # ---- tool-use ----
-tool_use: true                   # Enables or disables tool use (Globally).
+tool_use: true                   # Set false to disable all tool use
 toolsets:
   fs:
-    - fs:read
-    - fs:write
-    - fs:search
-    - fs:find
-    - fs_write
-use_tools: null                  # Which tools to use by default. (e.g. 'fs,web_search')
+    - Read
+    - Write
+    - ListDirectory
+    - Grep
+    - Glob
+use_tools:                      # Which tools to use by default.
+  - Bash                        # Pick specific tool by name
+  - fs                          # Load all tools in fs toolset example above
 
 # ---- mcp servers ----
 # MCP (Model Context Protocol) servers provide external tools.
@@ -92,15 +94,27 @@ acp_servers:                        # ACP agent sub-servers
   #   description: "Code writing agent"
 
 # ---- default session ----
-repl_default_session: null        # Set a default role or session for REPL mode (e.g. role:<name>, session:<name>, <session>:<role>)
-cmd_default_session: null         # Set a default role or session for CMD mode (e.g. role:<name>, session:<name>, <session>:<role>)
-agent_default_session: null       # Set a session to use when starting a agent (e.g. temp, default)
+# Session name templates with variable expansion.
+# Supported variables: $VAR or ${VAR} syntax.
+#   Special computed variables:
+#     $GIT_BRANCH  - current git branch (via `git rev-parse --abbrev-ref HEAD`)
+#     $GIT_PATH    - git-relative path of cwd (via `git rev-parse --show-prefix`, trailing `/` stripped)
+#     $AGENT_NAME  - name of the active agent (available in agent_default_session and agent front-matter)
+#   All other variables are resolved from environment (e.g. $USER, $PWD, $HOME).
+#   Unresolved variables expand to empty string.
+# Sanitization: `/` → `-`, space → `_`, leading/trailing `-` and `_` stripped.
+# Examples: "project-$GIT_BRANCH", "$USER-session", "myproject-$GIT_BRANCH-$GIT_PATH"
+#           "$AGENT_NAME-$GIT_BRANCH" (agent context: "coder-main")
+# Use `.reset` in REPL to re-expand variables after switching branches.
+repl_default_session: null        # Session name template for REPL mode
+cmd_default_session: null         # Session name template for CMD mode
+agent_default_session: null       # Session name template when starting an agent (supports $AGENT_NAME)
 
 # ---- session ----
 # Controls the persistence of the session. if true, auto save; if false, not save; if null, asking the user
 save_session: null
 # Compress session when token count reaches or exceeds this threshold
-compress_threshold: 4000
+compress_threshold: 150000
 # Text prompt used for creating a concise summary of session message
 summarize_prompt: 'Summarize the discussion briefly in 200 words or less to use as a prompt for future context.'
 # Text prompt used for including the summary of the entire session

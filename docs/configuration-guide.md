@@ -47,7 +47,7 @@ Harnx supports tool use (renamed from "Function calling").
 
 - **tool_use**: Enable or disable tool use globally. (`true`/`false`)
 - **toolsets**: Define named groups of tools for use with `use_tools` or `-t/--tool`.
-- **use_tools**: Specify which tools to make available.
+- **use_tools**: Specify which tools to make available (YAML list or comma-separated string).
 
 Visit [https://github.com/sigoden/llm-functions](https://github.com/sigoden/llm-functions) for setup instructions and available tools.
 
@@ -107,7 +107,7 @@ Agent config files support the following properties:
 - **model**: Override the default model for this agent.
 - **temperature**: Override the default temperature for this agent.
 - **top_p**: Override the default top_p for this agent.
-- **use_tools**: Specify which tools this agent can use.
+- **use_tools**: Specify which tools this agent can use (YAML list or comma-separated string).
 - **agent_default_session**: Session to use when starting this agent.
 - **instructions**: System prompt / instructions for the agent.
 - **variables**: Variables that can be interpolated into the agent's prompts.

@@ -131,6 +131,17 @@ fn parse_toolsets_json(value: &str) -> serde_json::Result<IndexMap<String, Vec<S
         .collect())
 }
 
+/// Deserializes `use_tools` accepting both a YAML list and a comma-separated string.
+fn deserialize_use_tools<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<ToolsetValue>::deserialize(deserializer)?;
+    Ok(value.map(normalize_toolset_value))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -153,7 +164,8 @@ pub struct Config {
     #[serde(alias = "mapping_tools")]
     #[serde(deserialize_with = "deserialize_toolsets")]
     pub toolsets: IndexMap<String, Vec<String>>,
-    pub use_tools: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_use_tools")]
+    pub use_tools: Option<Vec<String>>,
 
     pub repl_default_session: Option<String>,
     pub cmd_default_session: Option<String>,
@@ -250,7 +262,7 @@ impl Default for Config {
             agent_default_session: None,
 
             save_session: None,
-            compress_threshold: 4000,
+            compress_threshold: 180000,
             summarize_prompt: None,
             summary_prompt: None,
 
@@ -604,7 +616,13 @@ impl Config {
             ("model", agent.model().id()),
             ("temperature", format_option_value(&agent.temperature())),
             ("top_p", format_option_value(&agent.top_p())),
-            ("use_tools", format_option_value(&agent.use_tools())),
+            (
+                "use_tools",
+                agent
+                    .use_tools()
+                    .map(|v| v.join(","))
+                    .unwrap_or_else(|| "null".into()),
+            ),
             (
                 "max_output_tokens",
                 agent
@@ -669,7 +687,18 @@ impl Config {
                 config.write().set_top_p(value);
             }
             "use_tools" => {
-                let value = parse_value(value)?;
+                let value: Option<Vec<String>> = if value == "null" {
+                    None
+                } else {
+                    Some(
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .collect(),
+                    )
+                };
                 config.write().set_use_tools(value);
             }
             "max_output_tokens" => {
@@ -814,7 +843,7 @@ impl Config {
         }
     }
 
-    pub fn set_use_tools(&mut self, value: Option<String>) {
+    pub fn set_use_tools(&mut self, value: Option<Vec<String>>) {
         if let Some(session) = self.session.as_mut() {
             session.set_use_tools(value);
         } else if let Some(agent) = self.agent.as_mut() {
@@ -830,18 +859,19 @@ impl Config {
             Some(v) => v,
             None => return HashSet::new(),
         };
-        if use_tools == "all" {
+        let use_tools_str = use_tools.join(",");
+        if use_tools.iter().any(|v| v == "all") {
             return self
                 .tool_declarations_for_use_tools(Some("all"))
                 .into_iter()
                 .map(|d| d.name)
                 .collect();
         }
-        let declarations = self.tool_declarations_for_use_tools(Some(&use_tools));
+        let declarations = self.tool_declarations_for_use_tools(Some(&use_tools_str));
         let declaration_names: HashSet<String> =
             declarations.iter().map(|d| d.name.clone()).collect();
         let mut names = HashSet::new();
-        for item in use_tools.split(',').map(str::trim) {
+        for item in use_tools.iter().map(|s| s.trim()) {
             if let Some(values) = self.toolsets.get(item) {
                 names.extend(
                     values
@@ -1235,6 +1265,55 @@ impl Config {
         Ok(())
     }
 
+    pub fn reset_session(&mut self) -> Result<()> {
+        // Capture current session name before exiting
+        let old_session_name = self.session.as_ref().map(|s| s.name().to_string());
+
+        // Discard the current session without saving
+        if let Some(session) = self.session.take() {
+            drop(session);
+            self.discontinuous_last_message();
+        }
+        if let Some(agent) = self.agent.as_mut() {
+            agent.exit_session();
+        }
+
+        // Re-create a session with freshly-expanded variables
+        let new_session_name = if let Some(agent) = &self.agent {
+            let extra_vars = std::collections::HashMap::from([("AGENT_NAME", agent.name())]);
+            // Per-agent front-matter first, then global config fallback
+            let template = agent
+                .agent_default_session()
+                .map(|s| s.to_string())
+                .or_else(|| self.agent_default_session.clone());
+            template
+                .map(|v| {
+                    session_name::sanitize_session_name(
+                        &session_name::expand_session_variables_with(&v, &extra_vars),
+                    )
+                })
+                .filter(|v| !v.is_empty())
+        } else {
+            let default_session = match self.working_mode {
+                WorkingMode::Repl => self.repl_default_session.as_ref(),
+                WorkingMode::Cmd => self.cmd_default_session.as_ref(),
+                WorkingMode::Serve | WorkingMode::Acp(_) => None,
+            };
+            default_session
+                .filter(|v| !v.is_empty())
+                .map(|v| {
+                    session_name::sanitize_session_name(&session_name::expand_session_variables(v))
+                })
+                .filter(|v| !v.is_empty())
+        };
+
+        let session_name = new_session_name.or(old_session_name);
+        if let Some(name) = session_name {
+            self.use_session(Some(&name))?;
+        }
+        Ok(())
+    }
+
     pub fn set_save_session_this_time(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             session.set_save_session_this_time();
@@ -1529,16 +1608,32 @@ impl Config {
             bail!("Already in a agent, please run '.exit agent' first to exit the current agent.");
         }
         let agent = Agent::init(config, agent_name, abort_signal).await?;
+        let extra_vars = std::collections::HashMap::from([("AGENT_NAME", agent.name())]);
+        let global_agent_session = config.read().agent_default_session.clone();
         let session = session_name.map(|v| v.to_string()).or_else(|| {
             if config.read().macro_flag {
                 None
             } else {
-                agent.agent_default_session().map(|v| v.to_string())
+                // Per-agent front-matter first, then global config fallback
+                let template = agent
+                    .agent_default_session()
+                    .map(|s| s.to_string())
+                    .or_else(|| global_agent_session.clone());
+                template
+                    .map(|v| {
+                        session_name::sanitize_session_name(
+                            &session_name::expand_session_variables_with(&v, &extra_vars),
+                        )
+                    })
+                    .filter(|v| !v.is_empty())
             }
         });
         config.write().rag = agent.rag();
         config.write().agent = Some(agent);
         if let Some(session) = session {
+            // Exit any existing session (e.g. from repl_default_session) before
+            // switching to the agent's session.
+            config.write().exit_session()?;
             config.write().use_session(Some(&session))?;
         } else {
             config.write().init_agent_shared_variables()?;
@@ -1636,23 +1731,11 @@ impl Config {
             }
             None => return Ok(()),
         };
-        let err_msg = || format!("Invalid default session '{default_session}'");
-        match default_session.split_once(':') {
-            Some(("role", name)) => {
-                self.use_agent_by_name(name).with_context(err_msg)?;
-            }
-            Some(("session", name)) => {
-                self.use_session(Some(name)).with_context(err_msg)?;
-            }
-            Some((session_name, agent_name)) => {
-                self.use_session(Some(session_name)).with_context(err_msg)?;
-                if let Some(true) = self.session.as_ref().map(|v| v.is_empty()) {
-                    self.use_agent_by_name(agent_name).with_context(err_msg)?;
-                }
-            }
-            _ => {
-                bail!("{}", err_msg())
-            }
+        let session_name = session_name::sanitize_session_name(
+            &session_name::expand_session_variables(&default_session),
+        );
+        if !session_name.is_empty() {
+            self.use_session(Some(&session_name))?;
         }
         Ok(())
     }
@@ -1661,15 +1744,15 @@ impl Config {
         let mut functions = vec![];
         if self.tool_use {
             if let Some(use_tools) = agent.use_tools() {
-                let declarations = self.tool_declarations_for_use_tools(Some(&use_tools));
+                let use_tools_str = use_tools.join(",");
+                let declarations = self.tool_declarations_for_use_tools(Some(&use_tools_str));
                 let mut tool_names: HashSet<String> = Default::default();
                 let declaration_names: HashSet<String> =
                     declarations.iter().map(|v| v.name.to_string()).collect();
-                if use_tools == "all" {
+                if use_tools.iter().any(|v| v == "all") {
                     tool_names.extend(declaration_names);
                 } else {
-                    for item in use_tools.split(',') {
-                        let item = item.trim();
+                    for item in use_tools.iter().map(|s| s.trim()) {
                         if let Some(values) = self.toolsets.get(item) {
                             tool_names.extend(
                                 values
@@ -1886,12 +1969,7 @@ impl Config {
         } else if cmd == ".drop" && args.len() == 2 && args[0] == "tool" {
             let agent = self.extract_agent();
             let current = agent.use_tools().unwrap_or_default();
-            values = current
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| (s.to_string(), None))
-                .collect();
+            values = current.into_iter().map(|s| (s, None)).collect();
         } else if cmd == ".mcp" && args.len() == 2 {
             let subcmd = args[0];
             if matches!(
@@ -2334,8 +2412,18 @@ impl Config {
                 self.toolsets = v;
             }
         }
-        if let Some(v) = read_env_value::<String>(&get_env_name("use_tools")) {
-            self.use_tools = v;
+        if let Ok(v) = env::var(get_env_name("use_tools")) {
+            if v == "null" {
+                self.use_tools = None;
+            } else {
+                self.use_tools = Some(
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect(),
+                );
+            }
         }
 
         if let Some(v) = read_env_value::<String>(&get_env_name("repl_default_session")) {
