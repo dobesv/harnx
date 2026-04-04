@@ -90,7 +90,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
             AssertState::True(StateFlags::SESSION),
         ),
         ReplCommand::new(
-            ".reset",
+            ".reset repl",
             "Reset session to initial state (re-expands variables)",
             AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
         ),
@@ -639,9 +639,14 @@ pub async fn run_repl_command(
                     println!(r#"Usage: .empty session"#)
                 }
             },
-            ".reset" => {
-                config.write().reset_session()?;
-            }
+            ".reset" => match args {
+                Some("repl") => {
+                    config.write().reset_session()?;
+                }
+                _ => {
+                    println!(r#"Usage: .reset repl"#)
+                }
+            },
             ".rebuild" => match args {
                 Some("rag") => {
                     Config::rebuild_rag(config, abort_signal.clone()).await?;
