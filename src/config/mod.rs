@@ -2189,7 +2189,11 @@ impl Config {
         input: &Input,
         output: &str,
         tool_results: &[ToolResult],
+        usage: &crate::client::CompletionTokenUsage,
     ) -> Result<()> {
+        if let Some(session) = &mut self.session {
+            session.add_completion_usage(usage);
+        }
         if !tool_results.is_empty() {
             return Ok(());
         }

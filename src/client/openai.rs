@@ -193,6 +193,20 @@ pub async fn openai_chat_completions_streaming(
                 function_id = id.to_string();
             }
         }
+        // Only capture usage from the final usage-only chunk (where choices is empty/absent).
+        // Some providers send partial usage in intermediate chunks which would give wrong values.
+        if let Some(usage) = data.get("usage") {
+            let choices_empty = data["choices"]
+                .as_array()
+                .is_none_or(|c| c.is_empty());
+            if choices_empty {
+                handler.set_usage(
+                    usage["prompt_tokens"].as_u64(),
+                    usage["completion_tokens"].as_u64(),
+                    usage["prompt_tokens_details"]["cached_tokens"].as_u64(),
+                );
+            }
+        }
         Ok(false)
     };
 
@@ -330,6 +344,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
     }
     if stream {
         body["stream"] = true.into();
+        body["stream_options"] = json!({"include_usage": true});
     }
     if let Some(functions) = functions {
         body["tools"] = functions
@@ -397,6 +412,7 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["prompt_tokens"].as_u64(),
         output_tokens: data["usage"]["completion_tokens"].as_u64(),
+        cached_tokens: data["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64(),
     };
     Ok(output)
 }

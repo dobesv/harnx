@@ -1103,7 +1103,7 @@ async fn ask_inner(
             env::current_dir().unwrap_or_default(),
         )
     };
-    let (output, tool_results) = if input.stream() {
+    let (output, tool_results, usage) = if input.stream() {
         match call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await {
             Ok(result) => result,
             Err(err) => {
@@ -1120,7 +1120,9 @@ async fn ask_inner(
                     Some(persistent_manager),
                 )
                 .await;
-                let _ = config.write().after_chat_completion(&input, "", &[]);
+                let _ = config
+                    .write()
+                    .after_chat_completion(&input, "", &[], &Default::default());
                 return Err(err);
             }
         }
@@ -1143,14 +1145,27 @@ async fn ask_inner(
                     Some(persistent_manager),
                 )
                 .await;
-                let _ = config.write().after_chat_completion(&input, "", &[]);
+                let _ = config
+                    .write()
+                    .after_chat_completion(&input, "", &[], &Default::default());
                 return Err(err);
             }
         }
     };
     config
         .write()
-        .after_chat_completion(&input, &output, &tool_results)?;
+        .after_chat_completion(&input, &output, &tool_results, &usage)?;
+    if tool_results.is_empty() {
+        let session_usage = config
+            .read()
+            .session
+            .as_ref()
+            .map(|s| s.completion_usage().clone());
+        let display_usage = session_usage.as_ref().unwrap_or(&usage);
+        if !display_usage.is_empty() {
+            eprintln!("{}", dimmed_text(&format!("[{}]", display_usage)));
+        }
+    }
     let stop_outcome = if tool_results.is_empty() {
         let event = HookEvent::Stop {
             stop_hook_active: true,

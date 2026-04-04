@@ -1,4 +1,4 @@
-use super::{catch_error, ToolCall};
+use super::{catch_error, CompletionTokenUsage, ToolCall};
 use crate::utils::AbortSignal;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -13,6 +13,9 @@ pub struct SseHandler {
     abort_signal: AbortSignal,
     buffer: String,
     tool_calls: Vec<ToolCall>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
 }
 
 impl SseHandler {
@@ -22,6 +25,9 @@ impl SseHandler {
             abort_signal,
             buffer: String::new(),
             tool_calls: Vec::new(),
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
         }
     }
 
@@ -69,11 +75,27 @@ impl SseHandler {
         &self.tool_calls
     }
 
-    pub fn take(self) -> (String, Vec<ToolCall>) {
-        let Self {
-            buffer, tool_calls, ..
-        } = self;
-        (buffer, tool_calls)
+    pub fn set_usage(
+        &mut self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cached_tokens: Option<u64>,
+    ) {
+        if input_tokens.is_some() {
+            self.input_tokens = input_tokens;
+        }
+        if output_tokens.is_some() {
+            self.output_tokens = output_tokens;
+        }
+        if cached_tokens.is_some() {
+            self.cached_tokens = cached_tokens;
+        }
+    }
+
+    pub fn take(self) -> (String, Vec<ToolCall>, CompletionTokenUsage) {
+        let usage =
+            CompletionTokenUsage::new(self.input_tokens, self.output_tokens, self.cached_tokens);
+        (self.buffer, self.tool_calls, usage)
     }
 }
 

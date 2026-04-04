@@ -382,6 +382,7 @@ pub struct ChatCompletionsOutput {
     pub id: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
 }
 
 impl ChatCompletionsOutput {
@@ -390,6 +391,49 @@ impl ChatCompletionsOutput {
             text: text.to_string(),
             ..Default::default()
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompletionTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+impl CompletionTokenUsage {
+    pub fn new(input: Option<u64>, output: Option<u64>, cached: Option<u64>) -> Self {
+        Self {
+            input_tokens: input.unwrap_or(0),
+            output_tokens: output.unwrap_or(0),
+            cached_tokens: cached.unwrap_or(0),
+        }
+    }
+
+    pub fn accumulate(&mut self, other: &CompletionTokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cached_tokens += other.cached_tokens;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0
+    }
+}
+
+impl std::fmt::Display for CompletionTokenUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = vec![];
+        if self.input_tokens > 0 {
+            parts.push(format!("📥 {}", self.input_tokens));
+        }
+        if self.output_tokens > 0 {
+            parts.push(format!("📤 {}", self.output_tokens));
+        }
+        if self.cached_tokens > 0 {
+            parts.push(format!("💾 {}", self.cached_tokens));
+        }
+        write!(f, "{}", parts.join("  "))
     }
 }
 
@@ -499,16 +543,28 @@ pub async fn create_openai_compatible_client_config(
     Ok(Some((model, clients)))
 }
 
+fn spinner_label(config: &GlobalConfig) -> String {
+    let config = config.read();
+    if let Some(session) = &config.session {
+        let su = session.completion_usage();
+        if !su.is_empty() {
+            return format!("Generating [{}]", su);
+        }
+    }
+    "Generating".to_string()
+}
+
 pub async fn call_chat_completions(
     input: &Input,
     print: bool,
     extract_code: bool,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>)> {
+) -> Result<(String, Vec<ToolResult>, CompletionTokenUsage)> {
+    let spinner_message = spinner_label(client.global_config());
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
-        "Generating",
+        &spinner_message,
         abort_signal,
     )
     .await;
@@ -518,8 +574,12 @@ pub async fn call_chat_completions(
             let ChatCompletionsOutput {
                 mut text,
                 tool_calls,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
                 ..
             } = ret;
+            let usage = CompletionTokenUsage::new(input_tokens, output_tokens, cached_tokens);
             if !text.is_empty() {
                 if extract_code {
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
@@ -528,7 +588,11 @@ pub async fn call_chat_completions(
                     client.global_config().read().print_markdown(&text)?;
                 }
             }
-            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
+            Ok((
+                text,
+                eval_tool_calls(client.global_config(), tool_calls)?,
+                usage,
+            ))
         }
         Err(err) => Err(err),
     }
@@ -538,25 +602,31 @@ pub async fn call_chat_completions_streaming(
     input: &Input,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>)> {
+) -> Result<(String, Vec<ToolResult>, CompletionTokenUsage)> {
+    let spinner_message = spinner_label(client.global_config());
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
 
     let (send_ret, render_ret) = tokio::join!(
         client.chat_completions_streaming(input, &mut handler),
-        render_stream(rx, client.global_config(), abort_signal.clone()),
+        render_stream(
+            rx,
+            client.global_config(),
+            abort_signal.clone(),
+            &spinner_message
+        ),
     );
 
     let aborted = handler.abort().aborted();
 
     let _ = render_ret;
 
-    let (text, tool_calls) = handler.take();
+    let (text, tool_calls, usage) = handler.take();
     if aborted {
         if !text.is_empty() {
             println!();
         }
-        return Ok((text, vec![]));
+        return Ok((text, vec![], usage));
     }
 
     match send_ret {
@@ -564,7 +634,11 @@ pub async fn call_chat_completions_streaming(
             if !text.is_empty() && !text.ends_with('\n') {
                 println!();
             }
-            Ok((text, eval_tool_calls(client.global_config(), tool_calls)?))
+            Ok((
+                text,
+                eval_tool_calls(client.global_config(), tool_calls)?,
+                usage,
+            ))
         }
         Err(err) => {
             if !text.is_empty() {
@@ -573,7 +647,7 @@ pub async fn call_chat_completions_streaming(
             if text.is_empty() {
                 Err(err)
             } else {
-                Ok((text, vec![]))
+                Ok((text, vec![], usage))
             }
         }
     }

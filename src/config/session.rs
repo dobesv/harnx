@@ -1,7 +1,7 @@
 use super::input::*;
 use super::*;
 
-use crate::client::{Message, MessageContent, MessageRole};
+use crate::client::{CompletionTokenUsage, Message, MessageContent, MessageRole};
 use crate::render::MarkdownRender;
 
 use anyhow::{bail, Context, Result};
@@ -66,6 +66,8 @@ pub struct Session {
     autoname: Option<AutoName>,
     #[serde(skip)]
     tokens: usize,
+    #[serde(skip)]
+    completion_usage: CompletionTokenUsage,
 }
 
 impl Session {
@@ -146,6 +148,14 @@ impl Session {
 
     pub fn update_tokens(&mut self) {
         self.tokens = self.model().total_tokens(&self.messages);
+    }
+
+    pub fn completion_usage(&self) -> &CompletionTokenUsage {
+        &self.completion_usage
+    }
+
+    pub fn add_completion_usage(&mut self, usage: &CompletionTokenUsage) {
+        self.completion_usage.accumulate(usage);
     }
 
     pub fn has_user_messages(&self) -> bool {
@@ -524,6 +534,7 @@ impl Session {
         self.compressed_messages.clear();
         self.data_urls.clear();
         self.autoname = None;
+        self.completion_usage = CompletionTokenUsage::default();
         self.dirty = true;
         self.update_tokens();
     }

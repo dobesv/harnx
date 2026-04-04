@@ -230,6 +230,11 @@ pub async fn gemini_chat_completions_streaming(
             {
                 bail!("Blocked due to safety")
             }
+            handler.set_usage(
+                data["usageMetadata"]["promptTokenCount"].as_u64(),
+                data["usageMetadata"]["candidatesTokenCount"].as_u64(),
+                data["usageMetadata"]["cachedContentTokenCount"].as_u64(),
+            );
 
             Ok(())
         };
@@ -304,6 +309,7 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
         id: None,
         input_tokens: data["usageMetadata"]["promptTokenCount"].as_u64(),
         output_tokens: data["usageMetadata"]["candidatesTokenCount"].as_u64(),
+        cached_tokens: data["usageMetadata"]["cachedContentTokenCount"].as_u64(),
     };
     Ok(output)
 }
