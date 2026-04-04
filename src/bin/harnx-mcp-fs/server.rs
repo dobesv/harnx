@@ -9,7 +9,7 @@ use harnx::mcp_safety::{
 use fancy_regex::Regex;
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
@@ -407,7 +407,16 @@ impl FsServer {
             let _ = write!(output, "\n\n[{}]", notices.join(". "));
         }
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        let summary = format!(
+            "Read {} ({} lines, {})",
+            params.path,
+            total_matching_lines,
+            format_size(raw_output.len())
+        );
+        Ok(CallToolResult::success(vec![
+            Content::text(output).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     async fn write_file_impl(&self, params: WriteFileParams) -> Result<CallToolResult, ErrorData> {
@@ -546,6 +555,7 @@ impl FsServer {
             ))]));
         }
 
+        let entry_count = entries.len();
         let mut output = entries.join("\n");
         if limit_reached {
             let _ = write!(
@@ -562,7 +572,11 @@ impl FsServer {
             );
         }
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        let summary = format!("Listed {} entries in {}", entry_count, params.path);
+        Ok(CallToolResult::success(vec![
+            Content::text(output).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     async fn search_files_impl(
@@ -614,6 +628,7 @@ impl FsServer {
 
         let limit_reached = results.len() > max_results;
         results.truncate(max_results);
+        let match_count = results.len();
 
         let raw_output = results.join("\n");
         let truncated_output = truncate_output(&raw_output, &TruncateOpts::default());
@@ -637,7 +652,15 @@ impl FsServer {
             let _ = write!(output, "\n\n[{}]", notices.join(". "));
         }
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        let summary = format!(
+            "Found {} matches in {}",
+            match_count,
+            params.path.as_deref().unwrap_or("workspace")
+        );
+        Ok(CallToolResult::success(vec![
+            Content::text(output).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     async fn find_files_impl(&self, params: FindFilesParams) -> Result<CallToolResult, ErrorData> {
@@ -685,6 +708,7 @@ impl FsServer {
         paths.sort();
         let limit_reached = paths.len() > max_results;
         paths.truncate(max_results);
+        let path_count = paths.len();
 
         let mut output = paths.join("\n");
         if limit_reached {
@@ -695,7 +719,11 @@ impl FsServer {
             );
         }
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        let summary = format!("Found {} matches", path_count);
+        Ok(CallToolResult::success(vec![
+            Content::text(output).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 }
 

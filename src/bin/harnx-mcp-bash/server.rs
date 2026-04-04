@@ -4,7 +4,7 @@ use harnx::mcp_safety::{
 
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
@@ -199,7 +199,14 @@ impl BashServer {
                     "\n{}",
                     render_output_block(&sanitized_output, &truncated_output)
                 );
-                Ok(CallToolResult::success(vec![Content::text(output)]))
+                let summary = format!(
+                    "exit_code: {exit_code}, {total_lines} lines, {}",
+                    format_size(total_bytes)
+                );
+                Ok(CallToolResult::success(vec![
+                    Content::text(output).with_audience(vec![Role::Assistant]),
+                    Content::text(summary).with_audience(vec![Role::User]),
+                ]))
             }
             None => tool_error(render_timeout_message(
                 &working_dir,
