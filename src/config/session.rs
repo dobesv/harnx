@@ -104,6 +104,14 @@ impl Session {
         if let Some(agent_name) = &session.agent_name {
             if let Ok(agent) = config.retrieve_agent(agent_name) {
                 session.agent_prompt = agent.interpolated_instructions();
+                // Re-apply the agent's use_tools when the saved session doesn't
+                // have its own.  Older sessions (or sessions saved before the
+                // agent had use_tools configured) would deserialize with None,
+                // causing `.info tools` to show everything as disabled even
+                // though the tools actually still work via select_tools().
+                if session.use_tools.is_none() {
+                    session.use_tools = agent.use_tools();
+                }
             }
         }
 
