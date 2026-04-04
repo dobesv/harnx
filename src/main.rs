@@ -150,14 +150,18 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         config.write().set_model(model_id)?;
     }
     if !cli.tool.is_empty() {
-        let existing = config.read().use_tools.clone().unwrap_or_default();
+        let existing = config
+            .read()
+            .extract_agent()
+            .use_tools()
+            .unwrap_or_default();
         let mut tools: Vec<String> = existing;
         for t in &cli.tool {
             if !tools.iter().any(|v| v == t) {
                 tools.push(t.clone());
             }
         }
-        config.write().use_tools = Some(tools);
+        config.write().set_use_tools(Some(tools));
     }
     if cli.no_stream {
         config.write().stream = false;

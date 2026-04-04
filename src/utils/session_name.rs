@@ -63,21 +63,53 @@ pub fn expand_session_variables_with(template: &str, extra_vars: &HashMap<&str, 
 
 /// Sanitize a session name for safe use as a filename / session identifier.
 ///
-/// - `/` → `-`
-/// - space → `_`
+/// - `/` and `\` → `-`
+/// - Whitespace → `_`
+/// - Windows-reserved characters (`<>:"|?*`) → removed
+/// - Path-traversal segments (`..`) → removed
+/// - Consecutive `-` or `_` → collapsed to a single separator
 /// - Strip leading/trailing `-` and `_` characters
+/// - Returns `"session"` if the result would be empty
 pub fn sanitize_session_name(name: &str) -> String {
-    let sanitized: String = name
+    // Replace path separators and whitespace, remove unsafe chars
+    let mapped: String = name
         .chars()
-        .map(|c| match c {
-            '/' => '-',
-            ' ' => '_',
-            other => other,
+        .filter_map(|c| match c {
+            '/' | '\\' => Some('-'),
+            c if c.is_whitespace() => Some('_'),
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' => None,
+            other => Some(other),
         })
         .collect();
-    sanitized
+
+    // Remove path-traversal segments ("..") by replacing ".." with ""
+    let no_traversal = mapped.replace("..", "");
+
+    // Collapse consecutive separators (- or _) into a single one
+    let mut result = String::with_capacity(no_traversal.len());
+    let mut last_was_sep = false;
+    for c in no_traversal.chars() {
+        let is_sep = c == '-' || c == '_';
+        if is_sep {
+            if !last_was_sep {
+                result.push(c);
+            }
+            last_was_sep = true;
+        } else {
+            result.push(c);
+            last_was_sep = false;
+        }
+    }
+
+    let trimmed = result
         .trim_matches(|c: char| c == '-' || c == '_')
-        .to_string()
+        .to_string();
+
+    if trimmed.is_empty() {
+        "session".to_string()
+    } else {
+        trimmed
+    }
 }
 
 fn resolve_variable(name: &str, extra_vars: &HashMap<&str, &str>) -> String {
@@ -221,8 +253,40 @@ mod tests {
 
     #[test]
     fn test_sanitize_empty() {
-        assert_eq!(sanitize_session_name(""), "");
-        assert_eq!(sanitize_session_name("---"), "");
+        assert_eq!(sanitize_session_name(""), "session");
+        assert_eq!(sanitize_session_name("---"), "session");
+    }
+
+    #[test]
+    fn test_sanitize_backslash() {
+        assert_eq!(sanitize_session_name("feat\\branch"), "feat-branch");
+    }
+
+    #[test]
+    fn test_sanitize_windows_reserved() {
+        assert_eq!(sanitize_session_name("my<session>name"), "mysessionname");
+        assert_eq!(sanitize_session_name("file:name|test"), "filenametest");
+        assert_eq!(sanitize_session_name("a\"b?c*d"), "abcd");
+    }
+
+    #[test]
+    fn test_sanitize_path_traversal() {
+        assert_eq!(sanitize_session_name("../../../etc/passwd"), "etc-passwd");
+        assert_eq!(sanitize_session_name("foo/../bar"), "foo-bar");
+        assert_eq!(sanitize_session_name(".."), "session");
+    }
+
+    #[test]
+    fn test_sanitize_collapse_separators() {
+        assert_eq!(sanitize_session_name("a//b"), "a-b");
+        assert_eq!(sanitize_session_name("a--b__c"), "a-b_c");
+    }
+
+    #[test]
+    fn test_sanitize_unicode_whitespace() {
+        // non-breaking space and other unicode whitespace
+        assert_eq!(sanitize_session_name("a\u{00a0}b"), "a_b");
+        assert_eq!(sanitize_session_name("a\tb"), "a_b");
     }
 
     #[test]
