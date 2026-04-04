@@ -1115,6 +1115,7 @@ async fn ask_inner(
                     Some(persistent_manager),
                 )
                 .await;
+                let _ = config.write().after_chat_completion(&input, "", &[]);
                 return Err(err);
             }
         }
@@ -1137,6 +1138,7 @@ async fn ask_inner(
                     Some(persistent_manager),
                 )
                 .await;
+                let _ = config.write().after_chat_completion(&input, "", &[]);
                 return Err(err);
             }
         }

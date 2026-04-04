@@ -547,13 +547,18 @@ pub async fn call_chat_completions_streaming(
         render_stream(rx, client.global_config(), abort_signal.clone()),
     );
 
-    if handler.abort().aborted() {
-        bail!("Aborted.");
-    }
+    let aborted = handler.abort().aborted();
 
-    render_ret?;
+    let _ = render_ret;
 
     let (text, tool_calls) = handler.take();
+    if aborted {
+        if !text.is_empty() {
+            println!();
+        }
+        return Ok((text, vec![]));
+    }
+
     match send_ret {
         Ok(_) => {
             if !text.is_empty() && !text.ends_with('\n') {
@@ -565,7 +570,11 @@ pub async fn call_chat_completions_streaming(
             if !text.is_empty() {
                 println!();
             }
-            Err(err)
+            if text.is_empty() {
+                Err(err)
+            } else {
+                Ok((text, vec![]))
+            }
         }
     }
 }
