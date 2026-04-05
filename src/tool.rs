@@ -10,7 +10,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::io::Write as _;
 use tokio::runtime::Handle;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Result<Vec<ToolResult>> {
     let mut output = vec![];
@@ -361,9 +363,45 @@ impl ToolCall {
                 // call_tool internally races session_prompt against
                 // Ctrl+C and cancels the ACP session (including
                 // auto-created sessions) when the user aborts.
+                //
+                // Subscribe to ACP chunk notifications so that tool calls,
+                // agent thoughts, plan updates, and text chunks from the
+                // sub-agent (and any nested sub-sub-agents) are printed to
+                // stdout in real-time instead of being silently swallowed.
                 let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(async { manager.call_tool(&tool_name, json_data).await })
+                    tokio::runtime::Handle::current().block_on(async {
+                        let is_terminal = *IS_STDOUT_TERMINAL;
+                        let (chunk_rx, subscription_id) = manager.subscribe_chunks().await;
+
+                        // Spawn a spinner that shows while the ACP agent
+                        // works.  When chunks arrive the spinner is
+                        // temporarily cleared so the output is clean, then
+                        // restored so the user sees live progress.
+                        let spinner = if is_terminal {
+                            Some(spawn_spinner(&format!("  {} working…", tool_name)))
+                        } else {
+                            None
+                        };
+
+                        // Forward chunks to stdout in a background task.
+                        let spinner_clone = spinner.clone();
+                        let spinner_msg = format!("  {} working…", tool_name);
+                        let forward_handle =
+                            tokio::spawn(forward_acp_chunks(chunk_rx, spinner_clone, spinner_msg));
+
+                        let call_result = manager.call_tool(&tool_name, json_data).await;
+
+                        // Tear down: unsubscribe first (closes the
+                        // channel), then await the forward task.
+                        manager.unsubscribe_chunks(subscription_id).await;
+                        let _ = forward_handle.await;
+
+                        if let Some(s) = spinner {
+                            s.stop();
+                        }
+
+                        call_result
+                    })
                 })
                 .map_err(|err| {
                     // Only user-initiated aborts (Ctrl+C) are fatal and should
@@ -405,6 +443,31 @@ impl ToolCall {
         })?;
 
         Ok(result)
+    }
+}
+
+/// Forwards ACP chunk notifications to stdout with spinner management.
+///
+/// Each incoming chunk temporarily clears the spinner, prints the chunk,
+/// then restores the spinner.  This gives the user live visibility into
+/// sub-agent (and sub-sub-agent) tool calls, thoughts, and plan updates.
+async fn forward_acp_chunks(
+    mut chunk_rx: UnboundedReceiver<String>,
+    spinner: Option<Spinner>,
+    spinner_msg: String,
+) {
+    while let Some(chunk) = chunk_rx.recv().await {
+        // Pause the spinner (clear display but keep task alive) before
+        // printing so output is clean, then resume it afterwards.
+        if let Some(ref s) = spinner {
+            s.pause();
+        }
+        print!("{chunk}");
+        let _ = std::io::stdout().flush();
+        // Re-enable the spinner after printing.
+        if let Some(ref s) = spinner {
+            let _ = s.set_message(spinner_msg.clone());
+        }
     }
 }
 
