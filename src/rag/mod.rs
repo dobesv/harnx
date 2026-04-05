@@ -91,6 +91,7 @@ impl Rag {
             rag.sync_documents(&paths, true, loaders, Some(spinner)),
             spinner_rx,
             abort_signal,
+            None,
         )
         .await?;
         if rag.save()? {
@@ -141,6 +142,7 @@ impl Rag {
             self.sync_documents(document_paths, refresh, loaders, Some(spinner)),
             spinner_rx,
             abort_signal,
+            None,
         )
         .await?;
         if self.save()? {

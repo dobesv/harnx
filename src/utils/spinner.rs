@@ -1,4 +1,9 @@
-use super::{poll_abort_signal, wait_abort_signal, AbortSignal, IS_STDOUT_TERMINAL};
+use super::{
+    poll_abort_signal, poll_abort_signal_with_input, wait_abort_signal, AbortSignal,
+    IS_STDOUT_TERMINAL,
+};
+
+use crate::repl::input_queue::InputQueue;
 
 use anyhow::{bail, Result};
 use crossterm::{cursor, queue, style, terminal};
@@ -19,22 +24,56 @@ use tokio::{
 pub struct SpinnerInner {
     index: usize,
     message: String,
+    input_line_rendered: bool,
 }
 
 impl SpinnerInner {
     const DATA: [&'static str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-    fn step(&mut self) -> Result<()> {
+    fn step(&mut self, input_queue: Option<&InputQueue>) -> Result<()> {
         if !*IS_STDOUT_TERMINAL || self.message.is_empty() {
             return Ok(());
         }
         let mut writer = stdout();
         let frame = Self::DATA[self.index % Self::DATA.len()];
         let line = format!("{frame}{}", self.message);
-        queue!(writer, cursor::MoveToColumn(0), style::Print(line),)?;
+
+        // Clear input line if previously rendered
+        if self.input_line_rendered {
+            queue!(
+                writer,
+                cursor::MoveToColumn(0),
+                terminal::Clear(terminal::ClearType::CurrentLine),
+                cursor::MoveUp(1),
+                cursor::MoveToColumn(0),
+                terminal::Clear(terminal::ClearType::CurrentLine),
+            )?;
+            self.input_line_rendered = false;
+        } else {
+            queue!(writer, cursor::MoveToColumn(0),)?;
+        }
+
+        queue!(writer, style::Print(&line),)?;
+
         if self.index == 0 {
             queue!(writer, cursor::Hide)?;
         }
+
+        // Render input queue line below spinner
+        if let Some(iq) = input_queue {
+            let display = iq.get_display_line();
+            if !display.is_empty() {
+                queue!(
+                    writer,
+                    style::Print("\n"),
+                    cursor::MoveToColumn(0),
+                    terminal::Clear(terminal::ClearType::CurrentLine),
+                    style::Print(&display),
+                )?;
+                self.input_line_rendered = true;
+            }
+        }
+
         writer.flush()?;
         self.index += 1;
         Ok(())
@@ -54,6 +93,16 @@ impl SpinnerInner {
         }
         self.message.clear();
         let mut writer = stdout();
+        if self.input_line_rendered {
+            // Move up to spinner line, then clear down
+            queue!(
+                writer,
+                cursor::MoveToColumn(0),
+                terminal::Clear(terminal::ClearType::CurrentLine),
+                cursor::MoveUp(1),
+            )?;
+            self.input_line_rendered = false;
+        }
         queue!(
             writer,
             cursor::MoveToColumn(0),
@@ -115,7 +164,7 @@ pub fn spawn_spinner(message: &str) -> Spinner {
                     }
                 }
                 _ = interval.tick() => {
-                    let _ = spinner.step();
+                    let _ = spinner.step(None);
                 }
             }
         }
@@ -133,13 +182,27 @@ where
     F: Future<Output = Result<T>>,
 {
     let (_, spinner_rx) = Spinner::create(message);
-    abortable_run_with_spinner_rx(task, spinner_rx, abort_signal).await
+    abortable_run_with_spinner_rx(task, spinner_rx, abort_signal, None).await
+}
+
+pub async fn abortable_run_with_spinner_with_input<F, T>(
+    task: F,
+    message: &str,
+    abort_signal: AbortSignal,
+    input_queue: &InputQueue,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let (_, spinner_rx) = Spinner::create(message);
+    abortable_run_with_spinner_rx(task, spinner_rx, abort_signal, Some(input_queue.clone())).await
 }
 
 pub async fn abortable_run_with_spinner_rx<F, T>(
     task: F,
     spinner_rx: UnboundedReceiver<SpinnerEvent>,
     abort_signal: AbortSignal,
+    input_queue: Option<InputQueue>,
 ) -> Result<T>
 where
     F: Future<Output = Result<T>>,
@@ -165,7 +228,12 @@ where
         };
         let (task_ret, spinner_ret) = tokio::join!(
             run_task,
-            run_abortable_spinner(spinner_rx, done_rx, abort_signal.clone())
+            run_abortable_spinner(
+                spinner_rx,
+                done_rx,
+                abort_signal.clone(),
+                input_queue.clone()
+            )
         );
         spinner_ret?;
         task_ret
@@ -178,6 +246,7 @@ async fn run_abortable_spinner(
     mut spinner_rx: UnboundedReceiver<SpinnerEvent>,
     mut done_rx: oneshot::Receiver<()>,
     abort_signal: AbortSignal,
+    input_queue: Option<InputQueue>,
 ) -> Result<()> {
     let mut spinner = SpinnerInner::default();
     loop {
@@ -204,11 +273,15 @@ async fn run_abortable_spinner(
             Err(_) => {}
         }
 
-        if poll_abort_signal(&abort_signal)? {
+        let aborted = match &input_queue {
+            Some(iq) => poll_abort_signal_with_input(&abort_signal, iq)?,
+            None => poll_abort_signal(&abort_signal)?,
+        };
+        if aborted {
             break;
         }
 
-        spinner.step()?;
+        spinner.step(input_queue.as_ref())?;
     }
 
     spinner.clear_message()?;

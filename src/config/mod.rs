@@ -16,7 +16,7 @@ use crate::hooks::{AsyncHookManager, HooksConfig};
 use crate::mcp::{McpManager, McpServerConfig};
 use crate::rag::Rag;
 use crate::render::{MarkdownRender, RenderOptions};
-use crate::repl::{run_repl_command, split_args_text};
+use crate::repl::{input_queue::InputQueue, run_repl_command, split_args_text};
 use crate::tool::{ToolDeclaration, ToolResult, Tools};
 use crate::utils::*;
 
@@ -2818,6 +2818,7 @@ pub async fn macro_execute(
         crate::hooks::PersistentHookManager::new(),
     ));
     let mut pending_async_context = None;
+    let macro_input_queue = InputQueue::new();
     for step in &macro_value.steps {
         let command = Macro::interpolate_command(step, &variables);
         println!(">> {}", multiline_text(&command));
@@ -2828,6 +2829,7 @@ pub async fn macro_execute(
             &mut async_manager,
             &persistent_manager,
             &mut pending_async_context,
+            &macro_input_queue,
         )
         .await?;
     }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -7,6 +7,8 @@ use std::{
     },
     time::Duration,
 };
+
+use crate::repl::input_queue::InputQueue;
 
 pub type AbortSignal = Arc<AbortSignalInner>;
 
@@ -69,20 +71,43 @@ pub async fn wait_abort_signal(abort_signal: &AbortSignal) {
 }
 
 pub fn poll_abort_signal(abort_signal: &AbortSignal) -> Result<bool> {
+    poll_abort_signal_inner(abort_signal, None)
+}
+
+pub fn poll_abort_signal_with_input(
+    abort_signal: &AbortSignal,
+    input_queue: &InputQueue,
+) -> Result<bool> {
+    poll_abort_signal_inner(abort_signal, Some(input_queue))
+}
+
+fn poll_abort_signal_inner(
+    abort_signal: &AbortSignal,
+    input_queue: Option<&InputQueue>,
+) -> Result<bool> {
     if crossterm::event::poll(Duration::from_millis(25))? {
         if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
-                    abort_signal.set_ctrlc();
-                    return Ok(true);
-                }
-                KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
-                    abort_signal.set_ctrld();
-                    return Ok(true);
-                }
-                _ => {}
+            if handle_abort_key(abort_signal, &key) {
+                return Ok(true);
+            }
+            if let Some(iq) = input_queue {
+                iq.handle_key_event(key);
             }
         }
     }
     Ok(false)
+}
+
+fn handle_abort_key(abort_signal: &AbortSignal, key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+            abort_signal.set_ctrlc();
+            true
+        }
+        KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+            abort_signal.set_ctrld();
+            true
+        }
+        _ => false,
+    }
 }

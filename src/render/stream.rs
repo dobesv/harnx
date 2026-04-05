@@ -1,6 +1,7 @@
 use super::{MarkdownRender, SseEvent};
 
-use crate::utils::{poll_abort_signal, spawn_spinner, AbortSignal};
+use crate::repl::input_queue::InputQueue;
+use crate::utils::{poll_abort_signal, poll_abort_signal_with_input, spawn_spinner, AbortSignal};
 
 use anyhow::Result;
 use crossterm::{
@@ -19,11 +20,20 @@ pub async fn markdown_stream(
     render: &mut MarkdownRender,
     abort_signal: &AbortSignal,
     spinner_message: &str,
+    input_queue: Option<&InputQueue>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
 
-    let ret = markdown_stream_inner(rx, render, abort_signal, &mut stdout, spinner_message).await;
+    let ret = markdown_stream_inner(
+        rx,
+        render,
+        abort_signal,
+        &mut stdout,
+        spinner_message,
+        input_queue,
+    )
+    .await;
 
     disable_raw_mode()?;
 
@@ -37,6 +47,7 @@ pub async fn raw_stream(
     mut rx: UnboundedReceiver<SseEvent>,
     abort_signal: &AbortSignal,
     spinner_message: &str,
+    _input_queue: Option<&InputQueue>,
 ) -> Result<()> {
     let mut spinner = Some(spawn_spinner(spinner_message));
 
@@ -72,6 +83,7 @@ async fn markdown_stream_inner(
     abort_signal: &AbortSignal,
     writer: &mut Stdout,
     spinner_message: &str,
+    input_queue: Option<&InputQueue>,
 ) -> Result<()> {
     let mut buffer = String::new();
     let mut buffer_rows = 1;
@@ -154,7 +166,11 @@ async fn markdown_stream_inner(
             }
         }
 
-        if poll_abort_signal(abort_signal)? {
+        let aborted = match input_queue {
+            Some(iq) => poll_abort_signal_with_input(abort_signal, iq)?,
+            None => poll_abort_signal(abort_signal)?,
+        };
+        if aborted {
             break;
         }
     }

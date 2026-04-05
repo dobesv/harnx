@@ -3,6 +3,7 @@ use super::*;
 use crate::{
     config::{Config, GlobalConfig, Input},
     render::render_stream,
+    repl::input_queue::InputQueue,
     tool::{eval_tool_calls, ToolCall, ToolDeclaration, ToolResult},
     utils::*,
 };
@@ -569,14 +570,28 @@ pub async fn call_chat_completions(
     extract_code: bool,
     client: &dyn Client,
     abort_signal: AbortSignal,
+    input_queue: Option<&InputQueue>,
 ) -> Result<(String, Vec<ToolResult>, CompletionTokenUsage)> {
     let spinner_message = spinner_label(client.global_config());
-    let ret = abortable_run_with_spinner(
-        client.chat_completions(input.clone()),
-        &spinner_message,
-        abort_signal,
-    )
-    .await;
+    let ret = match input_queue {
+        Some(iq) => {
+            abortable_run_with_spinner_with_input(
+                client.chat_completions(input.clone()),
+                &spinner_message,
+                abort_signal,
+                iq,
+            )
+            .await
+        }
+        None => {
+            abortable_run_with_spinner(
+                client.chat_completions(input.clone()),
+                &spinner_message,
+                abort_signal,
+            )
+            .await
+        }
+    };
 
     match ret {
         Ok(ret) => {
@@ -611,6 +626,7 @@ pub async fn call_chat_completions_streaming(
     input: &Input,
     client: &dyn Client,
     abort_signal: AbortSignal,
+    input_queue: Option<InputQueue>,
 ) -> Result<(String, Vec<ToolResult>, CompletionTokenUsage)> {
     let spinner_message = spinner_label(client.global_config());
     let (tx, rx) = unbounded_channel();
@@ -622,7 +638,8 @@ pub async fn call_chat_completions_streaming(
             rx,
             client.global_config(),
             abort_signal.clone(),
-            &spinner_message
+            &spinner_message,
+            input_queue,
         ),
     );
 

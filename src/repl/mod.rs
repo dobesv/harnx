@@ -1,9 +1,11 @@
 mod completer;
 mod highlighter;
+pub mod input_queue;
 mod prompt;
 
 use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
+use self::input_queue::InputQueue;
 use self::prompt::ReplPrompt;
 
 use crate::client::{call_chat_completions, call_chat_completions_streaming};
@@ -204,6 +206,7 @@ pub struct Repl {
     async_manager: AsyncHookManager,
     persistent_manager: std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
     pending_async_context: Option<String>,
+    input_queue: InputQueue,
 }
 
 impl Repl {
@@ -217,6 +220,8 @@ impl Repl {
         let prompt = ReplPrompt::new(config);
         let abort_signal = create_abort_signal();
 
+        let input_queue = InputQueue::new();
+
         Ok(Self {
             config: config.clone(),
             editor,
@@ -225,6 +230,7 @@ impl Repl {
             async_manager,
             persistent_manager,
             pending_async_context: None,
+            input_queue,
         })
     }
 
@@ -271,6 +277,7 @@ Type ".help" for additional help.
                         &mut self.async_manager,
                         &self.persistent_manager,
                         &mut self.pending_async_context,
+                        &self.input_queue,
                     )
                     .await
                     {
@@ -282,6 +289,32 @@ Type ".help" for additional help.
                         Err(err) => {
                             render_error(err);
                             println!()
+                        }
+                    }
+                    // Drain any queued message from the input queue
+                    while let Some(queued_line) = self.input_queue.dequeue() {
+                        self.abort_signal.reset();
+                        println!("{}", dimmed_text(&format!(">> {queued_line}")));
+                        match run_repl_command(
+                            &self.config,
+                            self.abort_signal.clone(),
+                            &queued_line,
+                            &mut self.async_manager,
+                            &self.persistent_manager,
+                            &mut self.pending_async_context,
+                            &self.input_queue,
+                        )
+                        .await
+                        {
+                            Ok(exit) => {
+                                if exit {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                render_error(err);
+                                println!()
+                            }
                         }
                     }
                 }
@@ -332,6 +365,7 @@ Type ".help" for additional help.
             &self.persistent_manager,
             &mut self.pending_async_context,
             max_resume,
+            Some(&self.input_queue),
         )
         .await?;
         Ok(true)
@@ -455,6 +489,7 @@ pub async fn run_repl_command(
     async_manager: &mut AsyncHookManager,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
     pending_async_context: &mut Option<String>,
+    input_queue: &InputQueue,
 ) -> Result<bool> {
     let max_resume = config.read().resolved_hooks().max_resume.unwrap_or(5);
     if let Ok(Some(captures)) = MULTILINE_RE.captures(line) {
@@ -579,6 +614,7 @@ pub async fn run_repl_command(
                                 persistent_manager,
                                 pending_async_context,
                                 max_resume,
+                                Some(input_queue),
                             )
                             .await?;
                         }
@@ -812,6 +848,7 @@ Commands:
                         persistent_manager,
                         pending_async_context,
                         max_resume,
+                        Some(input_queue),
                     )
                     .await?;
                 }
@@ -850,6 +887,7 @@ Commands:
                     persistent_manager,
                     pending_async_context,
                     max_resume,
+                    Some(input_queue),
                 )
                 .await?;
             }
@@ -874,6 +912,7 @@ Commands:
                     persistent_manager,
                     pending_async_context,
                     max_resume,
+                    Some(input_queue),
                 )
                 .await?;
             }
@@ -1030,6 +1069,7 @@ Commands:
                         persistent_manager,
                         pending_async_context,
                         hooks.max_resume.unwrap_or(5),
+                        Some(input_queue),
                     )
                     .await?;
                 }
@@ -1051,6 +1091,7 @@ async fn ask(
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
     pending_async_context: &mut Option<String>,
     max_resume: u32,
+    input_queue: Option<&InputQueue>,
 ) -> Result<()> {
     ask_inner(
         config,
@@ -1062,6 +1103,7 @@ async fn ask(
         pending_async_context,
         0,
         max_resume,
+        input_queue,
     )
     .await
 }
@@ -1078,6 +1120,7 @@ async fn ask_inner(
     pending_async_context: &mut Option<String>,
     resume_count: u32,
     max_resume: u32,
+    input_queue: Option<&InputQueue>,
 ) -> Result<()> {
     if input.is_empty() {
         return Ok(());
@@ -1108,7 +1151,14 @@ async fn ask_inner(
         )
     };
     let (output, tool_results, usage) = if input.stream() {
-        match call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await {
+        match call_chat_completions_streaming(
+            &input,
+            client.as_ref(),
+            abort_signal.clone(),
+            input_queue.cloned(),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(err) => {
                 let event = HookEvent::StopFailure {
@@ -1131,8 +1181,15 @@ async fn ask_inner(
             }
         }
     } else {
-        match call_chat_completions(&input, true, false, client.as_ref(), abort_signal.clone())
-            .await
+        match call_chat_completions(
+            &input,
+            true,
+            false,
+            client.as_ref(),
+            abort_signal.clone(),
+            input_queue,
+        )
+        .await
         {
             Ok(result) => result,
             Err(err) => {
@@ -1249,6 +1306,7 @@ async fn ask_inner(
                 pending_async_context,
                 0,
                 max_resume,
+                input_queue,
             ))
             .await;
         }
@@ -1263,6 +1321,7 @@ async fn ask_inner(
             pending_async_context,
             resume_count,
             max_resume,
+            input_queue,
         )
         .await
     } else {
@@ -1288,6 +1347,7 @@ async fn ask_inner(
                     pending_async_context,
                     resume_count + 1,
                     max_resume,
+                    input_queue,
                 )
                 .await;
             }
@@ -1313,6 +1373,7 @@ async fn ask_inner(
                 pending_async_context,
                 resume_count + 1,
                 max_resume,
+                input_queue,
             )
             .await;
         }
