@@ -545,13 +545,22 @@ pub async fn create_openai_compatible_client_config(
 
 fn spinner_label(config: &GlobalConfig) -> String {
     let config = config.read();
+    // Icons omitted — the spinner braille frame serves as the leading character
+    let status = config.render_status_line(false);
     if let Some(session) = &config.session {
         let su = session.completion_usage();
         if !su.is_empty() {
-            return format!("Generating [{}]", su);
+            if status.is_empty() {
+                return su.to_string();
+            }
+            return format!("{}    {}", status, su);
         }
     }
-    "Generating".to_string()
+    if status.is_empty() {
+        "Generating".to_string()
+    } else {
+        status
+    }
 }
 
 pub async fn call_chat_completions(

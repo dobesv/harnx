@@ -245,6 +245,14 @@ Type ".help" for additional help.
             )
         }
 
+        // Print initial session/agent status line
+        {
+            let status = self.config.read().render_status_line(true);
+            if !status.is_empty() {
+                eprintln!("{}", dimmed_text(&status));
+            }
+        }
+
         loop {
             if self.abort_signal.aborted_ctrld() {
                 break;
@@ -1029,10 +1037,6 @@ Commands:
         }
     }
 
-    if !config.read().macro_flag {
-        println!();
-    }
-
     Ok(false)
 }
 
@@ -1156,15 +1160,42 @@ async fn ask_inner(
         .write()
         .after_chat_completion(&input, &output, &tool_results, &usage)?;
     if tool_results.is_empty() {
-        let session_usage = config
-            .read()
+        if !config.read().macro_flag {
+            eprintln!();
+        }
+        let config_read = config.read();
+        let status = config_read.render_status_line(true);
+        let session_usage = config_read
             .session
             .as_ref()
             .map(|s| s.completion_usage().clone());
         let display_usage = session_usage.as_ref().unwrap_or(&usage);
-        if !display_usage.is_empty() {
-            eprintln!("{}", dimmed_text(&format!("[{}]", display_usage)));
+        let context_stats = config_read
+            .session
+            .as_ref()
+            .map(|s| {
+                let (tokens, percent) = s.tokens_usage();
+                if percent > 0.0 {
+                    format!("💬 {}({:.0}%)", tokens, percent)
+                } else {
+                    format!("💬 {}", tokens)
+                }
+            })
+            .unwrap_or_default();
+        let mut line_parts = vec![];
+        if !status.is_empty() {
+            line_parts.push(status);
         }
+        if !display_usage.is_empty() {
+            line_parts.push(format!("   {}", display_usage));
+        }
+        if !context_stats.is_empty() {
+            line_parts.push(format!("  {}", context_stats));
+        }
+        if !line_parts.is_empty() {
+            eprintln!("{}", dimmed_text(&line_parts.join("")));
+        }
+        drop(config_read);
     }
     let stop_outcome = if tool_results.is_empty() {
         let event = HookEvent::Stop {

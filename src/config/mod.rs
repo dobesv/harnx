@@ -86,8 +86,8 @@ __CONTEXT__
 __INPUT__
 </user_query>"#;
 
-const LEFT_PROMPT: &str = "{color.green}{?session {?agent {agent}>}{session}{?agent /}}{!session {?agent {agent}>}}{agent}{?rag @{rag}}{color.cyan}{?session )}{!session >}{color.reset} ";
-const RIGHT_PROMPT: &str = "{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}";
+const LEFT_PROMPT: &str = "{color.cyan}>{color.reset} ";
+const RIGHT_PROMPT: &str = "";
 
 static EDITOR: OnceLock<Option<String>> = OnceLock::new();
 
@@ -2082,6 +2082,37 @@ impl Config {
         let variables = self.generate_prompt_context();
         let right_prompt = self.right_prompt.as_deref().unwrap_or(RIGHT_PROMPT);
         render_prompt(right_prompt, &variables)
+    }
+
+    /// Render a status line showing agent name and session ID.
+    ///
+    /// When `use_icons` is true, an appropriate icon leads the line:
+    /// - `🤖 <agent> ▸ <session>` when an agent is active
+    /// - `💬 <session>` when only a session is active (no robot icon)
+    ///
+    /// When `use_icons` is false, icons are omitted (used for spinner where
+    /// the braille animation frame serves as the leading character).
+    pub fn render_status_line(&self, use_icons: bool) -> String {
+        let agent_name = if let Some(agent) = &self.agent {
+            Some(agent.name().to_string())
+        } else {
+            let agent = self.extract_agent();
+            if agent.name() != TEMP_AGENT_NAME {
+                Some(agent.name().to_string())
+            } else {
+                None
+            }
+        };
+        let session_name = self.session.as_ref().map(|s| s.name().to_string());
+        match (agent_name, session_name, use_icons) {
+            (Some(agent), Some(session), true) => format!("🤖 {} ▸ {}", agent, session),
+            (Some(agent), Some(session), false) => format!("{} ▸ {}", agent, session),
+            (Some(agent), None, true) => format!("🤖 {}", agent),
+            (Some(agent), None, false) => agent,
+            (None, Some(session), true) => format!("💬 {}", session),
+            (None, Some(session), false) => session,
+            (None, None, _) => String::new(),
+        }
     }
 
     pub fn print_markdown(&self, text: &str) -> Result<()> {
