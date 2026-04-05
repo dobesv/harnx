@@ -31,6 +31,12 @@ struct TodoFrontMatter {
     created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
+    /// Key that uniquely identifies this todo within its plan
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    /// List of keys of todos this todo depends on (within the same plan)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dependencies: Vec<String>,
 }
 
 fn default_status() -> String {
@@ -86,6 +92,12 @@ struct TodoCreateParams {
     /// Optional markdown body
     #[serde(default)]
     body: Option<String>,
+    /// Key that uniquely identifies this todo within its plan
+    #[serde(default)]
+    key: Option<String>,
+    /// List of keys of todos this todo depends on (within the same plan)
+    #[serde(default)]
+    dependencies: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +119,12 @@ struct TodoUpdateParams {
     /// New body (optional, replaces body)
     #[serde(default)]
     body: Option<String>,
+    /// New key (optional)
+    #[serde(default)]
+    key: Option<String>,
+    /// New dependencies (optional, replaces all)
+    #[serde(default)]
+    dependencies: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +153,31 @@ struct PlanWriteParams {
     name: String,
     /// Full plan markdown text
     content: String,
+    /// Optional list of todos to create along with the plan
+    #[serde(default)]
+    todos: Vec<TodoSpec>,
+}
+
+/// A todo specification for creating todos with a plan
+#[derive(Debug, Deserialize)]
+struct TodoSpec {
+    /// Short title
+    title: String,
+    /// Key that uniquely identifies this todo within the plan
+    #[serde(default)]
+    key: Option<String>,
+    /// Optional tags
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Initial status (default: "open")
+    #[serde(default)]
+    status: Option<String>,
+    /// Optional markdown body
+    #[serde(default)]
+    body: Option<String>,
+    /// List of keys of todos this todo depends on (within the same plan)
+    #[serde(default)]
+    dependencies: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +186,14 @@ struct PlanAddNoteParams {
     name: String,
     /// Note text to append to the end of the plan
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanGetTodoParams {
+    /// Plan name or ID
+    plan: String,
+    /// Todo key within the plan
+    key: String,
 }
 
 // ── JsonSchema impls ────────────────────────────────────────────────────────
@@ -225,6 +276,16 @@ impl_json_schema!(
             "Long-form markdown details",
             gen.subschema_for::<Option<String>>()
         ),
+        (
+            "key",
+            "Key that uniquely identifies this todo within its plan",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "dependencies",
+            "List of keys of todos this todo depends on (within the same plan)",
+            gen.subschema_for::<Option<Vec<String>>>()
+        ),
     ],
     &["title"]
 );
@@ -258,6 +319,16 @@ impl_json_schema!(
             "body",
             "New body (replaces, optional)",
             gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "key",
+            "New key (optional)",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "dependencies",
+            "New dependencies (replaces all, optional)",
+            gen.subschema_for::<Option<Vec<String>>>()
         ),
     ],
     &["id"]
@@ -301,6 +372,11 @@ impl_json_schema!(
             "Full plan markdown text",
             gen.subschema_for::<String>()
         ),
+        (
+            "todos",
+            "Optional list of todos to create along with the plan",
+            gen.subschema_for::<Option<Vec<TodoSpec>>>()
+        ),
     ],
     &["name", "content"]
 );
@@ -317,6 +393,54 @@ impl_json_schema!(
         ),
     ],
     &["name", "text"]
+);
+
+impl_json_schema!(
+    PlanGetTodoParams,
+    "PlanGetTodoParams",
+    |gen: &mut SchemaGenerator| vec![
+        ("plan", "Plan name or ID", gen.subschema_for::<String>()),
+        (
+            "key",
+            "Todo key within the plan",
+            gen.subschema_for::<String>()
+        ),
+    ],
+    &["plan", "key"]
+);
+
+impl_json_schema!(
+    TodoSpec,
+    "TodoSpec",
+    |gen: &mut SchemaGenerator| vec![
+        ("title", "Short title", gen.subschema_for::<String>()),
+        (
+            "key",
+            "Key that uniquely identifies this todo within the plan",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "tags",
+            "Optional tags",
+            gen.subschema_for::<Option<Vec<String>>>()
+        ),
+        (
+            "status",
+            "Initial status (default: 'open')",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "body",
+            "Optional markdown body",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "dependencies",
+            "List of keys of todos this todo depends on (within the same plan)",
+            gen.subschema_for::<Option<Vec<String>>>()
+        ),
+    ],
+    &["title"]
 );
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -373,6 +497,8 @@ fn parse_todo_content(content: &str, id_fallback: &str) -> TodoRecord {
                 status: "open".to_string(),
                 created_at: String::new(),
                 updated_at: None,
+                key: None,
+                dependencies: vec![],
             },
             body: content.to_string(),
         };
@@ -389,6 +515,8 @@ fn parse_todo_content(content: &str, id_fallback: &str) -> TodoRecord {
                 status: "open".to_string(),
                 created_at: String::new(),
                 updated_at: None,
+                key: None,
+                dependencies: vec![],
             },
             body: content.to_string(),
         };
@@ -407,6 +535,8 @@ fn parse_todo_content(content: &str, id_fallback: &str) -> TodoRecord {
         status: "open".to_string(),
         created_at: String::new(),
         updated_at: None,
+        key: None,
+        dependencies: vec![],
     });
 
     TodoRecord { front, body }
@@ -514,6 +644,8 @@ fn todo_to_json(todo: &TodoRecord) -> Value {
         "status": todo.front.status,
         "created_at": todo.front.created_at,
         "updated_at": todo.front.updated_at,
+        "key": todo.front.key,
+        "dependencies": todo.front.dependencies,
         "body": todo.body,
     })
 }
@@ -622,6 +754,8 @@ impl TodoServer {
                 status: params.status.unwrap_or_else(|| "open".to_string()),
                 created_at: now_iso(),
                 updated_at: None,
+                key: params.key,
+                dependencies: params.dependencies,
             },
             body: params.body.unwrap_or_default(),
         };
@@ -660,6 +794,12 @@ impl TodoServer {
         }
         if let Some(body) = params.body {
             todo.body = body;
+        }
+        if let Some(key) = params.key {
+            todo.front.key = Some(key);
+        }
+        if let Some(dependencies) = params.dependencies {
+            todo.front.dependencies = dependencies;
         }
         todo.front.updated_at = Some(now_iso());
         if let Err(e) = write_todo(&self.dir, &todo) {
@@ -733,7 +873,8 @@ impl TodoServer {
     }
 
     fn handle_plan_write(&self, params: PlanWriteParams) -> Result<CallToolResult, ErrorData> {
-        let path = match self.plan_path(&params.name) {
+        let plan_name = params.name.clone();
+        let path = match self.plan_path(&plan_name) {
             Ok(p) => p,
             Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
         };
@@ -749,10 +890,67 @@ impl TodoServer {
                 "Failed to write plan: {e}"
             ))]));
         }
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Plan '{}' saved",
-            params.name
-        ))]))
+
+        // Create todos if provided
+        let mut created_todos = Vec::new();
+        let mut errors = Vec::new();
+
+        for spec in params.todos {
+            let id = generate_id();
+            if todo_path(&self.dir, &id).exists() {
+                errors.push(format!("ID collision for todo '{}', skipped", spec.title));
+                continue;
+            }
+            let todo = TodoRecord {
+                front: TodoFrontMatter {
+                    id: id.clone(),
+                    title: spec.title.clone(),
+                    tags: spec.tags.clone(),
+                    plan: Some(plan_name.clone()),
+                    status: spec.status.clone().unwrap_or_else(|| "open".to_string()),
+                    created_at: now_iso(),
+                    updated_at: None,
+                    key: spec.key.clone(),
+                    dependencies: spec.dependencies.clone(),
+                },
+                body: spec.body.clone().unwrap_or_default(),
+            };
+            match write_todo(&self.dir, &todo) {
+                Ok(()) => {
+                    created_todos.push(todo_to_json(&todo));
+                }
+                Err(e) => {
+                    errors.push(format!("Failed to create todo '{}': {}", spec.title, e));
+                }
+            }
+        }
+
+        let mut messages = vec![format!("Plan '{}' saved", plan_name)];
+
+        if !created_todos.is_empty() {
+            messages.push(format!("Created {} todo(s)", created_todos.len()));
+        }
+        if !errors.is_empty() {
+            messages.push(errors.join("\n"));
+        }
+
+        let summary = messages.join(". ");
+        let mut result_json = serde_json::json!({
+            "plan": plan_name,
+            "todos_created": created_todos.len(),
+        });
+        if !created_todos.is_empty() {
+            result_json["todos"] = serde_json::to_value(&created_todos).unwrap_or_default();
+        }
+        if !errors.is_empty() {
+            result_json["errors"] = serde_json::to_value(&errors).unwrap_or_default();
+        }
+
+        let text = serde_json::to_string_pretty(&result_json).unwrap_or_default();
+        Ok(CallToolResult::success(vec![
+            Content::text(text).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     fn handle_plan_add_note(&self, params: PlanAddNoteParams) -> Result<CallToolResult, ErrorData> {
@@ -795,6 +993,39 @@ impl TodoServer {
             "Note added to plan '{}'",
             params.name
         ))]))
+    }
+
+    fn handle_plan_get_todo(&self, params: PlanGetTodoParams) -> Result<CallToolResult, ErrorData> {
+        let all_todos = list_todos(&self.dir);
+        let matching: Vec<_> = all_todos
+            .iter()
+            .filter(|t| {
+                t.front.plan.as_deref() == Some(params.plan.as_str())
+                    && t.front.key.as_deref() == Some(params.key.as_str())
+            })
+            .collect();
+
+        if matching.is_empty() {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "No todo with key '{}' found in plan '{}'",
+                params.key, params.plan
+            ))]));
+        }
+
+        if matching.len() > 1 {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Multiple todos with key '{}' found in plan '{}' - this indicates data inconsistency",
+                params.key, params.plan
+            ))]));
+        }
+
+        let todo = &matching[0];
+        let summary = format!("Found {}: {}", display_id(&todo.front.id), todo.front.title);
+        let text = serde_json::to_string_pretty(&todo_to_json(todo)).unwrap_or_default();
+        Ok(CallToolResult::success(vec![
+            Content::text(text).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
     }
 
     fn plan_path(&self, name: &str) -> Result<PathBuf, String> {
@@ -850,13 +1081,13 @@ impl ServerHandler for TodoServer {
                 .with_input_schema::<TodoGetParams>(),
                 Tool::new(
                     "todo_create",
-                    "Create a new todo with title, optional tags, status, and body.",
+                    "Create a new todo with title, optional tags, status, body, key, and dependencies.",
                     Map::new(),
                 )
                 .with_input_schema::<TodoCreateParams>(),
                 Tool::new(
                     "todo_update",
-                    "Update a todo's title, status, tags, or body (replaces).",
+                    "Update a todo's title, status, tags, key, dependencies, or body (replaces).",
                     Map::new(),
                 )
                 .with_input_schema::<TodoUpdateParams>(),
@@ -872,7 +1103,7 @@ impl ServerHandler for TodoServer {
                     .with_input_schema::<PlanReadParams>(),
                 Tool::new(
                     "write_plan",
-                    "Write/update a plan's content by name.",
+                    "Write/update a plan's content by name. Optionally create todos along with the plan.",
                     Map::new(),
                 )
                 .with_input_schema::<PlanWriteParams>(),
@@ -882,6 +1113,12 @@ impl ServerHandler for TodoServer {
                     Map::new(),
                 )
                 .with_input_schema::<PlanAddNoteParams>(),
+                Tool::new(
+                    "plan_get_todo",
+                    "Get a todo by its plan name and key within the plan.",
+                    Map::new(),
+                )
+                .with_input_schema::<PlanGetTodoParams>(),
             ],
             next_cursor: None,
         })
@@ -928,6 +1165,10 @@ impl ServerHandler for TodoServer {
             "plan_add_note" => {
                 let params = parse_arguments::<PlanAddNoteParams>(request.arguments)?;
                 self.handle_plan_add_note(params)
+            }
+            "plan_get_todo" => {
+                let params = parse_arguments::<PlanGetTodoParams>(request.arguments)?;
+                self.handle_plan_get_todo(params)
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
