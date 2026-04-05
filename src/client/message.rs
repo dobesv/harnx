@@ -181,12 +181,7 @@ impl MessageContentToolCalls {
         }
     }
 
-    pub fn merge(
-        &mut self,
-        tool_results: Vec<ToolResult>,
-        _text: String,
-        thought: Option<String>,
-    ) {
+    pub fn merge(&mut self, tool_results: Vec<ToolResult>, _text: String, thought: Option<String>) {
         self.tool_results.extend(tool_results);
         self.text.clear();
         self.thought = thought;
