@@ -350,7 +350,7 @@ impl Agent {
             )
         };
         format!(
-            r#"# {} {}
+            r#"# {} v{}
 {}{}"#,
             self.name, self.version, self.description, starters
         )

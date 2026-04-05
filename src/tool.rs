@@ -1,6 +1,7 @@
 use crate::{
     config::GlobalConfig,
     hooks::{dispatch::dispatch_hooks, HookEvent, HookResultControl},
+    ui_output::emit_ui_output,
     utils::*,
 };
 use harnx::mcp_safety::{truncate_output, TruncateOpts};
@@ -102,7 +103,10 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                             _ => result.to_string(),
                         });
                     let truncated = truncate_output(&output_str, &opts);
-                    println!("{}", dimmed_text(&truncated));
+                    let text = format!("{}\n", dimmed_text(&truncated));
+                    if !emit_ui_output(text.clone()) {
+                        print!("{text}");
+                    }
                 }
 
                 if result.is_null() {
@@ -344,7 +348,10 @@ impl ToolCall {
                 Value::Null => format!("🛠️  {}", self.name),
                 _ => format!("🛠️  {} {}", self.name, json_data),
             };
-            println!("{}", dimmed_text(&prompt));
+            let text = format!("{}\n", dimmed_text(&prompt));
+            if !emit_ui_output(text.clone()) {
+                print!("{text}");
+            }
         }
 
         if self.name == TRIGGER_AGENT_TOOL_NAME {
@@ -378,20 +385,18 @@ impl ToolCall {
                 // stdout in real-time instead of being silently swallowed.
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
-                        let is_terminal = *IS_STDOUT_TERMINAL;
+                        let has_ui_output = emit_ui_output("");
+                        let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
                         let (chunk_rx, subscription_id) = manager.subscribe_chunks().await;
 
-                        // Spawn a spinner that shows while the ACP agent
-                        // works.  When chunks arrive the spinner is
-                        // temporarily cleared so the output is clean, then
-                        // restored so the user sees live progress.
+                        // Spawn a spinner only in non-TUI terminal mode.
                         let spinner = if is_terminal {
                             Some(spawn_spinner(&format!("  {} working…", tool_name)))
                         } else {
                             None
                         };
 
-                        // Forward chunks to stdout in a background task.
+                        // Forward chunks either to TUI output sink or stdout.
                         let spinner_clone = spinner.clone();
                         let spinner_msg = format!("  {} working…", tool_name);
                         let forward_handle =
@@ -470,8 +475,10 @@ async fn forward_acp_chunks(
         if let Some(ref s) = spinner {
             s.pause();
         }
-        print!("{chunk}");
-        let _ = std::io::stdout().flush();
+        if !emit_ui_output(chunk.clone()) {
+            print!("{chunk}");
+            let _ = std::io::stdout().flush();
+        }
         // Re-enable the spinner after printing.
         if let Some(ref s) = spinner {
             let _ = s.set_message(spinner_msg.clone());
