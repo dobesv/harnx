@@ -211,14 +211,43 @@ impl acp::Client for AcpNotificationClient {
                     )
                 }
             }
+            acp::SessionUpdate::SessionInfoUpdate(info) => {
+                // Extract token usage from custom _meta if present.
+                // Sent by harnx ACP servers via `harnx:usage`.
+                if let Some(meta) = &info.meta {
+                    if let Some(usage) = meta.get("harnx:usage") {
+                        let input = usage["input_tokens"].as_u64().unwrap_or(0);
+                        let output = usage["output_tokens"].as_u64().unwrap_or(0);
+                        let cached = usage["cached_tokens"].as_u64().unwrap_or(0);
+                        if input > 0 || output > 0 {
+                            let mut parts = vec![];
+                            if input > 0 {
+                                parts.push(format!("📥 {input}"));
+                            }
+                            if output > 0 {
+                                parts.push(format!("📤 {output}"));
+                            }
+                            if cached > 0 {
+                                parts.push(format!("💾 {cached}"));
+                            }
+                            format!("\n{}\n", dimmed_text(&format!("   {}", parts.join("  "))))
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            }
             // Explicitly list known-but-unhandled variants so new ones from
             // future ACP SDK upgrades surface as compile warnings in the
             // wildcard arm below.
             acp::SessionUpdate::UserMessageChunk(_)
             | acp::SessionUpdate::AvailableCommandsUpdate(_)
             | acp::SessionUpdate::CurrentModeUpdate(_)
-            | acp::SessionUpdate::ConfigOptionUpdate(_)
-            | acp::SessionUpdate::SessionInfoUpdate(_) => String::new(),
+            | acp::SessionUpdate::ConfigOptionUpdate(_) => String::new(),
             // Required catch-all: SessionUpdate is #[non_exhaustive].
             // Log so future variants aren't silently swallowed.
             other => {

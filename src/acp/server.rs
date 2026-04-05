@@ -54,6 +54,37 @@ impl HarnxAgent {
         Ok(())
     }
 
+    async fn send_usage(
+        &self,
+        session_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    ) -> acp::Result<()> {
+        if input_tokens == 0 && output_tokens == 0 {
+            return Ok(());
+        }
+        let connection = self.connection.borrow().clone();
+        if let Some(connection) = connection {
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "harnx:usage".to_string(),
+                json!({
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cached_tokens": cached_tokens,
+                }),
+            );
+            let update = acp::SessionInfoUpdate::new().meta(meta);
+            let notification = acp::SessionNotification::new(
+                acp::SessionId::new(session_id.to_string()),
+                acp::SessionUpdate::SessionInfoUpdate(update),
+            );
+            connection.session_notification(notification).await?;
+        }
+        Ok(())
+    }
+
     async fn execute_llm_streaming(
         &self,
         session_id: &str,
@@ -93,7 +124,18 @@ impl HarnxAgent {
 
         send_ret.map_err(|e| acp::Error::new(-32603, e.to_string()))?;
 
-        let (text, tool_calls, _usage) = handler.take();
+        let (text, tool_calls, usage) = handler.take();
+
+        // Send token usage stats to the parent via SessionInfoUpdate._meta
+        let _ = self
+            .send_usage(
+                session_id,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_tokens,
+            )
+            .await;
+
         Ok((text, tool_calls))
     }
 
@@ -116,6 +158,16 @@ impl HarnxAgent {
         if !output.text.is_empty() {
             self.send_text_chunk(session_id, &output.text).await?;
         }
+
+        // Send token usage stats to the parent via SessionInfoUpdate._meta
+        let _ = self
+            .send_usage(
+                session_id,
+                output.input_tokens.unwrap_or(0),
+                output.output_tokens.unwrap_or(0),
+                output.cached_tokens.unwrap_or(0),
+            )
+            .await;
 
         Ok((output.text, output.tool_calls))
     }
