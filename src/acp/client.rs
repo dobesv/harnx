@@ -147,6 +147,21 @@ impl acp::Client for AcpNotificationClient {
         let session_id = args.session_id.0.to_string();
         let _ = self.activity_tx.send(session_id.clone());
 
+        // Handle SessionInfoUpdate separately: its display output is
+        // display-only metadata (e.g. usage banners) that must never be
+        // appended to `state.response_text`.  When chunks are re-emitted
+        // upward by server.rs they become AgentMessageChunk, which *would*
+        // trigger the response_text append in the parent.  By handling
+        // SessionInfoUpdate with an early return we keep it out of the
+        // shared chunk → response_text path entirely.
+        if let acp::SessionUpdate::SessionInfoUpdate(ref info) = args.update {
+            let display = format_session_info_update(info);
+            if !display.is_empty() {
+                self.forward_display_chunk(&display).await;
+            }
+            return Ok(());
+        }
+
         let is_agent_message = matches!(args.update, acp::SessionUpdate::AgentMessageChunk(_));
         let chunk = match args.update {
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) => {
@@ -211,57 +226,8 @@ impl acp::Client for AcpNotificationClient {
                     )
                 }
             }
-            acp::SessionUpdate::SessionInfoUpdate(info) => {
-                // Extract token usage from custom _meta if present.
-                // Sent by harnx ACP servers via `harnx:usage`.
-                if let Some(meta) = &info.meta {
-                    if let Some(usage) = meta.get("harnx:usage") {
-                        let input = usage["input_tokens"].as_u64().unwrap_or(0);
-                        let output = usage["output_tokens"].as_u64().unwrap_or(0);
-                        let cached = usage["cached_tokens"].as_u64().unwrap_or(0);
-                        let agent = usage["agent"].as_str().unwrap_or("");
-                        let session = usage["session"].as_str().unwrap_or("");
-                        if input > 0 || output > 0 {
-                            // Format like the main REPL status line:
-                            //   🤖 agent ▸ session   📥 N  📤 N  💾 N
-                            let status = match (agent.is_empty(), session.is_empty()) {
-                                (false, false) => format!("🤖 {} ▸ {}", agent, session),
-                                (false, true) => format!("🤖 {}", agent),
-                                (true, false) => format!("💬 {}", session),
-                                (true, true) => String::new(),
-                            };
-                            let mut line_parts = vec![];
-                            if !status.is_empty() {
-                                line_parts.push(status);
-                            }
-                            let mut usage_parts = vec![];
-                            if input > 0 {
-                                usage_parts.push(format!("📥 {input}"));
-                            }
-                            if output > 0 {
-                                usage_parts.push(format!("📤 {output}"));
-                            }
-                            if cached > 0 {
-                                usage_parts.push(format!("💾 {cached}"));
-                            }
-                            if !usage_parts.is_empty() {
-                                line_parts.push(format!("   {}", usage_parts.join("  ")));
-                            }
-                            if line_parts.is_empty() {
-                                String::new()
-                            } else {
-                                format!("\n{}\n", dimmed_text(&line_parts.join("")))
-                            }
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                }
-            }
+            // SessionInfoUpdate is handled above via early return.
+            acp::SessionUpdate::SessionInfoUpdate(_) => unreachable!(),
             // Explicitly list known-but-unhandled variants so new ones from
             // future ACP SDK upgrades surface as compile warnings in the
             // wildcard arm below.
@@ -304,6 +270,29 @@ impl acp::Client for AcpNotificationClient {
         }
 
         Ok(())
+    }
+
+    /// Forward a display-only chunk (e.g. usage banner) to subscribers or
+    /// stderr.  Unlike the main chunk path this never touches
+    /// `state.response_text`.
+    async fn forward_display_chunk(&self, text: &str) {
+        let mut delivered = false;
+        let mut forwarders = self.chunk_forwarder.write().await;
+        if forwarders.is_empty() {
+            eprint!("{}", text);
+        } else {
+            let owned = text.to_string();
+            forwarders.retain(|_, tx| match tx.send(owned.clone()) {
+                Ok(()) => {
+                    delivered = true;
+                    true
+                }
+                Err(_) => false,
+            });
+            if !delivered {
+                eprint!("{}", text);
+            }
+        }
     }
 
     async fn write_text_file(
@@ -895,6 +884,55 @@ async fn join_worker(join: thread::JoinHandle<()>) {
         Err(_) => {
             log::warn!("Timed out waiting for ACP worker thread to exit");
         }
+    }
+}
+
+/// Format a `SessionInfoUpdate` for display.  Returns an empty string if
+/// there is nothing to show (no `harnx:usage` metadata or zero tokens).
+fn format_session_info_update(info: &acp::SessionInfoUpdate) -> String {
+    let Some(meta) = &info.meta else {
+        return String::new();
+    };
+    let Some(usage) = meta.get("harnx:usage") else {
+        return String::new();
+    };
+    let input = usage["input_tokens"].as_u64().unwrap_or(0);
+    let output = usage["output_tokens"].as_u64().unwrap_or(0);
+    let cached = usage["cached_tokens"].as_u64().unwrap_or(0);
+    let agent = usage["agent"].as_str().unwrap_or("");
+    let session = usage["session"].as_str().unwrap_or("");
+    if input == 0 && output == 0 {
+        return String::new();
+    }
+    // Format like the main REPL status line:
+    //   🤖 agent ▸ session   📥 N  📤 N  💾 N
+    let status = match (agent.is_empty(), session.is_empty()) {
+        (false, false) => format!("🤖 {} ▸ {}", agent, session),
+        (false, true) => format!("🤖 {}", agent),
+        (true, false) => format!("💬 {}", session),
+        (true, true) => String::new(),
+    };
+    let mut line_parts = vec![];
+    if !status.is_empty() {
+        line_parts.push(status);
+    }
+    let mut usage_parts = vec![];
+    if input > 0 {
+        usage_parts.push(format!("📥 {input}"));
+    }
+    if output > 0 {
+        usage_parts.push(format!("📤 {output}"));
+    }
+    if cached > 0 {
+        usage_parts.push(format!("💾 {cached}"));
+    }
+    if !usage_parts.is_empty() {
+        line_parts.push(format!("   {}", usage_parts.join("  ")));
+    }
+    if line_parts.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}\n", dimmed_text(&line_parts.join("")))
     }
 }
 
