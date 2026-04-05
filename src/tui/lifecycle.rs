@@ -48,6 +48,7 @@ impl Tui {
                 should_quit: false,
                 llm_busy: false,
                 transcript_scroll: 0,
+                max_scroll: 0,
                 streaming_assistant_idx: None,
                 pending_message: None,
                 completions: vec![],
