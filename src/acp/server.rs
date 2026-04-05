@@ -66,12 +66,21 @@ impl HarnxAgent {
         }
         let connection = self.connection.borrow().clone();
         if let Some(connection) = connection {
+            // Include the harnx session name (human-readable) when available,
+            // falling back to the ACP session ID.
+            let session_name = self
+                .config
+                .read()
+                .session
+                .as_ref()
+                .map(|s| s.name().to_string())
+                .unwrap_or_default();
             let mut meta = serde_json::Map::new();
             meta.insert(
                 "harnx:usage".to_string(),
                 json!({
                     "agent": self.agent_name,
-                    "session_id": session_id,
+                    "session": session_name,
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
                     "cached_tokens": cached_tokens,

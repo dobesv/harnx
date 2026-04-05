@@ -220,28 +220,38 @@ impl acp::Client for AcpNotificationClient {
                         let output = usage["output_tokens"].as_u64().unwrap_or(0);
                         let cached = usage["cached_tokens"].as_u64().unwrap_or(0);
                         let agent = usage["agent"].as_str().unwrap_or("");
-                        let sid = usage["session_id"].as_str().unwrap_or("");
+                        let session = usage["session"].as_str().unwrap_or("");
                         if input > 0 || output > 0 {
-                            let mut parts = vec![];
-                            // Show agent name and abbreviated session ID for context.
-                            if !agent.is_empty() {
-                                let sid_short = if sid.len() > 8 { &sid[..8] } else { sid };
-                                if !sid_short.is_empty() {
-                                    parts.push(format!("🤖 {agent}({sid_short})"));
-                                } else {
-                                    parts.push(format!("🤖 {agent}"));
-                                }
+                            // Format like the main REPL status line:
+                            //   🤖 agent ▸ session   📥 N  📤 N  💾 N
+                            let status = match (agent.is_empty(), session.is_empty()) {
+                                (false, false) => format!("🤖 {} ▸ {}", agent, session),
+                                (false, true) => format!("🤖 {}", agent),
+                                (true, false) => format!("💬 {}", session),
+                                (true, true) => String::new(),
+                            };
+                            let mut line_parts = vec![];
+                            if !status.is_empty() {
+                                line_parts.push(status);
                             }
+                            let mut usage_parts = vec![];
                             if input > 0 {
-                                parts.push(format!("📥 {input}"));
+                                usage_parts.push(format!("📥 {input}"));
                             }
                             if output > 0 {
-                                parts.push(format!("📤 {output}"));
+                                usage_parts.push(format!("📤 {output}"));
                             }
                             if cached > 0 {
-                                parts.push(format!("💾 {cached}"));
+                                usage_parts.push(format!("💾 {cached}"));
                             }
-                            format!("\n{}\n", dimmed_text(&format!("   {}", parts.join("  "))))
+                            if !usage_parts.is_empty() {
+                                line_parts.push(format!("   {}", usage_parts.join("  ")));
+                            }
+                            if line_parts.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n{}\n", dimmed_text(&line_parts.join("")))
+                            }
                         } else {
                             String::new()
                         }
