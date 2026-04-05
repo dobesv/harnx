@@ -859,7 +859,10 @@ fn parse_messages(message: Vec<Value>) -> Result<Vec<Message>> {
                             ) {
                                 let arguments =
                                     serde_json::from_str(arguments).map_err(|_| err())?;
-                                list.push((id, name.to_string(), arguments));
+                                let thought_signature = tool_call["function"]["thought_signature"]
+                                    .as_str()
+                                    .map(|v| v.to_string());
+                                list.push((id, name.to_string(), arguments, thought_signature));
                             } else {
                                 return Err(err());
                             }
@@ -881,17 +884,22 @@ fn parse_messages(message: Vec<Value>) -> Result<Vec<Message>> {
 
                     if tool_calls.len() == tool_values.len() {
                         let mut list = vec![];
-                        for ((id, name, arguments), (value, tool_call_id)) in
+                        for ((id, name, arguments, thought_signature), (value, tool_call_id)) in
                             tool_calls.into_iter().zip(tool_values.into_iter())
                         {
                             if id != tool_call_id {
                                 return Err(err());
                             }
-                            list.push(ToolResult::new(ToolCall::new(name, arguments, id), value))
+                            list.push(ToolResult::new(
+                                ToolCall::new(name, arguments, id, thought_signature),
+                                value,
+                            ))
                         }
                         output.push(Message::new(
                             MessageRole::Assistant,
-                            MessageContent::ToolCalls(MessageContentToolCalls::new(list, text)),
+                            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                                list, text, None,
+                            )),
                         ));
                         tool_results = None;
                     } else {

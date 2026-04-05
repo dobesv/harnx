@@ -209,12 +209,19 @@ impl Input {
         self.rag_name.as_deref()
     }
 
-    pub fn merge_tool_results(mut self, output: String, tool_results: Vec<ToolResult>) -> Self {
+    pub fn merge_tool_results(
+        mut self,
+        output: String,
+        thought: Option<String>,
+        tool_results: Vec<ToolResult>,
+    ) -> Self {
         match self.tool_calls.as_mut() {
             Some(exist_tool_results) => {
-                exist_tool_results.merge(tool_results, output);
+                exist_tool_results.merge(tool_results, output, thought);
             }
-            None => self.tool_calls = Some(MessageContentToolCalls::new(tool_results, output)),
+            None => {
+                self.tool_calls = Some(MessageContentToolCalls::new(tool_results, output, thought))
+            }
         }
         self
     }

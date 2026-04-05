@@ -487,7 +487,12 @@ impl Session {
         Ok(())
     }
 
-    pub fn add_message(&mut self, input: &Input, output: &str) -> Result<()> {
+    pub fn add_message(
+        &mut self,
+        input: &Input,
+        output: &str,
+        thought: Option<&str>,
+    ) -> Result<()> {
         if input.continue_output().is_some() {
             if let Some(message) = self.messages.last_mut() {
                 if let MessageContent::Text(text) = &mut message.content {
@@ -513,16 +518,18 @@ impl Session {
                     .push(Message::new(MessageRole::User, input.message_content()));
             }
             self.data_urls.extend(input.data_urls());
-            if let Some(tool_calls) = input.tool_calls() {
+            if let Some(tool_calls) = input.tool_calls().clone() {
                 self.messages.push(Message::new(
                     MessageRole::Tool,
-                    MessageContent::ToolCalls(tool_calls.clone()),
+                    MessageContent::ToolCalls(tool_calls),
                 ))
             }
-            self.messages.push(Message::new(
-                MessageRole::Assistant,
-                MessageContent::Text(output.to_string()),
-            ));
+            let content = match thought {
+                Some(v) => MessageContent::Text(format!("<think>\n{v}\n</think>\n{output}")),
+                _ => MessageContent::Text(output.to_string()),
+            };
+            self.messages
+                .push(Message::new(MessageRole::Assistant, content));
         }
         self.dirty = true;
         self.update_tokens();

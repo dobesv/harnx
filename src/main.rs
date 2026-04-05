@@ -462,7 +462,7 @@ async fn start_directive_inner(
         HookResultControl::Ask { .. } => {} // Ask is not applicable for UserPromptSubmit
         HookResultControl::Continue => {}
     }
-    let (output, tool_results, usage) = if !input.stream() {
+    let (output, thought, tool_results, usage) = if !input.stream() {
         match call_chat_completions(&input, true, false, client.as_ref(), abort_signal.clone())
             .await
         {
@@ -481,9 +481,13 @@ async fn start_directive_inner(
                     Some(persistent_manager),
                 )
                 .await;
-                let _ = config
-                    .write()
-                    .after_chat_completion(&input, "", &[], &Default::default());
+                let _ = config.write().after_chat_completion(
+                    &input,
+                    "",
+                    None,
+                    &[],
+                    &Default::default(),
+                );
                 return Err(err);
             }
         }
@@ -504,16 +508,24 @@ async fn start_directive_inner(
                     Some(persistent_manager),
                 )
                 .await;
-                let _ = config
-                    .write()
-                    .after_chat_completion(&input, "", &[], &Default::default());
+                let _ = config.write().after_chat_completion(
+                    &input,
+                    "",
+                    None,
+                    &[],
+                    &Default::default(),
+                );
                 return Err(err);
             }
         }
     };
-    config
-        .write()
-        .after_chat_completion(&input, &output, &tool_results, &usage)?;
+    config.write().after_chat_completion(
+        &input,
+        &output,
+        thought.as_deref(),
+        &tool_results,
+        &usage,
+    )?;
     if tool_results.is_empty() {
         let config_read = config.read();
         let status = config_read.render_status_line(true);
@@ -607,7 +619,7 @@ async fn start_directive_inner(
 
         return start_directive_inner(
             config,
-            input.merge_tool_results(output, tool_results),
+            input.merge_tool_results(output, thought, tool_results),
             abort_signal,
             async_manager,
             persistent_manager,

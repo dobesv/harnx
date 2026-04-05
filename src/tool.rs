@@ -281,6 +281,8 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 impl ToolCall {
@@ -303,11 +305,17 @@ impl ToolCall {
         new_calls
     }
 
-    pub fn new(name: String, arguments: Value, id: Option<String>) -> Self {
+    pub fn new(
+        name: String,
+        arguments: Value,
+        id: Option<String>,
+        thought_signature: Option<String>,
+    ) -> Self {
         Self {
             name,
             arguments,
             id,
+            thought_signature,
         }
     }
 
@@ -517,7 +525,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_eval_tool_calls_error_handling() {
         let config = Arc::new(RwLock::new(Config::default()));
-        let call = ToolCall::new("unknown_tool".to_string(), json!({}), Some("1".to_string()));
+        let call = ToolCall::new(
+            "unknown_tool".to_string(),
+            json!({}),
+            Some("1".to_string()),
+            None,
+        );
         let calls = vec![call];
 
         let result = eval_tool_calls(&config, calls).unwrap();
@@ -539,8 +552,14 @@ mod tests {
             TRIGGER_AGENT_TOOL_NAME.to_string(),
             json!({"agent": "test", "prompt": "test"}),
             Some("1".to_string()),
+            None,
         );
-        let call2 = ToolCall::new("unknown_tool".to_string(), json!({}), Some("2".to_string()));
+        let call2 = ToolCall::new(
+            "unknown_tool".to_string(),
+            json!({}),
+            Some("2".to_string()),
+            None,
+        );
         let calls = vec![call1, call2];
 
         let result = eval_tool_calls(&config, calls).unwrap();

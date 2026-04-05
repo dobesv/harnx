@@ -1107,7 +1107,7 @@ async fn ask_inner(
             env::current_dir().unwrap_or_default(),
         )
     };
-    let (output, tool_results, usage) = if input.stream() {
+    let (output, thought, tool_results, usage) = if input.stream() {
         match call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await {
             Ok(result) => result,
             Err(err) => {
@@ -1124,9 +1124,13 @@ async fn ask_inner(
                     Some(persistent_manager),
                 )
                 .await;
-                let _ = config
-                    .write()
-                    .after_chat_completion(&input, "", &[], &Default::default());
+                let _ = config.write().after_chat_completion(
+                    &input,
+                    "",
+                    None,
+                    &[],
+                    &Default::default(),
+                );
                 return Err(err);
             }
         }
@@ -1149,16 +1153,24 @@ async fn ask_inner(
                     Some(persistent_manager),
                 )
                 .await;
-                let _ = config
-                    .write()
-                    .after_chat_completion(&input, "", &[], &Default::default());
+                let _ = config.write().after_chat_completion(
+                    &input,
+                    "",
+                    None,
+                    &[],
+                    &Default::default(),
+                );
                 return Err(err);
             }
         }
     };
-    config
-        .write()
-        .after_chat_completion(&input, &output, &tool_results, &usage)?;
+    config.write().after_chat_completion(
+        &input,
+        &output,
+        thought.as_deref(),
+        &tool_results,
+        &usage,
+    )?;
     if tool_results.is_empty() {
         if !config.read().macro_flag {
             eprintln!();
@@ -1256,7 +1268,7 @@ async fn ask_inner(
         ask_inner(
             config,
             abort_signal,
-            input.merge_tool_results(output, tool_results),
+            input.merge_tool_results(output, thought, tool_results),
             false,
             async_manager,
             persistent_manager,

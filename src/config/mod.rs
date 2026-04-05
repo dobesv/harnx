@@ -1199,7 +1199,7 @@ impl Config {
                         .with_default(false)
                         .prompt()?;
                         if ans {
-                            session.add_message(input, output)?;
+                            session.add_message(input, output, None)?;
                         }
                     }
                 }
@@ -2235,6 +2235,7 @@ impl Config {
         &mut self,
         input: &Input,
         output: &str,
+        thought: Option<&str>,
         tool_results: &[ToolResult],
         usage: &crate::client::CompletionTokenUsage,
     ) -> Result<()> {
@@ -2246,7 +2247,7 @@ impl Config {
         }
         self.last_message = Some(LastMessage::new(input.clone(), output.to_string()));
         if !self.dry_run {
-            self.save_message(input, output)?;
+            self.save_message(input, output, thought)?;
         }
         Ok(())
     }
@@ -2257,11 +2258,11 @@ impl Config {
         }
     }
 
-    fn save_message(&mut self, input: &Input, output: &str) -> Result<()> {
+    fn save_message(&mut self, input: &Input, output: &str, thought: Option<&str>) -> Result<()> {
         let mut input = input.clone();
         input.clear_patch();
         if let Some(session) = input.session_mut(&mut self.session) {
-            session.add_message(&input, output)?;
+            session.add_message(&input, output, thought)?;
             return Ok(());
         }
 
@@ -2304,8 +2305,12 @@ impl Config {
             }
             None => String::new(),
         };
+        let thought = match thought {
+            Some(v) => format!("<think>\n{v}\n</think>\n"),
+            None => String::new(),
+        };
         let output = format!(
-            "# CHAT: {summary} [{now}]{scope}\n{raw_input}\n--------\n{tool_calls}{output}\n--------\n\n",
+            "# CHAT: {summary} [{now}]{scope}\n{raw_input}\n--------\n{thought}{tool_calls}{output}\n--------\n\n",
         );
         file.write_all(output.as_bytes())
             .with_context(|| "Failed to save message")

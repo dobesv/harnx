@@ -122,6 +122,7 @@ pub async fn openai_chat_completions_streaming(
                     function_name.clone(),
                     arguments,
                     normalize_function_id(&function_id),
+                    None,
                 ))?;
             }
             return Ok(true);
@@ -172,8 +173,8 @@ pub async fn openai_chat_completions_streaming(
                         function_name.clone(),
                         arguments,
                         normalize_function_id(&function_id),
-                    ))?;
-                }
+                        None,
+                    ))?;                }
                 function_name.clear();
                 function_arguments.clear();
                 function_id.clear();
@@ -258,6 +259,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                 MessageContent::ToolCalls(MessageContentToolCalls {
                     tool_results,
                     text: _,
+                    thought: _,
                     sequence,
                 }) => {
                     if !sequence {
@@ -393,6 +395,7 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
                     name.to_string(),
                     arguments,
                     Some(id.to_string()),
+                    None,
                 ));
             }
         }
@@ -409,6 +412,7 @@ pub fn openai_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        thought: None,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["prompt_tokens"].as_u64(),
         output_tokens: data["usage"]["completion_tokens"].as_u64(),

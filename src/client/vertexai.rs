@@ -217,11 +217,22 @@ pub async fn gemini_chat_completions_streaming(
                             handler.text("\n\n")?;
                         }
                         handler.text(text)?;
+                    } else if let Some(thought) = part["thought"].as_str() {
+                        handler.thought(thought)?;
                     } else if let (Some(name), Some(args)) = (
                         part["functionCall"]["name"].as_str(),
                         part["functionCall"]["args"].as_object(),
                     ) {
-                        handler.tool_call(ToolCall::new(name.to_string(), json!(args), None))?;
+                        let thought_signature = part["thoughtSignature"]
+                            .as_str()
+                            .or_else(|| part["thought_signature"].as_str())
+                            .map(|v| v.to_string());
+                        handler.tool_call(ToolCall::new(
+                            name.to_string(),
+                            json!(args),
+                            None,
+                            thought_signature,
+                        ))?;
                     }
                 }
             } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
@@ -277,23 +288,41 @@ struct EmbeddingsResBodyPredictionEmbeddings {
 
 fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsOutput> {
     let mut text_parts = vec![];
+    let mut thought_parts = vec![];
     let mut tool_calls = vec![];
     if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
         for part in parts {
             if let Some(text) = part["text"].as_str() {
                 text_parts.push(text);
             }
+            if let Some(thought) = part["thought"].as_str() {
+                thought_parts.push(thought);
+            }
             if let (Some(name), Some(args)) = (
                 part["functionCall"]["name"].as_str(),
                 part["functionCall"]["args"].as_object(),
             ) {
-                tool_calls.push(ToolCall::new(name.to_string(), json!(args), None));
+                let thought_signature = part["thoughtSignature"]
+                    .as_str()
+                    .or_else(|| part["thought_signature"].as_str())
+                    .map(|v| v.to_string());
+                tool_calls.push(ToolCall::new(
+                    name.to_string(),
+                    json!(args),
+                    None,
+                    thought_signature,
+                ));
             }
         }
     }
 
     let text = text_parts.join("\n\n");
-    if text.is_empty() && tool_calls.is_empty() {
+    let thought = if thought_parts.is_empty() {
+        None
+    } else {
+        Some(thought_parts.join("\n\n"))
+    };
+    if text.is_empty() && tool_calls.is_empty() && thought.is_none() {
         if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
             .as_str()
             .or_else(|| data["candidates"][0]["finishReason"].as_str())
@@ -306,6 +335,7 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        thought,
         id: None,
         input_tokens: data["usageMetadata"]["promptTokenCount"].as_u64(),
         output_tokens: data["usageMetadata"]["candidatesTokenCount"].as_u64(),
@@ -359,15 +389,35 @@ pub fn gemini_build_chat_completions_body(
                             .collect();
                         vec![json!({ "role": role, "parts": parts })]
                     },
-                    MessageContent::ToolCalls(MessageContentToolCalls { tool_results, .. }) => {
-                        let model_parts: Vec<Value> = tool_results.iter().map(|tool_result| {
-                            json!({
-                                "functionCall": {
-                                    "name": tool_result.call.name,
-                                    "args": tool_result.call.arguments,
+                    MessageContent::ToolCalls(MessageContentToolCalls {
+                        tool_results,
+                        text,
+                        thought,
+                        ..
+                    }) => {
+                        let mut model_parts = vec![];
+                        if let Some(thought) = thought {
+                            model_parts.push(json!({ "thought": thought }));
+                        }
+                        if !text.is_empty() {
+                            model_parts.push(json!({ "text": text }));
+                        }
+                        for tool_result in tool_results.iter() {
+                            let call_obj = json!({
+                                "name": tool_result.call.name,
+                                "args": tool_result.call.arguments,
+                            });
+                            let mut part_obj = json!({ "functionCall": call_obj });
+                            if let Some(signature) = &tool_result.call.thought_signature {
+                                if let Some(obj) = part_obj.as_object_mut() {
+                                    obj.insert(
+                                        "thoughtSignature".to_string(),
+                                        signature.clone().into(),
+                                    );
                                 }
-                            })
-                        }).collect();
+                            }
+                            model_parts.push(part_obj);
+                        }
                         let function_parts: Vec<Value> = tool_results.into_iter().map(|tool_result| {
                             json!({
                                 "functionResponse": {
@@ -395,7 +445,7 @@ pub fn gemini_build_chat_completions_body(
         );
     }
 
-    let mut body = json!({ "contents": contents, "generationConfig": {} });
+    let mut body = json!({ "contents": contents, "generationConfig": {} }); 
 
     if let Some(parts) = system_message {
         let gemini_parts: Vec<Value> = parts
