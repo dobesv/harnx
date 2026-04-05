@@ -1,0 +1,63 @@
+use crate::client::CompletionTokenUsage;
+use crate::config::GlobalConfig;
+use crate::hooks::{AsyncHookManager, PersistentHookManager};
+use crate::tool::ToolResult;
+use crate::utils::AbortSignal;
+
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, Mutex};
+use tui_textarea::TextArea;
+
+pub(super) const MIN_INPUT_HEIGHT: u16 = 3;
+pub(super) const MAX_INPUT_HEIGHT: u16 = 8;
+pub(super) const TICK_RATE: Duration = Duration::from_millis(80);
+pub(super) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+pub struct Tui {
+    pub(super) config: GlobalConfig,
+    pub(super) abort_signal: AbortSignal,
+    pub(super) async_manager: Arc<Mutex<AsyncHookManager>>,
+    pub(super) persistent_manager: Arc<Mutex<PersistentHookManager>>,
+    pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
+    pub(super) app: App,
+    pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
+    pub(super) event_rx: mpsc::UnboundedReceiver<TuiEvent>,
+}
+
+pub(super) struct App {
+    pub(super) transcript: Vec<TranscriptEntry>,
+    pub(super) input: TextArea<'static>,
+    pub(super) spinner_index: usize,
+    pub(super) should_quit: bool,
+    pub(super) llm_busy: bool,
+    pub(super) transcript_scroll: u16,
+    pub(super) streaming_assistant_idx: Option<usize>,
+    pub(super) pending_message: Option<String>,
+    pub(super) completions: Vec<(String, Option<String>)>,
+    pub(super) completion_index: usize,
+    pub(super) completion_prefix: String,
+    pub(super) completion_suffix: String,
+    pub(super) history: Vec<String>,
+    pub(super) history_index: Option<usize>,
+    pub(super) history_draft: String,
+}
+
+#[derive(Clone)]
+pub(super) enum TranscriptEntry {
+    System(String),
+    User(String),
+    Assistant(String),
+    Error(String),
+}
+
+pub(super) enum TuiEvent {
+    UiOutput(String),
+    Chunk(String),
+    Finished {
+        output: String,
+        usage: CompletionTokenUsage,
+        tool_results: Vec<ToolResult>,
+    },
+    Errored(String),
+}
