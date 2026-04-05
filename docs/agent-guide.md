@@ -24,7 +24,7 @@ model: openai:gpt-4o
 temperature: 0
 top_p: 0.9
 use_tools:
-  - fs:all
+  - fs_*
   - bash_exec
 description: A helpful coding assistant
 version: "1.0"
@@ -176,15 +176,16 @@ Both the body and `instructions` support `{{variable}}` and `{{__builtin__}}` in
 
 ## Tools
 
-The `use_tools` field controls which MCP tools the agent can access. Tools are specified as a YAML list (a comma-separated string is also accepted for backward compatibility).
+The `use_tools` field controls which MCP tools the agent can access. Tools are specified as a YAML list (a comma-separated string is also accepted for backward compatibility). Glob patterns are supported via the `globset` crate, including `*` wildcards and `{a,b}` brace expansion.
 
 ### Syntax
 
 | Pattern | Meaning |
 |---|---|
 | `tool_name` | Enable a single tool by name |
-| `server:all` | Enable all tools from an MCP server |
-| `all` | Enable every available tool |
+| `server_*` | Enable all tools from an MCP server (glob pattern) |
+| `*` | Enable every available tool |
+| `prefix_{a,b}` | Enable specific tools matching a brace expansion |
 | `toolset_name` | Enable a named toolset (defined in global config) |
 
 ### Examples
@@ -197,18 +198,22 @@ use_tools:
 
 # All tools from a server
 use_tools:
-  - fs:all
-  - git:all
+  - fs_*
+  - git_*
 
 # Everything
 use_tools:
-  - all
+  - "*"
 
 # Mix of patterns
 use_tools:
-  - fs:all
+  - fs_*
   - web_search
   - my_toolset
+
+# Specific tools via brace expansion
+use_tools:
+  - fs_{read_file,write_file,list_directory}
 ```
 
 When tools are enabled, their declarations are injected into the system prompt as a numbered list appended after the prompt body.
@@ -334,7 +339,7 @@ An agent with access to filesystem and shell tools:
 ---
 model: claude:claude-3-5-sonnet
 use_tools:
-  - fs:all
+  - fs_*
   - bash_exec
 description: Coding assistant with file and shell access
 ---

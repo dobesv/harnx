@@ -21,6 +21,7 @@ use crate::tool::{ToolDeclaration, ToolResult, Tools};
 use crate::utils::*;
 
 use anyhow::{anyhow, bail, Context, Result};
+use globset::GlobBuilder;
 use indexmap::IndexMap;
 use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use parking_lot::RwLock;
@@ -100,8 +101,8 @@ enum ToolsetValue {
 
 fn normalize_toolset_value(value: ToolsetValue) -> Vec<String> {
     match value {
-        ToolsetValue::String(value) => value
-            .split(',')
+        ToolsetValue::String(value) => split_tool_selectors(&value)
+            .into_iter()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
@@ -129,6 +130,38 @@ fn parse_toolsets_json(value: &str) -> serde_json::Result<IndexMap<String, Vec<S
         .into_iter()
         .map(|(key, value)| (key, normalize_toolset_value(value)))
         .collect())
+}
+
+/// Split a comma-separated string of tool selectors while respecting `{…}` brace groups.
+///
+/// A comma inside braces (e.g. `fs_{read_file,write_file}`) is *not* treated as a separator.
+fn split_tool_selectors(input: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut depth: usize = 0;
+    for (i, ch) in input.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                items.push(&input[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&input[start..]);
+    items
+}
+
+/// Check whether a glob pattern matches a tool name.
+/// Returns `false` if the pattern is invalid (graceful degradation).
+fn matches_tool_glob(pattern: &str, name: &str) -> bool {
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .ok()
+        .is_some_and(|g| g.compile_matcher().is_match(name))
 }
 
 /// Deserializes `use_tools` accepting both a YAML list and a comma-separated string.
@@ -691,8 +724,8 @@ impl Config {
                     None
                 } else {
                     Some(
-                        value
-                            .split(',')
+                        split_tool_selectors(value)
+                            .into_iter()
                             .map(str::trim)
                             .filter(|s| !s.is_empty())
                             .map(String::from)
@@ -730,7 +763,7 @@ impl Config {
                 if value
                     && config
                         .read()
-                        .tool_declarations_for_use_tools(Some("all"))
+                        .tool_declarations_for_use_tools(Some("*"))
                         .is_empty()
                 {
                     bail!("Tool use cannot be enabled because no tools are installed.")
@@ -860,13 +893,6 @@ impl Config {
             None => return HashSet::new(),
         };
         let use_tools_str = use_tools.join(",");
-        if use_tools.iter().any(|v| v == "all") {
-            return self
-                .tool_declarations_for_use_tools(Some("all"))
-                .into_iter()
-                .map(|d| d.name)
-                .collect();
-        }
         let declarations = self.tool_declarations_for_use_tools(Some(&use_tools_str));
         let declaration_names: HashSet<String> =
             declarations.iter().map(|d| d.name.clone()).collect();
@@ -879,16 +905,13 @@ impl Config {
                         .filter(|v| declaration_names.contains(v.as_str()))
                         .cloned(),
                 );
-            } else if let Some(server) = item.strip_suffix(":all") {
-                let prefix = format!("{server}_");
+            } else {
                 names.extend(
                     declaration_names
                         .iter()
-                        .filter(|n| n.starts_with(&prefix))
+                        .filter(|n| matches_tool_glob(item, n))
                         .cloned(),
                 );
-            } else if declaration_names.contains(item) {
-                names.insert(item.to_string());
             }
         }
         names
@@ -1749,28 +1772,21 @@ impl Config {
                 let mut tool_names: HashSet<String> = Default::default();
                 let declaration_names: HashSet<String> =
                     declarations.iter().map(|v| v.name.to_string()).collect();
-                if use_tools.iter().any(|v| v == "all") {
-                    tool_names.extend(declaration_names);
-                } else {
-                    for item in use_tools.iter().map(|s| s.trim()) {
-                        if let Some(values) = self.toolsets.get(item) {
-                            tool_names.extend(
-                                values
-                                    .iter()
-                                    .filter(|v| declaration_names.contains(v.as_str()))
-                                    .cloned(),
-                            )
-                        } else if let Some(server) = item.strip_suffix(":all") {
-                            let prefix = format!("{server}_");
-                            tool_names.extend(
-                                declaration_names
-                                    .iter()
-                                    .filter(|name| name.starts_with(&prefix))
-                                    .cloned(),
-                            );
-                        } else if declaration_names.contains(item) {
-                            tool_names.insert(item.to_string());
-                        }
+                for item in use_tools.iter().map(|s| s.trim()) {
+                    if let Some(values) = self.toolsets.get(item) {
+                        tool_names.extend(
+                            values
+                                .iter()
+                                .filter(|v| declaration_names.contains(v.as_str()))
+                                .cloned(),
+                        )
+                    } else {
+                        tool_names.extend(
+                            declaration_names
+                                .iter()
+                                .filter(|name| matches_tool_glob(item, name))
+                                .cloned(),
+                        );
                     }
                 }
                 functions = declarations
@@ -1918,10 +1934,10 @@ impl Config {
                     }
                     let mut values = vec![];
                     if prefix.is_empty() {
-                        values.push("all".to_string());
+                        values.push("*".to_string());
                     }
                     values.extend(
-                        self.tool_declarations_for_use_tools(Some("all"))
+                        self.tool_declarations_for_use_tools(Some("*"))
                             .iter()
                             .map(|v| v.name.clone()),
                     );
@@ -1950,14 +1966,14 @@ impl Config {
             values = candidates.into_iter().map(|v| (v, None)).collect();
         } else if cmd == ".use" && args.len() == 2 && args[0] == "tool" {
             let mut candidates: Vec<String> = self
-                .tool_declarations_for_use_tools(Some("all"))
+                .tool_declarations_for_use_tools(Some("*"))
                 .iter()
                 .map(|v| v.name.clone())
                 .collect();
             candidates.extend(self.toolsets.keys().map(|v| v.to_string()));
             if let Some(manager) = &self.mcp_manager {
                 for name in manager.list_servers() {
-                    candidates.push(format!("{name}:all"));
+                    candidates.push(format!("{name}_*"));
                 }
             }
             let active = self.active_tool_names();
@@ -2452,7 +2468,8 @@ impl Config {
                 self.use_tools = None;
             } else {
                 self.use_tools = Some(
-                    v.split(',')
+                    split_tool_selectors(&v)
+                        .into_iter()
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(String::from)
@@ -2566,11 +2583,11 @@ impl Config {
                     declarations.extend(manager.get_all_tools_blocking());
                 }
             }
-            if use_tools == "all"
-                || use_tools
-                    .split(',')
-                    .any(|v| v.trim() == crate::tool::TRIGGER_AGENT_TOOL_NAME)
-            {
+            if split_tool_selectors(use_tools).into_iter().any(|v| {
+                let v = v.trim();
+                v == crate::tool::TRIGGER_AGENT_TOOL_NAME
+                    || matches_tool_glob(v, crate::tool::TRIGGER_AGENT_TOOL_NAME)
+            }) {
                 declarations.push(crate::tool::trigger_agent_tool_declaration());
             }
         }
@@ -3069,6 +3086,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_tool_selectors_simple() {
+        assert_eq!(split_tool_selectors("a,b,c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_split_tool_selectors_braces() {
+        assert_eq!(
+            split_tool_selectors("fs_{read_file,write_file},bash_exec"),
+            vec!["fs_{read_file,write_file}", "bash_exec"]
+        );
+    }
+
+    #[test]
+    fn test_split_tool_selectors_single() {
+        assert_eq!(split_tool_selectors("*"), vec!["*"]);
+    }
+
+    #[test]
+    fn test_split_tool_selectors_nested_braces() {
+        assert_eq!(
+            split_tool_selectors("a_{b_{c,d},e},f"),
+            vec!["a_{b_{c,d},e}", "f"]
+        );
+    }
+
+    #[test]
+    fn test_split_tool_selectors_empty() {
+        assert_eq!(split_tool_selectors(""), vec![""]);
+    }
 
     #[test]
     fn test_init_mcp_manager_with_roots() {

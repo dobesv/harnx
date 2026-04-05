@@ -482,7 +482,7 @@ pub async fn run_repl_command(
                 }
                 Some("tools") => {
                     let conf = config.read();
-                    let declarations = conf.tool_declarations_for_use_tools(Some("all"));
+                    let declarations = conf.tool_declarations_for_use_tools(Some("*"));
                     let active_tools = conf.active_tool_names();
                     if declarations.is_empty() {
                         println!("No tools available");
@@ -877,28 +877,28 @@ Commands:
                 )
                 .await?;
             }
-            ".use" => {
-                match split_first_arg(args) {
-                    Some(("tool", name)) => {
-                        let name = name.map(|n| n.trim()).unwrap_or("");
-                        if name.is_empty() {
-                            println!("Usage: .use tool <name>  (tool name, toolset name, or <server>:all)");
+            ".use" => match split_first_arg(args) {
+                Some(("tool", name)) => {
+                    let name = name.map(|n| n.trim()).unwrap_or("");
+                    if name.is_empty() {
+                        println!(
+                            "Usage: .use tool <name>  (tool name, toolset name, or <server>_*)"
+                        );
+                    } else {
+                        let mut conf = config.write();
+                        let current = conf.extract_agent().use_tools().unwrap_or_default();
+                        if current.iter().any(|v| v == name) {
+                            println!("'{}' is already in use_tools", name);
                         } else {
-                            let mut conf = config.write();
-                            let current = conf.extract_agent().use_tools().unwrap_or_default();
-                            if current.iter().any(|v| v == name) {
-                                println!("'{}' is already in use_tools", name);
-                            } else {
-                                let mut new_items = current;
-                                new_items.push(name.to_string());
-                                conf.set_use_tools(Some(new_items));
-                                println!("Added '{}' to use_tools", name);
-                            }
+                            let mut new_items = current;
+                            new_items.push(name.to_string());
+                            conf.set_use_tools(Some(new_items));
+                            println!("Added '{}' to use_tools", name);
                         }
                     }
-                    _ => println!("Usage: .use tool <name>"),
                 }
-            }
+                _ => println!("Usage: .use tool <name>"),
+            },
             ".drop" => match split_first_arg(args) {
                 Some(("tool", name)) => {
                     let name = name.map(|n| n.trim()).unwrap_or("");
