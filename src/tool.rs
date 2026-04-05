@@ -358,15 +358,23 @@ impl ToolCall {
         if let Some(manager) = acp_manager {
             if manager.find_client_for_tool(&self.name).is_some() {
                 let tool_name = self.name.clone();
+                // call_tool internally races session_prompt against
+                // Ctrl+C and cancels the ACP session (including
+                // auto-created sessions) when the user aborts.
                 let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        tokio::select! {
-                            result = manager.call_tool(&tool_name, json_data) => result.map_err(ToolError::Recoverable),
-                            _ = tokio::signal::ctrl_c() => {
-                                Err(ToolError::Fatal(anyhow!("ACP tool call aborted by user")))
-                            }
-                        }
-                    })
+                    tokio::runtime::Handle::current()
+                        .block_on(async { manager.call_tool(&tool_name, json_data).await })
+                })
+                .map_err(|err| {
+                    // Only user-initiated aborts (Ctrl+C) are fatal and should
+                    // stop the entire tool batch.  Other failures (timeouts,
+                    // connection errors, bad arguments) are recoverable so the
+                    // LLM receives the error message and can retry.
+                    if err.to_string().contains("aborted by user") {
+                        ToolError::Fatal(err)
+                    } else {
+                        ToolError::Recoverable(err)
+                    }
                 })?;
 
                 return Ok(result);

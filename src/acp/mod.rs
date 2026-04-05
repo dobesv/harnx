@@ -106,7 +106,21 @@ impl AcpManager {
                     Some(session_id) => session_id.to_owned(),
                     None => client.session_new().await?,
                 };
-                let response = client.session_prompt(Some(&session_id), &message).await?;
+
+                // session_id is now known (even if auto-created).
+                // Race the prompt against Ctrl+C so the user can abort; on
+                // cancellation we tell the ACP server to stop work.
+                let response = tokio::select! {
+                    result = client.session_prompt(Some(&session_id), &message) => result?,
+                    _ = tokio::signal::ctrl_c() => {
+                        // Best-effort cancel on the ACP server.
+                        if let Err(err) = client.session_cancel(&session_id).await {
+                            log::warn!("Failed to cancel ACP session on Ctrl+C: {err}");
+                        }
+                        return Err(anyhow!("ACP tool call aborted by user"));
+                    }
+                };
+
                 Ok(json!({
                     "session_id": session_id,
                     "response": response,
