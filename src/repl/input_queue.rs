@@ -78,12 +78,9 @@ impl InputQueue {
     }
 
     /// Get the display line for rendering below spinner/stream.
-    /// Returns empty string if buffer is empty and nothing is queued.
+    /// Always returns a visible prompt marker so users can tell they can type.
     pub fn get_display_line(&self) -> String {
         let inner = self.0.lock().unwrap();
-        if inner.buffer.is_empty() && inner.queued_message.is_none() {
-            return String::new();
-        }
         if inner.queued_message.is_some() {
             format!("⏳ {}", inner.buffer)
         } else {
