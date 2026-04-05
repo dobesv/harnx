@@ -70,6 +70,8 @@ impl HarnxAgent {
             meta.insert(
                 "harnx:usage".to_string(),
                 json!({
+                    "agent": self.agent_name,
+                    "session_id": session_id,
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
                     "cached_tokens": cached_tokens,

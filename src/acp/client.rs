@@ -219,8 +219,19 @@ impl acp::Client for AcpNotificationClient {
                         let input = usage["input_tokens"].as_u64().unwrap_or(0);
                         let output = usage["output_tokens"].as_u64().unwrap_or(0);
                         let cached = usage["cached_tokens"].as_u64().unwrap_or(0);
+                        let agent = usage["agent"].as_str().unwrap_or("");
+                        let sid = usage["session_id"].as_str().unwrap_or("");
                         if input > 0 || output > 0 {
                             let mut parts = vec![];
+                            // Show agent name and abbreviated session ID for context.
+                            if !agent.is_empty() {
+                                let sid_short = if sid.len() > 8 { &sid[..8] } else { sid };
+                                if !sid_short.is_empty() {
+                                    parts.push(format!("🤖 {agent}({sid_short})"));
+                                } else {
+                                    parts.push(format!("🤖 {agent}"));
+                                }
+                            }
                             if input > 0 {
                                 parts.push(format!("📥 {input}"));
                             }
