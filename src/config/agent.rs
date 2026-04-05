@@ -839,11 +839,11 @@ mod tests {
 
     #[test]
     fn test_agent_from_markdown_with_use_tools() {
-        let content = "---\nuse_tools: fs:all,bash_exec\n---\nHelp with files.";
+        let content = "---\nuse_tools: fs_*,bash_exec\n---\nHelp with files.";
         let agent = Agent::from_markdown("tools-agent", content);
         assert_eq!(
             agent.use_tools(),
-            Some(vec!["fs:all".to_string(), "bash_exec".to_string()])
+            Some(vec!["fs_*".to_string(), "bash_exec".to_string()])
         );
     }
 

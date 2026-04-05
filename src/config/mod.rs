@@ -21,6 +21,7 @@ use crate::tool::{ToolDeclaration, ToolResult, Tools};
 use crate::utils::*;
 
 use anyhow::{anyhow, bail, Context, Result};
+use globset::GlobBuilder;
 use indexmap::IndexMap;
 use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use parking_lot::RwLock;
@@ -129,6 +130,16 @@ fn parse_toolsets_json(value: &str) -> serde_json::Result<IndexMap<String, Vec<S
         .into_iter()
         .map(|(key, value)| (key, normalize_toolset_value(value)))
         .collect())
+}
+
+/// Check whether a glob pattern matches a tool name.
+/// Returns `false` if the pattern is invalid (graceful degradation).
+fn matches_tool_glob(pattern: &str, name: &str) -> bool {
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .ok()
+        .is_some_and(|g| g.compile_matcher().is_match(name))
 }
 
 /// Deserializes `use_tools` accepting both a YAML list and a comma-separated string.
@@ -730,7 +741,7 @@ impl Config {
                 if value
                     && config
                         .read()
-                        .tool_declarations_for_use_tools(Some("all"))
+                        .tool_declarations_for_use_tools(Some("*"))
                         .is_empty()
                 {
                     bail!("Tool use cannot be enabled because no tools are installed.")
@@ -860,13 +871,6 @@ impl Config {
             None => return HashSet::new(),
         };
         let use_tools_str = use_tools.join(",");
-        if use_tools.iter().any(|v| v == "all") {
-            return self
-                .tool_declarations_for_use_tools(Some("all"))
-                .into_iter()
-                .map(|d| d.name)
-                .collect();
-        }
         let declarations = self.tool_declarations_for_use_tools(Some(&use_tools_str));
         let declaration_names: HashSet<String> =
             declarations.iter().map(|d| d.name.clone()).collect();
@@ -879,16 +883,13 @@ impl Config {
                         .filter(|v| declaration_names.contains(v.as_str()))
                         .cloned(),
                 );
-            } else if let Some(server) = item.strip_suffix(":all") {
-                let prefix = format!("{server}_");
+            } else {
                 names.extend(
                     declaration_names
                         .iter()
-                        .filter(|n| n.starts_with(&prefix))
+                        .filter(|n| matches_tool_glob(item, n))
                         .cloned(),
                 );
-            } else if declaration_names.contains(item) {
-                names.insert(item.to_string());
             }
         }
         names
@@ -1749,28 +1750,21 @@ impl Config {
                 let mut tool_names: HashSet<String> = Default::default();
                 let declaration_names: HashSet<String> =
                     declarations.iter().map(|v| v.name.to_string()).collect();
-                if use_tools.iter().any(|v| v == "all") {
-                    tool_names.extend(declaration_names);
-                } else {
-                    for item in use_tools.iter().map(|s| s.trim()) {
-                        if let Some(values) = self.toolsets.get(item) {
-                            tool_names.extend(
-                                values
-                                    .iter()
-                                    .filter(|v| declaration_names.contains(v.as_str()))
-                                    .cloned(),
-                            )
-                        } else if let Some(server) = item.strip_suffix(":all") {
-                            let prefix = format!("{server}_");
-                            tool_names.extend(
-                                declaration_names
-                                    .iter()
-                                    .filter(|name| name.starts_with(&prefix))
-                                    .cloned(),
-                            );
-                        } else if declaration_names.contains(item) {
-                            tool_names.insert(item.to_string());
-                        }
+                for item in use_tools.iter().map(|s| s.trim()) {
+                    if let Some(values) = self.toolsets.get(item) {
+                        tool_names.extend(
+                            values
+                                .iter()
+                                .filter(|v| declaration_names.contains(v.as_str()))
+                                .cloned(),
+                        )
+                    } else {
+                        tool_names.extend(
+                            declaration_names
+                                .iter()
+                                .filter(|name| matches_tool_glob(item, name))
+                                .cloned(),
+                        );
                     }
                 }
                 functions = declarations
@@ -1918,10 +1912,10 @@ impl Config {
                     }
                     let mut values = vec![];
                     if prefix.is_empty() {
-                        values.push("all".to_string());
+                        values.push("*".to_string());
                     }
                     values.extend(
-                        self.tool_declarations_for_use_tools(Some("all"))
+                        self.tool_declarations_for_use_tools(Some("*"))
                             .iter()
                             .map(|v| v.name.clone()),
                     );
@@ -1950,14 +1944,14 @@ impl Config {
             values = candidates.into_iter().map(|v| (v, None)).collect();
         } else if cmd == ".use" && args.len() == 2 && args[0] == "tool" {
             let mut candidates: Vec<String> = self
-                .tool_declarations_for_use_tools(Some("all"))
+                .tool_declarations_for_use_tools(Some("*"))
                 .iter()
                 .map(|v| v.name.clone())
                 .collect();
             candidates.extend(self.toolsets.keys().map(|v| v.to_string()));
             if let Some(manager) = &self.mcp_manager {
                 for name in manager.list_servers() {
-                    candidates.push(format!("{name}:all"));
+                    candidates.push(format!("{name}_*"));
                 }
             }
             let active = self.active_tool_names();
@@ -2535,11 +2529,11 @@ impl Config {
                     declarations.extend(manager.get_all_tools_blocking());
                 }
             }
-            if use_tools == "all"
-                || use_tools
-                    .split(',')
-                    .any(|v| v.trim() == crate::tool::TRIGGER_AGENT_TOOL_NAME)
-            {
+            if use_tools.split(',').any(|v| {
+                let v = v.trim();
+                v == crate::tool::TRIGGER_AGENT_TOOL_NAME
+                    || matches_tool_glob(v, crate::tool::TRIGGER_AGENT_TOOL_NAME)
+            }) {
                 declarations.push(crate::tool::trigger_agent_tool_declaration());
             }
         }
