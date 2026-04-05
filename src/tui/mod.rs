@@ -88,6 +88,7 @@ struct App {
     should_quit: bool,
     llm_busy: bool,
     transcript_scroll: u16,
+    streaming_assistant_idx: Option<usize>,
     /// Pending message queued to send when LLM finishes.
     /// Set when user presses Enter while llm_busy.
     /// Cleared when user edits the input (converts back to draft).
@@ -97,6 +98,8 @@ struct App {
     completion_index: usize,
     /// The original text before the word being completed, used to apply completions
     completion_prefix: String,
+    /// The original text after the word being completed, preserved when applying completions
+    completion_suffix: String,
     /// Input history (most-recent-first)
     history: Vec<String>,
     /// Index into history while navigating (None = current draft)
@@ -507,10 +510,12 @@ impl Tui {
                 should_quit: false,
                 llm_busy: false,
                 transcript_scroll: 0,
+                streaming_assistant_idx: None,
                 pending_message: None,
                 completions: vec![],
                 completion_index: 0,
                 completion_prefix: String::new(),
+                completion_suffix: String::new(),
                 history: vec![],
                 history_index: None,
                 history_draft: String::new(),
@@ -906,9 +911,17 @@ impl Tui {
                 }
             }
             TuiEvent::Chunk(chunk) => {
-                match self.app.transcript.last_mut() {
-                    Some(TranscriptEntry::Assistant(existing)) => existing.push_str(&chunk),
-                    _ => self.app.transcript.push(TranscriptEntry::Assistant(chunk)),
+                if let Some(idx) = self.app.streaming_assistant_idx {
+                    match self.app.transcript.get_mut(idx) {
+                        Some(TranscriptEntry::Assistant(existing)) => existing.push_str(&chunk),
+                        _ => {
+                            self.app.transcript.push(TranscriptEntry::Assistant(chunk));
+                            self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
+                        }
+                    }
+                } else {
+                    self.app.transcript.push(TranscriptEntry::Assistant(chunk));
+                    self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
                 }
                 self.pin_transcript_to_bottom();
             }
@@ -919,16 +932,26 @@ impl Tui {
             } => {
                 self.app.llm_busy = false;
                 if !output.is_empty() {
-                    match self.app.transcript.last_mut() {
-                        Some(TranscriptEntry::Assistant(existing)) if !existing.is_empty() => {
-                            if existing != &output {
-                                *existing = output;
+                    if let Some(idx) = self.app.streaming_assistant_idx {
+                        match self.app.transcript.get_mut(idx) {
+                            Some(TranscriptEntry::Assistant(existing)) if !existing.is_empty() => {
+                                if existing != &output {
+                                    *existing = output;
+                                }
+                            }
+                            _ => {
+                                self.app.transcript.push(TranscriptEntry::Assistant(output));
+                                self.app.streaming_assistant_idx =
+                                    Some(self.app.transcript.len() - 1);
                             }
                         }
-                        _ => self.app.transcript.push(TranscriptEntry::Assistant(output)),
+                    } else {
+                        self.app.transcript.push(TranscriptEntry::Assistant(output));
+                        self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
                     }
                     self.pin_transcript_to_bottom();
                 }
+                self.app.streaming_assistant_idx = None;
                 if !tool_results.is_empty() {
                     self.app.transcript.push(TranscriptEntry::System(format!(
                         "{} tool result(s) returned",
@@ -954,6 +977,7 @@ impl Tui {
             }
             TuiEvent::Errored(err) => {
                 self.app.llm_busy = false;
+                self.app.streaming_assistant_idx = None;
                 self.app.transcript.push(TranscriptEntry::Error(err));
                 self.pin_transcript_to_bottom();
                 self.refresh_input_chrome();
@@ -1175,13 +1199,18 @@ impl Tui {
             return;
         }
 
-        // Compute prefix: everything before the word being completed
+        // Compute replacement bounds so we only replace the token under the cursor.
         let text_before = &line[..pos];
         let word_start = text_before
             .rfind(|c: char| c.is_whitespace())
             .map(|i| i + 1)
             .unwrap_or(0);
+        let word_end = line[pos..]
+            .find(|c: char| c.is_whitespace())
+            .map(|i| pos + i)
+            .unwrap_or(line.len());
         self.app.completion_prefix = line[..word_start].to_string();
+        self.app.completion_suffix = line[word_end..].to_string();
 
         self.app.completions = completions;
         self.app.completion_index = 0;
@@ -1193,7 +1222,10 @@ impl Tui {
             return;
         }
         let (value, _) = &self.app.completions[self.app.completion_index];
-        let new_text = format!("{}{}", self.app.completion_prefix, value);
+        let new_text = format!(
+            "{}{}{}",
+            self.app.completion_prefix, value, self.app.completion_suffix
+        );
 
         self.set_input_text(&new_text);
     }
@@ -1232,17 +1264,14 @@ impl Tui {
             let commands: Vec<(String, Option<String>)> = crate::repl::REPL_COMMANDS
                 .iter()
                 .filter(|c| c.name.starts_with(filter))
-                .map(|c| (c.name.to_string(), Some(c.description.to_string())))
+                .map(|c| (format!("{} ", c.name), Some(c.description.to_string())))
                 .collect();
             return commands;
         }
 
         // For multi-part commands, delegate to config's repl_complete
         if cmd.starts_with('.') {
-            let mut args: Vec<&str> = parts[1..].iter().map(|p| p.0).collect();
-            if line.ends_with(' ') {
-                args.push("");
-            }
+            let args: Vec<&str> = parts[1..].iter().map(|p| p.0).collect();
             let filter = args.last().copied().unwrap_or("");
             return self.config.read().repl_complete(cmd, &args, filter);
         }
@@ -1368,12 +1397,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
+        let config = test_config();
+        let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+        let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+        tui.handle_tui_event(TuiEvent::Chunk("Hello ".to_string()))
+            .await
+            .unwrap();
+        tui.handle_tui_event(TuiEvent::UiOutput("tool output".to_string()))
+            .await
+            .unwrap();
+        tui.handle_tui_event(TuiEvent::Chunk("world".to_string()))
+            .await
+            .unwrap();
+
+        let assistant_entries: Vec<_> = tui
+            .app
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Assistant(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistant_entries, vec!["Hello world"]);
+        assert!(tui
+            .app
+            .transcript
+            .iter()
+            .any(|entry| matches!(entry, TranscriptEntry::System(text) if text == "tool output")));
+    }
+
+    #[tokio::test]
     async fn compute_completions_handles_trailing_space_after_command() {
         let config = test_config();
         let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
         let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
         let line = ".model ";
-        let _completions = tui.compute_completions(line, line.len());
+        let completions = tui.compute_completions(line, line.len());
+
+        assert!(completions.iter().all(|(value, _)| !value.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn compute_completions_appends_space_for_command_matches() {
+        let config = test_config();
+        let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+        let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+        let completions = tui.compute_completions(".mod", 4);
+
+        assert!(completions.iter().any(|(value, _)| value == ".model "));
+    }
+
+    #[tokio::test]
+    async fn apply_completion_preserves_text_after_cursor() {
+        let config = test_config();
+        let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+        let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+        tui.set_input_text(".model gp --info");
+        tui.app.completion_prefix = ".model ".to_string();
+        tui.app.completion_suffix = " --info".to_string();
+        tui.app.completions = vec![("gpt-4o".to_string(), None)];
+        tui.app.completion_index = 0;
+
+        tui.apply_completion();
+
+        assert_eq!(tui.app.input.lines().join("\n"), ".model gpt-4o --info");
+    }
+
+    #[tokio::test]
+    async fn info_commands_render_into_tui_transcript() {
+        let config = test_config();
+        let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+        let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+        tui.run_repl_command(".info session").await.unwrap();
+        while let Ok(event) = tui.event_rx.try_recv() {
+            tui.handle_tui_event(event).await.unwrap();
+        }
+
+        let has_session_output = tui
+            .app
+            .transcript
+            .iter()
+            .any(|entry| matches!(entry, TranscriptEntry::System(text) if !text.is_empty()));
+        assert!(has_session_output);
     }
 }
