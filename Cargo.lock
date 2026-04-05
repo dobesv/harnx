@@ -1450,6 +1450,7 @@ dependencies = [
  "inquire",
  "is-terminal",
  "json-patch",
+ "libc",
  "log",
  "nu-ansi-term 0.50.3",
  "os_info",

@@ -13,16 +13,21 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+
+// ---------------------------------------------------------------------------
+// Parameter structs
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 struct ExecCommandParams {
@@ -65,17 +70,109 @@ impl JsonSchema for ExecCommandParams {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct SpawnCommandParams {
+    command: String,
+    #[serde(default)]
+    working_dir: Option<String>,
+}
+
+impl JsonSchema for SpawnCommandParams {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("SpawnCommandParams")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let command = generator.subschema_for::<String>();
+        let working_dir = generator.subschema_for::<Option<String>>();
+        object_schema(
+            vec![("command", command), ("working_dir", working_dir)],
+            &["command"],
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WaitParams {
+    pid: u32,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    tail_lines: Option<usize>,
+}
+
+impl JsonSchema for WaitParams {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("WaitParams")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let pid = generator.subschema_for::<u32>();
+        let timeout_secs = generator.subschema_for::<Option<u64>>();
+        let tail_lines = generator.subschema_for::<Option<usize>>();
+        object_schema(
+            vec![
+                ("pid", pid),
+                ("timeout_secs", timeout_secs),
+                ("tail_lines", tail_lines),
+            ],
+            &["pid"],
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminateParams {
+    pid: u32,
+    #[serde(default)]
+    signal: Option<String>,
+}
+
+impl JsonSchema for TerminateParams {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("TerminateParams")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let pid = generator.subschema_for::<u32>();
+        let signal = generator.subschema_for::<Option<String>>();
+        object_schema(vec![("pid", pid), ("signal", signal)], &["pid"])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spawned process tracking
+// ---------------------------------------------------------------------------
+
+struct SpawnedProcess {
+    child: tokio::process::Child,
+    command: String,
+    working_dir: PathBuf,
+    log_path: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// BashServer
+// ---------------------------------------------------------------------------
+
 #[derive(Clone)]
 pub struct BashServer {
     roots: Arc<RwLock<Vec<PathBuf>>>,
     roots_initialized: Arc<AtomicBool>,
+    spawned: Arc<Mutex<HashMap<u32, SpawnedProcess>>>,
+    log_dir: Arc<PathBuf>,
+    spawn_counter: Arc<AtomicU64>,
 }
 
 impl BashServer {
     pub fn new(initial_roots: Vec<PathBuf>) -> Self {
+        let log_dir = std::env::temp_dir().join(format!("harnx-bg-{}", std::process::id()));
         Self {
             roots: Arc::new(RwLock::new(initial_roots)),
             roots_initialized: Arc::new(AtomicBool::new(false)),
+            spawned: Arc::new(Mutex::new(HashMap::new())),
+            log_dir: Arc::new(log_dir),
+            spawn_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -115,6 +212,10 @@ impl BashServer {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // exec (existing)
+    // -----------------------------------------------------------------------
 
     async fn exec_command_impl(
         &self,
@@ -220,6 +321,270 @@ impl BashServer {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // spawn
+    // -----------------------------------------------------------------------
+
+    async fn spawn_impl(&self, params: SpawnCommandParams) -> Result<CallToolResult, ErrorData> {
+        if params.command.trim().is_empty() {
+            return Err(ErrorData::invalid_params("command cannot be empty", None));
+        }
+
+        let working_dir = self
+            .resolve_working_dir(params.working_dir.as_deref())
+            .await?;
+
+        // Ensure log directory exists.
+        std::fs::create_dir_all(self.log_dir.as_ref()).map_err(|err| {
+            internal_error(format!(
+                "failed to create log directory '{}': {err}",
+                self.log_dir.display()
+            ))
+        })?;
+
+        let seq = self.spawn_counter.fetch_add(1, Ordering::SeqCst);
+        let log_path = self.log_dir.join(format!("bg-{seq}.log"));
+
+        let log_file = std::fs::File::create(&log_path).map_err(|err| {
+            internal_error(format!(
+                "failed to create log file '{}': {err}",
+                log_path.display()
+            ))
+        })?;
+        let log_file_err = log_file
+            .try_clone()
+            .map_err(|err| internal_error(format!("failed to clone log file handle: {err}")))?;
+
+        let child = Command::new("bash")
+            .args(["-c", &params.command])
+            .current_dir(&working_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err))
+            .spawn()
+            .map_err(|err| internal_error(format!("failed to spawn command: {err}")))?;
+
+        let pid = child
+            .id()
+            .ok_or_else(|| internal_error("spawned process exited before PID could be read"))?;
+
+        let entry = SpawnedProcess {
+            child,
+            command: params.command.clone(),
+            working_dir: working_dir.clone(),
+            log_path: log_path.clone(),
+        };
+
+        self.spawned.lock().await.insert(pid, entry);
+
+        let mut output = String::new();
+        let _ = writeln!(output, "pid: {pid}");
+        let _ = writeln!(output, "log_path: {}", log_path.display());
+        let _ = writeln!(output, "working_dir: {}", working_dir.display());
+        let _ = write!(output, "command: {}", params.command);
+        let summary = format!("spawned pid {pid}, log: {}", log_path.display());
+
+        Ok(CallToolResult::success(vec![
+            Content::text(output).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ]))
+    }
+
+    // -----------------------------------------------------------------------
+    // wait
+    // -----------------------------------------------------------------------
+
+    async fn wait_impl(&self, params: WaitParams) -> Result<CallToolResult, ErrorData> {
+        let timeout_secs = params.timeout_secs.unwrap_or(120);
+        let tail_line_count = params.tail_lines.unwrap_or(20);
+
+        // Take the child out of the map so we can await it without holding the
+        // lock for the entire duration.
+        let (mut child, command, working_dir, log_path) = {
+            let mut map = self.spawned.lock().await;
+            let entry = map.remove(&params.pid).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!(
+                        "pid {} is not a tracked background process (or already waited on)",
+                        params.pid
+                    ),
+                    None,
+                )
+            })?;
+            (
+                entry.child,
+                entry.command,
+                entry.working_dir,
+                entry.log_path,
+            )
+        };
+
+        let timeout = Duration::from_secs(timeout_secs);
+        let wait_result = tokio::time::timeout(timeout, child.wait()).await;
+
+        let log_tail = read_log_tail(&log_path, tail_line_count);
+
+        match wait_result {
+            Ok(Ok(status)) => {
+                let exit_code = status.code().unwrap_or(-1);
+                let mut output = String::new();
+                let _ = writeln!(output, "pid: {}", params.pid);
+                let _ = writeln!(output, "status: exited");
+                let _ = writeln!(output, "exit_code: {exit_code}");
+                let _ = writeln!(output, "working_dir: {}", working_dir.display());
+                let _ = writeln!(output, "command: {command}");
+                let _ = writeln!(output, "log_path: {}", log_path.display());
+                let _ = write!(output, "\n{log_tail}");
+                let summary = format!("pid {} exited with code {exit_code}", params.pid);
+                Ok(CallToolResult::success(vec![
+                    Content::text(output).with_audience(vec![Role::Assistant]),
+                    Content::text(summary).with_audience(vec![Role::User]),
+                ]))
+            }
+            Ok(Err(err)) => Err(internal_error(format!(
+                "error waiting for pid {}: {err}",
+                params.pid
+            ))),
+            Err(_) => {
+                // Timed out — put the child back so it can be waited on or
+                // terminated later.
+                self.spawned.lock().await.insert(
+                    params.pid,
+                    SpawnedProcess {
+                        child,
+                        command: command.clone(),
+                        working_dir: working_dir.clone(),
+                        log_path: log_path.clone(),
+                    },
+                );
+
+                let mut output = String::new();
+                let _ = writeln!(output, "pid: {}", params.pid);
+                let _ = writeln!(
+                    output,
+                    "status: still running (timed out after {timeout_secs}s)"
+                );
+                let _ = writeln!(output, "working_dir: {}", working_dir.display());
+                let _ = writeln!(output, "command: {command}");
+                let _ = writeln!(output, "log_path: {}", log_path.display());
+                let _ = write!(output, "\n{log_tail}");
+                let summary = format!("pid {} still running after {timeout_secs}s", params.pid);
+                Ok(CallToolResult::success(vec![
+                    Content::text(output).with_audience(vec![Role::Assistant]),
+                    Content::text(summary).with_audience(vec![Role::User]),
+                ]))
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // terminate
+    // -----------------------------------------------------------------------
+
+    async fn terminate_impl(&self, params: TerminateParams) -> Result<CallToolResult, ErrorData> {
+        let signal_name = params.signal.as_deref().unwrap_or("SIGTERM");
+
+        // Validate signal name on all platforms
+        let normalized = match signal_name.to_uppercase().as_str() {
+            "SIGTERM" | "TERM" | "15" => "SIGTERM",
+            "SIGKILL" | "KILL" | "9" => "SIGKILL",
+            "SIGINT" | "INT" | "2" => "SIGINT",
+            "SIGHUP" | "HUP" | "1" => "SIGHUP",
+            other => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "unsupported signal: {other} (use SIGTERM, SIGKILL, SIGINT, or SIGHUP)"
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        // Platform-specific signal handling
+        #[cfg(unix)]
+        {
+            let signum = match normalized {
+                "SIGTERM" => libc::SIGTERM,
+                "SIGKILL" => libc::SIGKILL,
+                "SIGINT" => libc::SIGINT,
+                "SIGHUP" => libc::SIGHUP,
+                _ => unreachable!("already validated"),
+            };
+
+            let map = self.spawned.lock().await;
+            let entry = map.get(&params.pid).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("pid {} is not a tracked background process", params.pid),
+                    None,
+                )
+            })?;
+
+            let raw_pid = params.pid as i32;
+            // SAFETY: we are sending a well-known signal to a PID we own.
+            let ret = unsafe { libc::kill(raw_pid, signum) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(internal_error(format!(
+                    "failed to send {signal_name} to pid {}: {err}",
+                    params.pid
+                )));
+            }
+
+            let mut output = String::new();
+            let _ = writeln!(output, "pid: {}", params.pid);
+            let _ = writeln!(output, "signal: {}", normalized);
+            let _ = writeln!(output, "command: {}", entry.command);
+            let _ = write!(output, "log_path: {}", entry.log_path.display());
+            let summary = format!("sent {} to pid {}", normalized, params.pid);
+
+            Ok(CallToolResult::success(vec![
+                Content::text(output).with_audience(vec![Role::Assistant]),
+                Content::text(summary).with_audience(vec![Role::User]),
+            ]))
+        }
+
+        #[cfg(windows)]
+        {
+            // Windows does not support POSIX signals. Use the child handle to terminate.
+            let mut map = self.spawned.lock().await;
+            let entry = map.get_mut(&params.pid).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("pid {} is not a tracked background process", params.pid),
+                    None,
+                )
+            })?;
+
+            // On Windows, start_kill() sends a terminate signal to the process.
+            // Windows doesn't have signal-based flow control, so all signals
+            // result in the same termination behavior.
+            if let Err(e) = entry.child.start_kill() {
+                return Err(internal_error(format!(
+                    "failed to terminate pid {}: {e}",
+                    params.pid
+                )));
+            }
+
+            let command = entry.command.clone();
+            let log_path = entry.log_path.clone();
+
+            let mut output = String::new();
+            let _ = writeln!(output, "pid: {}", params.pid);
+            let _ = writeln!(output, "signal: {}", normalized);
+            let _ = writeln!(output, "command: {}", command);
+            let _ = write!(output, "log_path: {}", log_path.display());
+            let summary = format!("sent {} to pid {}", normalized, params.pid);
+
+            Ok(CallToolResult::success(vec![
+                Content::text(output).with_audience(vec![Role::Assistant]),
+                Content::text(summary).with_audience(vec![Role::User]),
+            ]))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // shared helpers
+    // -----------------------------------------------------------------------
+
     async fn resolve_working_dir(&self, requested: Option<&str>) -> Result<PathBuf, ErrorData> {
         let roots = self.roots.read().await;
         let default_dir = roots
@@ -279,6 +644,10 @@ impl BashServer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ServerHandler impl
+// ---------------------------------------------------------------------------
+
 impl ServerHandler for BashServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
@@ -303,12 +672,32 @@ impl ServerHandler for BashServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult {
-            tools: vec![Tool::new(
-                "exec",
-                "Execute a local bash command and return truncated combined stdout/stderr.",
-                Map::new(),
-            )
-            .with_input_schema::<ExecCommandParams>()],
+            tools: vec![
+                Tool::new(
+                    "exec",
+                    "Execute a local bash command and return truncated combined stdout/stderr.",
+                    Map::new(),
+                )
+                .with_input_schema::<ExecCommandParams>(),
+                Tool::new(
+                    "spawn",
+                    "Spawn a background bash command. Returns the PID and log file path immediately without waiting for the command to finish. Output is written to a log file. Use 'wait' to check for completion and 'terminate' to stop it.",
+                    Map::new(),
+                )
+                .with_input_schema::<SpawnCommandParams>(),
+                Tool::new(
+                    "wait",
+                    "Wait for a spawned background process to exit. Returns the exit code and tail of the log file. If the process does not exit within the timeout, returns its current status and log tail without killing it.",
+                    Map::new(),
+                )
+                .with_input_schema::<WaitParams>(),
+                Tool::new(
+                    "terminate",
+                    "Send a signal to a spawned background process. Default signal is SIGTERM. Supported signals: SIGTERM, SIGKILL, SIGINT, SIGHUP.",
+                    Map::new(),
+                )
+                .with_input_schema::<TerminateParams>(),
+            ],
             next_cursor: None,
         })
     }
@@ -329,6 +718,18 @@ impl ServerHandler for BashServer {
             "exec" => {
                 let params = parse_arguments::<ExecCommandParams>(request.arguments)?;
                 self.exec_command_impl(params).await
+            }
+            "spawn" => {
+                let params = parse_arguments::<SpawnCommandParams>(request.arguments)?;
+                self.spawn_impl(params).await
+            }
+            "wait" => {
+                let params = parse_arguments::<WaitParams>(request.arguments)?;
+                self.wait_impl(params).await
+            }
+            "terminate" => {
+                let params = parse_arguments::<TerminateParams>(request.arguments)?;
+                self.terminate_impl(params).await
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
@@ -352,6 +753,10 @@ impl ServerHandler for BashServer {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Free functions
+// ---------------------------------------------------------------------------
 
 fn parse_arguments<T: DeserializeOwned>(
     arguments: Option<Map<String, Value>>,
@@ -477,6 +882,29 @@ fn render_timeout_message(
     let _ = write!(output, "\n{}", render_output_block(original, truncated));
     output
 }
+
+/// Read the last `n` lines from a log file, returning a formatted block.
+fn read_log_tail(path: &Path, n: usize) -> String {
+    let content = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(err) => return format!("log: <error reading {}: {err}>", path.display()),
+    };
+    if content.is_empty() {
+        return "log: <empty>".to_string();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if total <= n {
+        format!("log ({total} lines):\n{content}")
+    } else {
+        let tail = lines[total - n..].join("\n");
+        format!("log (last {n} of {total} lines):\n{tail}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(all(test, not(target_os = "windows")))]
 mod tests {
@@ -604,13 +1032,14 @@ mod tests {
         });
 
         let tools = peer.list_tools(Default::default()).await.unwrap();
-        let names = tools
+        let mut names = tools
             .tools
             .iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
+        names.sort();
 
-        assert_eq!(names, vec!["exec"]);
+        assert_eq!(names, vec!["exec", "spawn", "terminate", "wait"]);
     }
 
     #[tokio::test]
@@ -721,5 +1150,221 @@ mod tests {
         let text = text_content(&result);
         assert_eq!(result.is_error, Some(true));
         assert!(text.contains("command timed out after 1s and was terminated"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_and_wait() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        // Spawn a quick command.
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "echo hello from background".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("pid:"));
+        assert!(text.contains("log_path:"));
+
+        // Parse the PID.
+        let pid: u32 = text
+            .lines()
+            .find(|l| l.starts_with("pid:"))
+            .unwrap()
+            .trim_start_matches("pid:")
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Wait for it.
+        let result = server
+            .wait_impl(WaitParams {
+                pid,
+                timeout_secs: Some(5),
+                tail_lines: Some(10),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("status: exited"));
+        assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("hello from background"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_wait_timeout() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "sleep 60".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        let pid: u32 = text
+            .lines()
+            .find(|l| l.starts_with("pid:"))
+            .unwrap()
+            .trim_start_matches("pid:")
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Wait with a short timeout — should not kill the process.
+        let result = server
+            .wait_impl(WaitParams {
+                pid,
+                timeout_secs: Some(1),
+                tail_lines: Some(10),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("still running"));
+
+        // Process should still be tracked.
+        assert!(server.spawned.lock().await.contains_key(&pid));
+
+        // Clean up.
+        let result = server
+            .terminate_impl(TerminateParams {
+                pid,
+                signal: Some("SIGKILL".to_string()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_and_terminate() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "sleep 60".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        let pid: u32 = text
+            .lines()
+            .find(|l| l.starts_with("pid:"))
+            .unwrap()
+            .trim_start_matches("pid:")
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Terminate with SIGTERM.
+        let result = server
+            .terminate_impl(TerminateParams { pid, signal: None })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("signal: SIGTERM"));
+
+        // Wait for it to exit after the signal.
+        let result = server
+            .wait_impl(WaitParams {
+                pid,
+                timeout_secs: Some(5),
+                tail_lines: Some(10),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(text.contains("status: exited"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_unknown_pid() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .wait_impl(WaitParams {
+                pid: 99999999,
+                timeout_secs: Some(1),
+                tail_lines: None,
+            })
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_terminate_unknown_pid() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .terminate_impl(TerminateParams {
+                pid: 99999999,
+                signal: None,
+            })
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_output() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        // Spawn a command that produces output over time.
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "for i in 1 2 3; do echo line$i; done".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        let pid: u32 = text
+            .lines()
+            .find(|l| l.starts_with("pid:"))
+            .unwrap()
+            .trim_start_matches("pid:")
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Wait for it to finish.
+        let result = server
+            .wait_impl(WaitParams {
+                pid,
+                timeout_secs: Some(5),
+                tail_lines: Some(10),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("line1"));
+        assert!(text.contains("line2"));
+        assert!(text.contains("line3"));
     }
 }
