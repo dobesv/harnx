@@ -6,9 +6,12 @@ mod hooks;
 mod mcp;
 mod rag;
 mod render;
+#[allow(dead_code, unused_imports)]
 mod repl;
 mod serve;
 mod tool;
+mod tui;
+mod ui_output;
 #[macro_use]
 mod utils;
 
@@ -29,7 +32,7 @@ use crate::hooks::{
     PersistentHookManager,
 };
 use crate::render::render_error;
-use crate::repl::Repl;
+use crate::tui::Tui;
 use crate::utils::*;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -688,9 +691,10 @@ async fn start_interactive(config: &GlobalConfig) -> Result<()> {
     let async_manager = AsyncHookManager::new();
     let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
     dispatch_session_start(config, "repl", &async_manager, &persistent_manager).await;
-    let mut repl: Repl = Repl::init(config, async_manager, persistent_manager.clone())?;
-    let result = repl.run().await;
-    exit_session_with_hook(config, repl.async_manager(), &persistent_manager).await?;
+    let mut tui: Tui = Tui::init(config, async_manager, persistent_manager.clone())?;
+    let result = tui.run().await;
+    let async_manager = tui.async_manager().lock().await;
+    exit_session_with_hook(config, &async_manager, &persistent_manager).await?;
     persistent_manager.lock().await.shutdown();
     result
 }

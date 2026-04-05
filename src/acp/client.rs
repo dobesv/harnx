@@ -1,5 +1,6 @@
 use super::AcpServerConfig;
 
+use crate::ui_output::emit_ui_output;
 use crate::utils::dimmed_text;
 use agent_client_protocol::{self as acp, Agent as _};
 use anyhow::{anyhow, Context, Result};
@@ -101,7 +102,9 @@ impl AcpNotificationClient {
         let mut delivered = false;
         let mut forwarders = self.chunk_forwarder.write().await;
         if forwarders.is_empty() {
-            eprint!("{}", text);
+            if !emit_ui_output(text.to_string()) {
+                eprint!("{}", text);
+            }
         } else {
             let owned = text.to_string();
             forwarders.retain(|_, tx| match tx.send(owned.clone()) {
@@ -111,7 +114,7 @@ impl AcpNotificationClient {
                 }
                 Err(_) => false,
             });
-            if !delivered {
+            if !delivered && !emit_ui_output(text.to_string()) {
                 eprint!("{}", text);
             }
         }
@@ -270,7 +273,9 @@ impl acp::Client for AcpNotificationClient {
             let mut delivered = false;
             let mut forwarders = self.chunk_forwarder.write().await;
             if forwarders.is_empty() {
-                eprint!("{}", chunk);
+                if !emit_ui_output(chunk.clone()) {
+                    eprint!("{}", chunk);
+                }
             } else {
                 forwarders.retain(|_, tx| match tx.send(chunk.clone()) {
                     Ok(()) => {
@@ -279,7 +284,7 @@ impl acp::Client for AcpNotificationClient {
                     }
                     Err(_) => false,
                 });
-                if !delivered {
+                if !delivered && !emit_ui_output(chunk.clone()) {
                     eprint!("{}", chunk);
                 }
             }

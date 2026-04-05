@@ -1,5 +1,8 @@
+#[allow(dead_code)]
 mod completer;
+#[allow(dead_code)]
 mod highlighter;
+#[allow(dead_code)]
 mod prompt;
 
 use self::completer::ReplCompleter;
@@ -36,7 +39,7 @@ use std::{env, process};
 
 const MENU_NAME: &str = "completion_menu";
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
+pub static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -415,8 +418,8 @@ Type ".help" for additional help.
 
 #[derive(Debug, Clone)]
 pub struct ReplCommand {
-    name: &'static str,
-    description: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
     state: AssertState,
 }
 
