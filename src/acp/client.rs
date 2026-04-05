@@ -93,6 +93,29 @@ impl AcpNotificationClient {
             activity_tx,
         }
     }
+
+    /// Forward a display-only chunk (e.g. usage banner) to subscribers or
+    /// stderr.  Unlike the main chunk path this never touches
+    /// `state.response_text`.
+    async fn forward_display_chunk(&self, text: &str) {
+        let mut delivered = false;
+        let mut forwarders = self.chunk_forwarder.write().await;
+        if forwarders.is_empty() {
+            eprint!("{}", text);
+        } else {
+            let owned = text.to_string();
+            forwarders.retain(|_, tx| match tx.send(owned.clone()) {
+                Ok(()) => {
+                    delivered = true;
+                    true
+                }
+                Err(_) => false,
+            });
+            if !delivered {
+                eprint!("{}", text);
+            }
+        }
+    }
 }
 
 impl<T> TokioCompat<T> {
@@ -270,29 +293,6 @@ impl acp::Client for AcpNotificationClient {
         }
 
         Ok(())
-    }
-
-    /// Forward a display-only chunk (e.g. usage banner) to subscribers or
-    /// stderr.  Unlike the main chunk path this never touches
-    /// `state.response_text`.
-    async fn forward_display_chunk(&self, text: &str) {
-        let mut delivered = false;
-        let mut forwarders = self.chunk_forwarder.write().await;
-        if forwarders.is_empty() {
-            eprint!("{}", text);
-        } else {
-            let owned = text.to_string();
-            forwarders.retain(|_, tx| match tx.send(owned.clone()) {
-                Ok(()) => {
-                    delivered = true;
-                    true
-                }
-                Err(_) => false,
-            });
-            if !delivered {
-                eprint!("{}", text);
-            }
-        }
     }
 
     async fn write_text_file(

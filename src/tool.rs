@@ -457,9 +457,10 @@ async fn forward_acp_chunks(
     spinner_msg: String,
 ) {
     while let Some(chunk) = chunk_rx.recv().await {
-        // Clear the spinner line before printing so output is clean.
+        // Pause the spinner (clear display but keep task alive) before
+        // printing so output is clean, then resume it afterwards.
         if let Some(ref s) = spinner {
-            s.stop();
+            s.pause();
         }
         print!("{chunk}");
         let _ = std::io::stdout().flush();

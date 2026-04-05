@@ -86,11 +86,21 @@ impl Spinner {
         let _ = self.0.send(SpinnerEvent::Stop);
         std::thread::sleep(Duration::from_millis(10));
     }
+
+    /// Clear the spinner display without terminating the background task.
+    /// The spinner can be resumed later with `set_message()`.
+    pub fn pause(&self) {
+        let _ = self.0.send(SpinnerEvent::Pause);
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub enum SpinnerEvent {
     SetMessage(String),
+    /// Clear spinner and terminate the background task.
     Stop,
+    /// Clear spinner display but keep the background task alive.
+    Pause,
 }
 
 pub fn spawn_spinner(message: &str) -> Spinner {
@@ -109,6 +119,9 @@ pub fn spawn_spinner(message: &str) -> Spinner {
                             SpinnerEvent::Stop => {
                                 spinner.clear_message()?;
                                 break;
+                            }
+                            SpinnerEvent::Pause => {
+                                spinner.clear_message()?;
                             }
                         }
 
@@ -198,7 +211,7 @@ async fn run_abortable_spinner(
             Ok(SpinnerEvent::SetMessage(message)) => {
                 spinner.set_message(message)?;
             }
-            Ok(SpinnerEvent::Stop) => {
+            Ok(SpinnerEvent::Stop) | Ok(SpinnerEvent::Pause) => {
                 spinner.clear_message()?;
             }
             Err(_) => {}
