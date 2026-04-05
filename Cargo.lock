@@ -685,7 +685,6 @@ dependencies = [
  "mio",
  "parking_lot",
  "rustix 0.38.44",
- "serde",
  "signal-hook",
  "signal-hook-mio",
  "winapi",
@@ -704,6 +703,7 @@ dependencies = [
  "mio",
  "parking_lot",
  "rustix 1.0.7",
+ "serde",
  "signal-hook",
  "signal-hook-mio",
  "winapi",
@@ -3059,12 +3059,12 @@ dependencies = [
 
 [[package]]
 name = "reedline"
-version = "0.40.0"
+version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5cdfab7494d13ebfb6ce64828648518205d3ce8541ef1f94a27887f29d2d50b"
+checksum = "fe9e7c532bfc2759bc8a28902c04e8b993fc13ebd085ee4292eb1b230fa9beef"
 dependencies = [
  "chrono",
- "crossterm 0.28.1",
+ "crossterm 0.29.0",
  "fd-lock",
  "itertools",
  "nu-ansi-term 0.50.3",
@@ -3073,6 +3073,7 @@ dependencies = [
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "thiserror 2.0.12",
+ "unicase",
  "unicode-segmentation",
  "unicode-width 0.2.0",
 ]
