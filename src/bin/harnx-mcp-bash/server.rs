@@ -483,11 +483,13 @@ impl BashServer {
 
     async fn terminate_impl(&self, params: TerminateParams) -> Result<CallToolResult, ErrorData> {
         let signal_name = params.signal.as_deref().unwrap_or("SIGTERM");
-        let signum = match signal_name.to_uppercase().as_str() {
-            "SIGTERM" | "TERM" | "15" => libc::SIGTERM,
-            "SIGKILL" | "KILL" | "9" => libc::SIGKILL,
-            "SIGINT" | "INT" | "2" => libc::SIGINT,
-            "SIGHUP" | "HUP" | "1" => libc::SIGHUP,
+
+        // Validate signal name on all platforms
+        let normalized = match signal_name.to_uppercase().as_str() {
+            "SIGTERM" | "TERM" | "15" => "SIGTERM",
+            "SIGKILL" | "KILL" | "9" => "SIGKILL",
+            "SIGINT" | "INT" | "2" => "SIGINT",
+            "SIGHUP" | "HUP" | "1" => "SIGHUP",
             other => {
                 return Err(ErrorData::invalid_params(
                     format!(
@@ -498,36 +500,85 @@ impl BashServer {
             }
         };
 
-        let map = self.spawned.lock().await;
-        let entry = map.get(&params.pid).ok_or_else(|| {
-            ErrorData::invalid_params(
-                format!("pid {} is not a tracked background process", params.pid),
-                None,
-            )
-        })?;
+        // Platform-specific signal handling
+        #[cfg(unix)]
+        {
+            let signum = match normalized {
+                "SIGTERM" => libc::SIGTERM,
+                "SIGKILL" => libc::SIGKILL,
+                "SIGINT" => libc::SIGINT,
+                "SIGHUP" => libc::SIGHUP,
+                _ => unreachable!("already validated"),
+            };
 
-        let raw_pid = params.pid as i32;
-        // SAFETY: we are sending a well-known signal to a PID we own.
-        let ret = unsafe { libc::kill(raw_pid, signum) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(internal_error(format!(
-                "failed to send {signal_name} to pid {}: {err}",
-                params.pid
-            )));
+            let map = self.spawned.lock().await;
+            let entry = map.get(&params.pid).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("pid {} is not a tracked background process", params.pid),
+                    None,
+                )
+            })?;
+
+            let raw_pid = params.pid as i32;
+            // SAFETY: we are sending a well-known signal to a PID we own.
+            let ret = unsafe { libc::kill(raw_pid, signum) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(internal_error(format!(
+                    "failed to send {signal_name} to pid {}: {err}",
+                    params.pid
+                )));
+            }
+
+            let mut output = String::new();
+            let _ = writeln!(output, "pid: {}", params.pid);
+            let _ = writeln!(output, "signal: {}", normalized);
+            let _ = writeln!(output, "command: {}", entry.command);
+            let _ = write!(output, "log_path: {}", entry.log_path.display());
+            let summary = format!("sent {} to pid {}", normalized, params.pid);
+
+            Ok(CallToolResult::success(vec![
+                Content::text(output).with_audience(vec![Role::Assistant]),
+                Content::text(summary).with_audience(vec![Role::User]),
+            ]))
         }
 
-        let mut output = String::new();
-        let _ = writeln!(output, "pid: {}", params.pid);
-        let _ = writeln!(output, "signal: {signal_name}");
-        let _ = writeln!(output, "command: {}", entry.command);
-        let _ = write!(output, "log_path: {}", entry.log_path.display());
-        let summary = format!("sent {signal_name} to pid {}", params.pid);
+        #[cfg(windows)]
+        {
+            // Windows does not support POSIX signals. Use the child handle to terminate.
+            let mut map = self.spawned.lock().await;
+            let entry = map.get_mut(&params.pid).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("pid {} is not a tracked background process", params.pid),
+                    None,
+                )
+            })?;
 
-        Ok(CallToolResult::success(vec![
-            Content::text(output).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
-        ]))
+            // On Windows, start_kill() sends a terminate signal to the process.
+            // Windows doesn't have signal-based flow control, so all signals
+            // result in the same termination behavior.
+            if let Err(e) = entry.child.start_kill() {
+                return Err(internal_error(format!(
+                    "failed to terminate pid {}: {e}",
+                    params.pid
+                )));
+            }
+
+            let command = entry.command.clone();
+            let log_path = entry.log_path.clone();
+
+            let mut output = String::new();
+            let _ = writeln!(output, "pid: {}", params.pid);
+            let _ = writeln!(output, "signal: {}", normalized);
+            let _ = writeln!(output, "command: {}", command);
+            let _ = write!(output, "log_path: {}", log_path.display());
+            let summary = format!("sent {} to pid {}", normalized, params.pid);
+
+            Ok(CallToolResult::success(vec![
+                Content::text(output).with_audience(vec![Role::Assistant]),
+                Content::text(summary).with_audience(vec![Role::User]),
+            ]))
+        }
     }
 
     // -----------------------------------------------------------------------
