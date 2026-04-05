@@ -166,21 +166,30 @@ pub struct ImageUrl {
 pub struct MessageContentToolCalls {
     pub tool_results: Vec<ToolResult>,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought: Option<String>,
     pub sequence: bool,
 }
 
 impl MessageContentToolCalls {
-    pub fn new(tool_results: Vec<ToolResult>, text: String) -> Self {
+    pub fn new(tool_results: Vec<ToolResult>, text: String, thought: Option<String>) -> Self {
         Self {
             tool_results,
             text,
+            thought,
             sequence: false,
         }
     }
 
-    pub fn merge(&mut self, tool_results: Vec<ToolResult>, _text: String) {
+    pub fn merge(
+        &mut self,
+        tool_results: Vec<ToolResult>,
+        _text: String,
+        thought: Option<String>,
+    ) {
         self.tool_results.extend(tool_results);
         self.text.clear();
+        self.thought = thought;
         self.sequence = true;
     }
 }

@@ -887,11 +887,16 @@ fn parse_messages(message: Vec<Value>) -> Result<Vec<Message>> {
                             if id != tool_call_id {
                                 return Err(err());
                             }
-                            list.push(ToolResult::new(ToolCall::new(name, arguments, id), value))
+                            list.push(ToolResult::new(
+                                ToolCall::new(name, arguments, id, None),
+                                value,
+                            ))
                         }
                         output.push(Message::new(
                             MessageRole::Assistant,
-                            MessageContent::ToolCalls(MessageContentToolCalls::new(list, text)),
+                            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                                list, text, None,
+                            )),
                         ));
                         tool_results = None;
                     } else {

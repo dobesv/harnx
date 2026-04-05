@@ -123,6 +123,7 @@ pub async fn claude_chat_completions_streaming(
                                 function_name.clone(),
                                 arguments,
                                 Some(function_id.clone()),
+                                None,
                             ))?;
                         }
                         function_name = name.into();
@@ -163,6 +164,7 @@ pub async fn claude_chat_completions_streaming(
                             function_name.clone(),
                             arguments,
                             Some(function_id.clone()),
+                            None,
                         ))?;
                     }
                 }
@@ -353,6 +355,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
                             name.to_string(),
                             input.clone(),
                             Some(id.to_string()),
+                            None,
                         ));
                     }
                 }
@@ -369,8 +372,9 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
     }
 
     let output = ChatCompletionsOutput {
-        text: text.to_string(),
+        text,
         tool_calls,
+        thought: None,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["output_tokens"].as_u64(),

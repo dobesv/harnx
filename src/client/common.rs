@@ -379,6 +379,7 @@ pub struct ChatCompletionsData {
 pub struct ChatCompletionsOutput {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    pub thought: Option<String>,
     pub id: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -569,7 +570,12 @@ pub async fn call_chat_completions(
     extract_code: bool,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>, CompletionTokenUsage)> {
+) -> Result<(
+    String,
+    Option<String>,
+    Vec<ToolResult>,
+    CompletionTokenUsage,
+)> {
     let spinner_message = spinner_label(client.global_config());
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
@@ -583,12 +589,21 @@ pub async fn call_chat_completions(
             let ChatCompletionsOutput {
                 mut text,
                 tool_calls,
+                thought,
                 input_tokens,
                 output_tokens,
                 cached_tokens,
                 ..
             } = ret;
             let usage = CompletionTokenUsage::new(input_tokens, output_tokens, cached_tokens);
+            if print {
+                if let Some(v) = &thought {
+                    client
+                        .global_config()
+                        .read()
+                        .print_markdown(&format!("<think>\n{}\n</think>\n\n", v))?;
+                }
+            }
             if !text.is_empty() {
                 if extract_code {
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
@@ -599,6 +614,7 @@ pub async fn call_chat_completions(
             }
             Ok((
                 text,
+                thought,
                 eval_tool_calls(client.global_config(), tool_calls)?,
                 usage,
             ))
@@ -611,7 +627,12 @@ pub async fn call_chat_completions_streaming(
     input: &Input,
     client: &dyn Client,
     abort_signal: AbortSignal,
-) -> Result<(String, Vec<ToolResult>, CompletionTokenUsage)> {
+) -> Result<(
+    String,
+    Option<String>,
+    Vec<ToolResult>,
+    CompletionTokenUsage,
+)> {
     let spinner_message = spinner_label(client.global_config());
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
@@ -630,12 +651,12 @@ pub async fn call_chat_completions_streaming(
 
     let _ = render_ret;
 
-    let (text, tool_calls, usage) = handler.take();
+    let (text, thought, tool_calls, usage) = handler.take();
     if aborted {
         if !text.is_empty() {
             println!();
         }
-        return Ok((text, vec![], usage));
+        return Ok((text, thought, vec![], usage));
     }
 
     match send_ret {
@@ -645,6 +666,7 @@ pub async fn call_chat_completions_streaming(
             }
             Ok((
                 text,
+                thought,
                 eval_tool_calls(client.global_config(), tool_calls)?,
                 usage,
             ))
@@ -656,7 +678,7 @@ pub async fn call_chat_completions_streaming(
             if text.is_empty() {
                 Err(err)
             } else {
-                Ok((text, vec![], usage))
+                Ok((text, thought, vec![], usage))
             }
         }
     }

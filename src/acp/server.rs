@@ -102,7 +102,7 @@ impl HarnxAgent {
         input: &Input,
         client: &dyn Client,
         abort_signal: &AbortSignal,
-    ) -> Result<(String, Vec<ToolCall>), acp::Error> {
+    ) -> Result<(String, Option<String>, Vec<ToolCall>), acp::Error> {
         let (tx, mut rx) = unbounded_channel();
         let mut handler = SseHandler::new(tx, abort_signal.clone());
 
@@ -135,7 +135,7 @@ impl HarnxAgent {
 
         send_ret.map_err(|e| acp::Error::new(-32603, e.to_string()))?;
 
-        let (text, tool_calls, usage) = handler.take();
+        let (text, thought, tool_calls, usage) = handler.take();
 
         // Send token usage stats to the parent via SessionInfoUpdate._meta
         let _ = self
@@ -147,7 +147,7 @@ impl HarnxAgent {
             )
             .await;
 
-        Ok((text, tool_calls))
+        Ok((text, thought, tool_calls))
     }
 
     async fn execute_llm_non_streaming(
@@ -156,16 +156,20 @@ impl HarnxAgent {
         input: &Input,
         client: &dyn Client,
         abort_signal: &AbortSignal,
-    ) -> Result<(String, Vec<ToolCall>), acp::Error> {
+    ) -> Result<(String, Option<String>, Vec<ToolCall>), acp::Error> {
         let output = tokio::select! {
             result = client.chat_completions(input.clone()) => {
                 result.map_err(|e| acp::Error::new(-32603, e.to_string()))?
             }
             _ = wait_abort_signal(abort_signal) => {
-                return Ok((String::new(), vec![]));
+                return Ok((String::new(), None, vec![]));
             }
         };
 
+        if let Some(thought) = &output.thought {
+            self.send_text_chunk(session_id, &format!("<think>\n{}\n</think>\n", thought))
+                .await?;
+        }
         if !output.text.is_empty() {
             self.send_text_chunk(session_id, &output.text).await?;
         }
@@ -180,7 +184,7 @@ impl HarnxAgent {
             )
             .await;
 
-        Ok((output.text, output.tool_calls))
+        Ok((output.text, output.thought, output.tool_calls))
     }
 }
 
@@ -257,7 +261,7 @@ impl acp::Agent for HarnxAgent {
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
             }
 
-            let (output, tool_calls) = if input.stream() {
+            let (output, thought, tool_calls) = if input.stream() {
                 self.execute_llm_streaming(&session_key, &input, client.as_ref(), &abort_signal)
                     .await?
             } else {
@@ -320,7 +324,7 @@ impl acp::Agent for HarnxAgent {
                 }
             };
 
-            input = input.merge_tool_results(output, tool_results);
+            input = input.merge_tool_results(output, thought, tool_results);
         }
     }
 

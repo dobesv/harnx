@@ -175,6 +175,7 @@ async fn chat_completions_streaming(
                             function_name.clone(),
                             arguments,
                             Some(function_id.clone()),
+                            None,
                         ))?;
                     }
                     function_name.clear();
@@ -238,6 +239,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
                     name.to_string(),
                     arguments,
                     Some(id.to_string()),
+                    None,
                 ));
             }
         }
@@ -249,6 +251,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
+        thought: None,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["billed_units"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["billed_units"]["output_tokens"].as_u64(),

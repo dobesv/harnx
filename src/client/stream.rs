@@ -12,6 +12,8 @@ pub struct SseHandler {
     sender: UnboundedSender<SseEvent>,
     abort_signal: AbortSignal,
     buffer: String,
+    thought_buffer: String,
+    thought_closed: bool,
     tool_calls: Vec<ToolCall>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -24,6 +26,8 @@ impl SseHandler {
             sender,
             abort_signal,
             buffer: String::new(),
+            thought_buffer: String::new(),
+            thought_closed: false,
             tool_calls: Vec::new(),
             input_tokens: None,
             output_tokens: None,
@@ -36,10 +40,39 @@ impl SseHandler {
         if text.is_empty() {
             return Ok(());
         }
+        let prefix = if !self.thought_buffer.is_empty() && !self.thought_closed {
+            self.thought_closed = true;
+            "\n</think>\n\n"
+        } else {
+            ""
+        };
         self.buffer.push_str(text);
         let ret = self
             .sender
-            .send(SseEvent::Text(text.to_string()))
+            .send(SseEvent::Text(format!("{prefix}{text}")))
+            .with_context(|| "Failed to send SseEvent:Text");
+        if let Err(err) = ret {
+            if self.abort_signal.aborted() {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub fn thought(&mut self, thought: &str) -> Result<()> {
+        if thought.is_empty() {
+            return Ok(());
+        }
+        let prefix = if self.thought_buffer.is_empty() {
+            "<think>\n"
+        } else {
+            ""
+        };
+        self.thought_buffer.push_str(thought);
+        let ret = self
+            .sender
+            .send(SseEvent::Text(format!("{prefix}{thought}")))
             .with_context(|| "Failed to send SseEvent:Text");
         if let Err(err) = ret {
             if self.abort_signal.aborted() {
@@ -52,6 +85,12 @@ impl SseHandler {
 
     pub fn done(&mut self) {
         // debug!("HandleDone");
+        if !self.thought_buffer.is_empty() && !self.thought_closed {
+            self.thought_closed = true;
+            let _ = self
+                .sender
+                .send(SseEvent::Text("\n</think>\n\n".to_string()));
+        }
         let ret = self.sender.send(SseEvent::Done);
         if ret.is_err() {
             if self.abort_signal.aborted() {
@@ -63,6 +102,12 @@ impl SseHandler {
 
     pub fn tool_call(&mut self, call: ToolCall) -> Result<()> {
         // debug!("HandleCall: {:?}", call);
+        if !self.thought_buffer.is_empty() && !self.thought_closed {
+            self.thought_closed = true;
+            let _ = self
+                .sender
+                .send(SseEvent::Text("\n</think>\n\n".to_string()));
+        }
         self.tool_calls.push(call);
         Ok(())
     }
@@ -92,10 +137,15 @@ impl SseHandler {
         }
     }
 
-    pub fn take(self) -> (String, Vec<ToolCall>, CompletionTokenUsage) {
+    pub fn take(self) -> (String, Option<String>, Vec<ToolCall>, CompletionTokenUsage) {
         let usage =
             CompletionTokenUsage::new(self.input_tokens, self.output_tokens, self.cached_tokens);
-        (self.buffer, self.tool_calls, usage)
+        let thought = if self.thought_buffer.is_empty() {
+            None
+        } else {
+            Some(self.thought_buffer)
+        };
+        (self.buffer, thought, self.tool_calls, usage)
     }
 }
 
