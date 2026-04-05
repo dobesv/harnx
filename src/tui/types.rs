@@ -32,6 +32,7 @@ pub(super) struct App {
     pub(super) should_quit: bool,
     pub(super) llm_busy: bool,
     pub(super) transcript_scroll: u16,
+    pub(super) max_scroll: u16,
     pub(super) streaming_assistant_idx: Option<usize>,
     pub(super) pending_message: Option<String>,
     pub(super) completions: Vec<(String, Option<String>)>,

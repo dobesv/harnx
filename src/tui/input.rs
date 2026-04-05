@@ -32,10 +32,19 @@ impl Tui {
                 }
             }
             (KeyCode::PageUp, KeyModifiers::NONE) => {
-                self.app.transcript_scroll = self.app.transcript_scroll.saturating_sub(10);
+                if self.app.transcript_scroll == u16::MAX {
+                    self.app.transcript_scroll = self.app.max_scroll.saturating_sub(10);
+                } else {
+                    self.app.transcript_scroll = self.app.transcript_scroll.saturating_sub(10);
+                }
             }
             (KeyCode::PageDown, KeyModifiers::NONE) => {
-                self.app.transcript_scroll = self.app.transcript_scroll.saturating_add(10);
+                let new_scroll = self.app.transcript_scroll.saturating_add(10);
+                if new_scroll >= self.app.max_scroll {
+                    self.app.transcript_scroll = u16::MAX;
+                } else {
+                    self.app.transcript_scroll = new_scroll;
+                }
             }
             (KeyCode::Tab, KeyModifiers::NONE) => {
                 self.handle_tab(false);
@@ -108,10 +117,21 @@ impl Tui {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.app.transcript_scroll = self.app.transcript_scroll.saturating_sub(3);
+                // If pinned to bottom, unpin and start from max_scroll
+                if self.app.transcript_scroll == u16::MAX {
+                    self.app.transcript_scroll = self.app.max_scroll.saturating_sub(3);
+                } else {
+                    self.app.transcript_scroll = self.app.transcript_scroll.saturating_sub(3);
+                }
             }
             MouseEventKind::ScrollDown => {
-                self.app.transcript_scroll = self.app.transcript_scroll.saturating_add(3);
+                // If at bottom, re-pin to bottom
+                let new_scroll = self.app.transcript_scroll.saturating_add(3);
+                if new_scroll >= self.app.max_scroll {
+                    self.app.transcript_scroll = u16::MAX;
+                } else {
+                    self.app.transcript_scroll = new_scroll;
+                }
             }
             _ => {}
         }

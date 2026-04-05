@@ -65,17 +65,31 @@ impl Tui {
         };
 
         // Clamp transcript_scroll to valid range (u16::MAX is the "pinned to bottom" sentinel)
-        let total_lines = transcript_lines.len() as u16;
         let visible_height = chunks[0].height;
-        let max_scroll = total_lines.saturating_sub(visible_height);
-        if self.app.transcript_scroll > max_scroll {
-            self.app.transcript_scroll = max_scroll;
+        // Compute line count after wrapping by measuring rendered content
+        let mut total_lines = 0u16;
+        let width = chunks[0].width;
+        for line in &transcript_lines {
+            let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            if width == 0 {
+                total_lines = total_lines.saturating_add(1);
+            } else {
+                let wrapped = line_len.div_ceil(width as usize);
+                total_lines = total_lines.saturating_add(wrapped.max(1) as u16);
+            }
         }
+        self.app.max_scroll = total_lines.saturating_sub(visible_height);
+
+        let effective_scroll = if self.app.transcript_scroll == u16::MAX {
+            self.app.max_scroll
+        } else {
+            self.app.transcript_scroll.min(self.app.max_scroll)
+        };
 
         let transcript = Paragraph::new(transcript_lines)
             .block(Block::default().borders(Borders::NONE).title("Transcript"))
             .wrap(Wrap { trim: false })
-            .scroll((self.app.transcript_scroll, 0));
+            .scroll((effective_scroll, 0));
         frame.render_widget(transcript, chunks[0]);
 
         let title = self.build_input_title();
