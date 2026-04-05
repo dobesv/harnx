@@ -883,6 +883,56 @@ impl Tui {
         Ok(())
     }
 
+    fn append_streaming_assistant_chunk(&mut self, chunk: &str) {
+        let mut remainder = chunk;
+        while !remainder.is_empty() {
+            if let Some(idx) = self.app.streaming_assistant_idx {
+                match self.app.transcript.get_mut(idx) {
+                    Some(TranscriptEntry::Assistant(existing)) => {
+                        if existing.is_empty() {
+                            if let Some(split_at) = remainder.find('\n') {
+                                let (segment, rest) = remainder.split_at(split_at + 1);
+                                existing.push_str(segment);
+                                remainder = rest;
+                                self.app.streaming_assistant_idx = None;
+                            } else {
+                                existing.push_str(remainder);
+                                break;
+                            }
+                        } else if let Some(last_newline) = existing.rfind('\n') {
+                            let tail = &existing[last_newline + 1..];
+                            if tail.is_empty() {
+                                self.app.streaming_assistant_idx = None;
+                            } else if let Some(split_at) = remainder.find('\n') {
+                                let (segment, rest) = remainder.split_at(split_at + 1);
+                                existing.push_str(segment);
+                                remainder = rest;
+                                self.app.streaming_assistant_idx = None;
+                            } else {
+                                existing.push_str(remainder);
+                                break;
+                            }
+                        } else if let Some(split_at) = remainder.find('\n') {
+                            let (segment, rest) = remainder.split_at(split_at + 1);
+                            existing.push_str(segment);
+                            remainder = rest;
+                            self.app.streaming_assistant_idx = None;
+                        } else {
+                            existing.push_str(remainder);
+                            break;
+                        }
+                    }
+                    _ => self.app.streaming_assistant_idx = None,
+                }
+            } else {
+                self.app
+                    .transcript
+                    .push(TranscriptEntry::Assistant(String::new()));
+                self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
+            }
+        }
+    }
+
     fn pin_transcript_to_bottom(&mut self) {
         self.app.transcript_scroll = u16::MAX;
     }
@@ -911,18 +961,7 @@ impl Tui {
                 }
             }
             TuiEvent::Chunk(chunk) => {
-                if let Some(idx) = self.app.streaming_assistant_idx {
-                    match self.app.transcript.get_mut(idx) {
-                        Some(TranscriptEntry::Assistant(existing)) => existing.push_str(&chunk),
-                        _ => {
-                            self.app.transcript.push(TranscriptEntry::Assistant(chunk));
-                            self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
-                        }
-                    }
-                } else {
-                    self.app.transcript.push(TranscriptEntry::Assistant(chunk));
-                    self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
-                }
+                self.append_streaming_assistant_chunk(&chunk);
                 self.pin_transcript_to_bottom();
             }
             TuiEvent::Finished {
@@ -1402,13 +1441,13 @@ mod tests {
         let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
         let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-        tui.handle_tui_event(TuiEvent::Chunk("Hello ".to_string()))
+        tui.handle_tui_event(TuiEvent::Chunk("Hello\nworld".to_string()))
             .await
             .unwrap();
         tui.handle_tui_event(TuiEvent::UiOutput("tool output".to_string()))
             .await
             .unwrap();
-        tui.handle_tui_event(TuiEvent::Chunk("world".to_string()))
+        tui.handle_tui_event(TuiEvent::Chunk("\nAgain".to_string()))
             .await
             .unwrap();
 
@@ -1421,7 +1460,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(assistant_entries, vec!["Hello world"]);
+        assert_eq!(assistant_entries, vec!["Hello\n", "world\n", "Again"]);
         assert!(tui
             .app
             .transcript
