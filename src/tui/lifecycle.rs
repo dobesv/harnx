@@ -1,0 +1,191 @@
+use super::*;
+use crate::tui::types::{App, TranscriptEntry, TuiEvent, SPINNER_FRAMES, TICK_RATE};
+
+impl Tui {
+    #[cfg(test)]
+    pub(super) fn queue_pending_message(&mut self, text: String) {
+        self.app.pending_message = Some(text);
+        self.refresh_input_chrome();
+    }
+
+    #[cfg(test)]
+    pub(super) fn apply_draft_edit_for_test(&mut self, key: KeyEvent) {
+        if self.app.pending_message.is_some() {
+            self.app.pending_message = None;
+        }
+        self.app.input.input(TextInput::from(key));
+        self.refresh_input_chrome();
+    }
+
+    pub fn init(
+        config: &GlobalConfig,
+        async_manager: AsyncHookManager,
+        persistent_manager: Arc<Mutex<PersistentHookManager>>,
+    ) -> Result<Self> {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let ui_output_tx = event_tx.clone();
+        let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel::<String>();
+        install_ui_output_sender(bridge_tx);
+        tokio::spawn(async move {
+            while let Some(text) = bridge_rx.recv().await {
+                let _ = ui_output_tx.send(TuiEvent::UiOutput(text));
+            }
+        });
+
+        // Build the initial transcript: welcome (if not in agent/RAG) + banner (if agent)
+        let initial_transcript = Self::build_initial_transcript(config);
+
+        Ok(Self {
+            config: config.clone(),
+            abort_signal: create_abort_signal(),
+            async_manager: Arc::new(Mutex::new(async_manager)),
+            persistent_manager,
+            pending_async_context: Arc::new(Mutex::new(None)),
+            app: App {
+                transcript: initial_transcript,
+                input: Self::new_input(),
+                spinner_index: 0,
+                should_quit: false,
+                llm_busy: false,
+                transcript_scroll: 0,
+                streaming_assistant_idx: None,
+                pending_message: None,
+                completions: vec![],
+                completion_index: 0,
+                completion_prefix: String::new(),
+                completion_suffix: String::new(),
+                history: vec![],
+                history_index: None,
+                history_draft: String::new(),
+            },
+            event_tx,
+            event_rx,
+        })
+    }
+
+    fn build_initial_transcript(config: &GlobalConfig) -> Vec<TranscriptEntry> {
+        let mut entries = vec![];
+        let cfg = config.read();
+        let state = cfg.state();
+
+        // Show welcome only when not already in an agent/RAG session (matches old REPL behaviour)
+        entries.push(TranscriptEntry::System(format!(
+            "Welcome to {} {}  •  Type .help for commands, Tab to complete.",
+            env!("CARGO_CRATE_NAME"),
+            env!("CARGO_PKG_VERSION")
+        )));
+
+        // Show agent banner and conversation starters if an agent is active
+        if state.contains(crate::config::StateFlags::AGENT) {
+            if let Ok(banner) = cfg.agent_banner() {
+                if !banner.trim().is_empty() {
+                    entries.push(TranscriptEntry::Assistant(banner));
+                }
+            }
+            if let Some(agent) = &cfg.agent {
+                let starters = agent.conversation_staters();
+                if !starters.is_empty() {
+                    let list = starters
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| format!("  {}. {s}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    entries.push(TranscriptEntry::System(format!(
+                        "Conversation starters:\n{list}\n(type .starter <n> to use)"
+                    )));
+                }
+            }
+        }
+
+        // Show status line if set (session / model info)
+        let status = cfg.render_status_line(true);
+        if !status.is_empty() {
+            entries.push(TranscriptEntry::System(status));
+        }
+
+        entries
+    }
+
+    pub fn async_manager(&self) -> &Arc<Mutex<AsyncHookManager>> {
+        &self.async_manager
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        let mut terminal = Self::setup_terminal()?;
+        let result = self.run_loop(&mut terminal).await;
+        Self::restore_terminal(&mut terminal)?;
+        self.config.write().exit_session()?;
+        result
+    }
+
+    async fn run_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        let mut last_tick = Instant::now();
+        loop {
+            terminal.draw(|frame| self.draw(frame))?;
+
+            if self.app.should_quit || self.abort_signal.aborted_ctrld() {
+                break;
+            }
+
+            let timeout = TICK_RATE.saturating_sub(last_tick.elapsed());
+            if event::poll(timeout)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        self.handle_key(key).await?
+                    }
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse);
+                    }
+                    Event::Resize(_, _) => {}
+                    _ => {}
+                }
+            }
+
+            while let Ok(evt) = self.event_rx.try_recv() {
+                self.handle_tui_event(evt).await?;
+            }
+
+            if last_tick.elapsed() >= TICK_RATE {
+                self.app.spinner_index = (self.app.spinner_index + 1) % SPINNER_FRAMES.len();
+                self.refresh_input_chrome();
+                last_tick = Instant::now();
+
+                // Check for async hook results that need a follow-up prompt (fix #2)
+                if !self.app.llm_busy {
+                    self.try_resume_async_hooks().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if an async hook has signalled a resume and automatically start the follow-up prompt.
+    async fn try_resume_async_hooks(&mut self) -> Result<()> {
+        let max_resume = self.config.read().resolved_hooks().max_resume.unwrap_or(5);
+        let should_resume = {
+            let mut async_guard = self.async_manager.lock().await;
+            let mut pending_guard = self.pending_async_context.lock().await;
+            drain_async_results(&mut async_guard, &mut pending_guard)
+        };
+        if !should_resume {
+            return Ok(());
+        }
+        if self.abort_signal.aborted() {
+            return Ok(());
+        }
+        let context = {
+            let mut pending_guard = self.pending_async_context.lock().await;
+            pending_guard
+                .take()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "Continue working on pending tasks.".to_string())
+        };
+        let _ = max_resume; // used inside run_prompt_inner
+        self.app.transcript.push(TranscriptEntry::System(format!(
+            "↩ Async resume: {context}"
+        )));
+        self.pin_transcript_to_bottom();
+        self.start_prompt(context).await
+    }
+}
