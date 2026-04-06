@@ -1,10 +1,13 @@
 use super::*;
+use crate::tui::terminal::PanicTerminalHookGuard;
 use crate::tui::types::{App, TranscriptEntry, TuiEvent, SPINNER_FRAMES, TICK_RATE};
 
 impl Tui {
     #[cfg(test)]
     pub(super) fn queue_pending_message(&mut self, text: String) {
-        self.app.pending_message = Some(text);
+        self.app.pending_message = Some(text.clone());
+        // Also set the input text so it remains visible (new behavior)
+        self.set_input_text(&text);
         self.refresh_input_chrome();
     }
 
@@ -113,6 +116,7 @@ impl Tui {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        let _panic_terminal_hook = PanicTerminalHookGuard::install();
         let mut terminal = Self::setup_terminal()?;
         let result = self.run_loop(&mut terminal).await;
         Self::restore_terminal(&mut terminal)?;

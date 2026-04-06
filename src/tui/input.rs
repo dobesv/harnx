@@ -67,8 +67,8 @@ impl Tui {
                     self.push_history(text.clone());
                     if self.app.llm_busy {
                         // Queue the message to send when LLM finishes
+                        // Keep the text in input so user can see/edit it
                         self.app.pending_message = Some(text);
-                        self.app.input = Self::new_input();
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through repl command handler
@@ -195,6 +195,8 @@ impl Tui {
                 self.refresh_input_chrome();
 
                 if let Some(pending) = self.app.pending_message.take() {
+                    // Clear input now that the pending message is actually being submitted
+                    self.app.input = Self::new_input();
                     self.app
                         .transcript
                         .push(TranscriptEntry::User(pending.clone()));
@@ -210,6 +212,8 @@ impl Tui {
                 self.refresh_input_chrome();
 
                 if let Some(pending) = self.app.pending_message.take() {
+                    // Clear input now that the pending message is actually being submitted
+                    self.app.input = Self::new_input();
                     self.app
                         .transcript
                         .push(TranscriptEntry::User(pending.clone()));
