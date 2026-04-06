@@ -185,7 +185,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
         ToolDeclaration {
             name: format!("{server_name}_session_prompt"),
             description: format!(
-                "Send a prompt to the '{server_name}' ACP agent. Auto-creates a session if session_id is not provided."
+                "Send a prompt to the '{server_name}' ACP agent. Auto-creates a session if session_id is not provided.  Use the session_id from a prior prompt call to continue the same conversation."
             ),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -204,7 +204,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                         JsonSchema {
                             type_value: Some("string".to_string()),
                             description: Some(
-                                "Session ID from a previous session_new call. If omitted, a new session is created automatically.".to_string(),
+                                "Session ID from a previous session_new call or a prior prompt call. If omitted, a new session is created automatically.".to_string(),
                             ),
                             ..Default::default()
                         },
