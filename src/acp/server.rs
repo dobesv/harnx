@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc::unbounded_channel;
 
 const MAX_TOOL_CALL_ROUNDS: u32 = 100;
+const MAX_POST_TOOL_LIMIT_ROUNDS: u32 = 1;
 
 pub struct HarnxAgent {
     agent_name: String,
@@ -256,6 +257,7 @@ impl acp::Agent for HarnxAgent {
             .map_err(|e| acp::Error::new(-32603, format!("Failed to create client: {e}")))?;
 
         let mut round = 0u32;
+        let mut post_tool_limit_rounds = 0u32;
         loop {
             if abort_signal.aborted() {
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
@@ -273,16 +275,28 @@ impl acp::Agent for HarnxAgent {
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
             }
 
+            if round > MAX_TOOL_CALL_ROUNDS {
+                post_tool_limit_rounds += 1;
+                if post_tool_limit_rounds > MAX_POST_TOOL_LIMIT_ROUNDS {
+                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                }
+            }
+
             round += 1;
             let tool_results = if round > MAX_TOOL_CALL_ROUNDS {
-                vec![ToolResult::new(
-                    tool_calls[0].clone(),
-                    json!({
-                        "error": "maximum tool call rounds exceeded",
-                        "action": "Provide your final answer to the user now. Summarize what you accomplished and any remaining work.",
-                        "guidance": "Explain that this session hit the tool call limit. If more tool use is needed, ask the user to continue in a new session or narrow the request."
-                    }),
-                )]
+                tool_calls
+                    .into_iter()
+                    .map(|call| {
+                        ToolResult::new(
+                            call,
+                            json!({
+                                "error": "maximum tool call rounds exceeded",
+                                "action": "Provide your final answer to the user now. Summarize what you accomplished and any remaining work.",
+                                "guidance": "Explain that this session hit the tool call limit. If more tool use is needed, ask the user to continue in a new session or narrow the request."
+                            }),
+                        )
+                    })
+                    .collect()
             } else {
                 let acp_manager = self.config.read().acp_manager.clone();
                 let result = if let Some(ref manager) = acp_manager {
