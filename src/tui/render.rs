@@ -44,7 +44,6 @@ impl Tui {
         lines
     }
 
-    #[cfg(test)]
     pub(crate) fn draw(&mut self, frame: &mut Frame<'_>) {
         let size = frame.area();
         let input_width = size.width.saturating_sub(2).max(1);

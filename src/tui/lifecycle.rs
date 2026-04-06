@@ -121,14 +121,15 @@ impl Tui {
         let _panic_terminal_hook = PanicTerminalHookGuard::install();
         let mut terminal = Self::setup_terminal()?;
         let mut event_source = CrosstermEventSource;
-        let result = self.run_loop(&mut terminal, &mut event_source).await;
+        let result = self.run_loop_inner(&mut terminal, &mut event_source).await;
         Self::restore_terminal(&mut terminal)?;
         self.config.write().exit_session()?;
         result
     }
 
-    #[cfg(test)]
-    pub(crate) async fn run_loop<B, E>(
+    /// Generic run_loop that works with any Backend and EventSource.
+    /// Used by production `run()` with Crossterm, and by tests with TestBackend.
+    async fn run_loop_inner<B, E>(
         &mut self,
         terminal: &mut Terminal<B>,
         event_source: &mut E,
