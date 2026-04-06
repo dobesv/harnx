@@ -263,3 +263,74 @@ async fn test_basic_message_and_streaming_response() {
 
     set_test_client(None);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_streaming_with_tool_calls() {
+    let config = test_config_with_mock_client();
+
+    // First turn: stream text, then make a tool call
+    // Second turn: more text after tool result
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_text_chunk("Let me check that for you.")
+                    .add_tool_call("search", serde_json::json!({"query": "test"}))
+                    .build(),
+            )
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_text_chunk("The answer is 42.")
+                    .build(),
+            )
+            .build(),
+    );
+
+    set_test_client(Some(mock_client.clone()));
+
+    let mut harness = TuiTestHarness::with_config(config.clone());
+    harness.tui().app.transcript.clear();
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptEntry::User("What is the answer?".to_string()));
+    harness.tui().start_prompt("What is the answer?".to_string()).await.unwrap();
+
+    harness
+        .sync()
+        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    // Process all pending events
+    loop {
+        match harness.tui().event_rx.try_recv() {
+            Ok(event) => {
+                harness.tui().handle_tui_event(event).await.unwrap();
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(e) => panic!("Unexpected error receiving event: {e}"),
+        }
+    }
+    harness.render();
+
+    // Wait for final response text
+    harness
+        .wait_until_screen_contains("The answer is 42.", Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    // Verify the screen shows tool result indicator
+    let screen = harness.screen_contents();
+    assert!(
+        screen.contains("tool result"),
+        "Screen should show tool result indicator"
+    );
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("streaming_with_tool_calls", rendered);
+
+    set_test_client(None);
+}

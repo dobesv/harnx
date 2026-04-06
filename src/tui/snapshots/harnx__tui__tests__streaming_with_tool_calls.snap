@@ -1,0 +1,26 @@
+---
+source: src/tui/tests.rs
+expression: rendered
+---
+Transcript
+> What is the answer?
+
+Let me check that for you.
+
+1 tool result(s) returned
+
+The answer is 42.
+
+
+
+
+
+
+
+
+
+
+
+
+
+• Input
