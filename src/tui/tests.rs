@@ -334,3 +334,72 @@ async fn test_streaming_with_tool_calls() {
 
     set_test_client(None);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_screen_overflow_and_word_wrap() {
+    let config = test_config_with_mock_client();
+    let user_message = "Please demonstrate wrapping in a small viewport.";
+    let long_response = concat!(
+        "This response contains several deliberately long words grouped into readable sentences ",
+        "so the viewport must wrap them cleanly across lines without clipping or splitting words awkwardly. ",
+        "Each sentence keeps going long enough to force vertical overflow in the transcript area and prove scrolling still leaves wrapped content visible."
+    );
+
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(MockTurnBuilder::new().add_text_chunk(long_response).build())
+            .build(),
+    );
+
+    set_test_client(Some(mock_client.clone()));
+
+    let mut harness = TuiTestHarness::with_size(40, 10);
+    harness.tui().app.transcript.clear();
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptEntry::User(user_message.to_string()));
+    harness.tui().start_prompt(user_message.to_string()).await.unwrap();
+
+    harness
+        .sync()
+        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    loop {
+        match harness.tui().event_rx.try_recv() {
+            Ok(event) => harness.tui().handle_tui_event(event).await.unwrap(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(e) => panic!("Unexpected error receiving event: {e}"),
+        }
+    }
+    harness.render();
+
+    harness
+        .wait_until_screen_contains("awkwardly.", Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(
+        rendered.contains("wrap them cleanly across lines without")
+            || rendered.contains("lines without\nclipping or splitting words awkwardly."),
+        "expected wrapped content to remain visible: {rendered}"
+    );
+    assert!(
+        rendered.contains("clipping or splitting words awkwardly.")
+            || rendered.contains("clipping or splitting\nwords awkwardly."),
+        "expected wrapped words to remain intact: {rendered}"
+    );
+    assert!(
+        !rendered.contains("splittin\ng"),
+        "word wrap should not split words across lines: {rendered}"
+    );
+
+    insta::assert_snapshot!("screen_overflow_and_word_wrap", rendered);
+
+    set_test_client(None);
+}
