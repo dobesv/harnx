@@ -462,8 +462,8 @@ impl Tui {
         )
         .await
         {
-            Ok(exit) => {
-                if exit {
+            Ok(outcome) => {
+                if matches!(outcome, crate::repl::CommandOutcome::Exit) {
                     self.app.should_quit = true;
                 }
                 let llm_busy = self.app.llm_busy;
