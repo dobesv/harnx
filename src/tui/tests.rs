@@ -1,12 +1,33 @@
 use super::*;
+use crate::client::{set_test_client, Client, ClientConfig};
 use crate::config::Config;
+use crate::test_utils::{MockClient, MockTurnBuilder, TuiTestHarness};
 use crate::tui::types::{TranscriptEntry, TuiEvent};
 use parking_lot::RwLock;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 fn test_config() -> GlobalConfig {
     Arc::new(RwLock::new(Config::default()))
+}
+
+fn test_config_with_mock_client() -> GlobalConfig {
+    let config = test_config();
+    {
+        let mut guard = config.write();
+        guard.clients = vec![ClientConfig::Unknown];
+        guard.model = MockClient::builder().build().model().clone();
+    }
+    config
+}
+
+fn normalize_screen(contents: &str) -> String {
+    contents
+        .lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[tokio::test]
@@ -161,4 +182,84 @@ async fn info_commands_render_into_tui_transcript() {
         .iter()
         .any(|entry| matches!(entry, TranscriptEntry::System(text) if !text.is_empty()));
     assert!(has_session_output);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_basic_message_and_streaming_response() {
+    let config = test_config_with_mock_client();
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_text_chunk("Hello")
+                    .add_text_chunk(" from")
+                    .add_text_chunk(" the mock client!")
+                    .build(),
+            )
+            .build(),
+    );
+
+    set_test_client(Some(mock_client.clone()));
+
+    let mut harness = TuiTestHarness::with_config(config.clone());
+    harness.tui().app.transcript.clear();
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptEntry::User("Test message".to_string()));
+    harness.tui().start_prompt("Test message".to_string()).await.unwrap();
+
+    harness
+        .sync()
+        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    // Process all pending events
+    loop {
+        match harness.tui().event_rx.try_recv() {
+            Ok(event) => {
+                harness.tui().handle_tui_event(event).await.unwrap();
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(e) => panic!("Unexpected error receiving event: {e}"),
+        }
+    }
+    harness.render();
+
+    // Wait for screen to contain expected text (using harness helper method)
+    harness
+        .wait_until_screen_contains("Hello from the mock client!", Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let assistant_entries: Vec<_> = harness
+        .tui()
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::Assistant(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_entries, vec!["Hello from the mock client!"]);
+    assert!(harness
+        .tui()
+        .app
+        .transcript
+        .iter()
+        .any(|entry| matches!(entry, TranscriptEntry::User(text) if text == "Test message")));
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("basic_message_and_streaming_response", rendered);
+
+    set_test_client(None);
 }

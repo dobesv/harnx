@@ -107,6 +107,35 @@ impl TuiTestHarness {
     pub fn sync(&self) -> &SyncHarness {
         &self.sync
     }
+
+    /// Process events and wait until screen contains expected text.
+    ///
+    /// This helper encapsulates the pattern of polling for events and checking
+    /// screen contents until a condition is met.
+    pub async fn wait_until_screen_contains(
+        &mut self,
+        expected: &str,
+        timeout_duration: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let expected = expected.to_string();
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow::anyhow!(
+                    "timed out waiting for screen to contain {:?}",
+                    expected
+                ));
+            }
+            
+            self.render();
+            if self.screen_contents().contains(&expected) {
+                return Ok(());
+            }
+            
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 }
 
 impl Default for TuiTestHarness {

@@ -1,0 +1,27 @@
+---
+source: src/tui/tests.rs
+assertion_line: 262
+expression: rendered
+---
+Transcript
+> Test message
+
+Hello from the mock client!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• Input

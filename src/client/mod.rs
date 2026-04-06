@@ -12,6 +12,91 @@ pub use message::*;
 pub use model::*;
 pub use stream::*;
 
+#[cfg(test)]
+static TEST_CLIENT: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<dyn Client>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub fn set_test_client(client: Option<std::sync::Arc<dyn Client>>) {
+    let slot = TEST_CLIENT.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().expect("test client mutex poisoned") = client;
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_client() -> Option<std::sync::Arc<dyn Client>> {
+    TEST_CLIENT
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("test client mutex poisoned")
+        .clone()
+}
+
+#[cfg(test)]
+pub(crate) struct TestClient(pub(crate) std::sync::Arc<dyn Client>);
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Client for TestClient {
+    fn global_config(&self) -> &crate::config::GlobalConfig {
+        self.0.global_config()
+    }
+
+    fn extra_config(&self) -> Option<&ExtraConfig> {
+        self.0.extra_config()
+    }
+
+    fn patch_config(&self) -> Option<&RequestPatch> {
+        self.0.patch_config()
+    }
+
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn model(&self) -> &Model {
+        self.0.model()
+    }
+
+    fn model_mut(&mut self) -> &mut Model {
+        panic!("test client wrapper does not support mutable model access")
+    }
+
+    async fn chat_completions_inner(
+        &self,
+        client: &reqwest::Client,
+        data: ChatCompletionsData,
+    ) -> anyhow::Result<ChatCompletionsOutput> {
+        self.0.chat_completions_inner(client, data).await
+    }
+
+    async fn chat_completions_streaming_inner(
+        &self,
+        client: &reqwest::Client,
+        handler: &mut SseHandler,
+        data: ChatCompletionsData,
+    ) -> anyhow::Result<()> {
+        self.0
+            .chat_completions_streaming_inner(client, handler, data)
+            .await
+    }
+
+    async fn embeddings_inner(
+        &self,
+        client: &reqwest::Client,
+        data: &EmbeddingsData,
+    ) -> anyhow::Result<EmbeddingsOutput> {
+        self.0.embeddings_inner(client, data).await
+    }
+
+    async fn rerank_inner(
+        &self,
+        client: &reqwest::Client,
+        data: &RerankData,
+    ) -> anyhow::Result<RerankOutput> {
+        self.0.rerank_inner(client, data).await
+    }
+}
+
 register_client!(
     (openai, "openai", OpenAIConfig, OpenAIClient),
     (

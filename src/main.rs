@@ -19,6 +19,9 @@ mod utils;
 #[macro_use]
 extern crate log;
 
+#[cfg(test)]
+pub mod test_utils;
+
 use crate::cli::Cli;
 use crate::client::{
     call_chat_completions, call_chat_completions_streaming, list_models, ModelType,

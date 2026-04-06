@@ -58,10 +58,10 @@ impl SyncHarness {
         &self,
         expected: &str,
         timeout_duration: Duration,
-        screen: G,
+        mut screen: G,
     ) -> Result<()>
     where
-        G: Fn() -> String,
+        G: FnMut() -> String,
     {
         self.wait_until(
             format!("screen to contain {expected:?}"),
