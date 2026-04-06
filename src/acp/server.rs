@@ -11,7 +11,7 @@ use anyhow::bail;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::unbounded_channel;
 
-const MAX_TOOL_CALL_ROUNDS: u32 = 32;
+const MAX_TOOL_CALL_ROUNDS: u32 = 100;
 
 pub struct HarnxAgent {
     agent_name: String,
