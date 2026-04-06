@@ -274,13 +274,16 @@ impl acp::Agent for HarnxAgent {
             }
 
             round += 1;
-            if round > MAX_TOOL_CALL_ROUNDS {
-                self.send_text_chunk(&session_key, "\n[Error: maximum tool call rounds exceeded]")
-                    .await?;
-                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
-            }
-
-            let tool_results = {
+            let tool_results = if round > MAX_TOOL_CALL_ROUNDS {
+                vec![ToolResult::new(
+                    tool_calls[0].clone(),
+                    json!({
+                        "error": "maximum tool call rounds exceeded",
+                        "action": "Provide your final answer to the user now. Summarize what you accomplished and any remaining work.",
+                        "guidance": "Explain that this session hit the tool call limit. If more tool use is needed, ask the user to continue in a new session or narrow the request."
+                    }),
+                )]
+            } else {
                 let acp_manager = self.config.read().acp_manager.clone();
                 let result = if let Some(ref manager) = acp_manager {
                     let (mut chunk_rx, subscription_id) = manager.subscribe_chunks().await;
