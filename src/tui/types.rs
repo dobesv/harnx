@@ -20,7 +20,13 @@ pub struct Tui {
     pub(super) async_manager: Arc<Mutex<AsyncHookManager>>,
     pub(super) persistent_manager: Arc<Mutex<PersistentHookManager>>,
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
+    #[cfg(test)]
+    pub(crate) app: App,
+    #[cfg(not(test))]
     pub(super) app: App,
+    #[cfg(test)]
+    pub(crate) event_tx: mpsc::UnboundedSender<TuiEvent>,
+    #[cfg(not(test))]
     pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
     pub(super) event_rx: mpsc::UnboundedReceiver<TuiEvent>,
 }
@@ -46,6 +52,15 @@ pub(super) struct App {
 }
 
 #[derive(Clone)]
+#[cfg(test)]
+pub(crate) enum TranscriptEntry {
+    System(String),
+    User(String),
+    Assistant(String),
+    Error(String),
+}
+
+#[cfg(not(test))]
 pub(super) enum TranscriptEntry {
     System(String),
     User(String),
@@ -53,6 +68,19 @@ pub(super) enum TranscriptEntry {
     Error(String),
 }
 
+#[cfg(test)]
+pub(crate) enum TuiEvent {
+    UiOutput(String),
+    Chunk(String),
+    Finished {
+        output: String,
+        usage: CompletionTokenUsage,
+        tool_results: Vec<ToolResult>,
+    },
+    Errored(String),
+}
+
+#[cfg(not(test))]
 pub(super) enum TuiEvent {
     UiOutput(String),
     Chunk(String),

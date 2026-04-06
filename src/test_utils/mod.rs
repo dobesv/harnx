@@ -6,6 +6,8 @@
 
 mod mock_client;
 mod sync;
+mod tui_harness;
 
 pub use mock_client::*;
 pub use sync::*;
+pub use tui_harness::*;

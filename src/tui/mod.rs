@@ -32,6 +32,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 
+#[cfg(test)]
+pub(crate) mod event_source;
+#[cfg(not(test))]
 mod event_source;
 mod input;
 mod lifecycle;
@@ -40,6 +43,9 @@ mod render;
 mod terminal;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod types;
+#[cfg(not(test))]
 mod types;
 
 pub use self::types::Tui;

@@ -127,12 +127,18 @@ impl Tui {
         result
     }
 
-    async fn run_loop<B, E>(&mut self, terminal: &mut Terminal<B>, event_source: &mut E) -> Result<()>
+    #[cfg(test)]
+    pub(crate) async fn run_loop<B, E>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        event_source: &mut E,
+    ) -> Result<()>
     where
         B: ratatui::backend::Backend,
         B::Error: std::error::Error + Send + Sync + 'static,
         E: EventSource,
     {
+
         self.install_external_editor_bridge();
         let mut last_tick = Instant::now();
         loop {
