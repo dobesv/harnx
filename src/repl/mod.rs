@@ -47,6 +47,8 @@ pub enum CommandOutcome {
     Continue,
     /// Exit the REPL loop.
     Exit,
+    /// An async resume prompt was handled and the loop should iterate again.
+    ResumeHandled,
 }
 
 pub static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
@@ -270,11 +272,10 @@ Type ".help" for additional help.
             if self.abort_signal.aborted_ctrld() {
                 break;
             }
-            if matches!(
-                self.process_pending_async_resume().await?,
-                CommandOutcome::Continue
-            ) {
-                continue;
+            match self.process_pending_async_resume().await? {
+                CommandOutcome::ResumeHandled => continue,
+                CommandOutcome::Exit => break,
+                CommandOutcome::Continue => {}
             }
             let sig = self.editor.read_line(&self.prompt);
             match sig {
@@ -350,7 +351,7 @@ Type ".help" for additional help.
             max_resume,
         )
         .await?;
-        Ok(CommandOutcome::Continue)
+        Ok(CommandOutcome::ResumeHandled)
     }
 
     fn create_editor(config: &GlobalConfig) -> Result<Reedline> {

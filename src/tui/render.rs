@@ -46,8 +46,9 @@ impl Tui {
 
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>) {
         let size = frame.area();
+        let input_width = size.width.saturating_sub(2).max(1);
         let input_height = self
-            .input_height()
+            .input_height(input_width)
             .clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -183,14 +184,8 @@ impl Tui {
         }
     }
 
-    pub(super) fn input_height(&self) -> u16 {
+    pub(super) fn input_height(&self, available_width: u16) -> u16 {
         let lines = self.app.input.lines();
-        let available_width = self
-            .app
-            .input
-            .block()
-            .map(|_| self.app.last_known_input_width.saturating_sub(0))
-            .unwrap_or(self.app.last_known_input_width);
         let body_width = available_width.max(1) as usize;
 
         let mut body_lines = 0usize;

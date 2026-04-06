@@ -1670,13 +1670,21 @@ impl Config {
         tokio::fs::write(&temp_file, &document_paths.join("\n"))
             .await
             .with_context(|| format!("Failed to write to '{}'", temp_file.display()))?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut config_write = config.write();
-            config_write.edit_with_tui_hooks(|this| {
-                let editor = this.editor()?;
-                edit_file(&editor, &temp_file)
+            let editor = config_write.editor()?;
+            let temp_file_path = temp_file.clone();
+            config_write.edit_with_tui_hooks(|_| {
+                std::thread::spawn(move || {
+                    let result = edit_file(&editor, &temp_file_path);
+                    let _ = tx.send(result);
+                });
+                Ok(())
             })?;
         }
+        rx.await
+            .map_err(|_| anyhow!("Editor thread terminated unexpectedly"))??;
         let new_document_paths = tokio::fs::read_to_string(&temp_file)
             .await
             .with_context(|| format!("Failed to read '{}'", temp_file.display()))?;
