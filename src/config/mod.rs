@@ -1676,15 +1676,13 @@ impl Config {
             let editor = config_write.editor()?;
             let temp_file_path = temp_file.clone();
             config_write.edit_with_tui_hooks(|_| {
-                std::thread::spawn(move || {
-                    let result = edit_file(&editor, &temp_file_path);
-                    let _ = tx.send(result);
-                });
+                let result = edit_file(&editor, &temp_file_path);
+                let _ = tx.send(result);
                 Ok(())
             })?;
         }
         rx.await
-            .map_err(|_| anyhow!("Editor thread terminated unexpectedly"))??;
+            .map_err(|_| anyhow!("Editor hook completion channel unexpectedly closed"))??;
         let new_document_paths = tokio::fs::read_to_string(&temp_file)
             .await
             .with_context(|| format!("Failed to read '{}'", temp_file.display()))?;
