@@ -67,8 +67,8 @@ impl Tui {
                     self.push_history(text.clone());
                     if self.app.llm_busy {
                         // Queue the message to send when LLM finishes
+                        // Keep the text in input so user can see/edit it
                         self.app.pending_message = Some(text);
-                        self.app.input = Self::new_input();
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through repl command handler
@@ -195,11 +195,18 @@ impl Tui {
                 self.refresh_input_chrome();
 
                 if let Some(pending) = self.app.pending_message.take() {
+                    // Clear input now that the pending message is actually being submitted
+                    self.app.input = Self::new_input();
                     self.app
                         .transcript
                         .push(TranscriptEntry::User(pending.clone()));
                     self.pin_transcript_to_bottom();
-                    self.start_prompt(pending).await?;
+                    if pending.trim_start().starts_with('.') {
+                        self.run_repl_command(&pending).await?;
+                        self.refresh_input_chrome();
+                    } else {
+                        self.start_prompt(pending).await?;
+                    }
                 }
             }
             TuiEvent::Errored(err) => {
@@ -210,11 +217,18 @@ impl Tui {
                 self.refresh_input_chrome();
 
                 if let Some(pending) = self.app.pending_message.take() {
+                    // Clear input now that the pending message is actually being submitted
+                    self.app.input = Self::new_input();
                     self.app
                         .transcript
                         .push(TranscriptEntry::User(pending.clone()));
                     self.pin_transcript_to_bottom();
-                    self.start_prompt(pending).await?;
+                    if pending.trim_start().starts_with('.') {
+                        self.run_repl_command(&pending).await?;
+                        self.refresh_input_chrome();
+                    } else {
+                        self.start_prompt(pending).await?;
+                    }
                 }
             }
         }
@@ -458,8 +472,8 @@ impl Tui {
         )
         .await
         {
-            Ok(exit) => {
-                if exit {
+            Ok(outcome) => {
+                if matches!(outcome, crate::repl::CommandOutcome::Exit) {
                     self.app.should_quit = true;
                 }
                 let llm_busy = self.app.llm_busy;

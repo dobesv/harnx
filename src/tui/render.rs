@@ -46,8 +46,9 @@ impl Tui {
 
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>) {
         let size = frame.area();
+        let input_width = size.width.saturating_sub(2).max(1);
         let input_height = self
-            .input_height()
+            .input_height(input_width)
             .clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -91,6 +92,8 @@ impl Tui {
             .wrap(Wrap { trim: false })
             .scroll((effective_scroll, 0));
         frame.render_widget(transcript, chunks[0]);
+
+        self.app.last_known_input_width = chunks[1].width.saturating_sub(2).max(1);
 
         let title = self.build_input_title();
         self.app.input.set_block(
@@ -181,10 +184,25 @@ impl Tui {
         }
     }
 
-    pub(super) fn input_height(&self) -> u16 {
+    pub(super) fn input_height(&self, available_width: u16) -> u16 {
         let lines = self.app.input.lines();
-        let body_lines = cmp::max(1, lines.len()) as u16;
-        body_lines + 2
+        let body_width = available_width.max(1) as usize;
+
+        let mut body_lines = 0usize;
+        for line in lines {
+            if line.is_empty() {
+                body_lines = body_lines.saturating_add(1);
+                continue;
+            }
+            let wrapped = textwrap::wrap(line, body_width).len().max(1);
+            body_lines = body_lines.saturating_add(wrapped);
+        }
+
+        let total = body_lines
+            .max(1)
+            .min((u16::MAX as usize).saturating_sub(2))
+            .saturating_add(2);
+        total as u16
     }
 
     pub(super) fn append_streaming_assistant_chunk(&mut self, chunk: &str) {

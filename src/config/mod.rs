@@ -175,7 +175,7 @@ where
     Ok(value.map(normalize_toolset_value))
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Deserialize)]
 #[serde(default)]
 pub struct Config {
     #[serde(rename(serialize = "model", deserialize = "model"))]
@@ -269,6 +269,130 @@ pub struct Config {
     pub rag: Option<Arc<Rag>>,
     #[serde(skip)]
     pub agent: Option<Agent>,
+    #[serde(skip)]
+    pub tui_before_editor: Option<Box<dyn FnMut() + Send + Sync>>,
+    #[serde(skip)]
+    pub tui_after_editor: Option<Box<dyn FnMut() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("model_id", &self.model_id)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("dry_run", &self.dry_run)
+            .field("stream", &self.stream)
+            .field("save", &self.save)
+            .field("keybindings", &self.keybindings)
+            .field("editor", &self.editor)
+            .field("wrap", &self.wrap)
+            .field("wrap_code", &self.wrap_code)
+            .field("tool_use", &self.tool_use)
+            .field("toolsets", &self.toolsets)
+            .field("use_tools", &self.use_tools)
+            .field("repl_default_session", &self.repl_default_session)
+            .field("cmd_default_session", &self.cmd_default_session)
+            .field("agent_default_session", &self.agent_default_session)
+            .field("save_session", &self.save_session)
+            .field("compress_threshold", &self.compress_threshold)
+            .field("summarize_prompt", &self.summarize_prompt)
+            .field("summary_prompt", &self.summary_prompt)
+            .field("rag_embedding_model", &self.rag_embedding_model)
+            .field("rag_reranker_model", &self.rag_reranker_model)
+            .field("rag_top_k", &self.rag_top_k)
+            .field("rag_chunk_size", &self.rag_chunk_size)
+            .field("rag_chunk_overlap", &self.rag_chunk_overlap)
+            .field("rag_template", &self.rag_template)
+            .field("document_loaders", &self.document_loaders)
+            .field("highlight", &self.highlight)
+            .field("theme", &self.theme)
+            .field("left_prompt", &self.left_prompt)
+            .field("right_prompt", &self.right_prompt)
+            .field("serve_addr", &self.serve_addr)
+            .field("user_agent", &self.user_agent)
+            .field("save_shell_history", &self.save_shell_history)
+            .field("sync_models_url", &self.sync_models_url)
+            .field("clients", &self.clients)
+            .field("mcp_servers", &self.mcp_servers)
+            .field("acp_servers", &self.acp_servers)
+            .field("hooks", &self.hooks)
+            .field("macro_flag", &self.macro_flag)
+            .field("info_flag", &self.info_flag)
+            .field("agent_variables", &self.agent_variables)
+            .field("mcp_root", &self.mcp_root)
+            .field("model", &self.model)
+            .field("tools", &self.tools)
+            .field("mcp_manager", &self.mcp_manager)
+            .field("acp_manager", &self.acp_manager)
+            .field("working_mode", &self.working_mode)
+            .field("last_message", &self.last_message)
+            .field("session", &self.session)
+            .field("rag", &self.rag)
+            .field("agent", &self.agent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for Config {
+    fn clone(&self) -> Self {
+        Self {
+            model_id: self.model_id.clone(),
+            temperature: self.temperature,
+            top_p: self.top_p,
+            dry_run: self.dry_run,
+            stream: self.stream,
+            save: self.save,
+            keybindings: self.keybindings.clone(),
+            editor: self.editor.clone(),
+            wrap: self.wrap.clone(),
+            wrap_code: self.wrap_code,
+            tool_use: self.tool_use,
+            toolsets: self.toolsets.clone(),
+            use_tools: self.use_tools.clone(),
+            repl_default_session: self.repl_default_session.clone(),
+            cmd_default_session: self.cmd_default_session.clone(),
+            agent_default_session: self.agent_default_session.clone(),
+            save_session: self.save_session,
+            compress_threshold: self.compress_threshold,
+            summarize_prompt: self.summarize_prompt.clone(),
+            summary_prompt: self.summary_prompt.clone(),
+            rag_embedding_model: self.rag_embedding_model.clone(),
+            rag_reranker_model: self.rag_reranker_model.clone(),
+            rag_top_k: self.rag_top_k,
+            rag_chunk_size: self.rag_chunk_size,
+            rag_chunk_overlap: self.rag_chunk_overlap,
+            rag_template: self.rag_template.clone(),
+            document_loaders: self.document_loaders.clone(),
+            highlight: self.highlight,
+            theme: self.theme.clone(),
+            left_prompt: self.left_prompt.clone(),
+            right_prompt: self.right_prompt.clone(),
+            serve_addr: self.serve_addr.clone(),
+            user_agent: self.user_agent.clone(),
+            save_shell_history: self.save_shell_history,
+            sync_models_url: self.sync_models_url.clone(),
+            clients: self.clients.clone(),
+            mcp_servers: self.mcp_servers.clone(),
+            acp_servers: self.acp_servers.clone(),
+            hooks: self.hooks.clone(),
+            macro_flag: self.macro_flag,
+            info_flag: self.info_flag,
+            agent_variables: self.agent_variables.clone(),
+            mcp_root: self.mcp_root.clone(),
+            model: self.model.clone(),
+            tools: self.tools.clone(),
+            mcp_manager: self.mcp_manager.clone(),
+            acp_manager: self.acp_manager.clone(),
+            working_mode: self.working_mode.clone(),
+            last_message: self.last_message.clone(),
+            session: self.session.clone(),
+            rag: self.rag.clone(),
+            agent: self.agent.clone(),
+            tui_before_editor: None,
+            tui_after_editor: None,
+        }
+    }
 }
 
 impl Default for Config {
@@ -339,6 +463,8 @@ impl Default for Config {
             session: None,
             rag: None,
             agent: None,
+            tui_before_editor: None,
+            tui_after_editor: None,
         }
     }
 }
@@ -564,10 +690,12 @@ impl Config {
         Ok((log_level, log_path))
     }
 
-    pub fn edit_config(&self) -> Result<()> {
+    pub fn edit_config(&mut self) -> Result<()> {
         let config_path = Self::config_file();
-        let editor = self.editor()?;
-        edit_file(&editor, &config_path)?;
+        self.edit_with_tui_hooks(|this| {
+            let editor = this.editor()?;
+            edit_file(&editor, &config_path)
+        })?;
         println!(
             "NOTE: Remember to restart {} if there are changes made to '{}",
             env!("CARGO_CRATE_NAME"),
@@ -1086,8 +1214,10 @@ impl Config {
     pub fn upsert_agent(&mut self, name: &str) -> Result<()> {
         let agent_path = Self::agent_file(name);
         ensure_parent_exists(&agent_path)?;
-        let editor = self.editor()?;
-        edit_file(&editor, &agent_path)?;
+        self.edit_with_tui_hooks(|this| {
+            let editor = this.editor()?;
+            edit_file(&editor, &agent_path)
+        })?;
         if self.working_mode.is_repl() {
             println!("✓ Saved the agent to '{}'.", agent_path.display());
         }
@@ -1256,6 +1386,29 @@ impl Config {
         Ok(())
     }
 
+    pub fn set_tui_editor_hooks(
+        &mut self,
+        before: Option<Box<dyn FnMut() + Send + Sync>>,
+        after: Option<Box<dyn FnMut() + Send + Sync>>,
+    ) {
+        self.tui_before_editor = before;
+        self.tui_after_editor = after;
+    }
+
+    fn edit_with_tui_hooks<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        if let Some(before) = self.tui_before_editor.as_mut() {
+            before();
+        }
+        let result = f(self);
+        if let Some(after) = self.tui_after_editor.as_mut() {
+            after();
+        }
+        result
+    }
+
     pub fn edit_session(&mut self) -> Result<()> {
         let name = match &self.session {
             Some(session) => session.name().to_string(),
@@ -1263,12 +1416,14 @@ impl Config {
         };
         let session_path = self.session_file(&name);
         self.save_session(Some(&name))?;
-        let editor = self.editor()?;
-        edit_file(&editor, &session_path).with_context(|| {
-            format!(
-                "Failed to edit '{}' with '{editor}'",
-                session_path.display()
-            )
+        self.edit_with_tui_hooks(|this| {
+            let editor = this.editor()?;
+            edit_file(&editor, &session_path).with_context(|| {
+                format!(
+                    "Failed to edit '{}' with '{editor}'",
+                    session_path.display()
+                )
+            })
         })?;
         self.session = Some(Session::load(self, &name, &session_path)?);
         self.discontinuous_last_message();
@@ -1515,8 +1670,19 @@ impl Config {
         tokio::fs::write(&temp_file, &document_paths.join("\n"))
             .await
             .with_context(|| format!("Failed to write to '{}'", temp_file.display()))?;
-        let editor = config.read().editor()?;
-        edit_file(&editor, &temp_file)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut config_write = config.write();
+            let editor = config_write.editor()?;
+            let temp_file_path = temp_file.clone();
+            config_write.edit_with_tui_hooks(|_| {
+                let result = edit_file(&editor, &temp_file_path);
+                let _ = tx.send(result);
+                Ok(())
+            })?;
+        }
+        rx.await
+            .map_err(|_| anyhow!("Editor hook completion channel unexpectedly closed"))??;
         let new_document_paths = tokio::fs::read_to_string(&temp_file)
             .await
             .with_context(|| format!("Failed to read '{}'", temp_file.display()))?;
@@ -1727,8 +1893,10 @@ impl Config {
         if ans {
             let macro_path = Self::macro_file(name);
             ensure_parent_exists(&macro_path)?;
-            let editor = self.editor()?;
-            edit_file(&editor, &macro_path)?;
+            self.edit_with_tui_hooks(|this| {
+                let editor = this.editor()?;
+                edit_file(&editor, &macro_path)
+            })?;
         } else {
             bail!("No macro");
         }

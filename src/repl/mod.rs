@@ -39,6 +39,18 @@ use std::{env, process};
 
 const MENU_NAME: &str = "completion_menu";
 
+/// Outcome of running a REPL command.
+/// Used to signal special actions (like TUI reset) beyond simple continue/exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// Continue the REPL loop normally.
+    Continue,
+    /// Exit the REPL loop.
+    Exit,
+    /// An async resume prompt was handled and the loop should iterate again.
+    ResumeHandled,
+}
+
 pub static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
@@ -260,8 +272,10 @@ Type ".help" for additional help.
             if self.abort_signal.aborted_ctrld() {
                 break;
             }
-            if self.process_pending_async_resume().await? {
-                continue;
+            match self.process_pending_async_resume().await? {
+                CommandOutcome::ResumeHandled => continue,
+                CommandOutcome::Exit => break,
+                CommandOutcome::Continue => {}
             }
             let sig = self.editor.read_line(&self.prompt);
             match sig {
@@ -277,8 +291,8 @@ Type ".help" for additional help.
                     )
                     .await
                     {
-                        Ok(exit) => {
-                            if exit {
+                        Ok(outcome) => {
+                            if matches!(outcome, CommandOutcome::Exit) {
                                 break;
                             }
                         }
@@ -303,7 +317,7 @@ Type ".help" for additional help.
         Ok(())
     }
 
-    async fn process_pending_async_resume(&mut self) -> Result<bool> {
+    async fn process_pending_async_resume(&mut self) -> Result<CommandOutcome> {
         let (should_resume, max_resume) = {
             let config = self.config.read();
             let hooks = config.resolved_hooks();
@@ -313,11 +327,11 @@ Type ".help" for additional help.
             )
         };
         if !should_resume {
-            return Ok(false);
+            return Ok(CommandOutcome::Continue);
         }
 
         if self.abort_signal.aborted() {
-            return Ok(true);
+            return Ok(CommandOutcome::Exit);
         }
 
         let context = self
@@ -337,7 +351,7 @@ Type ".help" for additional help.
             max_resume,
         )
         .await?;
-        Ok(true)
+        Ok(CommandOutcome::ResumeHandled)
     }
 
     fn create_editor(config: &GlobalConfig) -> Result<Reedline> {
@@ -458,7 +472,7 @@ pub async fn run_repl_command(
     async_manager: &mut AsyncHookManager,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
     pending_async_context: &mut Option<String>,
-) -> Result<bool> {
+) -> Result<CommandOutcome> {
     let max_resume = config.read().resolved_hooks().max_resume.unwrap_or(5);
     if let Ok(Some(captures)) = MULTILINE_RE.captures(line) {
         if let Some(text_match) = captures.get(1) {
@@ -612,7 +626,7 @@ pub async fn run_repl_command(
                 }
                 match args {
                     Some("config") => {
-                        config.read().edit_config()?;
+                        config.write().edit_config()?;
                     }
                     Some("agent") => {
                         config.write().edit_agent_prompt()?;
@@ -655,7 +669,7 @@ pub async fn run_repl_command(
                     config.write().reset_session()?;
                 }
                 _ => {
-                    println!(r#"Usage: .reset repl"#)
+                    println!(r#"Usage: .reset repl"#);
                 }
             },
             ".rebuild" => match args {
@@ -972,7 +986,7 @@ Commands:
                 }
                 Some(_) => unknown_command()?,
                 None => {
-                    return Ok(true);
+                    return Ok(CommandOutcome::Exit);
                 }
             },
             ".clear" => match args {
@@ -1040,7 +1054,7 @@ Commands:
         }
     }
 
-    Ok(false)
+    Ok(CommandOutcome::Continue)
 }
 
 #[allow(clippy::too_many_arguments)]

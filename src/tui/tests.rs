@@ -17,10 +17,32 @@ async fn pending_message_is_cleared_when_user_edits_again() {
     tui.app.llm_busy = true;
     tui.queue_pending_message("queued message".to_string());
 
+    // Input should still contain the pending message text (new behavior)
+    assert_eq!(tui.app.input.lines().join("\n"), "queued message");
+
+    // User types 'x', which cancels the pending and appends to existing content
     tui.apply_draft_edit_for_test(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
 
     assert!(tui.app.pending_message.is_none());
-    assert_eq!(tui.app.input.lines().join("\n"), "x");
+    assert_eq!(tui.app.input.lines().join("\n"), "queued messagex");
+}
+
+#[tokio::test]
+async fn shift_enter_inserts_newline_without_submitting() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.apply_draft_edit_for_test(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    tui.apply_draft_edit_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+    tui.apply_draft_edit_for_test(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+
+    assert_eq!(tui.app.input.lines().join("\n"), "a\nb");
+    assert!(tui
+        .app
+        .transcript
+        .iter()
+        .all(|entry| !matches!(entry, TranscriptEntry::User(_))));
 }
 
 #[tokio::test]

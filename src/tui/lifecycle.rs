@@ -1,10 +1,13 @@
 use super::*;
+use crate::tui::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
 use crate::tui::types::{App, TranscriptEntry, TuiEvent, SPINNER_FRAMES, TICK_RATE};
 
 impl Tui {
     #[cfg(test)]
     pub(super) fn queue_pending_message(&mut self, text: String) {
-        self.app.pending_message = Some(text);
+        self.app.pending_message = Some(text.clone());
+        // Also set the input text so it remains visible (new behavior)
+        self.set_input_text(&text);
         self.refresh_input_chrome();
     }
 
@@ -58,6 +61,7 @@ impl Tui {
                 history: vec![],
                 history_index: None,
                 history_draft: String::new(),
+                last_known_input_width: 1,
             },
             event_tx,
             event_rx,
@@ -113,6 +117,7 @@ impl Tui {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        let _panic_terminal_hook = PanicTerminalHookGuard::install();
         let mut terminal = Self::setup_terminal()?;
         let result = self.run_loop(&mut terminal).await;
         Self::restore_terminal(&mut terminal)?;
@@ -121,6 +126,7 @@ impl Tui {
     }
 
     async fn run_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        self.install_external_editor_bridge(terminal);
         let mut last_tick = Instant::now();
         loop {
             terminal.draw(|frame| self.draw(frame))?;
@@ -159,6 +165,27 @@ impl Tui {
             }
         }
         Ok(())
+    }
+
+    fn install_external_editor_bridge(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+        let _ = terminal;
+        self.config.write().set_tui_editor_hooks(
+            Some(Box::new(cleanup_terminal_state)),
+            Some(Box::new(|| {
+                let _ = enable_raw_mode();
+                let mut stdout = io::stdout();
+                let _ = stdout.execute(EnterAlternateScreen);
+                if supports_keyboard_enhancement().unwrap_or(false) {
+                    let _ = stdout.execute(PushKeyboardEnhancementFlags(
+                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                    ));
+                }
+                let _ = stdout.execute(EnableMouseCapture);
+                let _ = stdout.flush();
+            })),
+        );
     }
 
     /// Check if an async hook has signalled a resume and automatically start the follow-up prompt.
