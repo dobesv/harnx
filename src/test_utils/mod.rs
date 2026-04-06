@@ -5,5 +5,7 @@
 //! servers. Implementations are added in follow-up tasks.
 
 mod mock_client;
+mod sync;
 
 pub use mock_client::*;
+pub use sync::*;
