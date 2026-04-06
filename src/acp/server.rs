@@ -257,7 +257,6 @@ impl acp::Agent for HarnxAgent {
             .map_err(|e| acp::Error::new(-32603, format!("Failed to create client: {e}")))?;
 
         let mut round = 0u32;
-        let mut post_tool_limit_rounds = 0u32;
         loop {
             if abort_signal.aborted() {
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
@@ -275,15 +274,13 @@ impl acp::Agent for HarnxAgent {
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
             }
 
-            if round > MAX_TOOL_CALL_ROUNDS {
-                post_tool_limit_rounds += 1;
-                if post_tool_limit_rounds > MAX_POST_TOOL_LIMIT_ROUNDS {
-                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
-                }
-            }
-
             round += 1;
             let tool_results = if round > MAX_TOOL_CALL_ROUNDS {
+                // If the LLM keeps trying to call tools even though we told them they hit the limit, abort
+                if round > MAX_POST_TOOL_LIMIT_ROUNDS + 1 {
+                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                }
+
                 tool_calls
                     .into_iter()
                     .map(|call| {
