@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod hooks;
 mod mcp;
+mod mcp_safety;
 mod rag;
 mod render;
 #[allow(dead_code, unused_imports)]

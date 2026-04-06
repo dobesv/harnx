@@ -1,10 +1,10 @@
 use crate::{
     config::GlobalConfig,
     hooks::{dispatch::dispatch_hooks, HookEvent, HookResultControl},
+    mcp_safety::{truncate_output, TruncateOpts},
     ui_output::emit_ui_output,
     utils::*,
 };
-use harnx::mcp_safety::{truncate_output, TruncateOpts};
 
 use anyhow::{anyhow, bail, Result};
 use indexmap::IndexMap;

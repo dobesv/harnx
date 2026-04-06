@@ -1,6 +1,6 @@
 use super::Model;
 
-use crate::{multiline_text, tool::ToolResult, utils::dimmed_text};
+use crate::{tool::ToolResult, utils::{dimmed_text, multiline_text}};
 
 use serde::{Deserialize, Serialize};
 

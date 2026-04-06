@@ -1,8 +1,8 @@
 use super::{mcp_tool_to_declaration, McpServerConfig};
+use crate::mcp_safety::path_to_file_uri;
 use crate::tool::ToolDeclaration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use harnx::mcp_safety::path_to_file_uri;
 use parking_lot::RwLock;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
