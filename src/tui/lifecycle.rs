@@ -1,5 +1,5 @@
 use super::*;
-use crate::tui::terminal::PanicTerminalHookGuard;
+use crate::tui::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
 use crate::tui::types::{App, TranscriptEntry, TuiEvent, SPINNER_FRAMES, TICK_RATE};
 
 impl Tui {
@@ -167,8 +167,25 @@ impl Tui {
         Ok(())
     }
 
-    fn install_external_editor_bridge(&self, _terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
-        self.config.write().set_tui_editor_hooks(None, None);
+    fn install_external_editor_bridge(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+        let _ = terminal;
+        self.config.write().set_tui_editor_hooks(
+            Some(Box::new(cleanup_terminal_state)),
+            Some(Box::new(|| {
+                let _ = enable_raw_mode();
+                let mut stdout = io::stdout();
+                let _ = stdout.execute(EnterAlternateScreen);
+                if supports_keyboard_enhancement().unwrap_or(false) {
+                    let _ = stdout.execute(PushKeyboardEnhancementFlags(
+                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                    ));
+                }
+                let _ = stdout.execute(EnableMouseCapture);
+                let _ = stdout.flush();
+            })),
+        );
     }
 
     /// Check if an async hook has signalled a resume and automatically start the follow-up prompt.

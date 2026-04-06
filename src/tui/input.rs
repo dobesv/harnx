@@ -201,7 +201,12 @@ impl Tui {
                         .transcript
                         .push(TranscriptEntry::User(pending.clone()));
                     self.pin_transcript_to_bottom();
-                    self.start_prompt(pending).await?;
+                    if pending.trim_start().starts_with('.') {
+                        self.run_repl_command(&pending).await?;
+                        self.refresh_input_chrome();
+                    } else {
+                        self.start_prompt(pending).await?;
+                    }
                 }
             }
             TuiEvent::Errored(err) => {
@@ -218,7 +223,12 @@ impl Tui {
                         .transcript
                         .push(TranscriptEntry::User(pending.clone()));
                     self.pin_transcript_to_bottom();
-                    self.start_prompt(pending).await?;
+                    if pending.trim_start().starts_with('.') {
+                        self.run_repl_command(&pending).await?;
+                        self.refresh_input_chrome();
+                    } else {
+                        self.start_prompt(pending).await?;
+                    }
                 }
             }
         }

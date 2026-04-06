@@ -1,6 +1,6 @@
 use super::*;
 
-fn cleanup_terminal_state() {
+pub(super) fn cleanup_terminal_state() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
     if supports_keyboard_enhancement().unwrap_or(false) {
@@ -11,24 +11,22 @@ fn cleanup_terminal_state() {
     let _ = stdout.flush();
 }
 
-type PanicHook = Box<dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+type PanicHook = dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static;
 
 pub(super) struct PanicTerminalHookGuard {
-    previous_hook: Option<PanicHook>,
+    previous_hook: Option<std::sync::Arc<PanicHook>>,
 }
 
 impl PanicTerminalHookGuard {
     pub(super) fn install() -> Self {
-        let previous_hook = panic::take_hook();
-        let hook_to_restore = panic::take_hook();
-        panic::set_hook(previous_hook);
-        let chained_hook = panic::take_hook();
+        let previous_hook: std::sync::Arc<PanicHook> = std::sync::Arc::from(panic::take_hook());
+        let chained_hook = previous_hook.clone();
         panic::set_hook(Box::new(move |panic_info: &panic::PanicHookInfo<'_>| {
             cleanup_terminal_state();
             chained_hook(panic_info);
         }));
         Self {
-            previous_hook: Some(hook_to_restore),
+            previous_hook: Some(previous_hook),
         }
     }
 }
@@ -36,7 +34,9 @@ impl PanicTerminalHookGuard {
 impl Drop for PanicTerminalHookGuard {
     fn drop(&mut self) {
         if let Some(previous_hook) = self.previous_hook.take() {
-            panic::set_hook(previous_hook);
+            panic::set_hook(Box::new(move |panic_info: &panic::PanicHookInfo<'_>| {
+                previous_hook(panic_info);
+            }));
         }
     }
 }
@@ -51,7 +51,6 @@ impl Tui {
                 .border_style(Style::default()),
         );
         input.set_cursor_line_style(Style::default());
-        input.set_wrap_mode(WrapMode::WordOrGlyph);
         // input.set_placeholder_text("Enter submits · Shift+Enter / Ctrl+J for newline");
         input
     }

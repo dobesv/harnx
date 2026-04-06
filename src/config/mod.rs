@@ -690,10 +690,12 @@ impl Config {
         Ok((log_level, log_path))
     }
 
-    pub fn edit_config(&self) -> Result<()> {
+    pub fn edit_config(&mut self) -> Result<()> {
         let config_path = Self::config_file();
-        let editor = self.editor()?;
-        edit_file(&editor, &config_path)?;
+        self.edit_with_tui_hooks(|this| {
+            let editor = this.editor()?;
+            edit_file(&editor, &config_path)
+        })?;
         println!(
             "NOTE: Remember to restart {} if there are changes made to '{}",
             env!("CARGO_CRATE_NAME"),
@@ -1212,8 +1214,10 @@ impl Config {
     pub fn upsert_agent(&mut self, name: &str) -> Result<()> {
         let agent_path = Self::agent_file(name);
         ensure_parent_exists(&agent_path)?;
-        let editor = self.editor()?;
-        edit_file(&editor, &agent_path)?;
+        self.edit_with_tui_hooks(|this| {
+            let editor = this.editor()?;
+            edit_file(&editor, &agent_path)
+        })?;
         if self.working_mode.is_repl() {
             println!("✓ Saved the agent to '{}'.", agent_path.display());
         }
@@ -1391,6 +1395,20 @@ impl Config {
         self.tui_after_editor = after;
     }
 
+    fn edit_with_tui_hooks<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        if let Some(before) = self.tui_before_editor.as_mut() {
+            before();
+        }
+        let result = f(self);
+        if let Some(after) = self.tui_after_editor.as_mut() {
+            after();
+        }
+        result
+    }
+
     pub fn edit_session(&mut self) -> Result<()> {
         let name = match &self.session {
             Some(session) => session.name().to_string(),
@@ -1398,20 +1416,15 @@ impl Config {
         };
         let session_path = self.session_file(&name);
         self.save_session(Some(&name))?;
-        let editor = self.editor()?;
-        if let Some(before) = self.tui_before_editor.as_mut() {
-            before();
-        }
-        let edit_result = edit_file(&editor, &session_path).with_context(|| {
-            format!(
-                "Failed to edit '{}' with '{editor}'",
-                session_path.display()
-            )
-        });
-        if let Some(after) = self.tui_after_editor.as_mut() {
-            after();
-        }
-        edit_result?;
+        self.edit_with_tui_hooks(|this| {
+            let editor = this.editor()?;
+            edit_file(&editor, &session_path).with_context(|| {
+                format!(
+                    "Failed to edit '{}' with '{editor}'",
+                    session_path.display()
+                )
+            })
+        })?;
         self.session = Some(Session::load(self, &name, &session_path)?);
         self.discontinuous_last_message();
         Ok(())
@@ -1657,8 +1670,13 @@ impl Config {
         tokio::fs::write(&temp_file, &document_paths.join("\n"))
             .await
             .with_context(|| format!("Failed to write to '{}'", temp_file.display()))?;
-        let editor = config.read().editor()?;
-        edit_file(&editor, &temp_file)?;
+        {
+            let mut config_write = config.write();
+            config_write.edit_with_tui_hooks(|this| {
+                let editor = this.editor()?;
+                edit_file(&editor, &temp_file)
+            })?;
+        }
         let new_document_paths = tokio::fs::read_to_string(&temp_file)
             .await
             .with_context(|| format!("Failed to read '{}'", temp_file.display()))?;
@@ -1869,8 +1887,10 @@ impl Config {
         if ans {
             let macro_path = Self::macro_file(name);
             ensure_parent_exists(&macro_path)?;
-            let editor = self.editor()?;
-            edit_file(&editor, &macro_path)?;
+            self.edit_with_tui_hooks(|this| {
+                let editor = this.editor()?;
+                edit_file(&editor, &macro_path)
+            })?;
         } else {
             bail!("No macro");
         }

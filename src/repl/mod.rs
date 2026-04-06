@@ -270,7 +270,10 @@ Type ".help" for additional help.
             if self.abort_signal.aborted_ctrld() {
                 break;
             }
-            if matches!(self.process_pending_async_resume().await?, CommandOutcome::Continue) {
+            if matches!(
+                self.process_pending_async_resume().await?,
+                CommandOutcome::Continue
+            ) {
                 continue;
             }
             let sig = self.editor.read_line(&self.prompt);
@@ -622,7 +625,7 @@ pub async fn run_repl_command(
                 }
                 match args {
                     Some("config") => {
-                        config.read().edit_config()?;
+                        config.write().edit_config()?;
                     }
                     Some("agent") => {
                         config.write().edit_agent_prompt()?;

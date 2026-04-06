@@ -193,17 +193,21 @@ impl Tui {
             .unwrap_or(self.app.last_known_input_width);
         let body_width = available_width.max(1) as usize;
 
-        let mut body_lines = 0u16;
+        let mut body_lines = 0usize;
         for line in lines {
             if line.is_empty() {
                 body_lines = body_lines.saturating_add(1);
                 continue;
             }
-            let wrapped = textwrap::wrap(line, body_width).len().max(1) as u16;
+            let wrapped = textwrap::wrap(line, body_width).len().max(1);
             body_lines = body_lines.saturating_add(wrapped);
         }
 
-        cmp::max(1, body_lines) + 2
+        let total = body_lines
+            .max(1)
+            .min((u16::MAX as usize).saturating_sub(2))
+            .saturating_add(2);
+        total as u16
     }
 
     pub(super) fn append_streaming_assistant_chunk(&mut self, chunk: &str) {
