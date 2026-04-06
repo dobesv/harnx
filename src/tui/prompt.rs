@@ -149,10 +149,13 @@ impl Tui {
                     .await?;
                 }
                 let _ = ctx.event_tx.send(TuiEvent::Finished {
-                    output,
-                    usage,
-                    tool_results,
+                    output: output.clone(),
+                    usage: usage.clone(),
+                    tool_results: tool_results.clone(),
                 });
+                input = input.merge_tool_results(output, thought, tool_results);
+                with_embeddings = false;
+                continue;
             } else {
                 let _ = ctx.event_tx.send(TuiEvent::Finished {
                     output: output.clone(),
