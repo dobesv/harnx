@@ -4,10 +4,10 @@ use crate::hooks::{AsyncHookManager, PersistentHookManager};
 use crate::tool::ToolResult;
 use crate::utils::AbortSignal;
 
+use ratatui_textarea::TextArea;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
-use tui_textarea::TextArea;
 
 pub(super) const MIN_INPUT_HEIGHT: u16 = 3;
 pub(super) const MAX_INPUT_HEIGHT: u16 = 8;
@@ -42,6 +42,7 @@ pub(super) struct App {
     pub(super) history: Vec<String>,
     pub(super) history_index: Option<usize>,
     pub(super) history_draft: String,
+    pub(super) last_known_input_width: u16,
 }
 
 #[derive(Clone)]

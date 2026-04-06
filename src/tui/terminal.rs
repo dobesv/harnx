@@ -3,6 +3,9 @@ use super::*;
 fn cleanup_terminal_state() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
+    if supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = stdout.execute(PopKeyboardEnhancementFlags);
+    }
     let _ = stdout.execute(DisableMouseCapture);
     let _ = stdout.execute(LeaveAlternateScreen);
     let _ = stdout.flush();
@@ -48,6 +51,7 @@ impl Tui {
                 .border_style(Style::default()),
         );
         input.set_cursor_line_style(Style::default());
+        input.set_wrap_mode(WrapMode::WordOrGlyph);
         // input.set_placeholder_text("Enter submits · Shift+Enter / Ctrl+J for newline");
         input
     }
@@ -56,6 +60,13 @@ impl Tui {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         stdout.execute(EnterAlternateScreen)?;
+        if supports_keyboard_enhancement()? {
+            stdout.execute(PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            ))?;
+        }
         stdout.execute(EnableMouseCapture)?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(terminal)

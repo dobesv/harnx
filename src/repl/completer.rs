@@ -121,6 +121,8 @@ fn create_suggestion(value: &str, description: &str, span: Span) -> Suggestion {
         extra: None,
         span,
         append_whitespace: false,
+        display_override: None,
+        match_indices: None,
     }
 }
 

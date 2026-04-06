@@ -61,6 +61,7 @@ impl Tui {
                 history: vec![],
                 history_index: None,
                 history_draft: String::new(),
+                last_known_input_width: 1,
             },
             event_tx,
             event_rx,
@@ -125,6 +126,7 @@ impl Tui {
     }
 
     async fn run_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        self.install_external_editor_bridge(terminal);
         let mut last_tick = Instant::now();
         loop {
             terminal.draw(|frame| self.draw(frame))?;
@@ -163,6 +165,10 @@ impl Tui {
             }
         }
         Ok(())
+    }
+
+    fn install_external_editor_bridge(&self, _terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+        self.config.write().set_tui_editor_hooks(None, None);
     }
 
     /// Check if an async hook has signalled a resume and automatically start the follow-up prompt.
