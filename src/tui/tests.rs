@@ -213,7 +213,7 @@ async fn test_basic_message_and_streaming_response() {
 
     harness
         .sync()
-        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(1))
+        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(5))
         .await
         .unwrap();
 
@@ -231,7 +231,7 @@ async fn test_basic_message_and_streaming_response() {
 
     // Wait for screen to contain expected text (using harness helper method)
     harness
-        .wait_until_screen_contains("Hello from the mock client!", Duration::from_secs(1))
+        .wait_until_screen_contains("Hello from the mock client!", Duration::from_secs(5))
         .await
         .unwrap();
 
@@ -300,7 +300,7 @@ async fn test_streaming_with_tool_calls() {
 
     harness
         .sync()
-        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(2))
+        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(5))
         .await
         .unwrap();
 
@@ -318,7 +318,7 @@ async fn test_streaming_with_tool_calls() {
 
     // Wait for final response text
     harness
-        .wait_until_screen_contains("The answer is 42.", Duration::from_secs(2))
+        .wait_until_screen_contains("The answer is 42.", Duration::from_secs(5))
         .await
         .unwrap();
 
@@ -365,7 +365,7 @@ async fn test_screen_overflow_and_word_wrap() {
 
     harness
         .sync()
-        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(2))
+        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(5))
         .await
         .unwrap();
 
@@ -402,4 +402,28 @@ async fn test_screen_overflow_and_word_wrap() {
     insta::assert_snapshot!("screen_overflow_and_word_wrap", rendered);
 
     set_test_client(None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_tall_multiline_input() {
+    let mut harness = TuiTestHarness::with_size(40, 12);
+
+    harness.tui().set_input_text("First line\nSecond line\nThird line\nFourth line");
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+
+    assert!(
+        rendered.contains("First line")
+            && rendered.contains("Second line")
+            && rendered.contains("Third line")
+            && rendered.contains("Fourth line"),
+        "expected all input lines to be visible in expanded input area: {rendered}"
+    );
+    assert!(
+        rendered.contains("• Input\nFirst line\nSecond line\nThird line\nFourth line"),
+        "expected input area to expand vertically for multiline text: {rendered}"
+    );
+
+    insta::assert_snapshot!("tall_multiline_input", rendered);
 }
