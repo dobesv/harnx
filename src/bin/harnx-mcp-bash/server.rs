@@ -8,7 +8,7 @@ use fancy_regex::Regex;
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::{TokioChildWrapper, TokioCommandWrap};
+use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
     PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool,
@@ -377,9 +377,9 @@ impl BashServer {
                 .current_dir(&working_dir)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
+                .stderr(Stdio::piped());
         });
+        command.wrap(KillOnDrop);
         #[cfg(unix)]
         command.wrap(ProcessGroup::leader());
         #[cfg(windows)]
@@ -402,19 +402,27 @@ impl BashServer {
         let stderr_task = tokio::spawn(read_pipe_to_file(stderr, stderr_file));
 
         let timeout = Duration::from_secs(timeout_secs);
-        let timed_out = match tokio::time::timeout(timeout, async {
+        let (status, timed_out) = match tokio::time::timeout(timeout, async {
             Box::into_pin(child.wait()).await
         })
         .await
         {
-            Ok(Ok(status)) => Some(status),
+            Ok(Ok(status)) => (Some(status), false),
             Ok(Err(err)) => {
                 return Err(internal_error(format!("failed waiting for command: {err}")));
             }
             Err(_) => {
-                let _ = child.start_kill();
-                let _ = Box::into_pin(child.wait()).await;
-                None
+                child.start_kill().map_err(|err| {
+                    internal_error(format!("failed to kill command after timeout: {err}"))
+                })?;
+                match Box::into_pin(child.wait()).await {
+                    Ok(status) => (Some(status), true),
+                    Err(err) => {
+                        return Err(internal_error(format!(
+                            "failed waiting for killed command: {err}"
+                        )));
+                    }
+                }
             }
         };
 
@@ -436,8 +444,8 @@ impl BashServer {
         let truncated_output = truncate_output(&sanitized_output, &truncate_opts);
         let output_truncated = truncated_output != sanitized_output;
 
-        match timed_out {
-            Some(status) => {
+        match (status, timed_out) {
+            (Some(status), false) => {
                 let exit_code = status.code().unwrap_or(-1);
                 let mut output = String::new();
                 let _ = writeln!(output, "exit_code: {exit_code}");
@@ -468,17 +476,21 @@ impl BashServer {
                     Content::text(summary).with_audience(vec![Role::User]),
                 ]))
             }
-            None => tool_error(render_timeout_message(TimeoutRenderContext {
-                working_dir: &working_dir,
-                timeout_secs,
-                total_lines,
-                total_bytes,
-                original: &sanitized_output,
-                truncated: &truncated_output,
-                stdout_log_path: &stdout_log_path,
-                stderr_log_path: &stderr_log_path,
-                output_truncated,
-            })),
+            (Some(status), true) => {
+                let _ = status;
+                tool_error(render_timeout_message(TimeoutRenderContext {
+                    working_dir: &working_dir,
+                    timeout_secs,
+                    total_lines,
+                    total_bytes,
+                    original: &sanitized_output,
+                    truncated: &truncated_output,
+                    stdout_log_path: &stdout_log_path,
+                    stderr_log_path: &stderr_log_path,
+                    output_truncated,
+                }))
+            }
+            (None, _) => tool_error("process exited without status".to_string()),
         }
     }
 
