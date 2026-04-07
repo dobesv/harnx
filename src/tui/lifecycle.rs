@@ -195,6 +195,7 @@ impl Tui {
                     ));
                 }
                 let _ = stdout.execute(EnableMouseCapture);
+                let _ = stdout.execute(EnableBracketedPaste);
                 let _ = stdout.flush();
             })),
         );

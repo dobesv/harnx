@@ -6,6 +6,7 @@ pub(super) fn cleanup_terminal_state() {
     if supports_keyboard_enhancement().unwrap_or(false) {
         let _ = stdout.execute(PopKeyboardEnhancementFlags);
     }
+    let _ = stdout.execute(DisableBracketedPaste);
     let _ = stdout.execute(DisableMouseCapture);
     let _ = stdout.execute(LeaveAlternateScreen);
     let _ = stdout.flush();
@@ -67,6 +68,7 @@ impl Tui {
             ))?;
         }
         stdout.execute(EnableMouseCapture)?;
+        stdout.execute(EnableBracketedPaste)?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(terminal)
     }
