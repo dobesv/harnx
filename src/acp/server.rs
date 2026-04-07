@@ -277,7 +277,7 @@ impl acp::Agent for HarnxAgent {
             round += 1;
             let tool_results = if round > MAX_TOOL_CALL_ROUNDS {
                 // If the LLM keeps trying to call tools even though we told them they hit the limit, abort
-                if round > MAX_POST_TOOL_LIMIT_ROUNDS + 1 {
+                if round > MAX_TOOL_CALL_ROUNDS + MAX_POST_TOOL_LIMIT_ROUNDS {
                     return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
                 }
 

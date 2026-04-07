@@ -112,7 +112,7 @@ impl TuiTestHarness {
     /// Disconnects the global UI output sender first so stale spawned tasks
     /// can't inject events into the next test's Tui, then drains remaining
     /// events from the channel.
-    pub async fn drain_and_settle(&mut self) {
+    pub async fn drain_and_settle(&mut self) -> anyhow::Result<()> {
         // Disconnect the global UI output sender first. Any stale spawned
         // task calling emit_ui_output after this will fall back to print!
         // instead of injecting events into the next test's Tui.
@@ -123,7 +123,7 @@ impl TuiTestHarness {
         while quiet_count < 3 {
             let mut drained_any = false;
             while let Ok(event) = self.tui.event_rx.try_recv() {
-                let _ = self.tui.handle_tui_event(event).await;
+                self.tui.handle_tui_event(event).await?;
                 drained_any = true;
             }
             if drained_any {
@@ -134,6 +134,7 @@ impl TuiTestHarness {
             tokio::task::yield_now().await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        Ok(())
     }
 
     /// Process events and wait until screen contains expected text.
@@ -159,7 +160,7 @@ impl TuiTestHarness {
 
             // Drain any pending events so they get processed into the transcript
             while let Ok(event) = self.tui.event_rx.try_recv() {
-                let _ = self.tui.handle_tui_event(event).await;
+                self.tui.handle_tui_event(event).await?;
             }
 
             self.render();
@@ -188,8 +189,10 @@ mod tests {
         let mut harness = TuiTestHarness::new();
         harness.render();
         let contents = harness.screen_contents();
-        // The screen should contain something, even if just whitespace
-        assert!(!contents.is_empty());
+        assert!(
+            contents.contains("Input"),
+            "Initial screen should contain the Input area"
+        );
     }
 
     #[tokio::test]

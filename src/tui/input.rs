@@ -162,11 +162,15 @@ impl Tui {
                 self.append_streaming_assistant_chunk(&chunk);
                 self.pin_transcript_to_bottom();
             }
-            TuiEvent::Finished {
-                output,
-                usage,
-                tool_results,
-            } => {
+            TuiEvent::ToolRoundComplete { tool_count } => {
+                // Intermediate tool round — prompt loop continues, don't clear llm_busy
+                self.app.streaming_assistant_idx = None;
+                self.app.transcript.push(TranscriptEntry::System(format!(
+                    "{tool_count} tool result(s) returned"
+                )));
+                self.pin_transcript_to_bottom();
+            }
+            TuiEvent::Finished { output, usage } => {
                 self.app.llm_busy = false;
                 if !output.is_empty() {
                     if let Some(idx) = self.app.streaming_assistant_idx {
@@ -189,13 +193,6 @@ impl Tui {
                     self.pin_transcript_to_bottom();
                 }
                 self.app.streaming_assistant_idx = None;
-                if !tool_results.is_empty() {
-                    self.app.transcript.push(TranscriptEntry::System(format!(
-                        "{} tool result(s) returned",
-                        tool_results.len()
-                    )));
-                    self.pin_transcript_to_bottom();
-                }
                 if !usage.is_empty() {
                     self.app
                         .transcript

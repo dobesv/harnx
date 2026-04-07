@@ -81,7 +81,6 @@ impl Tui {
                     let _ = ctx.event_tx.send(TuiEvent::Finished {
                         output: String::new(),
                         usage: Default::default(),
-                        tool_results: vec![],
                     });
                     break;
                 }
@@ -148,10 +147,8 @@ impl Tui {
                     )
                     .await?;
                 }
-                let _ = ctx.event_tx.send(TuiEvent::Finished {
-                    output: output.clone(),
-                    usage: usage.clone(),
-                    tool_results: tool_results.clone(),
+                let _ = ctx.event_tx.send(TuiEvent::ToolRoundComplete {
+                    tool_count: tool_results.len(),
                 });
                 input = input.merge_tool_results(output, thought, tool_results);
                 with_embeddings = false;
@@ -160,7 +157,6 @@ impl Tui {
                 let _ = ctx.event_tx.send(TuiEvent::Finished {
                     output: output.clone(),
                     usage: usage.clone(),
-                    tool_results: vec![],
                 });
             }
 

@@ -1,7 +1,6 @@
 use crate::client::CompletionTokenUsage;
 use crate::config::GlobalConfig;
 use crate::hooks::{AsyncHookManager, PersistentHookManager};
-use crate::tool::ToolResult;
 use crate::utils::AbortSignal;
 
 use ratatui_textarea::TextArea;
@@ -77,10 +76,14 @@ pub(super) enum TranscriptEntry {
 pub(crate) enum TuiEvent {
     UiOutput(String),
     Chunk(String),
+    /// Intermediate tool round completed; the prompt loop continues.
+    ToolRoundComplete {
+        tool_count: usize,
+    },
+    /// Final completion — no more turns.
     Finished {
         output: String,
         usage: CompletionTokenUsage,
-        tool_results: Vec<ToolResult>,
     },
     Errored(String),
 }
@@ -89,10 +92,14 @@ pub(crate) enum TuiEvent {
 pub(super) enum TuiEvent {
     UiOutput(String),
     Chunk(String),
+    /// Intermediate tool round completed; the prompt loop continues.
+    ToolRoundComplete {
+        tool_count: usize,
+    },
+    /// Final completion — no more turns.
     Finished {
         output: String,
         usage: CompletionTokenUsage,
-        tool_results: Vec<ToolResult>,
     },
     Errored(String),
 }

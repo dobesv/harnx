@@ -104,7 +104,7 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                     });
                 let truncated = truncate_output(&output_str, &opts);
                 let text = format!("{}\n", dimmed_text(&truncated));
-                if !emit_ui_output(text.clone()) {
+                if !emit_ui_output(text.clone()) && *IS_STDOUT_TERMINAL {
                     print!("{text}");
                 }
 
@@ -348,7 +348,7 @@ impl ToolCall {
             _ => format!("🛠️  {} {}", self.name, json_data),
         };
         let text = format!("{}\n", dimmed_text(&prompt));
-        if !emit_ui_output(text.clone()) {
+        if !emit_ui_output(text.clone()) && *IS_STDOUT_TERMINAL {
             print!("{text}");
         }
 
@@ -384,7 +384,7 @@ impl ToolCall {
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         let has_ui_output = emit_ui_output("");
-                        let is_terminal = !has_ui_output;
+                        let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
                         let (chunk_rx, subscription_id) = manager.subscribe_chunks().await;
 
                         // Spawn a spinner only in non-TUI terminal mode.
@@ -529,8 +529,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_eval_tool_calls_error_handling() {
-        let _lock = crate::client::TEST_CLIENT_LOCK.lock().await;
-        crate::ui_output::clear_ui_output_sender();
+        let _guard = crate::client::TestStateGuard::new(None).await;
         let config = Arc::new(RwLock::new(Config::default()));
         let call = ToolCall::new(
             "unknown_tool".to_string(),
@@ -553,8 +552,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_eval_tool_calls_partial_error_handling() {
-        let _lock = crate::client::TEST_CLIENT_LOCK.lock().await;
-        crate::ui_output::clear_ui_output_sender();
+        let _guard = crate::client::TestStateGuard::new(None).await;
         let config = Arc::new(RwLock::new(Config::default()));
         // trigger_agent is handled internally and should succeed
         let call1 = ToolCall::new(

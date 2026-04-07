@@ -49,6 +49,7 @@ impl EventSource for MockEventSource {
             Ok(TuiEvent::UiOutput(text)) => Ok(Event::Paste(text)),
             Ok(TuiEvent::Chunk(text)) => Ok(Event::Paste(text)),
             Ok(TuiEvent::Errored(text)) => Ok(Event::Paste(text)),
+            Ok(TuiEvent::ToolRoundComplete { .. }) => Ok(Event::FocusGained),
             Ok(TuiEvent::Finished { .. }) => Ok(Event::FocusGained),
             Err(err) => Err(err.into()),
         }

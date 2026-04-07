@@ -19,14 +19,45 @@ static TEST_CLIENT: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<d
 /// Mutex that serializes tests using shared global state (test client,
 /// UI output sender). Tests that call `set_test_client`, `emit_ui_output`,
 /// or create a `Tui` should acquire this lock for their entire duration.
+/// Prefer using [`TestStateGuard`] instead of acquiring this directly.
 #[cfg(test)]
 pub static TEST_CLIENT_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// RAII guard that holds [`TEST_CLIENT_LOCK`], installs a test client on
+/// creation, and clears both the client and UI output sender on drop.
 #[cfg(test)]
-pub fn set_test_client(client: Option<std::sync::Arc<dyn Client>>) {
+pub struct TestStateGuard<'a> {
+    _lock: tokio::sync::MutexGuard<'a, ()>,
+}
+
+#[cfg(test)]
+impl TestStateGuard<'_> {
+    /// Acquire the global test-state lock and install `client`.
+    pub async fn new(client: Option<std::sync::Arc<dyn Client>>) -> TestStateGuard<'static> {
+        let lock = TEST_CLIENT_LOCK.lock().await;
+        set_test_client_inner(client);
+        TestStateGuard { _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestStateGuard<'_> {
+    fn drop(&mut self) {
+        set_test_client_inner(None);
+        crate::ui_output::clear_ui_output_sender();
+    }
+}
+
+#[cfg(test)]
+fn set_test_client_inner(client: Option<std::sync::Arc<dyn Client>>) {
     let slot = TEST_CLIENT.get_or_init(|| std::sync::Mutex::new(None));
     *slot.lock().expect("test client mutex poisoned") = client;
+}
+
+#[cfg(test)]
+pub fn set_test_client(client: Option<std::sync::Arc<dyn Client>>) {
+    set_test_client_inner(client);
 }
 
 #[cfg(test)]

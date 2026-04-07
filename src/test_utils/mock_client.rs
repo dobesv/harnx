@@ -46,7 +46,6 @@ use crate::client::{
     SseHandler, ToolCall,
 };
 use crate::config::{Config, GlobalConfig};
-use crate::tool::ToolDeclaration;
 use crate::utils::create_abort_signal;
 
 use anyhow::Result;
@@ -238,8 +237,6 @@ pub struct MockClient {
     name: String,
     extra_config: Option<ExtraConfig>,
     patch_config: Option<RequestPatch>,
-    #[allow(dead_code)]
-    declared_tools: Vec<ToolDeclaration>,
     default_turn: Option<MockTurn>,
     state: RwLock<MockClientState>,
 }
@@ -260,14 +257,19 @@ impl MockClient {
         self.state.read().turns.len()
     }
 
-    fn next_turn(&self, data: ChatCompletionsData) -> MockTurn {
+    fn next_turn(&self, data: ChatCompletionsData) -> Result<MockTurn> {
         let mut state = self.state.write();
         state.conversation_history.push(data);
         state
             .turns
             .pop_front()
             .or_else(|| self.default_turn.clone())
-            .unwrap_or_default()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MockClient exhausted all {} scripted turns with no default",
+                    state.conversation_history.len()
+                )
+            })
     }
 }
 
@@ -302,7 +304,7 @@ impl Client for MockClient {
         _client: &ReqwestClient,
         data: ChatCompletionsData,
     ) -> Result<ChatCompletionsOutput> {
-        let turn = self.next_turn(data);
+        let turn = self.next_turn(data)?;
         Ok(turn.output())
     }
 
@@ -312,7 +314,7 @@ impl Client for MockClient {
         handler: &mut SseHandler,
         data: ChatCompletionsData,
     ) -> Result<()> {
-        let turn = self.next_turn(data);
+        let turn = self.next_turn(data)?;
         for event in turn.events() {
             event.apply(handler, &mut ChatCompletionsOutput::default())?;
         }
@@ -342,7 +344,6 @@ pub struct MockClientBuilder {
     name: String,
     extra_config: Option<ExtraConfig>,
     patch_config: Option<RequestPatch>,
-    declared_tools: Vec<ToolDeclaration>,
     turns: Vec<MockTurn>,
     default_turn: Option<MockTurn>,
 }
@@ -355,7 +356,6 @@ impl Default for MockClientBuilder {
             name: "mock".to_string(),
             extra_config: None,
             patch_config: None,
-            declared_tools: vec![],
             turns: vec![],
             default_turn: None,
         }
@@ -390,12 +390,6 @@ impl MockClientBuilder {
     /// Set the request patch configuration.
     pub fn patch_config(mut self, patch_config: RequestPatch) -> Self {
         self.patch_config = Some(patch_config);
-        self
-    }
-
-    /// Set the tools available to the mock.
-    pub fn tools(mut self, tools: Vec<ToolDeclaration>) -> Self {
-        self.declared_tools = tools;
         self
     }
 
@@ -458,7 +452,6 @@ impl MockClientBuilder {
             name: self.name,
             extra_config: self.extra_config,
             patch_config: self.patch_config,
-            declared_tools: self.declared_tools,
             default_turn: self.default_turn,
             state: RwLock::new(MockClientState {
                 turns: self.turns.into(),
