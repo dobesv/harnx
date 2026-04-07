@@ -3,6 +3,7 @@ use crate::client::{set_test_client, Client, ClientConfig};
 use crate::config::Config;
 use crate::test_utils::{MockClient, MockTurnBuilder, TuiTestHarness};
 use crate::tui::types::{TranscriptEntry, TuiEvent};
+use crate::ui_output::clear_ui_output_sender;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,11 +14,25 @@ fn test_config() -> GlobalConfig {
 }
 
 fn test_config_with_mock_client() -> GlobalConfig {
+    test_config_with_mock_client_and_agent("test-agent", "test-session")
+}
+
+fn test_config_with_mock_client_and_agent(agent_name: &str, session_name: &str) -> GlobalConfig {
     let config = test_config();
     {
         let mut guard = config.write();
         guard.clients = vec![ClientConfig::Unknown];
-        guard.model = MockClient::builder().build().model().clone();
+        let model = MockClient::builder().build().model().clone();
+        guard.model = model.clone();
+        
+        // Set up agent for realistic status line
+        let mut agent = crate::config::Agent::from_prompt("");
+        agent.set_name(agent_name);
+        agent.set_model(model);
+        guard.agent = Some(agent);
+        
+        // Set up session for realistic status line
+        let _ = guard.use_session(Some(session_name));
     }
     config
 }
@@ -262,6 +277,7 @@ async fn test_basic_message_and_streaming_response() {
     insta::assert_snapshot!("basic_message_and_streaming_response", rendered);
 
     set_test_client(None);
+    clear_ui_output_sender();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -333,6 +349,7 @@ async fn test_streaming_with_tool_calls() {
     insta::assert_snapshot!("streaming_with_tool_calls", rendered);
 
     set_test_client(None);
+    clear_ui_output_sender();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -402,6 +419,7 @@ async fn test_screen_overflow_and_word_wrap() {
     insta::assert_snapshot!("screen_overflow_and_word_wrap", rendered);
 
     set_test_client(None);
+    clear_ui_output_sender();
 }
 
 #[tokio::test(flavor = "multi_thread")]

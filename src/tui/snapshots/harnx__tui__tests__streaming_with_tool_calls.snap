@@ -7,6 +7,8 @@ Transcript
 
 Let me check that for you.
 
+🛠️   search {"query":"test"}
+
 1 tool result(s) returned
 
 The answer is 42.
@@ -21,6 +23,4 @@ The answer is 42.
 
 
 
-
-
-• Input
+• 🤖  test-agent ▸ test-session   💬  56

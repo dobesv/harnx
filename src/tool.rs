@@ -85,28 +85,27 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                     ))
                 });
 
-                if *IS_STDOUT_TERMINAL {
-                    let mut opts = TruncateOpts::default();
-                    let marker = " [...] ";
-                    if let Ok((cols, rows)) = crossterm::terminal::size() {
-                        opts.head_lines = 5.max((rows / 2) as usize);
-                        opts.tail_lines = 0;
-                        // "<= " prefix is 3 chars, marker is 7 chars; total overhead = 10
-                        // line_head_bytes + marker.len() + prefix.len() must fit in cols
-                        opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
-                        opts.line_tail_bytes = 0;
-                        opts.marker = Some(marker.to_string());
-                    }
-                    let output_str =
-                        extract_user_display_text(&result).unwrap_or_else(|| match &result {
-                            Value::String(s) => s.clone(),
-                            _ => result.to_string(),
-                        });
-                    let truncated = truncate_output(&output_str, &opts);
-                    let text = format!("{}\n", dimmed_text(&truncated));
-                    if !emit_ui_output(text.clone()) {
-                        print!("{text}");
-                    }
+                // Emit tool result to TUI or terminal
+                let mut opts = TruncateOpts::default();
+                let marker = " [...] ";
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    opts.head_lines = 5.max((rows / 2) as usize);
+                    opts.tail_lines = 0;
+                    // "<= " prefix is 3 chars, marker is 7 chars; total overhead = 10
+                    // line_head_bytes + marker.len() + prefix.len() must fit in cols
+                    opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
+                    opts.line_tail_bytes = 0;
+                    opts.marker = Some(marker.to_string());
+                }
+                let output_str =
+                    extract_user_display_text(&result).unwrap_or_else(|| match &result {
+                        Value::String(s) => s.clone(),
+                        _ => result.to_string(),
+                    });
+                let truncated = truncate_output(&output_str, &opts);
+                let text = format!("{}\n", dimmed_text(&truncated));
+                if !emit_ui_output(text.clone()) {
+                    print!("{text}");
                 }
 
                 if result.is_null() {
@@ -343,15 +342,14 @@ impl ToolCall {
             )));
         };
 
-        if *IS_STDOUT_TERMINAL {
-            let prompt = match &json_data {
-                Value::Null => format!("🛠️  {}", self.name),
-                _ => format!("🛠️  {} {}", self.name, json_data),
-            };
-            let text = format!("{}\n", dimmed_text(&prompt));
-            if !emit_ui_output(text.clone()) {
-                print!("{text}");
-            }
+        // Emit tool call info to TUI or terminal
+        let prompt = match &json_data {
+            Value::Null => format!("🛠️  {}", self.name),
+            _ => format!("🛠️  {} {}", self.name, json_data),
+        };
+        let text = format!("{}\n", dimmed_text(&prompt));
+        if !emit_ui_output(text.clone()) {
+            print!("{text}");
         }
 
         if self.name == TRIGGER_AGENT_TOOL_NAME {
@@ -386,7 +384,7 @@ impl ToolCall {
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         let has_ui_output = emit_ui_output("");
-                        let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
+                        let is_terminal = !has_ui_output;
                         let (chunk_rx, subscription_id) = manager.subscribe_chunks().await;
 
                         // Spawn a spinner only in non-TUI terminal mode.
