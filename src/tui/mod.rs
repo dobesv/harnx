@@ -10,9 +10,9 @@ use crate::utils::{create_abort_signal, AbortSignal};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 
+mod event_source;
 mod input;
 mod lifecycle;
 mod prompt;
@@ -39,6 +40,9 @@ mod render;
 mod terminal;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod types;
+#[cfg(not(test))]
 mod types;
 
 pub use self::types::Tui;

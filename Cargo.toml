@@ -101,8 +101,10 @@ arboard = { version = "3.3.0", default-features = false, features = ["wayland-da
 arboard = { version = "3.3.0", default-features = false }
 
 [dev-dependencies]
+insta = { version = "1", features = ["yaml"] }
 pretty_assertions = "1.4.0"
 rand = "0.9.0"
+tokio-test = "0.4"
 
 [[bin]]
 name = "harnx-mcp-todo"
@@ -124,3 +126,13 @@ path = "src/bin/harnx-mcp-time/main.rs"
 lto = true
 strip = true
 opt-level = "z"
+
+# Recommended: use cargo-nextest for reliable test execution
+# Install: cargo install cargo-nextest
+# Run: cargo nextest run --lib
+#
+# With standard cargo test, use --test-threads=1:
+# cargo test --lib -- --test-threads=1
+#
+# The TUI tests use shared global state (UI_OUTPUT_SENDER) that cannot
+# be fully isolated between parallel test runs.

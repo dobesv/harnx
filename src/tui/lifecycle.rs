@@ -1,4 +1,5 @@
 use super::*;
+use crate::tui::event_source::{CrosstermEventSource, EventSource};
 use crate::tui::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
 use crate::tui::types::{App, TranscriptEntry, TuiEvent, SPINNER_FRAMES, TICK_RATE};
 
@@ -119,14 +120,26 @@ impl Tui {
     pub async fn run(&mut self) -> Result<()> {
         let _panic_terminal_hook = PanicTerminalHookGuard::install();
         let mut terminal = Self::setup_terminal()?;
-        let result = self.run_loop(&mut terminal).await;
+        let mut event_source = CrosstermEventSource;
+        let result = self.run_loop_inner(&mut terminal, &mut event_source).await;
         Self::restore_terminal(&mut terminal)?;
         self.config.write().exit_session()?;
         result
     }
 
-    async fn run_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-        self.install_external_editor_bridge(terminal);
+    /// Generic run_loop that works with any Backend and EventSource.
+    /// Used by production `run()` with Crossterm, and by tests with TestBackend.
+    async fn run_loop_inner<B, E>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        event_source: &mut E,
+    ) -> Result<()>
+    where
+        B: ratatui::backend::Backend,
+        B::Error: std::error::Error + Send + Sync + 'static,
+        E: EventSource,
+    {
+        self.install_external_editor_bridge();
         let mut last_tick = Instant::now();
         loop {
             terminal.draw(|frame| self.draw(frame))?;
@@ -136,8 +149,8 @@ impl Tui {
             }
 
             let timeout = TICK_RATE.saturating_sub(last_tick.elapsed());
-            if event::poll(timeout)? {
-                match event::read()? {
+            if event_source.poll(timeout)? {
+                match event_source.read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.handle_key(key).await?
                     }
@@ -167,8 +180,7 @@ impl Tui {
         Ok(())
     }
 
-    fn install_external_editor_bridge(&self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
-        let _ = terminal;
+    fn install_external_editor_bridge(&self) {
         self.config.write().set_tui_editor_hooks(
             Some(Box::new(cleanup_terminal_state)),
             Some(Box::new(|| {

@@ -83,6 +83,11 @@ macro_rules! register_client {
         )+
 
         pub fn init_client(config: &$crate::config::GlobalConfig, model: Option<$crate::client::Model>) -> anyhow::Result<Box<dyn Client>> {
+            #[cfg(test)]
+            if let Some(client) = $crate::client::take_test_client() {
+                return Ok(Box::new($crate::client::TestClient::new(client)));
+            }
+
             let model = model.unwrap_or_else(|| config.read().model.clone());
             None
             $(.or_else(|| $client::init(config, &model)))+

@@ -56,7 +56,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 Run the full verification pipeline before committing:
 
 ```sh
-cargo fmt && cargo build && cargo clippy --all --all-targets -- -D warnings && cargo test --all
+cargo fmt && cargo build && cargo clippy --all --all-targets -- -D warnings && cargo nextest run --all
 ```
 
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
@@ -64,10 +64,10 @@ cargo fmt && cargo build && cargo clippy --all --all-targets -- -D warnings && c
 During development you can run the individual commands:
 
 ```sh
-cargo build          # Compile the project
-cargo fmt            # Auto-format code (run without --check to fix)
+cargo build                                       # Compile the project
+cargo fmt                                         # Auto-format code (run without --check to fix)
 cargo clippy --all --all-targets -- -D warnings   # Lint — treat warnings as errors
-cargo test --all     # Run all tests
+cargo nextest run --all --stress-count=5          # Run all tests, repeat several times to catch flaky tests
 ```
 
 ## Commit Conventions
@@ -120,7 +120,7 @@ The YAML front matter specifies the version bump: `patch`, `minor`, or `major`.
 
 CI runs on every PR and push to `main` across Ubuntu, macOS, and Windows. See `.github/workflows/ci.yaml`. The pipeline:
 
-1. `cargo test --all`
+1. `cargo nextest run --all`
 2. `cargo clippy --all --all-targets -- -D warnings`
 3. `cargo fmt --all --check`
 

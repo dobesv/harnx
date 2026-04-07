@@ -8,6 +8,12 @@ pub struct AsyncHookManager {
     receiver: mpsc::UnboundedReceiver<HookResult>,
 }
 
+impl Default for AsyncHookManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AsyncHookManager {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();

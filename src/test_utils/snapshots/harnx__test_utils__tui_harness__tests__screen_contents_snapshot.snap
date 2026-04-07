@@ -1,0 +1,14 @@
+---
+source: src/test_utils/tui_harness.rs
+assertion_line: 146
+description: Basic TUI render test
+expression: normalized
+---
+Transcript
+Welcome to harnx 0.30.0  •  Type .help
+for commands, Tab to complete.
+
+
+
+
+• Input

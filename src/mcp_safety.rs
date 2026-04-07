@@ -23,6 +23,7 @@ pub fn path_to_file_uri(path: &Path) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let path_str = uri
         .strip_prefix("file://localhost")
@@ -77,6 +78,7 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+#[allow(dead_code)]
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -360,6 +362,7 @@ fn bytecount(s: &str, needle: u8) -> usize {
     s.as_bytes().iter().filter(|&&b| b == needle).count()
 }
 
+#[allow(dead_code)]
 pub fn validate_path(path_str: &str, roots: &[PathBuf]) -> Result<PathBuf, String> {
     let path = Path::new(path_str);
     let resolved = if path.is_absolute() {

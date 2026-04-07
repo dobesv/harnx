@@ -1,0 +1,26 @@
+---
+source: src/tui/tests.rs
+expression: rendered
+---
+Transcript
+> Test message
+
+Hello from the mock client!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• 🤖  test-agent ▸ test-session   💬  15

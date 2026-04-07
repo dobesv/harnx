@@ -29,6 +29,9 @@ jobs:
 
     env:
       RUSTFLAGS: --deny warnings
+      # Insta: update snapshots instead of failing (for PR review)
+      # Set to "no" for actual CI, developers can use "yes" locally
+      INSTA_UPDATE: "no"
 
     steps:
     - uses: actions/checkout@v6
@@ -38,8 +41,21 @@ jobs:
 
     - uses: Swatinem/rust-cache@v2
 
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest
+
     - name: Test
-      run: cargo test --all
+      run: cargo nextest run --all
+
+    - name: Check for pending snapshot updates
+      if: failure()
+      run: |
+        if ls src/tui/snapshots/*.snap.new 2>/dev/null; then
+          echo "::error::Snapshot updates pending. Run 'cargo insta review' locally to review and accept changes."
+          exit 1
+        fi
 
     - name: Clippy
       run: cargo clippy --all --all-targets -- -D warnings

@@ -1,7 +1,6 @@
 use crate::client::CompletionTokenUsage;
 use crate::config::GlobalConfig;
 use crate::hooks::{AsyncHookManager, PersistentHookManager};
-use crate::tool::ToolResult;
 use crate::utils::AbortSignal;
 
 use ratatui_textarea::TextArea;
@@ -20,8 +19,19 @@ pub struct Tui {
     pub(super) async_manager: Arc<Mutex<AsyncHookManager>>,
     pub(super) persistent_manager: Arc<Mutex<PersistentHookManager>>,
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub(crate) app: App,
+    #[cfg(not(test))]
+    #[allow(dead_code)]
     pub(super) app: App,
+    #[cfg(test)]
+    pub(crate) event_tx: mpsc::UnboundedSender<TuiEvent>,
+    #[cfg(not(test))]
     pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
+    #[cfg(test)]
+    pub(crate) event_rx: mpsc::UnboundedReceiver<TuiEvent>,
+    #[cfg(not(test))]
     pub(super) event_rx: mpsc::UnboundedReceiver<TuiEvent>,
 }
 
@@ -46,6 +56,15 @@ pub(super) struct App {
 }
 
 #[derive(Clone)]
+#[cfg(test)]
+pub(crate) enum TranscriptEntry {
+    System(String),
+    User(String),
+    Assistant(String),
+    Error(String),
+}
+
+#[cfg(not(test))]
 pub(super) enum TranscriptEntry {
     System(String),
     User(String),
@@ -53,13 +72,34 @@ pub(super) enum TranscriptEntry {
     Error(String),
 }
 
-pub(super) enum TuiEvent {
+#[cfg(test)]
+pub(crate) enum TuiEvent {
     UiOutput(String),
     Chunk(String),
+    /// Intermediate tool round completed; the prompt loop continues.
+    ToolRoundComplete {
+        tool_count: usize,
+    },
+    /// Final completion — no more turns.
     Finished {
         output: String,
         usage: CompletionTokenUsage,
-        tool_results: Vec<ToolResult>,
+    },
+    Errored(String),
+}
+
+#[cfg(not(test))]
+pub(super) enum TuiEvent {
+    UiOutput(String),
+    Chunk(String),
+    /// Intermediate tool round completed; the prompt loop continues.
+    ToolRoundComplete {
+        tool_count: usize,
+    },
+    /// Final completion — no more turns.
+    Finished {
+        output: String,
+        usage: CompletionTokenUsage,
     },
     Errored(String),
 }

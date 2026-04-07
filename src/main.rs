@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod hooks;
 mod mcp;
+pub mod mcp_safety;
 mod rag;
 mod render;
 #[allow(dead_code, unused_imports)]
@@ -17,6 +18,9 @@ mod utils;
 
 #[macro_use]
 extern crate log;
+
+#[cfg(test)]
+pub mod test_utils;
 
 use crate::cli::Cli;
 use crate::client::{
