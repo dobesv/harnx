@@ -23,9 +23,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let server = BashServer::new(roots);
+    let cleanup_server = server.clone();
     let transport = rmcp::transport::stdio();
     let service = server.serve(transport).await?;
-    service.waiting().await?;
+    let wait_result = service.waiting().await;
+    if let Err(err) = cleanup_server.cleanup_log_dir() {
+        eprintln!("harnx-mcp-bash: warning: failed to clean temp log dir: {err}");
+    }
+    wait_result?;
 
     Ok(())
 }
