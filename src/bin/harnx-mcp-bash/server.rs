@@ -1,5 +1,6 @@
 use harnx::mcp_safety::{
-    file_uri_to_path, format_size, sanitize_output_text, truncate_output, TruncateOpts,
+    file_uri_to_path, format_size, sanitize_output_text, truncate_output, validate_path,
+    TruncateOpts,
 };
 
 use fancy_regex::Regex;
@@ -22,7 +23,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
 
@@ -271,9 +272,9 @@ impl BashServer {
         }
     }
 
-    fn ensure_log_dir(&self) -> Result<(), ErrorData> {
+    async fn ensure_log_dir(&self) -> Result<(), ErrorData> {
         if let Some(parent) = self.inner.log_dir.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
+            tokio::fs::create_dir_all(parent).await.map_err(|err| {
                 internal_error(format!(
                     "failed to create temp parent directory '{}': {err}",
                     parent.display()
@@ -281,12 +282,14 @@ impl BashServer {
             })?;
         }
 
-        std::fs::create_dir_all(&self.inner.log_dir).map_err(|err| {
-            internal_error(format!(
-                "failed to create log directory '{}': {err}",
-                self.inner.log_dir.display()
-            ))
-        })
+        tokio::fs::create_dir_all(&self.inner.log_dir)
+            .await
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to create log directory '{}': {err}",
+                    self.inner.log_dir.display()
+                ))
+            })
     }
 
     fn next_exec_log_paths(&self) -> (PathBuf, PathBuf) {
@@ -298,31 +301,19 @@ impl BashServer {
     }
 
     fn validate_log_path(&self, requested: &str) -> Result<PathBuf, ErrorData> {
-        let candidate = PathBuf::from(requested);
-        let normalized = if candidate.is_absolute() {
-            candidate
-        } else {
-            self.inner.log_dir.join(candidate)
-        };
-
-        let canonical = normalized.canonicalize().map_err(|err| {
-            ErrorData::invalid_params(
-                format!("cannot resolve log path '{}': {err}", normalized.display()),
-                None,
-            )
-        })?;
-
-        if !canonical.starts_with(&self.inner.log_dir) {
-            return Err(ErrorData::invalid_params(
-                format!(
-                    "log path '{}' is outside the bash server temp log directory",
-                    canonical.display()
-                ),
-                None,
-            ));
-        }
-
-        Ok(canonical)
+        validate_path(requested, std::slice::from_ref(&self.inner.log_dir)).map_err(|err| {
+            if err.starts_with("Cannot resolve path") {
+                ErrorData::invalid_params(
+                    format!("cannot resolve log path '{requested}': {err}"),
+                    None,
+                )
+            } else {
+                ErrorData::invalid_params(
+                    format!("log path '{requested}' is outside the bash server temp log directory"),
+                    None,
+                )
+            }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -353,21 +344,25 @@ impl BashServer {
             ..default_opts
         };
 
-        self.ensure_log_dir()?;
+        self.ensure_log_dir().await?;
         let (stdout_log_path, stderr_log_path) = self.next_exec_log_paths();
 
-        let stdout_file = std::fs::File::create(&stdout_log_path).map_err(|err| {
-            internal_error(format!(
-                "failed to create stdout log file '{}': {err}",
-                stdout_log_path.display()
-            ))
-        })?;
-        let stderr_file = std::fs::File::create(&stderr_log_path).map_err(|err| {
-            internal_error(format!(
-                "failed to create stderr log file '{}': {err}",
-                stderr_log_path.display()
-            ))
-        })?;
+        let stdout_file = tokio::fs::File::create(&stdout_log_path)
+            .await
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to create stdout log file '{}': {err}",
+                    stdout_log_path.display()
+                ))
+            })?;
+        let stderr_file = tokio::fs::File::create(&stderr_log_path)
+            .await
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to create stderr log file '{}': {err}",
+                    stderr_log_path.display()
+                ))
+            })?;
 
         let mut child = Command::new("bash")
             .args(["-c", &params.command])
@@ -475,14 +470,16 @@ impl BashServer {
         }
 
         let path = self.validate_log_path(&params.path)?;
-        let metadata = std::fs::metadata(&path)
+        let metadata = tokio::fs::metadata(&path)
+            .await
             .map_err(|err| internal_error(format!("cannot access '{}': {err}", path.display())))?;
 
         if !metadata.is_file() {
             return tool_error(format!("'{}' is not a regular log file.", path.display()));
         }
 
-        let content = std::fs::read_to_string(&path)
+        let content = tokio::fs::read_to_string(&path)
+            .await
             .map_err(|err| internal_error(format!("failed to read '{}': {err}", path.display())))?;
 
         let grep_regex = match params.grep.as_deref() {
@@ -493,6 +490,7 @@ impl BashServer {
         };
 
         let mut notices = Vec::new();
+        let mut regex_error = None;
         let mut numbered_lines = content
             .lines()
             .enumerate()
@@ -502,12 +500,21 @@ impl BashServer {
                     Some(regex) => match regex.is_match(line) {
                         Ok(true) => Some((line_number, line.to_string())),
                         Ok(false) => None,
-                        Err(_) => None,
+                        Err(err) => {
+                            if regex_error.is_none() {
+                                regex_error = Some(err.to_string());
+                            }
+                            None
+                        }
                     },
                     None => Some((line_number, line.to_string())),
                 }
             })
             .collect::<Vec<_>>();
+
+        if let Some(err) = regex_error {
+            notices.push(format!("grep evaluation error: {err}"));
+        }
 
         let total_matching_lines = numbered_lines.len();
         if total_matching_lines == 0 {
@@ -531,7 +538,10 @@ impl BashServer {
                 numbered_lines = numbered_lines[total_matching_lines - tail..].to_vec();
             }
         } else if let Some(offset) = params.offset {
-            let offset = offset.max(1);
+            if offset == 0 {
+                return Err(ErrorData::invalid_params("offset must be >= 1", None));
+            }
+
             let limit = params.limit.unwrap_or(200).max(1);
             if offset > total_matching_lines {
                 return tool_error(format!(
@@ -611,7 +621,7 @@ impl BashServer {
             .resolve_working_dir(params.working_dir.as_deref())
             .await?;
 
-        self.ensure_log_dir()?;
+        self.ensure_log_dir().await?;
 
         let seq = self.inner.spawn_counter.fetch_add(1, Ordering::SeqCst);
         let log_path = self.inner.log_dir.join(format!("bg-{seq}.log"));
@@ -1066,16 +1076,25 @@ fn object_schema(properties: Vec<(&str, Schema)>, required: &[&str]) -> Schema {
     schema.into()
 }
 
-async fn read_pipe_to_file<R>(mut reader: R, mut file: std::fs::File) -> std::io::Result<Vec<u8>>
+async fn read_pipe_to_file<R, W>(mut reader: R, mut writer: W) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
-    use std::io::Write as _;
-
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
-    file.write_all(&bytes)?;
-    file.flush()?;
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+
+        writer.write_all(&buffer[..read]).await?;
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+
+    writer.flush().await?;
     Ok(bytes)
 }
 
