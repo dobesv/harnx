@@ -180,7 +180,11 @@ pub static REPL_COMMANDS: LazyLock<[ReplCommand; 39]> = LazyLock::new(|| {
             "Leave RAG",
             AssertState::TrueFalse(StateFlags::RAG, StateFlags::AGENT),
         ),
-        ReplCommand::new(".attach", "Attach a file to the next message", AssertState::pass()),
+        ReplCommand::new(
+            ".attach",
+            "Attach a file to the next message",
+            AssertState::pass(),
+        ),
         ReplCommand::new(".detach", "Remove attached files", AssertState::pass()),
         ReplCommand::new(".macro", "Execute a macro", AssertState::pass()),
         ReplCommand::new(".mcp", "Manage MCP servers", AssertState::pass()),

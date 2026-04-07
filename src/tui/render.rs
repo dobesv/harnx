@@ -50,10 +50,17 @@ impl Tui {
         let input_height = self
             .input_height(input_width)
             .clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
-        let attachment_height: u16 = if self.app.attachments.is_empty() { 0 } else { 1 };
+        let attachment_height: u16 = if self.app.attachments.is_empty() {
+            0
+        } else {
+            1
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(input_height + attachment_height)])
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(input_height + attachment_height),
+            ])
             .split(size);
 
         let transcript_lines = if self.app.transcript.is_empty() {

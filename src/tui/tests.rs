@@ -678,7 +678,10 @@ async fn test_streaming_error_shows_in_transcript() {
         .push(TranscriptEntry::User("Error test".to_string()));
 
     // The error should propagate through start_prompt
-    let result = harness.tui().start_prompt("Error test".to_string(), vec![]).await;
+    let result = harness
+        .tui()
+        .start_prompt("Error test".to_string(), vec![])
+        .await;
 
     let _ = result; // start_prompt always returns Ok (spawns a task)
 
@@ -793,8 +796,14 @@ async fn paste_multiline_creates_temp_attachment() {
 
     // Instead it should create a temp file attachment
     assert_eq!(tui.app.attachments.len(), 1, "Should create one attachment");
-    assert!(tui.app.attachments[0].temp, "Attachment should be marked temp");
-    assert!(tui.app.attachments[0].path.exists(), "Temp file should exist");
+    assert!(
+        tui.app.attachments[0].temp,
+        "Attachment should be marked temp"
+    );
+    assert!(
+        tui.app.attachments[0].path.exists(),
+        "Temp file should exist"
+    );
 
     // The temp file should contain the pasted text
     let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
@@ -807,7 +816,10 @@ async fn paste_multiline_creates_temp_attachment() {
         .iter()
         .filter(|entry| matches!(entry, TranscriptEntry::User(_)))
         .collect();
-    assert!(user_entries.is_empty(), "Paste should not trigger submission");
+    assert!(
+        user_entries.is_empty(),
+        "Paste should not trigger submission"
+    );
 
     // Cleanup
     tui.app.attachments[0].cleanup();
@@ -823,7 +835,10 @@ async fn paste_single_line_inserts_inline() {
 
     let text = tui.app.input.lines().join("\n");
     assert_eq!(text, "single line text");
-    assert!(tui.app.attachments.is_empty(), "Single-line paste should not create attachment");
+    assert!(
+        tui.app.attachments.is_empty(),
+        "Single-line paste should not create attachment"
+    );
 }
 
 #[tokio::test]
@@ -842,7 +857,10 @@ async fn paste_then_erase_then_paste_different_text() {
     // Second paste (single-line, different text)
     tui.handle_paste("second paste".to_string());
     let text = tui.app.input.lines().join("\n");
-    assert_eq!(text, "second paste", "Should only contain the second paste, not the first");
+    assert_eq!(
+        text, "second paste",
+        "Should only contain the second paste, not the first"
+    );
 }
 
 #[tokio::test]
@@ -864,13 +882,16 @@ async fn detach_cleans_up_temp_file() {
         .unwrap();
 
     assert!(tui.app.attachments.is_empty());
-    assert!(!temp_path.exists(), "Temp file should be deleted after detach");
+    assert!(
+        !temp_path.exists(),
+        "Temp file should be deleted after detach"
+    );
 }
 
 #[tokio::test]
 async fn attachment_footer_shows_attached_files() {
-    use std::path::PathBuf;
     use crate::tui::types::Attachment;
+    use std::path::PathBuf;
 
     let mut harness = TuiTestHarness::with_size(60, 12);
     harness.tui().app.attachments.push(Attachment {
@@ -977,8 +998,8 @@ async fn attach_nonexistent_file_shows_error() {
 
 #[tokio::test]
 async fn detach_clears_all_attachments() {
-    use std::path::PathBuf;
     use crate::tui::types::Attachment;
+    use std::path::PathBuf;
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
@@ -1005,8 +1026,8 @@ async fn detach_clears_all_attachments() {
 
 #[tokio::test]
 async fn detach_by_name_removes_specific_attachment() {
-    use std::path::PathBuf;
     use crate::tui::types::Attachment;
+    use std::path::PathBuf;
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
@@ -1034,8 +1055,8 @@ async fn detach_by_name_removes_specific_attachment() {
 
 #[tokio::test]
 async fn submit_drains_attachments() {
-    use std::path::PathBuf;
     use crate::tui::types::Attachment;
+    use std::path::PathBuf;
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
@@ -1052,7 +1073,10 @@ async fn submit_drains_attachments() {
         .await
         .unwrap();
 
-    assert!(tui.app.attachments.is_empty(), "Attachments should be cleared after submit");
+    assert!(
+        tui.app.attachments.is_empty(),
+        "Attachments should be cleared after submit"
+    );
     assert!(tui.app.llm_busy, "Should have started prompt");
 }
 
@@ -1179,7 +1203,9 @@ async fn attach_completes_file_paths() {
     let completions = tui.compute_completions(&line, line.len());
 
     assert!(
-        completions.iter().any(|(v, _)| v.contains("harnx_completion_test.txt")),
+        completions
+            .iter()
+            .any(|(v, _)| v.contains("harnx_completion_test.txt")),
         "Should complete file paths, got: {:?}",
         completions
     );
@@ -1189,8 +1215,8 @@ async fn attach_completes_file_paths() {
 
 #[tokio::test]
 async fn detach_completes_attachment_names() {
-    use std::path::PathBuf;
     use crate::tui::types::Attachment;
+    use std::path::PathBuf;
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
@@ -1210,6 +1236,14 @@ async fn detach_completes_attachment_names() {
     let completions = tui.compute_completions(".detach ", 8);
     let names: Vec<&str> = completions.iter().map(|(v, _)| v.as_str()).collect();
 
-    assert!(names.contains(&"photo.png"), "Should complete attachment names, got: {:?}", names);
-    assert!(names.contains(&"data.csv"), "Should complete attachment names, got: {:?}", names);
+    assert!(
+        names.contains(&"photo.png"),
+        "Should complete attachment names, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"data.csv"),
+        "Should complete attachment names, got: {:?}",
+        names
+    );
 }

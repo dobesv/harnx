@@ -134,7 +134,11 @@ impl Tui {
         };
 
         if last_line.starts_with(".attach ") {
-            let path_str = last_line.strip_prefix(".attach ").unwrap().trim().to_string();
+            let path_str = last_line
+                .strip_prefix(".attach ")
+                .unwrap()
+                .trim()
+                .to_string();
             let path = std::path::PathBuf::from(&path_str);
             if path.exists() {
                 let display_name = path
@@ -148,18 +152,22 @@ impl Tui {
                     temp: false,
                 });
             } else {
-                self.app.transcript.push(
-                    crate::tui::types::TranscriptEntry::Error(
-                        format!("File not found: {path_str}")
-                    )
-                );
+                self.app
+                    .transcript
+                    .push(crate::tui::types::TranscriptEntry::Error(format!(
+                        "File not found: {path_str}"
+                    )));
             }
         } else if last_line == ".detach" {
             for a in self.app.attachments.drain(..) {
                 a.cleanup();
             }
         } else if last_line.starts_with(".detach ") {
-            let name = last_line.strip_prefix(".detach ").unwrap().trim().to_string();
+            let name = last_line
+                .strip_prefix(".detach ")
+                .unwrap()
+                .trim()
+                .to_string();
             let mut kept = Vec::new();
             for a in self.app.attachments.drain(..) {
                 if a.display_name == name {
@@ -176,7 +184,8 @@ impl Tui {
         // Remove the last line (the command) and restore remaining text
         let remaining_text = {
             let lines = self.app.input.lines();
-            let remaining: Vec<String> = lines[..lines.len() - 1].iter().map(|s| s.clone()).collect();
+            let remaining: Vec<String> =
+                lines[..lines.len() - 1].to_vec();
             remaining.join("\n")
         };
         self.set_input_text(&remaining_text);
@@ -199,11 +208,11 @@ impl Tui {
                     self.app.attachments.push(attachment);
                 }
                 Err(err) => {
-                    self.app.transcript.push(
-                        crate::tui::types::TranscriptEntry::Error(
-                            format!("Failed to save pasted text: {err}")
-                        )
-                    );
+                    self.app
+                        .transcript
+                        .push(crate::tui::types::TranscriptEntry::Error(format!(
+                            "Failed to save pasted text: {err}"
+                        )));
                 }
             }
         } else {
@@ -582,8 +591,14 @@ impl Tui {
                 let prefix;
                 if filter.contains('/') || filter.contains('\\') {
                     let p = std::path::Path::new(filter);
-                    dir_path = p.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-                    prefix = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    dir_path = p
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf();
+                    prefix = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
                 } else {
                     dir_path = std::path::PathBuf::from(".");
                     prefix = filter.to_string();
