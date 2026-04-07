@@ -30,8 +30,10 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::fs::File as TokioFile;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
+use uuid::Uuid;
 #[derive(Debug, Deserialize)]
 struct ExecCommandParams {
     command: String,
@@ -223,7 +225,11 @@ pub struct BashServer {
 
 impl BashServer {
     pub fn new(initial_roots: Vec<PathBuf>) -> Self {
-        let log_dir = std::env::temp_dir().join(format!("harnx-bash-{}", std::process::id()));
+        let log_dir = std::env::temp_dir().join(format!(
+            "harnx-bash-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
         Self {
             inner: Arc::new(BashServerInner {
                 roots: RwLock::new(initial_roots),
@@ -414,6 +420,15 @@ impl BashServer {
 
         let stdout_bytes = join_pipe(stdout_task, "stdout").await?;
         let stderr_bytes = join_pipe(stderr_task, "stderr").await?;
+
+        // Sync log files to disk to ensure they're visible to other processes immediately
+        if let Ok(f) = tokio::fs::File::open(&stdout_log_path).await {
+            let _ = f.sync_all().await;
+        }
+        if let Ok(f) = tokio::fs::File::open(&stderr_log_path).await {
+            let _ = f.sync_all().await;
+        }
+
         let output_bytes = merge_output(&stdout_bytes, &stderr_bytes);
         let total_bytes = output_bytes.len();
         let sanitized_output = sanitize_output_text(&String::from_utf8_lossy(&output_bytes));
@@ -1095,10 +1110,9 @@ fn object_schema(properties: Vec<(&str, Schema)>, required: &[&str]) -> Schema {
     schema.into()
 }
 
-async fn read_pipe_to_file<R, W>(mut reader: R, mut writer: W) -> std::io::Result<Vec<u8>>
+async fn read_pipe_to_file<R>(mut reader: R, mut writer: TokioFile) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
 {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 8192];
@@ -1114,6 +1128,7 @@ where
     }
 
     writer.flush().await?;
+    writer.sync_all().await?;
     Ok(bytes)
 }
 
