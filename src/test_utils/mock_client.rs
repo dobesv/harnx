@@ -115,22 +115,21 @@ impl MockTurn {
         &self.events
     }
 
-    fn output(&self) -> ChatCompletionsOutput {
-        self.output.clone().unwrap_or_else(|| {
-            let mut output = ChatCompletionsOutput::default();
-            for event in &self.events {
-                match event {
-                    MockResponseEvent::Text(text) => output.text.push_str(text),
-                    MockResponseEvent::ToolCall(tool_call) => {
-                        output.tool_calls.push(tool_call.clone())
-                    }
-                    MockResponseEvent::Error(_) => {
-                        // Error is handled in streaming path, not in output generation
-                    }
+    fn output(&self) -> Result<ChatCompletionsOutput> {
+        if let Some(output) = &self.output {
+            return Ok(output.clone());
+        }
+        let mut output = ChatCompletionsOutput::default();
+        for event in &self.events {
+            match event {
+                MockResponseEvent::Text(text) => output.text.push_str(text),
+                MockResponseEvent::ToolCall(tool_call) => output.tool_calls.push(tool_call.clone()),
+                MockResponseEvent::Error(err) => {
+                    return Err(anyhow::anyhow!("{}", err));
                 }
             }
-            output
-        })
+        }
+        Ok(output)
     }
 }
 
@@ -305,7 +304,7 @@ impl Client for MockClient {
         data: ChatCompletionsData,
     ) -> Result<ChatCompletionsOutput> {
         let turn = self.next_turn(data)?;
-        Ok(turn.output())
+        turn.output()
     }
 
     async fn chat_completions_streaming_inner(
@@ -315,11 +314,15 @@ impl Client for MockClient {
         data: ChatCompletionsData,
     ) -> Result<()> {
         let turn = self.next_turn(data)?;
+        let mut result = Ok(());
         for event in turn.events() {
-            event.apply(handler, &mut ChatCompletionsOutput::default())?;
+            if let Err(e) = event.apply(handler, &mut ChatCompletionsOutput::default()) {
+                result = Err(e);
+                break;
+            }
         }
         handler.done();
-        Ok(())
+        result
     }
 }
 

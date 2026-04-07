@@ -32,9 +32,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 
-#[cfg(test)]
-pub(crate) mod event_source;
-#[cfg(not(test))]
 mod event_source;
 mod input;
 mod lifecycle;

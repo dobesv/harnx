@@ -39,6 +39,11 @@ impl TestStateGuard<'_> {
         set_test_client_inner(client);
         TestStateGuard { _lock: lock }
     }
+
+    /// Swap the test client while already holding the lock.
+    pub fn set_client(&self, client: Option<std::sync::Arc<dyn Client>>) {
+        set_test_client_inner(client);
+    }
 }
 
 #[cfg(test)]
@@ -56,11 +61,6 @@ fn set_test_client_inner(client: Option<std::sync::Arc<dyn Client>>) {
 }
 
 #[cfg(test)]
-pub fn set_test_client(client: Option<std::sync::Arc<dyn Client>>) {
-    set_test_client_inner(client);
-}
-
-#[cfg(test)]
 pub(crate) fn take_test_client() -> Option<std::sync::Arc<dyn Client>> {
     TEST_CLIENT
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -70,33 +70,44 @@ pub(crate) fn take_test_client() -> Option<std::sync::Arc<dyn Client>> {
 }
 
 #[cfg(test)]
-pub(crate) struct TestClient(pub(crate) std::sync::Arc<dyn Client>);
+pub(crate) struct TestClient {
+    inner: std::sync::Arc<dyn Client>,
+    model: Model,
+}
+
+#[cfg(test)]
+impl TestClient {
+    pub(crate) fn new(inner: std::sync::Arc<dyn Client>) -> Self {
+        let model = inner.model().clone();
+        Self { inner, model }
+    }
+}
 
 #[cfg(test)]
 #[async_trait::async_trait]
 impl Client for TestClient {
     fn global_config(&self) -> &crate::config::GlobalConfig {
-        self.0.global_config()
+        self.inner.global_config()
     }
 
     fn extra_config(&self) -> Option<&ExtraConfig> {
-        self.0.extra_config()
+        self.inner.extra_config()
     }
 
     fn patch_config(&self) -> Option<&RequestPatch> {
-        self.0.patch_config()
+        self.inner.patch_config()
     }
 
     fn name(&self) -> &str {
-        self.0.name()
+        self.inner.name()
     }
 
     fn model(&self) -> &Model {
-        self.0.model()
+        &self.model
     }
 
     fn model_mut(&mut self) -> &mut Model {
-        panic!("test client wrapper does not support mutable model access")
+        &mut self.model
     }
 
     async fn chat_completions_inner(
@@ -104,7 +115,7 @@ impl Client for TestClient {
         client: &reqwest::Client,
         data: ChatCompletionsData,
     ) -> anyhow::Result<ChatCompletionsOutput> {
-        self.0.chat_completions_inner(client, data).await
+        self.inner.chat_completions_inner(client, data).await
     }
 
     async fn chat_completions_streaming_inner(
@@ -113,7 +124,7 @@ impl Client for TestClient {
         handler: &mut SseHandler,
         data: ChatCompletionsData,
     ) -> anyhow::Result<()> {
-        self.0
+        self.inner
             .chat_completions_streaming_inner(client, handler, data)
             .await
     }
@@ -123,7 +134,7 @@ impl Client for TestClient {
         client: &reqwest::Client,
         data: &EmbeddingsData,
     ) -> anyhow::Result<EmbeddingsOutput> {
-        self.0.embeddings_inner(client, data).await
+        self.inner.embeddings_inner(client, data).await
     }
 
     async fn rerank_inner(
@@ -131,7 +142,7 @@ impl Client for TestClient {
         client: &reqwest::Client,
         data: &RerankData,
     ) -> anyhow::Result<RerankOutput> {
-        self.0.rerank_inner(client, data).await
+        self.inner.rerank_inner(client, data).await
     }
 }
 

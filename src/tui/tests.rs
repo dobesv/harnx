@@ -1,5 +1,5 @@
 use super::*;
-use crate::client::{set_test_client, Client, ClientConfig, TestStateGuard};
+use crate::client::{Client, ClientConfig, TestStateGuard};
 use crate::config::Config;
 use crate::test_utils::{MockClient, MockTurnBuilder, TuiTestHarness};
 use crate::tui::types::{TranscriptEntry, TuiEvent};
@@ -864,7 +864,7 @@ async fn test_recovery_after_cancellation() {
             )
             .build(),
     );
-    set_test_client(Some(mock_client2.clone()));
+    _guard.set_client(Some(mock_client2.clone()));
 
     // User can send a new message
     harness.tui().app.transcript.clear();
