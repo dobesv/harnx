@@ -800,6 +800,25 @@ async fn paste_inserts_multiline_text_without_submitting() {
 }
 
 #[tokio::test]
+async fn attachment_footer_shows_attached_files() {
+    use std::path::PathBuf;
+    use crate::tui::types::Attachment;
+
+    let mut harness = TuiTestHarness::with_size(60, 12);
+    harness.tui().app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/photo.png"),
+        display_name: "photo.png".to_string(),
+    });
+    harness.render();
+
+    let screen = harness.screen_contents();
+    assert!(
+        screen.contains("photo.png"),
+        "Attachment footer should show filename, got: {screen}"
+    );
+}
+
+#[tokio::test]
 async fn paste_appends_to_existing_text() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));

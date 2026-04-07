@@ -50,9 +50,10 @@ impl Tui {
         let input_height = self
             .input_height(input_width)
             .clamp(MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT);
+        let attachment_height: u16 = if self.app.attachments.is_empty() { 0 } else { 1 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(input_height)])
+            .constraints([Constraint::Min(1), Constraint::Length(input_height + attachment_height)])
             .split(size);
 
         let transcript_lines = if self.app.transcript.is_empty() {
@@ -107,6 +108,29 @@ impl Tui {
                 ),
         );
         frame.render_widget(&self.app.input, chunks[1]);
+
+        if !self.app.attachments.is_empty() {
+            let names: Vec<&str> = self
+                .app
+                .attachments
+                .iter()
+                .map(|a| a.display_name.as_str())
+                .collect();
+            let footer_text = format!("  Attached: {}   [.detach to remove]", names.join(", "));
+            let footer_area = ratatui::layout::Rect::new(
+                chunks[1].x,
+                chunks[1].y + chunks[1].height - 1,
+                chunks[1].width,
+                1,
+            );
+            let footer = Paragraph::new(Line::from(Span::styled(
+                footer_text,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            )));
+            frame.render_widget(footer, footer_area);
+        }
 
         // Render completion popup above the input area
         if !self.app.completions.is_empty() {
