@@ -831,6 +831,81 @@ async fn paste_appends_to_existing_text() {
     assert_eq!(text, "before pasted text");
 }
 
+#[tokio::test]
+async fn attach_command_adds_attachment() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let tmp = std::env::temp_dir().join("harnx_test_attach.txt");
+    std::fs::write(&tmp, "test content").unwrap();
+
+    tui.set_input_text(&format!(".attach {}", tmp.display()));
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(tui.app.attachments.len(), 1);
+    assert_eq!(tui.app.attachments[0].display_name, "harnx_test_attach.txt");
+    assert_eq!(tui.app.input.lines().join("\n"), "");
+    let user_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e, TranscriptEntry::User(_)))
+        .collect();
+    assert!(user_entries.is_empty());
+
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[tokio::test]
+async fn attach_command_preserves_draft_text() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let tmp = std::env::temp_dir().join("harnx_test_attach2.txt");
+    std::fs::write(&tmp, "test").unwrap();
+
+    tui.set_input_text(&format!("Explain this image\n.attach {}", tmp.display()));
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(tui.app.attachments.len(), 1);
+    assert_eq!(tui.app.input.lines().join("\n"), "Explain this image");
+    let user_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e, TranscriptEntry::User(_)))
+        .collect();
+    assert!(user_entries.is_empty());
+
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[tokio::test]
+async fn attach_nonexistent_file_shows_error() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.set_input_text(".attach /nonexistent/file.txt");
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.attachments.is_empty());
+    let has_error = tui
+        .app
+        .transcript
+        .iter()
+        .any(|e| matches!(e, TranscriptEntry::Error(msg) if msg.contains("not found")));
+    assert!(has_error, "Should show error for nonexistent file");
+}
+
 /// Test recovery after cancellation - user can send a new message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_recovery_after_cancellation() {

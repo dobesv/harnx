@@ -58,6 +58,9 @@ impl Tui {
                 }
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
+                if self.try_handle_attach_command() {
+                    return Ok(());
+                }
                 self.app.completions.clear();
                 let text = self.app.input.lines().join("\n");
                 if !text.trim().is_empty() {
@@ -112,6 +115,58 @@ impl Tui {
             }
         }
         Ok(())
+    }
+
+    /// Check if the last line of input is an `.attach` or `.detach` command.
+    /// If so, execute it and return `true`. The command line is removed from
+    /// the textarea, preserving any preceding draft text.
+    fn try_handle_attach_command(&mut self) -> bool {
+        let last_line = {
+            let lines = self.app.input.lines();
+            match lines.last() {
+                Some(l) => l.trim().to_string(),
+                None => return false,
+            }
+        };
+
+        if last_line.starts_with(".attach ") {
+            let path_str = last_line.strip_prefix(".attach ").unwrap().trim().to_string();
+            let path = std::path::PathBuf::from(&path_str);
+            if path.exists() {
+                let display_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path_str.clone());
+                let resolved = path.canonicalize().unwrap_or(path);
+                self.app.attachments.push(crate::tui::types::Attachment {
+                    path: resolved,
+                    display_name,
+                });
+            } else {
+                self.app.transcript.push(
+                    crate::tui::types::TranscriptEntry::Error(
+                        format!("File not found: {path_str}")
+                    )
+                );
+            }
+        } else if last_line == ".detach" {
+            self.app.attachments.clear();
+        } else if last_line.starts_with(".detach ") {
+            let name = last_line.strip_prefix(".detach ").unwrap().trim().to_string();
+            self.app.attachments.retain(|a| a.display_name != name);
+        } else {
+            return false;
+        }
+
+        // Remove the last line (the command) and restore remaining text
+        let remaining_text = {
+            let lines = self.app.input.lines();
+            let remaining: Vec<String> = lines[..lines.len() - 1].iter().map(|s| s.clone()).collect();
+            remaining.join("\n")
+        };
+        self.set_input_text(&remaining_text);
+
+        true
     }
 
     pub(super) fn handle_paste(&mut self, text: String) {
