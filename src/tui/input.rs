@@ -224,8 +224,8 @@ impl Tui {
 
     fn write_paste_temp_file(text: &str) -> std::io::Result<crate::tui::types::Attachment> {
         use std::io::Write;
-        let id = uuid::Uuid::new_v4();
-        let filename = format!("harnx-paste-{id}.txt");
+        let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+        let filename = format!("paste-{short_id}.txt");
         let path = std::env::temp_dir().join(&filename);
         let mut f = std::fs::File::create(&path)?;
         f.write_all(text.as_bytes())?;
