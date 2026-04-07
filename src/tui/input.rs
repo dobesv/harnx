@@ -533,6 +533,58 @@ impl Tui {
         // For multi-part commands, delegate to config's repl_complete
         if cmd.starts_with('.') {
             let args: Vec<&str> = parts[1..].iter().map(|p| p.0).collect();
+
+            // File path completion for .attach
+            if cmd == ".attach" {
+                let filter = args.last().copied().unwrap_or("");
+                let dir_path;
+                let prefix;
+                if filter.contains('/') || filter.contains('\\') {
+                    let p = std::path::Path::new(filter);
+                    dir_path = p.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+                    prefix = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                } else {
+                    dir_path = std::path::PathBuf::from(".");
+                    prefix = filter.to_string();
+                };
+                if let Ok(entries) = std::fs::read_dir(&dir_path) {
+                    return entries
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            if name.starts_with(&prefix) {
+                                let full = if dir_path == std::path::Path::new(".") {
+                                    name.clone()
+                                } else {
+                                    format!("{}/{}", dir_path.display(), name)
+                                };
+                                let kind = if e.path().is_dir() {
+                                    Some("dir".to_string())
+                                } else {
+                                    None
+                                };
+                                Some((full, kind))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                }
+                return vec![];
+            }
+
+            // Attachment name completion for .detach
+            if cmd == ".detach" {
+                let filter = args.last().copied().unwrap_or("");
+                return self
+                    .app
+                    .attachments
+                    .iter()
+                    .filter(|a| a.display_name.starts_with(filter))
+                    .map(|a| (a.display_name.clone(), None))
+                    .collect();
+            }
+
             let filter = args.last().copied().unwrap_or("");
             return self.config.read().repl_complete(cmd, &args, filter);
         }

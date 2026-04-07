@@ -1090,3 +1090,50 @@ async fn test_recovery_after_cancellation() {
 
     harness.drain_and_settle().await.unwrap();
 }
+
+#[tokio::test]
+async fn attach_completes_file_paths() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let tmp_dir = std::env::temp_dir();
+    let tmp_file = tmp_dir.join("harnx_completion_test.txt");
+    std::fs::write(&tmp_file, "test").unwrap();
+
+    let line = format!(".attach {}/harnx_completion", tmp_dir.display());
+    let completions = tui.compute_completions(&line, line.len());
+
+    assert!(
+        completions.iter().any(|(v, _)| v.contains("harnx_completion_test.txt")),
+        "Should complete file paths, got: {:?}",
+        completions
+    );
+
+    std::fs::remove_file(&tmp_file).ok();
+}
+
+#[tokio::test]
+async fn detach_completes_attachment_names() {
+    use std::path::PathBuf;
+    use crate::tui::types::Attachment;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/photo.png"),
+        display_name: "photo.png".to_string(),
+    });
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/data.csv"),
+        display_name: "data.csv".to_string(),
+    });
+
+    let completions = tui.compute_completions(".detach ", 8);
+    let names: Vec<&str> = completions.iter().map(|(v, _)| v.as_str()).collect();
+
+    assert!(names.contains(&"photo.png"), "Should complete attachment names, got: {:?}", names);
+    assert!(names.contains(&"data.csv"), "Should complete attachment names, got: {:?}", names);
+}
