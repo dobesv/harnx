@@ -64,10 +64,10 @@ cargo fmt && cargo build && cargo clippy --all --all-targets -- -D warnings && c
 During development you can run the individual commands:
 
 ```sh
-cargo build          # Compile the project
-cargo fmt            # Auto-format code (run without --check to fix)
+cargo build                                       # Compile the project
+cargo fmt                                         # Auto-format code (run without --check to fix)
 cargo clippy --all --all-targets -- -D warnings   # Lint — treat warnings as errors
-cargo test --all     # Run all tests
+cargo nextest run --all                           # Run all tests
 ```
 
 ## Commit Conventions

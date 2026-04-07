@@ -1,3 +1,21 @@
+//! Synchronization primitives for async test coordination.
+//!
+//! This module provides [`SyncHarness`] which helps coordinate async tests
+//! by waiting for conditions to be met with configurable timeouts and polling.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use harnx::test_utils::SyncHarness;
+//! use std::time::Duration;
+//!
+//! let harness = SyncHarness::new()
+//!     .with_poll_interval(Duration::from_millis(10));
+//!
+//! // Wait for a mock client to exhaust its turns
+//! harness.wait_until_mock_exhausted(&mock, Duration::from_secs(5)).await?;
+//! ```
+
 use crate::test_utils::MockClient;
 
 use anyhow::{anyhow, Result};
@@ -7,9 +25,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
+/// Function type for probing idle state asynchronously.
 pub type IdleProbe = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
+/// Function type for capturing diagnostic trace on timeout.
 pub type TraceProbe = Arc<dyn Fn() -> String + Send + Sync>;
 
+/// Harness for waiting on async conditions in tests.
+///
+/// Provides configurable polling with timeouts for coordinating
+/// async test execution.
 #[derive(Clone)]
 pub struct SyncHarness {
     idle_probe: Option<IdleProbe>,
@@ -28,10 +53,14 @@ impl Default for SyncHarness {
 }
 
 impl SyncHarness {
+    /// Create a new sync harness with default settings.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Configure an async probe to check for idle state.
+    ///
+    /// The probe should return `true` when the system is idle.
     pub fn with_idle_probe<F, Fut>(mut self, probe: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -41,6 +70,7 @@ impl SyncHarness {
         self
     }
 
+    /// Configure a trace probe for diagnostics on timeout.
     pub fn with_trace_probe<F>(mut self, probe: F) -> Self
     where
         F: Fn() -> String + Send + Sync + 'static,
@@ -49,11 +79,13 @@ impl SyncHarness {
         self
     }
 
+    /// Set the polling interval for wait conditions.
     pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
         self.poll_interval = poll_interval;
         self
     }
 
+    /// Wait until the screen contains expected text.
     pub async fn wait_until_screen_contains<G>(
         &self,
         expected: &str,
@@ -74,6 +106,7 @@ impl SyncHarness {
         .await
     }
 
+    /// Wait until a mock client has exhausted all its scripted turns.
     pub async fn wait_until_mock_exhausted(
         &self,
         mock_client: &MockClient,
@@ -87,6 +120,7 @@ impl SyncHarness {
         .await
     }
 
+    /// Wait until the idle probe indicates the system is idle.
     pub async fn wait_until_idle(&self, timeout_duration: Duration) -> Result<()> {
         let Some(idle_probe) = self.idle_probe.as_ref() else {
             return Err(anyhow!("idle probe is not configured"));

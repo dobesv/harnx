@@ -1,3 +1,46 @@
+//! Mock LLM client for testing streaming responses and tool calls.
+//!
+//! This module provides [`MockClient`] which implements the [`Client`] trait
+//! and can be used to simulate LLM responses in tests.
+//!
+//! # Overview
+//!
+//! The mock client supports:
+//! - Streaming text responses in chunks
+//! - Tool call generation
+//! - Multi-turn conversations
+//! - Error injection for testing error handling
+//!
+//! # Example
+//!
+//! ```ignore
+//! use harnx::test_utils::{MockClient, MockTurnBuilder};
+//! use harnx::client::set_test_client;
+//!
+//! // Create a mock that streams a response with a tool call
+//! let mock = MockClient::builder()
+//!     .add_turn(
+//!         MockTurnBuilder::new()
+//!             .add_text_chunk("Let me search...")
+//!             .add_tool_call("search", serde_json::json!({"query": "test"}))
+//!             .build()
+//!     )
+//!     .add_turn(
+//!         MockTurnBuilder::new()
+//!             .add_text_chunk("Found 3 results!")
+//!             .build()
+//!     )
+//!     .build();
+//!
+//! // Inject the mock for testing
+//! set_test_client(Some(mock.clone()));
+//!
+//! // ... run your test code ...
+//!
+//! // Clean up
+//! set_test_client(None);
+//! ```
+
 use crate::client::{
     ChatCompletionsData, ChatCompletionsOutput, Client, ExtraConfig, Model, RequestPatch,
     SseEvent, SseHandler, ToolCall,
@@ -15,8 +58,13 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum MockResponseEvent {
+    /// A text chunk to stream to the client.
     Text(String),
+    /// A tool call to include in the response.
     ToolCall(ToolCall),
+    /// Return an error during streaming (for testing error scenarios).
+    /// Uses `Arc<Error>` since `anyhow::Error` is not `Clone`.
+    Error(Arc<anyhow::Error>),
 }
 
 impl MockResponseEvent {
@@ -30,11 +78,24 @@ impl MockResponseEvent {
                 handler.tool_call(tool_call.clone())?;
                 output.tool_calls.push(tool_call.clone());
             }
+            Self::Error(err) => {
+                // Return the error instead of continuing
+                // We need to convert Arc<Error> back to owned Error
+                // Since Error isn't Clone, we create a new error from the display
+                let msg = err.to_string();
+                return Err(anyhow::anyhow!("{}", msg));
+            }
         }
         Ok(())
     }
 }
 
+/// A single turn in a mock conversation.
+///
+/// Each turn contains a sequence of events (text chunks, tool calls, or errors)
+/// that will be streamed to the client.
+///
+/// Use [`MockTurnBuilder`] to construct turns.
 #[derive(Debug, Clone, Default)]
 pub struct MockTurn {
     events: Vec<MockResponseEvent>,
@@ -42,6 +103,7 @@ pub struct MockTurn {
 }
 
 impl MockTurn {
+    /// Create a turn with a single text response.
     pub fn with_text(text: impl Into<String>) -> Self {
         Self {
             events: vec![MockResponseEvent::Text(text.into())],
@@ -49,6 +111,7 @@ impl MockTurn {
         }
     }
 
+    /// Get the events in this turn.
     pub fn events(&self) -> &[MockResponseEvent] {
         &self.events
     }
@@ -60,6 +123,9 @@ impl MockTurn {
                 match event {
                     MockResponseEvent::Text(text) => output.text.push_str(text),
                     MockResponseEvent::ToolCall(tool_call) => output.tool_calls.push(tool_call.clone()),
+                    MockResponseEvent::Error(_) => {
+                        // Error is handled in streaming path, not in output generation
+                    }
                 }
             }
             output
@@ -67,6 +133,17 @@ impl MockTurn {
     }
 }
 
+/// Builder for constructing [`MockTurn`] instances.
+///
+/// # Example
+///
+/// ```ignore
+/// let turn = MockTurnBuilder::new()
+///     .add_text_chunk("Hello")
+///     .add_text_chunk(" world!")
+///     .add_tool_call("search", serde_json::json!({"query": "test"}))
+///     .build();
+/// ```
 #[derive(Debug, Clone)]
 pub struct MockTurnBuilder {
     turn: MockTurn,
@@ -81,15 +158,20 @@ impl Default for MockTurnBuilder {
 }
 
 impl MockTurnBuilder {
+    /// Create a new builder with an empty turn.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Add a text chunk to the response.
     pub fn add_text_chunk(mut self, chunk: impl Into<String>) -> Self {
         self.turn.events.push(MockResponseEvent::Text(chunk.into()));
         self
     }
 
+    /// Add a tool call to the response.
+    ///
+    /// A unique ID will be generated automatically.
     pub fn add_tool_call(mut self, name: impl Into<String>, arguments: Value) -> Self {
         let next_id = format!("tool-call-{}", self.turn.events.len() + 1);
         self.turn
@@ -103,6 +185,7 @@ impl MockTurnBuilder {
         self
     }
 
+    /// Add a tool call with a specific ID.
     pub fn add_tool_call_with_id(
         mut self,
         name: impl Into<String>,
@@ -120,11 +203,13 @@ impl MockTurnBuilder {
         self
     }
 
+    /// Set the output directly (bypasses event streaming).
     pub fn output(mut self, output: ChatCompletionsOutput) -> Self {
         self.turn.output = Some(output);
         self
     }
 
+    /// Build the turn.
     pub fn build(self) -> MockTurn {
         self.turn
     }
@@ -136,6 +221,20 @@ struct MockClientState {
     conversation_history: Vec<ChatCompletionsData>,
 }
 
+/// Mock LLM client for testing.
+///
+/// Implements the [`Client`] trait and can simulate streaming responses,
+/// tool calls, and error conditions.
+///
+/// Use [`MockClient::builder()`] to create instances.
+///
+/// # Example
+///
+/// ```ignore
+/// let mock = MockClient::builder()
+///     .add_turn(MockTurnBuilder::new().add_text_chunk("Hello!").build())
+///     .build();
+/// ```
 #[derive(Debug)]
 pub struct MockClient {
     global_config: GlobalConfig,
@@ -149,14 +248,17 @@ pub struct MockClient {
 }
 
 impl MockClient {
+    /// Create a new builder for constructing a mock client.
     pub fn builder() -> MockClientBuilder {
         MockClientBuilder::default()
     }
 
+    /// Get the conversation history recorded by this mock.
     pub fn conversation_history(&self) -> parking_lot::RwLockReadGuard<'_, MockClientState> {
         self.state.read()
     }
 
+    /// Get the number of remaining scripted turns.
     pub fn remaining_turns(&self) -> usize {
         self.state.read().turns.len()
     }
@@ -222,6 +324,20 @@ impl Client for MockClient {
     }
 }
 
+/// Builder for constructing [`MockClient`] instances.
+///
+/// # Example
+///
+/// ```ignore
+/// let mock = MockClient::builder()
+///     .name("test-mock")
+///     .add_turn(
+///         MockTurnBuilder::new()
+///             .add_text_chunk("Hello!")
+///             .build()
+///     )
+///     .build();
+/// ```
 #[derive(Debug)]
 pub struct MockClientBuilder {
     global_config: GlobalConfig,
@@ -250,36 +366,43 @@ impl Default for MockClientBuilder {
 }
 
 impl MockClientBuilder {
+    /// Set the global config for the mock.
     pub fn global_config(mut self, global_config: GlobalConfig) -> Self {
         self.global_config = global_config;
         self
     }
 
+    /// Set the name for the mock client.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
+    /// Set the model for the mock.
     pub fn model(mut self, model: Model) -> Self {
         self.model = model;
         self
     }
 
+    /// Set extra configuration for the mock.
     pub fn extra_config(mut self, extra_config: ExtraConfig) -> Self {
         self.extra_config = Some(extra_config);
         self
     }
 
+    /// Set the request patch configuration.
     pub fn patch_config(mut self, patch_config: RequestPatch) -> Self {
         self.patch_config = Some(patch_config);
         self
     }
 
+    /// Set the tools available to the mock.
     pub fn tools(mut self, tools: Vec<ToolDeclaration>) -> Self {
         self.declared_tools = tools;
         self
     }
 
+    /// Add a text chunk to the last turn (creates a turn if needed).
     pub fn add_text_chunk(mut self, chunk: impl Into<String>) -> Self {
         if self.turns.is_empty() {
             self.turns.push(MockTurn::default());
@@ -290,6 +413,7 @@ impl MockClientBuilder {
         self
     }
 
+    /// Add a tool call to the last turn (creates a turn if needed).
     pub fn add_tool_call(mut self, name: impl Into<String>, arguments: Value) -> Self {
         if self.turns.is_empty() {
             self.turns.push(MockTurn::default());
@@ -306,13 +430,27 @@ impl MockClientBuilder {
         self
     }
 
+    /// Add a scripted turn to the mock.
+    ///
+    /// Turns are consumed in order as the client makes requests.
     pub fn add_turn(mut self, turn: MockTurn) -> Self {
         self.turns.push(turn);
         self
     }
 
+    /// Set a default turn for requests that exhaust scripted turns.
     pub fn default_turn(mut self, turn: MockTurn) -> Self {
         self.default_turn = Some(turn);
+        self
+    }
+
+    /// Configure the mock to return an error on streaming requests.
+    pub fn error_on_stream(mut self, error: anyhow::Error) -> Self {
+        // Use a special marker in text to indicate error
+        self.turns.push(MockTurn {
+            events: vec![MockResponseEvent::Error(Arc::new(error))],
+            output: None,
+        });
         self
     }
 
