@@ -51,7 +51,7 @@ pub enum CommandOutcome {
     ResumeHandled,
 }
 
-pub static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
+pub static REPL_COMMANDS: LazyLock<[ReplCommand; 39]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -180,6 +180,8 @@ pub static REPL_COMMANDS: LazyLock<[ReplCommand; 37]> = LazyLock::new(|| {
             "Leave RAG",
             AssertState::TrueFalse(StateFlags::RAG, StateFlags::AGENT),
         ),
+        ReplCommand::new(".attach", "Attach a file to the next message", AssertState::pass()),
+        ReplCommand::new(".detach", "Remove attached files", AssertState::pass()),
         ReplCommand::new(".macro", "Execute a macro", AssertState::pass()),
         ReplCommand::new(".mcp", "Manage MCP servers", AssertState::pass()),
         ReplCommand::new(
