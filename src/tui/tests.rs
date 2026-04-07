@@ -906,6 +906,59 @@ async fn attach_nonexistent_file_shows_error() {
     assert!(has_error, "Should show error for nonexistent file");
 }
 
+#[tokio::test]
+async fn detach_clears_all_attachments() {
+    use std::path::PathBuf;
+    use crate::tui::types::Attachment;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/a.txt"),
+        display_name: "a.txt".to_string(),
+    });
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/b.txt"),
+        display_name: "b.txt".to_string(),
+    });
+
+    tui.set_input_text(".detach");
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.attachments.is_empty());
+}
+
+#[tokio::test]
+async fn detach_by_name_removes_specific_attachment() {
+    use std::path::PathBuf;
+    use crate::tui::types::Attachment;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/a.txt"),
+        display_name: "a.txt".to_string(),
+    });
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/b.txt"),
+        display_name: "b.txt".to_string(),
+    });
+
+    tui.set_input_text(".detach a.txt");
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(tui.app.attachments.len(), 1);
+    assert_eq!(tui.app.attachments[0].display_name, "b.txt");
+}
+
 /// Test recovery after cancellation - user can send a new message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_recovery_after_cancellation() {
