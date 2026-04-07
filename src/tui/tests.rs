@@ -879,30 +879,11 @@ async fn test_recovery_after_cancellation() {
         .await
         .unwrap();
 
-    // Wait for second response
+    // Wait for second response to appear on screen
     harness
-        .sync()
-        .wait_until_mock_exhausted(mock_client2.as_ref(), Duration::from_secs(3))
+        .wait_until_screen_contains("Second response", Duration::from_secs(5))
         .await
         .unwrap();
-
-    // Process events
-    loop {
-        match harness.tui().event_rx.try_recv() {
-            Ok(event) => {
-                let _ = harness.tui().handle_tui_event(event).await;
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-            Err(_) => break,
-        }
-    }
-    harness.render();
-
-    let screen = harness.screen_contents();
-    assert!(
-        screen.contains("Second response") || screen.contains("recovery"),
-        "Screen should show second response after recovery, got: {screen}"
-    );
 
     harness.drain_and_settle().await.unwrap();
 }
