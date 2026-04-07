@@ -210,14 +210,6 @@ struct BashServerInner {
     exec_counter: AtomicU64,
 }
 
-impl Drop for BashServerInner {
-    fn drop(&mut self) {
-        if self.log_dir.exists() {
-            let _ = std::fs::remove_dir_all(&self.log_dir);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // BashServer
 // ---------------------------------------------------------------------------
