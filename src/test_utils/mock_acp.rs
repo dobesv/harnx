@@ -55,7 +55,11 @@ impl MockAcpResponse {
 
 impl MockToolCall {
     /// Create a tool call that triggers a sub-agent.
-    pub fn new(name: impl Into<String>, arguments: serde_json::Value, response: MockAcpResponse) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+        response: MockAcpResponse,
+    ) -> Self {
         Self {
             name: name.into(),
             arguments,
@@ -84,13 +88,12 @@ mod tests {
 
     #[test]
     fn test_mock_response_with_tool_call() {
-        let response = MockAcpResponse::text("Thinking...")
-            .with_tool_call(MockToolCall::new(
-                "delegation",
-                serde_json::json!({"agent": "subagent"}),
-                MockAcpResponse::text("Sub-agent response"),
-            ));
-        
+        let response = MockAcpResponse::text("Thinking...").with_tool_call(MockToolCall::new(
+            "delegation",
+            serde_json::json!({"agent": "subagent"}),
+            MockAcpResponse::text("Sub-agent response"),
+        ));
+
         assert_eq!(response.chunks, vec!["Thinking..."]);
         assert_eq!(response.tool_calls.len(), 1);
     }

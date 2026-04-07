@@ -26,10 +26,12 @@ impl EventSource for CrosstermEventSource {
 
 #[cfg(test)]
 pub(crate) struct MockEventSource {
+    #[allow(dead_code)]
     rx: mpsc::UnboundedReceiver<TuiEvent>,
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl MockEventSource {
     pub(crate) fn new(rx: mpsc::UnboundedReceiver<TuiEvent>) -> Self {
         Self { rx }

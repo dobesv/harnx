@@ -139,7 +139,6 @@ impl Tui {
         B::Error: std::error::Error + Send + Sync + 'static,
         E: EventSource,
     {
-
         self.install_external_editor_bridge();
         let mut last_tick = Instant::now();
         loop {

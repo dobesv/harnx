@@ -42,8 +42,8 @@
 //! ```
 
 use crate::client::{
-    ChatCompletionsData, ChatCompletionsOutput, Client, ExtraConfig, Model, RequestPatch,
-    SseEvent, SseHandler, ToolCall,
+    ChatCompletionsData, ChatCompletionsOutput, Client, ExtraConfig, Model, RequestPatch, SseEvent,
+    SseHandler, ToolCall,
 };
 use crate::config::{Config, GlobalConfig};
 use crate::tool::ToolDeclaration;
@@ -122,7 +122,9 @@ impl MockTurn {
             for event in &self.events {
                 match event {
                     MockResponseEvent::Text(text) => output.text.push_str(text),
-                    MockResponseEvent::ToolCall(tool_call) => output.tool_calls.push(tool_call.clone()),
+                    MockResponseEvent::ToolCall(tool_call) => {
+                        output.tool_calls.push(tool_call.clone())
+                    }
                     MockResponseEvent::Error(_) => {
                         // Error is handled in streaming path, not in output generation
                     }
@@ -144,17 +146,9 @@ impl MockTurn {
 ///     .add_tool_call("search", serde_json::json!({"query": "test"}))
 ///     .build();
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MockTurnBuilder {
     turn: MockTurn,
-}
-
-impl Default for MockTurnBuilder {
-    fn default() -> Self {
-        Self {
-            turn: MockTurn::default(),
-        }
-    }
 }
 
 impl MockTurnBuilder {
@@ -216,9 +210,11 @@ impl MockTurnBuilder {
 }
 
 #[derive(Debug, Default)]
-struct MockClientState {
-    turns: VecDeque<MockTurn>,
-    conversation_history: Vec<ChatCompletionsData>,
+pub struct MockClientState {
+    /// The remaining turns to be consumed.
+    pub turns: VecDeque<MockTurn>,
+    /// The full conversation history.
+    pub conversation_history: Vec<ChatCompletionsData>,
 }
 
 /// Mock LLM client for testing.
@@ -242,6 +238,7 @@ pub struct MockClient {
     name: String,
     extra_config: Option<ExtraConfig>,
     patch_config: Option<RequestPatch>,
+    #[allow(dead_code)]
     declared_tools: Vec<ToolDeclaration>,
     default_turn: Option<MockTurn>,
     state: RwLock<MockClientState>,
@@ -475,7 +472,6 @@ impl MockClientBuilder {
 mod tests {
     use super::*;
     use crate::client::{Message, MessageContent, MessageRole};
-    use crate::utils::AbortSignal;
     use tokio::sync::mpsc::unbounded_channel;
 
     #[tokio::test(flavor = "multi_thread")]

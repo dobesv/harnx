@@ -137,7 +137,12 @@ impl SyncHarness {
         self.trace_probe.as_ref().map(|probe| probe())
     }
 
-    async fn wait_until<F>(&self, label: impl Into<String>, timeout_duration: Duration, mut predicate: F) -> Result<()>
+    async fn wait_until<F>(
+        &self,
+        label: impl Into<String>,
+        timeout_duration: Duration,
+        mut predicate: F,
+    ) -> Result<()>
     where
         F: FnMut() -> bool,
     {
@@ -252,7 +257,9 @@ mod tests {
                 functions: None,
                 stream: false,
             };
-            let _ = consumer_client.chat_completions_inner(&reqwest_client, data).await;
+            let _ = consumer_client
+                .chat_completions_inner(&reqwest_client, data)
+                .await;
         });
 
         harness
