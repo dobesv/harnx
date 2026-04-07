@@ -4,6 +4,11 @@ use harnx::mcp_safety::{
 };
 
 use fancy_regex::Regex;
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
     PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool,
@@ -20,17 +25,15 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::fs::File as TokioFile;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
-
-// ---------------------------------------------------------------------------
-// Parameter structs
-// ---------------------------------------------------------------------------
-
+use uuid::Uuid;
 #[derive(Debug, Deserialize)]
 struct ExecCommandParams {
     command: String,
@@ -196,7 +199,7 @@ impl JsonSchema for TerminateParams {
 // ---------------------------------------------------------------------------
 
 struct SpawnedProcess {
-    child: tokio::process::Child,
+    child: Box<dyn TokioChildWrapper>,
     command: String,
     working_dir: PathBuf,
     log_path: PathBuf,
@@ -222,7 +225,11 @@ pub struct BashServer {
 
 impl BashServer {
     pub fn new(initial_roots: Vec<PathBuf>) -> Self {
-        let log_dir = std::env::temp_dir().join(format!("harnx-bash-{}", std::process::id()));
+        let log_dir = std::env::temp_dir().join(format!(
+            "harnx-bash-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
         Self {
             inner: Arc::new(BashServerInner {
                 roots: RwLock::new(initial_roots),
@@ -364,22 +371,30 @@ impl BashServer {
                 ))
             })?;
 
-        let mut child = Command::new("bash")
-            .args(["-c", &params.command])
-            .current_dir(&working_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
+        let mut command = TokioCommandWrap::with_new("bash", |command| {
+            command
+                .args(["-c", &params.command])
+                .current_dir(&working_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        });
+        command.wrap(KillOnDrop);
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        command.wrap(JobObject);
+
+        let mut child = command
             .spawn()
             .map_err(|err| internal_error(format!("failed to spawn command: {err}")))?;
 
         let stdout = child
-            .stdout
+            .stdout()
             .take()
             .ok_or_else(|| internal_error("failed to capture stdout"))?;
         let stderr = child
-            .stderr
+            .stderr()
             .take()
             .ok_or_else(|| internal_error("failed to capture stderr"))?;
 
@@ -387,20 +402,41 @@ impl BashServer {
         let stderr_task = tokio::spawn(read_pipe_to_file(stderr, stderr_file));
 
         let timeout = Duration::from_secs(timeout_secs);
-        let timed_out = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => Some(status),
+        let (status, timed_out) = match tokio::time::timeout(timeout, async {
+            Box::into_pin(child.wait()).await
+        })
+        .await
+        {
+            Ok(Ok(status)) => (Some(status), false),
             Ok(Err(err)) => {
                 return Err(internal_error(format!("failed waiting for command: {err}")));
             }
             Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                None
+                child.start_kill().map_err(|err| {
+                    internal_error(format!("failed to kill command after timeout: {err}"))
+                })?;
+                match Box::into_pin(child.wait()).await {
+                    Ok(status) => (Some(status), true),
+                    Err(err) => {
+                        return Err(internal_error(format!(
+                            "failed waiting for killed command: {err}"
+                        )));
+                    }
+                }
             }
         };
 
         let stdout_bytes = join_pipe(stdout_task, "stdout").await?;
         let stderr_bytes = join_pipe(stderr_task, "stderr").await?;
+
+        // Sync log files to disk to ensure they're visible to other processes immediately
+        if let Ok(f) = tokio::fs::File::open(&stdout_log_path).await {
+            let _ = f.sync_all().await;
+        }
+        if let Ok(f) = tokio::fs::File::open(&stderr_log_path).await {
+            let _ = f.sync_all().await;
+        }
+
         let output_bytes = merge_output(&stdout_bytes, &stderr_bytes);
         let total_bytes = output_bytes.len();
         let sanitized_output = sanitize_output_text(&String::from_utf8_lossy(&output_bytes));
@@ -408,8 +444,8 @@ impl BashServer {
         let truncated_output = truncate_output(&sanitized_output, &truncate_opts);
         let output_truncated = truncated_output != sanitized_output;
 
-        match timed_out {
-            Some(status) => {
+        match (status, timed_out) {
+            (Some(status), false) => {
                 let exit_code = status.code().unwrap_or(-1);
                 let mut output = String::new();
                 let _ = writeln!(output, "exit_code: {exit_code}");
@@ -440,17 +476,21 @@ impl BashServer {
                     Content::text(summary).with_audience(vec![Role::User]),
                 ]))
             }
-            None => tool_error(render_timeout_message(TimeoutRenderContext {
-                working_dir: &working_dir,
-                timeout_secs,
-                total_lines,
-                total_bytes,
-                original: &sanitized_output,
-                truncated: &truncated_output,
-                stdout_log_path: &stdout_log_path,
-                stderr_log_path: &stderr_log_path,
-                output_truncated,
-            })),
+            (Some(status), true) => {
+                let _ = status;
+                tool_error(render_timeout_message(TimeoutRenderContext {
+                    working_dir: &working_dir,
+                    timeout_secs,
+                    total_lines,
+                    total_bytes,
+                    original: &sanitized_output,
+                    truncated: &truncated_output,
+                    stdout_log_path: &stdout_log_path,
+                    stderr_log_path: &stderr_log_path,
+                    output_truncated,
+                }))
+            }
+            (None, _) => tool_error("process exited without status".to_string()),
         }
     }
 
@@ -636,12 +676,20 @@ impl BashServer {
             .try_clone()
             .map_err(|err| internal_error(format!("failed to clone log file handle: {err}")))?;
 
-        let child = Command::new("bash")
-            .args(["-c", &params.command])
-            .current_dir(&working_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_err))
+        let mut command = TokioCommandWrap::with_new("bash", |command| {
+            command
+                .args(["-c", &params.command])
+                .current_dir(&working_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(log_file_err));
+        });
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        command.wrap(JobObject);
+
+        let child = command
             .spawn()
             .map_err(|err| internal_error(format!("failed to spawn command: {err}")))?;
 
@@ -699,7 +747,8 @@ impl BashServer {
         };
 
         let timeout = Duration::from_secs(timeout_secs);
-        let wait_result = tokio::time::timeout(timeout, child.wait()).await;
+        let wait_result =
+            tokio::time::timeout(timeout, async { Box::into_pin(child.wait()).await }).await;
 
         let log_tail = read_log_tail(&log_path, tail_line_count);
 
@@ -782,15 +831,12 @@ impl BashServer {
                 )
             })?;
 
-            let raw_pid = params.pid as i32;
-            let ret = unsafe { libc::kill(raw_pid, signum) };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(internal_error(format!(
+            entry.child.signal(signum).map_err(|err| {
+                internal_error(format!(
                     "failed to send {signal_name} to pid {}: {err}",
                     params.pid
-                )));
-            }
+                ))
+            })?;
 
             let mut output = String::new();
             let _ = writeln!(output, "pid: {}", params.pid);
@@ -1076,10 +1122,9 @@ fn object_schema(properties: Vec<(&str, Schema)>, required: &[&str]) -> Schema {
     schema.into()
 }
 
-async fn read_pipe_to_file<R, W>(mut reader: R, mut writer: W) -> std::io::Result<Vec<u8>>
+async fn read_pipe_to_file<R>(mut reader: R, mut writer: TokioFile) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
 {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 8192];
@@ -1095,6 +1140,7 @@ where
     }
 
     writer.flush().await?;
+    writer.sync_all().await?;
     Ok(bytes)
 }
 
