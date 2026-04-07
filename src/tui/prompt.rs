@@ -31,6 +31,10 @@ impl Tui {
                 .collect();
             Input::from_files(&config, &text, paths, None).await?
         };
+        // Clean up temp files now that Input has read them
+        for a in &attachments {
+            a.cleanup();
+        }
         Self::run_prompt_inner(
             PromptTaskContext {
                 config,

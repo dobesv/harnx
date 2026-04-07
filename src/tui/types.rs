@@ -40,6 +40,18 @@ pub struct Tui {
 pub(super) struct Attachment {
     pub(super) path: PathBuf,
     pub(super) display_name: String,
+    /// If true, the file at `path` is a temp file created by paste and should
+    /// be deleted when the attachment is sent or detached.
+    pub(super) temp: bool,
+}
+
+impl Attachment {
+    /// Remove the backing file if this is a temp attachment.
+    pub(super) fn cleanup(&self) {
+        if self.temp {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 #[derive(Clone)]

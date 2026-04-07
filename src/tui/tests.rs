@@ -780,16 +780,27 @@ async fn test_cancel_during_tool_execution() {
 }
 
 #[tokio::test]
-async fn paste_inserts_multiline_text_without_submitting() {
+async fn paste_multiline_creates_temp_attachment() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     tui.handle_paste("line one\nline two\nline three".to_string());
 
+    // Multi-line paste should NOT insert into the textarea
     let text = tui.app.input.lines().join("\n");
-    assert_eq!(text, "line one\nline two\nline three");
+    assert_eq!(text, "", "Multi-line paste should not go into textarea");
 
+    // Instead it should create a temp file attachment
+    assert_eq!(tui.app.attachments.len(), 1, "Should create one attachment");
+    assert!(tui.app.attachments[0].temp, "Attachment should be marked temp");
+    assert!(tui.app.attachments[0].path.exists(), "Temp file should exist");
+
+    // The temp file should contain the pasted text
+    let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
+    assert_eq!(contents, "line one\nline two\nline three");
+
+    // No submission should have occurred
     let user_entries: Vec<_> = tui
         .app
         .transcript
@@ -797,6 +808,63 @@ async fn paste_inserts_multiline_text_without_submitting() {
         .filter(|entry| matches!(entry, TranscriptEntry::User(_)))
         .collect();
     assert!(user_entries.is_empty(), "Paste should not trigger submission");
+
+    // Cleanup
+    tui.app.attachments[0].cleanup();
+}
+
+#[tokio::test]
+async fn paste_single_line_inserts_inline() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.handle_paste("single line text".to_string());
+
+    let text = tui.app.input.lines().join("\n");
+    assert_eq!(text, "single line text");
+    assert!(tui.app.attachments.is_empty(), "Single-line paste should not create attachment");
+}
+
+#[tokio::test]
+async fn paste_then_erase_then_paste_different_text() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // First paste (single-line)
+    tui.handle_paste("first paste".to_string());
+    assert_eq!(tui.app.input.lines().join("\n"), "first paste");
+
+    // Erase everything by resetting the input
+    tui.app.input = Tui::new_input();
+
+    // Second paste (single-line, different text)
+    tui.handle_paste("second paste".to_string());
+    let text = tui.app.input.lines().join("\n");
+    assert_eq!(text, "second paste", "Should only contain the second paste, not the first");
+}
+
+#[tokio::test]
+async fn detach_cleans_up_temp_file() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // Paste multi-line to create a temp attachment
+    tui.handle_paste("line one\nline two".to_string());
+    assert_eq!(tui.app.attachments.len(), 1);
+    let temp_path = tui.app.attachments[0].path.clone();
+    assert!(temp_path.exists(), "Temp file should exist before detach");
+
+    // Detach all
+    tui.set_input_text(".detach");
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.attachments.is_empty());
+    assert!(!temp_path.exists(), "Temp file should be deleted after detach");
 }
 
 #[tokio::test]
@@ -808,6 +876,7 @@ async fn attachment_footer_shows_attached_files() {
     harness.tui().app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/photo.png"),
         display_name: "photo.png".to_string(),
+        temp: false,
     });
     harness.render();
 
@@ -918,10 +987,12 @@ async fn detach_clears_all_attachments() {
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/a.txt"),
         display_name: "a.txt".to_string(),
+        temp: false,
     });
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/b.txt"),
         display_name: "b.txt".to_string(),
+        temp: false,
     });
 
     tui.set_input_text(".detach");
@@ -944,10 +1015,12 @@ async fn detach_by_name_removes_specific_attachment() {
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/a.txt"),
         display_name: "a.txt".to_string(),
+        temp: false,
     });
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/b.txt"),
         display_name: "b.txt".to_string(),
+        temp: false,
     });
 
     tui.set_input_text(".detach a.txt");
@@ -971,6 +1044,7 @@ async fn submit_drains_attachments() {
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/test.txt"),
         display_name: "test.txt".to_string(),
+        temp: false,
     });
     tui.set_input_text("Analyze this file");
 
@@ -1125,10 +1199,12 @@ async fn detach_completes_attachment_names() {
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/photo.png"),
         display_name: "photo.png".to_string(),
+        temp: false,
     });
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/data.csv"),
         display_name: "data.csv".to_string(),
+        temp: false,
     });
 
     let completions = tui.compute_completions(".detach ", 8);

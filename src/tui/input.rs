@@ -145,6 +145,7 @@ impl Tui {
                 self.app.attachments.push(crate::tui::types::Attachment {
                     path: resolved,
                     display_name,
+                    temp: false,
                 });
             } else {
                 self.app.transcript.push(
@@ -154,10 +155,20 @@ impl Tui {
                 );
             }
         } else if last_line == ".detach" {
-            self.app.attachments.clear();
+            for a in self.app.attachments.drain(..) {
+                a.cleanup();
+            }
         } else if last_line.starts_with(".detach ") {
             let name = last_line.strip_prefix(".detach ").unwrap().trim().to_string();
-            self.app.attachments.retain(|a| a.display_name != name);
+            let mut kept = Vec::new();
+            for a in self.app.attachments.drain(..) {
+                if a.display_name == name {
+                    a.cleanup();
+                } else {
+                    kept.push(a);
+                }
+            }
+            self.app.attachments = kept;
         } else {
             return false;
         }
@@ -181,8 +192,38 @@ impl Tui {
         if !self.app.completions.is_empty() {
             self.app.completions.clear();
         }
-        self.app.input.set_yank_text(&text);
-        self.app.input.paste();
+        if text.contains('\n') {
+            // Multi-line paste: write to temp file and attach
+            match Self::write_paste_temp_file(&text) {
+                Ok(attachment) => {
+                    self.app.attachments.push(attachment);
+                }
+                Err(err) => {
+                    self.app.transcript.push(
+                        crate::tui::types::TranscriptEntry::Error(
+                            format!("Failed to save pasted text: {err}")
+                        )
+                    );
+                }
+            }
+        } else {
+            // Single-line paste: insert inline
+            self.app.input.insert_str(&text);
+        }
+    }
+
+    fn write_paste_temp_file(text: &str) -> std::io::Result<crate::tui::types::Attachment> {
+        use std::io::Write;
+        let id = uuid::Uuid::new_v4();
+        let filename = format!("harnx-paste-{id}.txt");
+        let path = std::env::temp_dir().join(&filename);
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(text.as_bytes())?;
+        Ok(crate::tui::types::Attachment {
+            path,
+            display_name: filename,
+            temp: true,
+        })
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
