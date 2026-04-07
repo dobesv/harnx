@@ -21,13 +21,18 @@ pub struct Tui {
     pub(super) persistent_manager: Arc<Mutex<PersistentHookManager>>,
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
     #[cfg(test)]
+    #[allow(private_interfaces)]
     pub(crate) app: App,
     #[cfg(not(test))]
+    #[allow(dead_code)]
     pub(super) app: App,
     #[cfg(test)]
     pub(crate) event_tx: mpsc::UnboundedSender<TuiEvent>,
     #[cfg(not(test))]
     pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
+    #[cfg(test)]
+    pub(crate) event_rx: mpsc::UnboundedReceiver<TuiEvent>,
+    #[cfg(not(test))]
     pub(super) event_rx: mpsc::UnboundedReceiver<TuiEvent>,
 }
 

@@ -16,6 +16,13 @@ pub use stream::*;
 static TEST_CLIENT: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<dyn Client>>>> =
     std::sync::OnceLock::new();
 
+/// Mutex that serializes tests using shared global state (test client,
+/// UI output sender). Tests that call `set_test_client`, `emit_ui_output`,
+/// or create a `Tui` should acquire this lock for their entire duration.
+#[cfg(test)]
+pub static TEST_CLIENT_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[cfg(test)]
 pub fn set_test_client(client: Option<std::sync::Arc<dyn Client>>) {
     let slot = TEST_CLIENT.get_or_init(|| std::sync::Mutex::new(None));

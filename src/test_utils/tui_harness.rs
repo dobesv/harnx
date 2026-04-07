@@ -6,10 +6,9 @@
 
 use crate::config::{Config, GlobalConfig};
 use crate::hooks::{AsyncHookManager, PersistentHookManager};
-use crate::tui::types::Tui;
 use crate::test_utils::SyncHarness;
+use crate::tui::types::Tui;
 
-use anyhow::Result;
 use parking_lot::RwLock;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -61,10 +60,10 @@ impl TuiTestHarness {
     fn with_config_and_size(config: GlobalConfig, width: u16, height: u16) -> Self {
         let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
         let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
-        
+
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend).unwrap();
-        
+
         Self {
             tui,
             terminal,
@@ -79,7 +78,7 @@ impl TuiTestHarness {
     /// Get the current screen contents as a string.
     pub fn screen_contents(&self) -> String {
         let buffer = self.terminal.backend().buffer();
-        
+
         let mut contents = String::new();
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
@@ -108,10 +107,40 @@ impl TuiTestHarness {
         &self.sync
     }
 
+    /// Drain any remaining events and allow the spawned prompt task to finish.
+    ///
+    /// Disconnects the global UI output sender first so stale spawned tasks
+    /// can't inject events into the next test's Tui, then drains remaining
+    /// events from the channel.
+    pub async fn drain_and_settle(&mut self) {
+        // Disconnect the global UI output sender first. Any stale spawned
+        // task calling emit_ui_output after this will fall back to print!
+        // instead of injecting events into the next test's Tui.
+        crate::ui_output::clear_ui_output_sender();
+
+        // Drain any events already in the channel
+        let mut quiet_count = 0;
+        while quiet_count < 3 {
+            let mut drained_any = false;
+            while let Ok(event) = self.tui.event_rx.try_recv() {
+                let _ = self.tui.handle_tui_event(event).await;
+                drained_any = true;
+            }
+            if drained_any {
+                quiet_count = 0;
+            } else {
+                quiet_count += 1;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Process events and wait until screen contains expected text.
     ///
-    /// This helper encapsulates the pattern of polling for events and checking
-    /// screen contents until a condition is met.
+    /// This helper drains pending TUI events on each poll iteration, so that
+    /// events arriving asynchronously (e.g. from a spawned prompt task) are
+    /// processed into transcript entries before checking screen contents.
     pub async fn wait_until_screen_contains(
         &mut self,
         expected: &str,
@@ -119,7 +148,7 @@ impl TuiTestHarness {
     ) -> anyhow::Result<()> {
         let expected = expected.to_string();
         let deadline = tokio::time::Instant::now() + timeout_duration;
-        
+
         loop {
             if tokio::time::Instant::now() >= deadline {
                 return Err(anyhow::anyhow!(
@@ -127,12 +156,17 @@ impl TuiTestHarness {
                     expected
                 ));
             }
-            
+
+            // Drain any pending events so they get processed into the transcript
+            while let Ok(event) = self.tui.event_rx.try_recv() {
+                let _ = self.tui.handle_tui_event(event).await;
+            }
+
             self.render();
             if self.screen_contents().contains(&expected) {
                 return Ok(());
             }
-            
+
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }

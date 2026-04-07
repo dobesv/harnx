@@ -137,7 +137,17 @@ impl Tui {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn handle_tui_event(&mut self, event: TuiEvent) -> Result<()> {
+        self.handle_tui_event_inner(event).await
+    }
+
+    #[cfg(not(test))]
     pub(super) async fn handle_tui_event(&mut self, event: TuiEvent) -> Result<()> {
+        self.handle_tui_event_inner(event).await
+    }
+
+    async fn handle_tui_event_inner(&mut self, event: TuiEvent) -> Result<()> {
         match event {
             TuiEvent::UiOutput(text) => {
                 // Strip ANSI escape codes so raw terminal output doesn't corrupt the TUI (fix #6)

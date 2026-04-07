@@ -529,6 +529,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_eval_tool_calls_error_handling() {
+        let _lock = crate::client::TEST_CLIENT_LOCK.lock().await;
+        crate::ui_output::clear_ui_output_sender();
         let config = Arc::new(RwLock::new(Config::default()));
         let call = ToolCall::new(
             "unknown_tool".to_string(),
@@ -551,6 +553,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_eval_tool_calls_partial_error_handling() {
+        let _lock = crate::client::TEST_CLIENT_LOCK.lock().await;
+        crate::ui_output::clear_ui_output_sender();
         let config = Arc::new(RwLock::new(Config::default()));
         // trigger_agent is handled internally and should succeed
         let call1 = ToolCall::new(

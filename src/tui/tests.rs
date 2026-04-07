@@ -1,5 +1,5 @@
 use super::*;
-use crate::client::{set_test_client, Client, ClientConfig};
+use crate::client::{set_test_client, Client, ClientConfig, TEST_CLIENT_LOCK};
 use crate::config::Config;
 use crate::test_utils::{MockClient, MockTurnBuilder, TuiTestHarness};
 use crate::tui::types::{TranscriptEntry, TuiEvent};
@@ -24,13 +24,13 @@ fn test_config_with_mock_client_and_agent(agent_name: &str, session_name: &str) 
         guard.clients = vec![ClientConfig::Unknown];
         let model = MockClient::builder().build().model().clone();
         guard.model = model.clone();
-        
+
         // Set up agent for realistic status line
         let mut agent = crate::config::Agent::from_prompt("");
         agent.set_name(agent_name);
         agent.set_model(model);
         guard.agent = Some(agent);
-        
+
         // Set up session for realistic status line
         let _ = guard.use_session(Some(session_name));
     }
@@ -201,6 +201,7 @@ async fn info_commands_render_into_tui_transcript() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_basic_message_and_streaming_response() {
+    let _lock = TEST_CLIENT_LOCK.lock().await;
     let config = test_config_with_mock_client();
     let mock_client = Arc::new(
         MockClient::builder()
@@ -224,7 +225,11 @@ async fn test_basic_message_and_streaming_response() {
         .app
         .transcript
         .push(TranscriptEntry::User("Test message".to_string()));
-    harness.tui().start_prompt("Test message".to_string()).await.unwrap();
+    harness
+        .tui()
+        .start_prompt("Test message".to_string())
+        .await
+        .unwrap();
 
     harness
         .sync()
@@ -276,12 +281,14 @@ async fn test_basic_message_and_streaming_response() {
     let rendered = normalize_screen(&harness.screen_contents());
     insta::assert_snapshot!("basic_message_and_streaming_response", rendered);
 
+    harness.drain_and_settle().await;
     set_test_client(None);
     clear_ui_output_sender();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_streaming_with_tool_calls() {
+    let _lock = TEST_CLIENT_LOCK.lock().await;
     let config = test_config_with_mock_client();
 
     // First turn: stream text, then make a tool call
@@ -312,7 +319,11 @@ async fn test_streaming_with_tool_calls() {
         .app
         .transcript
         .push(TranscriptEntry::User("What is the answer?".to_string()));
-    harness.tui().start_prompt("What is the answer?".to_string()).await.unwrap();
+    harness
+        .tui()
+        .start_prompt("What is the answer?".to_string())
+        .await
+        .unwrap();
 
     harness
         .sync()
@@ -355,6 +366,7 @@ async fn test_streaming_with_tool_calls() {
     // is non-deterministic due to async event processing. The assertions above
     // verify the key content is present.
 
+    harness.drain_and_settle().await;
     set_test_client(None);
     clear_ui_output_sender();
 }
@@ -366,6 +378,7 @@ async fn test_streaming_with_tool_calls() {
 /// focuses on verifying the tool call appears in the TUI transcript.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sub_agent_delegation_tool_appears() {
+    let _lock = TEST_CLIENT_LOCK.lock().await;
     let config = test_config_with_mock_client_and_agent("coordinator", "delegation-test");
 
     // The mock returns trigger_agent tool call, which gets processed
@@ -398,7 +411,11 @@ async fn test_sub_agent_delegation_tool_appears() {
         .app
         .transcript
         .push(TranscriptEntry::User("Help me".to_string()));
-    harness.tui().start_prompt("Help me".to_string()).await.unwrap();
+    harness
+        .tui()
+        .start_prompt("Help me".to_string())
+        .await
+        .unwrap();
 
     harness
         .sync()
@@ -425,7 +442,7 @@ async fn test_sub_agent_delegation_tool_appears() {
         .unwrap();
 
     let screen = harness.screen_contents();
-    
+
     // Verify tool call appears with its arguments
     assert!(
         screen.contains("trigger_agent"),
@@ -440,6 +457,7 @@ async fn test_sub_agent_delegation_tool_appears() {
     // is non-deterministic due to async event processing. The assertions above
     // verify the key content is present.
 
+    harness.drain_and_settle().await;
     set_test_client(None);
     clear_ui_output_sender();
 }
@@ -448,15 +466,15 @@ async fn test_sub_agent_delegation_tool_appears() {
 fn test_tool_result_switch_agent_parsing() {
     // Unit test to verify that tool results with switch_agent action
     // are correctly parsed into SwitchAgentData
-    use crate::tool::{ToolResult, ToolCall};
-    
+    use crate::tool::{ToolCall, ToolResult};
+
     let tool_call = ToolCall::new(
         "trigger_agent".to_string(),
         serde_json::json!({"agent": "specialist", "prompt": "Help!"}),
         Some("tool-123".to_string()),
         None,
     );
-    
+
     let output = serde_json::json!({
         "status": "success",
         "message": "Transferring session to agent 'specialist'...",
@@ -464,9 +482,9 @@ fn test_tool_result_switch_agent_parsing() {
         "agent": "specialist",
         "prompt": "Help!"
     });
-    
+
     let mut result = ToolResult::new(tool_call, output);
-    
+
     // Verify switch_agent detection works
     if let Some(obj) = result.output.as_object() {
         if obj.get("action").and_then(|v| v.as_str()) == Some("switch_agent") {
@@ -481,7 +499,7 @@ fn test_tool_result_switch_agent_parsing() {
             }
         }
     }
-    
+
     assert!(result.switch_agent.is_some());
     let data = result.switch_agent.unwrap();
     assert_eq!(data.agent, "specialist");
@@ -490,6 +508,7 @@ fn test_tool_result_switch_agent_parsing() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_screen_overflow_and_word_wrap() {
+    let _lock = TEST_CLIENT_LOCK.lock().await;
     let config = test_config_with_mock_client();
     let user_message = "Please demonstrate wrapping in a small viewport.";
     let long_response = concat!(
@@ -514,7 +533,11 @@ async fn test_screen_overflow_and_word_wrap() {
         .app
         .transcript
         .push(TranscriptEntry::User(user_message.to_string()));
-    harness.tui().start_prompt(user_message.to_string()).await.unwrap();
+    harness
+        .tui()
+        .start_prompt(user_message.to_string())
+        .await
+        .unwrap();
 
     harness
         .sync()
@@ -554,6 +577,7 @@ async fn test_screen_overflow_and_word_wrap() {
 
     insta::assert_snapshot!("screen_overflow_and_word_wrap", rendered);
 
+    harness.drain_and_settle().await;
     set_test_client(None);
     clear_ui_output_sender();
 }
@@ -562,7 +586,9 @@ async fn test_screen_overflow_and_word_wrap() {
 async fn test_tall_multiline_input() {
     let mut harness = TuiTestHarness::with_size(40, 12);
 
-    harness.tui().set_input_text("First line\nSecond line\nThird line\nFourth line");
+    harness
+        .tui()
+        .set_input_text("First line\nSecond line\nThird line\nFourth line");
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());
@@ -586,6 +612,7 @@ async fn test_tall_multiline_input() {
 /// The abort signal should stop streaming and the TUI should show a cancellation message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ctrl_c_cancels_streaming() {
+    let _lock = TEST_CLIENT_LOCK.lock().await;
     let config = test_config_with_mock_client();
 
     // Mock streams a response that we'll cancel mid-stream
@@ -611,7 +638,11 @@ async fn test_ctrl_c_cancels_streaming() {
         .app
         .transcript
         .push(TranscriptEntry::User("Long request".to_string()));
-    harness.tui().start_prompt("Long request".to_string()).await.unwrap();
+    harness
+        .tui()
+        .start_prompt("Long request".to_string())
+        .await
+        .unwrap();
 
     // Wait for mock to be exhausted (streaming complete)
     harness
@@ -652,6 +683,7 @@ async fn test_ctrl_c_cancels_streaming() {
         "Screen should show abort message, got: {screen}"
     );
 
+    harness.drain_and_settle().await;
     set_test_client(None);
     clear_ui_output_sender();
 }
@@ -660,6 +692,7 @@ async fn test_ctrl_c_cancels_streaming() {
 /// When the mock returns an error, the error should be visible in the transcript.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_streaming_error_shows_in_transcript() {
+    let _lock = TEST_CLIENT_LOCK.lock().await;
     let config = test_config_with_mock_client();
 
     // Create a mock that will return an error on streaming
@@ -700,12 +733,13 @@ async fn test_streaming_error_shows_in_transcript() {
     // The error arrives via TuiEvent later. Since there's no event, check that
     // error handling in the mock works - the mock returns the error, but
     // it's up to the caller to handle it.
-    // 
+    //
     // For now, just verify the mock error_on_stream builder compiles and works.
     // The actual error propagation through the TUI event system is complex
     // and would require waiting for the Error event.
     let _ = result; // Don't assert on result, it's always Ok(())
 
+    harness.drain_and_settle().await;
     set_test_client(None);
     clear_ui_output_sender();
 }
@@ -714,6 +748,7 @@ async fn test_streaming_error_shows_in_transcript() {
 /// When user presses Ctrl+C while a tool is executing, the tool should be aborted.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_during_tool_execution() {
+    let _lock = TEST_CLIENT_LOCK.lock().await;
     let config = test_config_with_mock_client();
 
     // Mock returns a tool call, then more text
@@ -743,7 +778,11 @@ async fn test_cancel_during_tool_execution() {
         .app
         .transcript
         .push(TranscriptEntry::User("Search test".to_string()));
-    harness.tui().start_prompt("Search test".to_string()).await.unwrap();
+    harness
+        .tui()
+        .start_prompt("Search test".to_string())
+        .await
+        .unwrap();
 
     // Wait for mock to be exhausted
     harness
@@ -766,7 +805,7 @@ async fn test_cancel_during_tool_execution() {
 
     // Simulate Ctrl+C after tool call is processed
     harness.tui().abort_signal.set_ctrlc();
-    
+
     // Manually trigger the Ctrl+C handling (same as handle_key for Ctrl+C)
     harness.tui().app.transcript.push(TranscriptEntry::System(
         "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
@@ -783,6 +822,7 @@ async fn test_cancel_during_tool_execution() {
         "Screen should show abort message after cancel during tool execution, got: {screen}"
     );
 
+    harness.drain_and_settle().await;
     set_test_client(None);
     clear_ui_output_sender();
 }
@@ -790,6 +830,7 @@ async fn test_cancel_during_tool_execution() {
 /// Test recovery after cancellation - user can send a new message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_recovery_after_cancellation() {
+    let _lock = TEST_CLIENT_LOCK.lock().await;
     let config = test_config_with_mock_client();
 
     // Mock for both turns - each start_prompt consumes one turn
@@ -815,7 +856,11 @@ async fn test_recovery_after_cancellation() {
         .app
         .transcript
         .push(TranscriptEntry::User("First request".to_string()));
-    harness.tui().start_prompt("First request".to_string()).await.unwrap();
+    harness
+        .tui()
+        .start_prompt("First request".to_string())
+        .await
+        .unwrap();
 
     // Wait for first response
     harness
@@ -852,7 +897,10 @@ async fn test_recovery_after_cancellation() {
     harness.render();
 
     // Verify abort signal is reset
-    assert!(!harness.tui().abort_signal.aborted(), "abort signal should be reset after cancel");
+    assert!(
+        !harness.tui().abort_signal.aborted(),
+        "abort signal should be reset after cancel"
+    );
 
     // Create a second mock for the second request
     let mock_client2 = Arc::new(
@@ -874,7 +922,11 @@ async fn test_recovery_after_cancellation() {
         .app
         .transcript
         .push(TranscriptEntry::User("Second request".to_string()));
-    harness.tui().start_prompt("Second request".to_string()).await.unwrap();
+    harness
+        .tui()
+        .start_prompt("Second request".to_string())
+        .await
+        .unwrap();
 
     // Wait for second response
     harness
@@ -901,6 +953,7 @@ async fn test_recovery_after_cancellation() {
         "Screen should show second response after recovery, got: {screen}"
     );
 
+    harness.drain_and_settle().await;
     set_test_client(None);
     clear_ui_output_sender();
 }
