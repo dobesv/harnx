@@ -62,6 +62,7 @@ impl Tui {
                 history: vec![],
                 history_index: None,
                 history_draft: String::new(),
+                attachments: vec![],
                 last_known_input_width: 1,
             },
             event_tx,

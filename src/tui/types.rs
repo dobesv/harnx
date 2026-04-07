@@ -4,6 +4,7 @@ use crate::hooks::{AsyncHookManager, PersistentHookManager};
 use crate::utils::AbortSignal;
 
 use ratatui_textarea::TextArea;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -35,6 +36,12 @@ pub struct Tui {
     pub(super) event_rx: mpsc::UnboundedReceiver<TuiEvent>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct Attachment {
+    pub(super) path: PathBuf,
+    pub(super) display_name: String,
+}
+
 pub(super) struct App {
     pub(super) transcript: Vec<TranscriptEntry>,
     pub(super) input: TextArea<'static>,
@@ -52,6 +59,7 @@ pub(super) struct App {
     pub(super) history: Vec<String>,
     pub(super) history_index: Option<usize>,
     pub(super) history_draft: String,
+    pub(super) attachments: Vec<Attachment>,
     pub(super) last_known_input_width: u16,
 }
 
