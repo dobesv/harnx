@@ -237,6 +237,11 @@ impl Tui {
             "↩ Async resume: {context}"
         )));
         self.pin_transcript_to_bottom();
-        self.start_prompt(context, vec![], None).await
+        self.start_prompt(crate::tui::types::PendingMessage {
+            text: context,
+            attachments: vec![],
+            attachment_dir: None,
+        })
+        .await
     }
 }

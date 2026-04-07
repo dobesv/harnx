@@ -91,10 +91,13 @@ impl Tui {
                             .transcript
                             .push(TranscriptEntry::User(text.clone()));
                         self.app.input = Self::new_input();
-                        let attachments = std::mem::take(&mut self.app.attachments);
-                        let attachment_dir = self.app.attachment_dir.take();
+                        let msg = crate::tui::types::PendingMessage {
+                            text,
+                            attachments: std::mem::take(&mut self.app.attachments),
+                            attachment_dir: self.app.attachment_dir.take(),
+                        };
                         self.app.paste_count = 0;
-                        self.start_prompt(text, attachments, attachment_dir).await?;
+                        self.start_prompt(msg).await?;
                     }
                 }
             }
@@ -358,23 +361,7 @@ impl Tui {
                 self.refresh_input_chrome();
 
                 if let Some(pending) = self.app.pending_message.take() {
-                    // Clear input now that the pending message is actually being submitted
-                    self.app.input = Self::new_input();
-                    self.app
-                        .transcript
-                        .push(TranscriptEntry::User(pending.text.clone()));
-                    self.pin_transcript_to_bottom();
-                    if pending.text.trim_start().starts_with('.') {
-                        self.run_repl_command(&pending.text).await?;
-                        self.refresh_input_chrome();
-                    } else {
-                        self.start_prompt(
-                            pending.text,
-                            pending.attachments,
-                            pending.attachment_dir,
-                        )
-                        .await?;
-                    }
+                    self.submit_pending_message(pending).await?;
                 }
             }
             TuiEvent::Errored(err) => {
@@ -385,34 +372,34 @@ impl Tui {
                 self.refresh_input_chrome();
 
                 if let Some(pending) = self.app.pending_message.take() {
-                    // Clear input now that the pending message is actually being submitted
-                    self.app.input = Self::new_input();
-                    self.app
-                        .transcript
-                        .push(TranscriptEntry::User(pending.text.clone()));
-                    self.pin_transcript_to_bottom();
-                    if pending.text.trim_start().starts_with('.') {
-                        self.run_repl_command(&pending.text).await?;
-                        self.refresh_input_chrome();
-                    } else {
-                        self.start_prompt(
-                            pending.text,
-                            pending.attachments,
-                            pending.attachment_dir,
-                        )
-                        .await?;
-                    }
+                    self.submit_pending_message(pending).await?;
                 }
             }
         }
         Ok(())
     }
 
+    async fn submit_pending_message(
+        &mut self,
+        pending: crate::tui::types::PendingMessage,
+    ) -> Result<()> {
+        self.app.input = Self::new_input();
+        self.app
+            .transcript
+            .push(TranscriptEntry::User(pending.text.clone()));
+        self.pin_transcript_to_bottom();
+        if pending.text.trim_start().starts_with('.') {
+            self.run_repl_command(&pending.text).await?;
+            self.refresh_input_chrome();
+        } else {
+            self.start_prompt(pending).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn start_prompt(
         &mut self,
-        text: String,
-        attachments: Vec<crate::tui::types::Attachment>,
-        attachment_dir: Option<std::path::PathBuf>,
+        msg: crate::tui::types::PendingMessage,
     ) -> Result<()> {
         self.app.llm_busy = true;
 
@@ -425,10 +412,8 @@ impl Tui {
 
         tokio::spawn(async move {
             let result: Result<()> = Self::run_prompt_task(
+                msg,
                 config,
-                text,
-                attachments,
-                attachment_dir,
                 abort_signal,
                 async_manager,
                 persistent_manager,

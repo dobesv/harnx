@@ -224,7 +224,11 @@ async fn test_basic_message_and_streaming_response() {
         .push(TranscriptEntry::User("Test message".to_string()));
     harness
         .tui()
-        .start_prompt("Test message".to_string(), vec![], None)
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Test message".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+        })
         .await
         .unwrap();
 
@@ -315,7 +319,11 @@ async fn test_streaming_with_tool_calls() {
         .push(TranscriptEntry::User("What is the answer?".to_string()));
     harness
         .tui()
-        .start_prompt("What is the answer?".to_string(), vec![], None)
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "What is the answer?".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+        })
         .await
         .unwrap();
 
@@ -404,7 +412,11 @@ async fn test_sub_agent_delegation_tool_appears() {
         .push(TranscriptEntry::User("Help me".to_string()));
     harness
         .tui()
-        .start_prompt("Help me".to_string(), vec![], None)
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Help me".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+        })
         .await
         .unwrap();
 
@@ -505,7 +517,11 @@ async fn test_screen_overflow_and_word_wrap() {
         .push(TranscriptEntry::User(user_message.to_string()));
     harness
         .tui()
-        .start_prompt(user_message.to_string(), vec![], None)
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: user_message.to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+        })
         .await
         .unwrap();
 
@@ -607,7 +623,11 @@ async fn test_ctrl_c_cancels_streaming() {
         .push(TranscriptEntry::User("Long request".to_string()));
     harness
         .tui()
-        .start_prompt("Long request".to_string(), vec![], None)
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Long request".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+        })
         .await
         .unwrap();
 
@@ -680,7 +700,11 @@ async fn test_streaming_error_shows_in_transcript() {
     // The error should propagate through start_prompt
     let result = harness
         .tui()
-        .start_prompt("Error test".to_string(), vec![], None)
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Error test".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+        })
         .await;
 
     let _ = result; // start_prompt always returns Ok (spawns a task)
@@ -737,7 +761,11 @@ async fn test_cancel_during_tool_execution() {
         .push(TranscriptEntry::User("Search test".to_string()));
     harness
         .tui()
-        .start_prompt("Search test".to_string(), vec![], None)
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Search test".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+        })
         .await
         .unwrap();
 
@@ -1159,7 +1187,11 @@ async fn test_recovery_after_cancellation() {
         .push(TranscriptEntry::User("First request".to_string()));
     harness
         .tui()
-        .start_prompt("First request".to_string(), vec![], None)
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "First request".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+        })
         .await
         .unwrap();
 
@@ -1225,7 +1257,11 @@ async fn test_recovery_after_cancellation() {
         .push(TranscriptEntry::User("Second request".to_string()));
     harness
         .tui()
-        .start_prompt("Second request".to_string(), vec![], None)
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Second request".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+        })
         .await
         .unwrap();
 
