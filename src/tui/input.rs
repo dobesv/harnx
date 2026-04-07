@@ -114,6 +114,18 @@ impl Tui {
         Ok(())
     }
 
+    pub(super) fn handle_paste(&mut self, text: String) {
+        if self.app.pending_message.is_some() {
+            self.app.pending_message = None;
+            self.refresh_input_chrome();
+        }
+        if !self.app.completions.is_empty() {
+            self.app.completions.clear();
+        }
+        self.app.input.set_yank_text(&text);
+        self.app.input.paste();
+    }
+
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {

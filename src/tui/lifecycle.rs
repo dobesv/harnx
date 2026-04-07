@@ -157,6 +157,9 @@ impl Tui {
                     Event::Mouse(mouse) => {
                         self.handle_mouse(mouse);
                     }
+                    Event::Paste(text) => {
+                        self.handle_paste(text);
+                    }
                     Event::Resize(_, _) => {}
                     _ => {}
                 }

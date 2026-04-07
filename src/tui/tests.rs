@@ -779,6 +779,39 @@ async fn test_cancel_during_tool_execution() {
     harness.drain_and_settle().await.unwrap();
 }
 
+#[tokio::test]
+async fn paste_inserts_multiline_text_without_submitting() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.handle_paste("line one\nline two\nline three".to_string());
+
+    let text = tui.app.input.lines().join("\n");
+    assert_eq!(text, "line one\nline two\nline three");
+
+    let user_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter(|entry| matches!(entry, TranscriptEntry::User(_)))
+        .collect();
+    assert!(user_entries.is_empty(), "Paste should not trigger submission");
+}
+
+#[tokio::test]
+async fn paste_appends_to_existing_text() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.set_input_text("before ");
+    tui.handle_paste("pasted text".to_string());
+
+    let text = tui.app.input.lines().join("\n");
+    assert_eq!(text, "before pasted text");
+}
+
 /// Test recovery after cancellation - user can send a new message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_recovery_after_cancellation() {
