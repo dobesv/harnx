@@ -71,7 +71,10 @@ impl Tui {
                     if self.app.llm_busy {
                         // Queue the message to send when LLM finishes
                         // Keep the text in input so user can see/edit it
-                        self.app.pending_message = Some(text);
+                        self.app.pending_message = Some(crate::tui::types::PendingMessage {
+                            text,
+                            attachments: std::mem::take(&mut self.app.attachments),
+                        });
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through repl command handler
@@ -86,14 +89,15 @@ impl Tui {
                             .transcript
                             .push(TranscriptEntry::User(text.clone()));
                         self.app.input = Self::new_input();
-                        self.start_prompt(text).await?;
+                        let attachments = std::mem::take(&mut self.app.attachments);
+                        self.start_prompt(text, attachments).await?;
                     }
                 }
             }
             (KeyCode::Enter, KeyModifiers::SHIFT) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                 // Shift+Enter / Ctrl+J inserts a newline - clear pending if any
-                if self.app.pending_message.is_some() {
-                    self.app.pending_message = None;
+                if let Some(pending) = self.app.pending_message.take() {
+                    self.app.attachments = pending.attachments;
                     self.refresh_input_chrome();
                 }
                 self.app.input.input(TextInput {
@@ -103,8 +107,8 @@ impl Tui {
             }
             _ => {
                 // Any other key input clears pending message (converts back to draft)
-                if self.app.pending_message.is_some() {
-                    self.app.pending_message = None;
+                if let Some(pending) = self.app.pending_message.take() {
+                    self.app.attachments = pending.attachments;
                     self.refresh_input_chrome();
                 }
                 // Clear completions on any non-tab key
@@ -170,8 +174,8 @@ impl Tui {
     }
 
     pub(super) fn handle_paste(&mut self, text: String) {
-        if self.app.pending_message.is_some() {
-            self.app.pending_message = None;
+        if let Some(pending) = self.app.pending_message.take() {
+            self.app.attachments = pending.attachments;
             self.refresh_input_chrome();
         }
         if !self.app.completions.is_empty() {
@@ -273,13 +277,13 @@ impl Tui {
                     self.app.input = Self::new_input();
                     self.app
                         .transcript
-                        .push(TranscriptEntry::User(pending.clone()));
+                        .push(TranscriptEntry::User(pending.text.clone()));
                     self.pin_transcript_to_bottom();
-                    if pending.trim_start().starts_with('.') {
-                        self.run_repl_command(&pending).await?;
+                    if pending.text.trim_start().starts_with('.') {
+                        self.run_repl_command(&pending.text).await?;
                         self.refresh_input_chrome();
                     } else {
-                        self.start_prompt(pending).await?;
+                        self.start_prompt(pending.text, pending.attachments).await?;
                     }
                 }
             }
@@ -295,13 +299,13 @@ impl Tui {
                     self.app.input = Self::new_input();
                     self.app
                         .transcript
-                        .push(TranscriptEntry::User(pending.clone()));
+                        .push(TranscriptEntry::User(pending.text.clone()));
                     self.pin_transcript_to_bottom();
-                    if pending.trim_start().starts_with('.') {
-                        self.run_repl_command(&pending).await?;
+                    if pending.text.trim_start().starts_with('.') {
+                        self.run_repl_command(&pending.text).await?;
                         self.refresh_input_chrome();
                     } else {
-                        self.start_prompt(pending).await?;
+                        self.start_prompt(pending.text, pending.attachments).await?;
                     }
                 }
             }
@@ -309,7 +313,11 @@ impl Tui {
         Ok(())
     }
 
-    pub(super) async fn start_prompt(&mut self, text: String) -> Result<()> {
+    pub(super) async fn start_prompt(
+        &mut self,
+        text: String,
+        attachments: Vec<crate::tui::types::Attachment>,
+    ) -> Result<()> {
         self.app.llm_busy = true;
 
         let config = self.config.clone();
@@ -323,6 +331,7 @@ impl Tui {
             let result: Result<()> = Self::run_prompt_task(
                 config,
                 text,
+                attachments,
                 abort_signal,
                 async_manager,
                 persistent_manager,

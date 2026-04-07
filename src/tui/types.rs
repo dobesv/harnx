@@ -42,6 +42,12 @@ pub(super) struct Attachment {
     pub(super) display_name: String,
 }
 
+#[derive(Clone)]
+pub(super) struct PendingMessage {
+    pub(super) text: String,
+    pub(super) attachments: Vec<Attachment>,
+}
+
 pub(super) struct App {
     pub(super) transcript: Vec<TranscriptEntry>,
     pub(super) input: TextArea<'static>,
@@ -51,7 +57,7 @@ pub(super) struct App {
     pub(super) transcript_scroll: u16,
     pub(super) max_scroll: u16,
     pub(super) streaming_assistant_idx: Option<usize>,
-    pub(super) pending_message: Option<String>,
+    pub(super) pending_message: Option<PendingMessage>,
     pub(super) completions: Vec<(String, Option<String>)>,
     pub(super) completion_index: usize,
     pub(super) completion_prefix: String,

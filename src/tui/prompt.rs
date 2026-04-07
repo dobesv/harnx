@@ -15,13 +15,22 @@ impl Tui {
     pub(super) async fn run_prompt_task(
         config: GlobalConfig,
         text: String,
+        attachments: Vec<crate::tui::types::Attachment>,
         abort_signal: AbortSignal,
         async_manager: Arc<Mutex<AsyncHookManager>>,
         persistent_manager: Arc<Mutex<PersistentHookManager>>,
         pending_async_context: Arc<Mutex<Option<String>>>,
         event_tx: mpsc::UnboundedSender<TuiEvent>,
     ) -> Result<()> {
-        let input = Input::from_str(&config, &text, None);
+        let input = if attachments.is_empty() {
+            Input::from_str(&config, &text, None)
+        } else {
+            let paths: Vec<String> = attachments
+                .iter()
+                .map(|a| a.path.to_string_lossy().to_string())
+                .collect();
+            Input::from_files(&config, &text, paths, None).await?
+        };
         Self::run_prompt_inner(
             PromptTaskContext {
                 config,
