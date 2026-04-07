@@ -16,6 +16,7 @@ impl Tui {
         config: GlobalConfig,
         text: String,
         attachments: Vec<crate::tui::types::Attachment>,
+        attachment_dir: Option<std::path::PathBuf>,
         abort_signal: AbortSignal,
         async_manager: Arc<Mutex<AsyncHookManager>>,
         persistent_manager: Arc<Mutex<PersistentHookManager>>,
@@ -31,9 +32,9 @@ impl Tui {
                 .collect();
             Input::from_files(&config, &text, paths, None).await?
         };
-        // Clean up temp files now that Input has read them
-        for a in &attachments {
-            a.cleanup();
+        // Clean up attachment directory now that Input has read the files
+        if let Some(dir) = attachment_dir {
+            crate::tui::types::cleanup_attachment_dir(&dir);
         }
         Self::run_prompt_inner(
             PromptTaskContext {

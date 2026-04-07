@@ -74,7 +74,9 @@ impl Tui {
                         self.app.pending_message = Some(crate::tui::types::PendingMessage {
                             text,
                             attachments: std::mem::take(&mut self.app.attachments),
+                            attachment_dir: self.app.attachment_dir.take(),
                         });
+                        self.app.paste_count = 0;
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through repl command handler
@@ -90,7 +92,9 @@ impl Tui {
                             .push(TranscriptEntry::User(text.clone()));
                         self.app.input = Self::new_input();
                         let attachments = std::mem::take(&mut self.app.attachments);
-                        self.start_prompt(text, attachments).await?;
+                        let attachment_dir = self.app.attachment_dir.take();
+                        self.app.paste_count = 0;
+                        self.start_prompt(text, attachments, attachment_dir).await?;
                     }
                 }
             }
@@ -98,6 +102,7 @@ impl Tui {
                 // Shift+Enter / Ctrl+J inserts a newline - clear pending if any
                 if let Some(pending) = self.app.pending_message.take() {
                     self.app.attachments = pending.attachments;
+                    self.app.attachment_dir = pending.attachment_dir;
                     self.refresh_input_chrome();
                 }
                 self.app.input.input(TextInput {
@@ -109,6 +114,7 @@ impl Tui {
                 // Any other key input clears pending message (converts back to draft)
                 if let Some(pending) = self.app.pending_message.take() {
                     self.app.attachments = pending.attachments;
+                    self.app.attachment_dir = pending.attachment_dir;
                     self.refresh_input_chrome();
                 }
                 // Clear completions on any non-tab key
@@ -119,6 +125,26 @@ impl Tui {
             }
         }
         Ok(())
+    }
+
+    /// Ensure the attachment temp directory exists, creating it via mkdtemp if needed.
+    fn ensure_attachment_dir(&mut self) -> std::io::Result<std::path::PathBuf> {
+        if let Some(ref dir) = self.app.attachment_dir {
+            Ok(dir.clone())
+        } else {
+            let dir = crate::tui::types::create_attachment_dir()?;
+            self.app.attachment_dir = Some(dir.clone());
+            Ok(dir)
+        }
+    }
+
+    /// Clean up the attachment temp directory and reset attachment state.
+    pub(super) fn cleanup_attachments(&mut self) {
+        self.app.attachments.clear();
+        self.app.paste_count = 0;
+        if let Some(dir) = self.app.attachment_dir.take() {
+            crate::tui::types::cleanup_attachment_dir(&dir);
+        }
     }
 
     /// Check if the last line of input is an `.attach` or `.detach` command.
@@ -139,44 +165,50 @@ impl Tui {
                 .unwrap()
                 .trim()
                 .to_string();
-            let path = std::path::PathBuf::from(&path_str);
-            if path.exists() {
-                let display_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path_str.clone());
-                let resolved = path.canonicalize().unwrap_or(path);
-                self.app.attachments.push(crate::tui::types::Attachment {
-                    path: resolved,
-                    display_name,
-                    temp: false,
-                });
+            let src = std::path::PathBuf::from(&path_str);
+            if src.exists() {
+                match self.ensure_attachment_dir() {
+                    Ok(dir) => {
+                        let display_name = src
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path_str.clone());
+                        let dest = dir.join(&display_name);
+                        if let Err(err) = std::fs::copy(&src, &dest) {
+                            self.app.transcript.push(TranscriptEntry::Error(format!(
+                                "Failed to copy attachment: {err}"
+                            )));
+                        } else {
+                            self.app.attachments.push(crate::tui::types::Attachment {
+                                path: dest,
+                                display_name,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        self.app.transcript.push(TranscriptEntry::Error(format!(
+                            "Failed to create attachment directory: {err}"
+                        )));
+                    }
+                }
             } else {
-                self.app
-                    .transcript
-                    .push(crate::tui::types::TranscriptEntry::Error(format!(
-                        "File not found: {path_str}"
-                    )));
+                self.app.transcript.push(TranscriptEntry::Error(format!(
+                    "File not found: {path_str}"
+                )));
             }
         } else if last_line == ".detach" {
-            for a in self.app.attachments.drain(..) {
-                a.cleanup();
-            }
+            self.cleanup_attachments();
         } else if last_line.starts_with(".detach ") {
             let name = last_line
                 .strip_prefix(".detach ")
                 .unwrap()
                 .trim()
                 .to_string();
-            let mut kept = Vec::new();
-            for a in self.app.attachments.drain(..) {
-                if a.display_name == name {
-                    a.cleanup();
-                } else {
-                    kept.push(a);
-                }
+            self.app.attachments.retain(|a| a.display_name != name);
+            // If no attachments left, clean up the directory
+            if self.app.attachments.is_empty() {
+                self.cleanup_attachments();
             }
-            self.app.attachments = kept;
         } else {
             return false;
         }
@@ -195,6 +227,7 @@ impl Tui {
     pub(super) fn handle_paste(&mut self, text: String) {
         if let Some(pending) = self.app.pending_message.take() {
             self.app.attachments = pending.attachments;
+            self.app.attachment_dir = pending.attachment_dir;
             self.refresh_input_chrome();
         }
         if !self.app.completions.is_empty() {
@@ -204,16 +237,14 @@ impl Tui {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if text.contains('\n') {
             // Multi-line paste: write to temp file and attach
-            match Self::write_paste_temp_file(&text) {
+            match self.write_paste_to_attachment_dir(&text) {
                 Ok(attachment) => {
                     self.app.attachments.push(attachment);
                 }
                 Err(err) => {
-                    self.app
-                        .transcript
-                        .push(crate::tui::types::TranscriptEntry::Error(format!(
-                            "Failed to save pasted text: {err}"
-                        )));
+                    self.app.transcript.push(TranscriptEntry::Error(format!(
+                        "Failed to save pasted text: {err}"
+                    )));
                 }
             }
         } else {
@@ -222,17 +253,20 @@ impl Tui {
         }
     }
 
-    fn write_paste_temp_file(text: &str) -> std::io::Result<crate::tui::types::Attachment> {
+    fn write_paste_to_attachment_dir(
+        &mut self,
+        text: &str,
+    ) -> std::io::Result<crate::tui::types::Attachment> {
         use std::io::Write;
-        let short_id = &uuid::Uuid::new_v4().to_string()[..8];
-        let filename = format!("paste-{short_id}.txt");
-        let path = std::env::temp_dir().join(&filename);
+        let dir = self.ensure_attachment_dir()?;
+        self.app.paste_count += 1;
+        let filename = format!("paste-{}.txt", self.app.paste_count);
+        let path = dir.join(&filename);
         let mut f = std::fs::File::create(&path)?;
         f.write_all(text.as_bytes())?;
         Ok(crate::tui::types::Attachment {
             path,
             display_name: filename,
-            temp: true,
         })
     }
 
@@ -334,7 +368,12 @@ impl Tui {
                         self.run_repl_command(&pending.text).await?;
                         self.refresh_input_chrome();
                     } else {
-                        self.start_prompt(pending.text, pending.attachments).await?;
+                        self.start_prompt(
+                            pending.text,
+                            pending.attachments,
+                            pending.attachment_dir,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -356,7 +395,12 @@ impl Tui {
                         self.run_repl_command(&pending.text).await?;
                         self.refresh_input_chrome();
                     } else {
-                        self.start_prompt(pending.text, pending.attachments).await?;
+                        self.start_prompt(
+                            pending.text,
+                            pending.attachments,
+                            pending.attachment_dir,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -368,6 +412,7 @@ impl Tui {
         &mut self,
         text: String,
         attachments: Vec<crate::tui::types::Attachment>,
+        attachment_dir: Option<std::path::PathBuf>,
     ) -> Result<()> {
         self.app.llm_busy = true;
 
@@ -383,6 +428,7 @@ impl Tui {
                 config,
                 text,
                 attachments,
+                attachment_dir,
                 abort_signal,
                 async_manager,
                 persistent_manager,

@@ -9,6 +9,7 @@ impl Tui {
         self.app.pending_message = Some(crate::tui::types::PendingMessage {
             text: text.clone(),
             attachments: vec![],
+            attachment_dir: None,
         });
         // Also set the input text so it remains visible (new behavior)
         self.set_input_text(&text);
@@ -66,6 +67,8 @@ impl Tui {
                 history_index: None,
                 history_draft: String::new(),
                 attachments: vec![],
+                attachment_dir: None,
+                paste_count: 0,
                 last_known_input_width: 1,
             },
             event_tx,
@@ -234,6 +237,6 @@ impl Tui {
             "↩ Async resume: {context}"
         )));
         self.pin_transcript_to_bottom();
-        self.start_prompt(context, vec![]).await
+        self.start_prompt(context, vec![], None).await
     }
 }

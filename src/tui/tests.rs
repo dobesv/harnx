@@ -224,7 +224,7 @@ async fn test_basic_message_and_streaming_response() {
         .push(TranscriptEntry::User("Test message".to_string()));
     harness
         .tui()
-        .start_prompt("Test message".to_string(), vec![])
+        .start_prompt("Test message".to_string(), vec![], None)
         .await
         .unwrap();
 
@@ -315,7 +315,7 @@ async fn test_streaming_with_tool_calls() {
         .push(TranscriptEntry::User("What is the answer?".to_string()));
     harness
         .tui()
-        .start_prompt("What is the answer?".to_string(), vec![])
+        .start_prompt("What is the answer?".to_string(), vec![], None)
         .await
         .unwrap();
 
@@ -404,7 +404,7 @@ async fn test_sub_agent_delegation_tool_appears() {
         .push(TranscriptEntry::User("Help me".to_string()));
     harness
         .tui()
-        .start_prompt("Help me".to_string(), vec![])
+        .start_prompt("Help me".to_string(), vec![], None)
         .await
         .unwrap();
 
@@ -505,7 +505,7 @@ async fn test_screen_overflow_and_word_wrap() {
         .push(TranscriptEntry::User(user_message.to_string()));
     harness
         .tui()
-        .start_prompt(user_message.to_string(), vec![])
+        .start_prompt(user_message.to_string(), vec![], None)
         .await
         .unwrap();
 
@@ -607,7 +607,7 @@ async fn test_ctrl_c_cancels_streaming() {
         .push(TranscriptEntry::User("Long request".to_string()));
     harness
         .tui()
-        .start_prompt("Long request".to_string(), vec![])
+        .start_prompt("Long request".to_string(), vec![], None)
         .await
         .unwrap();
 
@@ -680,7 +680,7 @@ async fn test_streaming_error_shows_in_transcript() {
     // The error should propagate through start_prompt
     let result = harness
         .tui()
-        .start_prompt("Error test".to_string(), vec![])
+        .start_prompt("Error test".to_string(), vec![], None)
         .await;
 
     let _ = result; // start_prompt always returns Ok (spawns a task)
@@ -737,7 +737,7 @@ async fn test_cancel_during_tool_execution() {
         .push(TranscriptEntry::User("Search test".to_string()));
     harness
         .tui()
-        .start_prompt("Search test".to_string(), vec![])
+        .start_prompt("Search test".to_string(), vec![], None)
         .await
         .unwrap();
 
@@ -794,16 +794,17 @@ async fn paste_multiline_creates_temp_attachment() {
     let text = tui.app.input.lines().join("\n");
     assert_eq!(text, "", "Multi-line paste should not go into textarea");
 
-    // Instead it should create a temp file attachment
+    // Instead it should create a temp file attachment in the attachment dir
     assert_eq!(tui.app.attachments.len(), 1, "Should create one attachment");
     assert!(
-        tui.app.attachments[0].temp,
-        "Attachment should be marked temp"
+        tui.app.attachment_dir.is_some(),
+        "Should create attachment dir"
     );
     assert!(
         tui.app.attachments[0].path.exists(),
         "Temp file should exist"
     );
+    assert_eq!(tui.app.attachments[0].display_name, "paste-1.txt");
 
     // The temp file should contain the pasted text
     let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
@@ -822,7 +823,7 @@ async fn paste_multiline_creates_temp_attachment() {
     );
 
     // Cleanup
-    tui.app.attachments[0].cleanup();
+    tui.cleanup_attachments();
 }
 
 #[tokio::test]
@@ -839,15 +840,13 @@ async fn paste_multiline_with_cr_creates_temp_attachment() {
         1,
         "CR-separated paste should create attachment"
     );
-    assert!(tui.app.attachments[0].temp);
-
     let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
     assert_eq!(
         contents, "line one\nline two\nline three",
         "CRs should be normalized to LFs"
     );
 
-    tui.app.attachments[0].cleanup();
+    tui.cleanup_attachments();
 }
 
 #[tokio::test]
@@ -864,7 +863,6 @@ async fn paste_multiline_with_crlf_creates_temp_attachment() {
         1,
         "CRLF paste should create attachment"
     );
-    assert!(tui.app.attachments[0].temp);
 
     let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
     assert_eq!(
@@ -872,7 +870,7 @@ async fn paste_multiline_with_crlf_creates_temp_attachment() {
         "CRLFs should be normalized to LFs"
     );
 
-    tui.app.attachments[0].cleanup();
+    tui.cleanup_attachments();
 }
 
 #[tokio::test]
@@ -914,7 +912,7 @@ async fn paste_then_erase_then_paste_different_text() {
 }
 
 #[tokio::test]
-async fn detach_cleans_up_temp_file() {
+async fn detach_cleans_up_temp_dir() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
@@ -922,7 +920,9 @@ async fn detach_cleans_up_temp_file() {
     // Paste multi-line to create a temp attachment
     tui.handle_paste("line one\nline two".to_string());
     assert_eq!(tui.app.attachments.len(), 1);
+    let temp_dir = tui.app.attachment_dir.clone().unwrap();
     let temp_path = tui.app.attachments[0].path.clone();
+    assert!(temp_dir.exists(), "Temp dir should exist before detach");
     assert!(temp_path.exists(), "Temp file should exist before detach");
 
     // Detach all
@@ -932,6 +932,11 @@ async fn detach_cleans_up_temp_file() {
         .unwrap();
 
     assert!(tui.app.attachments.is_empty());
+    assert!(tui.app.attachment_dir.is_none());
+    assert!(
+        !temp_dir.exists(),
+        "Temp dir should be deleted after detach"
+    );
     assert!(
         !temp_path.exists(),
         "Temp file should be deleted after detach"
@@ -947,7 +952,6 @@ async fn attachment_footer_shows_attached_files() {
     harness.tui().app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/photo.png"),
         display_name: "photo.png".to_string(),
-        temp: false,
     });
     harness.render();
 
@@ -1058,12 +1062,10 @@ async fn detach_clears_all_attachments() {
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/a.txt"),
         display_name: "a.txt".to_string(),
-        temp: false,
     });
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/b.txt"),
         display_name: "b.txt".to_string(),
-        temp: false,
     });
 
     tui.set_input_text(".detach");
@@ -1086,12 +1088,10 @@ async fn detach_by_name_removes_specific_attachment() {
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/a.txt"),
         display_name: "a.txt".to_string(),
-        temp: false,
     });
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/b.txt"),
         display_name: "b.txt".to_string(),
-        temp: false,
     });
 
     tui.set_input_text(".detach a.txt");
@@ -1115,7 +1115,6 @@ async fn submit_drains_attachments() {
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/test.txt"),
         display_name: "test.txt".to_string(),
-        temp: false,
     });
     tui.set_input_text("Analyze this file");
 
@@ -1160,7 +1159,7 @@ async fn test_recovery_after_cancellation() {
         .push(TranscriptEntry::User("First request".to_string()));
     harness
         .tui()
-        .start_prompt("First request".to_string(), vec![])
+        .start_prompt("First request".to_string(), vec![], None)
         .await
         .unwrap();
 
@@ -1226,7 +1225,7 @@ async fn test_recovery_after_cancellation() {
         .push(TranscriptEntry::User("Second request".to_string()));
     harness
         .tui()
-        .start_prompt("Second request".to_string(), vec![])
+        .start_prompt("Second request".to_string(), vec![], None)
         .await
         .unwrap();
 
@@ -1275,12 +1274,10 @@ async fn detach_completes_attachment_names() {
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/photo.png"),
         display_name: "photo.png".to_string(),
-        temp: false,
     });
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/data.csv"),
         display_name: "data.csv".to_string(),
-        temp: false,
     });
 
     let completions = tui.compute_completions(".detach ", 8);
