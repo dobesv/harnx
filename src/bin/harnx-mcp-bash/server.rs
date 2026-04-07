@@ -4,6 +4,11 @@ use harnx::mcp_safety::{
 };
 
 use fancy_regex::Regex;
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{TokioChildWrapper, TokioCommandWrap};
 use rmcp::model::{
     CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
     PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool,
@@ -20,17 +25,13 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
-
-// ---------------------------------------------------------------------------
-// Parameter structs
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Deserialize)]
 struct ExecCommandParams {
     command: String,
@@ -196,7 +197,7 @@ impl JsonSchema for TerminateParams {
 // ---------------------------------------------------------------------------
 
 struct SpawnedProcess {
-    child: tokio::process::Child,
+    child: Box<dyn TokioChildWrapper>,
     command: String,
     working_dir: PathBuf,
     log_path: PathBuf,
@@ -364,22 +365,30 @@ impl BashServer {
                 ))
             })?;
 
-        let mut child = Command::new("bash")
-            .args(["-c", &params.command])
-            .current_dir(&working_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
+        let mut command = TokioCommandWrap::with_new("bash", |command| {
+            command
+                .args(["-c", &params.command])
+                .current_dir(&working_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+        });
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        command.wrap(JobObject);
+
+        let mut child = command
             .spawn()
             .map_err(|err| internal_error(format!("failed to spawn command: {err}")))?;
 
         let stdout = child
-            .stdout
+            .stdout()
             .take()
             .ok_or_else(|| internal_error("failed to capture stdout"))?;
         let stderr = child
-            .stderr
+            .stderr()
             .take()
             .ok_or_else(|| internal_error("failed to capture stderr"))?;
 
@@ -387,14 +396,18 @@ impl BashServer {
         let stderr_task = tokio::spawn(read_pipe_to_file(stderr, stderr_file));
 
         let timeout = Duration::from_secs(timeout_secs);
-        let timed_out = match tokio::time::timeout(timeout, child.wait()).await {
+        let timed_out = match tokio::time::timeout(timeout, async {
+            Box::into_pin(child.wait()).await
+        })
+        .await
+        {
             Ok(Ok(status)) => Some(status),
             Ok(Err(err)) => {
                 return Err(internal_error(format!("failed waiting for command: {err}")));
             }
             Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                let _ = child.start_kill();
+                let _ = Box::into_pin(child.wait()).await;
                 None
             }
         };
@@ -636,12 +649,20 @@ impl BashServer {
             .try_clone()
             .map_err(|err| internal_error(format!("failed to clone log file handle: {err}")))?;
 
-        let child = Command::new("bash")
-            .args(["-c", &params.command])
-            .current_dir(&working_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_err))
+        let mut command = TokioCommandWrap::with_new("bash", |command| {
+            command
+                .args(["-c", &params.command])
+                .current_dir(&working_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(log_file_err));
+        });
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        command.wrap(JobObject);
+
+        let child = command
             .spawn()
             .map_err(|err| internal_error(format!("failed to spawn command: {err}")))?;
 
@@ -699,7 +720,8 @@ impl BashServer {
         };
 
         let timeout = Duration::from_secs(timeout_secs);
-        let wait_result = tokio::time::timeout(timeout, child.wait()).await;
+        let wait_result =
+            tokio::time::timeout(timeout, async { Box::into_pin(child.wait()).await }).await;
 
         let log_tail = read_log_tail(&log_path, tail_line_count);
 
@@ -782,15 +804,12 @@ impl BashServer {
                 )
             })?;
 
-            let raw_pid = params.pid as i32;
-            let ret = unsafe { libc::kill(raw_pid, signum) };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(internal_error(format!(
+            entry.child.signal(signum).map_err(|err| {
+                internal_error(format!(
                     "failed to send {signal_name} to pid {}: {err}",
                     params.pid
-                )));
-            }
+                ))
+            })?;
 
             let mut output = String::new();
             let _ = writeln!(output, "pid: {}", params.pid);
