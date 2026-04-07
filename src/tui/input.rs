@@ -184,8 +184,7 @@ impl Tui {
         // Remove the last line (the command) and restore remaining text
         let remaining_text = {
             let lines = self.app.input.lines();
-            let remaining: Vec<String> =
-                lines[..lines.len() - 1].to_vec();
+            let remaining: Vec<String> = lines[..lines.len() - 1].to_vec();
             remaining.join("\n")
         };
         self.set_input_text(&remaining_text);
@@ -201,6 +200,8 @@ impl Tui {
         if !self.app.completions.is_empty() {
             self.app.completions.clear();
         }
+        // Normalize line endings: \r\n -> \n, then \r -> \n
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if text.contains('\n') {
             // Multi-line paste: write to temp file and attach
             match Self::write_paste_temp_file(&text) {

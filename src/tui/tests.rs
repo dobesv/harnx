@@ -826,6 +826,56 @@ async fn paste_multiline_creates_temp_attachment() {
 }
 
 #[tokio::test]
+async fn paste_multiline_with_cr_creates_temp_attachment() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // Some terminals send \r instead of \n for newlines in paste
+    tui.handle_paste("line one\rline two\rline three".to_string());
+
+    assert_eq!(
+        tui.app.attachments.len(),
+        1,
+        "CR-separated paste should create attachment"
+    );
+    assert!(tui.app.attachments[0].temp);
+
+    let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
+    assert_eq!(
+        contents, "line one\nline two\nline three",
+        "CRs should be normalized to LFs"
+    );
+
+    tui.app.attachments[0].cleanup();
+}
+
+#[tokio::test]
+async fn paste_multiline_with_crlf_creates_temp_attachment() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // Windows-style line endings
+    tui.handle_paste("line one\r\nline two\r\nline three".to_string());
+
+    assert_eq!(
+        tui.app.attachments.len(),
+        1,
+        "CRLF paste should create attachment"
+    );
+    assert!(tui.app.attachments[0].temp);
+
+    let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
+    assert_eq!(
+        contents, "line one\nline two\nline three",
+        "CRLFs should be normalized to LFs"
+    );
+
+    tui.app.attachments[0].cleanup();
+}
+
+#[tokio::test]
 async fn paste_single_line_inserts_inline() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
