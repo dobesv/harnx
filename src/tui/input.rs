@@ -76,7 +76,6 @@ impl Tui {
                             attachments: std::mem::take(&mut self.app.attachments),
                             attachment_dir: self.app.attachment_dir.take(),
                         });
-                        self.app.paste_count = 0;
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through repl command handler
@@ -96,7 +95,6 @@ impl Tui {
                             attachments: std::mem::take(&mut self.app.attachments),
                             attachment_dir: self.app.attachment_dir.take(),
                         };
-                        self.app.paste_count = 0;
                         self.start_prompt(msg).await?;
                     }
                 }
@@ -144,7 +142,6 @@ impl Tui {
     /// Clean up the attachment temp directory and reset attachment state.
     pub(super) fn cleanup_attachments(&mut self) {
         self.app.attachments.clear();
-        self.app.paste_count = 0;
         if let Some(dir) = self.app.attachment_dir.take() {
             crate::tui::types::cleanup_attachment_dir(&dir);
         }
@@ -262,8 +259,8 @@ impl Tui {
     ) -> std::io::Result<crate::tui::types::Attachment> {
         use std::io::Write;
         let dir = self.ensure_attachment_dir()?;
-        self.app.paste_count += 1;
-        let filename = format!("paste-{}.txt", self.app.paste_count);
+        let n = self.app.attachments.len() + 1;
+        let filename = format!("paste-{n}.txt");
         let path = dir.join(&filename);
         let mut f = std::fs::File::create(&path)?;
         f.write_all(text.as_bytes())?;

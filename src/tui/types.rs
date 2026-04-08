@@ -70,7 +70,6 @@ pub(super) struct App {
     /// Temp directory holding copies of all current attachments. Created on
     /// first attach, removed recursively on submit or full detach.
     pub(super) attachment_dir: Option<PathBuf>,
-    pub(super) paste_count: usize,
     pub(super) last_known_input_width: u16,
 }
 
