@@ -479,21 +479,6 @@ async fn test_basic_message_and_streaming_response() {
         .any(|entry| matches!(entry, TranscriptEntry::User(text) if text == "Test message")));
 
     let rendered = normalize_screen(&harness.screen_contents());
-    let session_name = harness
-        .tui()
-        .config
-        .read()
-        .session
-        .as_ref()
-        .map(|s| s.name().to_string());
-    let expected_status = match session_name {
-        Some(name) => format!("• 🤖  test-agent ▸ {name}   💬  15"),
-        None => "• 🤖  test-agent".to_string(),
-    };
-    assert!(
-        rendered.contains(&expected_status),
-        "expected rendered screen to contain status line `{expected_status}`, got: {rendered}"
-    );
     insta::assert_snapshot!("basic_message_and_streaming_response", rendered);
 
     harness.drain_and_settle().await.unwrap();
