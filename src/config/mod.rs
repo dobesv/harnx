@@ -418,7 +418,7 @@ impl Default for Config {
             cmd_default_session: None,
             agent_default_session: None,
 
-            save_session: None,
+            save_session: Some(true),
             compress_threshold: 180000,
             summarize_prompt: None,
             summary_prompt: None,
@@ -1311,6 +1311,7 @@ impl Config {
             }
         }
         let mut new_session = false;
+        let sessions_dir = self.sessions_dir();
         if let Some(session) = session.as_mut() {
             if session.is_empty() {
                 new_session = true;
@@ -1334,6 +1335,9 @@ impl Config {
                     }
                 }
             }
+            // Store sessions_dir so the log file can be lazily initialized
+            // on the first event (avoids creating empty files in tests).
+            session.set_sessions_dir(sessions_dir);
         }
         self.session = session;
         self.init_agent_session_variables(new_session)?;
@@ -1911,7 +1915,7 @@ impl Config {
             WorkingMode::Repl => self.repl_default_session.as_ref(),
             WorkingMode::Cmd => self.cmd_default_session.as_ref(),
             WorkingMode::Serve => return Ok(()),
-            WorkingMode::Acp(_) => return Ok(()),
+            WorkingMode::Acp(_) => self.agent_default_session.as_ref(),
         };
         let default_session = match default_session {
             Some(v) => {

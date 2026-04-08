@@ -6,15 +6,58 @@ use crate::render::MarkdownRender;
 
 use anyhow::{bail, Context, Result};
 use fancy_regex::Regex;
-use inquire::{validator::Validation, Confirm, Text};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs::{read_to_string, write};
+use std::fs::{read_to_string, write, OpenOptions};
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::LazyLock;
 
 static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
+
+/// A single entry in the append-only session log file.
+///
+/// Session files use multi-document YAML (separated by `---`).
+/// The first document is always a `Header`; subsequent documents are events.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum SessionLogEntry {
+    #[serde(rename = "header")]
+    Header {
+        #[serde(rename = "model")]
+        model_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        temperature: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        top_p: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        use_tools: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        save_session: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compress_threshold: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_name: Option<String>,
+        #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+        agent_variables: AgentVariables,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        agent_instructions: String,
+    },
+    #[serde(rename = "message")]
+    Message {
+        role: MessageRole,
+        content: MessageContent,
+    },
+    #[serde(rename = "data_urls")]
+    DataUrls {
+        urls: HashMap<String, String>,
+    },
+    #[serde(rename = "compress")]
+    Compress { prompt: String },
+    #[serde(rename = "clear")]
+    Clear,
+}
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Session {
@@ -65,6 +108,10 @@ pub struct Session {
     #[serde(skip)]
     autoname: Option<AutoName>,
     #[serde(skip)]
+    sessions_dir: Option<PathBuf>,
+    #[serde(skip)]
+    resolved_save_name: Option<(PathBuf, String)>,
+    #[serde(skip)]
     tokens: usize,
     #[serde(skip)]
     completion_usage: CompletionTokenUsage,
@@ -86,14 +133,92 @@ impl Session {
     pub fn load(config: &Config, name: &str, path: &Path) -> Result<Self> {
         let content = read_to_string(path)
             .with_context(|| format!("Failed to load session {} at {}", name, path.display()))?;
-        let mut session: Self =
-            serde_yaml::from_str(&content).with_context(|| format!("Invalid session {name}"))?;
+
+        // Detect format: new log format has "type: header" as the first
+        // meaningful line. Old format files are silently treated as empty
+        // sessions (no crash, but content is not loaded).
+        let session = if Self::is_log_format(&content) {
+            Self::load_from_log(config, name, path, &content)?
+        } else {
+            // Old format: create a fresh session so we don't crash.
+            let mut session = Self::new(config, name);
+            Self::apply_name_and_path(&mut session, name, path, config);
+            session
+        };
+
+        Ok(session)
+    }
+
+    fn is_log_format(content: &str) -> bool {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == "---" {
+                continue;
+            }
+            return trimmed == "type: header";
+        }
+        false
+    }
+
+    fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Result<Self> {
+        let mut session = Self::default();
+
+        for document in serde_yaml::Deserializer::from_str(content) {
+            let entry = SessionLogEntry::deserialize(document)
+                .with_context(|| format!("Invalid log entry in session {name}"))?;
+            match entry {
+                SessionLogEntry::Header {
+                    model_id,
+                    temperature,
+                    top_p,
+                    use_tools,
+                    save_session,
+                    compress_threshold,
+                    agent_name,
+                    agent_variables,
+                    agent_instructions,
+                } => {
+                    session.model_id = model_id;
+                    session.temperature = temperature;
+                    session.top_p = top_p;
+                    session.use_tools = use_tools;
+                    session.save_session = save_session;
+                    session.compress_threshold = compress_threshold;
+                    session.agent_name = agent_name;
+                    session.agent_variables = agent_variables;
+                    session.agent_instructions = agent_instructions;
+                }
+                SessionLogEntry::Message { role, content } => {
+                    session.messages.push(Message::new(role, content));
+                }
+                SessionLogEntry::DataUrls { urls } => {
+                    session.data_urls.extend(urls);
+                }
+                SessionLogEntry::Compress { prompt } => {
+                    session.compressed_messages.append(&mut session.messages);
+                    session.messages.push(Message::new(
+                        MessageRole::System,
+                        MessageContent::Text(prompt),
+                    ));
+                }
+                SessionLogEntry::Clear => {
+                    session.messages.clear();
+                    session.compressed_messages.clear();
+                    session.data_urls.clear();
+                }
+            }
+        }
 
         session.model = Model::retrieve_model(config, &session.model_id, ModelType::Chat)?;
+        Self::apply_name_and_path(&mut session, name, path, config);
+        session.update_tokens();
+        Ok(session)
+    }
 
+    fn apply_name_and_path(session: &mut Self, name: &str, path: &Path, config: &Config) {
         if let Some(autoname) = name.strip_prefix("_/") {
             session.name = TEMP_SESSION_NAME.to_string();
-            session.path = None;
+            session.path = Some(path.display().to_string());
             if let Ok(true) = RE_AUTONAME_PREFIX.is_match(autoname) {
                 session.autoname = Some(AutoName::new(autoname[16..].to_string()));
             }
@@ -106,20 +231,106 @@ impl Session {
         if let Some(agent_name) = &session.agent_name {
             if let Ok(agent) = config.retrieve_agent(agent_name) {
                 session.agent_prompt = agent.interpolated_instructions();
-                // Re-apply the agent's use_tools when the saved session doesn't
-                // have its own.  Older sessions (or sessions saved before the
-                // agent had use_tools configured) would deserialize with None,
-                // causing `.info tools` to show everything as disabled even
-                // though the tools actually still work via select_tools().
                 if session.use_tools.is_none() {
                     session.use_tools = agent.use_tools();
                 }
             }
         }
+    }
 
-        session.update_tokens();
+    pub fn set_sessions_dir(&mut self, dir: PathBuf) {
+        self.sessions_dir = Some(dir);
+    }
 
-        Ok(session)
+    /// Initialize the session log file with a header entry.
+    /// Called lazily on the first append_event when a path hasn't been
+    /// established yet.  Best-effort: filesystem errors are silently
+    /// ignored so the session can still be used in-memory.
+    fn ensure_log_file(&mut self) {
+        if self.save_session == Some(false) {
+            return;
+        }
+        if self.path.is_some() {
+            return;
+        }
+        let Some(sessions_dir) = self.sessions_dir.clone() else {
+            return;
+        };
+
+        let (dir, session_name) = self.resolve_save_path(&sessions_dir);
+        let session_path = dir.join(format!("{session_name}.yaml"));
+        if ensure_parent_exists(&session_path).is_err() {
+            return;
+        }
+
+        let header = self.build_header_entry();
+        let Ok(content) = serde_yaml::to_string(&header) else {
+            return;
+        };
+        if write(&session_path, &content).is_ok() {
+            self.path = Some(session_path.display().to_string());
+        }
+    }
+
+    /// Append a log entry to the session file.
+    /// Lazily initializes the log file on the first call.
+    /// Returns true if the entry was successfully written.
+    fn append_event(&mut self, entry: &SessionLogEntry) -> bool {
+        self.ensure_log_file();
+        let Some(path_str) = &self.path else {
+            return false;
+        };
+        let path = Path::new(path_str);
+        let Ok(yaml) = serde_yaml::to_string(entry) else {
+            return false;
+        };
+        let mut data = String::from("---\n");
+        data.push_str(&yaml);
+        let Ok(mut file) = OpenOptions::new().append(true).open(path) else {
+            return false;
+        };
+        file.write_all(data.as_bytes()).is_ok()
+    }
+
+    fn build_header_entry(&self) -> SessionLogEntry {
+        SessionLogEntry::Header {
+            model_id: self.model_id.clone(),
+            temperature: self.temperature,
+            top_p: self.top_p,
+            use_tools: self.use_tools.clone(),
+            save_session: self.save_session,
+            compress_threshold: self.compress_threshold,
+            agent_name: self.agent_name.clone(),
+            agent_variables: self.agent_variables.clone(),
+            agent_instructions: self.agent_instructions.clone(),
+        }
+    }
+
+    fn resolve_save_path(&mut self, session_dir: &Path) -> (PathBuf, String) {
+        if let Some((dir, name)) = self.resolved_save_name.clone() {
+            // Update the cached name with autoname if it arrived since
+            // the first resolution.
+            if self.name == TEMP_SESSION_NAME && !name.contains('-') {
+                if let Some(autoname) = self.autoname() {
+                    let name = format!("{name}-{autoname}");
+                    self.resolved_save_name = Some((dir.clone(), name.clone()));
+                    return (dir, name);
+                }
+            }
+            return (dir, name);
+        }
+        let mut dir = session_dir.to_path_buf();
+        let mut name = self.name.clone();
+        if name == TEMP_SESSION_NAME {
+            dir = dir.join("_");
+            let now = chrono::Local::now();
+            name = now.format("%Y%m%dT%H%M%S").to_string();
+            if let Some(autoname) = self.autoname() {
+                name = format!("{name}-{autoname}");
+            }
+        }
+        self.resolved_save_name = Some((dir.clone(), name.clone()));
+        (dir, name)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -372,10 +583,12 @@ impl Session {
         self.compressed_messages.append(&mut self.messages);
         self.messages.push(Message::new(
             MessageRole::System,
-            MessageContent::Text(prompt),
+            MessageContent::Text(prompt.clone()),
         ));
-        self.dirty = true;
         self.update_tokens();
+        if !self.append_event(&SessionLogEntry::Compress { prompt }) {
+            self.dirty = true;
+        }
     }
 
     pub fn need_autoname(&self) -> bool {
@@ -405,60 +618,93 @@ impl Session {
     }
 
     pub fn exit(&mut self, session_dir: &Path, is_repl: bool) -> Result<()> {
-        let mut save_session = self.save_session();
-        if self.save_session_this_time {
-            save_session = Some(true);
+        if self.save_session == Some(false) && !self.save_session_this_time {
+            return Ok(());
         }
-        if self.dirty && save_session != Some(false) {
-            let mut session_dir = session_dir.to_path_buf();
-            let mut session_name = self.name().to_string();
-            if save_session.is_none() {
-                if !is_repl {
-                    return Ok(());
-                }
-                let ans = Confirm::new("Save session?").with_default(false).prompt()?;
-                if !ans {
-                    return Ok(());
-                }
-                if session_name == TEMP_SESSION_NAME {
-                    session_name = Text::new("Session name:")
-                        .with_validator(|input: &str| {
-                            let input = input.trim();
-                            if input.is_empty() {
-                                Ok(Validation::Invalid("This name is required".into()))
-                            } else if input == TEMP_SESSION_NAME {
-                                Ok(Validation::Invalid("This name is reserved".into()))
-                            } else {
-                                Ok(Validation::Valid)
-                            }
-                        })
-                        .prompt()?;
-                }
-            } else if save_session == Some(true) && session_name == TEMP_SESSION_NAME {
-                session_dir = session_dir.join("_");
-                ensure_parent_exists(&session_dir).with_context(|| {
-                    format!("Failed to create directory '{}'", session_dir.display())
-                })?;
-
-                let now = chrono::Local::now();
-                session_name = now.format("%Y%m%dT%H%M%S").to_string();
-                if let Some(autoname) = self.autoname() {
-                    session_name = format!("{session_name}-{autoname}")
+        if !self.dirty {
+            // Nothing new to persist, but print the path if the log file exists.
+            if is_repl {
+                if let Some(path) = &self.path {
+                    println!("✓ Session saved at '{path}'.");
                 }
             }
-            let session_path = session_dir.join(format!("{session_name}.yaml"));
-            self.save(&session_name, &session_path, is_repl)?;
+            return Ok(());
         }
+        // Session has unsaved changes that were not yet appended (e.g. legacy
+        // callers or sessions that didn't go through init_log). Do a full save.
+        let (session_dir, session_name) = self.resolve_save_path(session_dir);
+        let session_path = session_dir.join(format!("{session_name}.yaml"));
+        self.save(&session_name, &session_path, is_repl)?;
         Ok(())
     }
 
+    /// Full save: rewrites the entire session file in log format.
+    /// Used as a fallback when events were not incrementally appended.
     pub fn save(&mut self, session_name: &str, session_path: &Path, is_repl: bool) -> Result<()> {
         ensure_parent_exists(session_path)?;
 
         self.path = Some(session_path.display().to_string());
 
-        let content = serde_yaml::to_string(&self)
-            .with_context(|| format!("Failed to serde session '{}'", self.name))?;
+        // Write in the new log format.
+        let mut content = serde_yaml::to_string(&self.build_header_entry())
+            .with_context(|| format!("Failed to serialize session header for '{}'", self.name))?;
+        for msg in &self.compressed_messages {
+            let entry = SessionLogEntry::Message {
+                role: msg.role,
+                content: msg.content.clone(),
+            };
+            content.push_str("---\n");
+            content.push_str(
+                &serde_yaml::to_string(&entry)
+                    .with_context(|| format!("Failed to serialize message in '{}'", self.name))?,
+            );
+        }
+        if !self.compressed_messages.is_empty() {
+            // Write a compress entry to mark the boundary.
+            if let Some(system_msg) = self.messages.first() {
+                if system_msg.role == MessageRole::System {
+                    let compress_entry = SessionLogEntry::Compress {
+                        prompt: system_msg.content.to_text(),
+                    };
+                    content.push_str("---\n");
+                    content.push_str(&serde_yaml::to_string(&compress_entry).with_context(
+                        || format!("Failed to serialize compress entry in '{}'", self.name),
+                    )?);
+                }
+            }
+            // Write remaining messages (skip the system message from compress).
+            for msg in self.messages.iter().skip(1) {
+                let entry = SessionLogEntry::Message {
+                    role: msg.role,
+                    content: msg.content.clone(),
+                };
+                content.push_str("---\n");
+                content.push_str(&serde_yaml::to_string(&entry).with_context(|| {
+                    format!("Failed to serialize message in '{}'", self.name)
+                })?);
+            }
+        } else {
+            for msg in &self.messages {
+                let entry = SessionLogEntry::Message {
+                    role: msg.role,
+                    content: msg.content.clone(),
+                };
+                content.push_str("---\n");
+                content.push_str(&serde_yaml::to_string(&entry).with_context(|| {
+                    format!("Failed to serialize message in '{}'", self.name)
+                })?);
+            }
+        }
+        if !self.data_urls.is_empty() {
+            let entry = SessionLogEntry::DataUrls {
+                urls: self.data_urls.clone(),
+            };
+            content.push_str("---\n");
+            content.push_str(&serde_yaml::to_string(&entry).with_context(|| {
+                format!("Failed to serialize data_urls in '{}'", self.name)
+            })?);
+        }
+
         write(session_path, content).with_context(|| {
             format!(
                 "Failed to write session '{}' to '{}'",
@@ -499,39 +745,71 @@ impl Session {
                     *text = format!("{text}{output}");
                 }
             }
+            // Continue/regenerate are edits to the last message; mark dirty
+            // so the full-save fallback can persist them. We don't append
+            // because they modify an existing entry.
+            self.dirty = true;
         } else if input.regenerate() {
             if let Some(message) = self.messages.last_mut() {
                 if let MessageContent::Text(text) = &mut message.content {
                     *text = output.to_string();
                 }
             }
+            self.dirty = true;
         } else {
+            let mut all_appended = true;
             if self.messages.is_empty() {
-                if self.name == TEMP_SESSION_NAME && self.save_session == Some(true) {
+                if self.name == TEMP_SESSION_NAME && self.save_session != Some(false) {
                     let raw_input = input.raw();
                     let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
                     self.autoname = Some(AutoName::new_from_chat_history(chat_history));
                 }
-                self.messages.extend(input.agent().build_messages(input));
+                let agent_messages = input.agent().build_messages(input);
+                for msg in &agent_messages {
+                    all_appended &= self.append_event(&SessionLogEntry::Message {
+                        role: msg.role,
+                        content: msg.content.clone(),
+                    });
+                }
+                self.messages.extend(agent_messages);
             } else {
-                self.messages
-                    .push(Message::new(MessageRole::User, input.message_content()));
+                let user_msg = Message::new(MessageRole::User, input.message_content());
+                all_appended &= self.append_event(&SessionLogEntry::Message {
+                    role: user_msg.role,
+                    content: user_msg.content.clone(),
+                });
+                self.messages.push(user_msg);
             }
-            self.data_urls.extend(input.data_urls());
+            let new_data_urls = input.data_urls();
+            if !new_data_urls.is_empty() {
+                all_appended &= self.append_event(&SessionLogEntry::DataUrls {
+                    urls: new_data_urls.clone(),
+                });
+            }
+            self.data_urls.extend(new_data_urls);
             if let Some(tool_calls) = input.tool_calls().clone() {
-                self.messages.push(Message::new(
-                    MessageRole::Tool,
-                    MessageContent::ToolCalls(tool_calls),
-                ))
+                let tool_msg =
+                    Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls));
+                all_appended &= self.append_event(&SessionLogEntry::Message {
+                    role: tool_msg.role,
+                    content: tool_msg.content.clone(),
+                });
+                self.messages.push(tool_msg);
             }
             let content = match thought {
                 Some(v) => MessageContent::Text(format!("<think>\n{v}\n</think>\n{output}")),
                 _ => MessageContent::Text(output.to_string()),
             };
-            self.messages
-                .push(Message::new(MessageRole::Assistant, content));
+            let assistant_msg = Message::new(MessageRole::Assistant, content);
+            all_appended &= self.append_event(&SessionLogEntry::Message {
+                role: assistant_msg.role,
+                content: assistant_msg.content.clone(),
+            });
+            self.messages.push(assistant_msg);
+            // Only clear dirty if all events were appended; otherwise the
+            // full-save fallback in exit() will persist the data.
+            self.dirty = !all_appended;
         }
-        self.dirty = true;
         self.update_tokens();
         Ok(())
     }
@@ -542,8 +820,10 @@ impl Session {
         self.data_urls.clear();
         self.autoname = None;
         self.completion_usage = CompletionTokenUsage::default();
-        self.dirty = true;
         self.update_tokens();
+        if !self.append_event(&SessionLogEntry::Clear) {
+            self.dirty = true;
+        }
     }
 
     pub fn echo_messages(&self, input: &Input) -> String {
