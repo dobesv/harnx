@@ -1,9 +1,10 @@
 use agent_client_protocol::{self as acp, Client as _};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
 use uuid::Uuid;
 
 use crate::client::{Client, SseEvent, SseHandler};
-use crate::config::{GlobalConfig, Input};
+use crate::config::session::SessionLogEntry;
+use crate::config::{ensure_parent_exists, Config, GlobalConfig, Input};
 use crate::tool::{ToolCall, ToolResult};
 use crate::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
 
@@ -25,6 +26,23 @@ pub struct HarnxAgent {
 struct HarnxSession {
     id: String,
     abort_signal: AbortSignal,
+    log_path: Option<PathBuf>,
+}
+
+impl HarnxSession {
+    /// Append a session log entry to this session's log file.
+    fn append_log(&self, entry: &SessionLogEntry) {
+        let Some(path) = &self.log_path else { return };
+        let Ok(yaml) = serde_yaml::to_string(entry) else {
+            return;
+        };
+        let mut data = String::from("---\n");
+        data.push_str(&yaml);
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+            use std::io::Write as _;
+            let _ = file.write_all(data.as_bytes());
+        }
+    }
 }
 
 impl HarnxAgent {
@@ -39,6 +57,42 @@ impl HarnxAgent {
 
     pub fn set_connection(&self, conn: Rc<acp::AgentSideConnection>) {
         self.connection.replace(Some(conn));
+    }
+
+    /// Create a session log file for an ACP session and write the header.
+    /// Returns the log file path, or None if creation failed.
+    fn create_session_log(&self, session_id: &str) -> Option<PathBuf> {
+        let config = self.config.read();
+        let sessions_dir = Config::agent_data_dir(&self.agent_name).join("sessions").join("_");
+        drop(config);
+
+        let now = chrono::Local::now();
+        let name = now.format("%Y%m%dT%H%M%S").to_string();
+        let filename = format!("{name}-{}.yaml", &session_id[..8]);
+        let path = sessions_dir.join(&filename);
+        if ensure_parent_exists(&path).is_err() {
+            return None;
+        }
+
+        let agent = self
+            .config
+            .read()
+            .retrieve_agent(&self.agent_name)
+            .ok()?;
+        let header = SessionLogEntry::Header {
+            model_id: agent.model().id(),
+            temperature: agent.temperature(),
+            top_p: agent.top_p(),
+            use_tools: agent.use_tools(),
+            save_session: Some(true),
+            compress_threshold: None,
+            agent_name: Some(self.agent_name.clone()),
+            agent_variables: Default::default(),
+            agent_instructions: String::new(),
+        };
+        let content = serde_yaml::to_string(&header).ok()?;
+        std::fs::write(&path, &content).ok()?;
+        Some(path)
     }
 
     async fn send_text_chunk(&self, session_id: &str, text: &str) -> acp::Result<()> {
@@ -215,9 +269,11 @@ impl acp::Agent for HarnxAgent {
         _args: acp::NewSessionRequest,
     ) -> acp::Result<acp::NewSessionResponse> {
         let session_id = Uuid::new_v4().to_string();
+        let log_path = self.create_session_log(&session_id);
         let session = HarnxSession {
             id: session_id.clone(),
             abort_signal: AbortSignalInner::new(),
+            log_path,
         };
         self.sessions
             .borrow_mut()
@@ -256,6 +312,14 @@ impl acp::Agent for HarnxAgent {
             .create_client()
             .map_err(|e| acp::Error::new(-32603, format!("Failed to create client: {e}")))?;
 
+        // Log user prompt to session file.
+        {
+            let sessions = self.sessions.borrow();
+            if let Some(session) = sessions.get(session_key.as_str()) {
+                session.append_log(&SessionLogEntry::message_user(prompt_text.clone()));
+            }
+        }
+
         let mut round = 0u32;
         loop {
             if abort_signal.aborted() {
@@ -271,6 +335,15 @@ impl acp::Agent for HarnxAgent {
             };
 
             if tool_calls.is_empty() {
+                // Log final assistant response.
+                let sessions = self.sessions.borrow();
+                if let Some(session) = sessions.get(session_key.as_str()) {
+                    let content = match &thought {
+                        Some(t) => format!("<think>\n{t}\n</think>\n{output}"),
+                        None => output.clone(),
+                    };
+                    session.append_log(&SessionLogEntry::message_assistant(content));
+                }
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
             }
 

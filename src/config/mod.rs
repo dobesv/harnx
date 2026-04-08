@@ -1,6 +1,6 @@
 mod agent;
 mod input;
-mod session;
+pub mod session;
 
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};

@@ -59,6 +59,22 @@ pub enum SessionLogEntry {
     Clear,
 }
 
+impl SessionLogEntry {
+    pub fn message_user(text: String) -> Self {
+        Self::Message {
+            role: MessageRole::User,
+            content: MessageContent::Text(text),
+        }
+    }
+
+    pub fn message_assistant(text: String) -> Self {
+        Self::Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::Text(text),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Session {
     #[serde(rename(serialize = "model", deserialize = "model"))]
