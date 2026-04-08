@@ -52,6 +52,7 @@ impl Tui {
                 .border_style(Style::default()),
         );
         input.set_cursor_line_style(Style::default());
+        input.set_wrap_mode(ratatui_textarea::WrapMode::Word);
         // input.set_placeholder_text("Enter submits · Shift+Enter / Ctrl+J for newline");
         input
     }
