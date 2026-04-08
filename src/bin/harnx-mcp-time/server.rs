@@ -551,8 +551,10 @@ mod tests {
         });
 
         let result = peer
-            .call_tool(CallToolRequestParams::new("get_current_time")
-                .with_arguments(tool_args(serde_json::json!({ "timezone": "UTC" }))))
+            .call_tool(
+                CallToolRequestParams::new("get_current_time")
+                    .with_arguments(tool_args(serde_json::json!({ "timezone": "UTC" }))),
+            )
             .await
             .unwrap();
 

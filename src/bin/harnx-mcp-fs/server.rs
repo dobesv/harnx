@@ -1115,6 +1115,7 @@ fn search_file(
 mod tests {
     use super::*;
 
+    use harnx::mcp_safety::path_to_file_uri;
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
         CallToolRequestParams, ClientCapabilities, InitializeRequestParams, ListRootsResult, Root,
@@ -1174,11 +1175,12 @@ mod tests {
             &self,
             _cx: RequestContext<RoleClient>,
         ) -> Result<ListRootsResult, ErrorData> {
-            Ok(ListRootsResult::new(self
-                    .roots
+            Ok(ListRootsResult::new(
+                self.roots
                     .iter()
-                    .map(|root| Root::new(format!("file://{}", root.canonicalize().unwrap().display())))
-                    .collect()))
+                    .map(|root| Root::new(path_to_file_uri(&root.canonicalize().unwrap())))
+                    .collect(),
+            ))
         }
     }
 
@@ -1256,10 +1258,11 @@ mod tests {
         });
 
         let result = peer
-            .call_tool(CallToolRequestParams::new("read")
-                .with_arguments(tool_args(serde_json::json!({
+            .call_tool(CallToolRequestParams::new("read").with_arguments(tool_args(
+                serde_json::json!({
                     "path": file_path.to_string_lossy().to_string()
-                }))))
+                }),
+            )))
             .await
             .unwrap();
 
@@ -1288,20 +1291,22 @@ mod tests {
         });
 
         let write_result = peer
-            .call_tool(CallToolRequestParams::new("write")
-                .with_arguments(tool_args(serde_json::json!({
+            .call_tool(
+                CallToolRequestParams::new("write").with_arguments(tool_args(serde_json::json!({
                     "path": file_path.to_string_lossy().to_string(),
                     "content": "hello\nworld\n"
-                }))))
+                }))),
+            )
             .await
             .unwrap();
         assert_eq!(write_result.is_error, Some(false));
 
         let read_result = peer
-            .call_tool(CallToolRequestParams::new("read")
-                .with_arguments(tool_args(serde_json::json!({
+            .call_tool(CallToolRequestParams::new("read").with_arguments(tool_args(
+                serde_json::json!({
                     "path": file_path.to_string_lossy().to_string()
-                }))))
+                }),
+            )))
             .await
             .unwrap();
 
@@ -1330,12 +1335,13 @@ mod tests {
         });
 
         let edit_result = peer
-            .call_tool(CallToolRequestParams::new("edit")
-                .with_arguments(tool_args(serde_json::json!({
+            .call_tool(CallToolRequestParams::new("edit").with_arguments(tool_args(
+                serde_json::json!({
                     "path": file_path.to_string_lossy().to_string(),
                     "old_text": "old value",
                     "new_text": "new value"
-                }))))
+                }),
+            )))
             .await
             .unwrap();
         assert_eq!(edit_result.is_error, Some(false));

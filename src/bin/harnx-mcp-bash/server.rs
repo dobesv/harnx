@@ -743,8 +743,7 @@ impl BashServer {
         };
 
         let timeout = Duration::from_secs(timeout_secs);
-        let wait_result =
-            tokio::time::timeout(timeout, child.wait()).await;
+        let wait_result = tokio::time::timeout(timeout, child.wait()).await;
 
         let log_tail = read_log_tail(&log_path, tail_line_count);
 
@@ -1276,9 +1275,7 @@ mod tests {
     use super::*;
 
     use rmcp::handler::client::ClientHandler;
-    use rmcp::model::{
-        ClientCapabilities, InitializeRequestParams, ListRootsResult, Root,
-    };
+    use rmcp::model::{ClientCapabilities, InitializeRequestParams, ListRootsResult, Root};
     use rmcp::service::{
         serve_client, serve_server, RequestContext, RoleClient, RoleServer, RunningService,
     };
@@ -1335,11 +1332,14 @@ mod tests {
             &self,
             _cx: RequestContext<RoleClient>,
         ) -> Result<ListRootsResult, ErrorData> {
-            Ok(ListRootsResult::new(self
-                    .roots
+            Ok(ListRootsResult::new(
+                self.roots
                     .iter()
-                    .map(|root| Root::new(format!("file://{}", root.canonicalize().unwrap().display())))
-                    .collect()))
+                    .map(|root| {
+                        Root::new(format!("file://{}", root.canonicalize().unwrap().display()))
+                    })
+                    .collect(),
+            ))
         }
     }
 

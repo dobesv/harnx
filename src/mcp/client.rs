@@ -4,9 +4,9 @@ use crate::tool::ToolDeclaration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::RwLock;
+use process_wrap::tokio::CommandWrap;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::CommandWrap;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParams, ClientCapabilities, ErrorData, Implementation, InitializeRequestParams,
@@ -297,8 +297,10 @@ impl McpClient {
             _ => bail!("MCP tool arguments must be a JSON object or null"),
         };
 
-        let params = CallToolRequestParams::new(tool_name.to_string())
-            .with_arguments(arguments.unwrap_or_default());
+        let mut params = CallToolRequestParams::new(tool_name.to_string());
+        if let Some(args) = arguments {
+            params = params.with_arguments(args);
+        }
 
         let peer = {
             let service_guard = self.service.read();
