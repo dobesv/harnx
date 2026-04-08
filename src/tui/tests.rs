@@ -1390,6 +1390,16 @@ async fn test_recovery_after_cancellation() {
         .await
         .unwrap();
 
+    // Ensure the first prompt's background task finishes and all its events
+    // (including Finished) are drained, so they don't interfere with the
+    // second prompt below.
+    harness
+        .sync()
+        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    harness.drain_and_settle().await.unwrap();
+
     // Simulate cancellation
     harness.tui().app.transcript.push(TranscriptEntry::System(
         "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
