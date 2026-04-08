@@ -1,6 +1,41 @@
 use super::*;
 use crate::tui::types::{TranscriptEntry, TuiEvent};
 
+fn unique_attachment_display_name(
+    attachments: &[crate::tui::types::Attachment],
+    original_name: &str,
+) -> String {
+    if !attachments.iter().any(|a| a.display_name == original_name) {
+        return original_name.to_string();
+    }
+
+    for idx in 1.. {
+        let candidate = format!("{} ({idx})", original_name);
+        if !attachments.iter().any(|a| a.display_name == candidate) {
+            return candidate;
+        }
+    }
+
+    unreachable!()
+}
+
+fn unique_attachment_storage_path(
+    dir: &std::path::Path,
+    original_name: &str,
+) -> std::path::PathBuf {
+    let source_path = std::path::Path::new(original_name);
+    let stem = source_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "attachment".to_string());
+    let ext = source_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    dir.join(format!("{}-{}{}", stem, uuid::Uuid::new_v4(), ext))
+}
+
 impl Tui {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
@@ -47,10 +82,10 @@ impl Tui {
                 }
             }
             (KeyCode::Tab, KeyModifiers::NONE) => {
-                self.handle_tab(false);
+                self.handle_tab(false).await;
             }
             (KeyCode::BackTab, KeyModifiers::SHIFT) => {
-                self.handle_tab(true);
+                self.handle_tab(true).await;
             }
             (KeyCode::Esc, KeyModifiers::NONE) => {
                 if !self.app.completions.is_empty() {
@@ -58,9 +93,12 @@ impl Tui {
                 }
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
+                if self.try_handle_attach_command().await {
+                    return Ok(());
+                }
                 self.app.completions.clear();
                 let text = self.app.input.lines().join("\n");
-                if !text.trim().is_empty() {
+                if !text.trim().is_empty() || !self.app.attachments.is_empty() {
                     // Reset abort signal before each new submission (fix #3)
                     self.abort_signal.reset();
                     // Add to history (fix #4)
@@ -68,7 +106,14 @@ impl Tui {
                     if self.app.llm_busy {
                         // Queue the message to send when LLM finishes
                         // Keep the text in input so user can see/edit it
-                        self.app.pending_message = Some(text);
+                        let pending_attachments = self.app.attachments.clone();
+                        let pending_attachment_dir = self.app.attachment_dir.clone();
+                        self.app.pending_message = Some(crate::tui::types::PendingMessage {
+                            text,
+                            attachments: pending_attachments,
+                            attachment_dir: pending_attachment_dir,
+                            paste_count: self.app.paste_count,
+                        });
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through repl command handler
@@ -83,14 +128,22 @@ impl Tui {
                             .transcript
                             .push(TranscriptEntry::User(text.clone()));
                         self.app.input = Self::new_input();
-                        self.start_prompt(text).await?;
+                        let msg = crate::tui::types::PendingMessage {
+                            text,
+                            attachments: std::mem::take(&mut self.app.attachments),
+                            attachment_dir: self.app.attachment_dir.take(),
+                            paste_count: self.app.paste_count,
+                        };
+                        self.start_prompt(msg).await?;
                     }
                 }
             }
             (KeyCode::Enter, KeyModifiers::SHIFT) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                 // Shift+Enter / Ctrl+J inserts a newline - clear pending if any
-                if self.app.pending_message.is_some() {
-                    self.app.pending_message = None;
+                if let Some(pending) = self.app.pending_message.take() {
+                    self.app.attachments = pending.attachments;
+                    self.app.attachment_dir = pending.attachment_dir;
+                    self.app.paste_count = pending.paste_count;
                     self.refresh_input_chrome();
                 }
                 self.app.input.input(TextInput {
@@ -100,8 +153,10 @@ impl Tui {
             }
             _ => {
                 // Any other key input clears pending message (converts back to draft)
-                if self.app.pending_message.is_some() {
-                    self.app.pending_message = None;
+                if let Some(pending) = self.app.pending_message.take() {
+                    self.app.attachments = pending.attachments;
+                    self.app.attachment_dir = pending.attachment_dir;
+                    self.app.paste_count = pending.paste_count;
                     self.refresh_input_chrome();
                 }
                 // Clear completions on any non-tab key
@@ -112,6 +167,161 @@ impl Tui {
             }
         }
         Ok(())
+    }
+
+    /// Ensure the attachment temp directory exists, creating it via mkdtemp if needed.
+    async fn ensure_attachment_dir(&mut self) -> std::io::Result<std::path::PathBuf> {
+        if let Some(ref dir) = self.app.attachment_dir {
+            Ok(dir.clone())
+        } else {
+            let dir = crate::tui::types::create_attachment_dir()?;
+            self.app.attachment_dir = Some(dir.clone());
+            Ok(dir)
+        }
+    }
+
+    /// Clean up the attachment temp directory and reset attachment state.
+    pub(super) fn cleanup_attachments(&mut self) {
+        self.app.attachments.clear();
+        if let Some(dir) = self.app.attachment_dir.take() {
+            crate::tui::types::cleanup_attachment_dir(&dir);
+        }
+    }
+
+    /// Check if the last line of input is an `.attach` or `.detach` command.
+    /// If so, execute it and return `true`. The command line is removed from
+    /// the textarea, preserving any preceding draft text.
+    async fn try_handle_attach_command(&mut self) -> bool {
+        let last_line = {
+            let lines = self.app.input.lines();
+            match lines.last() {
+                Some(l) => l.trim().to_string(),
+                None => return false,
+            }
+        };
+
+        if last_line.starts_with(".attach ") {
+            let path_str = last_line
+                .strip_prefix(".attach ")
+                .unwrap()
+                .trim()
+                .to_string();
+            let src = std::path::PathBuf::from(&path_str);
+            if src.exists() {
+                match self.ensure_attachment_dir().await {
+                    Ok(dir) => {
+                        let original_name = src
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path_str.clone());
+                        let display_name =
+                            unique_attachment_display_name(&self.app.attachments, &original_name);
+                        let dest = unique_attachment_storage_path(&dir, &original_name);
+                        if let Err(err) = tokio::fs::copy(&src, &dest).await {
+                            self.app.transcript.push(TranscriptEntry::Error(format!(
+                                "Failed to copy attachment: {err}"
+                            )));
+                        } else {
+                            self.app.attachments.push(crate::tui::types::Attachment {
+                                path: dest,
+                                display_name,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        self.app.transcript.push(TranscriptEntry::Error(format!(
+                            "Failed to create attachment directory: {err}"
+                        )));
+                    }
+                }
+            } else {
+                self.app.transcript.push(TranscriptEntry::Error(format!(
+                    "File not found: {path_str}"
+                )));
+            }
+        } else if last_line == ".detach" {
+            self.cleanup_attachments();
+        } else if last_line.starts_with(".detach ") {
+            let name = last_line
+                .strip_prefix(".detach ")
+                .unwrap()
+                .trim()
+                .to_string();
+            for attachment in self
+                .app
+                .attachments
+                .iter()
+                .filter(|a| a.display_name == name)
+            {
+                if let Err(err) = std::fs::remove_file(&attachment.path) {
+                    self.app.transcript.push(TranscriptEntry::Error(format!(
+                        "Failed to remove detached attachment file {}: {err}",
+                        attachment.display_name
+                    )));
+                }
+            }
+            self.app.attachments.retain(|a| a.display_name != name);
+            // If no attachments left, clean up the directory
+            if self.app.attachments.is_empty() {
+                self.cleanup_attachments();
+            }
+        } else {
+            return false;
+        }
+
+        // Remove the last line (the command) and restore remaining text
+        let remaining_text = {
+            let lines = self.app.input.lines();
+            let remaining: Vec<String> = lines[..lines.len() - 1].to_vec();
+            remaining.join("\n")
+        };
+        self.set_input_text(&remaining_text);
+
+        true
+    }
+
+    pub(super) async fn handle_paste(&mut self, text: String) {
+        if let Some(pending) = self.app.pending_message.take() {
+            self.app.attachments = pending.attachments;
+            self.app.attachment_dir = pending.attachment_dir;
+            self.refresh_input_chrome();
+        }
+        if !self.app.completions.is_empty() {
+            self.app.completions.clear();
+        }
+        // Normalize line endings: \r\n -> \n, then \r -> \n
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.contains('\n') {
+            // Multi-line paste: write to temp file and attach
+            match self.write_paste_to_attachment_dir(&text).await {
+                Ok(attachment) => {
+                    self.app.attachments.push(attachment);
+                }
+                Err(err) => {
+                    self.app.transcript.push(TranscriptEntry::Error(format!(
+                        "Failed to save pasted text: {err}"
+                    )));
+                }
+            }
+        } else {
+            // Single-line paste: insert inline
+            self.app.input.insert_str(&text);
+        }
+    }
+
+    async fn write_paste_to_attachment_dir(
+        &mut self,
+        text: &str,
+    ) -> std::io::Result<crate::tui::types::Attachment> {
+        let dir = self.ensure_attachment_dir().await?;
+        self.app.paste_count += 1;
+        let filename = format!("paste-{}.txt", self.app.paste_count);
+        let path = dir.join(&filename);
+        tokio::fs::write(&path, text).await?;
+        Ok(crate::tui::types::Attachment {
+            path,
+            display_name: filename,
+        })
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -202,18 +412,7 @@ impl Tui {
                 self.refresh_input_chrome();
 
                 if let Some(pending) = self.app.pending_message.take() {
-                    // Clear input now that the pending message is actually being submitted
-                    self.app.input = Self::new_input();
-                    self.app
-                        .transcript
-                        .push(TranscriptEntry::User(pending.clone()));
-                    self.pin_transcript_to_bottom();
-                    if pending.trim_start().starts_with('.') {
-                        self.run_repl_command(&pending).await?;
-                        self.refresh_input_chrome();
-                    } else {
-                        self.start_prompt(pending).await?;
-                    }
+                    self.submit_pending_message(pending).await?;
                 }
             }
             TuiEvent::Errored(err) => {
@@ -224,25 +423,38 @@ impl Tui {
                 self.refresh_input_chrome();
 
                 if let Some(pending) = self.app.pending_message.take() {
-                    // Clear input now that the pending message is actually being submitted
-                    self.app.input = Self::new_input();
-                    self.app
-                        .transcript
-                        .push(TranscriptEntry::User(pending.clone()));
-                    self.pin_transcript_to_bottom();
-                    if pending.trim_start().starts_with('.') {
-                        self.run_repl_command(&pending).await?;
-                        self.refresh_input_chrome();
-                    } else {
-                        self.start_prompt(pending).await?;
-                    }
+                    self.submit_pending_message(pending).await?;
                 }
             }
         }
         Ok(())
     }
 
-    pub(super) async fn start_prompt(&mut self, text: String) -> Result<()> {
+    async fn submit_pending_message(
+        &mut self,
+        pending: crate::tui::types::PendingMessage,
+    ) -> Result<()> {
+        self.app.input = Self::new_input();
+        self.app
+            .transcript
+            .push(TranscriptEntry::User(pending.text.clone()));
+        self.pin_transcript_to_bottom();
+        if pending.text.trim_start().starts_with('.') {
+            self.app.attachments = pending.attachments;
+            self.app.attachment_dir = pending.attachment_dir;
+            self.app.paste_count = pending.paste_count;
+            self.run_repl_command(&pending.text).await?;
+            self.refresh_input_chrome();
+        } else {
+            self.start_prompt(pending).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn start_prompt(
+        &mut self,
+        msg: crate::tui::types::PendingMessage,
+    ) -> Result<()> {
         self.app.llm_busy = true;
 
         let config = self.config.clone();
@@ -254,8 +466,8 @@ impl Tui {
 
         tokio::spawn(async move {
             let result: Result<()> = Self::run_prompt_task(
+                msg,
                 config,
-                text,
                 abort_signal,
                 async_manager,
                 persistent_manager,
@@ -335,7 +547,7 @@ impl Tui {
         }
     }
 
-    fn handle_tab(&mut self, reverse: bool) {
+    async fn handle_tab(&mut self, reverse: bool) {
         if !self.app.completions.is_empty() {
             // Cycle through existing completions
             if reverse {
@@ -375,7 +587,7 @@ impl Tui {
             p.min(line.len())
         };
 
-        let completions = self.compute_completions(&line, pos);
+        let completions = self.compute_completions(&line, pos).await;
         if completions.is_empty() {
             return;
         }
@@ -411,7 +623,7 @@ impl Tui {
         self.set_input_text(&new_text);
     }
 
-    pub(super) fn compute_completions(
+    pub(super) async fn compute_completions(
         &self,
         line: &str,
         pos: usize,
@@ -457,6 +669,60 @@ impl Tui {
         // For multi-part commands, delegate to config's repl_complete
         if cmd.starts_with('.') {
             let args: Vec<&str> = parts[1..].iter().map(|p| p.0).collect();
+
+            // File path completion for .attach
+            if cmd == ".attach" {
+                let filter = args.last().copied().unwrap_or("");
+                let dir_path;
+                let prefix;
+                if filter.contains('/') || filter.contains('\\') {
+                    let p = std::path::Path::new(filter);
+                    dir_path = p
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf();
+                    prefix = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                } else {
+                    dir_path = std::path::PathBuf::from(".");
+                    prefix = filter.to_string();
+                };
+                if let Ok(mut entries) = tokio::fs::read_dir(&dir_path).await {
+                    let mut matches = Vec::new();
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with(&prefix) {
+                            let full = if dir_path == std::path::Path::new(".") {
+                                name.clone()
+                            } else {
+                                format!("{}/{}", dir_path.display(), name)
+                            };
+                            let kind = match entry.file_type().await {
+                                Ok(file_type) if file_type.is_dir() => Some("dir".to_string()),
+                                _ => None,
+                            };
+                            matches.push((full, kind));
+                        }
+                    }
+                    return matches;
+                }
+                return vec![];
+            }
+
+            // Attachment name completion for .detach
+            if cmd == ".detach" {
+                let filter = args.last().copied().unwrap_or("");
+                return self
+                    .app
+                    .attachments
+                    .iter()
+                    .filter(|a| a.display_name.starts_with(filter))
+                    .map(|a| (a.display_name.clone(), None))
+                    .collect();
+            }
+
             let filter = args.last().copied().unwrap_or("");
             return self.config.read().repl_complete(cmd, &args, filter);
         }

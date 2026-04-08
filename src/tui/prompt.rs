@@ -13,15 +13,33 @@ pub(super) struct PromptTaskContext {
 
 impl Tui {
     pub(super) async fn run_prompt_task(
+        msg: crate::tui::types::PendingMessage,
         config: GlobalConfig,
-        text: String,
         abort_signal: AbortSignal,
         async_manager: Arc<Mutex<AsyncHookManager>>,
         persistent_manager: Arc<Mutex<PersistentHookManager>>,
         pending_async_context: Arc<Mutex<Option<String>>>,
         event_tx: mpsc::UnboundedSender<TuiEvent>,
     ) -> Result<()> {
-        let input = Input::from_str(&config, &text, None);
+        let attachment_dir = msg.attachment_dir.clone();
+        let input_res = if msg.attachments.is_empty() {
+            Ok(Input::from_str(&config, &msg.text, None))
+        } else {
+            let paths: Vec<String> = msg
+                .attachments
+                .iter()
+                .map(|a| a.path.to_string_lossy().to_string())
+                .collect();
+            Input::from_files(&config, &msg.text, paths, None).await
+        };
+        if let Some(dir) = attachment_dir {
+            let cleanup_dir = dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::tui::types::cleanup_attachment_dir(&cleanup_dir);
+            })
+            .await;
+        }
+        let input = input_res?;
         Self::run_prompt_inner(
             PromptTaskContext {
                 config,

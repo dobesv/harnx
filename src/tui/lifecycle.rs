@@ -6,7 +6,12 @@ use crate::tui::types::{App, TranscriptEntry, TuiEvent, SPINNER_FRAMES, TICK_RAT
 impl Tui {
     #[cfg(test)]
     pub(super) fn queue_pending_message(&mut self, text: String) {
-        self.app.pending_message = Some(text.clone());
+        self.app.pending_message = Some(crate::tui::types::PendingMessage {
+            text: text.clone(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: self.app.paste_count,
+        });
         // Also set the input text so it remains visible (new behavior)
         self.set_input_text(&text);
         self.refresh_input_chrome();
@@ -14,8 +19,9 @@ impl Tui {
 
     #[cfg(test)]
     pub(super) fn apply_draft_edit_for_test(&mut self, key: KeyEvent) {
-        if self.app.pending_message.is_some() {
-            self.app.pending_message = None;
+        if let Some(pending) = self.app.pending_message.take() {
+            self.app.attachments = pending.attachments;
+            self.app.paste_count = pending.paste_count;
         }
         self.app.input.input(TextInput::from(key));
         self.refresh_input_chrome();
@@ -62,6 +68,9 @@ impl Tui {
                 history: vec![],
                 history_index: None,
                 history_draft: String::new(),
+                attachments: vec![],
+                attachment_dir: None,
+                paste_count: 0,
                 last_known_input_width: 1,
             },
             event_tx,
@@ -157,6 +166,9 @@ impl Tui {
                     Event::Mouse(mouse) => {
                         self.handle_mouse(mouse);
                     }
+                    Event::Paste(text) => {
+                        self.handle_paste(text).await;
+                    }
                     Event::Resize(_, _) => {}
                     _ => {}
                 }
@@ -195,6 +207,7 @@ impl Tui {
                     ));
                 }
                 let _ = stdout.execute(EnableMouseCapture);
+                let _ = stdout.execute(EnableBracketedPaste);
                 let _ = stdout.flush();
             })),
         );
@@ -226,6 +239,12 @@ impl Tui {
             "↩ Async resume: {context}"
         )));
         self.pin_transcript_to_bottom();
-        self.start_prompt(context).await
+        self.start_prompt(crate::tui::types::PendingMessage {
+            text: context,
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
+        .await
     }
 }

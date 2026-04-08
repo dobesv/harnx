@@ -106,6 +106,45 @@ async fn pending_message_is_auto_sent_after_finish() {
 }
 
 #[tokio::test]
+async fn pending_dot_command_restores_attachments_before_running() {
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    tui.app.llm_busy = true;
+    tui.app.pending_message = Some(crate::tui::types::PendingMessage {
+        text: ".info attachments".to_string(),
+        attachments: vec![
+            Attachment {
+                path: PathBuf::from("/tmp/a.txt"),
+                display_name: "a.txt".to_string(),
+            },
+            Attachment {
+                path: PathBuf::from("/tmp/b.txt"),
+                display_name: "b.txt".to_string(),
+            },
+        ],
+        attachment_dir: None,
+        paste_count: 0,
+    });
+    tui.set_input_text(".info attachments");
+
+    tui.handle_tui_event(TuiEvent::Finished {
+        output: "done".to_string(),
+        usage: Default::default(),
+    })
+    .await
+    .unwrap();
+
+    assert!(tui.app.pending_message.is_none());
+    assert_eq!(tui.app.attachments.len(), 2);
+    assert_eq!(tui.app.attachments[0].display_name, "a.txt");
+    assert_eq!(tui.app.attachments[1].display_name, "b.txt");
+}
+
+#[tokio::test]
 async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
@@ -145,7 +184,7 @@ async fn compute_completions_handles_trailing_space_after_command() {
     let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     let line = ".model ";
-    let completions = tui.compute_completions(line, line.len());
+    let completions = tui.compute_completions(line, line.len()).await;
 
     assert!(completions.iter().all(|(value, _)| !value.is_empty()));
 }
@@ -156,7 +195,7 @@ async fn compute_completions_appends_space_for_command_matches() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    let completions = tui.compute_completions(".mod", 4);
+    let completions = tui.compute_completions(".mod", 4).await;
 
     assert!(completions.iter().any(|(value, _)| value == ".model "));
 }
@@ -224,7 +263,12 @@ async fn test_basic_message_and_streaming_response() {
         .push(TranscriptEntry::User("Test message".to_string()));
     harness
         .tui()
-        .start_prompt("Test message".to_string())
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Test message".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
         .await
         .unwrap();
 
@@ -315,7 +359,12 @@ async fn test_streaming_with_tool_calls() {
         .push(TranscriptEntry::User("What is the answer?".to_string()));
     harness
         .tui()
-        .start_prompt("What is the answer?".to_string())
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "What is the answer?".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
         .await
         .unwrap();
 
@@ -404,7 +453,12 @@ async fn test_sub_agent_delegation_tool_appears() {
         .push(TranscriptEntry::User("Help me".to_string()));
     harness
         .tui()
-        .start_prompt("Help me".to_string())
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Help me".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
         .await
         .unwrap();
 
@@ -505,7 +559,12 @@ async fn test_screen_overflow_and_word_wrap() {
         .push(TranscriptEntry::User(user_message.to_string()));
     harness
         .tui()
-        .start_prompt(user_message.to_string())
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: user_message.to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
         .await
         .unwrap();
 
@@ -607,7 +666,12 @@ async fn test_ctrl_c_cancels_streaming() {
         .push(TranscriptEntry::User("Long request".to_string()));
     harness
         .tui()
-        .start_prompt("Long request".to_string())
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Long request".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
         .await
         .unwrap();
 
@@ -678,7 +742,15 @@ async fn test_streaming_error_shows_in_transcript() {
         .push(TranscriptEntry::User("Error test".to_string()));
 
     // The error should propagate through start_prompt
-    let result = harness.tui().start_prompt("Error test".to_string()).await;
+    let result = harness
+        .tui()
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Error test".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
+        .await;
 
     let _ = result; // start_prompt always returns Ok (spawns a task)
 
@@ -734,7 +806,12 @@ async fn test_cancel_during_tool_execution() {
         .push(TranscriptEntry::User("Search test".to_string()));
     harness
         .tui()
-        .start_prompt("Search test".to_string())
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Search test".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
         .await
         .unwrap();
 
@@ -779,6 +856,465 @@ async fn test_cancel_during_tool_execution() {
     harness.drain_and_settle().await.unwrap();
 }
 
+#[tokio::test]
+async fn paste_multiline_creates_temp_attachment() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.handle_paste("line one\nline two\nline three".to_string())
+        .await;
+
+    // Multi-line paste should NOT insert into the textarea
+    let text = tui.app.input.lines().join("\n");
+    assert_eq!(text, "", "Multi-line paste should not go into textarea");
+
+    // Instead it should create a temp file attachment in the attachment dir
+    assert_eq!(tui.app.attachments.len(), 1, "Should create one attachment");
+    assert!(
+        tui.app.attachment_dir.is_some(),
+        "Should create attachment dir"
+    );
+    assert!(
+        tui.app.attachments[0].path.exists(),
+        "Temp file should exist"
+    );
+    assert_eq!(tui.app.attachments[0].display_name, "paste-1.txt");
+
+    // The temp file should contain the pasted text
+    let contents = tokio::fs::read_to_string(&tui.app.attachments[0].path)
+        .await
+        .unwrap();
+    assert_eq!(contents, "line one\nline two\nline three");
+
+    // No submission should have occurred
+    let user_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter(|entry| matches!(entry, TranscriptEntry::User(_)))
+        .collect();
+    assert!(
+        user_entries.is_empty(),
+        "Paste should not trigger submission"
+    );
+
+    // Cleanup
+    tui.cleanup_attachments();
+}
+
+#[tokio::test]
+async fn paste_multiline_with_cr_creates_temp_attachment() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // Some terminals send \r instead of \n for newlines in paste
+    tui.handle_paste("line one\rline two\rline three".to_string())
+        .await;
+
+    assert_eq!(
+        tui.app.attachments.len(),
+        1,
+        "CR-separated paste should create attachment"
+    );
+    let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
+    assert_eq!(
+        contents, "line one\nline two\nline three",
+        "CRs should be normalized to LFs"
+    );
+
+    tui.cleanup_attachments();
+}
+
+#[tokio::test]
+async fn paste_multiline_with_crlf_creates_temp_attachment() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // Windows-style line endings
+    tui.handle_paste("line one\r\nline two\r\nline three".to_string())
+        .await;
+
+    assert_eq!(
+        tui.app.attachments.len(),
+        1,
+        "CRLF paste should create attachment"
+    );
+
+    let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
+    assert_eq!(
+        contents, "line one\nline two\nline three",
+        "CRLFs should be normalized to LFs"
+    );
+
+    tui.cleanup_attachments();
+}
+
+#[tokio::test]
+async fn paste_single_line_inserts_inline() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.handle_paste("single line text".to_string()).await;
+
+    let text = tui.app.input.lines().join("\n");
+    assert_eq!(text, "single line text");
+    assert!(
+        tui.app.attachments.is_empty(),
+        "Single-line paste should not create attachment"
+    );
+}
+
+#[tokio::test]
+async fn paste_then_erase_then_paste_different_text() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // First paste (single-line)
+    tui.handle_paste("first paste".to_string()).await;
+    assert_eq!(tui.app.input.lines().join("\n"), "first paste");
+
+    // Erase everything by resetting the input
+    tui.app.input = Tui::new_input();
+
+    // Second paste (single-line, different text)
+    tui.handle_paste("second paste".to_string()).await;
+    let text = tui.app.input.lines().join("\n");
+    assert_eq!(
+        text, "second paste",
+        "Should only contain the second paste, not the first"
+    );
+}
+
+#[tokio::test]
+async fn detach_cleans_up_temp_dir() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // Paste multi-line to create a temp attachment
+    tui.handle_paste("line one\nline two".to_string()).await;
+    assert_eq!(tui.app.attachments.len(), 1);
+    let temp_dir = tui.app.attachment_dir.clone().unwrap();
+    let temp_path = tui.app.attachments[0].path.clone();
+    assert!(temp_dir.exists(), "Temp dir should exist before detach");
+    assert!(temp_path.exists(), "Temp file should exist before detach");
+
+    // Detach all
+    tui.set_input_text(".detach");
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.attachments.is_empty());
+    assert!(tui.app.attachment_dir.is_none());
+    assert!(
+        !temp_dir.exists(),
+        "Temp dir should be deleted after detach"
+    );
+    assert!(
+        !temp_path.exists(),
+        "Temp file should be deleted after detach"
+    );
+}
+
+#[tokio::test]
+async fn attachment_footer_shows_attached_files() {
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let mut harness = TuiTestHarness::with_size(60, 12);
+    harness.tui().app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/photo.png"),
+        display_name: "photo.png".to_string(),
+    });
+    harness.render();
+
+    let screen = harness.screen_contents();
+    assert!(
+        screen.contains("photo.png"),
+        "Attachment footer should show filename, got: {screen}"
+    );
+}
+
+#[tokio::test]
+async fn paste_appends_to_existing_text() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.set_input_text("before ");
+    tui.handle_paste("pasted text".to_string()).await;
+
+    let text = tui.app.input.lines().join("\n");
+    assert_eq!(text, "before pasted text");
+}
+
+#[tokio::test]
+async fn attach_command_adds_attachment() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let tmp = std::env::temp_dir().join("harnx_test_attach.txt");
+    std::fs::write(&tmp, "test content").unwrap();
+
+    tui.set_input_text(&format!(".attach {}", tmp.display()));
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(tui.app.attachments.len(), 1);
+    assert_eq!(tui.app.attachments[0].display_name, "harnx_test_attach.txt");
+    assert_eq!(tui.app.input.lines().join("\n"), "");
+    let user_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e, TranscriptEntry::User(_)))
+        .collect();
+    assert!(user_entries.is_empty());
+
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[tokio::test]
+async fn attach_command_preserves_draft_text() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let tmp = std::env::temp_dir().join("harnx_test_attach2.txt");
+    std::fs::write(&tmp, "test").unwrap();
+
+    tui.set_input_text(&format!("Explain this image\n.attach {}", tmp.display()));
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(tui.app.attachments.len(), 1);
+    assert_eq!(tui.app.input.lines().join("\n"), "Explain this image");
+    let user_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e, TranscriptEntry::User(_)))
+        .collect();
+    assert!(user_entries.is_empty());
+
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[tokio::test]
+async fn attach_nonexistent_file_shows_error() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.set_input_text(".attach /nonexistent/file.txt");
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.attachments.is_empty());
+    let has_error = tui
+        .app
+        .transcript
+        .iter()
+        .any(|e| matches!(e, TranscriptEntry::Error(msg) if msg.contains("not found")));
+    assert!(has_error, "Should show error for nonexistent file");
+}
+
+#[tokio::test]
+async fn detach_clears_all_attachments() {
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/a.txt"),
+        display_name: "a.txt".to_string(),
+    });
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/b.txt"),
+        display_name: "b.txt".to_string(),
+    });
+
+    tui.set_input_text(".detach");
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.attachments.is_empty());
+}
+
+#[tokio::test]
+async fn detach_by_name_removes_specific_attachment() {
+    use crate::tui::types::Attachment;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("harnx-detach-by-name-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let a_path = temp_dir.join("a.txt");
+    let b_path = temp_dir.join("b.txt");
+    std::fs::write(&a_path, "a").unwrap();
+    std::fs::write(&b_path, "b").unwrap();
+
+    tui.app.attachments.push(Attachment {
+        path: a_path.clone(),
+        display_name: "a.txt".to_string(),
+    });
+    tui.app.attachments.push(Attachment {
+        path: b_path.clone(),
+        display_name: "b.txt".to_string(),
+    });
+
+    tui.set_input_text(".detach a.txt");
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(tui.app.attachments.len(), 1);
+    assert_eq!(tui.app.attachments[0].display_name, "b.txt");
+    assert!(
+        !a_path.exists(),
+        "Named detach should immediately remove the attachment file from disk"
+    );
+    assert!(
+        b_path.exists(),
+        "Non-detached attachment file should remain"
+    );
+}
+
+#[tokio::test]
+async fn submit_drains_attachments() {
+    use crate::tui::types::Attachment;
+
+    let config = test_config_with_mock_client();
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(MockTurnBuilder::new().add_text_chunk("done").build())
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
+    let mut harness = TuiTestHarness::with_config(config.clone());
+
+    let temp_dir = std::env::temp_dir().join(format!("harnx-submit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("test.txt");
+    tokio::fs::write(&path, "hello").await.unwrap();
+
+    harness.tui().app.attachments.push(Attachment {
+        path: path.clone(),
+        display_name: "test.txt".to_string(),
+    });
+    harness.tui().set_input_text("Analyze this file");
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(harness.tui().app.attachments.is_empty());
+    assert!(harness.tui().app.llm_busy);
+
+    harness
+        .sync()
+        .wait_until_mock_exhausted(&mock_client, Duration::from_secs(5))
+        .await
+        .unwrap();
+    harness.drain_and_settle().await.unwrap();
+    assert!(
+        !harness.tui().app.llm_busy,
+        "Prompt lifecycle should complete"
+    );
+}
+
+#[tokio::test]
+async fn submit_attachments_only_with_empty_text() {
+    use crate::tui::types::Attachment;
+
+    let config = test_config_with_mock_client();
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(MockTurnBuilder::new().add_text_chunk("done").build())
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
+    let mut harness = TuiTestHarness::with_config(config.clone());
+
+    let temp_dir = std::env::temp_dir().join(format!("harnx-submit-only-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("test.txt");
+    tokio::fs::write(&path, "hello").await.unwrap();
+
+    harness.tui().app.attachments.push(Attachment {
+        path: path.clone(),
+        display_name: "test.txt".to_string(),
+    });
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(harness.tui().app.attachments.is_empty());
+    assert!(harness.tui().app.llm_busy);
+
+    harness
+        .sync()
+        .wait_until_mock_exhausted(&mock_client, Duration::from_secs(5))
+        .await
+        .unwrap();
+    harness.drain_and_settle().await.unwrap();
+    assert!(
+        !harness.tui().app.llm_busy,
+        "Prompt lifecycle should complete"
+    );
+}
+
+#[tokio::test]
+async fn queued_message_keeps_attachments_visible_while_busy() {
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.llm_busy = true;
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/paste-1.txt"),
+        display_name: "paste-1.txt".to_string(),
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.pending_message.is_some());
+    assert_eq!(tui.app.attachments.len(), 1);
+    assert_eq!(tui.app.attachments[0].display_name, "paste-1.txt");
+    assert_eq!(
+        tui.app.pending_message.as_ref().unwrap().attachments.len(),
+        1,
+        "Pending message should also retain the attachment"
+    );
+}
+
 /// Test recovery after cancellation - user can send a new message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_recovery_after_cancellation() {
@@ -809,7 +1345,12 @@ async fn test_recovery_after_cancellation() {
         .push(TranscriptEntry::User("First request".to_string()));
     harness
         .tui()
-        .start_prompt("First request".to_string())
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "First request".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
         .await
         .unwrap();
 
@@ -875,7 +1416,12 @@ async fn test_recovery_after_cancellation() {
         .push(TranscriptEntry::User("Second request".to_string()));
     harness
         .tui()
-        .start_prompt("Second request".to_string())
+        .start_prompt(crate::tui::types::PendingMessage {
+            text: "Second request".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
         .await
         .unwrap();
 
@@ -886,4 +1432,61 @@ async fn test_recovery_after_cancellation() {
         .unwrap();
 
     harness.drain_and_settle().await.unwrap();
+}
+
+#[tokio::test]
+async fn attach_completes_file_paths() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let tmp_dir = std::env::temp_dir();
+    let tmp_file = tmp_dir.join("harnx_completion_test.txt");
+    std::fs::write(&tmp_file, "test").unwrap();
+
+    let line = format!(".attach {}/harnx_completion", tmp_dir.display());
+    let completions = tui.compute_completions(&line, line.len()).await;
+
+    assert!(
+        completions
+            .iter()
+            .any(|(v, _)| v.contains("harnx_completion_test.txt")),
+        "Should complete file paths, got: {:?}",
+        completions
+    );
+
+    std::fs::remove_file(&tmp_file).ok();
+}
+
+#[tokio::test]
+async fn detach_completes_attachment_names() {
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/photo.png"),
+        display_name: "photo.png".to_string(),
+    });
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/data.csv"),
+        display_name: "data.csv".to_string(),
+    });
+
+    let completions = tui.compute_completions(".detach ", 8).await;
+    let names: Vec<&str> = completions.iter().map(|(v, _)| v.as_str()).collect();
+
+    assert!(
+        names.contains(&"photo.png"),
+        "Should complete attachment names, got: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"data.csv"),
+        "Should complete attachment names, got: {:?}",
+        names
+    );
 }
