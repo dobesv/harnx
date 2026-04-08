@@ -284,6 +284,60 @@ async fn info_session_does_not_print_raw_output_in_tui_mode() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn info_session_renders_in_tui_snapshot() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(60, 14);
+    harness.tui().config = config.clone();
+    harness.tui().persistent_manager = persistent;
+
+    harness
+        .tui()
+        .run_repl_command(".info session")
+        .await
+        .unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.is_empty());
+    insta::assert_snapshot!("info_session_in_tui", rendered);
+}
+
+#[tokio::test]
+async fn representative_repl_commands_render_into_tui_transcript() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let commands = [".help", ".info session", ".mcp list"];
+
+    for command in commands {
+        let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent.clone()).unwrap();
+        tui.run_repl_command(command).await.unwrap();
+        while let Ok(event) = tui.event_rx.try_recv() {
+            tui.handle_tui_event(event).await.unwrap();
+        }
+
+        let transcript_text = tui
+            .app
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::System(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !transcript_text.is_empty(),
+            "expected command {command} to render output into TUI transcript"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_basic_message_and_streaming_response() {
     let config = test_config_with_mock_client();
     let mock_client = Arc::new(
