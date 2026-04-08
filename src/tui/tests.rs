@@ -145,7 +145,7 @@ async fn compute_completions_handles_trailing_space_after_command() {
     let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     let line = ".model ";
-    let completions = tui.compute_completions(line, line.len());
+    let completions = tui.compute_completions(line, line.len()).await;
 
     assert!(completions.iter().all(|(value, _)| !value.is_empty()));
 }
@@ -156,7 +156,7 @@ async fn compute_completions_appends_space_for_command_matches() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    let completions = tui.compute_completions(".mod", 4);
+    let completions = tui.compute_completions(".mod", 4).await;
 
     assert!(completions.iter().any(|(value, _)| value == ".model "));
 }
@@ -816,7 +816,8 @@ async fn paste_multiline_creates_temp_attachment() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    tui.handle_paste("line one\nline two\nline three".to_string());
+    tui.handle_paste("line one\nline two\nline three".to_string())
+        .await;
 
     // Multi-line paste should NOT insert into the textarea
     let text = tui.app.input.lines().join("\n");
@@ -861,7 +862,8 @@ async fn paste_multiline_with_cr_creates_temp_attachment() {
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     // Some terminals send \r instead of \n for newlines in paste
-    tui.handle_paste("line one\rline two\rline three".to_string());
+    tui.handle_paste("line one\rline two\rline three".to_string())
+        .await;
 
     assert_eq!(
         tui.app.attachments.len(),
@@ -884,7 +886,8 @@ async fn paste_multiline_with_crlf_creates_temp_attachment() {
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     // Windows-style line endings
-    tui.handle_paste("line one\r\nline two\r\nline three".to_string());
+    tui.handle_paste("line one\r\nline two\r\nline three".to_string())
+        .await;
 
     assert_eq!(
         tui.app.attachments.len(),
@@ -907,7 +910,7 @@ async fn paste_single_line_inserts_inline() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    tui.handle_paste("single line text".to_string());
+    tui.handle_paste("single line text".to_string()).await;
 
     let text = tui.app.input.lines().join("\n");
     assert_eq!(text, "single line text");
@@ -924,14 +927,14 @@ async fn paste_then_erase_then_paste_different_text() {
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     // First paste (single-line)
-    tui.handle_paste("first paste".to_string());
+    tui.handle_paste("first paste".to_string()).await;
     assert_eq!(tui.app.input.lines().join("\n"), "first paste");
 
     // Erase everything by resetting the input
     tui.app.input = Tui::new_input();
 
     // Second paste (single-line, different text)
-    tui.handle_paste("second paste".to_string());
+    tui.handle_paste("second paste".to_string()).await;
     let text = tui.app.input.lines().join("\n");
     assert_eq!(
         text, "second paste",
@@ -946,7 +949,7 @@ async fn detach_cleans_up_temp_dir() {
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     // Paste multi-line to create a temp attachment
-    tui.handle_paste("line one\nline two".to_string());
+    tui.handle_paste("line one\nline two".to_string()).await;
     assert_eq!(tui.app.attachments.len(), 1);
     let temp_dir = tui.app.attachment_dir.clone().unwrap();
     let temp_path = tui.app.attachments[0].path.clone();
@@ -997,7 +1000,7 @@ async fn paste_appends_to_existing_text() {
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     tui.set_input_text("before ");
-    tui.handle_paste("pasted text".to_string());
+    tui.handle_paste("pasted text".to_string()).await;
 
     let text = tui.app.input.lines().join("\n");
     assert_eq!(text, "before pasted text");
@@ -1314,7 +1317,7 @@ async fn attach_completes_file_paths() {
     std::fs::write(&tmp_file, "test").unwrap();
 
     let line = format!(".attach {}/harnx_completion", tmp_dir.display());
-    let completions = tui.compute_completions(&line, line.len());
+    let completions = tui.compute_completions(&line, line.len()).await;
 
     assert!(
         completions
@@ -1345,7 +1348,7 @@ async fn detach_completes_attachment_names() {
         display_name: "data.csv".to_string(),
     });
 
-    let completions = tui.compute_completions(".detach ", 8);
+    let completions = tui.compute_completions(".detach ", 8).await;
     let names: Vec<&str> = completions.iter().map(|(v, _)| v.as_str()).collect();
 
     assert!(

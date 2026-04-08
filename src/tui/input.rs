@@ -47,10 +47,10 @@ impl Tui {
                 }
             }
             (KeyCode::Tab, KeyModifiers::NONE) => {
-                self.handle_tab(false);
+                self.handle_tab(false).await;
             }
             (KeyCode::BackTab, KeyModifiers::SHIFT) => {
-                self.handle_tab(true);
+                self.handle_tab(true).await;
             }
             (KeyCode::Esc, KeyModifiers::NONE) => {
                 if !self.app.completions.is_empty() {
@@ -58,7 +58,7 @@ impl Tui {
                 }
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                if self.try_handle_attach_command() {
+                if self.try_handle_attach_command().await {
                     return Ok(());
                 }
                 self.app.completions.clear();
@@ -129,7 +129,7 @@ impl Tui {
     }
 
     /// Ensure the attachment temp directory exists, creating it via mkdtemp if needed.
-    fn ensure_attachment_dir(&mut self) -> std::io::Result<std::path::PathBuf> {
+    async fn ensure_attachment_dir(&mut self) -> std::io::Result<std::path::PathBuf> {
         if let Some(ref dir) = self.app.attachment_dir {
             Ok(dir.clone())
         } else {
@@ -150,7 +150,7 @@ impl Tui {
     /// Check if the last line of input is an `.attach` or `.detach` command.
     /// If so, execute it and return `true`. The command line is removed from
     /// the textarea, preserving any preceding draft text.
-    fn try_handle_attach_command(&mut self) -> bool {
+    async fn try_handle_attach_command(&mut self) -> bool {
         let last_line = {
             let lines = self.app.input.lines();
             match lines.last() {
@@ -167,14 +167,14 @@ impl Tui {
                 .to_string();
             let src = std::path::PathBuf::from(&path_str);
             if src.exists() {
-                match self.ensure_attachment_dir() {
+                match self.ensure_attachment_dir().await {
                     Ok(dir) => {
                         let display_name = src
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| path_str.clone());
                         let dest = dir.join(&display_name);
-                        if let Err(err) = std::fs::copy(&src, &dest) {
+                        if let Err(err) = tokio::fs::copy(&src, &dest).await {
                             self.app.transcript.push(TranscriptEntry::Error(format!(
                                 "Failed to copy attachment: {err}"
                             )));
@@ -224,7 +224,7 @@ impl Tui {
         true
     }
 
-    pub(super) fn handle_paste(&mut self, text: String) {
+    pub(super) async fn handle_paste(&mut self, text: String) {
         if let Some(pending) = self.app.pending_message.take() {
             self.app.attachments = pending.attachments;
             self.app.attachment_dir = pending.attachment_dir;
@@ -237,7 +237,7 @@ impl Tui {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if text.contains('\n') {
             // Multi-line paste: write to temp file and attach
-            match self.write_paste_to_attachment_dir(&text) {
+            match self.write_paste_to_attachment_dir(&text).await {
                 Ok(attachment) => {
                     self.app.attachments.push(attachment);
                 }
@@ -253,17 +253,15 @@ impl Tui {
         }
     }
 
-    fn write_paste_to_attachment_dir(
+    async fn write_paste_to_attachment_dir(
         &mut self,
         text: &str,
     ) -> std::io::Result<crate::tui::types::Attachment> {
-        use std::io::Write;
-        let dir = self.ensure_attachment_dir()?;
+        let dir = self.ensure_attachment_dir().await?;
         let n = self.app.attachments.len() + 1;
         let filename = format!("paste-{n}.txt");
         let path = dir.join(&filename);
-        let mut f = std::fs::File::create(&path)?;
-        f.write_all(text.as_bytes())?;
+        tokio::fs::write(&path, text).await?;
         Ok(crate::tui::types::Attachment {
             path,
             display_name: filename,
@@ -490,7 +488,7 @@ impl Tui {
         }
     }
 
-    fn handle_tab(&mut self, reverse: bool) {
+    async fn handle_tab(&mut self, reverse: bool) {
         if !self.app.completions.is_empty() {
             // Cycle through existing completions
             if reverse {
@@ -530,7 +528,7 @@ impl Tui {
             p.min(line.len())
         };
 
-        let completions = self.compute_completions(&line, pos);
+        let completions = self.compute_completions(&line, pos).await;
         if completions.is_empty() {
             return;
         }
@@ -566,7 +564,7 @@ impl Tui {
         self.set_input_text(&new_text);
     }
 
-    pub(super) fn compute_completions(
+    pub(super) async fn compute_completions(
         &self,
         line: &str,
         pos: usize,
@@ -632,28 +630,24 @@ impl Tui {
                     dir_path = std::path::PathBuf::from(".");
                     prefix = filter.to_string();
                 };
-                if let Ok(entries) = std::fs::read_dir(&dir_path) {
-                    return entries
-                        .filter_map(|e| e.ok())
-                        .filter_map(|e| {
-                            let name = e.file_name().to_string_lossy().to_string();
-                            if name.starts_with(&prefix) {
-                                let full = if dir_path == std::path::Path::new(".") {
-                                    name.clone()
-                                } else {
-                                    format!("{}/{}", dir_path.display(), name)
-                                };
-                                let kind = if e.path().is_dir() {
-                                    Some("dir".to_string())
-                                } else {
-                                    None
-                                };
-                                Some((full, kind))
+                if let Ok(mut entries) = tokio::fs::read_dir(&dir_path).await {
+                    let mut matches = Vec::new();
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with(&prefix) {
+                            let full = if dir_path == std::path::Path::new(".") {
+                                name.clone()
                             } else {
-                                None
-                            }
-                        })
-                        .collect();
+                                format!("{}/{}", dir_path.display(), name)
+                            };
+                            let kind = match entry.file_type().await {
+                                Ok(file_type) if file_type.is_dir() => Some("dir".to_string()),
+                                _ => None,
+                            };
+                            matches.push((full, kind));
+                        }
+                    }
+                    return matches;
                 }
                 return vec![];
             }
