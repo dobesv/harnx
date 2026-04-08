@@ -882,7 +882,9 @@ async fn paste_multiline_creates_temp_attachment() {
     assert_eq!(tui.app.attachments[0].display_name, "paste-1.txt");
 
     // The temp file should contain the pasted text
-    let contents = std::fs::read_to_string(&tui.app.attachments[0].path).unwrap();
+    let contents = tokio::fs::read_to_string(&tui.app.attachments[0].path)
+        .await
+        .unwrap();
     assert_eq!(contents, "line one\nline two\nline three");
 
     // No submission should have occurred
@@ -1198,55 +1200,89 @@ async fn detach_by_name_removes_specific_attachment() {
 #[tokio::test]
 async fn submit_drains_attachments() {
     use crate::tui::types::Attachment;
-    use std::path::PathBuf;
 
-    let config = test_config();
-    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let config = test_config_with_mock_client();
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(MockTurnBuilder::new().add_text_chunk("done").build())
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
+    let mut harness = TuiTestHarness::with_config(config.clone());
 
-    tui.app.attachments.push(Attachment {
-        path: PathBuf::from("/tmp/test.txt"),
+    let temp_dir = std::env::temp_dir().join(format!("harnx-submit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("test.txt");
+    tokio::fs::write(&path, "hello").await.unwrap();
+
+    harness.tui().app.attachments.push(Attachment {
+        path: path.clone(),
         display_name: "test.txt".to_string(),
     });
-    tui.set_input_text("Analyze this file");
+    harness.tui().set_input_text("Analyze this file");
 
-    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
+    assert!(harness.tui().app.attachments.is_empty());
+    assert!(harness.tui().app.llm_busy);
 
+    harness
+        .sync()
+        .wait_until_mock_exhausted(&mock_client, Duration::from_secs(5))
+        .await
+        .unwrap();
+    harness.drain_and_settle().await.unwrap();
     assert!(
-        tui.app.attachments.is_empty(),
-        "Attachments should be cleared after submit"
+        !harness.tui().app.llm_busy,
+        "Prompt lifecycle should complete"
     );
-    assert!(tui.app.llm_busy, "Should have started prompt");
 }
 
 #[tokio::test]
 async fn submit_attachments_only_with_empty_text() {
     use crate::tui::types::Attachment;
-    use std::path::PathBuf;
 
-    let config = test_config();
-    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let config = test_config_with_mock_client();
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(MockTurnBuilder::new().add_text_chunk("done").build())
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
+    let mut harness = TuiTestHarness::with_config(config.clone());
 
-    tui.app.attachments.push(Attachment {
-        path: PathBuf::from("/tmp/test.txt"),
+    let temp_dir = std::env::temp_dir().join(format!("harnx-submit-only-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("test.txt");
+    tokio::fs::write(&path, "hello").await.unwrap();
+
+    harness.tui().app.attachments.push(Attachment {
+        path: path.clone(),
         display_name: "test.txt".to_string(),
     });
-    // Don't set any input text — leave it empty
 
-    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
+    assert!(harness.tui().app.attachments.is_empty());
+    assert!(harness.tui().app.llm_busy);
 
+    harness
+        .sync()
+        .wait_until_mock_exhausted(&mock_client, Duration::from_secs(5))
+        .await
+        .unwrap();
+    harness.drain_and_settle().await.unwrap();
     assert!(
-        tui.app.attachments.is_empty(),
-        "Attachments should be cleared after submit"
-    );
-    assert!(
-        tui.app.llm_busy,
-        "Should have started prompt with attachments only"
+        !harness.tui().app.llm_busy,
+        "Prompt lifecycle should complete"
     );
 }
 

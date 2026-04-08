@@ -32,8 +32,12 @@ impl Tui {
                 .collect();
             Input::from_files(&config, &msg.text, paths, None).await
         };
-        if let Some(dir) = attachment_dir.as_ref() {
-            crate::tui::types::cleanup_attachment_dir(dir);
+        if let Some(dir) = attachment_dir {
+            let cleanup_dir = dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::tui::types::cleanup_attachment_dir(&cleanup_dir);
+            })
+            .await;
         }
         let input = input_res?;
         Self::run_prompt_inner(
