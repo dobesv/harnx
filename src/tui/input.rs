@@ -63,7 +63,7 @@ impl Tui {
                 }
                 self.app.completions.clear();
                 let text = self.app.input.lines().join("\n");
-                if !text.trim().is_empty() {
+                if !text.trim().is_empty() || !self.app.attachments.is_empty() {
                     // Reset abort signal before each new submission (fix #3)
                     self.abort_signal.reset();
                     // Add to history (fix #4)

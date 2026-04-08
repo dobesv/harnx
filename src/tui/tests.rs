@@ -1157,6 +1157,35 @@ async fn submit_drains_attachments() {
     assert!(tui.app.llm_busy, "Should have started prompt");
 }
 
+#[tokio::test]
+async fn submit_attachments_only_with_empty_text() {
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/test.txt"),
+        display_name: "test.txt".to_string(),
+    });
+    // Don't set any input text — leave it empty
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        tui.app.attachments.is_empty(),
+        "Attachments should be cleared after submit"
+    );
+    assert!(
+        tui.app.llm_busy,
+        "Should have started prompt with attachments only"
+    );
+}
+
 /// Test recovery after cancellation - user can send a new message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_recovery_after_cancellation() {
