@@ -1354,31 +1354,11 @@ async fn test_recovery_after_cancellation() {
         .await
         .unwrap();
 
-    // Wait for first response
+    // Wait for first response to appear on screen
     harness
-        .sync()
-        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(5))
+        .wait_until_screen_contains("First response", Duration::from_secs(5))
         .await
         .unwrap();
-
-    // Process events
-    loop {
-        match harness.tui().event_rx.try_recv() {
-            Ok(event) => {
-                let _ = harness.tui().handle_tui_event(event).await;
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-            Err(_) => break,
-        }
-    }
-    harness.render();
-
-    // Verify first response arrived
-    let screen = harness.screen_contents();
-    assert!(
-        screen.contains("First response"),
-        "Screen should show first response, got: {screen}"
-    );
 
     // Simulate cancellation
     harness.tui().app.transcript.push(TranscriptEntry::System(
