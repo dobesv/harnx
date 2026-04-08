@@ -1,11 +1,11 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 pub fn sha256(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
-    format!("{:x}", hasher.finalize())
+    hex_encode(&hasher.finalize())
 }
 
 pub fn hmac_sha256(key: &[u8], msg: &str) -> Vec<u8> {
