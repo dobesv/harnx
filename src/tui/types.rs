@@ -47,6 +47,7 @@ pub(super) struct PendingMessage {
     pub(super) text: String,
     pub(super) attachments: Vec<Attachment>,
     pub(super) attachment_dir: Option<PathBuf>,
+    pub(super) paste_count: usize,
 }
 
 pub(super) struct App {
@@ -70,23 +71,24 @@ pub(super) struct App {
     /// Temp directory holding copies of all current attachments. Created on
     /// first attach, removed recursively on submit or full detach.
     pub(super) attachment_dir: Option<PathBuf>,
+    pub(super) paste_count: usize,
     pub(super) last_known_input_width: u16,
 }
 
-/// Create a temp directory via `libc::mkdtemp` (atomic, no race conditions).
+/// Create a unique temporary attachment directory in the system temp area.
 pub(super) fn create_attachment_dir() -> std::io::Result<PathBuf> {
-    let template = std::env::temp_dir().join("harnx-attach-XXXXXX");
-    let mut bytes = template.to_string_lossy().into_owned().into_bytes();
-    bytes.push(0); // null terminator
-    let ptr = bytes.as_mut_ptr() as *mut libc::c_char;
-    let result = unsafe { libc::mkdtemp(ptr) };
-    if result.is_null() {
-        return Err(std::io::Error::last_os_error());
+    for _ in 0..16 {
+        let dir = std::env::temp_dir().join(format!("harnx-attach-{}", uuid::Uuid::new_v4()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
     }
-    let len = bytes.len() - 1; // strip null terminator
-    let path_str = String::from_utf8(bytes[..len].to_vec())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(PathBuf::from(path_str))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to create unique attachment directory",
+    ))
 }
 
 /// Remove the attachment directory and all its contents.

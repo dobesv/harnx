@@ -106,6 +106,45 @@ async fn pending_message_is_auto_sent_after_finish() {
 }
 
 #[tokio::test]
+async fn pending_dot_command_restores_attachments_before_running() {
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    tui.app.llm_busy = true;
+    tui.app.pending_message = Some(crate::tui::types::PendingMessage {
+        text: ".info attachments".to_string(),
+        attachments: vec![
+            Attachment {
+                path: PathBuf::from("/tmp/a.txt"),
+                display_name: "a.txt".to_string(),
+            },
+            Attachment {
+                path: PathBuf::from("/tmp/b.txt"),
+                display_name: "b.txt".to_string(),
+            },
+        ],
+        attachment_dir: None,
+        paste_count: 0,
+    });
+    tui.set_input_text(".info attachments");
+
+    tui.handle_tui_event(TuiEvent::Finished {
+        output: "done".to_string(),
+        usage: Default::default(),
+    })
+    .await
+    .unwrap();
+
+    assert!(tui.app.pending_message.is_none());
+    assert_eq!(tui.app.attachments.len(), 2);
+    assert_eq!(tui.app.attachments[0].display_name, "a.txt");
+    assert_eq!(tui.app.attachments[1].display_name, "b.txt");
+}
+
+#[tokio::test]
 async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
@@ -228,6 +267,7 @@ async fn test_basic_message_and_streaming_response() {
             text: "Test message".to_string(),
             attachments: vec![],
             attachment_dir: None,
+            paste_count: 0,
         })
         .await
         .unwrap();
@@ -323,6 +363,7 @@ async fn test_streaming_with_tool_calls() {
             text: "What is the answer?".to_string(),
             attachments: vec![],
             attachment_dir: None,
+            paste_count: 0,
         })
         .await
         .unwrap();
@@ -416,6 +457,7 @@ async fn test_sub_agent_delegation_tool_appears() {
             text: "Help me".to_string(),
             attachments: vec![],
             attachment_dir: None,
+            paste_count: 0,
         })
         .await
         .unwrap();
@@ -521,6 +563,7 @@ async fn test_screen_overflow_and_word_wrap() {
             text: user_message.to_string(),
             attachments: vec![],
             attachment_dir: None,
+            paste_count: 0,
         })
         .await
         .unwrap();
@@ -627,6 +670,7 @@ async fn test_ctrl_c_cancels_streaming() {
             text: "Long request".to_string(),
             attachments: vec![],
             attachment_dir: None,
+            paste_count: 0,
         })
         .await
         .unwrap();
@@ -704,6 +748,7 @@ async fn test_streaming_error_shows_in_transcript() {
             text: "Error test".to_string(),
             attachments: vec![],
             attachment_dir: None,
+            paste_count: 0,
         })
         .await;
 
@@ -765,6 +810,7 @@ async fn test_cancel_during_tool_execution() {
             text: "Search test".to_string(),
             attachments: vec![],
             attachment_dir: None,
+            paste_count: 0,
         })
         .await
         .unwrap();
@@ -1110,18 +1156,25 @@ async fn detach_clears_all_attachments() {
 #[tokio::test]
 async fn detach_by_name_removes_specific_attachment() {
     use crate::tui::types::Attachment;
-    use std::path::PathBuf;
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
+    let temp_dir =
+        std::env::temp_dir().join(format!("harnx-detach-by-name-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let a_path = temp_dir.join("a.txt");
+    let b_path = temp_dir.join("b.txt");
+    std::fs::write(&a_path, "a").unwrap();
+    std::fs::write(&b_path, "b").unwrap();
+
     tui.app.attachments.push(Attachment {
-        path: PathBuf::from("/tmp/a.txt"),
+        path: a_path.clone(),
         display_name: "a.txt".to_string(),
     });
     tui.app.attachments.push(Attachment {
-        path: PathBuf::from("/tmp/b.txt"),
+        path: b_path.clone(),
         display_name: "b.txt".to_string(),
     });
 
@@ -1132,6 +1185,14 @@ async fn detach_by_name_removes_specific_attachment() {
 
     assert_eq!(tui.app.attachments.len(), 1);
     assert_eq!(tui.app.attachments[0].display_name, "b.txt");
+    assert!(
+        !a_path.exists(),
+        "Named detach should immediately remove the attachment file from disk"
+    );
+    assert!(
+        b_path.exists(),
+        "Non-detached attachment file should remain"
+    );
 }
 
 #[tokio::test]
@@ -1189,6 +1250,35 @@ async fn submit_attachments_only_with_empty_text() {
     );
 }
 
+#[tokio::test]
+async fn queued_message_keeps_attachments_visible_while_busy() {
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.llm_busy = true;
+    tui.app.attachments.push(Attachment {
+        path: PathBuf::from("/tmp/paste-1.txt"),
+        display_name: "paste-1.txt".to_string(),
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.pending_message.is_some());
+    assert_eq!(tui.app.attachments.len(), 1);
+    assert_eq!(tui.app.attachments[0].display_name, "paste-1.txt");
+    assert_eq!(
+        tui.app.pending_message.as_ref().unwrap().attachments.len(),
+        1,
+        "Pending message should also retain the attachment"
+    );
+}
+
 /// Test recovery after cancellation - user can send a new message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_recovery_after_cancellation() {
@@ -1223,6 +1313,7 @@ async fn test_recovery_after_cancellation() {
             text: "First request".to_string(),
             attachments: vec![],
             attachment_dir: None,
+            paste_count: 0,
         })
         .await
         .unwrap();
@@ -1293,6 +1384,7 @@ async fn test_recovery_after_cancellation() {
             text: "Second request".to_string(),
             attachments: vec![],
             attachment_dir: None,
+            paste_count: 0,
         })
         .await
         .unwrap();

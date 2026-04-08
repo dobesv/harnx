@@ -21,20 +21,21 @@ impl Tui {
         pending_async_context: Arc<Mutex<Option<String>>>,
         event_tx: mpsc::UnboundedSender<TuiEvent>,
     ) -> Result<()> {
-        let input = if msg.attachments.is_empty() {
-            Input::from_str(&config, &msg.text, None)
+        let attachment_dir = msg.attachment_dir.clone();
+        let input_res = if msg.attachments.is_empty() {
+            Ok(Input::from_str(&config, &msg.text, None))
         } else {
             let paths: Vec<String> = msg
                 .attachments
                 .iter()
                 .map(|a| a.path.to_string_lossy().to_string())
                 .collect();
-            Input::from_files(&config, &msg.text, paths, None).await?
+            Input::from_files(&config, &msg.text, paths, None).await
         };
-        // Clean up attachment directory now that Input has read the files
-        if let Some(dir) = msg.attachment_dir {
-            crate::tui::types::cleanup_attachment_dir(&dir);
+        if let Some(dir) = attachment_dir.as_ref() {
+            crate::tui::types::cleanup_attachment_dir(dir);
         }
+        let input = input_res?;
         Self::run_prompt_inner(
             PromptTaskContext {
                 config,

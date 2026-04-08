@@ -1,6 +1,41 @@
 use super::*;
 use crate::tui::types::{TranscriptEntry, TuiEvent};
 
+fn unique_attachment_display_name(
+    attachments: &[crate::tui::types::Attachment],
+    original_name: &str,
+) -> String {
+    if !attachments.iter().any(|a| a.display_name == original_name) {
+        return original_name.to_string();
+    }
+
+    for idx in 1.. {
+        let candidate = format!("{} ({idx})", original_name);
+        if !attachments.iter().any(|a| a.display_name == candidate) {
+            return candidate;
+        }
+    }
+
+    unreachable!()
+}
+
+fn unique_attachment_storage_path(
+    dir: &std::path::Path,
+    original_name: &str,
+) -> std::path::PathBuf {
+    let source_path = std::path::Path::new(original_name);
+    let stem = source_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "attachment".to_string());
+    let ext = source_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    dir.join(format!("{}-{}{}", stem, uuid::Uuid::new_v4(), ext))
+}
+
 impl Tui {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
@@ -71,10 +106,13 @@ impl Tui {
                     if self.app.llm_busy {
                         // Queue the message to send when LLM finishes
                         // Keep the text in input so user can see/edit it
+                        let pending_attachments = self.app.attachments.clone();
+                        let pending_attachment_dir = self.app.attachment_dir.clone();
                         self.app.pending_message = Some(crate::tui::types::PendingMessage {
                             text,
-                            attachments: std::mem::take(&mut self.app.attachments),
-                            attachment_dir: self.app.attachment_dir.take(),
+                            attachments: pending_attachments,
+                            attachment_dir: pending_attachment_dir,
+                            paste_count: self.app.paste_count,
                         });
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
@@ -94,6 +132,7 @@ impl Tui {
                             text,
                             attachments: std::mem::take(&mut self.app.attachments),
                             attachment_dir: self.app.attachment_dir.take(),
+                            paste_count: self.app.paste_count,
                         };
                         self.start_prompt(msg).await?;
                     }
@@ -104,6 +143,7 @@ impl Tui {
                 if let Some(pending) = self.app.pending_message.take() {
                     self.app.attachments = pending.attachments;
                     self.app.attachment_dir = pending.attachment_dir;
+                    self.app.paste_count = pending.paste_count;
                     self.refresh_input_chrome();
                 }
                 self.app.input.input(TextInput {
@@ -116,6 +156,7 @@ impl Tui {
                 if let Some(pending) = self.app.pending_message.take() {
                     self.app.attachments = pending.attachments;
                     self.app.attachment_dir = pending.attachment_dir;
+                    self.app.paste_count = pending.paste_count;
                     self.refresh_input_chrome();
                 }
                 // Clear completions on any non-tab key
@@ -169,11 +210,13 @@ impl Tui {
             if src.exists() {
                 match self.ensure_attachment_dir().await {
                     Ok(dir) => {
-                        let display_name = src
+                        let original_name = src
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| path_str.clone());
-                        let dest = dir.join(&display_name);
+                        let display_name =
+                            unique_attachment_display_name(&self.app.attachments, &original_name);
+                        let dest = unique_attachment_storage_path(&dir, &original_name);
                         if let Err(err) = tokio::fs::copy(&src, &dest).await {
                             self.app.transcript.push(TranscriptEntry::Error(format!(
                                 "Failed to copy attachment: {err}"
@@ -204,6 +247,19 @@ impl Tui {
                 .unwrap()
                 .trim()
                 .to_string();
+            for attachment in self
+                .app
+                .attachments
+                .iter()
+                .filter(|a| a.display_name == name)
+            {
+                if let Err(err) = std::fs::remove_file(&attachment.path) {
+                    self.app.transcript.push(TranscriptEntry::Error(format!(
+                        "Failed to remove detached attachment file {}: {err}",
+                        attachment.display_name
+                    )));
+                }
+            }
             self.app.attachments.retain(|a| a.display_name != name);
             // If no attachments left, clean up the directory
             if self.app.attachments.is_empty() {
@@ -258,8 +314,8 @@ impl Tui {
         text: &str,
     ) -> std::io::Result<crate::tui::types::Attachment> {
         let dir = self.ensure_attachment_dir().await?;
-        let n = self.app.attachments.len() + 1;
-        let filename = format!("paste-{n}.txt");
+        self.app.paste_count += 1;
+        let filename = format!("paste-{}.txt", self.app.paste_count);
         let path = dir.join(&filename);
         tokio::fs::write(&path, text).await?;
         Ok(crate::tui::types::Attachment {
@@ -384,6 +440,9 @@ impl Tui {
             .push(TranscriptEntry::User(pending.text.clone()));
         self.pin_transcript_to_bottom();
         if pending.text.trim_start().starts_with('.') {
+            self.app.attachments = pending.attachments;
+            self.app.attachment_dir = pending.attachment_dir;
+            self.app.paste_count = pending.paste_count;
             self.run_repl_command(&pending.text).await?;
             self.refresh_input_chrome();
         } else {

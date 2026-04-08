@@ -10,6 +10,7 @@ impl Tui {
             text: text.clone(),
             attachments: vec![],
             attachment_dir: None,
+            paste_count: self.app.paste_count,
         });
         // Also set the input text so it remains visible (new behavior)
         self.set_input_text(&text);
@@ -20,6 +21,7 @@ impl Tui {
     pub(super) fn apply_draft_edit_for_test(&mut self, key: KeyEvent) {
         if let Some(pending) = self.app.pending_message.take() {
             self.app.attachments = pending.attachments;
+            self.app.paste_count = pending.paste_count;
         }
         self.app.input.input(TextInput::from(key));
         self.refresh_input_chrome();
@@ -68,6 +70,7 @@ impl Tui {
                 history_draft: String::new(),
                 attachments: vec![],
                 attachment_dir: None,
+                paste_count: 0,
                 last_known_input_width: 1,
             },
             event_tx,
@@ -240,6 +243,7 @@ impl Tui {
             text: context,
             attachments: vec![],
             attachment_dir: None,
+            paste_count: 0,
         })
         .await
     }
