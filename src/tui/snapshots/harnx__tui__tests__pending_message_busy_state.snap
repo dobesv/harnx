@@ -1,0 +1,16 @@
+---
+source: src/tui/tests.rs
+assertion_line: 668
+expression: rendered
+---
+Welcome to harnx 0.30.0  •  Type .help
+for commands, Tab to complete.
+
+
+
+
+
+
+
+⠋ Input
+queued follow-up message

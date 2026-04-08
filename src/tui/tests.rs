@@ -16,6 +16,13 @@ fn test_config_with_mock_client() -> GlobalConfig {
     test_config_with_mock_client_and_agent("test-agent", "test-session")
 }
 
+fn line_to_plain(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
 fn test_config_with_mock_client_and_agent(agent_name: &str, session_name: &str) -> GlobalConfig {
     let config = test_config();
     {
@@ -42,6 +49,21 @@ fn normalize_screen(contents: &str) -> String {
         .map(|line| line.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[tokio::test]
+async fn pending_message_is_rendered_with_input_highlight_and_no_status_text() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    tui.app.llm_busy = true;
+    tui.queue_pending_message("queued message".to_string());
+
+    let title = line_to_plain(&tui.build_input_title());
+    assert!(!title.contains("Pending message queued"));
+
+    let rendered = tui.app.input.lines().join("\n");
+    assert_eq!(rendered, "queued message");
 }
 
 #[tokio::test]
@@ -628,6 +650,22 @@ async fn test_tall_multiline_input() {
     );
 
     insta::assert_snapshot!("tall_multiline_input", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pending_message_busy_state_snapshot() {
+    let mut harness = TuiTestHarness::with_size(40, 12);
+    harness.tui().app.llm_busy = true;
+    harness
+        .tui()
+        .queue_pending_message("queued follow-up message".to_string());
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.contains("Pending message queued"));
+    assert!(rendered.contains("queued follow-up message"));
+
+    insta::assert_snapshot!("pending_message_busy_state", rendered);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -326,10 +326,6 @@ impl Tui {
             }
         }
 
-        if self.app.pending_message.is_some() {
-            parts.push("Pending message queued".to_string());
-        }
-
         let text = if parts.is_empty() {
             "Input".to_string()
         } else {
@@ -345,13 +341,37 @@ impl Tui {
         Line::from(spans)
     }
 
-    pub(super) fn refresh_input_chrome(&mut self) {}
+    pub(super) fn refresh_input_chrome(&mut self) {
+        let llm_busy = self.app.llm_busy;
+        let pending_message = self.app.pending_message.is_some();
+        Self::refresh_input_chrome_from_state(
+            &self.config,
+            &mut self.app,
+            llm_busy,
+            pending_message,
+        );
+    }
 
     pub(super) fn refresh_input_chrome_from_state(
         _config: &GlobalConfig,
-        _app: &mut App,
+        app: &mut App,
         _llm_busy: bool,
-        _pending_message: bool,
+        pending_message: bool,
     ) {
+        let input_style = if pending_message {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Reset)
+        };
+        app.input.set_style(input_style);
+
+        let cursor_style = if pending_message {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        app.input.set_cursor_style(cursor_style);
     }
 }
