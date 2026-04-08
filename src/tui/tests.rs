@@ -9,7 +9,14 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 fn test_config() -> GlobalConfig {
-    Arc::new(RwLock::new(Config::default()))
+    let config = Arc::new(RwLock::new(Config::default()));
+    {
+        let mut guard = config.write();
+        guard.clients = vec![ClientConfig::Unknown];
+        let model = MockClient::builder().build().model().clone();
+        guard.model = model;
+    }
+    config
 }
 
 fn test_config_with_mock_client() -> GlobalConfig {
@@ -284,7 +291,7 @@ async fn info_session_does_not_print_raw_output_in_tui_mode() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn info_session_renders_in_tui_snapshot() {
+async fn info_session_without_session_renders_in_tui_snapshot() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut harness = TuiTestHarness::with_size(60, 14);
@@ -303,7 +310,58 @@ async fn info_session_renders_in_tui_snapshot() {
 
     let rendered = normalize_screen(&harness.screen_contents());
     assert!(!rendered.is_empty());
-    insta::assert_snapshot!("info_session_in_tui", rendered);
+    insta::assert_snapshot!("info_session_without_session_in_tui", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn info_session_with_session_renders_in_tui_snapshot() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(60, 18);
+    harness.tui().config = config.clone();
+    harness.tui().persistent_manager = persistent;
+
+    harness
+        .tui()
+        .run_repl_command(".session test-session")
+        .await
+        .unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+
+    harness
+        .tui()
+        .run_repl_command(".info session")
+        .await
+        .unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(rendered.contains("test-session"));
+    insta::assert_snapshot!("info_session_with_session_in_tui", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn help_renders_in_tui_snapshot() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(70, 24);
+    harness.tui().config = config.clone();
+    harness.tui().persistent_manager = persistent;
+
+    harness.tui().run_repl_command(".help").await.unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(rendered.contains("Show system info") || rendered.contains("Type :::"));
+    insta::assert_snapshot!("help_in_tui", rendered);
 }
 
 #[tokio::test]
