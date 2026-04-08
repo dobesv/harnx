@@ -117,9 +117,7 @@ pub(crate) enum TuiEvent {
     UiOutput(String),
     Chunk(String),
     /// Intermediate tool round completed; the prompt loop continues.
-    ToolRoundComplete {
-        tool_count: usize,
-    },
+    ToolRoundComplete,
     /// Final completion — no more turns.
     Finished {
         output: String,
@@ -133,9 +131,7 @@ pub(super) enum TuiEvent {
     UiOutput(String),
     Chunk(String),
     /// Intermediate tool round completed; the prompt loop continues.
-    ToolRoundComplete {
-        tool_count: usize,
-    },
+    ToolRoundComplete,
     /// Final completion — no more turns.
     Finished {
         output: String,

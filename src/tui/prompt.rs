@@ -165,9 +165,7 @@ impl Tui {
                     )
                     .await?;
                 }
-                let _ = ctx.event_tx.send(TuiEvent::ToolRoundComplete {
-                    tool_count: tool_results.len(),
-                });
+                let _ = ctx.event_tx.send(TuiEvent::ToolRoundComplete);
                 input = input.merge_tool_results(output, thought, tool_results);
                 with_embeddings = false;
                 continue;

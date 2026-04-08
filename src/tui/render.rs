@@ -82,24 +82,16 @@ impl Tui {
         let transcript_entries: Vec<Vec<Line<'static>>> = if self.app.transcript.is_empty() {
             vec![vec![Line::from(Span::raw(""))]]
         } else {
-            self.app
-                .transcript
-                .iter()
-                .map(Self::render_entry)
-                .collect()
+            self.app.transcript.iter().map(Self::render_entry).collect()
         };
 
-        self.app.scroll_state.render(
-            frame,
-            chunks[0],
-            &transcript_entries,
-            |lines| {
-                let paragraph = Paragraph::new(lines.clone())
-                    .wrap(Wrap { trim: false });
+        self.app
+            .scroll_state
+            .render(frame, chunks[0], &transcript_entries, |lines| {
+                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
                 let height = wrapped_line_count(lines, chunks[0].width);
                 (height, paragraph)
-            },
-        );
+            });
 
         self.app.last_known_input_width = chunks[1].width.saturating_sub(2).max(1);
 
@@ -295,7 +287,6 @@ impl Tui {
         self.app.transcript.clear();
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
     }
-
 
     pub(super) fn build_input_title(&self) -> Line<'static> {
         let config_read = self.config.read();

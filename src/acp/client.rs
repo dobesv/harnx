@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::Duration;
+use textwrap::{wrap, Options};
 use tokio::io::{
     AsyncBufReadExt, AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, BufReader, ReadBuf,
 };
@@ -191,7 +192,7 @@ impl acp::Client for AcpNotificationClient {
         let is_agent_message = matches!(args.update, acp::SessionUpdate::AgentMessageChunk(_));
         let chunk = match args.update {
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) => {
-                content_block_to_text(&content)
+                format_agent_message_display(&content_block_to_text(&content))
             }
             acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk { content, .. }) => {
                 let text = content_block_to_text(&content);
@@ -202,15 +203,7 @@ impl acp::Client for AcpNotificationClient {
                 }
             }
             acp::SessionUpdate::ToolCall(tc) => {
-                let input_str = tc
-                    .raw_input
-                    .as_ref()
-                    .map(|v| format!(" {v}"))
-                    .unwrap_or_default();
-                format!(
-                    "\n{}\n",
-                    dimmed_text(&format!("🛠️  {}{}", tc.title, input_str))
-                )
+                format_tool_call_display(&tc.title, tc.raw_input.as_ref())
             }
             acp::SessionUpdate::ToolCallUpdate(tcu) => {
                 let mut parts = vec![];
@@ -894,6 +887,53 @@ async fn join_worker(join: thread::JoinHandle<()>) {
 
 /// Format a `SessionInfoUpdate` for display.  Returns an empty string if
 /// there is nothing to show (no `harnx:usage` metadata or zero tokens).
+fn display_wrap_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&w| w >= 40)
+        .unwrap_or(88)
+}
+
+fn wrap_display_text(text: &str, initial_indent: &str, subsequent_indent: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    let options = Options::new(display_wrap_width())
+        .initial_indent(initial_indent)
+        .subsequent_indent(subsequent_indent)
+        .break_words(false)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation);
+    wrap(text, options).join("\n")
+}
+
+fn pretty_json_block(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn format_tool_call_display(title: &str, raw_input: Option<&serde_json::Value>) -> String {
+    let header = wrap_display_text(&format!("🛠️  {title}"), "", "   ");
+    match raw_input {
+        Some(input) => {
+            let body = pretty_json_block(input)
+                .lines()
+                .map(|line| format!("   {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\n{}\n{}\n", dimmed_text(&header), dimmed_text(&body))
+        }
+        None => format!("\n{}\n", dimmed_text(&header)),
+    }
+}
+
+fn format_agent_message_display(text: &str) -> String {
+    if text.trim().is_empty() {
+        String::new()
+    } else {
+        wrap_display_text(text, "", "")
+    }
+}
+
 fn format_session_info_update(info: &acp::SessionInfoUpdate) -> String {
     let Some(meta) = &info.meta else {
         return String::new();
@@ -949,5 +989,38 @@ fn content_block_to_text(content: &acp::ContentBlock) -> String {
         acp::ContentBlock::Audio(_) => "<audio>".to_string(),
         acp::ContentBlock::Resource(_) => "<resource>".to_string(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_format_tool_call_display_multiline_json() {
+        let rendered = format_tool_call_display(
+            "argus_session_prompt",
+            Some(&json!({
+                "message": "Goal — Something long that should remain visible\nAcceptance criteria — Multiline preserved",
+                "session_id": "abc123"
+            })),
+        );
+
+        assert!(rendered.contains("argus_session_prompt"));
+        assert!(rendered.contains("\"message\""));
+        assert!(rendered.contains("Acceptance criteria"));
+        assert!(rendered.contains("\"session_id\""));
+    }
+
+    #[test]
+    fn test_format_agent_message_display_preserves_multiline_content() {
+        let rendered = format_agent_message_display(
+            "Line one from sub-agent\nLine two from sub-agent with extra detail",
+        );
+
+        assert!(rendered.contains("Line one from sub-agent"));
+        assert!(rendered.contains("Line two from sub-agent"));
+        assert!(rendered.contains('\n'));
     }
 }

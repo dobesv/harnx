@@ -360,12 +360,10 @@ impl Tui {
                 self.append_streaming_assistant_chunk(&chunk);
                 self.pin_transcript_to_bottom();
             }
-            TuiEvent::ToolRoundComplete { tool_count } => {
-                // Intermediate tool round — prompt loop continues, don't clear llm_busy
-                self.app.streaming_assistant_idx = None;
-                self.app.transcript.push(TranscriptEntry::System(format!(
-                    "{tool_count} tool result(s) returned"
-                )));
+            TuiEvent::ToolRoundComplete => {
+                // Intermediate tool round — prompt loop continues, don't clear llm_busy.
+                // Keep the current assistant streaming entry so follow-up text can
+                // continue without inserting a blank separator or synthetic status line.
                 self.pin_transcript_to_bottom();
             }
             TuiEvent::Finished { output, usage } => {
