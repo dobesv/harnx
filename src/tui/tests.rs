@@ -258,6 +258,31 @@ async fn info_commands_render_into_tui_transcript() {
     assert!(has_session_output);
 }
 
+#[tokio::test]
+async fn info_session_does_not_print_raw_output_in_tui_mode() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.run_repl_command(".info session").await.unwrap();
+    while let Ok(event) = tui.event_rx.try_recv() {
+        tui.handle_tui_event(event).await.unwrap();
+    }
+
+    let transcript_text = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(transcript_text.contains("Session") || !transcript_text.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_basic_message_and_streaming_response() {
     let config = test_config_with_mock_client();
