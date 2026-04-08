@@ -512,7 +512,7 @@ pub async fn run_repl_command_with_output(
     match parse_command(line) {
         Some((cmd, args)) => match cmd {
             ".help" => {
-                dump_repl_help(output);
+                dump_repl_help(output)?;
             }
             ".info" => match args {
                 Some("session") => {
@@ -1381,20 +1381,21 @@ fn unknown_command() -> Result<()> {
     bail!(r#"Unknown command. Type ".help" for additional help."#);
 }
 
-fn dump_repl_help(output: &mut (dyn Write + Send)) {
+fn dump_repl_help(output: &mut (dyn Write + Send)) -> Result<()> {
     let head = REPL_COMMANDS
         .iter()
         .map(|cmd| format!("{:<24} {}", cmd.name, cmd.description))
         .collect::<Vec<String>>()
         .join("\n");
-    let _ = writeln!(
+    writeln!(
         output,
         r###"{head}
 
 Type ::: to start multi-line editing, type ::: to finish it.
 Press Ctrl+O to open an editor for editing the input buffer.
 Press Ctrl+C to cancel the response, Ctrl+D to exit the REPL."###,
-    );
+    )?;
+    Ok(())
 }
 
 fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {

@@ -1,7 +1,5 @@
 use super::*;
 use crate::tui::types::{TranscriptEntry, TuiEvent};
-use gag::BufferRedirect;
-use std::io::Read as _;
 
 fn unique_attachment_display_name(
     attachments: &[crate::tui::types::Attachment],
@@ -726,35 +724,27 @@ impl Tui {
             let abort_signal = self.abort_signal.clone();
             let mut async_manager = self.async_manager.lock().await;
             let mut pending_async_context = self.pending_async_context.lock().await;
+            let mut output = Vec::<u8>::new();
 
-            // Capture stdout/stderr so REPL commands that use print!/println!/
-            // eprint!/eprintln! don't write raw bytes into the ratatui
-            // alternate screen.  After the command finishes we drain the
-            // captured text and push it into the TUI transcript.
-            let mut stdout_buf = BufferRedirect::stdout().ok();
-            let mut stderr_buf = BufferRedirect::stderr().ok();
-
-            let result = crate::repl::run_repl_command(
+            let result = crate::repl::run_repl_command_with_output(
                 &config,
                 abort_signal,
                 line,
                 &mut async_manager,
                 &self.persistent_manager,
                 &mut pending_async_context,
+                &mut output,
             )
             .await;
 
-            // Drain captured output before dropping the redirects.
-            let captured = drain_captured(&mut stdout_buf, &mut stderr_buf);
-            drop(stdout_buf);
-            drop(stderr_buf);
-
+            let captured = String::from_utf8_lossy(&output).into_owned();
             (result, captured)
             // async_manager + pending_async_context guards drop here
         };
 
-        if !captured.is_empty() {
-            self.app.transcript.push(TranscriptEntry::System(captured));
+        let clean = strip_ansi(&captured).trim_end_matches('\n').to_string();
+        if !clean.is_empty() {
+            self.app.transcript.push(TranscriptEntry::System(clean));
             self.pin_transcript_to_bottom();
         }
 
@@ -780,28 +770,4 @@ impl Tui {
         }
         Ok(())
     }
-}
-
-/// Drain any captured stdout/stderr into a single trimmed string.
-fn drain_captured(
-    stdout_buf: &mut Option<BufferRedirect>,
-    stderr_buf: &mut Option<BufferRedirect>,
-) -> String {
-    let mut output = String::new();
-    if let Some(ref mut buf) = stdout_buf {
-        let _ = buf.read_to_string(&mut output);
-    }
-    if let Some(ref mut buf) = stderr_buf {
-        let mut err_output = String::new();
-        let _ = buf.read_to_string(&mut err_output);
-        if !err_output.is_empty() {
-            if !output.is_empty() && !output.ends_with('\n') {
-                output.push('\n');
-            }
-            output.push_str(&err_output);
-        }
-    }
-    // Strip ANSI escape codes so TUI transcript stays clean
-    let clean = strip_ansi(&output);
-    clean.trim().to_string()
 }

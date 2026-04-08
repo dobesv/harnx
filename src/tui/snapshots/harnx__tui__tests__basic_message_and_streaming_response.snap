@@ -1,6 +1,6 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 345
+assertion_line: 482
 expression: rendered
 ---
 > Test message
