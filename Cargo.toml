@@ -69,7 +69,7 @@ os_info = { version = "3.8.2", default-features = false }
 bm25 = { version = "2.0.1", features = ["parallelism"] }
 which = "8.0.0"
 fuzzy-matcher = "0.3.7"
-terminal-colorsaurus = "0.4.8"
+terminal-colorsaurus = "1.0.3"
 duct = "1.0.0"
 rmcp = { version = "0.8.1", features = ["client", "server", "transport-child-process", "transport-io"] }
 process-wrap = { version = "8", features = ["tokio1"] }

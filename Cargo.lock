@@ -4337,16 +4337,16 @@ dependencies = [
 
 [[package]]
 name = "terminal-colorsaurus"
-version = "0.4.8"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7afe4c174a3cbfb52ebcb11b28965daf74fe9111d4e07e40689d05af06e26e8"
+checksum = "7a46bb5364467da040298c573c8a95dbf9a512efc039630409a03126e3703e90"
 dependencies = [
  "cfg-if",
  "libc",
  "memchr",
  "mio",
  "terminal-trx",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "xterm-color",
 ]
 

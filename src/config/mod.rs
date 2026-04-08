@@ -40,7 +40,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use syntect::highlighting::ThemeSet;
-use terminal_colorsaurus::{color_scheme, ColorScheme, QueryOptions};
+use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
 
 pub const TEMP_RAG_NAME: &str = "temp";
 pub const TEMP_SESSION_NAME: &str = "temp";
@@ -2709,10 +2709,10 @@ impl Config {
             if let Some(v) = read_env_value::<String>(&get_env_name("theme")) {
                 self.theme = v;
             } else if *IS_STDOUT_TERMINAL {
-                if let Ok(color_scheme) = color_scheme(QueryOptions::default()) {
-                    let theme = match color_scheme {
-                        ColorScheme::Dark => "dark",
-                        ColorScheme::Light => "light",
+                if let Ok(mode) = theme_mode(QueryOptions::default()) {
+                    let theme = match mode {
+                        ThemeMode::Dark => "dark",
+                        ThemeMode::Light => "light",
                     };
                     self.theme = Some(theme.into());
                 }
