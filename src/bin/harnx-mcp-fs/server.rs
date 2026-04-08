@@ -8,8 +8,8 @@ use harnx::mcp_safety::{
 
 use fancy_regex::Regex;
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
+    PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
@@ -729,26 +729,19 @@ impl FsServer {
 
 impl ServerHandler for FsServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: Default::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "harnx-mcp-fs".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-                website_url: None,
-                icons: None,
-            },
-            instructions: Some(
-                "Filesystem MCP server with read, write, edit, listing, grep, and glob tools."
-                    .to_string(),
-            ),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "harnx-mcp-fs",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "Filesystem MCP server with read, write, edit, listing, grep, and glob tools.",
+            )
     }
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = ToolAnnotations::new().read_only(true);
@@ -772,6 +765,7 @@ impl ServerHandler for FsServer {
             ];
 
         Ok(ListToolsResult {
+            meta: None,
             tools,
             next_cursor: None,
         })
@@ -779,7 +773,7 @@ impl ServerHandler for FsServer {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Err(err) = self.ensure_roots_initialized(&context.peer).await {
@@ -1123,8 +1117,7 @@ mod tests {
 
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
-        CallToolRequestParam, ClientCapabilities, InitializeRequestParam, ListRootsResult,
-        ProtocolVersion, Root,
+        CallToolRequestParams, ClientCapabilities, InitializeRequestParams, ListRootsResult, Root,
     };
     use rmcp::service::{
         serve_client, serve_server, RequestContext, RoleClient, RoleServer, RunningService,
@@ -1167,35 +1160,25 @@ mod tests {
     }
 
     impl ClientHandler for TestClientHandler {
-        fn get_info(&self) -> InitializeRequestParam {
-            InitializeRequestParam {
-                protocol_version: ProtocolVersion::default(),
-                capabilities: ClientCapabilities::builder()
+        fn get_info(&self) -> InitializeRequestParams {
+            InitializeRequestParams::new(
+                ClientCapabilities::builder()
                     .enable_roots()
                     .enable_roots_list_changed()
                     .build(),
-                client_info: Implementation {
-                    name: "test".to_string(),
-                    version: "0.1".to_string(),
-                    ..Default::default()
-                },
-            }
+                Implementation::new("test", "0.1"),
+            )
         }
 
         async fn list_roots(
             &self,
             _cx: RequestContext<RoleClient>,
         ) -> Result<ListRootsResult, ErrorData> {
-            Ok(ListRootsResult {
-                roots: self
+            Ok(ListRootsResult::new(self
                     .roots
                     .iter()
-                    .map(|root| Root {
-                        uri: format!("file://{}", root.canonicalize().unwrap().display()),
-                        name: None,
-                    })
-                    .collect(),
-            })
+                    .map(|root| Root::new(format!("file://{}", root.canonicalize().unwrap().display())))
+                    .collect()))
         }
     }
 
@@ -1273,12 +1256,10 @@ mod tests {
         });
 
         let result = peer
-            .call_tool(CallToolRequestParam {
-                name: "read".into(),
-                arguments: Some(tool_args(serde_json::json!({
+            .call_tool(CallToolRequestParams::new("read")
+                .with_arguments(tool_args(serde_json::json!({
                     "path": file_path.to_string_lossy().to_string()
-                }))),
-            })
+                }))))
             .await
             .unwrap();
 
@@ -1307,24 +1288,20 @@ mod tests {
         });
 
         let write_result = peer
-            .call_tool(CallToolRequestParam {
-                name: "write".into(),
-                arguments: Some(tool_args(serde_json::json!({
+            .call_tool(CallToolRequestParams::new("write")
+                .with_arguments(tool_args(serde_json::json!({
                     "path": file_path.to_string_lossy().to_string(),
                     "content": "hello\nworld\n"
-                }))),
-            })
+                }))))
             .await
             .unwrap();
         assert_eq!(write_result.is_error, Some(false));
 
         let read_result = peer
-            .call_tool(CallToolRequestParam {
-                name: "read".into(),
-                arguments: Some(tool_args(serde_json::json!({
+            .call_tool(CallToolRequestParams::new("read")
+                .with_arguments(tool_args(serde_json::json!({
                     "path": file_path.to_string_lossy().to_string()
-                }))),
-            })
+                }))))
             .await
             .unwrap();
 
@@ -1353,14 +1330,12 @@ mod tests {
         });
 
         let edit_result = peer
-            .call_tool(CallToolRequestParam {
-                name: "edit".into(),
-                arguments: Some(tool_args(serde_json::json!({
+            .call_tool(CallToolRequestParams::new("edit")
+                .with_arguments(tool_args(serde_json::json!({
                     "path": file_path.to_string_lossy().to_string(),
                     "old_text": "old value",
                     "new_text": "new value"
-                }))),
-            })
+                }))))
             .await
             .unwrap();
         assert_eq!(edit_result.is_error, Some(false));

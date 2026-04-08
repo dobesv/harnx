@@ -4,8 +4,8 @@
 //! File format: `<8-hex-id>.md` containing a JSON header block followed by markdown body.
 
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
+    PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
@@ -1043,29 +1043,23 @@ impl TodoServer {
 
 impl ServerHandler for TodoServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: Default::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "harnx-mcp-todo".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-                website_url: None,
-                icons: None,
-            },
-            instructions: Some(
-                "File-based todo/plan management. Todos stored as markdown files with JSON front matter."
-                    .to_string(),
-            ),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "harnx-mcp-todo",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "File-based todo/plan management. Todos stored as markdown files with JSON front matter.",
+            )
     }
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult {
+            meta: None,
             tools: vec![
                 Tool::new(
                     "todo_list",
@@ -1126,7 +1120,7 @@ impl ServerHandler for TodoServer {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         match request.name.as_ref() {
