@@ -31,16 +31,25 @@ struct HarnxSession {
 
 impl HarnxSession {
     /// Append a session log entry to this session's log file.
-    fn append_log(&self, entry: &SessionLogEntry) {
+    /// Uses async-compatible I/O (tokio::fs) to avoid blocking the Tokio runtime.
+    /// Best-effort: errors are logged but don't interrupt the session.
+    async fn append_log(&self, entry: &SessionLogEntry) {
         let Some(path) = &self.log_path else { return };
         let Ok(yaml) = serde_yaml::to_string(entry) else {
             return;
         };
         let mut data = String::from("---\n");
         data.push_str(&yaml);
-        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-            use std::io::Write as _;
-            let _ = file.write_all(data.as_bytes());
+        use tokio::io::AsyncWriteExt;
+        match tokio::fs::OpenOptions::new().append(true).open(path).await {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(data.as_bytes()).await {
+                    warn!("Failed to write session log: {e}");
+                }
+            }
+            Err(e) => {
+                warn!("Failed to open session log for append: {e}");
+            }
         }
     }
 }
@@ -61,24 +70,23 @@ impl HarnxAgent {
 
     /// Create a session log file for an ACP session and write the header.
     /// Returns the log file path, or None if creation failed.
-    fn create_session_log(&self, session_id: &str) -> Option<PathBuf> {
+    async fn create_session_log(&self, session_id: &str) -> Option<PathBuf> {
         let config = self.config.read();
-        let sessions_dir = Config::agent_data_dir(&self.agent_name).join("sessions").join("_");
+        let sessions_dir = Config::agent_data_dir(&self.agent_name)
+            .join("sessions")
+            .join("_");
         drop(config);
 
         let now = chrono::Local::now();
         let name = now.format("%Y%m%dT%H%M%S").to_string();
-        let filename = format!("{name}-{}.yaml", &session_id[..8]);
+        let short_id = session_id.get(..8).unwrap_or(session_id);
+        let filename = format!("{name}-{short_id}.yaml");
         let path = sessions_dir.join(&filename);
         if ensure_parent_exists(&path).is_err() {
             return None;
         }
 
-        let agent = self
-            .config
-            .read()
-            .retrieve_agent(&self.agent_name)
-            .ok()?;
+        let agent = self.config.read().retrieve_agent(&self.agent_name).ok()?;
         let header = SessionLogEntry::Header {
             model_id: agent.model().id(),
             temperature: agent.temperature(),
@@ -91,7 +99,9 @@ impl HarnxAgent {
             agent_instructions: String::new(),
         };
         let content = serde_yaml::to_string(&header).ok()?;
-        std::fs::write(&path, &content).ok()?;
+        if tokio::fs::write(&path, &content).await.is_err() {
+            return None;
+        }
         Some(path)
     }
 
@@ -269,7 +279,7 @@ impl acp::Agent for HarnxAgent {
         _args: acp::NewSessionRequest,
     ) -> acp::Result<acp::NewSessionResponse> {
         let session_id = Uuid::new_v4().to_string();
-        let log_path = self.create_session_log(&session_id);
+        let log_path = self.create_session_log(&session_id).await;
         let session = HarnxSession {
             id: session_id.clone(),
             abort_signal: AbortSignalInner::new(),
@@ -312,12 +322,15 @@ impl acp::Agent for HarnxAgent {
             .create_client()
             .map_err(|e| acp::Error::new(-32603, format!("Failed to create client: {e}")))?;
 
-        // Log user prompt to session file.
-        {
+        // Log user prompt to session file (async, best-effort).
+        let session_for_user_log = {
             let sessions = self.sessions.borrow();
-            if let Some(session) = sessions.get(session_key.as_str()) {
-                session.append_log(&SessionLogEntry::message_user(prompt_text.clone()));
-            }
+            sessions.get(session_key.as_str()).cloned()
+        };
+        if let Some(session) = session_for_user_log {
+            session
+                .append_log(&SessionLogEntry::message_user(prompt_text.clone()))
+                .await;
         }
 
         let mut round = 0u32;
@@ -336,13 +349,18 @@ impl acp::Agent for HarnxAgent {
 
             if tool_calls.is_empty() {
                 // Log final assistant response.
-                let sessions = self.sessions.borrow();
-                if let Some(session) = sessions.get(session_key.as_str()) {
+                let session_for_assistant_log = {
+                    let sessions = self.sessions.borrow();
+                    sessions.get(session_key.as_str()).cloned()
+                };
+                if let Some(session) = session_for_assistant_log {
                     let content = match &thought {
                         Some(t) => format!("<think>\n{t}\n</think>\n{output}"),
                         None => output.clone(),
                     };
-                    session.append_log(&SessionLogEntry::message_assistant(content));
+                    session
+                        .append_log(&SessionLogEntry::message_assistant(content))
+                        .await;
                 }
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
             }

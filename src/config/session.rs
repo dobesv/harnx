@@ -50,9 +50,7 @@ pub enum SessionLogEntry {
         content: MessageContent,
     },
     #[serde(rename = "data_urls")]
-    DataUrls {
-        urls: HashMap<String, String>,
-    },
+    DataUrls { urls: HashMap<String, String> },
     #[serde(rename = "compress")]
     Compress { prompt: String },
     #[serde(rename = "clear")]
@@ -677,7 +675,9 @@ impl Session {
         }
         if !self.compressed_messages.is_empty() {
             // Write a compress entry to mark the boundary.
-            if let Some(system_msg) = self.messages.first() {
+            // Only write it and skip the first message if the first message
+            // is actually a system message from compression.
+            let wrote_compress = if let Some(system_msg) = self.messages.first() {
                 if system_msg.role == MessageRole::System {
                     let compress_entry = SessionLogEntry::Compress {
                         prompt: system_msg.content.to_text(),
@@ -686,18 +686,26 @@ impl Session {
                     content.push_str(&serde_yaml::to_string(&compress_entry).with_context(
                         || format!("Failed to serialize compress entry in '{}'", self.name),
                     )?);
+                    true
+                } else {
+                    false
                 }
-            }
-            // Write remaining messages (skip the system message from compress).
-            for msg in self.messages.iter().skip(1) {
+            } else {
+                false
+            };
+            // Write remaining messages (skip the system message from compress only if we wrote a compress entry).
+            let start_idx = if wrote_compress { 1 } else { 0 };
+            for msg in self.messages.iter().skip(start_idx) {
                 let entry = SessionLogEntry::Message {
                     role: msg.role,
                     content: msg.content.clone(),
                 };
                 content.push_str("---\n");
-                content.push_str(&serde_yaml::to_string(&entry).with_context(|| {
-                    format!("Failed to serialize message in '{}'", self.name)
-                })?);
+                content.push_str(
+                    &serde_yaml::to_string(&entry).with_context(|| {
+                        format!("Failed to serialize message in '{}'", self.name)
+                    })?,
+                );
             }
         } else {
             for msg in &self.messages {
@@ -706,9 +714,11 @@ impl Session {
                     content: msg.content.clone(),
                 };
                 content.push_str("---\n");
-                content.push_str(&serde_yaml::to_string(&entry).with_context(|| {
-                    format!("Failed to serialize message in '{}'", self.name)
-                })?);
+                content.push_str(
+                    &serde_yaml::to_string(&entry).with_context(|| {
+                        format!("Failed to serialize message in '{}'", self.name)
+                    })?,
+                );
             }
         }
         if !self.data_urls.is_empty() {
@@ -716,9 +726,10 @@ impl Session {
                 urls: self.data_urls.clone(),
             };
             content.push_str("---\n");
-            content.push_str(&serde_yaml::to_string(&entry).with_context(|| {
-                format!("Failed to serialize data_urls in '{}'", self.name)
-            })?);
+            content
+                .push_str(&serde_yaml::to_string(&entry).with_context(|| {
+                    format!("Failed to serialize data_urls in '{}'", self.name)
+                })?);
         }
 
         write(session_path, content).with_context(|| {

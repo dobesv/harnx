@@ -1313,6 +1313,10 @@ impl Config {
         let mut new_session = false;
         let sessions_dir = self.sessions_dir();
         if let Some(session) = session.as_mut() {
+            // Store sessions_dir so the log file can be lazily initialized
+            // on the first event (avoids creating empty files in tests).
+            // Must be set before any add_message() call that triggers logging.
+            session.set_sessions_dir(sessions_dir);
             if session.is_empty() {
                 new_session = true;
                 if let Some(LastMessage {
@@ -1335,9 +1339,6 @@ impl Config {
                     }
                 }
             }
-            // Store sessions_dir so the log file can be lazily initialized
-            // on the first event (avoids creating empty files in tests).
-            session.set_sessions_dir(sessions_dir);
         }
         self.session = session;
         self.init_agent_session_variables(new_session)?;

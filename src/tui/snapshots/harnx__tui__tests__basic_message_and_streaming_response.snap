@@ -1,5 +1,6 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 323
 expression: rendered
 ---
 Transcript
@@ -23,4 +24,4 @@ Hello from the mock client!
 
 
 
-• 🤖  test-agent ▸ test-session   💬  15
+• 🤖  test-agent
