@@ -907,15 +907,17 @@ fn wrap_display_text(text: &str, initial_indent: &str, subsequent_indent: &str) 
     wrap(text, options).join("\n")
 }
 
-fn pretty_json_block(value: &serde_json::Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+fn pretty_yaml_block(value: &serde_json::Value) -> String {
+    serde_yaml::to_string(value)
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_else(|_| value.to_string())
 }
 
 fn format_tool_call_display(title: &str, raw_input: Option<&serde_json::Value>) -> String {
     let header = wrap_display_text(&format!("🛠️  {title}"), "", "   ");
     match raw_input {
         Some(input) => {
-            let body = pretty_json_block(input)
+            let body = pretty_yaml_block(input)
                 .lines()
                 .map(|line| format!("   {line}"))
                 .collect::<Vec<_>>()
@@ -998,7 +1000,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_format_tool_call_display_multiline_json() {
+    fn test_format_tool_call_display_multiline_yaml() {
         let rendered = format_tool_call_display(
             "argus_session_prompt",
             Some(&json!({
@@ -1008,9 +1010,9 @@ mod tests {
         );
 
         assert!(rendered.contains("argus_session_prompt"));
-        assert!(rendered.contains("\"message\""));
+        assert!(rendered.contains("message:"));
         assert!(rendered.contains("Acceptance criteria"));
-        assert!(rendered.contains("\"session_id\""));
+        assert!(rendered.contains("session_id:"));
     }
 
     #[test]

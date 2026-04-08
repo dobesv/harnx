@@ -309,8 +309,10 @@ fn wrap_display_text(text: &str, initial_indent: &str, subsequent_indent: &str) 
     wrap(text, options).join("\n")
 }
 
-fn pretty_json_block(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+fn pretty_yaml_block(value: &Value) -> String {
+    serde_yaml::to_string(value)
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_else(|_| value.to_string())
 }
 
 fn format_tool_invocation_display(tool_name: &str, json_data: &Value) -> String {
@@ -318,7 +320,7 @@ fn format_tool_invocation_display(tool_name: &str, json_data: &Value) -> String 
     match json_data {
         Value::Null => format!("{}\n", dimmed_text(&header)),
         _ => {
-            let body = pretty_json_block(json_data)
+            let body = pretty_yaml_block(json_data)
                 .lines()
                 .map(|line| format!("   {line}"))
                 .collect::<Vec<_>>()
@@ -564,7 +566,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_format_tool_invocation_display_multiline_json() {
+    fn test_format_tool_invocation_display_multiline_yaml() {
         let rendered = format_tool_invocation_display(
             "argus_session_prompt",
             &json!({
@@ -574,9 +576,9 @@ mod tests {
         );
 
         assert!(rendered.contains("argus_session_prompt"));
-        assert!(rendered.contains("\"message\""));
+        assert!(rendered.contains("message:"));
         assert!(rendered.contains("Acceptance criteria"));
-        assert!(rendered.contains("\"session_id\""));
+        assert!(rendered.contains("session_id:"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
