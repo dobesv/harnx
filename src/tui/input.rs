@@ -56,29 +56,24 @@ impl Tui {
                 if self.app.completions.is_empty() {
                     self.history_prev();
                 } else {
-                    self.app.transcript_scroll = self.app.transcript_scroll.saturating_sub(1);
+                    self.app.scroll_state.scroll_up();
                 }
             }
             (KeyCode::Down, KeyModifiers::NONE) => {
                 if self.app.completions.is_empty() {
                     self.history_next();
                 } else {
-                    self.app.transcript_scroll = self.app.transcript_scroll.saturating_add(1);
+                    self.app.scroll_state.scroll_down();
                 }
             }
             (KeyCode::PageUp, KeyModifiers::NONE) => {
-                if self.app.transcript_scroll == u16::MAX {
-                    self.app.transcript_scroll = self.app.max_scroll.saturating_sub(10);
-                } else {
-                    self.app.transcript_scroll = self.app.transcript_scroll.saturating_sub(10);
+                for _ in 0..10 {
+                    self.app.scroll_state.scroll_up();
                 }
             }
             (KeyCode::PageDown, KeyModifiers::NONE) => {
-                let new_scroll = self.app.transcript_scroll.saturating_add(10);
-                if new_scroll >= self.app.max_scroll {
-                    self.app.transcript_scroll = u16::MAX;
-                } else {
-                    self.app.transcript_scroll = new_scroll;
+                for _ in 0..10 {
+                    self.app.scroll_state.scroll_down();
                 }
             }
             (KeyCode::Tab, KeyModifiers::NONE) => {
@@ -327,20 +322,13 @@ impl Tui {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                // If pinned to bottom, unpin and start from max_scroll
-                if self.app.transcript_scroll == u16::MAX {
-                    self.app.transcript_scroll = self.app.max_scroll.saturating_sub(3);
-                } else {
-                    self.app.transcript_scroll = self.app.transcript_scroll.saturating_sub(3);
+                for _ in 0..3 {
+                    self.app.scroll_state.scroll_up();
                 }
             }
             MouseEventKind::ScrollDown => {
-                // If at bottom, re-pin to bottom
-                let new_scroll = self.app.transcript_scroll.saturating_add(3);
-                if new_scroll >= self.app.max_scroll {
-                    self.app.transcript_scroll = u16::MAX;
-                } else {
-                    self.app.transcript_scroll = new_scroll;
+                for _ in 0..3 {
+                    self.app.scroll_state.scroll_down();
                 }
             }
             _ => {}

@@ -255,7 +255,7 @@ async fn test_basic_message_and_streaming_response() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -351,7 +351,7 @@ async fn test_streaming_with_tool_calls() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -445,7 +445,7 @@ async fn test_sub_agent_delegation_tool_appears() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -551,7 +551,7 @@ async fn test_screen_overflow_and_word_wrap() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_size(40, 10);
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -688,7 +688,7 @@ async fn test_ctrl_c_cancels_streaming() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -764,7 +764,7 @@ async fn test_streaming_error_shows_in_transcript() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -828,7 +828,7 @@ async fn test_cancel_during_tool_execution() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -1365,7 +1365,7 @@ async fn test_recovery_after_cancellation() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
 
     // Send first message
     harness
@@ -1428,7 +1428,7 @@ async fn test_recovery_after_cancellation() {
     _guard.set_client(Some(mock_client2.clone()));
 
     // User can send a new message
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
