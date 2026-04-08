@@ -635,6 +635,36 @@ async fn test_tall_multiline_input() {
     insta::assert_snapshot!("tall_multiline_input", rendered);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_input_word_wraps_long_line() {
+    // Use a narrow viewport (30 cols) so a long single-line input must wrap
+    let mut harness = TuiTestHarness::with_size(30, 10);
+
+    let long_input = "the quick brown fox jumps over the lazy dog";
+    harness.tui().set_input_text(long_input);
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+
+    // The input is 43 chars, wider than the 30-col viewport.
+    // With word wrap the full text should still be visible across multiple lines.
+    assert!(
+        rendered.contains("the quick brown fox jumps"),
+        "expected start of input visible: {rendered}"
+    );
+    assert!(
+        rendered.contains("the lazy dog"),
+        "expected end of input visible after wrap: {rendered}"
+    );
+    // The full phrase should NOT appear on a single rendered line (it was wrapped).
+    assert!(
+        !rendered.lines().any(|l| l.contains(long_input)),
+        "expected long input to be split across lines, not on one line: {rendered}"
+    );
+
+    insta::assert_snapshot!("input_word_wraps_long_line", rendered);
+}
+
 /// Test Ctrl+C cancellation during streaming aborts the operation gracefully.
 /// The abort signal should stop streaming and the TUI should show a cancellation message.
 #[tokio::test(flavor = "multi_thread")]
@@ -1359,6 +1389,16 @@ async fn test_recovery_after_cancellation() {
         .wait_until_screen_contains("First response", Duration::from_secs(5))
         .await
         .unwrap();
+
+    // Ensure the first prompt's background task finishes and all its events
+    // (including Finished) are drained, so they don't interfere with the
+    // second prompt below.
+    harness
+        .sync()
+        .wait_until_mock_exhausted(mock_client.as_ref(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    harness.drain_and_settle().await.unwrap();
 
     // Simulate cancellation
     harness.tui().app.transcript.push(TranscriptEntry::System(
