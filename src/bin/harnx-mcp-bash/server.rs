@@ -8,10 +8,10 @@ use fancy_regex::Regex;
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
+    PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
@@ -199,7 +199,7 @@ impl JsonSchema for TerminateParams {
 // ---------------------------------------------------------------------------
 
 struct SpawnedProcess {
-    child: Box<dyn TokioChildWrapper>,
+    child: Box<dyn ChildWrapper>,
     command: String,
     working_dir: PathBuf,
     log_path: PathBuf,
@@ -371,7 +371,7 @@ impl BashServer {
                 ))
             })?;
 
-        let mut command = TokioCommandWrap::with_new("bash", |command| {
+        let mut command = CommandWrap::with_new("bash", |command| {
             command
                 .args(["-c", &params.command])
                 .current_dir(&working_dir)
@@ -402,11 +402,7 @@ impl BashServer {
         let stderr_task = tokio::spawn(read_pipe_to_file(stderr, stderr_file));
 
         let timeout = Duration::from_secs(timeout_secs);
-        let (status, timed_out) = match tokio::time::timeout(timeout, async {
-            Box::into_pin(child.wait()).await
-        })
-        .await
-        {
+        let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
             Ok(Ok(status)) => (Some(status), false),
             Ok(Err(err)) => {
                 return Err(internal_error(format!("failed waiting for command: {err}")));
@@ -415,7 +411,7 @@ impl BashServer {
                 child.start_kill().map_err(|err| {
                     internal_error(format!("failed to kill command after timeout: {err}"))
                 })?;
-                match Box::into_pin(child.wait()).await {
+                match child.wait().await {
                     Ok(status) => (Some(status), true),
                     Err(err) => {
                         return Err(internal_error(format!(
@@ -676,7 +672,7 @@ impl BashServer {
             .try_clone()
             .map_err(|err| internal_error(format!("failed to clone log file handle: {err}")))?;
 
-        let mut command = TokioCommandWrap::with_new("bash", |command| {
+        let mut command = CommandWrap::with_new("bash", |command| {
             command
                 .args(["-c", &params.command])
                 .current_dir(&working_dir)
@@ -747,8 +743,7 @@ impl BashServer {
         };
 
         let timeout = Duration::from_secs(timeout_secs);
-        let wait_result =
-            tokio::time::timeout(timeout, async { Box::into_pin(child.wait()).await }).await;
+        let wait_result = tokio::time::timeout(timeout, child.wait()).await;
 
         let log_tail = read_log_tail(&log_path, tail_line_count);
 
@@ -962,29 +957,23 @@ impl BashServer {
 
 impl ServerHandler for BashServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: Default::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "harnx-mcp-bash".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-                website_url: None,
-                icons: None,
-            },
-            instructions: Some(
-                "Local shell command MCP server with output truncation and retrievable temp logs."
-                    .to_string(),
-            ),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "harnx-mcp-bash",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "Local shell command MCP server with output truncation and retrievable temp logs.",
+            )
     }
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult {
+            meta: None,
             tools: vec![
                 Tool::new(
                     "exec",
@@ -1023,7 +1012,7 @@ impl ServerHandler for BashServer {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Err(err) = self.ensure_roots_initialized(&context.peer).await {
@@ -1286,9 +1275,7 @@ mod tests {
     use super::*;
 
     use rmcp::handler::client::ClientHandler;
-    use rmcp::model::{
-        ClientCapabilities, InitializeRequestParam, ListRootsResult, ProtocolVersion, Root,
-    };
+    use rmcp::model::{ClientCapabilities, InitializeRequestParams, ListRootsResult, Root};
     use rmcp::service::{
         serve_client, serve_server, RequestContext, RoleClient, RoleServer, RunningService,
     };
@@ -1331,35 +1318,28 @@ mod tests {
     }
 
     impl ClientHandler for TestClientHandler {
-        fn get_info(&self) -> InitializeRequestParam {
-            InitializeRequestParam {
-                protocol_version: ProtocolVersion::default(),
-                capabilities: ClientCapabilities::builder()
+        fn get_info(&self) -> InitializeRequestParams {
+            InitializeRequestParams::new(
+                ClientCapabilities::builder()
                     .enable_roots()
                     .enable_roots_list_changed()
                     .build(),
-                client_info: Implementation {
-                    name: "test".to_string(),
-                    version: "0.1".to_string(),
-                    ..Default::default()
-                },
-            }
+                Implementation::new("test", "0.1"),
+            )
         }
 
         async fn list_roots(
             &self,
             _cx: RequestContext<RoleClient>,
         ) -> Result<ListRootsResult, ErrorData> {
-            Ok(ListRootsResult {
-                roots: self
-                    .roots
+            Ok(ListRootsResult::new(
+                self.roots
                     .iter()
-                    .map(|root| Root {
-                        uri: format!("file://{}", root.canonicalize().unwrap().display()),
-                        name: None,
+                    .map(|root| {
+                        Root::new(format!("file://{}", root.canonicalize().unwrap().display()))
                     })
                     .collect(),
-            })
+            ))
         }
     }
 

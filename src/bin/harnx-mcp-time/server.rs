@@ -1,8 +1,8 @@
 use chrono::{Datelike, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParam, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
+    PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
@@ -245,26 +245,19 @@ impl TimeServer {
 
 impl ServerHandler for TimeServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: Default::default(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "harnx-mcp-time".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-                website_url: None,
-                icons: None,
-            },
-            instructions: Some(
-                "Time utilities: get current time, convert between timezones, and wait/sleep."
-                    .to_string(),
-            ),
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "harnx-mcp-time",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "Time utilities: get current time, convert between timezones, and wait/sleep.",
+            )
     }
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = ToolAnnotations::new()
@@ -371,6 +364,7 @@ impl ServerHandler for TimeServer {
         ];
 
         Ok(ListToolsResult {
+            meta: None,
             tools,
             next_cursor: None,
         })
@@ -378,7 +372,7 @@ impl ServerHandler for TimeServer {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         match request.name.as_ref() {
@@ -474,7 +468,7 @@ mod tests {
     use super::*;
 
     use rmcp::handler::client::ClientHandler;
-    use rmcp::model::{ClientCapabilities, InitializeRequestParam, ProtocolVersion};
+    use rmcp::model::{ClientCapabilities, InitializeRequestParams};
     use rmcp::service::{serve_client, serve_server, RoleClient, RoleServer, RunningService};
     use tokio::io::duplex;
 
@@ -482,19 +476,14 @@ mod tests {
     struct TestClientHandler;
 
     impl ClientHandler for TestClientHandler {
-        fn get_info(&self) -> InitializeRequestParam {
-            InitializeRequestParam {
-                protocol_version: ProtocolVersion::default(),
-                capabilities: ClientCapabilities::builder()
+        fn get_info(&self) -> InitializeRequestParams {
+            InitializeRequestParams::new(
+                ClientCapabilities::builder()
                     .enable_roots()
                     .enable_roots_list_changed()
                     .build(),
-                client_info: Implementation {
-                    name: "test".to_string(),
-                    version: "0.1".to_string(),
-                    ..Default::default()
-                },
-            }
+                Implementation::new("test", "0.1"),
+            )
         }
     }
 
@@ -562,10 +551,10 @@ mod tests {
         });
 
         let result = peer
-            .call_tool(CallToolRequestParam {
-                name: "get_current_time".into(),
-                arguments: Some(tool_args(serde_json::json!({ "timezone": "UTC" }))),
-            })
+            .call_tool(
+                CallToolRequestParams::new("get_current_time")
+                    .with_arguments(tool_args(serde_json::json!({ "timezone": "UTC" }))),
+            )
             .await
             .unwrap();
 

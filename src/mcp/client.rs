@@ -4,13 +4,13 @@ use crate::tool::ToolDeclaration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::RwLock;
+use process_wrap::tokio::CommandWrap;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::TokioCommandWrap;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CallToolRequestParam, ClientCapabilities, ErrorData, Implementation, InitializeRequestParam,
-    ListRootsResult, ProtocolVersion, Root,
+    CallToolRequestParams, ClientCapabilities, ErrorData, Implementation, InitializeRequestParams,
+    ListRootsResult, Root,
 };
 use rmcp::service::{RequestContext, RoleClient, RunningService, ServiceError};
 use rmcp::transport::TokioChildProcess;
@@ -44,21 +44,14 @@ impl McpClientHandler {
 }
 
 impl ClientHandler for McpClientHandler {
-    fn get_info(&self) -> InitializeRequestParam {
-        InitializeRequestParam {
-            protocol_version: ProtocolVersion::default(),
-            capabilities: ClientCapabilities::builder()
+    fn get_info(&self) -> InitializeRequestParams {
+        InitializeRequestParams::new(
+            ClientCapabilities::builder()
                 .enable_roots()
                 .enable_roots_list_changed()
                 .build(),
-            client_info: Implementation {
-                name: "harnx".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: None,
-                website_url: None,
-                icons: None,
-            },
-        }
+            Implementation::new("harnx", env!("CARGO_PKG_VERSION")),
+        )
     }
 
     async fn list_roots(
@@ -74,13 +67,10 @@ impl ClientHandler for McpClientHandler {
                     .canonicalize()
                     .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(path)))
                     .ok()?;
-                Some(Root {
-                    uri: path_to_file_uri(&abs),
-                    name: None,
-                })
+                Some(Root::new(path_to_file_uri(&abs)))
             })
             .collect();
-        Ok(ListRootsResult { roots })
+        Ok(ListRootsResult::new(roots))
     }
 }
 
@@ -163,7 +153,7 @@ impl McpClient {
         // Spawn in a new process group so SIGINT (Ctrl+C) in the parent
         // terminal doesn't propagate to MCP server child processes.
         #[allow(unused_mut)]
-        let mut wrap = TokioCommandWrap::from(command);
+        let mut wrap = CommandWrap::from(command);
         #[cfg(unix)]
         wrap.wrap(ProcessGroup::leader());
 
@@ -307,10 +297,10 @@ impl McpClient {
             _ => bail!("MCP tool arguments must be a JSON object or null"),
         };
 
-        let params = CallToolRequestParam {
-            name: tool_name.to_string().into(),
-            arguments,
-        };
+        let mut params = CallToolRequestParams::new(tool_name.to_string());
+        if let Some(args) = arguments {
+            params = params.with_arguments(args);
+        }
 
         let peer = {
             let service_guard = self.service.read();
@@ -378,7 +368,7 @@ mod tests {
     use super::*;
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::{
-        CallToolRequestParam, CallToolResult, Content, InitializeResult, ListToolsResult,
+        CallToolRequestParams, CallToolResult, Content, InitializeResult, ListToolsResult,
         ServerCapabilities, Tool,
     };
     use rmcp::service::{serve_server, NotificationContext, RoleServer};
@@ -388,7 +378,7 @@ mod tests {
 
     #[derive(Clone, Default, Debug)]
     struct MockServerHandler {
-        initialized_params: Arc<RwLock<Option<InitializeRequestParam>>>,
+        initialized_params: Arc<RwLock<Option<InitializeRequestParams>>>,
         roots_list_changed_notified: Arc<RwLock<bool>>,
         peer: Arc<RwLock<Option<rmcp::service::Peer<rmcp::service::RoleServer>>>>,
         tools: Arc<RwLock<Vec<Tool>>>,
@@ -397,23 +387,13 @@ mod tests {
 
     impl ServerHandler for MockServerHandler {
         fn get_info(&self) -> InitializeResult {
-            InitializeResult {
-                protocol_version: ProtocolVersion::default(),
-                capabilities: ServerCapabilities::default(),
-                server_info: Implementation {
-                    name: "mock-server".to_string(),
-                    version: "0.1.0".to_string(),
-                    title: None,
-                    website_url: None,
-                    icons: None,
-                },
-                instructions: None,
-            }
+            InitializeResult::new(ServerCapabilities::default())
+                .with_server_info(Implementation::new("mock-server", "0.1.0"))
         }
 
         async fn initialize(
             &self,
-            params: InitializeRequestParam,
+            params: InitializeRequestParams,
             cx: RequestContext<rmcp::service::RoleServer>,
         ) -> Result<InitializeResult, rmcp::model::ErrorData> {
             *self.initialized_params.write() = Some(params);
@@ -423,10 +403,11 @@ mod tests {
 
         async fn list_tools(
             &self,
-            _params: Option<rmcp::model::PaginatedRequestParam>,
+            _params: Option<rmcp::model::PaginatedRequestParams>,
             _cx: RequestContext<rmcp::service::RoleServer>,
         ) -> Result<ListToolsResult, rmcp::model::ErrorData> {
             Ok(ListToolsResult {
+                meta: None,
                 tools: self.tools.read().clone(),
                 next_cursor: None,
             })
@@ -434,7 +415,7 @@ mod tests {
 
         async fn call_tool(
             &self,
-            request: CallToolRequestParam,
+            request: CallToolRequestParams,
             _cx: RequestContext<RoleServer>,
         ) -> Result<CallToolResult, rmcp::model::ErrorData> {
             let arguments = request
