@@ -8,6 +8,7 @@ mod prompt;
 use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
+use std::io::Write;
 
 use crate::client::{call_chat_completions, call_chat_completions_streaming};
 use crate::config::{
@@ -34,6 +35,7 @@ use reedline::{
     ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi,
 };
 use reedline::{MenuBuilder, Signal};
+use std::io::Write as _;
 use std::sync::LazyLock;
 use std::{env, process};
 
@@ -474,10 +476,32 @@ impl Validator for ReplValidator {
 pub async fn run_repl_command(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
+    line: &str,
+    async_manager: &mut AsyncHookManager,
+    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
+    pending_async_context: &mut Option<String>,
+) -> Result<CommandOutcome> {
+    let mut stdout_sink = std::io::stdout();
+    run_repl_command_with_output(
+        config,
+        abort_signal,
+        line,
+        async_manager,
+        persistent_manager,
+        pending_async_context,
+        &mut stdout_sink,
+    )
+    .await
+}
+
+pub async fn run_repl_command_with_output(
+    config: &GlobalConfig,
+    abort_signal: AbortSignal,
     mut line: &str,
     async_manager: &mut AsyncHookManager,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
     pending_async_context: &mut Option<String>,
+    output: &mut (dyn Write + Send),
 ) -> Result<CommandOutcome> {
     let max_resume = config.read().resolved_hooks().max_resume.unwrap_or(5);
     if let Ok(Some(captures)) = MULTILINE_RE.captures(line) {
@@ -488,27 +512,27 @@ pub async fn run_repl_command(
     match parse_command(line) {
         Some((cmd, args)) => match cmd {
             ".help" => {
-                dump_repl_help();
+                dump_repl_help(output);
             }
             ".info" => match args {
                 Some("session") => {
                     let info = config.read().session_info()?;
-                    print!("{info}");
+                    write!(output, "{info}")?;
                 }
                 Some("rag") => {
                     let info = config.read().rag_info()?;
-                    print!("{info}");
+                    write!(output, "{info}")?;
                 }
                 Some("agent") => {
                     let info = config.read().agent_info()?;
-                    print!("{info}");
+                    write!(output, "{info}")?;
                 }
                 Some("tools") => {
                     let conf = config.read();
                     let declarations = conf.tool_declarations_for_use_tools(Some("*"));
                     let active_tools = conf.active_tool_names();
                     if declarations.is_empty() {
-                        println!("No tools available");
+                        writeln!(output, "No tools available")?;
                     } else {
                         for decl in &declarations {
                             let marker = if active_tools.contains(&decl.name) {
@@ -516,32 +540,37 @@ pub async fn run_repl_command(
                             } else {
                                 "○"
                             };
-                            println!("  {} {} - {}", marker, decl.name, decl.description);
+                            writeln!(output, "  {} {} - {}", marker, decl.name, decl.description)?;
                         }
                         let active_count = declarations
                             .iter()
                             .filter(|d| active_tools.contains(&d.name))
                             .count();
-                        println!("\n{} active / {} total", active_count, declarations.len());
+                        writeln!(
+                            output,
+                            "\n{} active / {} total",
+                            active_count,
+                            declarations.len()
+                        )?;
                     }
                 }
                 Some(_) => unknown_command()?,
                 None => {
-                    let output = config.read().sysinfo()?;
-                    print!("{output}");
+                    let sysinfo = config.read().sysinfo()?;
+                    write!(output, "{sysinfo}")?;
                 }
             },
             ".model" => match args {
                 Some(name) => {
                     config.write().set_model(name)?;
                 }
-                None => println!("Usage: .model <name>"),
+                None => writeln!(output, "Usage: .model <name>")?,
             },
             ".prompt" => match args {
                 Some(text) => {
                     config.write().use_prompt(text)?;
                 }
-                None => println!("Usage: .prompt <text>..."),
+                None => writeln!(output, "Usage: .prompt <text>...")?,
             },
             ".session" => {
                 config.write().use_session(args)?;
@@ -575,9 +604,10 @@ pub async fn run_repl_command(
                     config.write().agent_variables = None;
                     ret?;
                 }
-                None => {
-                    println!(r#"Usage: .agent <agent-name> [session-name] [key=value]..."#)
-                }
+                None => writeln!(
+                    output,
+                    r#"Usage: .agent <agent-name> [session-name] [key=value]..."#
+                )?,
             },
             ".starter" => match args {
                 Some(id) => {
@@ -591,7 +621,7 @@ pub async fn run_repl_command(
                     }
                     match text {
                         Some(text) => {
-                            println!("{}", dimmed_text(&format!(">> {text}")));
+                            writeln!(output, "{}", dimmed_text(&format!(">> {text}")))?;
                             let input = Input::from_str(config, &text, None);
                             ask(
                                 config,
@@ -612,7 +642,7 @@ pub async fn run_repl_command(
                 }
                 None => {
                     let banner = config.read().agent_banner()?;
-                    config.read().print_markdown(&banner)?;
+                    writeln!(output, "{banner}")?;
                 }
             },
             ".save" => match split_first_arg(args) {
@@ -622,9 +652,7 @@ pub async fn run_repl_command(
                 Some(("session", name)) => {
                     config.write().save_session(name)?;
                 }
-                _ => {
-                    println!(r#"Usage: .save <agent|session> [name]"#)
-                }
+                _ => writeln!(output, r#"Usage: .save <agent|session> [name]"#)?,
             },
             ".edit" => {
                 if config.read().macro_flag {
@@ -643,9 +671,7 @@ pub async fn run_repl_command(
                     Some("rag-docs") => {
                         Config::edit_rag_docs(config, abort_signal.clone()).await?;
                     }
-                    _ => {
-                        println!(r#"Usage: .edit <config|agent|session|rag-docs>"#)
-                    }
+                    _ => writeln!(output, r#"Usage: .edit <config|agent|session|rag-docs>"#)?,
                 }
             }
             ".compress" => match args {
@@ -656,64 +682,56 @@ pub async fn run_repl_command(
                         abort_signal.clone(),
                     )
                     .await?;
-                    println!("✓ Successfully compressed the session.");
+                    writeln!(output, "✓ Successfully compressed the session.")?;
                 }
-                _ => {
-                    println!(r#"Usage: .compress session"#)
-                }
+                _ => writeln!(output, r#"Usage: .compress session"#)?,
             },
             ".empty" => match args {
                 Some("session") => {
                     config.write().empty_session()?;
                 }
-                _ => {
-                    println!(r#"Usage: .empty session"#)
-                }
+                _ => writeln!(output, r#"Usage: .empty session"#)?,
             },
             ".reset" => match args {
                 Some("repl") => {
                     config.write().reset_session()?;
                 }
                 _ => {
-                    println!(r#"Usage: .reset repl"#);
+                    writeln!(output, r#"Usage: .reset repl"#)?;
                 }
             },
             ".rebuild" => match args {
                 Some("rag") => {
                     Config::rebuild_rag(config, abort_signal.clone()).await?;
                 }
-                _ => {
-                    println!(r#"Usage: .rebuild rag"#)
-                }
+                _ => writeln!(output, r#"Usage: .rebuild rag"#)?,
             },
             ".sources" => match args {
                 Some("rag") => {
-                    let output = Config::rag_sources(config)?;
-                    println!("{output}");
+                    let sources = Config::rag_sources(config)?;
+                    writeln!(output, "{sources}")?;
                 }
-                _ => {
-                    println!(r#"Usage: .sources rag"#)
-                }
+                _ => writeln!(output, r#"Usage: .sources rag"#)?,
             },
             ".mcp" => match split_first_arg(args) {
                 Some(("list", _)) => {
                     let servers = Config::mcp_list_servers(config);
                     if servers.is_empty() {
-                        println!("No MCP servers configured");
+                        writeln!(output, "No MCP servers configured")?;
                     } else {
-                        println!("MCP Servers:");
+                        writeln!(output, "MCP Servers:")?;
                         for name in servers {
-                            println!("  {}", name);
+                            writeln!(output, "  {}", name)?;
                         }
                     }
                 }
                 Some(("connect", name)) => {
                     let name = name.map(|n| n.trim()).unwrap_or("");
                     if name.is_empty() {
-                        println!("Usage: .mcp connect <server>");
+                        writeln!(output, "Usage: .mcp connect <server>")?;
                     } else {
                         Config::mcp_connect_server(config, name).await?;
-                        println!("Connected to MCP server '{}'", name);
+                        writeln!(output, "Connected to MCP server '{}'", name)?;
                     }
                 }
                 Some(("disconnect", name)) => {
@@ -735,29 +753,29 @@ pub async fn run_repl_command(
                             _ => manager.get_all_tools().await,
                         };
                         if tools.is_empty() {
-                            println!("No MCP tools available");
+                            writeln!(output, "No MCP tools available")?;
                         } else {
-                            println!("MCP Tools:");
+                            writeln!(output, "MCP Tools:")?;
                             for tool in tools {
-                                println!("  {} - {}", tool.name, tool.description);
+                                writeln!(output, "  {} - {}", tool.name, tool.description)?;
                             }
                         }
                     } else {
-                        println!("MCP is not configured");
+                        writeln!(output, "MCP is not configured")?;
                     }
                 }
                 Some(("roots", name)) => {
                     let name = name.map(|n| n.trim()).unwrap_or("");
                     if name.is_empty() {
-                        println!("Usage: .mcp roots <server>");
+                        writeln!(output, "Usage: .mcp roots <server>")?;
                     } else {
                         let roots = Config::mcp_get_roots(config, name)?;
                         if roots.is_empty() {
-                            println!("No roots for MCP server '{}'", name);
+                            writeln!(output, "No roots for MCP server '{}'", name)?;
                         } else {
-                            println!("MCP Roots for '{}':", name);
+                            writeln!(output, "MCP Roots for '{}':", name)?;
                             for root in roots {
-                                println!("  {}", root);
+                                writeln!(output, "  {}", root)?;
                             }
                         }
                     }
@@ -767,13 +785,13 @@ pub async fn run_repl_command(
                     if let Some((name, root)) = name_and_root.split_once(' ') {
                         let (name, root) = (name.trim(), root.trim());
                         if name.is_empty() || root.is_empty() {
-                            println!("Usage: .mcp add-root <server> <root>");
+                            writeln!(output, "Usage: .mcp add-root <server> <root>")?;
                         } else {
                             Config::mcp_add_root(config, name, root).await?;
-                            println!("Added root '{}' to MCP server '{}'", root, name);
+                            writeln!(output, "Added root '{}' to MCP server '{}'", root, name)?;
                         }
                     } else {
-                        println!("Usage: .mcp add-root <server> <root>");
+                        writeln!(output, "Usage: .mcp add-root <server> <root>")?;
                     }
                 }
                 Some(("remove-root", name_and_root)) => {
@@ -781,17 +799,18 @@ pub async fn run_repl_command(
                     if let Some((name, root)) = name_and_root.split_once(' ') {
                         let (name, root) = (name.trim(), root.trim());
                         if name.is_empty() || root.is_empty() {
-                            println!("Usage: .mcp remove-root <server> <root>");
+                            writeln!(output, "Usage: .mcp remove-root <server> <root>")?;
                         } else {
                             Config::mcp_remove_root(config, name, root).await?;
-                            println!("Removed root '{}' from MCP server '{}'", root, name);
+                            writeln!(output, "Removed root '{}' from MCP server '{}'", root, name)?;
                         }
                     } else {
-                        println!("Usage: .mcp remove-root <server> <root>");
+                        writeln!(output, "Usage: .mcp remove-root <server> <root>")?;
                     }
                 }
                 _ => {
-                    println!(
+                    writeln!(
+                        output,
                         r#"Usage: .mcp <command>
 
 Commands:
@@ -802,7 +821,7 @@ Commands:
   .mcp roots <server>          - List roots for an MCP server
   .mcp add-root <server> <root> - Add a root to an MCP server
   .mcp remove-root <server> <root> - Remove a root from an MCP server"#
-                    );
+                    )?;
                 }
             },
             ".macro" => match split_first_arg(args) {
@@ -813,7 +832,7 @@ Commands:
                         macro_execute(config, name, extra, abort_signal.clone()).await?;
                     }
                 }
-                None => println!("Usage: .macro <name> <text>..."),
+                None => writeln!(output, "Usage: .macro <name> <text>...")?,
             },
             ".file" => match args {
                 Some(args) => {
@@ -904,34 +923,35 @@ Commands:
                 Some(("tool", name)) => {
                     let name = name.map(|n| n.trim()).unwrap_or("");
                     if name.is_empty() {
-                        println!(
+                        writeln!(
+                            output,
                             "Usage: .use tool <name>  (tool name, toolset name, or <server>_*)"
-                        );
+                        )?;
                     } else {
                         let mut conf = config.write();
                         let current = conf.extract_agent().use_tools().unwrap_or_default();
                         if current.iter().any(|v| v == name) {
-                            println!("'{}' is already in use_tools", name);
+                            writeln!(output, "'{}' is already in use_tools", name)?;
                         } else {
                             let mut new_items = current;
                             new_items.push(name.to_string());
                             conf.set_use_tools(Some(new_items));
-                            println!("Added '{}' to use_tools", name);
+                            writeln!(output, "Added '{}' to use_tools", name)?;
                         }
                     }
                 }
-                _ => println!("Usage: .use tool <name>"),
+                _ => writeln!(output, "Usage: .use tool <name>")?,
             },
             ".drop" => match split_first_arg(args) {
                 Some(("tool", name)) => {
                     let name = name.map(|n| n.trim()).unwrap_or("");
                     if name.is_empty() {
-                        println!("Usage: .drop tool <name>");
+                        writeln!(output, "Usage: .drop tool <name>")?;
                     } else {
                         let mut conf = config.write();
                         let current = conf.extract_agent().use_tools().unwrap_or_default();
                         if !current.iter().any(|v| v == name) {
-                            println!("'{}' is not in use_tools", name);
+                            writeln!(output, "'{}' is not in use_tools", name)?;
                         } else {
                             let remaining: Vec<String> =
                                 current.into_iter().filter(|i| i != name).collect();
@@ -941,27 +961,26 @@ Commands:
                                 Some(remaining)
                             };
                             conf.set_use_tools(new_value);
-                            println!("Removed '{}' from use_tools", name);
+                            writeln!(output, "Removed '{}' from use_tools", name)?;
                         }
                     }
                 }
-                _ => println!("Usage: .drop tool <name>"),
+                _ => writeln!(output, "Usage: .drop tool <name>")?,
             },
             ".set" => match args {
                 Some(args) => {
                     Config::update(config, args)?;
                 }
-                _ => {
-                    println!("Usage: .set <key> <value>...")
-                }
+                _ => writeln!(output, "Usage: .set <key> <value>...")?,
             },
             ".delete" => match args {
                 Some(args) => {
                     Config::delete(config, args)?;
                 }
-                _ => {
-                    println!("Usage: .delete <agent|session|rag|macro|agent-data>")
-                }
+                _ => writeln!(
+                    output,
+                    "Usage: .delete <agent|session|rag|macro|agent-data>"
+                )?,
             },
             ".copy" => {
                 let output = match config
@@ -1362,13 +1381,14 @@ fn unknown_command() -> Result<()> {
     bail!(r#"Unknown command. Type ".help" for additional help."#);
 }
 
-fn dump_repl_help() {
+fn dump_repl_help(output: &mut (dyn Write + Send)) {
     let head = REPL_COMMANDS
         .iter()
         .map(|cmd| format!("{:<24} {}", cmd.name, cmd.description))
         .collect::<Vec<String>>()
         .join("\n");
-    println!(
+    let _ = writeln!(
+        output,
         r###"{head}
 
 Type ::: to start multi-line editing, type ::: to finish it.
