@@ -1,6 +1,6 @@
 mod agent;
 mod input;
-mod session;
+pub mod session;
 
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
@@ -418,7 +418,7 @@ impl Default for Config {
             cmd_default_session: None,
             agent_default_session: None,
 
-            save_session: None,
+            save_session: Some(true),
             compress_threshold: 180000,
             summarize_prompt: None,
             summary_prompt: None,
@@ -1311,7 +1311,12 @@ impl Config {
             }
         }
         let mut new_session = false;
+        let sessions_dir = self.sessions_dir();
         if let Some(session) = session.as_mut() {
+            // Store sessions_dir so the log file can be lazily initialized
+            // on the first event (avoids creating empty files in tests).
+            // Must be set before any add_message() call that triggers logging.
+            session.set_sessions_dir(sessions_dir);
             if session.is_empty() {
                 new_session = true;
                 if let Some(LastMessage {
@@ -1911,7 +1916,7 @@ impl Config {
             WorkingMode::Repl => self.repl_default_session.as_ref(),
             WorkingMode::Cmd => self.cmd_default_session.as_ref(),
             WorkingMode::Serve => return Ok(()),
-            WorkingMode::Acp(_) => return Ok(()),
+            WorkingMode::Acp(_) => self.agent_default_session.as_ref(),
         };
         let default_session = match default_session {
             Some(v) => {
