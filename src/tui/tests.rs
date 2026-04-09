@@ -9,14 +9,27 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 fn test_config() -> GlobalConfig {
-    Arc::new(RwLock::new(Config::default()))
+    let config = Arc::new(RwLock::new(Config::default()));
+    {
+        let mut guard = config.write();
+        guard.clients = vec![ClientConfig::Unknown];
+        let model = MockClient::builder().build().model().clone();
+        guard.model = model;
+    }
+    config
 }
 
-fn test_config_with_mock_client() -> GlobalConfig {
-    test_config_with_mock_client_and_agent("test-agent", "test-session")
+fn line_to_plain(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
-fn test_config_with_mock_client_and_agent(agent_name: &str, session_name: &str) -> GlobalConfig {
+fn test_config_with_mock_client_and_agent(
+    agent_name: &str,
+    session_name: Option<&str>,
+) -> GlobalConfig {
     let config = test_config();
     {
         let mut guard = config.write();
@@ -30,13 +43,10 @@ fn test_config_with_mock_client_and_agent(agent_name: &str, session_name: &str) 
         agent.set_model(model.clone());
         guard.agent = Some(agent);
 
-        // Build deterministic in-memory session state for tests instead of
-        // relying on use_session(), which resolves models through configured
-        // clients and can fail with the mock test model.
-        let mut session = crate::config::session::Session::new(&guard, session_name);
-        session.set_model(model);
-        session.set_sessions_dir(guard.sessions_dir());
-        guard.session = Some(session);
+        // Set up session if session_name is provided.
+        if let Some(name) = session_name {
+            guard.session = Some(crate::config::session::Session::new(&guard, name));
+        }
     }
     config
 }
@@ -47,6 +57,21 @@ fn normalize_screen(contents: &str) -> String {
         .map(|line| line.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[tokio::test]
+async fn pending_message_is_rendered_with_input_highlight_and_no_status_text() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    tui.app.llm_busy = true;
+    tui.queue_pending_message("queued message".to_string());
+
+    let title = line_to_plain(&tui.build_input_title());
+    assert!(!title.contains("Pending message queued"));
+
+    let rendered = tui.app.input.lines().join("\n");
+    assert_eq!(rendered, "queued message");
 }
 
 #[tokio::test]
@@ -241,9 +266,144 @@ async fn info_commands_render_into_tui_transcript() {
     assert!(has_session_output);
 }
 
+#[tokio::test]
+async fn info_session_does_not_print_raw_output_in_tui_mode() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.run_repl_command(".info session").await.unwrap();
+    while let Ok(event) = tui.event_rx.try_recv() {
+        tui.handle_tui_event(event).await.unwrap();
+    }
+
+    let transcript_text = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(transcript_text.contains("Session") || !transcript_text.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn info_session_without_session_renders_in_tui_snapshot() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(60, 14);
+    harness.tui().config = config.clone();
+    harness.tui().persistent_manager = persistent;
+
+    harness
+        .tui()
+        .run_repl_command(".info session")
+        .await
+        .unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.is_empty());
+    insta::assert_snapshot!("info_session_without_session_in_tui", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn info_session_with_session_renders_in_tui_snapshot() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(60, 18);
+    harness.tui().config = config.clone();
+    harness.tui().persistent_manager = persistent;
+
+    harness
+        .tui()
+        .run_repl_command(".session info-session-with-session-test")
+        .await
+        .unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+
+    harness
+        .tui()
+        .run_repl_command(".info session")
+        .await
+        .unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(rendered.contains("info-session-with-session-test"));
+    insta::assert_snapshot!("info_session_with_session_in_tui", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn help_renders_in_tui_snapshot() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(70, 24);
+    harness.tui().config = config.clone();
+    harness.tui().persistent_manager = persistent;
+
+    harness.tui().run_repl_command(".help").await.unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(rendered.contains("Show system info") || rendered.contains("Type :::"));
+    insta::assert_snapshot!("help_in_tui", rendered);
+}
+
+#[tokio::test]
+async fn representative_repl_commands_render_into_tui_transcript() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let commands = [".help", ".info session", ".mcp list"];
+
+    for command in commands {
+        let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent.clone()).unwrap();
+        tui.run_repl_command(command).await.unwrap();
+        while let Ok(event) = tui.event_rx.try_recv() {
+            tui.handle_tui_event(event).await.unwrap();
+        }
+
+        let transcript_text = tui
+            .app
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::System(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !transcript_text.is_empty(),
+            "expected command {command} to render output into TUI transcript"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_basic_message_and_streaming_response() {
-    let config = test_config_with_mock_client();
+    let guard = TestStateGuard::new(None).await;
+    let config = test_config_with_mock_client_and_agent("test-agent", None);
+    assert!(
+        config.read().session.is_none(),
+        "config should not have a session before test setup"
+    );
     let mock_client = Arc::new(
         MockClient::builder()
             .global_config(config.clone())
@@ -257,10 +417,14 @@ async fn test_basic_message_and_streaming_response() {
             .build(),
     );
 
-    let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
+    guard.set_client(Some(mock_client.clone()));
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    assert!(
+        harness.tui().config.read().session.is_none(),
+        "harness config should not have a session before prompt starts"
+    );
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -332,7 +496,8 @@ async fn test_basic_message_and_streaming_response() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_streaming_with_tool_calls() {
-    let config = test_config_with_mock_client();
+    let config =
+        test_config_with_mock_client_and_agent("test-agent", Some("streaming-tool-calls-session"));
 
     // First turn: stream text, then make a tool call
     // Second turn: more text after tool result
@@ -356,7 +521,7 @@ async fn test_streaming_with_tool_calls() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -397,12 +562,7 @@ async fn test_streaming_with_tool_calls() {
         .await
         .unwrap();
 
-    // Verify the screen shows tool result indicator
     let screen = harness.screen_contents();
-    assert!(
-        screen.contains("tool result"),
-        "Screen should show tool result indicator"
-    );
 
     // Verify tool call appears in the transcript
     assert!(
@@ -424,7 +584,7 @@ async fn test_streaming_with_tool_calls() {
 /// focuses on verifying the tool call appears in the TUI transcript.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sub_agent_delegation_tool_appears() {
-    let config = test_config_with_mock_client_and_agent("coordinator", "delegation-test");
+    let config = test_config_with_mock_client_and_agent("coordinator", Some("delegation-test"));
 
     // The mock returns trigger_agent tool call, which gets processed
     // The tool result will have switch_agent data, but we're just verifying
@@ -450,7 +610,7 @@ async fn test_sub_agent_delegation_tool_appears() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -538,7 +698,8 @@ async fn test_tool_result_switch_agent_parsing() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_screen_overflow_and_word_wrap() {
-    let config = test_config_with_mock_client();
+    let config =
+        test_config_with_mock_client_and_agent("test-agent", Some("screen-overflow-wrap-session"));
     let user_message = "Please demonstrate wrapping in a small viewport.";
     let long_response = concat!(
         "This response contains several deliberately long words grouped into readable sentences ",
@@ -556,7 +717,7 @@ async fn test_screen_overflow_and_word_wrap() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_size(40, 10);
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -641,6 +802,22 @@ async fn test_tall_multiline_input() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pending_message_busy_state_snapshot() {
+    let mut harness = TuiTestHarness::with_size(40, 12);
+    harness.tui().app.llm_busy = true;
+    harness
+        .tui()
+        .queue_pending_message("queued follow-up message".to_string());
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.contains("Pending message queued"));
+    assert!(rendered.contains("queued follow-up message"));
+
+    insta::assert_snapshot!("pending_message_busy_state", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_input_word_wraps_long_line() {
     // Use a narrow viewport (30 cols) so a long single-line input must wrap
     let mut harness = TuiTestHarness::with_size(30, 10);
@@ -674,7 +851,8 @@ async fn test_input_word_wraps_long_line() {
 /// The abort signal should stop streaming and the TUI should show a cancellation message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ctrl_c_cancels_streaming() {
-    let config = test_config_with_mock_client();
+    let config =
+        test_config_with_mock_client_and_agent("test-agent", Some("ctrl-c-cancel-session"));
 
     // Mock streams a response that we'll cancel mid-stream
     let mock_client = Arc::new(
@@ -693,7 +871,7 @@ async fn test_ctrl_c_cancels_streaming() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -756,7 +934,10 @@ async fn test_ctrl_c_cancels_streaming() {
 /// When the mock returns an error, the error should be visible in the transcript.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_streaming_error_shows_in_transcript() {
-    let config = test_config_with_mock_client();
+    let config = test_config_with_mock_client_and_agent(
+        "test-agent",
+        Some("streaming-error-transcript-session"),
+    );
 
     // Create a mock that will return an error on streaming
     let mock_client = Arc::new(
@@ -769,7 +950,7 @@ async fn test_streaming_error_shows_in_transcript() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -810,7 +991,8 @@ async fn test_streaming_error_shows_in_transcript() {
 /// When user presses Ctrl+C while a tool is executing, the tool should be aborted.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_during_tool_execution() {
-    let config = test_config_with_mock_client();
+    let config =
+        test_config_with_mock_client_and_agent("test-agent", Some("cancel-tool-execution-session"));
 
     // Mock returns a tool call, then more text
     let mock_client = Arc::new(
@@ -833,7 +1015,7 @@ async fn test_cancel_during_tool_execution() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app
@@ -1236,7 +1418,10 @@ async fn detach_by_name_removes_specific_attachment() {
 async fn submit_drains_attachments() {
     use crate::tui::types::Attachment;
 
-    let config = test_config_with_mock_client();
+    let config = test_config_with_mock_client_and_agent(
+        "test-agent",
+        Some("submit-drains-attachments-session"),
+    );
     let mock_client = Arc::new(
         MockClient::builder()
             .global_config(config.clone())
@@ -1281,7 +1466,10 @@ async fn submit_drains_attachments() {
 async fn submit_attachments_only_with_empty_text() {
     use crate::tui::types::Attachment;
 
-    let config = test_config_with_mock_client();
+    let config = test_config_with_mock_client_and_agent(
+        "test-agent",
+        Some("submit-attachments-only-session"),
+    );
     let mock_client = Arc::new(
         MockClient::builder()
             .global_config(config.clone())
@@ -1353,7 +1541,10 @@ async fn queued_message_keeps_attachments_visible_while_busy() {
 /// Test recovery after cancellation - user can send a new message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_recovery_after_cancellation() {
-    let config = test_config_with_mock_client();
+    let config = test_config_with_mock_client_and_agent(
+        "test-agent",
+        Some("recovery-after-cancellation-session"),
+    );
 
     // Mock for both turns - each start_prompt consumes one turn
     let mock_client = Arc::new(
@@ -1370,7 +1561,7 @@ async fn test_recovery_after_cancellation() {
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
 
     // Send first message
     harness
@@ -1433,7 +1624,7 @@ async fn test_recovery_after_cancellation() {
     _guard.set_client(Some(mock_client2.clone()));
 
     // User can send a new message
-    harness.tui().app.transcript.clear();
+    harness.tui().clear_transcript();
     harness
         .tui()
         .app

@@ -1,0 +1,20 @@
+---
+source: src/tui/tests.rs
+expression: rendered
+---
+Welcome to harnx 0.30.0  •  Type .help for commands, Tab to
+complete.
+
+model               mock:mock-model
+save_session        true
+
+
+
+
+
+
+
+
+
+
+• 💬  info-session-with-session-test

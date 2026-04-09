@@ -56,29 +56,24 @@ impl Tui {
                 if self.app.completions.is_empty() {
                     self.history_prev();
                 } else {
-                    self.app.transcript_scroll = self.app.transcript_scroll.saturating_sub(1);
+                    self.app.scroll_state.scroll_up();
                 }
             }
             (KeyCode::Down, KeyModifiers::NONE) => {
                 if self.app.completions.is_empty() {
                     self.history_next();
                 } else {
-                    self.app.transcript_scroll = self.app.transcript_scroll.saturating_add(1);
+                    self.app.scroll_state.scroll_down();
                 }
             }
             (KeyCode::PageUp, KeyModifiers::NONE) => {
-                if self.app.transcript_scroll == u16::MAX {
-                    self.app.transcript_scroll = self.app.max_scroll.saturating_sub(10);
-                } else {
-                    self.app.transcript_scroll = self.app.transcript_scroll.saturating_sub(10);
+                for _ in 0..10 {
+                    self.app.scroll_state.scroll_up();
                 }
             }
             (KeyCode::PageDown, KeyModifiers::NONE) => {
-                let new_scroll = self.app.transcript_scroll.saturating_add(10);
-                if new_scroll >= self.app.max_scroll {
-                    self.app.transcript_scroll = u16::MAX;
-                } else {
-                    self.app.transcript_scroll = new_scroll;
+                for _ in 0..10 {
+                    self.app.scroll_state.scroll_down();
                 }
             }
             (KeyCode::Tab, KeyModifiers::NONE) => {
@@ -327,20 +322,13 @@ impl Tui {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                // If pinned to bottom, unpin and start from max_scroll
-                if self.app.transcript_scroll == u16::MAX {
-                    self.app.transcript_scroll = self.app.max_scroll.saturating_sub(3);
-                } else {
-                    self.app.transcript_scroll = self.app.transcript_scroll.saturating_sub(3);
+                for _ in 0..3 {
+                    self.app.scroll_state.scroll_up();
                 }
             }
             MouseEventKind::ScrollDown => {
-                // If at bottom, re-pin to bottom
-                let new_scroll = self.app.transcript_scroll.saturating_add(3);
-                if new_scroll >= self.app.max_scroll {
-                    self.app.transcript_scroll = u16::MAX;
-                } else {
-                    self.app.transcript_scroll = new_scroll;
+                for _ in 0..3 {
+                    self.app.scroll_state.scroll_down();
                 }
             }
             _ => {}
@@ -372,12 +360,10 @@ impl Tui {
                 self.append_streaming_assistant_chunk(&chunk);
                 self.pin_transcript_to_bottom();
             }
-            TuiEvent::ToolRoundComplete { tool_count } => {
-                // Intermediate tool round — prompt loop continues, don't clear llm_busy
-                self.app.streaming_assistant_idx = None;
-                self.app.transcript.push(TranscriptEntry::System(format!(
-                    "{tool_count} tool result(s) returned"
-                )));
+            TuiEvent::ToolRoundComplete => {
+                // Intermediate tool round — prompt loop continues, don't clear llm_busy.
+                // Keep the current assistant streaming entry so follow-up text can
+                // continue without inserting a blank separator or synthetic status line.
                 self.pin_transcript_to_bottom();
             }
             TuiEvent::Finished { output, usage } => {
@@ -731,20 +717,38 @@ impl Tui {
     }
 
     pub(super) async fn run_repl_command(&mut self, line: &str) -> Result<()> {
-        let config = self.config.clone();
-        let abort_signal = self.abort_signal.clone();
-        let mut async_manager = self.async_manager.lock().await;
-        let mut pending_async_context = self.pending_async_context.lock().await;
-        match crate::repl::run_repl_command(
-            &config,
-            abort_signal,
-            line,
-            &mut async_manager,
-            &self.persistent_manager,
-            &mut pending_async_context,
-        )
-        .await
-        {
+        // Run the command inside a block that owns the lock guards so they are
+        // dropped before we touch `self` again for transcript / UI updates.
+        let (result, captured) = {
+            let config = self.config.clone();
+            let abort_signal = self.abort_signal.clone();
+            let mut async_manager = self.async_manager.lock().await;
+            let mut pending_async_context = self.pending_async_context.lock().await;
+            let mut output = Vec::<u8>::new();
+
+            let result = crate::repl::run_repl_command_with_output(
+                &config,
+                abort_signal,
+                line,
+                &mut async_manager,
+                &self.persistent_manager,
+                &mut pending_async_context,
+                &mut output,
+            )
+            .await;
+
+            let captured = String::from_utf8_lossy(&output).into_owned();
+            (result, captured)
+            // async_manager + pending_async_context guards drop here
+        };
+
+        let clean = strip_ansi(&captured).trim_end_matches('\n').to_string();
+        if !clean.is_empty() {
+            self.app.transcript.push(TranscriptEntry::System(clean));
+            self.pin_transcript_to_bottom();
+        }
+
+        match result {
             Ok(outcome) => {
                 if matches!(outcome, crate::repl::CommandOutcome::Exit) {
                     self.app.should_quit = true;

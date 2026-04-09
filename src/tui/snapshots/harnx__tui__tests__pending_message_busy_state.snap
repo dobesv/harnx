@@ -1,5 +1,6 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 668
 expression: rendered
 ---
 Welcome to harnx 0.30.0  •  Type .help
@@ -8,8 +9,8 @@ for commands, Tab to complete.
 
 
 
-• Input
-First line
-Second line
-Third line
-Fourth line
+
+
+
+⠋ Input
+queued follow-up message

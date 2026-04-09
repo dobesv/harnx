@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Write as _;
+use textwrap::{wrap, Options};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -288,6 +289,47 @@ pub struct ToolCall {
     pub thought_signature: Option<String>,
 }
 
+fn display_wrap_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&w| w >= 40)
+        .unwrap_or(88)
+}
+
+fn wrap_display_text(text: &str, initial_indent: &str, subsequent_indent: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    let options = Options::new(display_wrap_width())
+        .initial_indent(initial_indent)
+        .subsequent_indent(subsequent_indent)
+        .break_words(false)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation);
+    wrap(text, options).join("\n")
+}
+
+fn pretty_yaml_block(value: &Value) -> String {
+    serde_yaml::to_string(value)
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn format_tool_invocation_display(tool_name: &str, json_data: &Value) -> String {
+    let header = wrap_display_text(&format!("🛠️  {tool_name}"), "", "   ");
+    match json_data {
+        Value::Null => format!("{}\n", dimmed_text(&header)),
+        _ => {
+            let body = pretty_yaml_block(json_data)
+                .lines()
+                .map(|line| format!("   {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{}\n{}\n", dimmed_text(&header), dimmed_text(&body))
+        }
+    }
+}
+
 impl ToolCall {
     pub fn dedup(calls: Vec<Self>) -> Vec<Self> {
         let mut new_calls = vec![];
@@ -343,11 +385,7 @@ impl ToolCall {
         };
 
         // Emit tool call info to TUI or terminal
-        let prompt = match &json_data {
-            Value::Null => format!("🛠️  {}", self.name),
-            _ => format!("🛠️  {} {}", self.name, json_data),
-        };
-        let text = format!("{}\n", dimmed_text(&prompt));
+        let text = format_tool_invocation_display(&self.name, &json_data);
         if !emit_ui_output(text.clone()) && *IS_STDOUT_TERMINAL {
             print!("{text}");
         }
@@ -526,6 +564,22 @@ mod tests {
     use crate::config::Config;
     use parking_lot::RwLock;
     use std::sync::Arc;
+
+    #[test]
+    fn test_format_tool_invocation_display_multiline_yaml() {
+        let rendered = format_tool_invocation_display(
+            "argus_session_prompt",
+            &json!({
+                "message": "Goal — Improve display\nAcceptance criteria — Wrap nicely",
+                "session_id": "session-1"
+            }),
+        );
+
+        assert!(rendered.contains("argus_session_prompt"));
+        assert!(rendered.contains("message:"));
+        assert!(rendered.contains("Acceptance criteria"));
+        assert!(rendered.contains("session_id:"));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_eval_tool_calls_error_handling() {

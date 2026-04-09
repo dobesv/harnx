@@ -1,6 +1,22 @@
 use super::*;
 use crate::tui::types::{App, TranscriptEntry, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES};
 
+/// Estimate the number of terminal rows a set of lines will occupy
+/// after word-wrapping to the given width.
+fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
+    let mut total = 0usize;
+    for line in lines {
+        let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+        if width == 0 {
+            total += 1;
+        } else {
+            let wrapped = line_len.div_ceil(width as usize);
+            total += wrapped.max(1);
+        }
+    }
+    total
+}
+
 impl Tui {
     pub(super) fn render_entry(entry: &TranscriptEntry) -> Vec<Line<'static>> {
         let (prefix, text, style) = match entry {
@@ -63,43 +79,19 @@ impl Tui {
             ])
             .split(size);
 
-        let transcript_lines = if self.app.transcript.is_empty() {
-            vec![Line::from(Span::raw(""))]
+        let transcript_entries: Vec<Vec<Line<'static>>> = if self.app.transcript.is_empty() {
+            vec![vec![Line::from(Span::raw(""))]]
         } else {
-            self.app
-                .transcript
-                .iter()
-                .flat_map(Self::render_entry)
-                .collect::<Vec<_>>()
+            self.app.transcript.iter().map(Self::render_entry).collect()
         };
 
-        // Clamp transcript_scroll to valid range (u16::MAX is the "pinned to bottom" sentinel)
-        let visible_height = chunks[0].height;
-        // Compute line count after wrapping by measuring rendered content
-        let mut total_lines = 0u16;
-        let width = chunks[0].width;
-        for line in &transcript_lines {
-            let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
-            if width == 0 {
-                total_lines = total_lines.saturating_add(1);
-            } else {
-                let wrapped = line_len.div_ceil(width as usize);
-                total_lines = total_lines.saturating_add(wrapped.max(1) as u16);
-            }
-        }
-        self.app.max_scroll = total_lines.saturating_sub(visible_height);
-
-        let effective_scroll = if self.app.transcript_scroll == u16::MAX {
-            self.app.max_scroll
-        } else {
-            self.app.transcript_scroll.min(self.app.max_scroll)
-        };
-
-        let transcript = Paragraph::new(transcript_lines)
-            .block(Block::default().borders(Borders::NONE).title("Transcript"))
-            .wrap(Wrap { trim: false })
-            .scroll((effective_scroll, 0));
-        frame.render_widget(transcript, chunks[0]);
+        self.app
+            .scroll_state
+            .render(frame, chunks[0], &transcript_entries, |lines| {
+                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+                let height = wrapped_line_count(lines, chunks[0].width);
+                (height, paragraph)
+            });
 
         self.app.last_known_input_width = chunks[1].width.saturating_sub(2).max(1);
 
@@ -287,7 +279,14 @@ impl Tui {
     }
 
     pub(super) fn pin_transcript_to_bottom(&mut self) {
-        self.app.transcript_scroll = u16::MAX;
+        self.app.scroll_state.follow = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_transcript(&mut self) {
+        self.app.transcript.clear();
+        self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
+        self.app.streaming_assistant_idx = None;
     }
 
     pub(super) fn build_input_title(&self) -> Line<'static> {
@@ -328,10 +327,6 @@ impl Tui {
             }
         }
 
-        if self.app.pending_message.is_some() {
-            parts.push("Pending message queued".to_string());
-        }
-
         let text = if parts.is_empty() {
             "Input".to_string()
         } else {
@@ -347,13 +342,37 @@ impl Tui {
         Line::from(spans)
     }
 
-    pub(super) fn refresh_input_chrome(&mut self) {}
+    pub(super) fn refresh_input_chrome(&mut self) {
+        let llm_busy = self.app.llm_busy;
+        let pending_message = self.app.pending_message.is_some();
+        Self::refresh_input_chrome_from_state(
+            &self.config,
+            &mut self.app,
+            llm_busy,
+            pending_message,
+        );
+    }
 
     pub(super) fn refresh_input_chrome_from_state(
         _config: &GlobalConfig,
-        _app: &mut App,
+        app: &mut App,
         _llm_busy: bool,
-        _pending_message: bool,
+        pending_message: bool,
     ) {
+        let input_style = if pending_message {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Reset)
+        };
+        app.input.set_style(input_style);
+
+        let cursor_style = if pending_message {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        app.input.set_cursor_style(cursor_style);
     }
 }

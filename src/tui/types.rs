@@ -56,8 +56,7 @@ pub(super) struct App {
     pub(super) spinner_index: usize,
     pub(super) should_quit: bool,
     pub(super) llm_busy: bool,
-    pub(super) transcript_scroll: u16,
-    pub(super) max_scroll: u16,
+    pub(super) scroll_state: ratatui_widget_scrolling::ScrollState,
     pub(super) streaming_assistant_idx: Option<usize>,
     pub(super) pending_message: Option<PendingMessage>,
     pub(super) completions: Vec<(String, Option<String>)>,
@@ -118,9 +117,7 @@ pub(crate) enum TuiEvent {
     UiOutput(String),
     Chunk(String),
     /// Intermediate tool round completed; the prompt loop continues.
-    ToolRoundComplete {
-        tool_count: usize,
-    },
+    ToolRoundComplete,
     /// Final completion — no more turns.
     Finished {
         output: String,
@@ -134,9 +131,7 @@ pub(super) enum TuiEvent {
     UiOutput(String),
     Chunk(String),
     /// Intermediate tool round completed; the prompt loop continues.
-    ToolRoundComplete {
-        tool_count: usize,
-    },
+    ToolRoundComplete,
     /// Final completion — no more turns.
     Finished {
         output: String,
