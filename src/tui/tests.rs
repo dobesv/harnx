@@ -30,7 +30,7 @@ fn line_to_plain(line: &Line<'_>) -> String {
         .collect()
 }
 
-fn test_config_with_mock_client_and_agent(agent_name: &str, _session_name: &str) -> GlobalConfig {
+fn test_config_with_mock_client_and_agent(agent_name: &str, session_name: &str) -> GlobalConfig {
     let config = test_config();
     {
         let mut guard = config.write();
@@ -47,8 +47,9 @@ fn test_config_with_mock_client_and_agent(agent_name: &str, _session_name: &str)
         // Build deterministic in-memory session state for tests instead of
         // relying on use_session(), which resolves models through configured
         // clients and can fail with the mock test model.
-        let mut session = crate::config::session::Session::new(&guard, "test-session");
+        let mut session = crate::config::session::Session::new(&guard, session_name);
         session.set_model(model);
+        session.set_sessions_dir(guard.sessions_dir());
         guard.session = Some(session);
     }
     config
