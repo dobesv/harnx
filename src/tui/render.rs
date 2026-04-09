@@ -286,6 +286,7 @@ impl Tui {
     pub(crate) fn clear_transcript(&mut self) {
         self.app.transcript.clear();
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
+        self.app.streaming_assistant_idx = None;
     }
 
     pub(super) fn build_input_title(&self) -> Line<'static> {

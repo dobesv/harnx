@@ -19,10 +19,6 @@ fn test_config() -> GlobalConfig {
     config
 }
 
-fn test_config_with_mock_client() -> GlobalConfig {
-    test_config_with_mock_client_and_agent("test-agent", "test-session")
-}
-
 fn line_to_plain(line: &Line<'_>) -> String {
     line.spans
         .iter()
@@ -30,7 +26,10 @@ fn line_to_plain(line: &Line<'_>) -> String {
         .collect()
 }
 
-fn test_config_with_mock_client_and_agent(agent_name: &str, session_name: &str) -> GlobalConfig {
+fn test_config_with_mock_client_and_agent(
+    agent_name: &str,
+    session_name: Option<&str>,
+) -> GlobalConfig {
     let config = test_config();
     {
         let mut guard = config.write();
@@ -44,13 +43,10 @@ fn test_config_with_mock_client_and_agent(agent_name: &str, session_name: &str) 
         agent.set_model(model.clone());
         guard.agent = Some(agent);
 
-        // Build deterministic in-memory session state for tests instead of
-        // relying on use_session(), which resolves models through configured
-        // clients and can fail with the mock test model.
-        let mut session = crate::config::session::Session::new(&guard, session_name);
-        session.set_model(model);
-        session.set_sessions_dir(guard.sessions_dir());
-        guard.session = Some(session);
+        // Set up session if session_name is provided.
+        if let Some(name) = session_name {
+            guard.session = Some(crate::config::session::Session::new(&guard, name));
+        }
     }
     config
 }
@@ -328,7 +324,7 @@ async fn info_session_with_session_renders_in_tui_snapshot() {
 
     harness
         .tui()
-        .run_repl_command(".session test-session")
+        .run_repl_command(".session info-session-with-session-test")
         .await
         .unwrap();
     while let Ok(event) = harness.tui().event_rx.try_recv() {
@@ -346,7 +342,7 @@ async fn info_session_with_session_renders_in_tui_snapshot() {
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());
-    assert!(rendered.contains("test-session"));
+    assert!(rendered.contains("info-session-with-session-test"));
     insta::assert_snapshot!("info_session_with_session_in_tui", rendered);
 }
 
@@ -402,7 +398,12 @@ async fn representative_repl_commands_render_into_tui_transcript() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_basic_message_and_streaming_response() {
-    let config = test_config_with_mock_client();
+    let guard = TestStateGuard::new(None).await;
+    let config = test_config_with_mock_client_and_agent("test-agent", None);
+    assert!(
+        config.read().session.is_none(),
+        "config should not have a session before test setup"
+    );
     let mock_client = Arc::new(
         MockClient::builder()
             .global_config(config.clone())
@@ -416,9 +417,13 @@ async fn test_basic_message_and_streaming_response() {
             .build(),
     );
 
-    let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
+    guard.set_client(Some(mock_client.clone()));
 
     let mut harness = TuiTestHarness::with_config(config.clone());
+    assert!(
+        harness.tui().config.read().session.is_none(),
+        "harness config should not have a session before prompt starts"
+    );
     harness.tui().clear_transcript();
     harness
         .tui()
@@ -491,7 +496,8 @@ async fn test_basic_message_and_streaming_response() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_streaming_with_tool_calls() {
-    let config = test_config_with_mock_client();
+    let config =
+        test_config_with_mock_client_and_agent("test-agent", Some("streaming-tool-calls-session"));
 
     // First turn: stream text, then make a tool call
     // Second turn: more text after tool result
@@ -578,7 +584,7 @@ async fn test_streaming_with_tool_calls() {
 /// focuses on verifying the tool call appears in the TUI transcript.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sub_agent_delegation_tool_appears() {
-    let config = test_config_with_mock_client_and_agent("coordinator", "delegation-test");
+    let config = test_config_with_mock_client_and_agent("coordinator", Some("delegation-test"));
 
     // The mock returns trigger_agent tool call, which gets processed
     // The tool result will have switch_agent data, but we're just verifying
@@ -692,7 +698,8 @@ async fn test_tool_result_switch_agent_parsing() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_screen_overflow_and_word_wrap() {
-    let config = test_config_with_mock_client();
+    let config =
+        test_config_with_mock_client_and_agent("test-agent", Some("screen-overflow-wrap-session"));
     let user_message = "Please demonstrate wrapping in a small viewport.";
     let long_response = concat!(
         "This response contains several deliberately long words grouped into readable sentences ",
@@ -844,7 +851,8 @@ async fn test_input_word_wraps_long_line() {
 /// The abort signal should stop streaming and the TUI should show a cancellation message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ctrl_c_cancels_streaming() {
-    let config = test_config_with_mock_client();
+    let config =
+        test_config_with_mock_client_and_agent("test-agent", Some("ctrl-c-cancel-session"));
 
     // Mock streams a response that we'll cancel mid-stream
     let mock_client = Arc::new(
@@ -926,7 +934,10 @@ async fn test_ctrl_c_cancels_streaming() {
 /// When the mock returns an error, the error should be visible in the transcript.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_streaming_error_shows_in_transcript() {
-    let config = test_config_with_mock_client();
+    let config = test_config_with_mock_client_and_agent(
+        "test-agent",
+        Some("streaming-error-transcript-session"),
+    );
 
     // Create a mock that will return an error on streaming
     let mock_client = Arc::new(
@@ -980,7 +991,8 @@ async fn test_streaming_error_shows_in_transcript() {
 /// When user presses Ctrl+C while a tool is executing, the tool should be aborted.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_during_tool_execution() {
-    let config = test_config_with_mock_client();
+    let config =
+        test_config_with_mock_client_and_agent("test-agent", Some("cancel-tool-execution-session"));
 
     // Mock returns a tool call, then more text
     let mock_client = Arc::new(
@@ -1406,7 +1418,10 @@ async fn detach_by_name_removes_specific_attachment() {
 async fn submit_drains_attachments() {
     use crate::tui::types::Attachment;
 
-    let config = test_config_with_mock_client();
+    let config = test_config_with_mock_client_and_agent(
+        "test-agent",
+        Some("submit-drains-attachments-session"),
+    );
     let mock_client = Arc::new(
         MockClient::builder()
             .global_config(config.clone())
@@ -1451,7 +1466,10 @@ async fn submit_drains_attachments() {
 async fn submit_attachments_only_with_empty_text() {
     use crate::tui::types::Attachment;
 
-    let config = test_config_with_mock_client();
+    let config = test_config_with_mock_client_and_agent(
+        "test-agent",
+        Some("submit-attachments-only-session"),
+    );
     let mock_client = Arc::new(
         MockClient::builder()
             .global_config(config.clone())
@@ -1523,7 +1541,10 @@ async fn queued_message_keeps_attachments_visible_while_busy() {
 /// Test recovery after cancellation - user can send a new message.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_recovery_after_cancellation() {
-    let config = test_config_with_mock_client();
+    let config = test_config_with_mock_client_and_agent(
+        "test-agent",
+        Some("recovery-after-cancellation-session"),
+    );
 
     // Mock for both turns - each start_prompt consumes one turn
     let mock_client = Arc::new(
