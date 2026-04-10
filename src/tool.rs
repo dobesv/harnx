@@ -105,7 +105,7 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                 let output_str =
                     extract_user_display_text(&result).unwrap_or_else(|| match &result {
                         Value::String(s) => s.clone(),
-                        _ => result.to_string(),
+                        _ => pretty_yaml_block(&result),
                     });
                 let truncated = truncate_output(&output_str, &opts);
                 let text = format!("{}\n", dimmed_text(&truncated));

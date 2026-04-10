@@ -106,6 +106,7 @@ insta = { version = "1", features = ["yaml"] }
 pretty_assertions = "1.4.0"
 rand = "0.10.0"
 tokio-test = "0.4"
+tempfile = "3"
 
 [[bin]]
 name = "harnx-mcp-todo"
