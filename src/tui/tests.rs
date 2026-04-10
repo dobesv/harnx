@@ -2,8 +2,10 @@ use super::*;
 use crate::client::{Client, ClientConfig, TestStateGuard};
 use crate::config::Config;
 use crate::test_utils::{MockClient, MockTurnBuilder, TuiTestHarness};
+use crate::tui::render_helpers::event_fallback_text;
 use crate::tui::types::{TranscriptEntry, TuiEvent};
 use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
+use crate::utils::dimmed_text;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
@@ -290,15 +292,15 @@ async fn ui_output_inserts_heading_when_source_changes() {
         })
         .collect();
 
-    assert!(system_entries.contains(&"🤖 argus ▸ session-1"));
+    assert!(system_entries.contains(&"> argus ▸ session-1"));
     assert!(system_entries.contains(&"first chunk"));
     assert!(system_entries.contains(&"second chunk"));
-    assert!(system_entries.contains(&"🤖 hephaestus ▸ session-2"));
+    assert!(system_entries.contains(&"> hephaestus ▸ session-2"));
     assert!(system_entries.contains(&"other chunk"));
 
     let argus_heading_count = system_entries
         .iter()
-        .filter(|text| **text == "🤖 argus ▸ session-1")
+        .filter(|text| **text == "> argus ▸ session-1")
         .count();
     assert_eq!(argus_heading_count, 1);
 }
@@ -682,7 +684,7 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
     assert_eq!(
         system_entries,
         vec![
-            "🤖 argus ▸ session-1",
+            "> argus ▸ session-1",
             "<think>thinking before tool</think>",
             "argus_session_prompt",
             "   message: delegate",
@@ -841,7 +843,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
             input_tokens: 12,
             output_tokens: 34,
             cached_tokens: 5,
-            session_label: Some("🤖 argus ▸ session-1".to_string()),
+            session_label: Some("> argus ▸ session-1".to_string()),
         },
         source: Some(UiOutputSource {
             agent: "argus".to_string(),
@@ -878,18 +880,141 @@ async fn structured_ui_output_variants_render_in_transcript() {
         })
         .collect();
 
-    assert!(system_entries.contains(&"🤖 argus ▸ session-1"));
+    assert!(system_entries.contains(&"> argus ▸ session-1"));
     assert!(system_entries.contains(&"argus_session_prompt"));
     assert!(system_entries.contains(&"   message: hello"));
     assert!(system_entries.contains(&"<think>thinking hard</think>"));
     assert!(system_entries.contains(&"-> argus_session_prompt completed"));
     assert!(system_entries.contains(&"Plan:"));
     assert!(system_entries.contains(&"  [in_progress] Refactor ACP formatting"));
-    assert!(system_entries.contains(&"🤖 argus ▸ session-1   📥 12   📤 34   💾 5"));
+    assert!(system_entries.contains(&"> argus ▸ session-1   in 12   out 34   cache 5"));
     assert!(system_entries.contains(&"->️ bash"));
     assert!(system_entries.contains(&"   command: ls"));
     assert!(system_entries.contains(&"   line one"));
     assert!(system_entries.contains(&"   line two"));
+}
+
+#[tokio::test]
+async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let source = UiOutputSource {
+        agent: "pytheas".to_string(),
+        session_id: Some("session-1".to_string()),
+    };
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::Usage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cached_tokens: 0,
+            session_label: None,
+        },
+        source: Some(source.clone()),
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::Usage {
+            input_tokens: 20,
+            output_tokens: 2,
+            cached_tokens: 0,
+            session_label: None,
+        },
+        source: Some(source.clone()),
+    }))
+    .await
+    .unwrap();
+
+    let system_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        system_entries
+            .iter()
+            .filter(|line| **line == "> pytheas ▸ session-1")
+            .count(),
+        1
+    );
+    assert_eq!(
+        system_entries
+            .iter()
+            .filter(|line| **line == "> pytheas ▸ session-1   in 10   out 1")
+            .count(),
+        0
+    );
+    assert_eq!(
+        system_entries
+            .iter()
+            .filter(|line| **line == "> pytheas ▸ session-1   in 20   out 2")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn submitting_message_with_attachments_renders_attachment_list_and_preview() {
+    use crate::tui::types::Attachment;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes.txt");
+    std::fs::write(&file, "first line\nsecond line\nthird line").unwrap();
+
+    tui.submit_pending_message(crate::tui::types::PendingMessage {
+        text: "hello with files".to_string(),
+        attachments: vec![Attachment {
+            path: file,
+            display_name: "notes.txt".to_string(),
+        }],
+        attachment_dir: None,
+        paste_count: 0,
+    })
+    .await
+    .unwrap();
+
+    let system_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(matches!(
+        tui.app.transcript.iter().find(|entry| matches!(entry, TranscriptEntry::User(_))),
+        Some(TranscriptEntry::User(text)) if text == "hello with files"
+    ));
+    assert!(system_entries.contains(&"Attachments (1):"));
+    assert!(system_entries.contains(&"  - notes.txt"));
+    assert!(system_entries.contains(&"      first line"));
+    assert!(system_entries.contains(&"      second line"));
+}
+
+#[test]
+fn mcp_tool_result_fallback_uses_multiline_yaml_for_structured_json() {
+    let event = UiOutputEventKind::ToolResultText {
+        text: dimmed_text("content:\n  - type: text\n    text: hello\nisError: false\n"),
+    };
+
+    let rendered = event_fallback_text(&event, None);
+    assert!(rendered.contains("content:"));
+    assert!(rendered.contains("type: text"));
+    assert!(!rendered.contains("{\"content\""));
 }
 
 #[tokio::test(flavor = "multi_thread")]

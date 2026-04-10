@@ -4,6 +4,10 @@ use crate::tui::render_helpers::{
 };
 use crate::tui::types::{TranscriptEntry, TuiEvent};
 use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
+use std::path::Path;
+
+const ATTACHMENT_PREVIEW_MAX_CHARS: usize = 800;
+const ATTACHMENT_PREVIEW_MAX_LINES: usize = 12;
 
 fn unique_attachment_display_name(
     attachments: &[crate::tui::types::Attachment],
@@ -38,6 +42,34 @@ fn unique_attachment_storage_path(
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
     dir.join(format!("{}-{}{}", stem, uuid::Uuid::new_v4(), ext))
+}
+
+fn render_attachment_preview(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let mut lines = Vec::new();
+    let mut chars_seen = 0usize;
+
+    for line in text.lines().take(ATTACHMENT_PREVIEW_MAX_LINES) {
+        if chars_seen >= ATTACHMENT_PREVIEW_MAX_CHARS {
+            break;
+        }
+        let remaining = ATTACHMENT_PREVIEW_MAX_CHARS.saturating_sub(chars_seen);
+        let snippet: String = line.chars().take(remaining).collect();
+        chars_seen += snippet.chars().count();
+        lines.push(snippet);
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    let truncated = text.chars().count() > chars_seen || text.lines().count() > lines.len();
+    let mut preview = lines.join("\n");
+    if truncated {
+        preview.push_str("\n...");
+    }
+    Some(preview)
 }
 
 impl Tui {
@@ -364,7 +396,23 @@ impl Tui {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn submit_pending_message(
+        &mut self,
+        pending: crate::tui::types::PendingMessage,
+    ) -> Result<()> {
+        self.submit_pending_message_inner(pending).await
+    }
+
+    #[cfg(not(test))]
     async fn submit_pending_message(
+        &mut self,
+        pending: crate::tui::types::PendingMessage,
+    ) -> Result<()> {
+        self.submit_pending_message_inner(pending).await
+    }
+
+    async fn submit_pending_message_inner(
         &mut self,
         pending: crate::tui::types::PendingMessage,
     ) -> Result<()> {
@@ -372,6 +420,7 @@ impl Tui {
         self.app
             .transcript
             .push(TranscriptEntry::User(pending.text.clone()));
+        self.render_submitted_attachments(&pending.attachments);
         self.pin_transcript_to_bottom();
         if pending.text.trim_start().starts_with('.') {
             self.app.attachments = pending.attachments;
@@ -383,6 +432,32 @@ impl Tui {
             self.start_prompt(pending).await?;
         }
         Ok(())
+    }
+
+    fn render_submitted_attachments(&mut self, attachments: &[crate::tui::types::Attachment]) {
+        if attachments.is_empty() {
+            return;
+        }
+
+        self.app.transcript.push(TranscriptEntry::System(format!(
+            "Attachments ({}):",
+            attachments.len()
+        )));
+
+        for attachment in attachments {
+            self.app.transcript.push(TranscriptEntry::System(format!(
+                "  - {}",
+                attachment.display_name
+            )));
+
+            if let Some(preview) = render_attachment_preview(&attachment.path) {
+                for line in preview.lines() {
+                    self.app
+                        .transcript
+                        .push(TranscriptEntry::System(format!("      {line}")));
+                }
+            }
+        }
     }
 
     fn flush_pending_thought(&mut self) {
@@ -404,10 +479,11 @@ impl Tui {
 
     async fn render_ui_output_event(&mut self, event: UiOutputEvent) {
         let is_thought = matches!(&event.kind, UiOutputEventKind::AcpThought { .. });
+        let is_usage = matches!(&event.kind, UiOutputEventKind::Usage { .. });
         if !is_thought {
             self.flush_pending_thought();
         }
-        self.render_ui_output_heading(event.source.as_ref());
+        self.render_ui_output_heading(event.source.as_ref(), is_usage);
 
         let rendered_entries = match event.kind {
             UiOutputEventKind::TranscriptText { text } => {
@@ -527,15 +603,24 @@ impl Tui {
                 output_tokens,
                 cached_tokens,
                 session_label,
-            } => render_usage_line(
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-                session_label.as_deref(),
-                event.source.as_ref(),
-            )
-            .map(|line| vec![TranscriptEntry::System(line)])
-            .unwrap_or_default(),
+            } => {
+                let line = render_usage_line(
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                    session_label.as_deref(),
+                    event.source.as_ref(),
+                );
+                if let Some(line) = line {
+                    if self.update_existing_usage_line(event.source.as_ref(), &line) {
+                        vec![]
+                    } else {
+                        vec![TranscriptEntry::System(line)]
+                    }
+                } else {
+                    vec![]
+                }
+            }
             UiOutputEventKind::McpToolInvocation {
                 tool_name,
                 input_yaml,
@@ -543,14 +628,21 @@ impl Tui {
         };
 
         if !rendered_entries.is_empty() {
+            let start_idx = self.app.transcript.len();
             self.app.transcript.extend(rendered_entries);
+            if is_usage {
+                self.app.last_usage_source = event.source.clone();
+                self.app.last_usage_transcript_idx = Some(start_idx);
+            } else {
+                self.clear_usage_tracking();
+            }
             self.pin_transcript_to_bottom();
-        } else if is_thought {
+        } else if is_thought || is_usage {
             self.pin_transcript_to_bottom();
         }
     }
 
-    fn render_ui_output_heading(&mut self, source: Option<&UiOutputSource>) {
+    fn render_ui_output_heading(&mut self, source: Option<&UiOutputSource>, is_usage: bool) {
         let source = source.cloned();
         if source != self.app.last_ui_output_source {
             if let Some(source) = &source {
@@ -558,6 +650,37 @@ impl Tui {
                 self.app.transcript.push(TranscriptEntry::System(heading));
             }
             self.app.last_ui_output_source = source;
+        }
+        if !is_usage {
+            self.clear_usage_tracking();
+        }
+    }
+
+    fn clear_usage_tracking(&mut self) {
+        self.app.last_usage_source = None;
+        self.app.last_usage_transcript_idx = None;
+    }
+
+    fn update_existing_usage_line(&mut self, source: Option<&UiOutputSource>, line: &str) -> bool {
+        if self.app.last_usage_source.as_ref() != source {
+            return false;
+        }
+        let Some(idx) = self.app.last_usage_transcript_idx else {
+            return false;
+        };
+        let Some(entry) = self.app.transcript.get_mut(idx) else {
+            self.clear_usage_tracking();
+            return false;
+        };
+        match entry {
+            TranscriptEntry::System(existing) => {
+                *existing = line.to_string();
+                true
+            }
+            _ => {
+                self.clear_usage_tracking();
+                false
+            }
         }
     }
 

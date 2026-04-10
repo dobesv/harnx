@@ -1628,6 +1628,7 @@ dependencies = [
  "simplelog",
  "syntect",
  "sys-locale",
+ "tempfile",
  "terminal-colorsaurus",
  "textwrap",
  "time",

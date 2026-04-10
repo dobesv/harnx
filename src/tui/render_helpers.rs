@@ -13,9 +13,9 @@ pub(crate) fn render_status_line(title: Option<&str>, status: Option<&str>) -> O
 pub(crate) fn source_heading(source: &UiOutputSource) -> String {
     match &source.session_id {
         Some(session_id) if !session_id.is_empty() => {
-            format!("🤖 {} ▸ {}", source.agent, session_id)
+            format!("> {} ▸ {}", source.agent, session_id)
         }
-        _ => format!("🤖 {}", source.agent),
+        _ => format!("> {}", source.agent),
     }
 }
 
@@ -58,13 +58,13 @@ pub(crate) fn render_usage_line(
         parts.push(source_heading(source));
     }
     if input_tokens > 0 {
-        parts.push(format!("📥 {input_tokens}"));
+        parts.push(format!("in {input_tokens}"));
     }
     if output_tokens > 0 {
-        parts.push(format!("📤 {output_tokens}"));
+        parts.push(format!("out {output_tokens}"));
     }
     if cached_tokens > 0 {
-        parts.push(format!("💾 {cached_tokens}"));
+        parts.push(format!("cache {cached_tokens}"));
     }
     (!parts.is_empty()).then(|| parts.join("   "))
 }

@@ -7,10 +7,10 @@ Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
 Top-level assistant opening response.Top-level assistant closes
 response.
 
-🤖  argus ▸ session-1
+> argus ▸ session-1
 sub-agent tool call
 sub-agent follow-up output
-🤖  hephaestus ▸ session-2
+> hephaestus ▸ session-2
 other sub-agent output
 
 

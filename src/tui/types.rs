@@ -43,7 +43,7 @@ pub(super) struct Attachment {
 }
 
 #[derive(Clone)]
-pub(super) struct PendingMessage {
+pub(crate) struct PendingMessage {
     pub(super) text: String,
     pub(super) attachments: Vec<Attachment>,
     pub(super) attachment_dir: Option<PathBuf>,
@@ -59,6 +59,8 @@ pub(super) struct App {
     pub(super) scroll_state: ratatui_widget_scrolling::ScrollState,
     pub(super) streaming_assistant_idx: Option<usize>,
     pub(super) last_ui_output_source: Option<UiOutputSource>,
+    pub(super) last_usage_source: Option<UiOutputSource>,
+    pub(super) last_usage_transcript_idx: Option<usize>,
     pub(super) pending_thought_source: Option<UiOutputSource>,
     pub(super) pending_thought_text: String,
     pub(super) pending_message: Option<PendingMessage>,
