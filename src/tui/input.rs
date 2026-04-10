@@ -1,5 +1,9 @@
 use super::*;
+use crate::tui::render_helpers::{
+    render_plan_entries, render_structured_block, render_usage_line, source_heading,
+};
 use crate::tui::types::{TranscriptEntry, TuiEvent};
+use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
 
 fn unique_attachment_display_name(
     attachments: &[crate::tui::types::Attachment],
@@ -347,18 +351,8 @@ impl Tui {
 
     async fn handle_tui_event_inner(&mut self, event: TuiEvent) -> Result<()> {
         match event {
-            TuiEvent::UiOutput(text) => {
-                // Strip ANSI escape codes so raw terminal output doesn't corrupt the TUI (fix #6)
-                let clean = strip_ansi(&text);
-                let clean = clean.trim_end_matches('\n').to_string();
-                if !clean.is_empty() {
-                    self.app.transcript.push(TranscriptEntry::System(clean));
-                    self.pin_transcript_to_bottom();
-                }
-            }
-            TuiEvent::Chunk(chunk) => {
-                self.append_streaming_assistant_chunk(&chunk);
-                self.pin_transcript_to_bottom();
+            TuiEvent::UiOutput(event) => {
+                self.render_ui_output_event(event).await;
             }
             TuiEvent::ToolRoundComplete => {
                 // Intermediate tool round — prompt loop continues, don't clear llm_busy.
@@ -366,8 +360,63 @@ impl Tui {
                 // continue without inserting a blank separator or synthetic status line.
                 self.pin_transcript_to_bottom();
             }
-            TuiEvent::Finished { output, usage } => {
+        }
+        Ok(())
+    }
+
+    async fn submit_pending_message(
+        &mut self,
+        pending: crate::tui::types::PendingMessage,
+    ) -> Result<()> {
+        self.app.input = Self::new_input();
+        self.app
+            .transcript
+            .push(TranscriptEntry::User(pending.text.clone()));
+        self.pin_transcript_to_bottom();
+        if pending.text.trim_start().starts_with('.') {
+            self.app.attachments = pending.attachments;
+            self.app.attachment_dir = pending.attachment_dir;
+            self.app.paste_count = pending.paste_count;
+            self.run_repl_command(&pending.text).await?;
+            self.refresh_input_chrome();
+        } else {
+            self.start_prompt(pending).await?;
+        }
+        Ok(())
+    }
+
+    async fn render_ui_output_event(&mut self, event: UiOutputEvent) {
+        self.render_ui_output_heading(event.source.as_ref());
+
+        let rendered_entries = match event.kind {
+            UiOutputEventKind::TranscriptText { text } => {
+                let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
+                if clean.is_empty() {
+                    vec![]
+                } else {
+                    vec![TranscriptEntry::System(clean)]
+                }
+            }
+            UiOutputEventKind::ToolResultText { text } => {
+                let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
+                if clean.is_empty() {
+                    vec![]
+                } else {
+                    clean
+                        .lines()
+                        .map(|line| TranscriptEntry::System(format!("   {line}")))
+                        .collect()
+                }
+            }
+            UiOutputEventKind::LlmText(text) => {
+                self.app.last_ui_output_source = None;
+                self.append_streaming_assistant_chunk(&text);
+                self.pin_transcript_to_bottom();
+                vec![]
+            }
+            UiOutputEventKind::LlmFinal { output, usage } => {
                 self.app.llm_busy = false;
+                self.app.last_ui_output_source = None;
                 if !output.is_empty() {
                     if let Some(idx) = self.app.streaming_assistant_idx {
                         match self.app.transcript.get_mut(idx) {
@@ -398,43 +447,87 @@ impl Tui {
                 self.refresh_input_chrome();
 
                 if let Some(pending) = self.app.pending_message.take() {
-                    self.submit_pending_message(pending).await?;
+                    if let Err(err) = self.submit_pending_message(pending).await {
+                        self.app
+                            .transcript
+                            .push(TranscriptEntry::Error(err.to_string()));
+                        self.pin_transcript_to_bottom();
+                    }
                 }
+                vec![]
             }
-            TuiEvent::Errored(err) => {
+            UiOutputEventKind::LlmError(err) => {
                 self.app.llm_busy = false;
                 self.app.streaming_assistant_idx = None;
+                self.app.last_ui_output_source = None;
                 self.app.transcript.push(TranscriptEntry::Error(err));
                 self.pin_transcript_to_bottom();
                 self.refresh_input_chrome();
 
                 if let Some(pending) = self.app.pending_message.take() {
-                    self.submit_pending_message(pending).await?;
+                    if let Err(err) = self.submit_pending_message(pending).await {
+                        self.app
+                            .transcript
+                            .push(TranscriptEntry::Error(err.to_string()));
+                        self.pin_transcript_to_bottom();
+                    }
+                }
+                vec![]
+            }
+            UiOutputEventKind::AcpThought { text } => {
+                let clean = strip_ansi(&text).trim().to_string();
+                if clean.is_empty() {
+                    vec![]
+                } else {
+                    vec![TranscriptEntry::System(format!("<think>{clean}</think>"))]
                 }
             }
+            UiOutputEventKind::StructuredBlock { title, body } => {
+                render_structured_block(&title, body.as_deref())
+            }
+            UiOutputEventKind::StatusLine { text } => {
+                if text.is_empty() {
+                    vec![]
+                } else {
+                    vec![TranscriptEntry::System(text)]
+                }
+            }
+            UiOutputEventKind::Plan { entries } => render_plan_entries(&entries),
+            UiOutputEventKind::Usage {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                session_label,
+            } => render_usage_line(
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                session_label.as_deref(),
+                event.source.as_ref(),
+            )
+            .map(|line| vec![TranscriptEntry::System(line)])
+            .unwrap_or_default(),
+            UiOutputEventKind::McpToolInvocation {
+                tool_name,
+                input_yaml,
+            } => render_structured_block(&format!("->️ {tool_name}"), input_yaml.as_deref()),
+        };
+
+        if !rendered_entries.is_empty() {
+            self.app.transcript.extend(rendered_entries);
+            self.pin_transcript_to_bottom();
         }
-        Ok(())
     }
 
-    async fn submit_pending_message(
-        &mut self,
-        pending: crate::tui::types::PendingMessage,
-    ) -> Result<()> {
-        self.app.input = Self::new_input();
-        self.app
-            .transcript
-            .push(TranscriptEntry::User(pending.text.clone()));
-        self.pin_transcript_to_bottom();
-        if pending.text.trim_start().starts_with('.') {
-            self.app.attachments = pending.attachments;
-            self.app.attachment_dir = pending.attachment_dir;
-            self.app.paste_count = pending.paste_count;
-            self.run_repl_command(&pending.text).await?;
-            self.refresh_input_chrome();
-        } else {
-            self.start_prompt(pending).await?;
+    fn render_ui_output_heading(&mut self, source: Option<&UiOutputSource>) {
+        let source = source.cloned();
+        if source != self.app.last_ui_output_source {
+            if let Some(source) = &source {
+                let heading = source_heading(source);
+                self.app.transcript.push(TranscriptEntry::System(heading));
+            }
+            self.app.last_ui_output_source = source;
         }
-        Ok(())
     }
 
     pub(super) async fn start_prompt(
@@ -462,7 +555,10 @@ impl Tui {
             )
             .await;
             if let Err(err) = result {
-                let _ = event_tx.send(TuiEvent::Errored(err.to_string()));
+                let _ = event_tx.send(TuiEvent::UiOutput(UiOutputEvent {
+                    kind: UiOutputEventKind::LlmError(err.to_string()),
+                    source: None,
+                }));
             }
         });
 

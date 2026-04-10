@@ -1,6 +1,6 @@
-use crate::client::CompletionTokenUsage;
 use crate::config::GlobalConfig;
 use crate::hooks::{AsyncHookManager, PersistentHookManager};
+use crate::ui_output::{UiOutputEvent, UiOutputSource};
 use crate::utils::AbortSignal;
 
 use ratatui_textarea::TextArea;
@@ -58,6 +58,7 @@ pub(super) struct App {
     pub(super) llm_busy: bool,
     pub(super) scroll_state: ratatui_widget_scrolling::ScrollState,
     pub(super) streaming_assistant_idx: Option<usize>,
+    pub(super) last_ui_output_source: Option<UiOutputSource>,
     pub(super) pending_message: Option<PendingMessage>,
     pub(super) completions: Vec<(String, Option<String>)>,
     pub(super) completion_index: usize,
@@ -114,28 +115,14 @@ pub(super) enum TranscriptEntry {
 
 #[cfg(test)]
 pub(crate) enum TuiEvent {
-    UiOutput(String),
-    Chunk(String),
+    UiOutput(UiOutputEvent),
     /// Intermediate tool round completed; the prompt loop continues.
     ToolRoundComplete,
-    /// Final completion — no more turns.
-    Finished {
-        output: String,
-        usage: CompletionTokenUsage,
-    },
-    Errored(String),
 }
 
 #[cfg(not(test))]
 pub(super) enum TuiEvent {
-    UiOutput(String),
-    Chunk(String),
+    UiOutput(UiOutputEvent),
     /// Intermediate tool round completed; the prompt loop continues.
     ToolRoundComplete,
-    /// Final completion — no more turns.
-    Finished {
-        output: String,
-        usage: CompletionTokenUsage,
-    },
-    Errored(String),
 }

@@ -1,7 +1,10 @@
 use super::AcpServerConfig;
 
-use crate::ui_output::emit_ui_output;
-use crate::utils::dimmed_text;
+use crate::tui::render_helpers::event_fallback_text;
+use crate::ui_output::{
+    emit_ui_output_event, pretty_yaml_block, UiOutputEvent, UiOutputEventKind, UiOutputPlanEntry,
+    UiOutputSource,
+};
 use agent_client_protocol::{self as acp, Agent as _};
 use anyhow::{anyhow, Context, Result};
 use std::cell::RefCell;
@@ -74,6 +77,7 @@ enum WorkerCommand {
 }
 
 struct AcpNotificationClient {
+    agent_name: String,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
     activity_tx: broadcast::Sender<String>,
@@ -85,11 +89,13 @@ struct TokioCompat<T> {
 
 impl AcpNotificationClient {
     fn new(
+        agent_name: String,
         sessions: Arc<RwLock<HashMap<String, SessionState>>>,
         chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
         activity_tx: broadcast::Sender<String>,
     ) -> Self {
         Self {
+            agent_name,
             sessions,
             chunk_forwarder,
             activity_tx,
@@ -99,24 +105,46 @@ impl AcpNotificationClient {
     /// Forward a display-only chunk (e.g. usage banner) to subscribers or
     /// stderr.  Unlike the main chunk path this never touches
     /// `state.response_text`.
-    async fn forward_display_chunk(&self, text: &str) {
+    async fn forward_display_chunk(&self, text: &str, session_id: &str) {
+        self.forward_ui_output_event(
+            UiOutputEvent {
+                kind: UiOutputEventKind::TranscriptText {
+                    text: text.to_string(),
+                },
+                source: None,
+            },
+            session_id,
+        )
+        .await;
+    }
+
+    async fn forward_ui_output_event(&self, event: UiOutputEvent, session_id: &str) {
         let mut delivered = false;
         let mut forwarders = self.chunk_forwarder.write().await;
+        let source = Some(UiOutputSource {
+            agent: self.agent_name.clone(),
+            session_id: Some(session_id.to_string()),
+        });
+        let text_fallback = format_ui_event_for_terminal(&event.kind, source.as_ref());
+        let event = UiOutputEvent {
+            kind: event.kind,
+            source,
+        };
+
         if forwarders.is_empty() {
-            if !emit_ui_output(text.to_string()) {
-                eprint!("{}", text);
+            if !emit_ui_output_event(event) {
+                eprint!("{}", text_fallback);
             }
         } else {
-            let owned = text.to_string();
-            forwarders.retain(|_, tx| match tx.send(owned.clone()) {
+            forwarders.retain(|_, tx| match tx.send(text_fallback.clone()) {
                 Ok(()) => {
                     delivered = true;
                     true
                 }
                 Err(_) => false,
             });
-            if !delivered && !emit_ui_output(text.to_string()) {
-                eprint!("{}", text);
+            if !delivered && !emit_ui_output_event(event) {
+                eprint!("{}", text_fallback);
             }
         }
     }
@@ -182,67 +210,85 @@ impl acp::Client for AcpNotificationClient {
         // SessionInfoUpdate with an early return we keep it out of the
         // shared chunk → response_text path entirely.
         if let acp::SessionUpdate::SessionInfoUpdate(ref info) = args.update {
-            let display = format_session_info_update(info);
-            if !display.is_empty() {
-                self.forward_display_chunk(&display).await;
+            if let Some(event) = session_info_update_event(info) {
+                self.forward_ui_output_event(event, &session_id).await;
             }
             return Ok(());
         }
 
         let is_agent_message = matches!(args.update, acp::SessionUpdate::AgentMessageChunk(_));
-        let chunk = match args.update {
+        let event = match args.update {
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) => {
-                format_agent_message_display(&content_block_to_text(&content))
+                let text = content_block_to_text(&content);
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(UiOutputEvent {
+                        kind: UiOutputEventKind::LlmText(text),
+                        source: None,
+                    })
+                }
             }
             acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk { content, .. }) => {
                 let text = content_block_to_text(&content);
                 if text.is_empty() {
-                    String::new()
+                    None
                 } else {
-                    format!("<think>{text}</think>")
+                    Some(UiOutputEvent {
+                        kind: UiOutputEventKind::AcpThought { text },
+                        source: None,
+                    })
                 }
             }
-            acp::SessionUpdate::ToolCall(tc) => {
-                format_tool_call_display(&tc.title, tc.raw_input.as_ref())
-            }
+            acp::SessionUpdate::ToolCall(tc) => Some(UiOutputEvent {
+                kind: UiOutputEventKind::StructuredBlock {
+                    title: tc.title,
+                    body: tc.raw_input.as_ref().map(pretty_yaml_block),
+                },
+                source: None,
+            }),
             acp::SessionUpdate::ToolCallUpdate(tcu) => {
-                let mut parts = vec![];
-                if let Some(title) = &tcu.fields.title {
-                    parts.push(title.clone());
-                }
-                if let Some(status) = &tcu.fields.status {
-                    parts.push(
-                        serde_json::to_value(status)
-                            .ok()
-                            .and_then(|v| v.as_str().map(String::from))
-                            .unwrap_or_else(|| format!("{:?}", status)),
-                    );
-                }
-                if parts.is_empty() {
-                    String::new()
+                let title = tcu.fields.title.clone();
+                let status = tcu.fields.status.as_ref().map(|status| {
+                    serde_json::to_value(status)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_else(|| format!("{:?}", status))
+                });
+                if title.is_none() && status.is_none() {
+                    None
                 } else {
-                    format!("\n{}\n", dimmed_text(&parts.join(" ")))
+                    Some(UiOutputEvent {
+                        kind: UiOutputEventKind::StatusLine {
+                            text: crate::tui::render_helpers::render_status_line(
+                                title.as_deref(),
+                                status.as_deref(),
+                            )
+                            .unwrap_or_default(),
+                        },
+                        source: None,
+                    })
                 }
             }
             acp::SessionUpdate::Plan(p) => {
-                let entries: Vec<String> = p
+                let entries: Vec<UiOutputPlanEntry> = p
                     .entries
                     .iter()
-                    .map(|e| {
-                        let status_str = serde_json::to_value(&e.status)
+                    .map(|e| UiOutputPlanEntry {
+                        status: serde_json::to_value(&e.status)
                             .ok()
                             .and_then(|v| v.as_str().map(String::from))
-                            .unwrap_or_else(|| format!("{:?}", e.status));
-                        format!("  [{}] {}", status_str, e.content)
+                            .unwrap_or_else(|| format!("{:?}", e.status)),
+                        content: e.content.clone(),
                     })
                     .collect();
                 if entries.is_empty() {
-                    String::new()
+                    None
                 } else {
-                    format!(
-                        "\n{}\n",
-                        dimmed_text(&format!("Plan:\n{}", entries.join("\n")))
-                    )
+                    Some(UiOutputEvent {
+                        kind: UiOutputEventKind::Plan { entries },
+                        source: None,
+                    })
                 }
             }
             // SessionInfoUpdate is handled above via early return.
@@ -253,37 +299,29 @@ impl acp::Client for AcpNotificationClient {
             acp::SessionUpdate::UserMessageChunk(_)
             | acp::SessionUpdate::AvailableCommandsUpdate(_)
             | acp::SessionUpdate::CurrentModeUpdate(_)
-            | acp::SessionUpdate::ConfigOptionUpdate(_) => String::new(),
+            | acp::SessionUpdate::ConfigOptionUpdate(_) => None,
             // Required catch-all: SessionUpdate is #[non_exhaustive].
             // Log so future variants aren't silently swallowed.
             other => {
                 log::debug!("Unhandled ACP SessionUpdate variant: {:?}", other);
-                String::new()
+                None
             }
         };
 
-        if !chunk.is_empty() {
-            let mut delivered = false;
-            let mut forwarders = self.chunk_forwarder.write().await;
-            if forwarders.is_empty() {
-                if !emit_ui_output(chunk.clone()) {
-                    eprint!("{}", chunk);
+        if let Some(event) = event {
+            let chunk_for_response = if is_agent_message {
+                match &event.kind {
+                    UiOutputEventKind::LlmText(text)
+                    | UiOutputEventKind::TranscriptText { text } => Some(text.clone()),
+                    _ => None,
                 }
             } else {
-                forwarders.retain(|_, tx| match tx.send(chunk.clone()) {
-                    Ok(()) => {
-                        delivered = true;
-                        true
-                    }
-                    Err(_) => false,
-                });
-                if !delivered && !emit_ui_output(chunk.clone()) {
-                    eprint!("{}", chunk);
-                }
-            }
-            drop(forwarders);
+                None
+            };
 
-            if is_agent_message {
+            self.forward_ui_output_event(event, &session_id).await;
+
+            if let Some(chunk) = chunk_for_response {
                 let mut sessions = self.sessions.write().await;
                 let state = sessions.entry(session_id).or_default();
                 state.response_text.push_str(&chunk);
@@ -682,7 +720,8 @@ async fn worker_main(
         });
     }
 
-    let client = AcpNotificationClient::new(sessions.clone(), chunk_forwarder, activity_tx);
+    let client =
+        AcpNotificationClient::new(name.clone(), sessions.clone(), chunk_forwarder, activity_tx);
     let (conn, handle_io) = acp::ClientSideConnection::new(
         client,
         TokioCompat::new(stdin),
@@ -907,80 +946,51 @@ fn wrap_display_text(text: &str, initial_indent: &str, subsequent_indent: &str) 
     wrap(text, options).join("\n")
 }
 
-fn pretty_yaml_block(value: &serde_json::Value) -> String {
-    serde_yaml::to_string(value)
-        .map(|s| s.trim_end().to_string())
-        .unwrap_or_else(|_| value.to_string())
-}
-
-fn format_tool_call_display(title: &str, raw_input: Option<&serde_json::Value>) -> String {
-    let header = wrap_display_text(&format!("🛠️  {title}"), "", "   ");
-    match raw_input {
-        Some(input) => {
-            let body = pretty_yaml_block(input)
-                .lines()
-                .map(|line| format!("   {line}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("\n{}\n{}\n", dimmed_text(&header), dimmed_text(&body))
-        }
-        None => format!("\n{}\n", dimmed_text(&header)),
-    }
-}
-
-fn format_agent_message_display(text: &str) -> String {
-    if text.trim().is_empty() {
-        String::new()
-    } else {
-        wrap_display_text(text, "", "")
-    }
-}
-
-fn format_session_info_update(info: &acp::SessionInfoUpdate) -> String {
-    let Some(meta) = &info.meta else {
-        return String::new();
-    };
-    let Some(usage) = meta.get("harnx:usage") else {
-        return String::new();
-    };
-    let input = usage["input_tokens"].as_u64().unwrap_or(0);
-    let output = usage["output_tokens"].as_u64().unwrap_or(0);
-    let cached = usage["cached_tokens"].as_u64().unwrap_or(0);
+fn session_info_update_event(info: &acp::SessionInfoUpdate) -> Option<UiOutputEvent> {
+    let meta = info.meta.as_ref()?;
+    let usage = meta.get("harnx:usage")?;
+    let input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
+    let cached_tokens = usage["cached_tokens"].as_u64().unwrap_or(0);
     let agent = usage["agent"].as_str().unwrap_or("");
     let session = usage["session"].as_str().unwrap_or("");
-    if input == 0 && output == 0 {
-        return String::new();
+    if input_tokens == 0 && output_tokens == 0 {
+        return None;
     }
-    // Format like the main REPL status line:
-    //   🤖 agent ▸ session   📥 N  📤 N  💾 N
-    let status = match (agent.is_empty(), session.is_empty()) {
-        (false, false) => format!("🤖 {} ▸ {}", agent, session),
-        (false, true) => format!("🤖 {}", agent),
-        (true, false) => format!("💬 {}", session),
-        (true, true) => String::new(),
+
+    let session_label = match (agent.is_empty(), session.is_empty()) {
+        (false, false) => Some(crate::tui::render_helpers::source_heading(
+            &UiOutputSource {
+                agent: agent.to_string(),
+                session_id: Some(session.to_string()),
+            },
+        )),
+        (false, true) => Some(crate::tui::render_helpers::source_heading(
+            &UiOutputSource {
+                agent: agent.to_string(),
+                session_id: None,
+            },
+        )),
+        (true, false) => Some(format!("💬 {}", session)),
+        (true, true) => None,
     };
-    let mut line_parts = vec![];
-    if !status.is_empty() {
-        line_parts.push(status);
-    }
-    let mut usage_parts = vec![];
-    if input > 0 {
-        usage_parts.push(format!("📥 {input}"));
-    }
-    if output > 0 {
-        usage_parts.push(format!("📤 {output}"));
-    }
-    if cached > 0 {
-        usage_parts.push(format!("💾 {cached}"));
-    }
-    if !usage_parts.is_empty() {
-        line_parts.push(format!("   {}", usage_parts.join("  ")));
-    }
-    if line_parts.is_empty() {
-        String::new()
-    } else {
-        format!("\n{}\n", dimmed_text(&line_parts.join("")))
-    }
+
+    Some(UiOutputEvent {
+        kind: UiOutputEventKind::Usage {
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            session_label,
+        },
+        source: None,
+    })
+}
+
+fn format_ui_event_for_terminal(
+    kind: &UiOutputEventKind,
+    source: Option<&UiOutputSource>,
+) -> String {
+    event_fallback_text(kind, source)
 }
 
 fn content_block_to_text(content: &acp::ContentBlock) -> String {
@@ -1000,25 +1010,49 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_format_tool_call_display_multiline_yaml() {
-        let rendered = format_tool_call_display(
-            "argus_session_prompt",
-            Some(&json!({
-                "message": "Goal — Something long that should remain visible\nAcceptance criteria — Multiline preserved",
-                "session_id": "abc123"
-            })),
+    fn terminal_fallback_renders_structured_tool_call_and_plan() {
+        let tool_rendered = format_ui_event_for_terminal(
+            &UiOutputEventKind::StructuredBlock {
+                title: "argus_session_prompt".to_string(),
+                body: Some(pretty_yaml_block(&json!({
+                    "message": "Goal — Something long that should remain visible\nAcceptance criteria — Multiline preserved",
+                    "session_id": "abc123"
+                }))),
+            },
+            None,
         );
+        assert!(tool_rendered.contains("argus_session_prompt"));
+        assert!(tool_rendered.contains("message:"));
+        assert!(tool_rendered.contains("Acceptance criteria"));
+        assert!(tool_rendered.contains("session_id:"));
 
-        assert!(rendered.contains("argus_session_prompt"));
-        assert!(rendered.contains("message:"));
-        assert!(rendered.contains("Acceptance criteria"));
-        assert!(rendered.contains("session_id:"));
+        let plan_rendered = format_ui_event_for_terminal(
+            &UiOutputEventKind::Plan {
+                entries: vec![
+                    UiOutputPlanEntry {
+                        status: "in_progress".to_string(),
+                        content: "Migrate remaining ACP formatting".to_string(),
+                    },
+                    UiOutputPlanEntry {
+                        status: "pending".to_string(),
+                        content: "Update snapshots".to_string(),
+                    },
+                ],
+            },
+            None,
+        );
+        assert!(plan_rendered.contains("Plan:"));
+        assert!(plan_rendered.contains("[in_progress] Migrate remaining ACP formatting"));
+        assert!(plan_rendered.contains("[pending] Update snapshots"));
     }
 
     #[test]
-    fn test_format_agent_message_display_preserves_multiline_content() {
-        let rendered = format_agent_message_display(
-            "Line one from sub-agent\nLine two from sub-agent with extra detail",
+    fn agent_message_chunks_stay_verbatim_in_terminal_fallback() {
+        let rendered = format_ui_event_for_terminal(
+            &UiOutputEventKind::LlmText(
+                "Line one from sub-agent\nLine two from sub-agent with extra detail".to_string(),
+            ),
+            None,
         );
 
         assert!(rendered.contains("Line one from sub-agent"));

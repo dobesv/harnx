@@ -3,6 +3,7 @@ use crate::client::{Client, ClientConfig, TestStateGuard};
 use crate::config::Config;
 use crate::test_utils::{MockClient, MockTurnBuilder, TuiTestHarness};
 use crate::tui::types::{TranscriptEntry, TuiEvent};
+use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,6 +58,22 @@ fn normalize_screen(contents: &str) -> String {
         .map(|line| line.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[tokio::test]
+async fn input_cursor_style_remains_visible_in_normal_and_pending_states() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    Tui::refresh_input_chrome_from_state(&config, &mut tui.app, false, false);
+    let normal_style = tui.app.input.cursor_style();
+    assert!(normal_style.add_modifier.contains(Modifier::REVERSED));
+
+    Tui::refresh_input_chrome_from_state(&config, &mut tui.app, false, true);
+    let pending_style = tui.app.input.cursor_style();
+    assert!(pending_style.add_modifier.contains(Modifier::REVERSED));
+    assert!(pending_style.add_modifier.contains(Modifier::BOLD));
 }
 
 #[tokio::test]
@@ -118,10 +135,13 @@ async fn pending_message_is_auto_sent_after_finish() {
     tui.app.llm_busy = true;
     tui.queue_pending_message("follow up".to_string());
 
-    tui.handle_tui_event(TuiEvent::Finished {
-        output: "done".to_string(),
-        usage: Default::default(),
-    })
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::LlmFinal {
+            output: "done".to_string(),
+            usage: Default::default(),
+        },
+        source: None,
+    }))
     .await
     .unwrap();
 
@@ -161,10 +181,13 @@ async fn pending_dot_command_restores_attachments_before_running() {
     });
     tui.set_input_text(".info attachments");
 
-    tui.handle_tui_event(TuiEvent::Finished {
-        output: "done".to_string(),
-        usage: Default::default(),
-    })
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::LlmFinal {
+            output: "done".to_string(),
+            usage: Default::default(),
+        },
+        source: None,
+    }))
     .await
     .unwrap();
 
@@ -180,15 +203,26 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    tui.handle_tui_event(TuiEvent::Chunk("Hello\nworld".to_string()))
-        .await
-        .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput("tool output".to_string()))
-        .await
-        .unwrap();
-    tui.handle_tui_event(TuiEvent::Chunk("\nAgain".to_string()))
-        .await
-        .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::LlmText("Hello\nworld".to_string()),
+        source: None,
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::TranscriptText {
+            text: "tool output".to_string(),
+        },
+        source: None,
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::LlmText("\nAgain".to_string()),
+        source: None,
+    }))
+    .await
+    .unwrap();
 
     let assistant_entries: Vec<_> = tui
         .app
@@ -205,6 +239,68 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
         .transcript
         .iter()
         .any(|entry| matches!(entry, TranscriptEntry::System(text) if text == "tool output")));
+}
+
+#[tokio::test]
+async fn ui_output_inserts_heading_when_source_changes() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let source = crate::ui_output::UiOutputSource {
+        agent: "argus".to_string(),
+        session_id: Some("session-1".to_string()),
+    };
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::TranscriptText {
+            text: "first chunk".to_string(),
+        },
+        source: Some(source.clone()),
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::TranscriptText {
+            text: "second chunk".to_string(),
+        },
+        source: Some(source),
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::TranscriptText {
+            text: "other chunk".to_string(),
+        },
+        source: Some(crate::ui_output::UiOutputSource {
+            agent: "hephaestus".to_string(),
+            session_id: Some("session-2".to_string()),
+        }),
+    }))
+    .await
+    .unwrap();
+
+    let system_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(system_entries.contains(&"🤖 argus ▸ session-1"));
+    assert!(system_entries.contains(&"first chunk"));
+    assert!(system_entries.contains(&"second chunk"));
+    assert!(system_entries.contains(&"🤖 hephaestus ▸ session-2"));
+    assert!(system_entries.contains(&"other chunk"));
+
+    let argus_heading_count = system_entries
+        .iter()
+        .filter(|text| **text == "🤖 argus ▸ session-1")
+        .count();
+    assert_eq!(argus_heading_count, 1);
 }
 
 #[tokio::test]
@@ -344,6 +440,193 @@ async fn info_session_with_session_renders_in_tui_snapshot() {
     let rendered = normalize_screen(&harness.screen_contents());
     assert!(rendered.contains("info-session-with-session-test"));
     insta::assert_snapshot!("info_session_with_session_in_tui", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
+    let config = test_config_with_mock_client_and_agent("main-agent", Some("main-session"));
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(72, 18);
+    harness.tui().config = config;
+    harness.tui().persistent_manager = persistent;
+
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::LlmText("Top-level assistant opening response.".to_string()),
+            source: None,
+        }))
+        .await
+        .unwrap();
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::TranscriptText {
+                text: "sub-agent tool call".to_string(),
+            },
+            source: Some(UiOutputSource {
+                agent: "argus".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        }))
+        .await
+        .unwrap();
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::TranscriptText {
+                text: "sub-agent follow-up output".to_string(),
+            },
+            source: Some(UiOutputSource {
+                agent: "argus".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        }))
+        .await
+        .unwrap();
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::TranscriptText {
+                text: "other sub-agent output".to_string(),
+            },
+            source: Some(UiOutputSource {
+                agent: "hephaestus".to_string(),
+                session_id: Some("session-2".to_string()),
+            }),
+        }))
+        .await
+        .unwrap();
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::LlmText("Top-level assistant closes response.".to_string()),
+            source: None,
+        }))
+        .await
+        .unwrap();
+
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(rendered.contains("argus ▸ session-1"));
+    assert!(rendered.contains("hephaestus ▸ session-2"));
+    insta::assert_snapshot!("sub_agent_heading_transitions_in_tui", rendered);
+}
+
+#[tokio::test]
+async fn structured_ui_output_variants_render_in_transcript() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::StructuredBlock {
+            title: "argus_session_prompt".to_string(),
+            body: Some("message: hello\nsession_id: abc123".to_string()),
+        },
+        source: Some(UiOutputSource {
+            agent: "argus".to_string(),
+            session_id: Some("session-1".to_string()),
+        }),
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::AcpThought {
+            text: "thinking hard".to_string(),
+        },
+        source: Some(UiOutputSource {
+            agent: "argus".to_string(),
+            session_id: Some("session-1".to_string()),
+        }),
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::StatusLine {
+            text: "-> argus_session_prompt completed".to_string(),
+        },
+        source: Some(UiOutputSource {
+            agent: "argus".to_string(),
+            session_id: Some("session-1".to_string()),
+        }),
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::Plan {
+            entries: vec![
+                crate::ui_output::UiOutputPlanEntry {
+                    status: "in_progress".to_string(),
+                    content: "Refactor ACP formatting".to_string(),
+                },
+                crate::ui_output::UiOutputPlanEntry {
+                    status: "pending".to_string(),
+                    content: "Update snapshots".to_string(),
+                },
+            ],
+        },
+        source: Some(UiOutputSource {
+            agent: "argus".to_string(),
+            session_id: Some("session-1".to_string()),
+        }),
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::Usage {
+            input_tokens: 12,
+            output_tokens: 34,
+            cached_tokens: 5,
+            session_label: Some("🤖 argus ▸ session-1".to_string()),
+        },
+        source: Some(UiOutputSource {
+            agent: "argus".to_string(),
+            session_id: Some("session-1".to_string()),
+        }),
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::McpToolInvocation {
+            tool_name: "bash".to_string(),
+            input_yaml: Some("command: ls".to_string()),
+        },
+        source: None,
+    }))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::ToolResultText {
+            text: "\u{1b}[2mline one\nline two\u{1b}[0m\n".to_string(),
+        },
+        source: None,
+    }))
+    .await
+    .unwrap();
+
+    let system_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(system_entries.contains(&"🤖 argus ▸ session-1"));
+    assert!(system_entries.contains(&"argus_session_prompt"));
+    assert!(system_entries.contains(&"   message: hello"));
+    assert!(system_entries.contains(&"<think>thinking hard</think>"));
+    assert!(system_entries.contains(&"-> argus_session_prompt completed"));
+    assert!(system_entries.contains(&"Plan:"));
+    assert!(system_entries.contains(&"  [in_progress] Refactor ACP formatting"));
+    assert!(system_entries.contains(&"🤖 argus ▸ session-1   📥 12   📤 34   💾 5"));
+    assert!(system_entries.contains(&"->️ bash"));
+    assert!(system_entries.contains(&"   command: ls"));
+    assert!(system_entries.contains(&"   line one"));
+    assert!(system_entries.contains(&"   line two"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
