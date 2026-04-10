@@ -5,6 +5,7 @@ mod config;
 mod server;
 
 use crate::tool::{JsonSchema, ToolDeclaration};
+use crate::ui_output::UiOutputEvent;
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
@@ -15,6 +16,12 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+#[derive(Clone, Debug)]
+pub enum NestedAcpEvent {
+    Text(String),
+    Ui(UiOutputEvent),
+}
 
 pub struct AcpManager {
     clients: Arc<RwLock<HashMap<String, Arc<AcpClient>>>>,
@@ -59,7 +66,7 @@ impl AcpManager {
         tools
     }
 
-    pub async fn subscribe_chunks(&self) -> (mpsc::UnboundedReceiver<String>, u64) {
+    pub async fn subscribe_chunks(&self) -> (mpsc::UnboundedReceiver<NestedAcpEvent>, u64) {
         let (tx, rx) = mpsc::unbounded_channel();
         let subscription_id = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
         let clients: Vec<_> = self.clients.read().values().cloned().collect();

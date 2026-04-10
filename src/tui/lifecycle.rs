@@ -60,6 +60,8 @@ impl Tui {
                 scroll_state: ratatui_widget_scrolling::ScrollState::new(),
                 streaming_assistant_idx: None,
                 last_ui_output_source: None,
+                pending_thought_source: None,
+                pending_thought_text: String::new(),
                 pending_message: None,
                 completions: vec![],
                 completion_index: 0,

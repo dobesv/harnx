@@ -59,6 +59,8 @@ pub(super) struct App {
     pub(super) scroll_state: ratatui_widget_scrolling::ScrollState,
     pub(super) streaming_assistant_idx: Option<usize>,
     pub(super) last_ui_output_source: Option<UiOutputSource>,
+    pub(super) pending_thought_source: Option<UiOutputSource>,
+    pub(super) pending_thought_text: String,
     pub(super) pending_message: Option<PendingMessage>,
     pub(super) completions: Vec<(String, Option<String>)>,
     pub(super) completion_index: usize,

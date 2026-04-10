@@ -385,7 +385,28 @@ impl Tui {
         Ok(())
     }
 
+    fn flush_pending_thought(&mut self) {
+        if self.app.pending_thought_text.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.app.pending_thought_text);
+        self.app.pending_thought_source = None;
+        self.app.transcript.push(TranscriptEntry::System(format!(
+            "<think>{}</think>",
+            text.trim()
+        )));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_pending_thought_for_test(&mut self) {
+        self.flush_pending_thought();
+    }
+
     async fn render_ui_output_event(&mut self, event: UiOutputEvent) {
+        let is_thought = matches!(&event.kind, UiOutputEventKind::AcpThought { .. });
+        if !is_thought {
+            self.flush_pending_thought();
+        }
         self.render_ui_output_heading(event.source.as_ref());
 
         let rendered_entries = match event.kind {
@@ -410,11 +431,13 @@ impl Tui {
             }
             UiOutputEventKind::LlmText(text) => {
                 self.app.last_ui_output_source = None;
+                self.app.pending_thought_source = None;
                 self.append_streaming_assistant_chunk(&text);
                 self.pin_transcript_to_bottom();
                 vec![]
             }
             UiOutputEventKind::LlmFinal { output, usage } => {
+                self.flush_pending_thought();
                 self.app.llm_busy = false;
                 self.app.last_ui_output_source = None;
                 if !output.is_empty() {
@@ -457,6 +480,7 @@ impl Tui {
                 vec![]
             }
             UiOutputEventKind::LlmError(err) => {
+                self.flush_pending_thought();
                 self.app.llm_busy = false;
                 self.app.streaming_assistant_idx = None;
                 self.app.last_ui_output_source = None;
@@ -475,11 +499,16 @@ impl Tui {
                 vec![]
             }
             UiOutputEventKind::AcpThought { text } => {
-                let clean = strip_ansi(&text).trim().to_string();
-                if clean.is_empty() {
+                let clean = strip_ansi(&text);
+                if clean.trim().is_empty() {
                     vec![]
                 } else {
-                    vec![TranscriptEntry::System(format!("<think>{clean}</think>"))]
+                    if self.app.pending_thought_source != event.source {
+                        self.flush_pending_thought();
+                        self.app.pending_thought_source = event.source.clone();
+                    }
+                    self.app.pending_thought_text.push_str(&clean);
+                    vec![]
                 }
             }
             UiOutputEventKind::StructuredBlock { title, body } => {
@@ -515,6 +544,8 @@ impl Tui {
 
         if !rendered_entries.is_empty() {
             self.app.transcript.extend(rendered_entries);
+            self.pin_transcript_to_bottom();
+        } else if is_thought {
             self.pin_transcript_to_bottom();
         }
     }

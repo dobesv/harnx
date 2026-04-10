@@ -56,7 +56,14 @@ impl Tui {
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(prefix.to_string(), style)));
         }
-        lines.push(Line::from(""));
+        let add_trailing_spacing = match entry {
+            TranscriptEntry::System(_) => false,
+            TranscriptEntry::Assistant(text) => !text.contains('\n'),
+            _ => true,
+        };
+        if add_trailing_spacing {
+            lines.push(Line::from(""));
+        }
         lines
     }
 

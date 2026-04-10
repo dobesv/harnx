@@ -1,4 +1,4 @@
-use super::AcpServerConfig;
+use super::{AcpServerConfig, NestedAcpEvent};
 
 use crate::tui::render_helpers::event_fallback_text;
 use crate::ui_output::{
@@ -38,7 +38,7 @@ pub struct AcpClient {
     initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     worker: Arc<Mutex<Option<AcpWorkerHandle>>>,
-    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
+    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<NestedAcpEvent>>>>,
     activity_tx: broadcast::Sender<String>,
 }
 
@@ -79,7 +79,7 @@ enum WorkerCommand {
 struct AcpNotificationClient {
     agent_name: String,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
-    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
+    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<NestedAcpEvent>>>>,
     activity_tx: broadcast::Sender<String>,
 }
 
@@ -91,7 +91,7 @@ impl AcpNotificationClient {
     fn new(
         agent_name: String,
         sessions: Arc<RwLock<HashMap<String, SessionState>>>,
-        chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
+        chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<NestedAcpEvent>>>>,
         activity_tx: broadcast::Sender<String>,
     ) -> Self {
         Self {
@@ -136,7 +136,7 @@ impl AcpNotificationClient {
                 eprint!("{}", text_fallback);
             }
         } else {
-            forwarders.retain(|_, tx| match tx.send(text_fallback.clone()) {
+            forwarders.retain(|_, tx| match tx.send(NestedAcpEvent::Ui(event.clone())) {
                 Ok(()) => {
                     delivered = true;
                     true
@@ -596,7 +596,7 @@ impl AcpClient {
             })?
     }
 
-    pub async fn set_chunk_forwarder(&self, id: u64, tx: mpsc::UnboundedSender<String>) {
+    pub async fn set_chunk_forwarder(&self, id: u64, tx: mpsc::UnboundedSender<NestedAcpEvent>) {
         self.chunk_forwarder.write().await.insert(id, tx);
     }
 
@@ -626,7 +626,7 @@ fn spawn_worker(
     config: AcpServerConfig,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
-    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
+    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<NestedAcpEvent>>>>,
     activity_tx: broadcast::Sender<String>,
 ) -> Result<(AcpWorkerHandle, oneshot::Receiver<Result<()>>)> {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -682,7 +682,7 @@ async fn worker_main(
     initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
     mut rx: mpsc::UnboundedReceiver<WorkerCommand>,
     ready_tx: oneshot::Sender<Result<()>>,
-    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<String>>>>,
+    chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<NestedAcpEvent>>>>,
     mut abort_rx: oneshot::Receiver<()>,
     activity_tx: broadcast::Sender<String>,
 ) -> Result<()> {

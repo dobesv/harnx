@@ -1,3 +1,4 @@
+use super::NestedAcpEvent;
 use agent_client_protocol::{self as acp, Client as _};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use uuid::Uuid;
@@ -5,6 +6,7 @@ use uuid::Uuid;
 use crate::client::{Client, SseEvent, SseHandler};
 use crate::config::{GlobalConfig, Input};
 use crate::tool::{ToolCall, ToolResult};
+use crate::ui_output::UiOutputEventKind;
 use crate::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
 
 use anyhow::bail;
@@ -330,14 +332,25 @@ impl acp::Agent for HarnxAgent {
                     let forward_task = tokio::task::spawn_local(async move {
                         while let Some(chunk) = chunk_rx.recv().await {
                             if let Some(ref conn) = connection {
-                                let notification = acp::SessionNotification::new(
-                                    acp::SessionId::new(sid.clone()),
-                                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                                        chunk.into(),
-                                    )),
-                                );
-                                if let Err(e) = conn.session_notification(notification).await {
-                                    warn!("ACP nested streaming notification failed: {e}");
+                                let update = match chunk {
+                                    NestedAcpEvent::Ui(event) => {
+                                        nested_ui_event_to_session_update(event).await
+                                    }
+                                    NestedAcpEvent::Text(text) => {
+                                        Some(acp::SessionUpdate::AgentMessageChunk(
+                                            acp::ContentChunk::new(text.into()),
+                                        ))
+                                    }
+                                };
+
+                                if let Some(update) = update {
+                                    let notification = acp::SessionNotification::new(
+                                        acp::SessionId::new(sid.clone()),
+                                        update,
+                                    );
+                                    if let Err(e) = conn.session_notification(notification).await {
+                                        warn!("ACP nested streaming notification failed: {e}");
+                                    }
                                 }
                             }
                         }
@@ -394,6 +407,55 @@ fn content_block_to_text(content: &acp::ContentBlock) -> String {
 // single-threaded runtimes (the sync version uses `block_in_place` which
 // panics on `current_thread`). Skips CLI hooks since they are designed
 // for interactive terminal use.
+async fn nested_ui_event_to_session_update(
+    event: crate::ui_output::UiOutputEvent,
+) -> Option<acp::SessionUpdate> {
+    match event.kind {
+        UiOutputEventKind::LlmText(text)
+        | UiOutputEventKind::TranscriptText { text }
+        | UiOutputEventKind::ToolResultText { text } => Some(
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(text.into())),
+        ),
+        UiOutputEventKind::AcpThought { text } => Some(acp::SessionUpdate::AgentThoughtChunk(
+            acp::ContentChunk::new(text.into()),
+        )),
+        UiOutputEventKind::StructuredBlock { title, body } => Some(acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(title, body.unwrap_or_default()),
+        )),
+        UiOutputEventKind::StatusLine { text } => Some(acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new("status", acp::ToolCallUpdateFields::new().title(text)),
+        )),
+        UiOutputEventKind::Plan { entries } => {
+            let mapped_entries = entries
+                .into_iter()
+                .map(|entry| {
+                    let status = match entry.status.as_str() {
+                        "completed" => acp::PlanEntryStatus::Completed,
+                        "in_progress" => acp::PlanEntryStatus::InProgress,
+                        _ => acp::PlanEntryStatus::Pending,
+                    };
+                    acp::PlanEntry::new(entry.content, acp::PlanEntryPriority::Medium, status)
+                })
+                .collect();
+            Some(acp::SessionUpdate::Plan(acp::Plan::new(mapped_entries)))
+        }
+        UiOutputEventKind::McpToolInvocation {
+            tool_name,
+            input_yaml,
+        } => Some(acp::SessionUpdate::ToolCall(acp::ToolCall::new(
+            tool_name,
+            input_yaml.unwrap_or_default(),
+        ))),
+        UiOutputEventKind::LlmFinal { output, .. } => Some(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(output.into()),
+        )),
+        UiOutputEventKind::LlmError(err) => Some(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(format!("[error] {err}").into()),
+        )),
+        UiOutputEventKind::Usage { .. } => None,
+    }
+}
+
 async fn eval_tool_calls_async(
     config: &GlobalConfig,
     mut calls: Vec<ToolCall>,
@@ -739,6 +801,56 @@ mod tests {
 
             server_handle.abort();
             client_handle.abort();
+        });
+    }
+
+    #[test]
+    fn nested_ui_event_maps_to_structured_session_updates() {
+        run_local(async {
+            let tool_update = nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
+                kind: UiOutputEventKind::McpToolInvocation {
+                    tool_name: "argus_session_prompt".to_string(),
+                    input_yaml: Some("message: hello".to_string()),
+                },
+                source: None,
+            })
+            .await
+            .expect("tool update");
+
+            match tool_update {
+                acp::SessionUpdate::ToolCall(call) => {
+                    assert!(format!("{:?}", call).contains("argus_session_prompt"));
+                    assert!(format!("{:?}", call).contains("message: hello"));
+                }
+                other => panic!("unexpected tool update: {other:?}"),
+            }
+
+            let thought_update =
+                nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
+                    kind: UiOutputEventKind::AcpThought {
+                        text: "thinking".to_string(),
+                    },
+                    source: None,
+                })
+                .await
+                .expect("thought update");
+            assert!(matches!(
+                thought_update,
+                acp::SessionUpdate::AgentThoughtChunk(_)
+            ));
+
+            let plan_update = nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
+                kind: UiOutputEventKind::Plan {
+                    entries: vec![crate::ui_output::UiOutputPlanEntry {
+                        status: "in_progress".to_string(),
+                        content: "delegate to argus".to_string(),
+                    }],
+                },
+                source: None,
+            })
+            .await
+            .expect("plan update");
+            assert!(matches!(plan_update, acp::SessionUpdate::Plan(_)));
         });
     }
 

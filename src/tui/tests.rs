@@ -514,6 +514,269 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
 }
 
 #[tokio::test]
+async fn structured_system_entries_do_not_insert_blank_lines_between_each_line() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(72, 16);
+    harness.tui().config = config;
+    harness.tui().persistent_manager = persistent;
+
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::StructuredBlock {
+                title: "argus_session_prompt".to_string(),
+                body: Some("message: hello\nsession_id: abc123".to_string()),
+            },
+            source: Some(UiOutputSource {
+                agent: "argus".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        }))
+        .await
+        .unwrap();
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::AcpThought {
+                text: "thinking hard\nstep two".to_string(),
+            },
+            source: Some(UiOutputSource {
+                agent: "argus".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        }))
+        .await
+        .unwrap();
+
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(!rendered.contains("argus_session_prompt\n\n   message: hello"));
+    assert!(!rendered.contains("💭 thinking hard\n\nstep two 💬"));
+}
+
+#[tokio::test]
+async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    for chunk in ["thinking ", "before ", "tool"] {
+        tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::AcpThought {
+                text: chunk.to_string(),
+            },
+            source: None,
+        }))
+        .await
+        .unwrap();
+    }
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::StructuredBlock {
+            title: "argus_session_prompt".to_string(),
+            body: Some("message: delegate".to_string()),
+        },
+        source: None,
+    }))
+    .await
+    .unwrap();
+
+    for chunk in ["thinking ", "after ", "tool"] {
+        tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::AcpThought {
+                text: chunk.to_string(),
+            },
+            source: None,
+        }))
+        .await
+        .unwrap();
+    }
+
+    tui.flush_pending_thought_for_test();
+
+    let system_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text)
+                if !text.starts_with("Welcome to harnx") && !text.starts_with('•') =>
+            {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        system_entries,
+        vec![
+            "<think>thinking before tool</think>",
+            "argus_session_prompt",
+            "   message: delegate",
+            "<think>thinking after tool</think>",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let source = Some(UiOutputSource {
+        agent: "argus".to_string(),
+        session_id: Some("session-1".to_string()),
+    });
+
+    for chunk in ["thinking ", "before ", "tool"] {
+        tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::AcpThought {
+                text: chunk.to_string(),
+            },
+            source: source.clone(),
+        }))
+        .await
+        .unwrap();
+    }
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::StructuredBlock {
+            title: "argus_session_prompt".to_string(),
+            body: Some("message: delegate".to_string()),
+        },
+        source: source.clone(),
+    }))
+    .await
+    .unwrap();
+
+    for chunk in ["thinking ", "after ", "tool"] {
+        tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::AcpThought {
+                text: chunk.to_string(),
+            },
+            source: source.clone(),
+        }))
+        .await
+        .unwrap();
+    }
+
+    tui.flush_pending_thought_for_test();
+
+    let system_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text)
+                if !text.starts_with("Welcome to harnx") && !text.starts_with('•') =>
+            {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        system_entries,
+        vec![
+            "🤖 argus ▸ session-1",
+            "<think>thinking before tool</think>",
+            "argus_session_prompt",
+            "   message: delegate",
+            "<think>thinking after tool</think>",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn llm_multiline_text_renders_without_extra_blank_lines() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(60, 12);
+    harness.tui().config = config;
+    harness.tui().persistent_manager = persistent;
+
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::LlmText("line one\nline two\nline three".to_string()),
+            source: None,
+        }))
+        .await
+        .unwrap();
+
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(rendered.contains("line one"));
+    assert!(rendered.contains("line two"));
+    assert!(rendered.contains("line three"));
+    assert!(!rendered.contains("line one\n\nline two"));
+    assert!(!rendered.contains("line two\n\nline three"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
+    let config = test_config_with_mock_client_and_agent("coordinator", Some("coalescing-test"));
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(72, 18);
+    harness.tui().config = config;
+    harness.tui().persistent_manager = persistent;
+
+    for chunk in ["thinking ", "before ", "tool"] {
+        harness
+            .tui()
+            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+                kind: UiOutputEventKind::AcpThought {
+                    text: chunk.to_string(),
+                },
+                source: Some(UiOutputSource {
+                    agent: "argus".to_string(),
+                    session_id: Some("session-1".to_string()),
+                }),
+            }))
+            .await
+            .unwrap();
+    }
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::StructuredBlock {
+                title: "argus_session_prompt".to_string(),
+                body: Some("message: delegate".to_string()),
+            },
+            source: Some(UiOutputSource {
+                agent: "argus".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        }))
+        .await
+        .unwrap();
+    for chunk in ["thinking ", "after ", "tool"] {
+        harness
+            .tui()
+            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+                kind: UiOutputEventKind::AcpThought {
+                    text: chunk.to_string(),
+                },
+                source: Some(UiOutputSource {
+                    agent: "argus".to_string(),
+                    session_id: Some("session-1".to_string()),
+                }),
+            }))
+            .await
+            .unwrap();
+    }
+    harness.tui().flush_pending_thought_for_test();
+
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("thinking_stream_coalescing_around_tool_calls", rendered);
+}
+
+#[tokio::test]
 async fn structured_ui_output_variants_render_in_transcript() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
