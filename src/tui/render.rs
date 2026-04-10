@@ -56,7 +56,14 @@ impl Tui {
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(prefix.to_string(), style)));
         }
-        lines.push(Line::from(""));
+        let add_trailing_spacing = match entry {
+            TranscriptEntry::System(_) => false,
+            TranscriptEntry::Assistant(text) => !text.contains('\n'),
+            _ => true,
+        };
+        if add_trailing_spacing {
+            lines.push(Line::from(""));
+        }
         lines
     }
 
@@ -320,9 +327,9 @@ impl Tui {
             let (tokens, percent) = session.tokens_usage();
             if tokens > 0 {
                 if percent > 0.0 {
-                    parts.push(format!("💬 {}({:.0}%)", tokens, percent));
+                    parts.push(format!("Context: {}({:.0}%)", tokens, percent));
                 } else {
-                    parts.push(format!("💬 {}", tokens));
+                    parts.push(format!("Context: {}", tokens));
                 }
             }
         }
@@ -369,9 +376,9 @@ impl Tui {
         let cursor_style = if pending_message {
             Style::default()
                 .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
-            Style::default()
+            Style::default().add_modifier(Modifier::REVERSED)
         };
         app.input.set_cursor_style(cursor_style);
     }

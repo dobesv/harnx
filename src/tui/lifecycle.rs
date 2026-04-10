@@ -34,11 +34,11 @@ impl Tui {
     ) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let ui_output_tx = event_tx.clone();
-        let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel::<String>();
+        let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
         install_ui_output_sender(bridge_tx);
         tokio::spawn(async move {
-            while let Some(text) = bridge_rx.recv().await {
-                let _ = ui_output_tx.send(TuiEvent::UiOutput(text));
+            while let Some(event) = bridge_rx.recv().await {
+                let _ = ui_output_tx.send(TuiEvent::UiOutput(event));
             }
         });
 
@@ -59,6 +59,9 @@ impl Tui {
                 llm_busy: false,
                 scroll_state: ratatui_widget_scrolling::ScrollState::new(),
                 streaming_assistant_idx: None,
+                last_ui_output_source: None,
+                pending_thought_source: None,
+                pending_thought_text: String::new(),
                 pending_message: None,
                 completions: vec![],
                 completion_index: 0,

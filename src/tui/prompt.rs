@@ -96,10 +96,15 @@ impl Tui {
                 )
                 .await;
                 if matches!(outcome.control, HookResultControl::Block { .. }) {
-                    let _ = ctx.event_tx.send(TuiEvent::Finished {
-                        output: String::new(),
-                        usage: Default::default(),
-                    });
+                    let _ =
+                        ctx.event_tx
+                            .send(TuiEvent::UiOutput(crate::ui_output::UiOutputEvent {
+                                kind: crate::ui_output::UiOutputEventKind::LlmFinal {
+                                    output: String::new(),
+                                    usage: Default::default(),
+                                },
+                                source: None,
+                            }));
                     break;
                 }
             }
@@ -170,10 +175,15 @@ impl Tui {
                 with_embeddings = false;
                 continue;
             } else {
-                let _ = ctx.event_tx.send(TuiEvent::Finished {
-                    output: output.clone(),
-                    usage: usage.clone(),
-                });
+                let _ = ctx
+                    .event_tx
+                    .send(TuiEvent::UiOutput(crate::ui_output::UiOutputEvent {
+                        kind: crate::ui_output::UiOutputEventKind::LlmFinal {
+                            output: output.clone(),
+                            usage: usage.clone(),
+                        },
+                        source: None,
+                    }));
             }
 
             let max_resume = hooks.max_resume.unwrap_or(5);
@@ -244,7 +254,11 @@ impl Tui {
             while let Some(evt) = rx.recv().await {
                 match evt {
                     crate::client::SseEvent::Text(text) => {
-                        let _ = event_tx.send(TuiEvent::Chunk(text));
+                        let _ =
+                            event_tx.send(TuiEvent::UiOutput(crate::ui_output::UiOutputEvent {
+                                kind: crate::ui_output::UiOutputEventKind::LlmText(text),
+                                source: None,
+                            }));
                     }
                     crate::client::SseEvent::Done => break,
                 }

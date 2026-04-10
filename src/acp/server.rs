@@ -1,11 +1,12 @@
+use super::NestedAcpEvent;
 use agent_client_protocol::{self as acp, Client as _};
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use uuid::Uuid;
 
 use crate::client::{Client, SseEvent, SseHandler};
-use crate::config::session::SessionLogEntry;
-use crate::config::{ensure_parent_exists, Config, GlobalConfig, Input};
+use crate::config::{GlobalConfig, Input};
 use crate::tool::{ToolCall, ToolResult};
+use crate::ui_output::UiOutputEventKind;
 use crate::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
 
 use anyhow::bail;
@@ -26,32 +27,6 @@ pub struct HarnxAgent {
 struct HarnxSession {
     id: String,
     abort_signal: AbortSignal,
-    log_path: Option<PathBuf>,
-}
-
-impl HarnxSession {
-    /// Append a session log entry to this session's log file.
-    /// Uses async-compatible I/O (tokio::fs) to avoid blocking the Tokio runtime.
-    /// Best-effort: errors are logged but don't interrupt the session.
-    async fn append_log(&self, entry: &SessionLogEntry) {
-        let Some(path) = &self.log_path else { return };
-        let Ok(yaml) = serde_yaml::to_string(entry) else {
-            return;
-        };
-        let mut data = String::from("---\n");
-        data.push_str(&yaml);
-        use tokio::io::AsyncWriteExt;
-        match tokio::fs::OpenOptions::new().append(true).open(path).await {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(data.as_bytes()).await {
-                    warn!("Failed to write session log: {e}");
-                }
-            }
-            Err(e) => {
-                warn!("Failed to open session log for append: {e}");
-            }
-        }
-    }
 }
 
 impl HarnxAgent {
@@ -66,43 +41,6 @@ impl HarnxAgent {
 
     pub fn set_connection(&self, conn: Rc<acp::AgentSideConnection>) {
         self.connection.replace(Some(conn));
-    }
-
-    /// Create a session log file for an ACP session and write the header.
-    /// Returns the log file path, or None if creation failed.
-    async fn create_session_log(&self, session_id: &str) -> Option<PathBuf> {
-        let config = self.config.read();
-        let sessions_dir = Config::agent_data_dir(&self.agent_name)
-            .join("sessions")
-            .join("_");
-        drop(config);
-
-        let now = chrono::Local::now();
-        let name = now.format("%Y%m%dT%H%M%S").to_string();
-        let short_id = session_id.get(..8).unwrap_or(session_id);
-        let filename = format!("{name}-{short_id}.yaml");
-        let path = sessions_dir.join(&filename);
-        if ensure_parent_exists(&path).is_err() {
-            return None;
-        }
-
-        let agent = self.config.read().retrieve_agent(&self.agent_name).ok()?;
-        let header = SessionLogEntry::Header {
-            model_id: agent.model().id(),
-            temperature: agent.temperature(),
-            top_p: agent.top_p(),
-            use_tools: agent.use_tools(),
-            save_session: Some(true),
-            compress_threshold: None,
-            agent_name: Some(self.agent_name.clone()),
-            agent_variables: Default::default(),
-            agent_instructions: String::new(),
-        };
-        let content = serde_yaml::to_string(&header).ok()?;
-        if tokio::fs::write(&path, &content).await.is_err() {
-            return None;
-        }
-        Some(path)
     }
 
     async fn send_text_chunk(&self, session_id: &str, text: &str) -> acp::Result<()> {
@@ -279,11 +217,20 @@ impl acp::Agent for HarnxAgent {
         _args: acp::NewSessionRequest,
     ) -> acp::Result<acp::NewSessionResponse> {
         let session_id = Uuid::new_v4().to_string();
-        let log_path = self.create_session_log(&session_id).await;
+        {
+            let mut config = self.config.write();
+            if config.session.is_some() {
+                config
+                    .exit_session()
+                    .map_err(|e| acp::Error::new(-32603, format!("Failed to exit session: {e}")))?;
+            }
+            config
+                .use_session(Some(&session_id))
+                .map_err(|e| acp::Error::new(-32603, format!("Failed to create session: {e}")))?;
+        }
         let session = HarnxSession {
             id: session_id.clone(),
             abort_signal: AbortSignalInner::new(),
-            log_path,
         };
         self.sessions
             .borrow_mut()
@@ -311,6 +258,21 @@ impl acp::Agent for HarnxAgent {
             session.abort_signal.clone()
         };
 
+        {
+            let mut config = self.config.write();
+            let active_session_name = config.session.as_ref().map(|s| s.name().to_string());
+            if active_session_name.as_deref() != Some(session_key.as_str()) {
+                if config.session.is_some() {
+                    config.exit_session().map_err(|e| {
+                        acp::Error::new(-32603, format!("Failed to exit session: {e}"))
+                    })?;
+                }
+                config
+                    .use_session(Some(&session_key))
+                    .map_err(|e| acp::Error::new(-32603, format!("Failed to load session: {e}")))?;
+            }
+        }
+
         let agent = self
             .config
             .read()
@@ -321,17 +283,6 @@ impl acp::Agent for HarnxAgent {
         let client = input
             .create_client()
             .map_err(|e| acp::Error::new(-32603, format!("Failed to create client: {e}")))?;
-
-        // Log user prompt to session file (async, best-effort).
-        let session_for_user_log = {
-            let sessions = self.sessions.borrow();
-            sessions.get(session_key.as_str()).cloned()
-        };
-        if let Some(session) = session_for_user_log {
-            session
-                .append_log(&SessionLogEntry::message_user(prompt_text.clone()))
-                .await;
-        }
 
         let mut round = 0u32;
         loop {
@@ -348,20 +299,6 @@ impl acp::Agent for HarnxAgent {
             };
 
             if tool_calls.is_empty() {
-                // Log final assistant response.
-                let session_for_assistant_log = {
-                    let sessions = self.sessions.borrow();
-                    sessions.get(session_key.as_str()).cloned()
-                };
-                if let Some(session) = session_for_assistant_log {
-                    let content = match &thought {
-                        Some(t) => format!("<think>\n{t}\n</think>\n{output}"),
-                        None => output.clone(),
-                    };
-                    session
-                        .append_log(&SessionLogEntry::message_assistant(content))
-                        .await;
-                }
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
             }
 
@@ -395,14 +332,25 @@ impl acp::Agent for HarnxAgent {
                     let forward_task = tokio::task::spawn_local(async move {
                         while let Some(chunk) = chunk_rx.recv().await {
                             if let Some(ref conn) = connection {
-                                let notification = acp::SessionNotification::new(
-                                    acp::SessionId::new(sid.clone()),
-                                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                                        chunk.into(),
-                                    )),
-                                );
-                                if let Err(e) = conn.session_notification(notification).await {
-                                    warn!("ACP nested streaming notification failed: {e}");
+                                let update = match chunk {
+                                    NestedAcpEvent::Ui(event) => {
+                                        nested_ui_event_to_session_update(event).await
+                                    }
+                                    NestedAcpEvent::Text(text) => {
+                                        Some(acp::SessionUpdate::AgentMessageChunk(
+                                            acp::ContentChunk::new(text.into()),
+                                        ))
+                                    }
+                                };
+
+                                if let Some(update) = update {
+                                    let notification = acp::SessionNotification::new(
+                                        acp::SessionId::new(sid.clone()),
+                                        update,
+                                    );
+                                    if let Err(e) = conn.session_notification(notification).await {
+                                        warn!("ACP nested streaming notification failed: {e}");
+                                    }
                                 }
                             }
                         }
@@ -459,6 +407,54 @@ fn content_block_to_text(content: &acp::ContentBlock) -> String {
 // single-threaded runtimes (the sync version uses `block_in_place` which
 // panics on `current_thread`). Skips CLI hooks since they are designed
 // for interactive terminal use.
+async fn nested_ui_event_to_session_update(
+    event: crate::ui_output::UiOutputEvent,
+) -> Option<acp::SessionUpdate> {
+    match event.kind {
+        UiOutputEventKind::LlmText(text) | UiOutputEventKind::TranscriptText { text } => Some(
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(text.into())),
+        ),
+        UiOutputEventKind::ToolResultText { .. } => None,
+        UiOutputEventKind::AcpThought { text } => Some(acp::SessionUpdate::AgentThoughtChunk(
+            acp::ContentChunk::new(text.into()),
+        )),
+        UiOutputEventKind::StructuredBlock { title, body } => Some(acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(title, body.unwrap_or_default()),
+        )),
+        UiOutputEventKind::StatusLine { text } => Some(acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new("status", acp::ToolCallUpdateFields::new().title(text)),
+        )),
+        UiOutputEventKind::Plan { entries } => {
+            let mapped_entries = entries
+                .into_iter()
+                .map(|entry| {
+                    let status = match entry.status.as_str() {
+                        "completed" => acp::PlanEntryStatus::Completed,
+                        "in_progress" => acp::PlanEntryStatus::InProgress,
+                        _ => acp::PlanEntryStatus::Pending,
+                    };
+                    acp::PlanEntry::new(entry.content, acp::PlanEntryPriority::Medium, status)
+                })
+                .collect();
+            Some(acp::SessionUpdate::Plan(acp::Plan::new(mapped_entries)))
+        }
+        UiOutputEventKind::McpToolInvocation {
+            tool_name,
+            input_yaml,
+        } => Some(acp::SessionUpdate::ToolCall(acp::ToolCall::new(
+            tool_name,
+            input_yaml.unwrap_or_default(),
+        ))),
+        UiOutputEventKind::LlmFinal { output, .. } => Some(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(output.into()),
+        )),
+        UiOutputEventKind::LlmError(err) => Some(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(format!("[error] {err}").into()),
+        )),
+        UiOutputEventKind::Usage { .. } => None,
+    }
+}
+
 async fn eval_tool_calls_async(
     config: &GlobalConfig,
     mut calls: Vec<ToolCall>,
@@ -808,12 +804,62 @@ mod tests {
     }
 
     #[test]
+    fn nested_ui_event_maps_to_structured_session_updates() {
+        run_local(async {
+            let tool_update = nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
+                kind: UiOutputEventKind::McpToolInvocation {
+                    tool_name: "argus_session_prompt".to_string(),
+                    input_yaml: Some("message: hello".to_string()),
+                },
+                source: None,
+            })
+            .await
+            .expect("tool update");
+
+            match tool_update {
+                acp::SessionUpdate::ToolCall(call) => {
+                    assert!(format!("{:?}", call).contains("argus_session_prompt"));
+                    assert!(format!("{:?}", call).contains("message: hello"));
+                }
+                other => panic!("unexpected tool update: {other:?}"),
+            }
+
+            let thought_update =
+                nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
+                    kind: UiOutputEventKind::AcpThought {
+                        text: "thinking".to_string(),
+                    },
+                    source: None,
+                })
+                .await
+                .expect("thought update");
+            assert!(matches!(
+                thought_update,
+                acp::SessionUpdate::AgentThoughtChunk(_)
+            ));
+
+            let plan_update = nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
+                kind: UiOutputEventKind::Plan {
+                    entries: vec![crate::ui_output::UiOutputPlanEntry {
+                        status: "in_progress".to_string(),
+                        content: "delegate to argus".to_string(),
+                    }],
+                },
+                source: None,
+            })
+            .await
+            .expect("plan update");
+            assert!(matches!(plan_update, acp::SessionUpdate::Plan(_)));
+        });
+    }
+
+    #[test]
     fn test_acp_server_new_session_and_prompt_roundtrip() {
         let config = test_config();
 
         run_local(async move {
             let (client_conn, chunks, server_handle, client_handle) =
-                setup_roundtrip(CREATE_TITLE_AGENT, config);
+                setup_roundtrip(CREATE_TITLE_AGENT, config.clone());
 
             timeout(
                 Duration::from_secs(5),
@@ -837,6 +883,11 @@ mod tests {
             .expect("new_session should not hang")
             .expect("new_session should succeed");
 
+            assert_eq!(
+                config.read().session.as_ref().map(|s| s.name().to_string()),
+                Some(session.session_id.to_string())
+            );
+
             let response = timeout(
                 Duration::from_secs(5),
                 client_conn.prompt(acp::PromptRequest::new(
@@ -853,6 +904,13 @@ mod tests {
                 chunks.borrow().join("").contains("hello from client"),
                 "expected prompt roundtrip output, got {:?}",
                 chunks.borrow()
+            );
+
+            let session_path = config.read().session_file(&session.session_id.to_string());
+            assert!(
+                !session_path.display().to_string().contains("/sessions/_/"),
+                "session file should not be written under '_' temp directory: {}",
+                session_path.display()
             );
 
             server_handle.abort();

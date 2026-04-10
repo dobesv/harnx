@@ -1,8 +1,13 @@
 use crate::{
+    acp::NestedAcpEvent,
     config::GlobalConfig,
     hooks::{dispatch::dispatch_hooks, HookEvent, HookResultControl},
     mcp_safety::{truncate_output, TruncateOpts},
-    ui_output::emit_ui_output,
+    tui::render_helpers::event_fallback_text,
+    ui_output::{
+        emit_ui_output_event, has_ui_output_sink, pretty_yaml_block, UiOutputEvent,
+        UiOutputEventKind,
+    },
     utils::*,
 };
 
@@ -12,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Write as _;
-use textwrap::{wrap, Options};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -105,7 +109,11 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                     });
                 let truncated = truncate_output(&output_str, &opts);
                 let text = format!("{}\n", dimmed_text(&truncated));
-                if !emit_ui_output(text.clone()) && *IS_STDOUT_TERMINAL {
+                let event = UiOutputEvent {
+                    kind: UiOutputEventKind::ToolResultText { text: text.clone() },
+                    source: None,
+                };
+                if !emit_ui_output_event(event) && *IS_STDOUT_TERMINAL {
                     print!("{text}");
                 }
 
@@ -290,47 +298,6 @@ pub struct ToolCall {
     pub thought_signature: Option<String>,
 }
 
-fn display_wrap_width() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&w| w >= 40)
-        .unwrap_or(88)
-}
-
-fn wrap_display_text(text: &str, initial_indent: &str, subsequent_indent: &str) -> String {
-    if text.trim().is_empty() {
-        return String::new();
-    }
-    let options = Options::new(display_wrap_width())
-        .initial_indent(initial_indent)
-        .subsequent_indent(subsequent_indent)
-        .break_words(false)
-        .word_splitter(textwrap::WordSplitter::NoHyphenation);
-    wrap(text, options).join("\n")
-}
-
-fn pretty_yaml_block(value: &Value) -> String {
-    serde_yaml::to_string(value)
-        .map(|s| s.trim_end().to_string())
-        .unwrap_or_else(|_| value.to_string())
-}
-
-fn format_tool_invocation_display(tool_name: &str, json_data: &Value) -> String {
-    let header = wrap_display_text(&format!("🛠️  {tool_name}"), "", "   ");
-    match json_data {
-        Value::Null => format!("{}\n", dimmed_text(&header)),
-        _ => {
-            let body = pretty_yaml_block(json_data)
-                .lines()
-                .map(|line| format!("   {line}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("{}\n{}\n", dimmed_text(&header), dimmed_text(&body))
-        }
-    }
-}
-
 impl ToolCall {
     pub fn dedup(calls: Vec<Self>) -> Vec<Self> {
         let mut new_calls = vec![];
@@ -386,8 +353,18 @@ impl ToolCall {
         };
 
         // Emit tool call info to TUI or terminal
-        let text = format_tool_invocation_display(&self.name, &json_data);
-        if !emit_ui_output(text.clone()) && *IS_STDOUT_TERMINAL {
+        let event = UiOutputEvent {
+            kind: UiOutputEventKind::McpToolInvocation {
+                tool_name: self.name.clone(),
+                input_yaml: match json_data {
+                    Value::Null => None,
+                    _ => Some(pretty_yaml_block(&json_data)),
+                },
+            },
+            source: None,
+        };
+        let text = event_fallback_text(&event.kind, event.source.as_ref());
+        if !emit_ui_output_event(event) && *IS_STDOUT_TERMINAL {
             print!("{text}");
         }
 
@@ -422,7 +399,7 @@ impl ToolCall {
                 // stdout in real-time instead of being silently swallowed.
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
-                        let has_ui_output = emit_ui_output("");
+                        let has_ui_output = has_ui_output_sink();
                         let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
                         let (chunk_rx, subscription_id) = manager.subscribe_chunks().await;
 
@@ -436,8 +413,12 @@ impl ToolCall {
                         // Forward chunks either to TUI output sink or stdout.
                         let spinner_clone = spinner.clone();
                         let spinner_msg = format!("  {} working…", tool_name);
-                        let forward_handle =
-                            tokio::spawn(forward_acp_chunks(chunk_rx, spinner_clone, spinner_msg));
+                        let forward_handle = tokio::spawn(forward_acp_chunks(
+                            chunk_rx,
+                            spinner_clone,
+                            spinner_msg,
+                            is_terminal,
+                        ));
 
                         let call_result = manager.call_tool(&tool_name, json_data).await;
 
@@ -502,9 +483,10 @@ impl ToolCall {
 /// then restores the spinner.  This gives the user live visibility into
 /// sub-agent (and sub-sub-agent) tool calls, thoughts, and plan updates.
 async fn forward_acp_chunks(
-    mut chunk_rx: UnboundedReceiver<String>,
+    mut chunk_rx: UnboundedReceiver<NestedAcpEvent>,
     spinner: Option<Spinner>,
     spinner_msg: String,
+    allow_fallback_print: bool,
 ) {
     while let Some(chunk) = chunk_rx.recv().await {
         // Pause the spinner (clear display but keep task alive) before
@@ -512,9 +494,24 @@ async fn forward_acp_chunks(
         if let Some(ref s) = spinner {
             s.pause();
         }
-        if !emit_ui_output(chunk.clone()) {
-            print!("{chunk}");
-            let _ = std::io::stdout().flush();
+        match chunk {
+            NestedAcpEvent::Ui(event) => {
+                let fallback = event_fallback_text(&event.kind, event.source.as_ref());
+                if !emit_ui_output_event(event) && allow_fallback_print {
+                    print!("{fallback}");
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            NestedAcpEvent::Text(text) => {
+                let event = UiOutputEvent {
+                    kind: UiOutputEventKind::TranscriptText { text: text.clone() },
+                    source: None,
+                };
+                if !emit_ui_output_event(event) && allow_fallback_print {
+                    print!("{text}");
+                    let _ = std::io::stdout().flush();
+                }
+            }
         }
         // Re-enable the spinner after printing.
         if let Some(ref s) = spinner {
@@ -563,17 +560,22 @@ fn extract_user_display_text(result: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::ui_output::{clear_ui_output_sender, install_ui_output_sender};
     use parking_lot::RwLock;
     use std::sync::Arc;
+    use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
-    fn test_format_tool_invocation_display_multiline_yaml() {
-        let rendered = format_tool_invocation_display(
-            "argus_session_prompt",
-            &json!({
-                "message": "Goal — Improve display\nAcceptance criteria — Wrap nicely",
-                "session_id": "session-1"
-            }),
+    fn test_mcp_tool_invocation_terminal_fallback_multiline_yaml() {
+        let rendered = event_fallback_text(
+            &UiOutputEventKind::McpToolInvocation {
+                tool_name: "argus_session_prompt".to_string(),
+                input_yaml: Some(pretty_yaml_block(&json!({
+                    "message": "Goal — Improve display\nAcceptance criteria — Wrap nicely",
+                    "session_id": "session-1"
+                }))),
+            },
+            None,
         );
 
         assert!(rendered.contains("argus_session_prompt"));
@@ -780,5 +782,51 @@ mod tests {
             extract_user_display_text(&result),
             Some("has annotations but no audience".to_string())
         );
+    }
+
+    #[test]
+    fn test_tool_result_event_fallback_text_matches_terminal_output() {
+        let text = "\u{1b}[2mtool output\u{1b}[0m\n".to_string();
+        let event = UiOutputEventKind::ToolResultText { text: text.clone() };
+
+        assert_eq!(event_fallback_text(&event, None), text);
+    }
+
+    #[tokio::test]
+    async fn forward_acp_chunks_preserves_structured_nested_events() {
+        let (ui_tx, mut ui_rx) = unbounded_channel();
+        install_ui_output_sender(ui_tx);
+
+        let (tx, rx) = unbounded_channel();
+        let forward = tokio::spawn(forward_acp_chunks(rx, None, "working".to_string(), false));
+
+        tx.send(NestedAcpEvent::Ui(UiOutputEvent {
+            kind: UiOutputEventKind::McpToolInvocation {
+                tool_name: "argus_session_prompt".to_string(),
+                input_yaml: Some("message: hi".to_string()),
+            },
+            source: Some(crate::ui_output::UiOutputSource {
+                agent: "argus".to_string(),
+                session_id: Some("sess-1".to_string()),
+            }),
+        }))
+        .unwrap();
+        drop(tx);
+
+        forward.await.unwrap();
+
+        let event = ui_rx.recv().await.expect("forwarded UI event");
+        match event.kind {
+            UiOutputEventKind::McpToolInvocation {
+                tool_name,
+                input_yaml,
+            } => {
+                assert_eq!(tool_name, "argus_session_prompt");
+                assert_eq!(input_yaml.as_deref(), Some("message: hi"));
+            }
+            other => panic!("unexpected event kind: {other:?}"),
+        }
+
+        clear_ui_output_sender();
     }
 }

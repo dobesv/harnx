@@ -37,6 +37,7 @@ mod input;
 mod lifecycle;
 mod prompt;
 mod render;
+pub(crate) mod render_helpers;
 mod terminal;
 #[cfg(test)]
 mod tests;
