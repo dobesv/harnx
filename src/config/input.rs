@@ -284,6 +284,7 @@ impl Input {
     }
 
     pub fn set_agent(&mut self, agent: Agent) {
+        self.with_agent = !agent.name().trim().is_empty();
         self.agent = agent;
     }
 

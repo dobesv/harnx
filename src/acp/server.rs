@@ -299,12 +299,21 @@ impl acp::Agent for HarnxAgent {
                     .await?
             };
 
-            {
-                let mut config = self.config.write();
-                config
-                    .save_message(&input, &output, thought.as_deref())
-                    .map_err(|e| acp::Error::new(-32603, format!("Failed to save message: {e}")))?;
-            }
+            let config = self.config.clone();
+            let input_for_save = input.clone();
+            let output_for_save = output.clone();
+            let thought_for_save = thought.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut config = config.write();
+                config.save_message(
+                    &input_for_save,
+                    &output_for_save,
+                    thought_for_save.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to join save task: {e}")))?
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to save message: {e}")))?;
 
             if tool_calls.is_empty() {
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
@@ -921,10 +930,11 @@ mod tests {
             .expect("prompt should succeed");
 
             assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+            let chunks = chunks.borrow();
             assert!(
-                !chunks.borrow().is_empty(),
-                "expected prompt roundtrip output chunks, got {:?}",
-                chunks.borrow()
+                chunks.iter().any(|chunk| !chunk.trim().is_empty()),
+                "expected prompt roundtrip output to include at least one non-empty chunk, got {:?}",
+                *chunks
             );
 
             let session_path = config.read().session_file(&session.session_id.to_string());
