@@ -315,7 +315,7 @@ mod tests {
 
     use bytes::Bytes;
     use futures_util::stream;
-    use rand::Rng;
+    use rand::RngExt;
 
     fn split_chunks(text: &str) -> Vec<Vec<u8>> {
         let mut rng = rand::rng();
