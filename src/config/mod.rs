@@ -2431,12 +2431,21 @@ impl Config {
         }
     }
 
-    fn save_message(&mut self, input: &Input, output: &str, thought: Option<&str>) -> Result<()> {
+    pub(crate) fn save_message(
+        &mut self,
+        input: &Input,
+        output: &str,
+        thought: Option<&str>,
+    ) -> Result<()> {
         let mut input = input.clone();
         input.clear_patch();
-        if let Some(session) = input.session_mut(&mut self.session) {
-            session.add_message(&input, output, thought)?;
-            return Ok(());
+        let sessions_dir = self.sessions_dir();
+        if input.with_session() {
+            if let Some(session) = self.session.as_mut() {
+                session.set_sessions_dir(sessions_dir);
+                session.add_message(&input, output, thought)?;
+                return Ok(());
+            }
         }
 
         if !self.save {

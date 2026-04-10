@@ -283,6 +283,11 @@ impl Input {
         &self.agent
     }
 
+    pub fn set_agent(&mut self, agent: Agent) {
+        self.with_agent = !agent.name().trim().is_empty();
+        self.agent = agent;
+    }
+
     pub fn session<'a>(&self, session: &'a Option<Session>) -> Option<&'a Session> {
         if self.with_session {
             session.as_ref()
@@ -291,12 +296,8 @@ impl Input {
         }
     }
 
-    pub fn session_mut<'a>(&self, session: &'a mut Option<Session>) -> Option<&'a mut Session> {
-        if self.with_session {
-            session.as_mut()
-        } else {
-            None
-        }
+    pub fn with_session(&self) -> bool {
+        self.with_session
     }
 
     pub fn with_agent(&self) -> bool {

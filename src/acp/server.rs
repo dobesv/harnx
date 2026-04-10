@@ -279,7 +279,8 @@ impl acp::Agent for HarnxAgent {
             .retrieve_agent(&self.agent_name)
             .map_err(|e| acp::Error::new(-32603, format!("Failed to retrieve agent: {e}")))?;
 
-        let mut input = Input::from_str(&self.config, &prompt_text, Some(agent));
+        let mut input = Input::from_str(&self.config, &prompt_text, None);
+        input.set_agent(agent);
         let client = input
             .create_client()
             .map_err(|e| acp::Error::new(-32603, format!("Failed to create client: {e}")))?;
@@ -297,6 +298,22 @@ impl acp::Agent for HarnxAgent {
                 self.execute_llm_non_streaming(&session_key, &input, client.as_ref(), &abort_signal)
                     .await?
             };
+
+            let config = self.config.clone();
+            let input_for_save = input.clone();
+            let output_for_save = output.clone();
+            let thought_for_save = thought.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut config = config.write();
+                config.save_message(
+                    &input_for_save,
+                    &output_for_save,
+                    thought_for_save.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to join save task: {e}")))?
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to save message: {e}")))?;
 
             if tool_calls.is_empty() {
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
@@ -545,14 +562,16 @@ async fn eval_mcp_async(
 mod tests {
     use super::*;
     use crate::{
-        client::{ClientConfig, Model, ModelType},
+        client::{ClientConfig, Model, ModelType, TestStateGuard},
         config::{Config, CREATE_TITLE_AGENT},
+        test_utils::{MockClient, MockTurnBuilder},
     };
     use agent_client_protocol::Agent;
     use std::{
         cell::RefCell,
         pin::Pin,
         rc::Rc,
+        sync::Arc,
         task::{Context as TaskContext, Poll},
     };
     use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, ReadBuf};
@@ -665,7 +684,7 @@ mod tests {
         config.clients = clients;
         config.model = Model::retrieve_model(&config, "openai:gpt-4o", ModelType::Chat)
             .expect("load test model");
-        config.dry_run = true;
+        config.save_session = Some(true);
 
         Arc::new(RwLock::new(config))
     }
@@ -858,6 +877,17 @@ mod tests {
         let config = test_config();
 
         run_local(async move {
+            let _guard = TestStateGuard::new(Some(Arc::new(
+                MockClient::builder()
+                    .add_turn(
+                        MockTurnBuilder::new()
+                            .add_text_chunk("mock roundtrip response")
+                            .build(),
+                    )
+                    .build(),
+            )))
+            .await;
+
             let (client_conn, chunks, server_handle, client_handle) =
                 setup_roundtrip(CREATE_TITLE_AGENT, config.clone());
 
@@ -900,16 +930,22 @@ mod tests {
             .expect("prompt should succeed");
 
             assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+            let chunks = chunks.borrow();
             assert!(
-                chunks.borrow().join("").contains("hello from client"),
-                "expected prompt roundtrip output, got {:?}",
-                chunks.borrow()
+                chunks.iter().any(|chunk| !chunk.trim().is_empty()),
+                "expected prompt roundtrip output to include at least one non-empty chunk, got {:?}",
+                *chunks
             );
 
             let session_path = config.read().session_file(&session.session_id.to_string());
             assert!(
                 !session_path.display().to_string().contains("/sessions/_/"),
                 "session file should not be written under '_' temp directory: {}",
+                session_path.display()
+            );
+            assert!(
+                session_path.exists(),
+                "ACP prompt should persist the session to disk at {}",
                 session_path.display()
             );
 
