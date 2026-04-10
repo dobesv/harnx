@@ -131,11 +131,12 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                 output.push(result_obj);
             }
             Err(ToolError::Recoverable(err)) => {
+                let error_display = format!("{err:#}");
                 let fail_event = HookEvent::PostToolUseFailure {
                     tool_name: call.name.clone(),
                     tool_input: tool_input.clone(),
                     tool_use_id: tool_use_id.clone(),
-                    error: err.to_string(),
+                    error: error_display.clone(),
                 };
                 let _ = tokio::task::block_in_place(|| {
                     Handle::current().block_on(dispatch_hooks(
@@ -149,7 +150,7 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                 is_all_null = false;
                 let error_result = json!({
                     "is_error": true,
-                    "error": err.to_string(),
+                    "error": error_display,
                 });
                 output.push(ToolResult::new(call, error_result));
             }

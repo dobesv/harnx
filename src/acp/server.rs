@@ -422,7 +422,7 @@ impl acp::Agent for HarnxAgent {
                 match result {
                     Ok(results) => results,
                     Err(e) => {
-                        self.send_text_chunk(&session_key, &format!("\n[Tool error: {e}]"))
+                        self.send_text_chunk(&session_key, &format!("\n[Tool error: {e:#}]"))
                             .await?;
                         return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
                     }
