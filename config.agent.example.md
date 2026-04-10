@@ -5,7 +5,7 @@
 model: openai:gpt-4o             # Specify the LLM to use
 temperature: null                # Set default temperature parameter, range (0, 1)
 top_p: null                      # Set default top-p parameter
-use_tools:                       # Which MCP tools to use (e.g. 'fs:all,bash_exec')
+use_tools:                       # Which MCP tools to allow
   - Bash
   - Glob
   - Grep
