@@ -553,14 +553,16 @@ async fn eval_mcp_async(
 mod tests {
     use super::*;
     use crate::{
-        client::{ClientConfig, Model, ModelType},
+        client::{ClientConfig, Model, ModelType, TestStateGuard},
         config::{Config, CREATE_TITLE_AGENT},
+        test_utils::{MockClient, MockTurnBuilder},
     };
     use agent_client_protocol::Agent;
     use std::{
         cell::RefCell,
         pin::Pin,
         rc::Rc,
+        sync::Arc,
         task::{Context as TaskContext, Poll},
     };
     use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, ReadBuf};
@@ -866,6 +868,17 @@ mod tests {
         let config = test_config();
 
         run_local(async move {
+            let _guard = TestStateGuard::new(Some(Arc::new(
+                MockClient::builder()
+                    .add_turn(
+                        MockTurnBuilder::new()
+                            .add_text_chunk("mock roundtrip response")
+                            .build(),
+                    )
+                    .build(),
+            )))
+            .await;
+
             let (client_conn, chunks, server_handle, client_handle) =
                 setup_roundtrip(CREATE_TITLE_AGENT, config.clone());
 
