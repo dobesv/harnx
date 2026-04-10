@@ -413,8 +413,12 @@ impl ToolCall {
                         // Forward chunks either to TUI output sink or stdout.
                         let spinner_clone = spinner.clone();
                         let spinner_msg = format!("  {} working…", tool_name);
-                        let forward_handle =
-                            tokio::spawn(forward_acp_chunks(chunk_rx, spinner_clone, spinner_msg));
+                        let forward_handle = tokio::spawn(forward_acp_chunks(
+                            chunk_rx,
+                            spinner_clone,
+                            spinner_msg,
+                            is_terminal,
+                        ));
 
                         let call_result = manager.call_tool(&tool_name, json_data).await;
 
@@ -482,6 +486,7 @@ async fn forward_acp_chunks(
     mut chunk_rx: UnboundedReceiver<NestedAcpEvent>,
     spinner: Option<Spinner>,
     spinner_msg: String,
+    allow_fallback_print: bool,
 ) {
     while let Some(chunk) = chunk_rx.recv().await {
         // Pause the spinner (clear display but keep task alive) before
@@ -492,7 +497,7 @@ async fn forward_acp_chunks(
         match chunk {
             NestedAcpEvent::Ui(event) => {
                 let fallback = event_fallback_text(&event.kind, event.source.as_ref());
-                if !emit_ui_output_event(event) {
+                if !emit_ui_output_event(event) && allow_fallback_print {
                     print!("{fallback}");
                     let _ = std::io::stdout().flush();
                 }
@@ -502,7 +507,7 @@ async fn forward_acp_chunks(
                     kind: UiOutputEventKind::TranscriptText { text: text.clone() },
                     source: None,
                 };
-                if !emit_ui_output_event(event) {
+                if !emit_ui_output_event(event) && allow_fallback_print {
                     print!("{text}");
                     let _ = std::io::stdout().flush();
                 }
@@ -793,7 +798,7 @@ mod tests {
         install_ui_output_sender(ui_tx);
 
         let (tx, rx) = unbounded_channel();
-        let forward = tokio::spawn(forward_acp_chunks(rx, None, "working".to_string()));
+        let forward = tokio::spawn(forward_acp_chunks(rx, None, "working".to_string(), false));
 
         tx.send(NestedAcpEvent::Ui(UiOutputEvent {
             kind: UiOutputEventKind::McpToolInvocation {

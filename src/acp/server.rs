@@ -411,11 +411,10 @@ async fn nested_ui_event_to_session_update(
     event: crate::ui_output::UiOutputEvent,
 ) -> Option<acp::SessionUpdate> {
     match event.kind {
-        UiOutputEventKind::LlmText(text)
-        | UiOutputEventKind::TranscriptText { text }
-        | UiOutputEventKind::ToolResultText { text } => Some(
+        UiOutputEventKind::LlmText(text) | UiOutputEventKind::TranscriptText { text } => Some(
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(text.into())),
         ),
+        UiOutputEventKind::ToolResultText { .. } => None,
         UiOutputEventKind::AcpThought { text } => Some(acp::SessionUpdate::AgentThoughtChunk(
             acp::ContentChunk::new(text.into()),
         )),
