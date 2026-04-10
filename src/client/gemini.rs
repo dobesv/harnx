@@ -90,7 +90,7 @@ fn prepare_embeddings(self_: &GeminiClient, data: &EmbeddingsData) -> Result<Req
         .iter()
         .map(|text| {
             json!({
-                "model": self_.model.real_name(),
+                "model": format!("models/{}", self_.model.real_name()),
                 "content": {
                     "parts": [
                         {
