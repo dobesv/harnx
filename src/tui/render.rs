@@ -1,5 +1,5 @@
 use super::*;
-use crate::tui::types::{App, TranscriptEntry, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES};
+use crate::tui::types::{App, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES};
 
 /// Estimate the number of terminal rows a set of lines will occupy
 /// after word-wrapping to the given width.
@@ -18,30 +18,12 @@ fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
 }
 
 impl Tui {
-    pub(super) fn render_entry(entry: &TranscriptEntry) -> Vec<Line<'static>> {
-        let (prefix, text, style) = match entry {
-            TranscriptEntry::System(text) => (
-                "",
-                text.clone(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            ),
-            TranscriptEntry::User(text) => (
-                "> ",
-                text.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            TranscriptEntry::Assistant(text) => ("", text.clone(), Style::default()),
-            TranscriptEntry::Error(text) => (
-                "error: ",
-                text.clone(),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-        };
-
+    fn render_text_entry(
+        prefix: &str,
+        text: &str,
+        style: Style,
+        add_trailing_spacing: bool,
+    ) -> Vec<Line<'static>> {
         let mut lines = vec![];
         for (index, line) in text.lines().enumerate() {
             if index == 0 {
@@ -56,15 +38,151 @@ impl Tui {
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(prefix.to_string(), style)));
         }
-        let add_trailing_spacing = match entry {
-            TranscriptEntry::System(_) => false,
-            TranscriptEntry::Assistant(text) => !text.contains('\n'),
-            _ => true,
-        };
         if add_trailing_spacing {
             lines.push(Line::from(""));
         }
         lines
+    }
+
+    pub(super) fn render_entry(entry: &TranscriptItem) -> Vec<Line<'static>> {
+        match entry {
+            TranscriptItem::SourceHeading(source) => Self::render_text_entry(
+                "",
+                &crate::tui::render_helpers::source_heading(source),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                false,
+            ),
+            TranscriptItem::SystemText(text) => Self::render_text_entry(
+                "",
+                text,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                false,
+            ),
+            TranscriptItem::UserText(text) => Self::render_text_entry(
+                "> ",
+                text,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                true,
+            ),
+            TranscriptItem::AssistantText(text) => {
+                Self::render_text_entry("", text, Style::default(), !text.contains('\n'))
+            }
+            TranscriptItem::ErrorText(text) => Self::render_text_entry(
+                "error: ",
+                text,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                true,
+            ),
+            TranscriptItem::ThoughtText(text) => Self::render_text_entry(
+                "",
+                &format!("<think>{text}</think>"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                false,
+            ),
+            TranscriptItem::ToolResultText(text) => Self::render_text_entry(
+                "   ",
+                text,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                false,
+            ),
+            TranscriptItem::StatusLine(text) => Self::render_text_entry(
+                "",
+                text,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                false,
+            ),
+            TranscriptItem::Plan(entries) => {
+                let mut lines = Self::render_text_entry(
+                    "",
+                    "Plan:",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                for entry in entries {
+                    lines.extend(Self::render_text_entry(
+                        "",
+                        &format!("  [{}] {}", entry.status, entry.content),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                        false,
+                    ));
+                }
+                lines
+            }
+            TranscriptItem::UsageLine(text) => Self::render_text_entry(
+                "",
+                text,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                false,
+            ),
+            TranscriptItem::ToolCall {
+                tool_name,
+                input_yaml,
+            } => {
+                let mut lines = Self::render_text_entry(
+                    "",
+                    &format!("->️ {tool_name}"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                if let Some(yaml) = input_yaml {
+                    for line in yaml.lines() {
+                        lines.extend(Self::render_text_entry(
+                            "   ",
+                            line,
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                            false,
+                        ));
+                    }
+                }
+                lines
+            }
+            TranscriptItem::AttachmentHeader(text) => Self::render_text_entry(
+                "",
+                &format!("{text}:"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                false,
+            ),
+            TranscriptItem::AttachmentItem(text) => Self::render_text_entry(
+                "  - ",
+                text,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                false,
+            ),
+            TranscriptItem::AttachmentPreviewLine(text) => Self::render_text_entry(
+                "      ",
+                text,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                false,
+            ),
+        }
     }
 
     pub(crate) fn draw(&mut self, frame: &mut Frame<'_>) {
@@ -240,7 +358,7 @@ impl Tui {
         while !remainder.is_empty() {
             if let Some(idx) = self.app.streaming_assistant_idx {
                 match self.app.transcript.get_mut(idx) {
-                    Some(TranscriptEntry::Assistant(existing)) => {
+                    Some(TranscriptItem::AssistantText(existing)) => {
                         if existing.is_empty() {
                             if let Some(split_at) = remainder.find('\n') {
                                 let (segment, rest) = remainder.split_at(split_at + 1);
@@ -279,7 +397,7 @@ impl Tui {
             } else {
                 self.app
                     .transcript
-                    .push(TranscriptEntry::Assistant(String::new()));
+                    .push(TranscriptItem::AssistantText(String::new()));
                 self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
             }
         }

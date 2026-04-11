@@ -1,5 +1,4 @@
-use crate::tui::types::TranscriptEntry;
-use crate::ui_output::{UiOutputEventKind, UiOutputPlanEntry, UiOutputSource};
+use crate::ui_output::{UiOutputEventKind, UiOutputSource};
 
 pub(crate) fn render_status_line(title: Option<&str>, status: Option<&str>) -> Option<String> {
     let line = [title, status]
@@ -17,20 +16,6 @@ pub(crate) fn source_heading(source: &UiOutputSource) -> String {
         }
         _ => format!("> {}", source.agent),
     }
-}
-
-pub(super) fn render_plan_entries(entries: &[UiOutputPlanEntry]) -> Vec<TranscriptEntry> {
-    if entries.is_empty() {
-        return vec![];
-    }
-
-    let mut rendered = vec![TranscriptEntry::System("Plan: ".trim_end().to_string())];
-    rendered.extend(
-        entries.iter().map(|entry| {
-            TranscriptEntry::System(format!("  [{}] {}", entry.status, entry.content))
-        }),
-    );
-    rendered
 }
 
 pub(crate) fn render_usage_line(
