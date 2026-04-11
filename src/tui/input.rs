@@ -1,8 +1,6 @@
 use super::*;
-use crate::tui::render_helpers::{
-    render_plan_entries, render_status_line, render_usage_line, source_heading,
-};
-use crate::tui::types::{TranscriptEntry, TuiEvent};
+use crate::tui::render_helpers::{render_status_line, render_usage_line};
+use crate::tui::types::{TranscriptItem, TuiEvent};
 use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
 use std::path::Path;
 
@@ -82,7 +80,7 @@ impl Tui {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 // Abort current operation; reset signal so next submit works (fix #3)
                 self.abort_signal.set_ctrlc();
-                self.app.transcript.push(TranscriptEntry::System(
+                self.app.transcript.push(TranscriptItem::SystemText(
                     "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
                 ));
                 self.app.llm_busy = false;
@@ -150,14 +148,14 @@ impl Tui {
                         // Dot-command: route through repl command handler
                         self.app
                             .transcript
-                            .push(TranscriptEntry::User(text.clone()));
+                            .push(TranscriptItem::UserText(text.clone()));
                         self.app.input = Self::new_input();
                         self.run_repl_command(&text).await?;
                         self.refresh_input_chrome();
                     } else {
                         self.app
                             .transcript
-                            .push(TranscriptEntry::User(text.clone()));
+                            .push(TranscriptItem::UserText(text.clone()));
                         self.app.input = Self::new_input();
                         let msg = crate::tui::types::PendingMessage {
                             text,
@@ -249,7 +247,7 @@ impl Tui {
                             unique_attachment_display_name(&self.app.attachments, &original_name);
                         let dest = unique_attachment_storage_path(&dir, &original_name);
                         if let Err(err) = tokio::fs::copy(&src, &dest).await {
-                            self.app.transcript.push(TranscriptEntry::Error(format!(
+                            self.app.transcript.push(TranscriptItem::ErrorText(format!(
                                 "Failed to copy attachment: {err}"
                             )));
                         } else {
@@ -260,13 +258,13 @@ impl Tui {
                         }
                     }
                     Err(err) => {
-                        self.app.transcript.push(TranscriptEntry::Error(format!(
+                        self.app.transcript.push(TranscriptItem::ErrorText(format!(
                             "Failed to create attachment directory: {err}"
                         )));
                     }
                 }
             } else {
-                self.app.transcript.push(TranscriptEntry::Error(format!(
+                self.app.transcript.push(TranscriptItem::ErrorText(format!(
                     "File not found: {path_str}"
                 )));
             }
@@ -285,7 +283,7 @@ impl Tui {
                 .filter(|a| a.display_name == name)
             {
                 if let Err(err) = std::fs::remove_file(&attachment.path) {
-                    self.app.transcript.push(TranscriptEntry::Error(format!(
+                    self.app.transcript.push(TranscriptItem::ErrorText(format!(
                         "Failed to remove detached attachment file {}: {err}",
                         attachment.display_name
                     )));
@@ -329,7 +327,7 @@ impl Tui {
                     self.app.attachments.push(attachment);
                 }
                 Err(err) => {
-                    self.app.transcript.push(TranscriptEntry::Error(format!(
+                    self.app.transcript.push(TranscriptItem::ErrorText(format!(
                         "Failed to save pasted text: {err}"
                     )));
                 }
@@ -419,7 +417,7 @@ impl Tui {
         self.app.input = Self::new_input();
         self.app
             .transcript
-            .push(TranscriptEntry::User(pending.text.clone()));
+            .push(TranscriptItem::UserText(pending.text.clone()));
         self.render_submitted_attachments(&pending.attachments);
         self.pin_transcript_to_bottom();
         if pending.text.trim_start().starts_with('.') {
@@ -439,22 +437,23 @@ impl Tui {
             return;
         }
 
-        self.app.transcript.push(TranscriptEntry::System(format!(
-            "Attachments ({}):",
-            attachments.len()
-        )));
+        self.app
+            .transcript
+            .push(TranscriptItem::AttachmentHeader(format!(
+                "Attachments ({})",
+                attachments.len()
+            )));
 
         for attachment in attachments {
-            self.app.transcript.push(TranscriptEntry::System(format!(
-                "  - {}",
-                attachment.display_name
-            )));
+            self.app.transcript.push(TranscriptItem::AttachmentItem(
+                attachment.display_name.clone(),
+            ));
 
             if let Some(preview) = render_attachment_preview(&attachment.path) {
                 for line in preview.lines() {
                     self.app
                         .transcript
-                        .push(TranscriptEntry::System(format!("      {line}")));
+                        .push(TranscriptItem::AttachmentPreviewLine(line.to_string()));
                 }
             }
         }
@@ -466,10 +465,9 @@ impl Tui {
         }
         let text = std::mem::take(&mut self.app.pending_thought_text);
         self.app.pending_thought_source = None;
-        self.app.transcript.push(TranscriptEntry::System(format!(
-            "<think>{}</think>",
-            text.trim()
-        )));
+        self.app
+            .transcript
+            .push(TranscriptItem::ThoughtText(text.trim().to_string()));
     }
 
     #[cfg(test)]
@@ -491,7 +489,7 @@ impl Tui {
                 if clean.is_empty() {
                     vec![]
                 } else {
-                    vec![TranscriptEntry::System(clean)]
+                    vec![TranscriptItem::SystemText(clean)]
                 }
             }
             UiOutputEventKind::ToolResultText { text } => {
@@ -501,7 +499,7 @@ impl Tui {
                 } else {
                     clean
                         .lines()
-                        .map(|line| TranscriptEntry::System(format!("   {line}")))
+                        .map(|line| TranscriptItem::ToolResultText(line.to_string()))
                         .collect()
                 }
             }
@@ -521,19 +519,25 @@ impl Tui {
                 if !output.is_empty() {
                     if let Some(idx) = self.app.streaming_assistant_idx {
                         match self.app.transcript.get_mut(idx) {
-                            Some(TranscriptEntry::Assistant(existing)) if !existing.is_empty() => {
+                            Some(TranscriptItem::AssistantText(existing))
+                                if !existing.is_empty() =>
+                            {
                                 if existing != &output {
                                     *existing = output;
                                 }
                             }
                             _ => {
-                                self.app.transcript.push(TranscriptEntry::Assistant(output));
+                                self.app
+                                    .transcript
+                                    .push(TranscriptItem::AssistantText(output));
                                 self.app.streaming_assistant_idx =
                                     Some(self.app.transcript.len() - 1);
                             }
                         }
                     } else {
-                        self.app.transcript.push(TranscriptEntry::Assistant(output));
+                        self.app
+                            .transcript
+                            .push(TranscriptItem::AssistantText(output));
                         self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
                     }
                     self.pin_transcript_to_bottom();
@@ -542,7 +546,7 @@ impl Tui {
                 if !usage.is_empty() {
                     self.app
                         .transcript
-                        .push(TranscriptEntry::System(format!("Usage: {usage}")));
+                        .push(TranscriptItem::SystemText(format!("Usage: {usage}")));
                     self.pin_transcript_to_bottom();
                 }
                 self.refresh_input_chrome();
@@ -551,7 +555,7 @@ impl Tui {
                     if let Err(err) = self.submit_pending_message(pending).await {
                         self.app
                             .transcript
-                            .push(TranscriptEntry::Error(err.to_string()));
+                            .push(TranscriptItem::ErrorText(err.to_string()));
                         self.pin_transcript_to_bottom();
                     }
                 }
@@ -562,7 +566,7 @@ impl Tui {
                 self.app.llm_busy = false;
                 self.app.streaming_assistant_idx = None;
                 self.app.last_ui_output_source = None;
-                self.app.transcript.push(TranscriptEntry::Error(err));
+                self.app.transcript.push(TranscriptItem::ErrorText(err));
                 self.pin_transcript_to_bottom();
                 self.refresh_input_chrome();
 
@@ -570,7 +574,7 @@ impl Tui {
                     if let Err(err) = self.submit_pending_message(pending).await {
                         self.app
                             .transcript
-                            .push(TranscriptEntry::Error(err.to_string()));
+                            .push(TranscriptItem::ErrorText(err.to_string()));
                         self.pin_transcript_to_bottom();
                     }
                 }
@@ -602,12 +606,12 @@ impl Tui {
 
             UiOutputEventKind::ToolCallUpdate { title, status, .. } => {
                 if let Some(text) = render_status_line(title.as_deref(), status.as_deref()) {
-                    vec![TranscriptEntry::System(text)]
+                    vec![TranscriptItem::StatusLine(text)]
                 } else {
                     vec![]
                 }
             }
-            UiOutputEventKind::Plan { entries } => render_plan_entries(&entries),
+            UiOutputEventKind::Plan { entries } => vec![TranscriptItem::Plan(entries)],
             UiOutputEventKind::Usage {
                 input_tokens,
                 output_tokens,
@@ -625,7 +629,7 @@ impl Tui {
                     if self.update_existing_usage_line(event.source.as_ref(), &line) {
                         vec![]
                     } else {
-                        vec![TranscriptEntry::System(line)]
+                        vec![TranscriptItem::UsageLine(line)]
                     }
                 } else {
                     vec![]
@@ -636,14 +640,10 @@ impl Tui {
                 input_yaml,
                 ..
             } => {
-                let mut entries = vec![TranscriptEntry::System(format!("->️ {tool_name}"))];
-                if let Some(yaml) = &input_yaml {
-                    entries.extend(
-                        yaml.lines()
-                            .map(|line| TranscriptEntry::System(format!("   {line}"))),
-                    );
-                }
-                entries
+                vec![TranscriptItem::ToolCall {
+                    tool_name,
+                    input_yaml,
+                }]
             }
         };
 
@@ -666,8 +666,9 @@ impl Tui {
         let source = source.cloned();
         if source != self.app.last_ui_output_source {
             if let Some(source) = &source {
-                let heading = source_heading(source);
-                self.app.transcript.push(TranscriptEntry::System(heading));
+                self.app
+                    .transcript
+                    .push(TranscriptItem::SourceHeading(source.clone()));
             }
             self.app.last_ui_output_source = source;
         }
@@ -693,7 +694,7 @@ impl Tui {
             return false;
         };
         match entry {
-            TranscriptEntry::System(existing) => {
+            TranscriptItem::UsageLine(existing) => {
                 *existing = line.to_string();
                 true
             }
@@ -1014,7 +1015,7 @@ impl Tui {
 
         let clean = strip_ansi(&captured).trim_end_matches('\n').to_string();
         if !clean.is_empty() {
-            self.app.transcript.push(TranscriptEntry::System(clean));
+            self.app.transcript.push(TranscriptItem::SystemText(clean));
             self.pin_transcript_to_bottom();
         }
 
@@ -1035,7 +1036,7 @@ impl Tui {
             Err(err) => {
                 self.app
                     .transcript
-                    .push(TranscriptEntry::Error(err.to_string()));
+                    .push(TranscriptItem::ErrorText(err.to_string()));
             }
         }
         Ok(())
