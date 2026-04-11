@@ -5,8 +5,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn acp_test_binary_path() -> PathBuf {
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_harnx-acp-test") {
-        return PathBuf::from(path);
+    let candidates = [
+        std::env::var("NEXTEST_BIN_EXE_harnx-acp-test").ok(),
+        std::env::var("CARGO_BIN_EXE_harnx-acp-test").ok(),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return path;
+        }
     }
 
     let current_exe = std::env::current_exe().expect("current test executable path");
@@ -16,7 +24,13 @@ fn acp_test_binary_path() -> PathBuf {
     let target_dir = deps_dir
         .parent()
         .expect("deps directory should have target profile parent");
-    target_dir.join(format!("harnx-acp-test{}", std::env::consts::EXE_SUFFIX))
+    let fallback = target_dir.join(format!("harnx-acp-test{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        fallback.is_file(),
+        "ACP test helper binary not found. Checked NEXTEST_BIN_EXE_harnx-acp-test, CARGO_BIN_EXE_harnx-acp-test, and fallback path {}",
+        fallback.display()
+    );
+    fallback
 }
 
 fn cancel_sentinel_path() -> PathBuf {
