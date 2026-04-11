@@ -124,6 +124,10 @@ path = "src/bin/harnx-mcp-fs/main.rs"
 name = "harnx-mcp-time"
 path = "src/bin/harnx-mcp-time/main.rs"
 
+[[bin]]
+name = "harnx-acp-test"
+path = "src/bin/harnx-acp-test/main.rs"
+
 [profile.release]
 lto = true
 strip = true

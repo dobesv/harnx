@@ -304,6 +304,9 @@ pub use config::AcpServerConfig;
 pub use server::HarnxAgent;
 
 #[cfg(test)]
+mod test_regression_issue_68;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
