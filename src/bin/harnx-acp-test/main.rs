@@ -159,8 +159,8 @@ fn handle_request(message: Value, state: Arc<SessionState>) {
 
             state.set_cancelled();
             record_cancel(&session_id);
-            println!("CANCELLED:{session_id}");
-            io::stdout().flush().ok();
+            eprintln!("CANCELLED:{session_id}");
+            io::stderr().flush().ok();
         }
         "session/cancel" => {
             let session_id = params
