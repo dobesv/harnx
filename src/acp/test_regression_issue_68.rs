@@ -1,95 +1,103 @@
 use super::*;
-use anyhow::{anyhow, Result};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use anyhow::Result;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{oneshot, Notify};
 
-fn acp_test_binary_path() -> PathBuf {
-    let candidates = [
-        std::env::var("NEXTEST_BIN_EXE_harnx-acp-test").ok(),
-        std::env::var("CARGO_BIN_EXE_harnx-acp-test").ok(),
-    ];
+struct FakePromptClient {
+    started: Arc<Notify>,
+    release_prompt: Arc<Notify>,
+    cancelled_sessions: Arc<Mutex<Vec<String>>>,
+}
 
-    for candidate in candidates.into_iter().flatten() {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return path;
+impl FakePromptClient {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(Notify::new()),
+            release_prompt: Arc::new(Notify::new()),
+            cancelled_sessions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    let current_exe = std::env::current_exe().expect("current test executable path");
-    let deps_dir = current_exe
-        .parent()
-        .expect("test executable should have parent directory");
-    let target_dir = deps_dir
-        .parent()
-        .expect("deps directory should have target profile parent");
-    let fallback = target_dir.join(format!("harnx-acp-test{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        fallback.is_file(),
-        "ACP test helper binary not found. Checked NEXTEST_BIN_EXE_harnx-acp-test, CARGO_BIN_EXE_harnx-acp-test, and fallback path {}",
-        fallback.display()
-    );
-    fallback
-}
+    async fn session_prompt(&self, _session_id: Option<&str>, _message: &str) -> Result<String> {
+        self.started.notify_waiters();
+        self.release_prompt.notified().await;
+        Ok("completed".to_string())
+    }
 
-fn cancel_sentinel_path() -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("harnx-issue-68-cancel-{unique}.txt"))
-}
+    async fn session_cancel(&self, session_id: &str) -> Result<()> {
+        self.cancelled_sessions
+            .lock()
+            .expect("cancelled sessions mutex should lock")
+            .push(session_id.to_string());
+        Ok(())
+    }
 
-async fn wait_for_sentinel(path: &Path) -> Result<String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(contents) = tokio::fs::read_to_string(path).await {
-            if !contents.trim().is_empty() {
-                return Ok(contents);
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(anyhow!("cancel sentinel was not created"));
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+    async fn wait_until_prompt_started(&self) {
+        self.started.notified().await;
+    }
+
+    fn cancelled_sessions(&self) -> Vec<String> {
+        self.cancelled_sessions
+            .lock()
+            .expect("cancelled sessions mutex should lock")
+            .clone()
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_call_tool_session_prompt_ctrl_c_cancels_session() {
-    let sentinel_path = cancel_sentinel_path();
-    let _ = std::fs::remove_file(&sentinel_path);
+    let client = Arc::new(FakePromptClient::new());
+    let prompt_client = Arc::clone(&client);
+    let cancel_client = Arc::clone(&client);
+    let session_id = "session-1".to_string();
 
-    let mut env = HashMap::new();
-    env.insert(
-        "ACP_CANCEL_SENTINEL".to_string(),
-        sentinel_path.display().to_string(),
-    );
-
-    let manager = AcpManager::new();
-    manager.initialize(vec![AcpServerConfig {
-        name: "issue68".to_string(),
-        command: acp_test_binary_path().display().to_string(),
-        args: vec![],
-        env,
-        enabled: true,
-        description: Some("mock ACP server for issue 68 regression".to_string()),
-        idle_timeout_secs: 10,
-        operation_timeout_secs: 10,
-    }]);
-
-    let client = manager
-        .get_client("issue68")
-        .expect("ACP test client should be initialized");
-    let session_id = client.session_new().await.expect("create ACP test session");
-
-    let session_id_for_call = session_id.clone();
-    let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+    let (abort_tx, abort_rx) = oneshot::channel::<()>();
     let call_task = tokio::spawn(async move {
-        session_prompt_with_abort(
-            &client,
-            session_id_for_call,
+        session_prompt_with_abort_for_test(
+            move |session_id, message| {
+                let client = Arc::clone(&prompt_client);
+                async move { client.session_prompt(session_id.as_deref(), &message).await }
+            },
+            move |session_id| {
+                let client = Arc::clone(&cancel_client);
+                async move { client.session_cancel(&session_id).await }
+            },
+            session_id,
+            "please hang".to_string(),
+            async move {
+                let _ = abort_rx.await;
+            },
+        )
+        .await
+    });
+
+    client.wait_until_prompt_started().await;
+    abort_tx.send(()).expect("trigger ACP abort");
+
+    let result = call_task.await.expect("call task should join cleanly");
+    let err = result.expect_err("abort should fail ACP session prompt");
+    assert!(err.to_string().contains("aborted by user"));
+    assert_eq!(client.cancelled_sessions(), vec!["session-1".to_string()]);
+    client.release_prompt.notify_waiters();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_call_tool_session_prompt_ctrl_c_cancel_timeout_is_best_effort() {
+    let session_id = "session-timeout".to_string();
+
+    let (abort_tx, abort_rx) = oneshot::channel::<()>();
+    let call_task = tokio::spawn(async move {
+        session_prompt_with_abort_for_test(
+            |_session_id, _message| async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok("completed".to_string())
+            },
+            |_session_id| async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(())
+            },
+            session_id,
             "please hang".to_string(),
             async move {
                 let _ = abort_rx.await;
@@ -99,13 +107,11 @@ async fn test_call_tool_session_prompt_ctrl_c_cancels_session() {
     });
 
     abort_tx.send(()).expect("trigger ACP abort");
-    let result = call_task.await.expect("call task should join cleanly");
-    result.expect_err("abort should fail ACP session prompt");
 
-    let cancelled_session_id = wait_for_sentinel(&sentinel_path)
+    let result = tokio::time::timeout(Duration::from_secs(6), call_task)
         .await
-        .expect("mock server should record ACP cancellation");
-    assert_eq!(cancelled_session_id.trim(), session_id);
-
-    let _ = std::fs::remove_file(&sentinel_path);
+        .expect("abort path should not block indefinitely")
+        .expect("call task should join cleanly");
+    let err = result.expect_err("abort should fail ACP session prompt");
+    assert!(err.to_string().contains("aborted by user"));
 }
