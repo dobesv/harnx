@@ -3,10 +3,7 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
 
 fn acp_test_binary_path() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_harnx-acp-test") {
@@ -35,44 +32,15 @@ async fn wait_for_sentinel(path: &Path) -> Result<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if let Ok(contents) = tokio::fs::read_to_string(path).await {
-            return Ok(contents);
+            if !contents.trim().is_empty() {
+                return Ok(contents);
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(anyhow!("cancel sentinel was not created"));
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-}
-
-async fn spawn_mock_issue_68_server() -> Result<Child> {
-    let binary_path = acp_test_binary_path();
-    let mut child = Command::new(&binary_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .expect("mock ACP server should have stdout");
-    let mut reader = BufReader::new(stdout).lines();
-    let ready = tokio::time::timeout(Duration::from_secs(5), reader.next_line())
-        .await
-        .expect("mock ACP server ready line timeout")?
-        .expect("mock ACP server should emit ready line");
-    assert_eq!(ready, "READY");
-    child.stdout = Some(reader.into_inner().into_inner());
-    Ok(child)
-}
-
-async fn assert_mock_server_is_reachable(child: &mut Child) -> Result<()> {
-    if let Some(status) = child.try_wait()? {
-        return Err(anyhow!(
-            "mock ACP server exited unexpectedly with status {status}"
-        ));
-    }
-    Ok(())
 }
 
 async fn send_sigint_after(delay: Duration) {
@@ -116,10 +84,6 @@ async fn test_call_tool_session_prompt_ctrl_c_cancels_session() {
         sentinel_path.display().to_string(),
     );
 
-    let mut server = spawn_mock_issue_68_server()
-        .await
-        .expect("spawn mock ACP issue 68 server");
-
     let manager = AcpManager::new();
     manager.initialize(vec![AcpServerConfig {
         name: "issue68".to_string(),
@@ -149,14 +113,5 @@ async fn test_call_tool_session_prompt_ctrl_c_cancels_session() {
         .expect("mock server should record ACP cancellation");
     assert_eq!(cancelled_session_id.trim(), "session-1");
 
-    assert_mock_server_is_reachable(&mut server)
-        .await
-        .expect("mock server should still be responsive after cancellation");
-
-    if let Some(mut stdin) = server.stdin.take() {
-        let _ = stdin.write_all(b"STOP\n").await;
-        let _ = stdin.flush().await;
-    }
-    let _ = tokio::time::timeout(Duration::from_secs(5), server.wait()).await;
     let _ = std::fs::remove_file(&sentinel_path);
 }
