@@ -114,24 +114,8 @@ impl AcpManager {
                     None => client.session_new().await?,
                 };
 
-                // session_id is now known (even if auto-created).
-                // Race the prompt against Ctrl+C so the user can abort; on
-                // cancellation we tell the ACP server to stop work.
-                let response = tokio::select! {
-                    result = client.session_prompt(Some(&session_id), &message) => result?,
-                    _ = tokio::signal::ctrl_c() => {
-                        // Best-effort cancel on the ACP server.
-                        if let Err(err) = client.session_cancel(&session_id).await {
-                            log::warn!("Failed to cancel ACP session on Ctrl+C: {err}");
-                        }
-                        return Err(anyhow!("ACP tool call aborted by user"));
-                    }
-                };
-
-                Ok(json!({
-                    "session_id": session_id,
-                    "response": response,
-                }))
+                session_prompt_with_abort(&client, session_id, message, tokio::signal::ctrl_c())
+                    .await
             }
             "session_load" => {
                 let session_id = required_string(&arguments, "session_id")?.to_owned();
@@ -270,6 +254,77 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
     ]
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn session_prompt_with_abort<Fut>(
+    client: &AcpClient,
+    session_id: String,
+    message: String,
+    abort: Fut,
+) -> Result<Value>
+where
+    Fut: std::future::Future,
+{
+    let client_for_prompt = client;
+    let client_for_cancel = client;
+    let response = session_prompt_with_abort_for_test(
+        move |session_id: Option<String>, message: String| async move {
+            client_for_prompt
+                .session_prompt(session_id.as_deref(), &message)
+                .await
+        },
+        move |session_id: String| async move { client_for_cancel.session_cancel(&session_id).await },
+        session_id.clone(),
+        message,
+        abort,
+    )
+    .await?;
+
+    Ok(json!({
+        "session_id": session_id,
+        "response": response,
+    }))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn session_prompt_with_abort_for_test<
+    PromptFn,
+    PromptFut,
+    CancelFn,
+    CancelFut,
+    AbortFut,
+>(
+    prompt: PromptFn,
+    cancel: CancelFn,
+    session_id: String,
+    message: String,
+    abort: AbortFut,
+) -> Result<String>
+where
+    PromptFn: FnOnce(Option<String>, String) -> PromptFut,
+    PromptFut: std::future::Future<Output = Result<String>>,
+    CancelFn: FnOnce(String) -> CancelFut,
+    CancelFut: std::future::Future<Output = Result<()>>,
+    AbortFut: std::future::Future,
+{
+    tokio::pin!(abort);
+
+    tokio::select! {
+        result = prompt(Some(session_id.clone()), message) => result,
+        _ = &mut abort => {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), cancel(session_id)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    log::warn!("Failed to cancel ACP session on abort: {err}");
+                }
+                Err(_) => {
+                    log::warn!("Timed out cancelling ACP session on abort");
+                }
+            }
+            Err(anyhow!("ACP tool call aborted by user"))
+        }
+    }
+}
+
 fn expect_object(arguments: Value) -> Result<serde_json::Map<String, Value>> {
     match arguments {
         Value::Object(arguments) => Ok(arguments),
@@ -302,6 +357,9 @@ pub use client::AcpClient;
 pub use config::AcpServerConfig;
 #[allow(unused_imports)]
 pub use server::HarnxAgent;
+
+#[cfg(test)]
+mod test_regression_issue_68;
 
 #[cfg(test)]
 mod tests {
