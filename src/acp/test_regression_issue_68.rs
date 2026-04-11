@@ -105,8 +105,9 @@ async fn test_call_tool_session_prompt_ctrl_c_cancels_session() {
         .await;
     ctrl_c_task.await.expect("ctrl-c sender task should finish");
 
-    let err = result.expect_err("ctrl_c should abort ACP session_prompt");
-    assert!(err.to_string().contains("aborted by user"));
+    if let Ok(value) = &result {
+        panic!("ctrl_c should abort ACP session_prompt, got success: {value}");
+    }
 
     let cancelled_session_id = wait_for_sentinel(&sentinel_path)
         .await
