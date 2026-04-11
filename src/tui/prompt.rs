@@ -256,7 +256,10 @@ impl Tui {
                     crate::client::SseEvent::Text(text) => {
                         let _ =
                             event_tx.send(TuiEvent::UiOutput(crate::ui_output::UiOutputEvent {
-                                kind: crate::ui_output::UiOutputEventKind::LlmText(text),
+                                kind: crate::ui_output::UiOutputEventKind::MessageChunk {
+                                    text,
+                                    raw: None,
+                                },
                                 source: None,
                             }));
                     }

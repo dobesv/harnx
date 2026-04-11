@@ -6,6 +6,7 @@ use crate::tui::render_helpers::event_fallback_text;
 use crate::tui::types::{TranscriptEntry, TuiEvent};
 use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
 use crate::utils::dimmed_text;
+use agent_client_protocol as acp;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,7 +207,10 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::LlmText("Hello\nworld".to_string()),
+        kind: UiOutputEventKind::MessageChunk {
+            text: "Hello\nworld".to_string(),
+            raw: None,
+        },
         source: None,
     }))
     .await
@@ -220,7 +224,10 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
     .await
     .unwrap();
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::LlmText("\nAgain".to_string()),
+        kind: UiOutputEventKind::MessageChunk {
+            text: "\nAgain".to_string(),
+            raw: None,
+        },
         source: None,
     }))
     .await
@@ -455,7 +462,10 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
     harness
         .tui()
         .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::LlmText("Top-level assistant opening response.".to_string()),
+            kind: UiOutputEventKind::MessageChunk {
+                text: "Top-level assistant opening response.".to_string(),
+                raw: None,
+            },
             source: None,
         }))
         .await
@@ -502,7 +512,10 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
     harness
         .tui()
         .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::LlmText("Top-level assistant closes response.".to_string()),
+            kind: UiOutputEventKind::MessageChunk {
+                text: "Top-level assistant closes response.".to_string(),
+                raw: None,
+            },
             source: None,
         }))
         .await
@@ -526,9 +539,10 @@ async fn structured_system_entries_do_not_insert_blank_lines_between_each_line()
     harness
         .tui()
         .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::StructuredBlock {
-                title: "argus_session_prompt".to_string(),
-                body: Some("message: hello\nsession_id: abc123".to_string()),
+            kind: UiOutputEventKind::ToolCall {
+                tool_name: "argus_session_prompt".to_string(),
+                input_yaml: Some("message: hello\nsession_id: abc123".to_string()),
+                raw: None,
             },
             source: Some(UiOutputSource {
                 agent: "argus".to_string(),
@@ -540,8 +554,11 @@ async fn structured_system_entries_do_not_insert_blank_lines_between_each_line()
     harness
         .tui()
         .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::AcpThought {
+            kind: UiOutputEventKind::ThoughtChunk {
                 text: "thinking hard\nstep two".to_string(),
+                raw: Some(Box::new(acp::ContentChunk::new(
+                    "thinking hard\nstep two".into(),
+                ))),
             },
             source: Some(UiOutputSource {
                 agent: "argus".to_string(),
@@ -565,8 +582,9 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
 
     for chunk in ["thinking ", "before ", "tool"] {
         tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::AcpThought {
+            kind: UiOutputEventKind::ThoughtChunk {
                 text: chunk.to_string(),
+                raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
             },
             source: None,
         }))
@@ -575,9 +593,10 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
     }
 
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::StructuredBlock {
-            title: "argus_session_prompt".to_string(),
-            body: Some("message: delegate".to_string()),
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: "argus_session_prompt".to_string(),
+            input_yaml: Some("message: delegate".to_string()),
+            raw: None,
         },
         source: None,
     }))
@@ -586,8 +605,9 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
 
     for chunk in ["thinking ", "after ", "tool"] {
         tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::AcpThought {
+            kind: UiOutputEventKind::ThoughtChunk {
                 text: chunk.to_string(),
+                raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
             },
             source: None,
         }))
@@ -615,7 +635,7 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         system_entries,
         vec![
             "<think>thinking before tool</think>",
-            "argus_session_prompt",
+            "->️ argus_session_prompt",
             "   message: delegate",
             "<think>thinking after tool</think>",
         ]
@@ -635,8 +655,9 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
 
     for chunk in ["thinking ", "before ", "tool"] {
         tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::AcpThought {
+            kind: UiOutputEventKind::ThoughtChunk {
                 text: chunk.to_string(),
+                raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
             },
             source: source.clone(),
         }))
@@ -645,9 +666,10 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
     }
 
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::StructuredBlock {
-            title: "argus_session_prompt".to_string(),
-            body: Some("message: delegate".to_string()),
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: "argus_session_prompt".to_string(),
+            input_yaml: Some("message: delegate".to_string()),
+            raw: None,
         },
         source: source.clone(),
     }))
@@ -656,8 +678,9 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
 
     for chunk in ["thinking ", "after ", "tool"] {
         tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::AcpThought {
+            kind: UiOutputEventKind::ThoughtChunk {
                 text: chunk.to_string(),
+                raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
             },
             source: source.clone(),
         }))
@@ -686,7 +709,7 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         vec![
             "> argus ▸ session-1",
             "<think>thinking before tool</think>",
-            "argus_session_prompt",
+            "->️ argus_session_prompt",
             "   message: delegate",
             "<think>thinking after tool</think>",
         ]
@@ -704,7 +727,10 @@ async fn llm_multiline_text_renders_without_extra_blank_lines() {
     harness
         .tui()
         .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::LlmText("line one\nline two\nline three".to_string()),
+            kind: UiOutputEventKind::MessageChunk {
+                text: "line one\nline two\nline three".to_string(),
+                raw: None,
+            },
             source: None,
         }))
         .await
@@ -731,8 +757,9 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
         harness
             .tui()
             .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-                kind: UiOutputEventKind::AcpThought {
+                kind: UiOutputEventKind::ThoughtChunk {
                     text: chunk.to_string(),
+                    raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
                 },
                 source: Some(UiOutputSource {
                     agent: "argus".to_string(),
@@ -745,9 +772,10 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
     harness
         .tui()
         .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::StructuredBlock {
-                title: "argus_session_prompt".to_string(),
-                body: Some("message: delegate".to_string()),
+            kind: UiOutputEventKind::ToolCall {
+                tool_name: "argus_session_prompt".to_string(),
+                input_yaml: Some("message: delegate".to_string()),
+                raw: None,
             },
             source: Some(UiOutputSource {
                 agent: "argus".to_string(),
@@ -760,8 +788,9 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
         harness
             .tui()
             .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-                kind: UiOutputEventKind::AcpThought {
+                kind: UiOutputEventKind::ThoughtChunk {
                     text: chunk.to_string(),
+                    raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
                 },
                 source: Some(UiOutputSource {
                     agent: "argus".to_string(),
@@ -785,9 +814,10 @@ async fn structured_ui_output_variants_render_in_transcript() {
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::StructuredBlock {
-            title: "argus_session_prompt".to_string(),
-            body: Some("message: hello\nsession_id: abc123".to_string()),
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: "argus_session_prompt".to_string(),
+            input_yaml: Some("message: hello\nsession_id: abc123".to_string()),
+            raw: None,
         },
         source: Some(UiOutputSource {
             agent: "argus".to_string(),
@@ -797,8 +827,9 @@ async fn structured_ui_output_variants_render_in_transcript() {
     .await
     .unwrap();
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::AcpThought {
+        kind: UiOutputEventKind::ThoughtChunk {
             text: "thinking hard".to_string(),
+            raw: Some(Box::new(acp::ContentChunk::new("thinking hard".into()))),
         },
         source: Some(UiOutputSource {
             agent: "argus".to_string(),
@@ -808,8 +839,10 @@ async fn structured_ui_output_variants_render_in_transcript() {
     .await
     .unwrap();
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::StatusLine {
-            text: "-> argus_session_prompt completed".to_string(),
+        kind: UiOutputEventKind::ToolCallUpdate {
+            title: Some("argus_session_prompt".to_string()),
+            status: Some("completed".to_string()),
+            raw: None,
         },
         source: Some(UiOutputSource {
             agent: "argus".to_string(),
@@ -853,9 +886,10 @@ async fn structured_ui_output_variants_render_in_transcript() {
     .await
     .unwrap();
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::McpToolInvocation {
+        kind: UiOutputEventKind::ToolCall {
             tool_name: "bash".to_string(),
             input_yaml: Some("command: ls".to_string()),
+            raw: None,
         },
         source: None,
     }))
@@ -881,7 +915,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         .collect();
 
     assert!(system_entries.contains(&"> argus ▸ session-1"));
-    assert!(system_entries.contains(&"argus_session_prompt"));
+    assert!(system_entries.contains(&"->️ argus_session_prompt"));
     assert!(system_entries.contains(&"   message: hello"));
     assert!(system_entries.contains(&"<think>thinking hard</think>"));
     assert!(system_entries.contains(&"-> argus_session_prompt completed"));
@@ -958,6 +992,51 @@ async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() 
             .filter(|line| **line == "> pytheas ▸ session-1   in 20   out 2")
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn acp_message_chunks_coalesce_like_direct_llm_streaming() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let source = UiOutputSource {
+        agent: "aristarchus".to_string(),
+        session_id: Some("session-1".to_string()),
+    };
+
+    for chunk in [
+        "Now I have ",
+        "enough ",
+        "information to ",
+        "complete my review.",
+    ] {
+        tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::MessageChunk {
+                text: chunk.to_string(),
+                raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
+            },
+            source: Some(source.clone()),
+        }))
+        .await
+        .unwrap();
+    }
+
+    let assistant_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptEntry::Assistant(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(assistant_entries.len(), 1);
+    assert_eq!(
+        assistant_entries[0],
+        "Now I have enough information to complete my review."
     );
 }
 

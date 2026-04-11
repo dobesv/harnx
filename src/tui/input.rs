@@ -1,6 +1,6 @@
 use super::*;
 use crate::tui::render_helpers::{
-    render_plan_entries, render_structured_block, render_usage_line, source_heading,
+    render_plan_entries, render_status_line, render_usage_line, source_heading,
 };
 use crate::tui::types::{TranscriptEntry, TuiEvent};
 use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
@@ -478,7 +478,7 @@ impl Tui {
     }
 
     async fn render_ui_output_event(&mut self, event: UiOutputEvent) {
-        let is_thought = matches!(&event.kind, UiOutputEventKind::AcpThought { .. });
+        let is_thought = matches!(&event.kind, UiOutputEventKind::ThoughtChunk { .. });
         let is_usage = matches!(&event.kind, UiOutputEventKind::Usage { .. });
         if !is_thought {
             self.flush_pending_thought();
@@ -505,12 +505,16 @@ impl Tui {
                         .collect()
                 }
             }
-            UiOutputEventKind::LlmText(text) => {
-                self.app.last_ui_output_source = None;
-                self.app.pending_thought_source = None;
-                self.append_streaming_assistant_chunk(&text);
-                self.pin_transcript_to_bottom();
-                vec![]
+            UiOutputEventKind::MessageChunk { text, .. } => {
+                if text.trim().is_empty() {
+                    vec![]
+                } else {
+                    self.app.last_ui_output_source = None;
+                    self.app.pending_thought_source = None;
+                    self.append_streaming_assistant_chunk(&text);
+                    self.pin_transcript_to_bottom();
+                    vec![]
+                }
             }
             UiOutputEventKind::LlmFinal { output, usage } => {
                 self.flush_pending_thought();
@@ -574,8 +578,18 @@ impl Tui {
                 }
                 vec![]
             }
-            UiOutputEventKind::AcpThought { text } => {
-                let clean = strip_ansi(&text);
+            UiOutputEventKind::ThoughtChunk { text, raw } => {
+                let text = crate::tui::render_helpers::event_fallback_text(
+                    &UiOutputEventKind::ThoughtChunk {
+                        text: text.clone(),
+                        raw: raw.clone(),
+                    },
+                    event.source.as_ref(),
+                );
+                let clean = strip_ansi(&text)
+                    .trim_start_matches("<think>")
+                    .trim_end_matches("</think>")
+                    .to_string();
                 if clean.trim().is_empty() {
                     vec![]
                 } else {
@@ -587,14 +601,12 @@ impl Tui {
                     vec![]
                 }
             }
-            UiOutputEventKind::StructuredBlock { title, body } => {
-                render_structured_block(&title, body.as_deref())
-            }
-            UiOutputEventKind::StatusLine { text } => {
-                if text.is_empty() {
-                    vec![]
-                } else {
+
+            UiOutputEventKind::ToolCallUpdate { title, status, .. } => {
+                if let Some(text) = render_status_line(title.as_deref(), status.as_deref()) {
                     vec![TranscriptEntry::System(text)]
+                } else {
+                    vec![]
                 }
             }
             UiOutputEventKind::Plan { entries } => render_plan_entries(&entries),
@@ -621,10 +633,20 @@ impl Tui {
                     vec![]
                 }
             }
-            UiOutputEventKind::McpToolInvocation {
+            UiOutputEventKind::ToolCall {
                 tool_name,
                 input_yaml,
-            } => render_structured_block(&format!("->️ {tool_name}"), input_yaml.as_deref()),
+                ..
+            } => {
+                let mut entries = vec![TranscriptEntry::System(format!("->️ {tool_name}"))];
+                if let Some(yaml) = &input_yaml {
+                    entries.extend(
+                        yaml.lines()
+                            .map(|line| TranscriptEntry::System(format!("   {line}"))),
+                    );
+                }
+                entries
+            }
         };
 
         if !rendered_entries.is_empty() {
