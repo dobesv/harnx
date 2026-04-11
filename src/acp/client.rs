@@ -960,84 +960,51 @@ fn agent_from_meta_value(value: &serde_json::Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn session_from_meta_value(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("session")
-        .and_then(serde_json::Value::as_str)
-        .filter(|session| !session.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 fn resolve_notification_source(
     fallback_agent: &str,
     notification: &acp::SessionNotification,
 ) -> UiOutputSource {
     let session_id = notification.session_id.0.to_string();
-    let (update_agent, update_session) = match &notification.update {
-        acp::SessionUpdate::AgentMessageChunk(chunk) => {
-            let meta = chunk.meta.as_ref().map(|meta| json!(meta));
-            (
-                meta.as_ref().and_then(agent_from_meta_value),
-                meta.as_ref().and_then(session_from_meta_value),
-            )
-        }
-        acp::SessionUpdate::AgentThoughtChunk(chunk) => {
-            let meta = chunk.meta.as_ref().map(|meta| json!(meta));
-            (
-                meta.as_ref().and_then(agent_from_meta_value),
-                meta.as_ref().and_then(session_from_meta_value),
-            )
-        }
-        acp::SessionUpdate::ToolCall(call) => {
-            let meta = call.meta.as_ref().map(|meta| json!(meta));
-            (
-                meta.as_ref().and_then(agent_from_meta_value),
-                meta.as_ref().and_then(session_from_meta_value),
-            )
-        }
-        acp::SessionUpdate::ToolCallUpdate(update) => {
-            let meta = update.meta.as_ref().map(|meta| json!(meta));
-            (
-                meta.as_ref().and_then(agent_from_meta_value),
-                meta.as_ref().and_then(session_from_meta_value),
-            )
-        }
-        acp::SessionUpdate::Plan(plan) => {
-            let meta = plan.meta.as_ref().map(|meta| json!(meta));
-            (
-                meta.as_ref().and_then(agent_from_meta_value),
-                meta.as_ref().and_then(session_from_meta_value),
-            )
-        }
-        acp::SessionUpdate::SessionInfoUpdate(info) => {
-            let direct_meta = info.meta.as_ref().map(|meta| json!(meta));
-            (
-                direct_meta
+    let update_agent = match &notification.update {
+        acp::SessionUpdate::AgentMessageChunk(chunk) => chunk
+            .meta
+            .as_ref()
+            .and_then(|meta| agent_from_meta_value(&json!(meta))),
+        acp::SessionUpdate::AgentThoughtChunk(chunk) => chunk
+            .meta
+            .as_ref()
+            .and_then(|meta| agent_from_meta_value(&json!(meta))),
+        acp::SessionUpdate::ToolCall(call) => call
+            .meta
+            .as_ref()
+            .and_then(|meta| agent_from_meta_value(&json!(meta))),
+        acp::SessionUpdate::ToolCallUpdate(update) => update
+            .meta
+            .as_ref()
+            .and_then(|meta| agent_from_meta_value(&json!(meta))),
+        acp::SessionUpdate::Plan(plan) => plan
+            .meta
+            .as_ref()
+            .and_then(|meta| agent_from_meta_value(&json!(meta))),
+        acp::SessionUpdate::SessionInfoUpdate(info) => info
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("agent"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|agent| !agent.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                info.meta
                     .as_ref()
+                    .and_then(|meta| meta.get("harnx:usage"))
                     .and_then(agent_from_meta_value)
-                    .or_else(|| {
-                        info.meta
-                            .as_ref()
-                            .and_then(|meta| meta.get("harnx:usage"))
-                            .and_then(agent_from_meta_value)
-                    }),
-                direct_meta
-                    .as_ref()
-                    .and_then(session_from_meta_value)
-                    .or_else(|| {
-                        info.meta
-                            .as_ref()
-                            .and_then(|meta| meta.get("harnx:usage"))
-                            .and_then(session_from_meta_value)
-                    }),
-            )
-        }
-        _ => (None, None),
+            }),
+        _ => None,
     };
 
     UiOutputSource {
         agent: update_agent.unwrap_or_else(|| fallback_agent.to_string()),
-        session_id: Some(update_session.unwrap_or(session_id)),
+        session_id: Some(session_id),
     }
 }
 
@@ -1130,23 +1097,6 @@ mod tests {
         let source = resolve_notification_source("argus", &notification);
         assert_eq!(source.agent, "argus");
         assert_eq!(source.session_id.as_deref(), Some("outer-session"));
-    }
-
-    #[test]
-    fn resolve_notification_source_uses_nested_session_when_present() {
-        let notification = acp::SessionNotification::new(
-            acp::SessionId::new("outer-session"),
-            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("hello".into()).meta(
-                serde_json::Map::from_iter([
-                    ("agent".to_string(), json!("aristarchus")),
-                    ("session".to_string(), json!("nested-session")),
-                ]),
-            )),
-        );
-
-        let source = resolve_notification_source("argus", &notification);
-        assert_eq!(source.agent, "aristarchus");
-        assert_eq!(source.session_id.as_deref(), Some("nested-session"));
     }
 
     #[test]

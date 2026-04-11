@@ -3,7 +3,7 @@ use crate::client::{Client, ClientConfig, TestStateGuard};
 use crate::config::Config;
 use crate::test_utils::{MockClient, MockTurnBuilder, TuiTestHarness};
 use crate::tui::render_helpers::event_fallback_text;
-use crate::tui::types::{TranscriptItem, TuiEvent};
+use crate::tui::types::{TranscriptEntry, TuiEvent};
 use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
 use crate::utils::dimmed_text;
 use agent_client_protocol as acp;
@@ -127,7 +127,7 @@ async fn shift_enter_inserts_newline_without_submitting() {
         .app
         .transcript
         .iter()
-        .all(|entry| !matches!(entry, TranscriptItem::UserText(_))));
+        .all(|entry| !matches!(entry, TranscriptEntry::User(_))));
 }
 
 #[tokio::test]
@@ -154,7 +154,7 @@ async fn pending_message_is_auto_sent_after_finish() {
         .app
         .transcript
         .iter()
-        .any(|entry| matches!(entry, TranscriptItem::UserText(text) if text == "follow up"));
+        .any(|entry| matches!(entry, TranscriptEntry::User(text) if text == "follow up"));
     assert!(has_user_entry);
 }
 
@@ -238,7 +238,7 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
         .transcript
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptItem::AssistantText(text) => Some(text.as_str()),
+            TranscriptEntry::Assistant(text) => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -247,7 +247,7 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
         .app
         .transcript
         .iter()
-        .any(|entry| matches!(entry, TranscriptItem::SystemText(text) if text == "tool output")));
+        .any(|entry| matches!(entry, TranscriptEntry::System(text) if text == "tool output")));
 }
 
 #[tokio::test]
@@ -293,22 +293,17 @@ async fn ui_output_inserts_heading_when_source_changes() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
-        .filter_map(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            (!text.is_empty()).then_some(text)
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text) => Some(text.as_str()),
+            _ => None,
         })
         .collect();
 
-    assert!(system_entries.contains(&"> argus ▸ session-1".to_string()));
-    assert!(system_entries.contains(&"first chunk".to_string()));
-    assert!(system_entries.contains(&"second chunk".to_string()));
-    assert!(system_entries.contains(&"> hephaestus ▸ session-2".to_string()));
-    assert!(system_entries.contains(&"other chunk".to_string()));
+    assert!(system_entries.contains(&"> argus ▸ session-1"));
+    assert!(system_entries.contains(&"first chunk"));
+    assert!(system_entries.contains(&"second chunk"));
+    assert!(system_entries.contains(&"> hephaestus ▸ session-2"));
+    assert!(system_entries.contains(&"other chunk"));
 
     let argus_heading_count = system_entries
         .iter()
@@ -372,7 +367,7 @@ async fn info_commands_render_into_tui_transcript() {
         .app
         .transcript
         .iter()
-        .any(|entry| matches!(entry, TranscriptItem::SystemText(text) if !text.is_empty()));
+        .any(|entry| matches!(entry, TranscriptEntry::System(text) if !text.is_empty()));
     assert!(has_session_output);
 }
 
@@ -392,7 +387,7 @@ async fn info_session_does_not_print_raw_output_in_tui_mode() {
         .transcript
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptItem::SystemText(text) => Some(text.as_str()),
+            TranscriptEntry::System(text) => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -626,18 +621,13 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
-        .filter_map(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            if text.is_empty() || text.starts_with("Welcome to harnx") || text.starts_with('•') {
-                None
-            } else {
-                Some(text)
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text)
+                if !text.starts_with("Welcome to harnx") && !text.starts_with('•') =>
+            {
+                Some(text.as_str())
             }
+            _ => None,
         })
         .collect();
 
@@ -704,18 +694,13 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
-        .filter_map(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            if text.is_empty() || text.starts_with("Welcome to harnx") || text.starts_with('•') {
-                None
-            } else {
-                Some(text)
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text)
+                if !text.starts_with("Welcome to harnx") && !text.starts_with('•') =>
+            {
+                Some(text.as_str())
             }
+            _ => None,
         })
         .collect();
 
@@ -923,29 +908,24 @@ async fn structured_ui_output_variants_render_in_transcript() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
-        .filter_map(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            (!text.is_empty()).then_some(text)
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text) => Some(text.as_str()),
+            _ => None,
         })
         .collect();
 
-    assert!(system_entries.contains(&"> argus ▸ session-1".to_string()));
-    assert!(system_entries.contains(&"->️ argus_session_prompt".to_string()));
-    assert!(system_entries.contains(&"   message: hello".to_string()));
-    assert!(system_entries.contains(&"<think>thinking hard</think>".to_string()));
-    assert!(system_entries.contains(&"-> argus_session_prompt completed".to_string()));
-    assert!(system_entries.contains(&"Plan:".to_string()));
-    assert!(system_entries.contains(&"  [in_progress] Refactor ACP formatting".to_string()));
-    assert!(system_entries.contains(&"> argus ▸ session-1   in 12   out 34   cache 5".to_string()));
-    assert!(system_entries.contains(&"->️ bash".to_string()));
-    assert!(system_entries.contains(&"   command: ls".to_string()));
-    assert!(system_entries.contains(&"   line one".to_string()));
-    assert!(system_entries.contains(&"   line two".to_string()));
+    assert!(system_entries.contains(&"> argus ▸ session-1"));
+    assert!(system_entries.contains(&"->️ argus_session_prompt"));
+    assert!(system_entries.contains(&"   message: hello"));
+    assert!(system_entries.contains(&"<think>thinking hard</think>"));
+    assert!(system_entries.contains(&"-> argus_session_prompt completed"));
+    assert!(system_entries.contains(&"Plan:"));
+    assert!(system_entries.contains(&"  [in_progress] Refactor ACP formatting"));
+    assert!(system_entries.contains(&"> argus ▸ session-1   in 12   out 34   cache 5"));
+    assert!(system_entries.contains(&"->️ bash"));
+    assert!(system_entries.contains(&"   command: ls"));
+    assert!(system_entries.contains(&"   line one"));
+    assert!(system_entries.contains(&"   line two"));
 }
 
 #[tokio::test]
@@ -986,14 +966,9 @@ async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() 
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
-        .filter_map(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            (!text.is_empty()).then_some(text)
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text) => Some(text.as_str()),
+            _ => None,
         })
         .collect();
 
@@ -1053,7 +1028,7 @@ async fn acp_message_chunks_coalesce_like_direct_llm_streaming() {
         .transcript
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptItem::AssistantText(text) => Some(text.as_str()),
+            TranscriptEntry::Assistant(text) => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -1093,25 +1068,20 @@ async fn submitting_message_with_attachments_renders_attachment_list_and_preview
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
-        .filter_map(|line| {
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            (!text.is_empty()).then_some(text)
+        .filter_map(|entry| match entry {
+            TranscriptEntry::System(text) => Some(text.as_str()),
+            _ => None,
         })
         .collect();
 
     assert!(matches!(
-        tui.app.transcript.iter().find(|entry| matches!(entry, TranscriptItem::UserText(_))),
-        Some(TranscriptItem::UserText(text)) if text == "hello with files"
+        tui.app.transcript.iter().find(|entry| matches!(entry, TranscriptEntry::User(_))),
+        Some(TranscriptEntry::User(text)) if text == "hello with files"
     ));
-    assert!(system_entries.contains(&"Attachments (1):".to_string()));
-    assert!(system_entries.contains(&"  - notes.txt".to_string()));
-    assert!(system_entries.contains(&"      first line".to_string()));
-    assert!(system_entries.contains(&"      second line".to_string()));
+    assert!(system_entries.contains(&"Attachments (1):"));
+    assert!(system_entries.contains(&"  - notes.txt"));
+    assert!(system_entries.contains(&"      first line"));
+    assert!(system_entries.contains(&"      second line"));
 }
 
 #[test]
@@ -1163,7 +1133,7 @@ async fn representative_repl_commands_render_into_tui_transcript() {
             .transcript
             .iter()
             .filter_map(|entry| match entry {
-                TranscriptItem::SystemText(text) => Some(text.as_str()),
+                TranscriptEntry::System(text) => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1209,7 +1179,7 @@ async fn test_basic_message_and_streaming_response() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::UserText("Test message".to_string()));
+        .push(TranscriptEntry::User("Test message".to_string()));
     harness
         .tui()
         .start_prompt(crate::tui::types::PendingMessage {
@@ -1256,7 +1226,7 @@ async fn test_basic_message_and_streaming_response() {
         .transcript
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptItem::AssistantText(text) => Some(text.clone()),
+            TranscriptEntry::Assistant(text) => Some(text.clone()),
             _ => None,
         })
         .collect();
@@ -1266,7 +1236,7 @@ async fn test_basic_message_and_streaming_response() {
         .app
         .transcript
         .iter()
-        .any(|entry| matches!(entry, TranscriptItem::UserText(text) if text == "Test message")));
+        .any(|entry| matches!(entry, TranscriptEntry::User(text) if text == "Test message")));
 
     let rendered = normalize_screen(&harness.screen_contents());
     insta::assert_snapshot!("basic_message_and_streaming_response", rendered);
@@ -1306,7 +1276,7 @@ async fn test_streaming_with_tool_calls() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::UserText("What is the answer?".to_string()));
+        .push(TranscriptEntry::User("What is the answer?".to_string()));
     harness
         .tui()
         .start_prompt(crate::tui::types::PendingMessage {
@@ -1395,7 +1365,7 @@ async fn test_sub_agent_delegation_tool_appears() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::UserText("Help me".to_string()));
+        .push(TranscriptEntry::User("Help me".to_string()));
     harness
         .tui()
         .start_prompt(crate::tui::types::PendingMessage {
@@ -1502,7 +1472,7 @@ async fn test_screen_overflow_and_word_wrap() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::UserText(user_message.to_string()));
+        .push(TranscriptEntry::User(user_message.to_string()));
     harness
         .tui()
         .start_prompt(crate::tui::types::PendingMessage {
@@ -1656,7 +1626,7 @@ async fn test_ctrl_c_cancels_streaming() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::UserText("Long request".to_string()));
+        .push(TranscriptEntry::User("Long request".to_string()));
     harness
         .tui()
         .start_prompt(crate::tui::types::PendingMessage {
@@ -1692,13 +1662,9 @@ async fn test_ctrl_c_cancels_streaming() {
     harness.tui().abort_signal.set_ctrlc();
 
     // Manually trigger the Ctrl+C handling (same as handle_key for Ctrl+C)
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::SystemText(
-            "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
-        ));
+    harness.tui().app.transcript.push(TranscriptEntry::System(
+        "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
+    ));
     harness.tui().app.llm_busy = false;
     harness.tui().abort_signal.reset();
 
@@ -1739,7 +1705,7 @@ async fn test_streaming_error_shows_in_transcript() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::UserText("Error test".to_string()));
+        .push(TranscriptEntry::User("Error test".to_string()));
 
     // The error should propagate through start_prompt
     let result = harness
@@ -1765,7 +1731,7 @@ async fn test_streaming_error_shows_in_transcript() {
         .app
         .transcript
         .iter()
-        .any(|entry| matches!(entry, TranscriptItem::ErrorText(_)));
+        .any(|entry| matches!(entry, TranscriptEntry::Error(_)));
     assert!(has_error, "Transcript should contain an error entry");
 
     harness.drain_and_settle().await.unwrap();
@@ -1804,7 +1770,7 @@ async fn test_cancel_during_tool_execution() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::UserText("Search test".to_string()));
+        .push(TranscriptEntry::User("Search test".to_string()));
     harness
         .tui()
         .start_prompt(crate::tui::types::PendingMessage {
@@ -1839,13 +1805,9 @@ async fn test_cancel_during_tool_execution() {
     harness.tui().abort_signal.set_ctrlc();
 
     // Manually trigger the Ctrl+C handling (same as handle_key for Ctrl+C)
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::SystemText(
-            "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
-        ));
+    harness.tui().app.transcript.push(TranscriptEntry::System(
+        "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
+    ));
     harness.tui().app.llm_busy = false;
     harness.tui().abort_signal.reset();
 
@@ -1897,7 +1859,7 @@ async fn paste_multiline_creates_temp_attachment() {
         .app
         .transcript
         .iter()
-        .filter(|entry| matches!(entry, TranscriptItem::UserText(_)))
+        .filter(|entry| matches!(entry, TranscriptEntry::User(_)))
         .collect();
     assert!(
         user_entries.is_empty(),
@@ -2080,7 +2042,7 @@ async fn attach_command_adds_attachment() {
         .app
         .transcript
         .iter()
-        .filter(|e| matches!(e, TranscriptItem::UserText(_)))
+        .filter(|e| matches!(e, TranscriptEntry::User(_)))
         .collect();
     assert!(user_entries.is_empty());
 
@@ -2107,7 +2069,7 @@ async fn attach_command_preserves_draft_text() {
         .app
         .transcript
         .iter()
-        .filter(|e| matches!(e, TranscriptItem::UserText(_)))
+        .filter(|e| matches!(e, TranscriptEntry::User(_)))
         .collect();
     assert!(user_entries.is_empty());
 
@@ -2130,7 +2092,7 @@ async fn attach_nonexistent_file_shows_error() {
         .app
         .transcript
         .iter()
-        .any(|e| matches!(e, TranscriptItem::ErrorText(msg) if msg.contains("not found")));
+        .any(|e| matches!(e, TranscriptEntry::Error(msg) if msg.contains("not found")));
     assert!(has_error, "Should show error for nonexistent file");
 }
 
@@ -2356,7 +2318,7 @@ async fn test_recovery_after_cancellation() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::UserText("First request".to_string()));
+        .push(TranscriptEntry::User("First request".to_string()));
     harness
         .tui()
         .start_prompt(crate::tui::types::PendingMessage {
@@ -2385,13 +2347,9 @@ async fn test_recovery_after_cancellation() {
     harness.drain_and_settle().await.unwrap();
 
     // Simulate cancellation
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::SystemText(
-            "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
-        ));
+    harness.tui().app.transcript.push(TranscriptEntry::System(
+        "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
+    ));
     harness.tui().app.llm_busy = false;
     harness.tui().abort_signal.reset();
     harness.render();
@@ -2421,7 +2379,7 @@ async fn test_recovery_after_cancellation() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::UserText("Second request".to_string()));
+        .push(TranscriptEntry::User("Second request".to_string()));
     harness
         .tui()
         .start_prompt(crate::tui::types::PendingMessage {
