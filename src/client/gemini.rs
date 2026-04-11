@@ -1,12 +1,13 @@
 use super::vertexai::*;
 use super::*;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+const GEMINI_MAX_BATCH_SIZE: usize = 100;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GeminiConfig {
@@ -72,29 +73,49 @@ fn prepare_chat_completions(
 }
 
 fn prepare_embeddings(self_: &GeminiClient, data: &EmbeddingsData) -> Result<RequestData> {
+    if data.texts.len() > GEMINI_MAX_BATCH_SIZE {
+        bail!(
+            "Gemini embeddings support at most {GEMINI_MAX_BATCH_SIZE} texts per request, got {}",
+            data.texts.len()
+        );
+    }
+
     let api_key = self_.get_api_key()?;
     let api_base = self_
         .get_api_base()
         .unwrap_or_else(|_| API_BASE.to_string());
 
-    let url = format!(
-        "{}/models/{}:embedContent?key={}",
-        api_base.trim_end_matches('/'),
-        self_.model.real_name(),
-        api_key
-    );
+    let requests: Vec<Value> = data
+        .texts
+        .iter()
+        .map(|text| {
+            json!({
+                "model": format!("models/{}", self_.model.real_name()),
+                "content": {
+                    "parts": [
+                        {
+                            "text": text
+                        }
+                    ]
+                }
+            })
+        })
+        .collect();
 
     let body = json!({
-        "content": {
-            "parts": [
-                {
-                    "text": data.try_get_text()?
-                }
-            ]
-        },
+        "requests": requests,
     });
 
-    let request_data = RequestData::new(url, body);
+    let mut request_data = RequestData::new(
+        format!(
+            "{}/models/{}:batchEmbedContents",
+            api_base.trim_end_matches('/'),
+            self_.model.real_name(),
+        ),
+        body,
+    );
+    request_data.header("x-goog-api-key", api_key);
+    request_data.header("Content-Type", "application/json");
 
     Ok(request_data)
 }
