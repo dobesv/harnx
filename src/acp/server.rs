@@ -462,7 +462,12 @@ async fn nested_ui_event_to_session_update(
             }
             Some(acp::SessionUpdate::AgentThoughtChunk(chunk))
         }
-        UiOutputEventKind::ToolCallUpdate { title, status, raw } => {
+        UiOutputEventKind::ToolCallUpdate {
+            tool_call_id,
+            title,
+            status,
+            raw,
+        } => {
             let mut update = if let Some(update) = raw {
                 *update
             } else {
@@ -478,7 +483,8 @@ async fn nested_ui_event_to_session_update(
                     };
                     fields = fields.status(status);
                 }
-                acp::ToolCallUpdate::new("status", fields)
+                let stable_tool_call_id = tool_call_id.unwrap_or_else(|| "status".to_string());
+                acp::ToolCallUpdate::new(stable_tool_call_id, fields)
             };
             if let Some(meta) = source_meta.clone() {
                 update = update.meta(meta);

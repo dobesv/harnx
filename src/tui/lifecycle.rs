@@ -42,7 +42,7 @@ impl Tui {
             }
         });
 
-        // Build the initial transcript: welcome (if not in agent/RAG) + banner (if agent)
+        // Build the initial transcript: welcome + banner (if agent)
         let initial_transcript = Self::build_initial_transcript(config);
 
         Ok(Self {
@@ -87,7 +87,7 @@ impl Tui {
         let cfg = config.read();
         let state = cfg.state();
 
-        // Show welcome only when not already in an agent/RAG session (matches old REPL behaviour)
+        // Show the welcome banner on startup, even when an agent/session status line is also present.
         entries.push(TranscriptItem::SystemText(format!(
             "Welcome to {} {}  •  Type .help for commands, Tab to complete.",
             env!("CARGO_CRATE_NAME"),

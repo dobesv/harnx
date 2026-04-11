@@ -504,7 +504,7 @@ impl Tui {
                 }
             }
             UiOutputEventKind::MessageChunk { text, .. } => {
-                if text.trim().is_empty() {
+                if text.is_empty() {
                     vec![]
                 } else {
                     self.append_streaming_assistant_chunk(&text);

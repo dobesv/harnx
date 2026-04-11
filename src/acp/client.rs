@@ -267,6 +267,7 @@ impl acp::Client for AcpNotificationClient {
                 } else {
                     Some(UiOutputEvent {
                         kind: UiOutputEventKind::ToolCallUpdate {
+                            tool_call_id: Some(tcu.tool_call_id.to_string()),
                             title,
                             status,
                             raw: Some(Box::new(tcu)),
