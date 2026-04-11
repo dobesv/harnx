@@ -9,13 +9,14 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+static WAIT_BEFORE_PROMPT_MS: AtomicU64 = AtomicU64::new(0);
 
 fn cancel_sentinel_path() -> Option<PathBuf> {
     std::env::var("ACP_CANCEL_SENTINEL")
@@ -54,7 +55,7 @@ fn send_error(msg_id: u64, code: i64, message: &str) {
 }
 
 struct SessionState {
-    current_session_id: std::sync::Mutex<Option<String>>,
+    current_session_id: Mutex<Option<String>>,
     next_session: AtomicU64,
     cancel_flag: AtomicBool,
 }
@@ -62,7 +63,7 @@ struct SessionState {
 impl SessionState {
     fn new() -> Self {
         Self {
-            current_session_id: std::sync::Mutex::new(None),
+            current_session_id: Mutex::new(None),
             next_session: AtomicU64::new(1),
             cancel_flag: AtomicBool::new(false),
         }
@@ -90,6 +91,11 @@ impl SessionState {
 }
 
 fn prompt_worker(msg_id: u64, _session_id: String, state: Arc<SessionState>) {
+    let wait_before_prompt_ms = WAIT_BEFORE_PROMPT_MS.load(Ordering::SeqCst);
+    if wait_before_prompt_ms > 0 {
+        thread::sleep(Duration::from_millis(wait_before_prompt_ms));
+    }
+
     // Simulate a long-running prompt that checks for cancellation
     while RUNNING.load(Ordering::SeqCst) && !state.is_cancelled() {
         thread::sleep(Duration::from_millis(50));
@@ -178,6 +184,17 @@ fn handle_request(message: Value, state: Arc<SessionState>) {
 }
 
 fn main() {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--wait-before-prompt-ms" {
+            if let Some(value) = args.next() {
+                if let Ok(parsed) = value.parse::<u64>() {
+                    WAIT_BEFORE_PROMPT_MS.store(parsed, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
     // Ignore SIGINT so we can test cancellation properly
     #[cfg(unix)]
     {

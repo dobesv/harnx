@@ -88,7 +88,7 @@ async fn test_call_tool_session_prompt_ctrl_c_cancels_session() {
     manager.initialize(vec![AcpServerConfig {
         name: "issue68".to_string(),
         command: acp_test_binary_path().display().to_string(),
-        args: vec![],
+        args: vec!["--wait-before-prompt-ms".to_string(), "1000".to_string()],
         env,
         enabled: true,
         description: Some("mock ACP server for issue 68 regression".to_string()),
@@ -96,7 +96,7 @@ async fn test_call_tool_session_prompt_ctrl_c_cancels_session() {
         operation_timeout_secs: 10,
     }]);
 
-    let ctrl_c_task = tokio::spawn(send_sigint_after(Duration::from_millis(300)));
+    let ctrl_c_task = tokio::spawn(send_sigint_after(Duration::from_millis(100)));
     let result = manager
         .call_tool(
             "issue68_session_prompt",
