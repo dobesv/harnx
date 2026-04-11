@@ -17,7 +17,7 @@ _harnx() {
 
     case "${cmd}" in
         harnx)
-            opts="-m -r -s -a -e -c -f -S -h -V --model --prompt --role --session --empty-session --save-session --agent --agent-variable --rag --rebuild-rag --macro --serve --execute --code --file --no-stream --dry-run --info --sync-models --list-models --list-roles --list-sessions --list-agents --list-rags --list-macros --help --version"
+            opts="-m -s -a -f -S -t -h -V --model --prompt --session --empty-session --save-session --agent --agent-variable --rag --rebuild-rag --macro --serve --acp --file --no-stream --dry-run --info --sync-models --list-models --list-sessions --list-agents --list-rags --list-macros --mcp-root --tool --help --version"
             if [[ ${cur} == -* || ${cword} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -33,11 +33,6 @@ _harnx() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
-                -r|--role)
-                    COMPREPLY=($(compgen -W "$("$1" --list-roles)" -- "${cur}"))
-                    __ltrim_colon_completions "$cur"
-                    return 0
-                    ;;
                 -s|--session)
                     COMPREPLY=($(compgen -W "$("$1" --list-sessions)" -- "${cur}"))
                     __ltrim_colon_completions "$cur"
@@ -48,13 +43,22 @@ _harnx() {
                     __ltrim_colon_completions "$cur"
                     return 0
                     ;;
-                -R|--rag)
+                --rag)
                     COMPREPLY=($(compgen -W "$("$1" --list-rags)" -- "${cur}"))
                     __ltrim_colon_completions "$cur"
                     return 0
                     ;;
                 --macro)
                     COMPREPLY=($(compgen -W "$("$1" --list-macros)" -- "${cur}"))
+                    __ltrim_colon_completions "$cur"
+                    return 0
+                    ;;
+                --serve)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --acp)
+                    COMPREPLY=($(compgen -W "$("$1" --list-agents)" -- "${cur}"))
                     __ltrim_colon_completions "$cur"
                     return 0
                     ;;
@@ -71,6 +75,26 @@ _harnx() {
                     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
                         compopt -o filenames
                     fi
+                    return 0
+                    ;;
+                --mcp-root)
+                    local oldifs
+                    if [[ -v IFS ]]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -d "${cur}"))
+                    if [[ -v oldifs ]]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
+                    return 0
+                    ;;
+                -t|--tool)
+                    # Tools can be tool names or toolset names - no dynamic completion available
+                    COMPREPLY=()
                     return 0
                     ;;
                 *)

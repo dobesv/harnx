@@ -23,8 +23,6 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
             [CompletionResult]::new('-m', '-m', [CompletionResultType]::ParameterName, 'Select a LLM model')
             [CompletionResult]::new('--model', '--model', [CompletionResultType]::ParameterName, 'Select a LLM model')
             [CompletionResult]::new('--prompt', '--prompt', [CompletionResultType]::ParameterName, 'Use the system prompt')
-            [CompletionResult]::new('-r', '-r', [CompletionResultType]::ParameterName, 'Select a role')
-            [CompletionResult]::new('--role', '--role', [CompletionResultType]::ParameterName, 'Select a role')
             [CompletionResult]::new('-s', '-s', [CompletionResultType]::ParameterName, 'Start or join a session')
             [CompletionResult]::new('--session', '--session', [CompletionResultType]::ParameterName, 'Start or join a session')
             [CompletionResult]::new('--empty-session', '--empty-session', [CompletionResultType]::ParameterName, 'Ensure the session is empty')
@@ -36,10 +34,7 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
             [CompletionResult]::new('--rebuild-rag', '--rebuild-rag', [CompletionResultType]::ParameterName, 'Rebuild the RAG to sync document changes')
             [CompletionResult]::new('--macro', '--macro', [CompletionResultType]::ParameterName, 'Execute a macro')
             [CompletionResult]::new('--serve', '--serve', [CompletionResultType]::ParameterName, 'Serve the LLM API and WebAPP')
-            [CompletionResult]::new('-e', '-e', [CompletionResultType]::ParameterName, 'Execute commands in natural language')
-            [CompletionResult]::new('--execute', '--execute', [CompletionResultType]::ParameterName, 'Execute commands in natural language')
-            [CompletionResult]::new('-c', '-c', [CompletionResultType]::ParameterName, 'Output code only')
-            [CompletionResult]::new('--code', '--code', [CompletionResultType]::ParameterName, 'Output code only')
+            [CompletionResult]::new('--acp', '--acp', [CompletionResultType]::ParameterName, 'Serve as an ACP agent over stdio')
             [CompletionResult]::new('-f', '-f', [CompletionResultType]::ParameterName, 'Include files, directories, or URLs')
             [CompletionResult]::new('--file', '--file', [CompletionResultType]::ParameterName, 'Include files, directories, or URLs')
             [CompletionResult]::new('-S', '-S', [CompletionResultType]::ParameterName, 'Turn off stream mode')
@@ -48,11 +43,13 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
             [CompletionResult]::new('--info', '--info', [CompletionResultType]::ParameterName, 'Display information')
             [CompletionResult]::new('--sync-models', '--sync-models', [CompletionResultType]::ParameterName, 'Sync models updates')
             [CompletionResult]::new('--list-models', '--list-models', [CompletionResultType]::ParameterName, 'List all available chat models')
-            [CompletionResult]::new('--list-roles', '--list-roles', [CompletionResultType]::ParameterName, 'List all roles')
             [CompletionResult]::new('--list-sessions', '--list-sessions', [CompletionResultType]::ParameterName, 'List all sessions')
             [CompletionResult]::new('--list-agents', '--list-agents', [CompletionResultType]::ParameterName, 'List all agents')
             [CompletionResult]::new('--list-rags', '--list-rags', [CompletionResultType]::ParameterName, 'List all RAGs')
             [CompletionResult]::new('--list-macros', '--list-macros', [CompletionResultType]::ParameterName, 'List all macros')
+            [CompletionResult]::new('--mcp-root', '--mcp-root', [CompletionResultType]::ParameterName, 'Add MCP roots')
+            [CompletionResult]::new('-t', '-t', [CompletionResultType]::ParameterName, 'Enable tools or toolsets for this session')
+            [CompletionResult]::new('--tool', '--tool', [CompletionResultType]::ParameterName, 'Enable tools or toolsets for this session')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('-V', '-V', [CompletionResultType]::ParameterName, 'Print version')
@@ -71,11 +68,8 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
             $offset=1
         }
         $flag = $commandElements[$commandElements.Count-$offset].ToString()
-        dump-args $flag ($flag -eq "-R") > /tmp/file1
         if ($flag -ceq "-m" -or $flag -eq "--model") {
             $completions = Get-HarnxValues "--list-models"
-        } elseif ($flag -ceq "-r" -or $flag -eq "--role") {
-            $completions = Get-HarnxValues "--list-roles"
         } elseif ($flag -ceq "-s" -or $flag -eq "--session") {
             $completions = Get-HarnxValues "--list-sessions"
         } elseif ($flag -ceq "-a" -or $flag -eq "--agent") {
@@ -84,7 +78,13 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
             $completions = Get-HarnxValues "--list-rags"
         } elseif ($flag -eq "--macro") {
             $completions = Get-HarnxValues "--list-macros"
+        } elseif ($flag -eq "--acp") {
+            $completions = Get-HarnxValues "--list-agents"
         } elseif ($flag -ceq "-f" -or $flag -eq "--file") {
+            $completions = @()
+        } elseif ($flag -eq "--mcp-root") {
+            $completions = @()
+        } elseif ($flag -ceq "-t" -or $flag -eq "--tool") {
             $completions = @()
         }
     }
