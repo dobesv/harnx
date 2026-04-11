@@ -1,3 +1,4 @@
+use agent_client_protocol as acp;
 #[cfg(test)]
 use std::sync::Mutex;
 #[cfg(not(test))]
@@ -15,24 +16,31 @@ pub enum UiOutputEventKind {
     ToolResultText {
         text: String,
     },
-    LlmText(String),
+    MessageChunk {
+        text: String,
+        raw: Option<Box<acp::ContentChunk>>,
+    },
     LlmFinal {
         output: String,
         usage: crate::client::CompletionTokenUsage,
     },
     LlmError(String),
-    AcpThought {
+    ThoughtChunk {
         text: String,
+        raw: Option<Box<acp::ContentChunk>>,
     },
-    StatusLine {
-        text: String,
+    ToolCall {
+        tool_name: String,
+        input_yaml: Option<String>,
+        raw: Option<Box<acp::ToolCall>>,
+    },
+    ToolCallUpdate {
+        title: Option<String>,
+        status: Option<String>,
+        raw: Option<Box<acp::ToolCallUpdate>>,
     },
     TranscriptText {
         text: String,
-    },
-    StructuredBlock {
-        title: String,
-        body: Option<String>,
     },
     Plan {
         entries: Vec<UiOutputPlanEntry>,
@@ -42,10 +50,6 @@ pub enum UiOutputEventKind {
         output_tokens: u64,
         cached_tokens: u64,
         session_label: Option<String>,
-    },
-    McpToolInvocation {
-        tool_name: String,
-        input_yaml: Option<String>,
     },
 }
 

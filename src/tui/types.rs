@@ -51,7 +51,7 @@ pub(crate) struct PendingMessage {
 }
 
 pub(super) struct App {
-    pub(super) transcript: Vec<TranscriptEntry>,
+    pub(super) transcript: Vec<TranscriptItem>,
     pub(super) input: TextArea<'static>,
     pub(super) spinner_index: usize,
     pub(super) should_quit: bool,
@@ -100,21 +100,25 @@ pub(super) fn cleanup_attachment_dir(dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-#[derive(Clone)]
-#[cfg(test)]
-pub(crate) enum TranscriptEntry {
-    System(String),
-    User(String),
-    Assistant(String),
-    Error(String),
-}
-
-#[cfg(not(test))]
-pub(super) enum TranscriptEntry {
-    System(String),
-    User(String),
-    Assistant(String),
-    Error(String),
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TranscriptItem {
+    SourceHeading(UiOutputSource),
+    SystemText(String),
+    UserText(String),
+    AssistantText(String),
+    ErrorText(String),
+    ThoughtText(String),
+    ToolResultText(String),
+    StatusLine(String),
+    Plan(Vec<crate::ui_output::UiOutputPlanEntry>),
+    UsageLine(String),
+    ToolCall {
+        tool_name: String,
+        input_yaml: Option<String>,
+    },
+    AttachmentHeader(String),
+    AttachmentItem(String),
+    AttachmentPreviewLine(String),
 }
 
 #[cfg(test)]

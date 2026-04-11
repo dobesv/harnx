@@ -1,7 +1,7 @@
 use super::*;
 use crate::tui::event_source::{CrosstermEventSource, EventSource};
 use crate::tui::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
-use crate::tui::types::{App, TranscriptEntry, TuiEvent, SPINNER_FRAMES, TICK_RATE};
+use crate::tui::types::{App, TranscriptItem, TuiEvent, SPINNER_FRAMES, TICK_RATE};
 
 impl Tui {
     #[cfg(test)]
@@ -82,13 +82,13 @@ impl Tui {
         })
     }
 
-    fn build_initial_transcript(config: &GlobalConfig) -> Vec<TranscriptEntry> {
+    fn build_initial_transcript(config: &GlobalConfig) -> Vec<TranscriptItem> {
         let mut entries = vec![];
         let cfg = config.read();
         let state = cfg.state();
 
         // Show welcome only when not already in an agent/RAG session (matches old REPL behaviour)
-        entries.push(TranscriptEntry::System(format!(
+        entries.push(TranscriptItem::SystemText(format!(
             "Welcome to {} {}  •  Type .help for commands, Tab to complete.",
             env!("CARGO_CRATE_NAME"),
             env!("CARGO_PKG_VERSION")
@@ -98,7 +98,7 @@ impl Tui {
         if state.contains(crate::config::StateFlags::AGENT) {
             if let Ok(banner) = cfg.agent_banner() {
                 if !banner.trim().is_empty() {
-                    entries.push(TranscriptEntry::Assistant(banner));
+                    entries.push(TranscriptItem::AssistantText(banner));
                 }
             }
             if let Some(agent) = &cfg.agent {
@@ -110,7 +110,7 @@ impl Tui {
                         .map(|(i, s)| format!("  {}. {s}", i + 1))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    entries.push(TranscriptEntry::System(format!(
+                    entries.push(TranscriptItem::SystemText(format!(
                         "Conversation starters:\n{list}\n(type .starter <n> to use)"
                     )));
                 }
@@ -120,7 +120,7 @@ impl Tui {
         // Show status line if set (session / model info)
         let status = cfg.render_status_line(true);
         if !status.is_empty() {
-            entries.push(TranscriptEntry::System(status));
+            entries.push(TranscriptItem::SystemText(status));
         }
 
         entries
@@ -239,7 +239,7 @@ impl Tui {
                 .unwrap_or_else(|| "Continue working on pending tasks.".to_string())
         };
         let _ = max_resume; // used inside run_prompt_inner
-        self.app.transcript.push(TranscriptEntry::System(format!(
+        self.app.transcript.push(TranscriptItem::SystemText(format!(
             "↩ Async resume: {context}"
         )));
         self.pin_transcript_to_bottom();

@@ -427,20 +427,64 @@ fn content_block_to_text(content: &acp::ContentBlock) -> String {
 async fn nested_ui_event_to_session_update(
     event: crate::ui_output::UiOutputEvent,
 ) -> Option<acp::SessionUpdate> {
+    let source_meta: Option<serde_json::Map<String, serde_json::Value>> =
+        event.source.as_ref().map(|source| {
+            serde_json::Map::from_iter([
+                ("agent".to_string(), json!(source.agent)),
+                ("session".to_string(), json!(source.session_id)),
+            ])
+        });
+
     match event.kind {
-        UiOutputEventKind::LlmText(text) | UiOutputEventKind::TranscriptText { text } => Some(
-            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(text.into())),
-        ),
+        UiOutputEventKind::TranscriptText { text } => {
+            let mut chunk = acp::ContentChunk::new(text.into());
+            if let Some(meta) = source_meta.clone() {
+                chunk = chunk.meta(meta);
+            }
+            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
+        }
+        UiOutputEventKind::MessageChunk { text, raw } => {
+            let mut chunk = raw
+                .map(|chunk| *chunk)
+                .unwrap_or_else(|| acp::ContentChunk::new(text.into()));
+            if let Some(meta) = source_meta.clone() {
+                chunk = chunk.meta(meta);
+            }
+            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
+        }
         UiOutputEventKind::ToolResultText { .. } => None,
-        UiOutputEventKind::AcpThought { text } => Some(acp::SessionUpdate::AgentThoughtChunk(
-            acp::ContentChunk::new(text.into()),
-        )),
-        UiOutputEventKind::StructuredBlock { title, body } => Some(acp::SessionUpdate::ToolCall(
-            acp::ToolCall::new(title, body.unwrap_or_default()),
-        )),
-        UiOutputEventKind::StatusLine { text } => Some(acp::SessionUpdate::ToolCallUpdate(
-            acp::ToolCallUpdate::new("status", acp::ToolCallUpdateFields::new().title(text)),
-        )),
+        UiOutputEventKind::ThoughtChunk { text, raw } => {
+            let mut chunk = raw
+                .map(|chunk| *chunk)
+                .unwrap_or_else(|| acp::ContentChunk::new(text.into()));
+            if let Some(meta) = source_meta.clone() {
+                chunk = chunk.meta(meta);
+            }
+            Some(acp::SessionUpdate::AgentThoughtChunk(chunk))
+        }
+        UiOutputEventKind::ToolCallUpdate { title, status, raw } => {
+            let mut update = if let Some(update) = raw {
+                *update
+            } else {
+                let mut fields = acp::ToolCallUpdateFields::new();
+                if let Some(title) = title {
+                    fields = fields.title(title);
+                }
+                if let Some(status) = status {
+                    let status = match status.as_str() {
+                        "completed" => acp::ToolCallStatus::Completed,
+                        "in_progress" => acp::ToolCallStatus::InProgress,
+                        _ => acp::ToolCallStatus::Pending,
+                    };
+                    fields = fields.status(status);
+                }
+                acp::ToolCallUpdate::new("status", fields)
+            };
+            if let Some(meta) = source_meta.clone() {
+                update = update.meta(meta);
+            }
+            Some(acp::SessionUpdate::ToolCallUpdate(update))
+        }
         UiOutputEventKind::Plan { entries } => {
             let mapped_entries = entries
                 .into_iter()
@@ -453,21 +497,39 @@ async fn nested_ui_event_to_session_update(
                     acp::PlanEntry::new(entry.content, acp::PlanEntryPriority::Medium, status)
                 })
                 .collect();
-            Some(acp::SessionUpdate::Plan(acp::Plan::new(mapped_entries)))
+            let mut plan = acp::Plan::new(mapped_entries);
+            if let Some(meta) = source_meta.clone() {
+                plan = plan.meta(meta);
+            }
+            Some(acp::SessionUpdate::Plan(plan))
         }
-        UiOutputEventKind::McpToolInvocation {
+        UiOutputEventKind::ToolCall {
             tool_name,
             input_yaml,
-        } => Some(acp::SessionUpdate::ToolCall(acp::ToolCall::new(
-            tool_name,
-            input_yaml.unwrap_or_default(),
-        ))),
-        UiOutputEventKind::LlmFinal { output, .. } => Some(acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new(output.into()),
-        )),
-        UiOutputEventKind::LlmError(err) => Some(acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new(format!("[error] {err}").into()),
-        )),
+            raw,
+        } => {
+            let mut call = raw
+                .map(|call| *call)
+                .unwrap_or_else(|| acp::ToolCall::new(tool_name, input_yaml.unwrap_or_default()));
+            if let Some(meta) = source_meta.clone() {
+                call = call.meta(meta);
+            }
+            Some(acp::SessionUpdate::ToolCall(call))
+        }
+        UiOutputEventKind::LlmFinal { output, .. } => {
+            let mut chunk = acp::ContentChunk::new(output.into());
+            if let Some(meta) = source_meta.clone() {
+                chunk = chunk.meta(meta);
+            }
+            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
+        }
+        UiOutputEventKind::LlmError(err) => {
+            let mut chunk = acp::ContentChunk::new(format!("[error] {err}").into());
+            if let Some(meta) = source_meta.clone() {
+                chunk = chunk.meta(meta);
+            }
+            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
+        }
         UiOutputEventKind::Usage { .. } => None,
     }
 }
@@ -825,12 +887,17 @@ mod tests {
     #[test]
     fn nested_ui_event_maps_to_structured_session_updates() {
         run_local(async {
+            let nested_source = crate::ui_output::UiOutputSource {
+                agent: "argus".to_string(),
+                session_id: Some("nested-123".to_string()),
+            };
             let tool_update = nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
-                kind: UiOutputEventKind::McpToolInvocation {
+                kind: UiOutputEventKind::ToolCall {
                     tool_name: "argus_session_prompt".to_string(),
                     input_yaml: Some("message: hello".to_string()),
+                    raw: None,
                 },
-                source: None,
+                source: Some(nested_source.clone()),
             })
             .await
             .expect("tool update");
@@ -839,23 +906,29 @@ mod tests {
                 acp::SessionUpdate::ToolCall(call) => {
                     assert!(format!("{:?}", call).contains("argus_session_prompt"));
                     assert!(format!("{:?}", call).contains("message: hello"));
+                    assert!(format!("{:?}", call).contains("argus"));
+                    assert!(format!("{:?}", call).contains("nested-123"));
                 }
                 other => panic!("unexpected tool update: {other:?}"),
             }
 
             let thought_update =
                 nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
-                    kind: UiOutputEventKind::AcpThought {
+                    kind: UiOutputEventKind::ThoughtChunk {
                         text: "thinking".to_string(),
+                        raw: Some(Box::new(acp::ContentChunk::new("thinking".into()))),
                     },
-                    source: None,
+                    source: Some(nested_source.clone()),
                 })
                 .await
                 .expect("thought update");
-            assert!(matches!(
-                thought_update,
-                acp::SessionUpdate::AgentThoughtChunk(_)
-            ));
+            match thought_update {
+                acp::SessionUpdate::AgentThoughtChunk(chunk) => {
+                    assert!(format!("{:?}", chunk).contains("argus"));
+                    assert!(format!("{:?}", chunk).contains("nested-123"));
+                }
+                other => panic!("unexpected thought update: {other:?}"),
+            }
 
             let plan_update = nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
                 kind: UiOutputEventKind::Plan {
@@ -864,7 +937,7 @@ mod tests {
                         content: "delegate to argus".to_string(),
                     }],
                 },
-                source: None,
+                source: Some(nested_source),
             })
             .await
             .expect("plan update");

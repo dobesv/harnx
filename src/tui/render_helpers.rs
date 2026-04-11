@@ -1,5 +1,4 @@
-use crate::tui::types::TranscriptEntry;
-use crate::ui_output::{UiOutputEventKind, UiOutputPlanEntry, UiOutputSource};
+use crate::ui_output::{UiOutputEventKind, UiOutputSource};
 
 pub(crate) fn render_status_line(title: Option<&str>, status: Option<&str>) -> Option<String> {
     let line = [title, status]
@@ -17,31 +16,6 @@ pub(crate) fn source_heading(source: &UiOutputSource) -> String {
         }
         _ => format!("> {}", source.agent),
     }
-}
-
-pub(super) fn render_structured_block(title: &str, body: Option<&str>) -> Vec<TranscriptEntry> {
-    let mut entries = vec![TranscriptEntry::System(title.to_string())];
-    if let Some(body) = body {
-        entries.extend(
-            body.lines()
-                .map(|line| TranscriptEntry::System(format!("   {line}"))),
-        );
-    }
-    entries
-}
-
-pub(super) fn render_plan_entries(entries: &[UiOutputPlanEntry]) -> Vec<TranscriptEntry> {
-    if entries.is_empty() {
-        return vec![];
-    }
-
-    let mut rendered = vec![TranscriptEntry::System("Plan: ".trim_end().to_string())];
-    rendered.extend(
-        entries.iter().map(|entry| {
-            TranscriptEntry::System(format!("  [{}] {}", entry.status, entry.content))
-        }),
-    );
-    rendered
 }
 
 pub(crate) fn render_usage_line(
@@ -74,25 +48,18 @@ pub(crate) fn event_fallback_text(
     source: Option<&UiOutputSource>,
 ) -> String {
     match kind {
-        UiOutputEventKind::LlmText(text)
+        UiOutputEventKind::MessageChunk { text, .. }
         | UiOutputEventKind::TranscriptText { text }
         | UiOutputEventKind::ToolResultText { text } => text.clone(),
         UiOutputEventKind::LlmFinal { output, usage: _ } => output.clone(),
         UiOutputEventKind::LlmError(err) => err.clone(),
-        UiOutputEventKind::AcpThought { text } => format!("<think>{text}</think>"),
-        UiOutputEventKind::StructuredBlock { title, body } => {
-            let mut lines = vec![title.clone()];
-            if let Some(body) = body {
-                lines.extend(body.lines().map(|line| format!("   {line}")));
-            }
-            format!("\n{}\n", lines.join("\n"))
+        UiOutputEventKind::ThoughtChunk { text, .. } => {
+            format!("<think>{text}</think>")
         }
-        UiOutputEventKind::StatusLine { text } => {
-            if text.is_empty() {
-                String::new()
-            } else {
-                format!("\n{text}\n")
-            }
+        UiOutputEventKind::ToolCallUpdate { title, status, .. } => {
+            render_status_line(title.as_deref(), status.as_deref())
+                .map(|text| format!("\n{text}\n"))
+                .unwrap_or_default()
         }
         UiOutputEventKind::Plan { entries } => {
             if entries.is_empty() {
@@ -120,9 +87,10 @@ pub(crate) fn event_fallback_text(
         )
         .map(|line| format!("\n{line}\n"))
         .unwrap_or_default(),
-        UiOutputEventKind::McpToolInvocation {
+        UiOutputEventKind::ToolCall {
             tool_name,
             input_yaml,
+            ..
         } => {
             let mut lines = vec![format!("->️ {tool_name}")];
             if let Some(input_yaml) = input_yaml {

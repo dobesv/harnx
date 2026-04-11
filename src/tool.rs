@@ -354,12 +354,13 @@ impl ToolCall {
 
         // Emit tool call info to TUI or terminal
         let event = UiOutputEvent {
-            kind: UiOutputEventKind::McpToolInvocation {
+            kind: UiOutputEventKind::ToolCall {
                 tool_name: self.name.clone(),
                 input_yaml: match json_data {
                     Value::Null => None,
                     _ => Some(pretty_yaml_block(&json_data)),
                 },
+                raw: None,
             },
             source: None,
         };
@@ -568,12 +569,13 @@ mod tests {
     #[test]
     fn test_mcp_tool_invocation_terminal_fallback_multiline_yaml() {
         let rendered = event_fallback_text(
-            &UiOutputEventKind::McpToolInvocation {
+            &UiOutputEventKind::ToolCall {
                 tool_name: "argus_session_prompt".to_string(),
                 input_yaml: Some(pretty_yaml_block(&json!({
                     "message": "Goal — Improve display\nAcceptance criteria — Wrap nicely",
                     "session_id": "session-1"
                 }))),
+                raw: None,
             },
             None,
         );
@@ -801,9 +803,10 @@ mod tests {
         let forward = tokio::spawn(forward_acp_chunks(rx, None, "working".to_string(), false));
 
         tx.send(NestedAcpEvent::Ui(UiOutputEvent {
-            kind: UiOutputEventKind::McpToolInvocation {
+            kind: UiOutputEventKind::ToolCall {
                 tool_name: "argus_session_prompt".to_string(),
                 input_yaml: Some("message: hi".to_string()),
+                raw: None,
             },
             source: Some(crate::ui_output::UiOutputSource {
                 agent: "argus".to_string(),
@@ -817,9 +820,10 @@ mod tests {
 
         let event = ui_rx.recv().await.expect("forwarded UI event");
         match event.kind {
-            UiOutputEventKind::McpToolInvocation {
+            UiOutputEventKind::ToolCall {
                 tool_name,
                 input_yaml,
+                ..
             } => {
                 assert_eq!(tool_name, "argus_session_prompt");
                 assert_eq!(input_yaml.as_deref(), Some("message: hi"));
