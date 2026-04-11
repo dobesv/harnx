@@ -1,6 +1,5 @@
 use super::*;
 use anyhow::{anyhow, Result};
-use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,38 +42,8 @@ async fn wait_for_sentinel(path: &Path) -> Result<String> {
     }
 }
 
-async fn send_sigint_after(delay: Duration) {
-    tokio::time::sleep(delay).await;
-    unsafe {
-        libc::raise(libc::SIGINT);
-    }
-}
-
-struct SignalTrap {
-    previous: libc::sighandler_t,
-}
-
-impl SignalTrap {
-    fn install() -> Self {
-        extern "C" fn handler(_sig: libc::c_int) {}
-
-        let previous =
-            unsafe { libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t) };
-        Self { previous }
-    }
-}
-
-impl Drop for SignalTrap {
-    fn drop(&mut self) {
-        unsafe {
-            libc::signal(libc::SIGINT, self.previous);
-        }
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn test_call_tool_session_prompt_ctrl_c_cancels_session() {
-    let _signal_trap = SignalTrap::install();
     let sentinel_path = cancel_sentinel_path();
     let _ = std::fs::remove_file(&sentinel_path);
 
@@ -88,7 +57,7 @@ async fn test_call_tool_session_prompt_ctrl_c_cancels_session() {
     manager.initialize(vec![AcpServerConfig {
         name: "issue68".to_string(),
         command: acp_test_binary_path().display().to_string(),
-        args: vec!["--wait-before-prompt-ms".to_string(), "1000".to_string()],
+        args: vec![],
         env,
         enabled: true,
         description: Some("mock ACP server for issue 68 regression".to_string()),
@@ -96,23 +65,33 @@ async fn test_call_tool_session_prompt_ctrl_c_cancels_session() {
         operation_timeout_secs: 10,
     }]);
 
-    let ctrl_c_task = tokio::spawn(send_sigint_after(Duration::from_millis(100)));
-    let result = manager
-        .call_tool(
-            "issue68_session_prompt",
-            json!({ "message": "please hang" }),
-        )
-        .await;
-    ctrl_c_task.await.expect("ctrl-c sender task should finish");
+    let client = manager
+        .get_client("issue68")
+        .expect("ACP test client should be initialized");
+    let session_id = client.session_new().await.expect("create ACP test session");
 
-    if let Ok(value) = &result {
-        panic!("ctrl_c should abort ACP session_prompt, got success: {value}");
-    }
+    let session_id_for_call = session_id.clone();
+    let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+    let call_task = tokio::spawn(async move {
+        session_prompt_with_abort(
+            &client,
+            session_id_for_call,
+            "please hang".to_string(),
+            async move {
+                let _ = abort_rx.await;
+            },
+        )
+        .await
+    });
+
+    abort_tx.send(()).expect("trigger ACP abort");
+    let result = call_task.await.expect("call task should join cleanly");
+    result.expect_err("abort should fail ACP session prompt");
 
     let cancelled_session_id = wait_for_sentinel(&sentinel_path)
         .await
         .expect("mock server should record ACP cancellation");
-    assert_eq!(cancelled_session_id.trim(), "session-1");
+    assert_eq!(cancelled_session_id.trim(), session_id);
 
     let _ = std::fs::remove_file(&sentinel_path);
 }

@@ -114,24 +114,8 @@ impl AcpManager {
                     None => client.session_new().await?,
                 };
 
-                // session_id is now known (even if auto-created).
-                // Race the prompt against Ctrl+C so the user can abort; on
-                // cancellation we tell the ACP server to stop work.
-                let response = tokio::select! {
-                    result = client.session_prompt(Some(&session_id), &message) => result?,
-                    _ = tokio::signal::ctrl_c() => {
-                        // Best-effort cancel on the ACP server.
-                        if let Err(err) = client.session_cancel(&session_id).await {
-                            log::warn!("Failed to cancel ACP session on Ctrl+C: {err}");
-                        }
-                        return Err(anyhow!("ACP tool call aborted by user"));
-                    }
-                };
-
-                Ok(json!({
-                    "session_id": session_id,
-                    "response": response,
-                }))
+                session_prompt_with_abort(&client, session_id, message, tokio::signal::ctrl_c())
+                    .await
             }
             "session_load" => {
                 let session_id = required_string(&arguments, "session_id")?.to_owned();
@@ -268,6 +252,31 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
             mcp_tool_name: Some("session_cancel".to_string()),
         },
     ]
+}
+
+async fn session_prompt_with_abort<Fut>(
+    client: &AcpClient,
+    session_id: String,
+    message: String,
+    abort: Fut,
+) -> Result<Value>
+where
+    Fut: std::future::Future,
+{
+    let response = tokio::select! {
+        result = client.session_prompt(Some(&session_id), &message) => result?,
+        _ = abort => {
+            if let Err(err) = client.session_cancel(&session_id).await {
+                log::warn!("Failed to cancel ACP session on abort: {err}");
+            }
+            return Err(anyhow!("ACP tool call aborted by user"));
+        }
+    };
+
+    Ok(json!({
+        "session_id": session_id,
+        "response": response,
+    }))
 }
 
 fn expect_object(arguments: Value) -> Result<serde_json::Map<String, Value>> {
