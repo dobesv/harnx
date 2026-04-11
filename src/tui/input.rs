@@ -509,8 +509,6 @@ impl Tui {
                 if text.trim().is_empty() {
                     vec![]
                 } else {
-                    self.app.last_ui_output_source = None;
-                    self.app.pending_thought_source = None;
                     self.append_streaming_assistant_chunk(&text);
                     self.pin_transcript_to_bottom();
                     vec![]

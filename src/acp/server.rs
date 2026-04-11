@@ -436,9 +436,13 @@ async fn nested_ui_event_to_session_update(
         });
 
     match event.kind {
-        UiOutputEventKind::TranscriptText { text } => Some(acp::SessionUpdate::AgentMessageChunk(
-            acp::ContentChunk::new(text.into()),
-        )),
+        UiOutputEventKind::TranscriptText { text } => {
+            let mut chunk = acp::ContentChunk::new(text.into());
+            if let Some(meta) = source_meta.clone() {
+                chunk = chunk.meta(meta);
+            }
+            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
+        }
         UiOutputEventKind::MessageChunk { text, raw } => {
             let mut chunk = raw
                 .map(|chunk| *chunk)
