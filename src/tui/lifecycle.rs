@@ -164,7 +164,9 @@ impl Tui {
             let timeout = TICK_RATE.saturating_sub(last_tick.elapsed());
             if event_source.poll(timeout)? {
                 match event_source.read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    Event::Key(key)
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
                         self.handle_key(key).await?
                     }
                     Event::Mouse(mouse) => {
@@ -206,8 +208,7 @@ impl Tui {
                 if supports_keyboard_enhancement().unwrap_or(false) {
                     let _ = stdout.execute(PushKeyboardEnhancementFlags(
                         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                            | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
                     ));
                 }
                 let _ = stdout.execute(EnableMouseCapture);
