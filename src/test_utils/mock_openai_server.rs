@@ -159,13 +159,63 @@ fn run_accept_loop(listener: TcpListener, mut shutdown: TcpStream, state: Arc<Se
 }
 
 fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
-    let mut buffer = vec![0_u8; 65536];
-    let bytes_read = match stream.read(&mut buffer) {
-        Ok(n) if n > 0 => n,
-        _ => return,
+    // Read the request in a loop until we have the complete headers
+    let mut buffer = Vec::new();
+    let mut temp_buf = [0u8; 1024];
+    let headers_end_pos = loop {
+        match stream.read(&mut temp_buf) {
+            Ok(0) => return, // EOF
+            Ok(n) => {
+                buffer.extend_from_slice(&temp_buf[..n]);
+                // Check if we have the full headers (ending with \r\n\r\n)
+                if let Some(pos) = buffer
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                {
+                    break pos + 4;
+                }
+                // Prevent unbounded growth while waiting for headers
+                if buffer.len() > 1_048_576 {
+                    // 1MB limit for headers
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
     };
 
-    let request_str = String::from_utf8_lossy(&buffer[..bytes_read]);
+    // Parse headers to extract Content-Length
+    let headers_str = match String::from_utf8(buffer[..headers_end_pos].to_vec()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let mut content_length = 0usize;
+    for line in headers_str.lines() {
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            content_length = value.trim().parse().unwrap_or(0);
+            break;
+        }
+    }
+
+    // Read the body based on Content-Length
+    let body_bytes_read = buffer.len() - headers_end_pos;
+    if body_bytes_read < content_length {
+        let remaining = content_length - body_bytes_read;
+        let current_len = buffer.len();
+        buffer.resize(current_len + remaining, 0);
+        let mut total_read = 0;
+        while total_read < remaining {
+            match stream.read(&mut buffer[current_len + total_read..]) {
+                Ok(0) => return, // EOF before complete body
+                Ok(n) => total_read += n,
+                Err(_) => return,
+            }
+        }
+    }
+
+    // Now parse the complete request
+    let request_str = String::from_utf8_lossy(&buffer);
     let mut lines = request_str.lines();
     let request_line = match lines.next() {
         Some(line) => line,
@@ -178,14 +228,17 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
 
     let method = parts[0];
     let path = parts[1];
-    let body_start = request_str.find("\r\n\r\n").map(|i| i + 4);
-    let body = body_start.map(|start| &request_str[start..]).unwrap_or("");
+    let body = if content_length > 0 && headers_end_pos < buffer.len() {
+        String::from_utf8_lossy(&buffer[headers_end_pos..headers_end_pos + content_length])
+    } else {
+        "".into()
+    };
 
     match (method, path) {
         ("GET", "/v1/models") => write_json_response(&mut stream, &handle_list_models()),
         ("POST", "/v1/chat/completions") => {
             let body_json: Value =
-                serde_json::from_str(body).unwrap_or_else(|_| json!({"error": "Invalid JSON"}));
+                serde_json::from_str(&body).unwrap_or_else(|_| json!({"error": "Invalid JSON"}));
             state.log_request(body_json.clone());
             handle_chat_completions(body_json, &state, &mut stream);
         }

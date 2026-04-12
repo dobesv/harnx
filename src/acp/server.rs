@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::client::{Client, SseEvent, SseHandler};
 use crate::config::{GlobalConfig, Input};
 use crate::tool::{ToolCall, ToolResult};
-use crate::ui_output::{emit_ui_output_event, UiOutputEvent, UiOutputEventKind};
+use crate::ui_output::{emit_ui_output_event, UiOutputEvent, UiOutputEventKind, UiOutputSource};
 use crate::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
 
 use anyhow::bail;
@@ -340,6 +340,10 @@ impl acp::Agent for HarnxAgent {
                     })
                     .collect()
             } else {
+                let source = Some(UiOutputSource {
+                    agent: self.agent_name.clone(),
+                    session_id: Some(session_key.clone()),
+                });
                 let acp_manager = self.config.read().acp_manager.clone();
                 let result = if let Some(ref manager) = acp_manager {
                     let (mut chunk_rx, subscription_id) = manager.subscribe_chunks().await;
@@ -374,14 +378,14 @@ impl acp::Agent for HarnxAgent {
                     });
 
                     let result =
-                        eval_tool_calls_async(&self.config, tool_calls, &abort_signal).await;
+                        eval_tool_calls_async(&self.config, tool_calls, &abort_signal, source.clone()).await;
 
                     manager.unsubscribe_chunks(subscription_id).await;
                     let _ = forward_task.await;
 
                     result
                 } else {
-                    eval_tool_calls_async(&self.config, tool_calls, &abort_signal).await
+                    eval_tool_calls_async(&self.config, tool_calls, &abort_signal, source).await
                 };
 
                 match result {
@@ -544,6 +548,7 @@ async fn eval_tool_calls_async(
     config: &GlobalConfig,
     mut calls: Vec<ToolCall>,
     abort_signal: &AbortSignal,
+    source: Option<UiOutputSource>,
 ) -> anyhow::Result<Vec<ToolResult>> {
     let mut output = vec![];
     if calls.is_empty() {
@@ -559,7 +564,7 @@ async fn eval_tool_calls_async(
         if abort_signal.aborted() {
             bail!("Tool execution cancelled");
         }
-        let result = eval_mcp_async(config, &call, abort_signal).await;
+        let result = eval_mcp_async(config, &call, abort_signal, source.clone()).await;
         match result {
             Ok(mut value) => {
                 if value.is_null() {
@@ -584,6 +589,7 @@ async fn eval_mcp_async(
     config: &GlobalConfig,
     call: &ToolCall,
     abort_signal: &AbortSignal,
+    source: Option<UiOutputSource>,
 ) -> anyhow::Result<Value> {
     let json_data = if call.arguments.is_null() {
         Value::Null
@@ -626,7 +632,7 @@ async fn eval_mcp_async(
             input_yaml: None,
             raw: None,
         },
-        source: None,
+        source,
     });
 
     tokio::select! {

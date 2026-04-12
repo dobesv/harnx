@@ -69,28 +69,34 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
 
     // Step 2: Export PATH and cd to repo root for subsequent commands
     tmux.send_text(&format!(
-        "export PATH={} && cd {}",
+        "export PATH={} && cd {}; printf '__READY__\\n'",
         shell_escape(&path_env),
         shell_escape(repo_root.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| screen.contains("$"))?;
+    tmux.wait_for(Duration::from_secs(5), |screen| screen.contains("__READY__"))?;
 
     // Step 3: Run diagnostics - list agents
     tmux.send_text(&format!(
-        "{} --list-agents",
-        shell_escape(harnx_bin.to_string_lossy().as_ref())
+        "{}; printf '__READY__\\n'",
+        format!(
+            "{} --list-agents",
+            shell_escape(harnx_bin.to_string_lossy().as_ref())
+        )
     ))?;
     tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| screen.contains("$"))?;
+    tmux.wait_for(Duration::from_secs(5), |screen| screen.contains("__READY__"))?;
 
     // Step 4: Run diagnostics - list models
     tmux.send_text(&format!(
-        "{} --list-models",
-        shell_escape(harnx_bin.to_string_lossy().as_ref())
+        "{}; printf '__READY__\\n'",
+        format!(
+            "{} --list-models",
+            shell_escape(harnx_bin.to_string_lossy().as_ref())
+        )
     ))?;
     tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| screen.contains("$"))?;
+    tmux.wait_for(Duration::from_secs(5), |screen| screen.contains("__READY__"))?;
 
     // Step 5: Launch the test agent
     tmux.send_text(&format!(
@@ -210,12 +216,12 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     let config = format!(
         "save: false\nclients:\n  - type: openai-compatible\n    name: mock-llm\n    api_base: http://127.0.0.1:{}/v1\n    api_key: dummy\n    models:\n      - name: test\n        max_input_tokens: 32000\n        max_output_tokens: 4096\n        supports_tool_use: true\nmcp_servers:\n  - name: repro249\n    command: {}\n    enabled: true\n    rename_tools:\n      {}: {}\nacp_servers:\n  - name: {}\n    command: {}\n    args: [\"--acp\", {}]\n    enabled: true\n",
         paths.port,
-        shell_escape(fake_mcp_server.to_string_lossy().as_ref()),
+        yaml_escape(fake_mcp_server.to_string_lossy().as_ref()),
         REPRO_249_MCP_TOOL_NAME,
         REPRO_249_MCP_TOOL_NAME,
         TEST_SUB_AGENT_NAME,
-        shell_escape(harnx_bin.to_string_lossy().as_ref()),
-        shell_escape(TEST_SUB_AGENT_NAME),
+        yaml_escape(harnx_bin.to_string_lossy().as_ref()),
+        yaml_escape(TEST_SUB_AGENT_NAME),
     );
     std::fs::write(&paths.config_path, config)?;
     std::fs::write(
@@ -279,5 +285,16 @@ fn shell_escape(input: &str) -> String {
     if input.is_empty() {
         return "''".to_string();
     }
-    format!("'{}'", input.replace('"', "'\"'\"'"))
+    // Escape single quotes for shell by replacing ' with '"'"'
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn yaml_escape(input: &str) -> String {
+    // For YAML string values, wrap in double quotes and escape internal double quotes and backslashes
+    if input.is_empty() {
+        return "\"\"".to_string();
+    }
+    // Simple escaping: escape backslashes first, then double quotes
+    let escaped = input.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
 }
