@@ -113,7 +113,7 @@ The YAML front matter specifies the version bump: `patch`, `minor`, or `major`.
 - **Error handling:** Use `anyhow::Result` / `anyhow::bail!` throughout.
 - **Async:** All I/O is async via Tokio. Use `async fn` and `.await`.
 - **Client modules:** Each LLM provider lives in `src/client/` and follows the patterns in `src/client/common.rs` and `src/client/macros.rs`.
-- **Configuration:** YAML-based (`config.yaml`); agents are Markdown files with YAML front matter.
+- **Configuration:** YAML-based; `config.yaml` holds global settings. Clients, MCP servers, and ACP servers each live in their own subdirectory (`clients/`, `mcp_servers/`, `acp_servers/`) as individual `<name>.yaml` files. Agents are Markdown files with YAML front matter in `agents/`. All agents are auto-registered as ACP servers.
 - **Dual license:** MIT OR Apache-2.0. Preserve license headers where present.
 
 ## CI Details

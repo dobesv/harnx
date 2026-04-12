@@ -15,6 +15,7 @@ fn default_operation_timeout() -> u64 {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AcpServerConfig {
+    #[serde(default)]
     pub name: String,
     pub command: String,
     #[serde(default)]

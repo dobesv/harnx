@@ -250,17 +250,38 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
         .join("debug")
         .join(binary_name("harnx"));
 
-    let config = format!(
-        "save: false\nclients:\n  - type: openai-compatible\n    name: mock-llm\n    api_base: http://127.0.0.1:{}/v1\n    api_key: dummy\n    models:\n      - name: test\n        max_input_tokens: 32000\n        max_output_tokens: 4096\n        supports_tool_use: true\nmcp_servers:\n  - name: repro249\n    command: {}\n    enabled: true\n    rename_tools:\n      {}: {}\nacp_servers:\n  - name: {}\n    command: {}\n    args: [\"--acp\", {}]\n    enabled: true\n",
+    std::fs::write(&paths.config_path, "save: false\n")?;
+
+    let clients_dir = paths.harnx_config_dir.join("clients");
+    let mcp_servers_dir = paths.harnx_config_dir.join("mcp_servers");
+    let acp_servers_dir = paths.harnx_config_dir.join("acp_servers");
+    std::fs::create_dir_all(&clients_dir)?;
+    std::fs::create_dir_all(&mcp_servers_dir)?;
+    std::fs::create_dir_all(&acp_servers_dir)?;
+
+    let client_config = format!(
+        "type: openai-compatible\nname: mock-llm\napi_base: http://127.0.0.1:{}/v1\napi_key: dummy\nmodels:\n  - name: test\n    max_input_tokens: 32000\n    max_output_tokens: 4096\n    supports_tool_use: true\n",
         paths.port,
+    );
+    std::fs::write(clients_dir.join("mock-llm.yaml"), client_config)?;
+
+    let mcp_config = format!(
+        "command: {}\nenabled: true\nrename_tools:\n  {}: {}\n",
         yaml_escape(fake_mcp_server.to_string_lossy().as_ref()),
         REPRO_249_MCP_TOOL_NAME,
         REPRO_249_MCP_TOOL_NAME,
-        TEST_SUB_AGENT_NAME,
+    );
+    std::fs::write(mcp_servers_dir.join("repro249.yaml"), mcp_config)?;
+
+    let acp_config = format!(
+        "command: {}\nargs: [\"--acp\", {}]\nenabled: true\n",
         yaml_escape(harnx_bin.to_string_lossy().as_ref()),
         yaml_escape(TEST_SUB_AGENT_NAME),
     );
-    std::fs::write(&paths.config_path, config)?;
+    std::fs::write(
+        acp_servers_dir.join(format!("{}.yaml", TEST_SUB_AGENT_NAME)),
+        acp_config,
+    )?;
     std::fs::write(
         paths.agents_dir.join(format!("{}.md", TEST_AGENT_NAME)),
         format!(

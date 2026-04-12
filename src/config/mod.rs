@@ -56,8 +56,9 @@ const MESSAGES_FILE_NAME: &str = "messages.md";
 const SESSIONS_DIR_NAME: &str = "sessions";
 const RAGS_DIR_NAME: &str = "rags";
 const AGENTS_DIR_NAME: &str = "agents";
-
-const CLIENTS_FIELD: &str = "clients";
+const CLIENTS_DIR_NAME: &str = "clients";
+const MCP_SERVERS_DIR_NAME: &str = "mcp_servers";
+const ACP_SERVERS_DIR_NAME: &str = "acp_servers";
 
 const SERVE_ADDR: &str = "127.0.0.1:8000";
 
@@ -229,12 +230,13 @@ pub struct Config {
     pub save_shell_history: bool,
     pub sync_models_url: Option<String>,
 
+    #[serde(skip)]
     pub clients: Vec<ClientConfig>,
 
-    #[serde(default)]
+    #[serde(skip)]
     pub mcp_servers: Vec<McpServerConfig>,
 
-    #[serde(default)]
+    #[serde(skip)]
     pub acp_servers: Vec<AcpServerConfig>,
 
     #[serde(default)]
@@ -560,6 +562,18 @@ impl Config {
         }
     }
 
+    pub fn clients_dir() -> PathBuf {
+        Self::local_path(CLIENTS_DIR_NAME)
+    }
+
+    pub fn mcp_servers_dir() -> PathBuf {
+        Self::local_path(MCP_SERVERS_DIR_NAME)
+    }
+
+    pub fn acp_servers_dir() -> PathBuf {
+        Self::local_path(ACP_SERVERS_DIR_NAME)
+    }
+
     pub fn macro_file(name: &str) -> PathBuf {
         Self::macros_dir().join(format!("{name}.yaml"))
     }
@@ -697,9 +711,12 @@ impl Config {
             edit_file(&editor, &config_path)
         })?;
         println!(
-            "NOTE: Remember to restart {} if there are changes made to '{}",
+            "NOTE: Remember to restart {} if there are changes made.\nConfig files:\n  {}\n  {}/\n  {}/\n  {}/",
             env!("CARGO_CRATE_NAME"),
             config_path.display(),
+            Self::clients_dir().display(),
+            Self::mcp_servers_dir().display(),
+            Self::acp_servers_dir().display(),
         );
         Ok(())
     }
@@ -2562,26 +2579,119 @@ impl Config {
 
     fn load_from_file(config_path: &Path) -> Result<Self> {
         let err = || format!("Failed to load config at '{}'", config_path.display());
-        let content = read_to_string(config_path).with_context(err)?;
-        let config: Self = serde_yaml::from_str(&content)
-            .map_err(|err| {
-                let err_msg = err.to_string();
-                let err_msg = if err_msg.starts_with(&format!("{CLIENTS_FIELD}: ")) {
-                    // location is incorrect, get rid of it
-                    err_msg
-                        .split_once(" at line")
-                        .map(|(v, _)| {
-                            format!("{v} (Sorry for being unable to provide an exact location)")
-                        })
-                        .unwrap_or_else(|| "clients: invalid value".into())
-                } else {
-                    err_msg
-                };
-                anyhow!("{err_msg}")
-            })
-            .with_context(err)?;
-
+        let mut config: Self = if config_path.exists() {
+            let content = read_to_string(config_path).with_context(err)?;
+            serde_yaml::from_str(&content)
+                .map_err(|err| anyhow!(err.to_string()))
+                .with_context(err)?
+        } else {
+            Self::default()
+        };
+        let config_dir = config_path.parent().unwrap_or(config_path);
+        config.clients = Self::load_clients_from_dir(&config_dir.join(CLIENTS_DIR_NAME))?;
+        config.mcp_servers =
+            Self::load_mcp_servers_from_dir(&config_dir.join(MCP_SERVERS_DIR_NAME))?;
+        config.acp_servers =
+            Self::load_acp_servers_from_dir(&config_dir.join(ACP_SERVERS_DIR_NAME))?;
+        Self::auto_register_agents(&mut config.acp_servers)?;
         Ok(config)
+    }
+
+    fn load_clients_from_dir(dir: &Path) -> Result<Vec<ClientConfig>> {
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
+        let mut clients = Vec::new();
+        for path in Self::sorted_yaml_files(dir)? {
+            let content = read_to_string(&path)
+                .with_context(|| format!("Failed to read client config '{}'", path.display()))?;
+            let client: ClientConfig = serde_yaml::from_str(&content)
+                .with_context(|| format!("Failed to parse client config '{}'", path.display()))?;
+            clients.push(client);
+        }
+        Ok(clients)
+    }
+
+    fn load_mcp_servers_from_dir(dir: &Path) -> Result<Vec<McpServerConfig>> {
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
+        let mut servers = Vec::new();
+        for path in Self::sorted_yaml_files(dir)? {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let content = read_to_string(&path).with_context(|| {
+                format!("Failed to read MCP server config '{}'", path.display())
+            })?;
+            let mut server: McpServerConfig =
+                serde_yaml::from_str(&content).with_context(|| {
+                    format!("Failed to parse MCP server config '{}'", path.display())
+                })?;
+            server.name = stem;
+            servers.push(server);
+        }
+        Ok(servers)
+    }
+
+    fn load_acp_servers_from_dir(dir: &Path) -> Result<Vec<AcpServerConfig>> {
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
+        let mut servers = Vec::new();
+        for path in Self::sorted_yaml_files(dir)? {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let content = read_to_string(&path).with_context(|| {
+                format!("Failed to read ACP server config '{}'", path.display())
+            })?;
+            let mut server: AcpServerConfig =
+                serde_yaml::from_str(&content).with_context(|| {
+                    format!("Failed to parse ACP server config '{}'", path.display())
+                })?;
+            server.name = stem;
+            servers.push(server);
+        }
+        Ok(servers)
+    }
+
+    fn auto_register_agents(acp_servers: &mut Vec<AcpServerConfig>) -> Result<()> {
+        let existing_names: HashSet<String> = acp_servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect();
+        let current_exe = std::env::current_exe()?.to_string_lossy().to_string();
+        for agent_name in list_agents() {
+            if !existing_names.contains(&agent_name) {
+                acp_servers.push(AcpServerConfig {
+                    name: agent_name.clone(),
+                    command: current_exe.clone(),
+                    args: vec!["--acp".to_string(), agent_name],
+                    env: Default::default(),
+                    enabled: true,
+                    description: None,
+                    idle_timeout_secs: 300,
+                    operation_timeout_secs: 3600,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn sorted_yaml_files(dir: &Path) -> Result<Vec<PathBuf>> {
+        let mut paths: Vec<PathBuf> = read_dir(dir)
+            .with_context(|| format!("Failed to read directory '{}'", dir.display()))?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("yaml"))
+            .collect();
+        paths.sort();
+        Ok(paths)
     }
 
     fn load_dynamic(model_id: &str) -> Result<Self> {
@@ -2602,8 +2712,14 @@ impl Config {
             "save": false,
             "clients": vec![client],
         });
-        let config =
+        let mut config: Self =
             serde_json::from_value(config).with_context(|| "Failed to load config from env")?;
+        let config_dir = Self::config_dir();
+        config.mcp_servers =
+            Self::load_mcp_servers_from_dir(&config_dir.join(MCP_SERVERS_DIR_NAME))?;
+        config.acp_servers =
+            Self::load_acp_servers_from_dir(&config_dir.join(ACP_SERVERS_DIR_NAME))?;
+        Self::auto_register_agents(&mut config.acp_servers)?;
         Ok(config)
     }
 
@@ -3158,11 +3274,8 @@ async fn create_config_file(config_path: &Path) -> Result<()> {
 
     let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
 
-    let mut config = serde_json::json!({});
     let (model, clients_config) = create_client_config(client).await?;
-    config["model"] = model.into();
-    config[CLIENTS_FIELD] = clients_config;
-
+    let config = serde_json::json!({ "model": model });
     let config_data = serde_yaml::to_string(&config).with_context(|| "Failed to create config")?;
     let config_data = format!(
         "# see https://github.com/dobesv/harnx/blob/main/config.example.yaml\n\n{config_data}"
@@ -3171,14 +3284,33 @@ async fn create_config_file(config_path: &Path) -> Result<()> {
     ensure_parent_exists(config_path)?;
     std::fs::write(config_path, config_data)
         .with_context(|| format!("Failed to write to '{}'", config_path.display()))?;
+
+    let clients_dir = config_path
+        .parent()
+        .unwrap_or(config_path)
+        .join(CLIENTS_DIR_NAME);
+    std::fs::create_dir_all(&clients_dir)
+        .with_context(|| format!("Failed to create '{}'", clients_dir.display()))?;
+    let client_filename = clients_config
+        .get("name")
+        .or_else(|| clients_config.get("type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("default");
+    let client_path = clients_dir.join(format!("{client_filename}.yaml"));
+    let client_data =
+        serde_yaml::to_string(&clients_config).with_context(|| "Failed to create client config")?;
+    std::fs::write(&client_path, client_data)
+        .with_context(|| format!("Failed to write to '{}'", client_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::prelude::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(config_path, perms)?;
+        std::fs::set_permissions(config_path, perms.clone())?;
+        std::fs::set_permissions(&client_path, perms)?;
     }
 
-    println!("✓ Saved the config file to '{}'.\n", config_path.display());
+    println!("✓ Saved the config file to '{}'.", config_path.display());
+    println!("✓ Saved the client config to '{}'.", client_path.display());
 
     Ok(())
 }

@@ -7,6 +7,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
+    #[serde(default)]
     pub name: String,
     pub command: String,
     #[serde(default)]
