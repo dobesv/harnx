@@ -434,6 +434,104 @@ impl ToolCall {
             }));
         }
 
+        let allowed_tool_names: std::collections::HashSet<String> = {
+            let guard = config.read();
+            let use_tools = guard.extract_agent().use_tools().map(|v| v.join(","));
+            guard
+                .tool_declarations_for_use_tools(use_tools.as_deref())
+                .into_iter()
+                .map(|decl| decl.name)
+                .collect()
+        };
+
+        let acp_manager = config.read().acp_manager.clone();
+        if self.name.ends_with("_session_handoff") {
+            if !allowed_tool_names.contains(&self.name) {
+                return Err(ToolError::Recoverable(anyhow!(
+                    "No tool provider configured for '{}'",
+                    self.name
+                )));
+            }
+            let agent = self.name.trim_end_matches("_session_handoff");
+            let prompt = json_data["prompt"].as_str().ok_or_else(|| {
+                ToolError::Recoverable(anyhow!("Missing 'prompt' argument for session handoff"))
+            })?;
+            let session_id = json_data["session_id"]
+                .as_str()
+                .map(ToString::to_string)
+                .or_else(|| {
+                    config
+                        .read()
+                        .session
+                        .as_ref()
+                        .map(|session| session.name().to_string())
+                });
+
+            if let Some(manager) = acp_manager.clone() {
+                let tool_name = format!("{}_session_prompt", agent);
+                if manager.find_client_for_tool(&tool_name).is_some() {
+                    let handoff_args = json!({
+                        "message": prompt,
+                        "session_id": session_id,
+                    });
+                    let result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let has_ui_output = has_ui_output_sink();
+                            let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
+                            tokio::task::yield_now().await;
+                            let (chunk_rx, subscription_id) = manager.subscribe_chunks().await;
+                            let spinner = if is_terminal {
+                                Some(spawn_spinner(&format!("  {} working…", tool_name)))
+                            } else {
+                                None
+                            };
+                            let spinner_clone = spinner.clone();
+                            let spinner_msg = format!("  {} working…", tool_name);
+                            let forward_handle = tokio::spawn(forward_acp_chunks(
+                                chunk_rx,
+                                spinner_clone,
+                                spinner_msg,
+                                is_terminal,
+                            ));
+                            let call_result = manager.call_tool(&tool_name, handoff_args).await;
+                            manager.unsubscribe_chunks(subscription_id).await;
+                            let _ = forward_handle.await;
+                            if let Some(s) = spinner {
+                                s.stop();
+                            }
+                            call_result
+                        })
+                    })
+                    .map_err(|err| {
+                        if err.to_string().contains("aborted by user") {
+                            ToolError::Fatal(err)
+                        } else {
+                            ToolError::Recoverable(err)
+                        }
+                    })?;
+                    let mut result = result;
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert("action".to_string(), json!("switch_agent"));
+                        obj.insert("agent".to_string(), json!(agent));
+                        if let Some(session_id) = obj.get("session_id").cloned() {
+                            obj.insert("session_id".to_string(), session_id);
+                        }
+                        obj.insert("prompt".to_string(), json!(prompt));
+                    }
+                    return Ok(result);
+                }
+            }
+
+            return Ok(json!({
+                "status": "success",
+                "message": format!("Transferring session to agent '{}'...", agent),
+                "action": "switch_agent",
+                "agent": agent,
+                "prompt": prompt,
+                "session_id": session_id,
+            }));
+        }
+
         let acp_manager = config.read().acp_manager.clone();
         if let Some(manager) = acp_manager {
             if manager.find_client_for_tool(&self.name).is_some() {

@@ -165,7 +165,46 @@ fn matches_tool_glob(pattern: &str, name: &str) -> bool {
         .is_some_and(|g| g.compile_matcher().is_match(name))
 }
 
-/// Deserializes `use_tools` accepting both a YAML list and a comma-separated string.
+fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
+    crate::config::agent::list_agents()
+        .into_iter()
+        .map(|agent_name| {
+            let mut properties = IndexMap::new();
+            properties.insert(
+                "prompt".to_string(),
+                crate::tool::JsonSchema {
+                    type_value: Some("string".to_string()),
+                    description: Some("The new prompt to start the target agent session with.".to_string()),
+                    ..Default::default()
+                },
+            );
+            properties.insert(
+                "session_id".to_string(),
+                crate::tool::JsonSchema {
+                    type_value: Some("string".to_string()),
+                    description: Some(
+                        "Optional existing target session ID. If omitted, a new session is created automatically.".to_string(),
+                    ),
+                    ..Default::default()
+                },
+            );
+            ToolDeclaration {
+                name: format!("{agent_name}_session_handoff"),
+                description: format!(
+                    "Exit the current interactive agent session and hand off to the '{agent_name}' agent. Auto-creates a target session if session_id is not provided, then sends the prompt and continues interaction in that agent session."
+                ),
+                parameters: crate::tool::JsonSchema {
+                    type_value: Some("object".to_string()),
+                    properties: Some(properties),
+                    required: Some(vec!["prompt".to_string()]),
+                    ..Default::default()
+                },
+                mcp_tool_name: None,
+            }
+        })
+        .collect()
+}
+
 fn deserialize_use_tools<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Vec<String>>, D::Error>
@@ -2907,6 +2946,7 @@ impl Config {
                 if let Some(manager) = &self.acp_manager {
                     declarations.extend(manager.get_all_tools_blocking());
                 }
+                declarations.extend(handoff_tool_declarations_for_agents());
             }
             if split_tool_selectors(use_tools).into_iter().any(|v| {
                 let v = v.trim();
