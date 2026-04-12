@@ -90,9 +90,10 @@ pub async fn openai_chat_completions(
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
+    let retry_after = parse_retry_after(res.headers());
     let data: Value = res.json().await?;
     if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
+        catch_error(&data, status.as_u16(), retry_after)?;
     }
 
     debug!("non-stream-data: {data}");
@@ -222,7 +223,7 @@ pub async fn openai_embeddings(
     let status = res.status();
     let data: Value = res.json().await?;
     if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
+        catch_error(&data, status.as_u16(), None)?;
     }
     let res_body: EmbeddingsResBody =
         serde_json::from_value(data).context("Invalid embeddings data")?;

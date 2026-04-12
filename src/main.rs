@@ -24,7 +24,7 @@ pub mod test_utils;
 
 use crate::cli::Cli;
 use crate::client::{
-    call_chat_completions, call_chat_completions_streaming, list_models, ModelType,
+    list_models, retry::call_with_retry_and_fallback, ModelType,
 };
 use crate::config::{
     ensure_parent_exists, list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
@@ -447,7 +447,6 @@ async fn start_directive_inner(
     }
     drain_async_results(async_manager, pending_async_context);
     inject_pending_async_context(&mut input, pending_async_context);
-    let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
     let (hooks, session_id, cwd) = hook_dispatch_context(config);
     let input_text = input.text();
@@ -469,10 +468,8 @@ async fn start_directive_inner(
         HookResultControl::Ask { .. } => {} // Ask is not applicable for UserPromptSubmit
         HookResultControl::Continue => {}
     }
-    let (output, thought, tool_results, usage) = if !input.stream() {
-        match call_chat_completions(&input, true, false, client.as_ref(), abort_signal.clone())
-            .await
-        {
+    let (output, thought, tool_results, usage) =
+        match call_with_retry_and_fallback(&input, config, abort_signal.clone()).await {
             Ok(result) => result,
             Err(err) => {
                 let event = HookEvent::StopFailure {
@@ -497,35 +494,7 @@ async fn start_directive_inner(
                 );
                 return Err(err);
             }
-        }
-    } else {
-        match call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await {
-            Ok(result) => result,
-            Err(err) => {
-                let event = HookEvent::StopFailure {
-                    error: err.to_string(),
-                    error_type: "api_error".to_string(),
-                };
-                let _ = dispatch_hooks_with_managers(
-                    &event,
-                    &hooks.entries,
-                    &session_id,
-                    &cwd,
-                    Some(async_manager),
-                    Some(persistent_manager),
-                )
-                .await;
-                let _ = config.write().after_chat_completion(
-                    &input,
-                    "",
-                    None,
-                    &[],
-                    &Default::default(),
-                );
-                return Err(err);
-            }
-        }
-    };
+        };
     config.write().after_chat_completion(
         &input,
         &output,

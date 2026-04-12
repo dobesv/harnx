@@ -10,7 +10,7 @@ use self::highlighter::ReplHighlighter;
 use self::prompt::ReplPrompt;
 use std::io::Write;
 
-use crate::client::{call_chat_completions, call_chat_completions_streaming};
+use crate::client::retry::call_with_retry_and_fallback;
 use crate::config::{
     macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage,
     StateFlags,
@@ -1134,7 +1134,6 @@ async fn ask_inner(
     drain_async_results(async_manager, pending_async_context);
     inject_pending_async_context(&mut input, pending_async_context);
 
-    let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
     let (hooks, session_id, cwd) = {
         let config = config.read();
@@ -1149,8 +1148,8 @@ async fn ask_inner(
             env::current_dir().unwrap_or_default(),
         )
     };
-    let (output, thought, tool_results, usage) = if input.stream() {
-        match call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await {
+    let (output, thought, tool_results, usage) =
+        match call_with_retry_and_fallback(&input, &config, abort_signal.clone()).await {
             Ok(result) => result,
             Err(err) => {
                 let event = HookEvent::StopFailure {
@@ -1175,37 +1174,7 @@ async fn ask_inner(
                 );
                 return Err(err);
             }
-        }
-    } else {
-        match call_chat_completions(&input, true, false, client.as_ref(), abort_signal.clone())
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                let event = HookEvent::StopFailure {
-                    error: err.to_string(),
-                    error_type: "api_error".to_string(),
-                };
-                let _ = dispatch_hooks_with_managers(
-                    &event,
-                    &hooks.entries,
-                    &session_id,
-                    &cwd,
-                    Some(async_manager),
-                    Some(persistent_manager),
-                )
-                .await;
-                let _ = config.write().after_chat_completion(
-                    &input,
-                    "",
-                    None,
-                    &[],
-                    &Default::default(),
-                );
-                return Err(err);
-            }
-        }
-    };
+        };
     config.write().after_chat_completion(
         &input,
         &output,

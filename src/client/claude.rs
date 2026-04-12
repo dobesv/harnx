@@ -70,9 +70,10 @@ pub async fn claude_chat_completions(
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
+    let retry_after = parse_retry_after(res.headers());
     let data: Value = res.json().await?;
     if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
+        catch_error(&data, status.as_u16(), retry_after)?;
     }
     debug!("non-stream-data: {data}");
     claude_extract_chat_completions(&data)

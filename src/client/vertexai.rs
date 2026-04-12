@@ -188,9 +188,10 @@ pub async fn gemini_chat_completions(
 ) -> Result<ChatCompletionsOutput> {
     let res = builder.send().await?;
     let status = res.status();
+    let retry_after = parse_retry_after(res.headers());
     let data: Value = res.json().await?;
     if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
+        catch_error(&data, status.as_u16(), retry_after)?;
     }
     debug!("non-stream-data: {data}");
     gemini_extract_chat_completions_text(&data)
@@ -204,8 +205,9 @@ pub async fn gemini_chat_completions_streaming(
     let res = builder.send().await?;
     let status = res.status();
     if !status.is_success() {
+        let retry_after = parse_retry_after(res.headers());
         let data: Value = res.json().await?;
-        catch_error(&data, status.as_u16())?;
+        catch_error(&data, status.as_u16(), retry_after)?;
     } else {
         let handle = |value: &str| -> Result<()> {
             let data: Value = serde_json::from_str(value)?;
@@ -259,7 +261,7 @@ async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<Embedding
     let status = res.status();
     let data: Value = res.json().await?;
     if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
+        catch_error(&data, status.as_u16(), None)?;
     }
     let res_body: EmbeddingsResBody =
         serde_json::from_value(data).context("Invalid embeddings data")?;

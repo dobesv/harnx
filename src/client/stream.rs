@@ -1,4 +1,4 @@
-use super::{catch_error, CompletionTokenUsage, ToolCall};
+use super::{catch_error, parse_retry_after, CompletionTokenUsage, ToolCall};
 use crate::utils::AbortSignal;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -183,6 +183,7 @@ where
                 match err {
                     EventSourceError::StreamEnded => {}
                     EventSourceError::InvalidStatusCode(status, res) => {
+                        let retry_after = parse_retry_after(res.headers());
                         let text = res.text().await?;
                         let data: Value = match text.parse() {
                             Ok(data) => data,
@@ -193,7 +194,7 @@ where
                                 );
                             }
                         };
-                        catch_error(&data, status.as_u16())?;
+                        catch_error(&data, status.as_u16(), retry_after)?;
                     }
                     EventSourceError::InvalidContentType(header_value, res) => {
                         let text = res.text().await?;

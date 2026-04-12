@@ -31,6 +31,21 @@ pub struct MockOpenAiTurn {
     pub text_chunks: Vec<String>,
     #[serde(default)]
     pub tool_calls: Vec<MockOpenAiToolCall>,
+    /// If set, return an HTTP error instead of a normal response.
+    #[serde(default)]
+    pub error: Option<MockOpenAiError>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MockOpenAiError {
+    pub status: u16,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub error_type: String,
+    /// Extra headers to include in the error response (e.g., "Retry-After: 5").
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -64,7 +79,7 @@ impl ServerState {
             .cloned()
             .unwrap_or_else(|| MockOpenAiTurn {
                 text_chunks: vec![self.script.fallback_text.clone()],
-                tool_calls: vec![],
+                ..Default::default()
             })
     }
 
@@ -266,6 +281,38 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut Tcp
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let turn = state.next_turn();
+
+    // Handle error responses
+    if let Some(error) = &turn.error {
+        let body = json!({
+            "error": {
+                "message": error.message,
+                "type": error.error_type,
+            }
+        });
+        let body_str = body.to_string();
+        let status_text = match error.status {
+            401 => "401 Unauthorized",
+            403 => "403 Forbidden",
+            429 => "429 Too Many Requests",
+            500 => "500 Internal Server Error",
+            502 => "502 Bad Gateway",
+            503 => "503 Service Unavailable",
+            _ => "400 Bad Request",
+        };
+        let mut extra_headers = String::new();
+        for (key, value) in &error.headers {
+            extra_headers.push_str(&format!("{key}: {value}\r\n"));
+        }
+        let response = format!(
+            "HTTP/1.1 {status_text}\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body_str}",
+            body_str.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        return;
+    }
+
     let tool_calls: Vec<Value> = turn
         .tool_calls
         .iter()

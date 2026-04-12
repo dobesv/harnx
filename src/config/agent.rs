@@ -17,6 +17,36 @@ use std::{
 
 pub const TEMP_AGENT_NAME: &str = "%%";
 
+fn default_retry_attempts() -> u32 {
+    3
+}
+fn default_initial_delay_ms() -> u64 {
+    1000
+}
+fn default_max_delay_ms() -> u64 {
+    60000
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RetryConfig {
+    #[serde(default = "default_retry_attempts")]
+    pub attempts: u32,
+    #[serde(default = "default_initial_delay_ms")]
+    pub initial_delay_ms: u64,
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            attempts: default_retry_attempts(),
+            initial_delay_ms: default_initial_delay_ms(),
+            max_delay_ms: default_max_delay_ms(),
+        }
+    }
+}
+
 pub const CREATE_TITLE_AGENT: &str = "%create-title%";
 
 const CREATE_TITLE_PROMPT: &str = r#"Create a concise, 3-6 word title.
@@ -46,6 +76,10 @@ pub struct Agent {
         skip_serializing_if = "Option::is_none"
     )]
     model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    model_fallbacks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry: Option<RetryConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -378,6 +412,19 @@ impl Agent {
 
     pub fn model_id(&self) -> Option<&str> {
         self.model_id.as_deref()
+    }
+
+    pub fn model_fallbacks(&self) -> &[String] {
+        &self.model_fallbacks
+    }
+
+    pub fn retry_config(&self) -> RetryConfig {
+        self.retry.clone().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn set_model_fallbacks(&mut self, fallbacks: Vec<String>) {
+        self.model_fallbacks = fallbacks;
     }
 
     pub fn use_tools(&self) -> Option<Vec<String>> {

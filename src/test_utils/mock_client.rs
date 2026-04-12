@@ -78,9 +78,18 @@ impl MockResponseEvent {
                 output.tool_calls.push(tool_call.clone());
             }
             Self::Error(err) => {
-                // Return the error instead of continuing
-                // We need to convert Arc<Error> back to owned Error
-                // Since Error isn't Clone, we create a new error from the display
+                // Try to downcast to a concrete error type that implements Clone.
+                // For LlmError (the most common test case), reconstruct it to preserve
+                // the error type through the anyhow chain.
+                if let Some(llm_err) = err.downcast_ref::<crate::client::LlmError>() {
+                    return Err(crate::client::LlmError {
+                        status: llm_err.status,
+                        message: llm_err.message.clone(),
+                        retry_after: llm_err.retry_after,
+                    }
+                    .into());
+                }
+                // Fallback: create a new error from the display string
                 let msg = err.to_string();
                 return Err(anyhow::anyhow!("{}", msg));
             }
@@ -125,6 +134,14 @@ impl MockTurn {
                 MockResponseEvent::Text(text) => output.text.push_str(text),
                 MockResponseEvent::ToolCall(tool_call) => output.tool_calls.push(tool_call.clone()),
                 MockResponseEvent::Error(err) => {
+                    if let Some(llm_err) = err.downcast_ref::<crate::client::LlmError>() {
+                        return Err(crate::client::LlmError {
+                            status: llm_err.status,
+                            message: llm_err.message.clone(),
+                            retry_after: llm_err.retry_after,
+                        }
+                        .into());
+                    }
                     return Err(anyhow::anyhow!("{}", err));
                 }
             }
