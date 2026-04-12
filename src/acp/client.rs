@@ -1235,6 +1235,14 @@ mod tests {
     async fn nested_tool_call_notification_preserves_structured_event_for_tui_pipeline() {
         let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
         crate::ui_output::install_ui_output_sender(ui_tx);
+        // Ensure we clean up the global sender when this test finishes.
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                crate::ui_output::clear_ui_output_sender();
+            }
+        }
+        let _guard = ClearOnDrop;
 
         let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));

@@ -38,6 +38,14 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
         return Ok(());
     }
 
+    let harnx_mcp_bin = target_dir.join(binary_name("harnx-mcp-repro249"));
+    if !harnx_mcp_bin.is_file() {
+        eprintln!(
+            "skipping repro_249_top_level_delegation_markers: harnx-mcp-repro249 binary is missing"
+        );
+        return Ok(());
+    }
+
     let temp = TempDir::new().context("failed to create temp dir")?;
     let mock = MockOpenAiServer::start(script())?;
     let paths = TestPaths::new(temp.path(), mock.port())?;
@@ -114,10 +122,11 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
     tmux.send_text("tell me how many files are in /tmp")?;
     tmux.send_keys(&["Enter"])?;
 
-    // Wait for the delegation to complete: top-level tool call and child heading must appear.
+    // Wait for delegation, child heading, and nested MCP tool call to all appear.
     let screen = tmux.wait_for(Duration::from_secs(30), |screen| {
         screen.contains(&format!("{}_session_prompt", TEST_SUB_AGENT_NAME))
             && screen.contains(&format!("> {}", TEST_SUB_AGENT_NAME))
+            && nested_mcp_tool_present(screen)
     })?;
 
     // ── Known-good markers: delegation happened ──────────────────────────────
