@@ -120,7 +120,6 @@ impl AcpNotificationClient {
     }
 
     async fn forward_ui_output_event(&self, event: UiOutputEvent, source: UiOutputSource) {
-        let mut delivered = false;
         let mut forwarders = self.chunk_forwarder.write().await;
         let source = event.source.clone().or(Some(source));
         let text_fallback = format_ui_event_for_terminal(&event.kind, source.as_ref());
@@ -129,21 +128,28 @@ impl AcpNotificationClient {
             source,
         };
 
-        if forwarders.is_empty() {
-            if !emit_ui_output_event(event) {
-                eprint!("{}", text_fallback);
+        // Always emit to the parent UI sink so the TUI transcript shows nested
+        // sub-agent events (tool calls, thoughts, etc.) regardless of whether
+        // a chunk forwarder is also registered.  This fixes issue #249 where
+        // delegated sub-agent internal MCP tool calls were invisible in the
+        // parent transcript because the forwarder was treated as an exclusive
+        // destination.
+        let emitted_to_ui = emit_ui_output_event(event.clone());
+
+        // Also forward to any registered chunk forwarders (e.g. the REPL
+        // command-line path that prints sub-agent output to stdout).
+        let mut forwarded_to_chunk = false;
+        forwarders.retain(|_, tx| match tx.send(NestedAcpEvent::Ui(event.clone())) {
+            Ok(()) => {
+                forwarded_to_chunk = true;
+                true
             }
-        } else {
-            forwarders.retain(|_, tx| match tx.send(NestedAcpEvent::Ui(event.clone())) {
-                Ok(()) => {
-                    delivered = true;
-                    true
-                }
-                Err(_) => false,
-            });
-            if !delivered && !emit_ui_output_event(event) {
-                eprint!("{}", text_fallback);
-            }
+            Err(_) => false,
+        });
+
+        // Fall back to stderr only if neither path accepted the event.
+        if !emitted_to_ui && !forwarded_to_chunk {
+            eprint!("{}", text_fallback);
         }
     }
 }

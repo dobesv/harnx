@@ -17,6 +17,13 @@ const TEST_SUB_AGENT_NAME: &str = "test-sub-agent";
 
 #[test]
 fn repro_249_top_level_delegation_markers() -> Result<()> {
+    if option_env!("CARGO_BIN_NAME") == Some("harnx") {
+        eprintln!(
+            "skipping repro_249_top_level_delegation_markers in binary test target to avoid duplicate tmux sessions"
+        );
+        return Ok(());
+    }
+
     if !TmuxHarness::is_available() {
         eprintln!("skipping repro_249_top_level_delegation_markers: tmux is unavailable");
         return Ok(());
@@ -113,17 +120,15 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
         "child sub-agent heading not visible:\n{screen}"
     );
 
-    // ── Issue #249 assertion ──────────────────────────────────────────────────
+    // ── Issue #249 regression assertion ───────────────────────────────────────
     // The child sub-agent internally called `repro249_unique_mcp_tool` via MCP.
-    // That internal tool call SHOULD be visible in the parent transcript, but is
-    // currently missing. This assertion documents the bug: if it ever starts
-    // passing, issue #249 is fixed.
+    // That internal tool call should remain visible in the parent transcript.
     let nested_visible = nested_mcp_tool_present(&screen);
     eprintln!(
         "\n=== Issue #249 tmux repro result ===\n\
          delegation visible    : {}\n\
          child heading visible : {}\n\
-         nested tool visible   : {} (expected: true — MISSING = bug reproduced)\n\
+         nested tool visible   : {} (expected: true — visible = fix confirmed)\n\
          === last screen ===\n{}\n====\n",
         screen.contains(&format!("{}_session_prompt", TEST_SUB_AGENT_NAME)),
         screen.contains(&format!("> {}", TEST_SUB_AGENT_NAME)),
@@ -131,8 +136,8 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
         screen,
     );
     assert!(
-        !nested_visible,
-        "nested internal MCP tool call IS now visible — issue #249 appears to be fixed!\n{screen}"
+        nested_visible,
+        "nested internal MCP tool call is not visible in the parent transcript; issue #249 regressed\n{screen}"
     );
 
     drop(tmux);

@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::client::{Client, SseEvent, SseHandler};
 use crate::config::{GlobalConfig, Input};
 use crate::tool::{ToolCall, ToolResult};
-use crate::ui_output::UiOutputEventKind;
+use crate::ui_output::{emit_ui_output_event, UiOutputEvent, UiOutputEventKind};
 use crate::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
 
 use anyhow::bail;
@@ -619,6 +619,15 @@ async fn eval_mcp_async(
         Some(m) => m,
         None => bail!("No tool provider configured for '{}'", call.name),
     };
+
+    emit_ui_output_event(UiOutputEvent {
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: call.name.clone(),
+            input_yaml: None,
+            raw: None,
+        },
+        source: None,
+    });
 
     tokio::select! {
         result = manager.call_tool(&call.name, json_data) => result,
