@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::client::{Client, SseEvent, SseHandler};
 use crate::config::{GlobalConfig, Input};
 use crate::tool::{ToolCall, ToolResult};
-use crate::ui_output::UiOutputEventKind;
+use crate::ui_output::{emit_ui_output_event, UiOutputEvent, UiOutputEventKind, UiOutputSource};
 use crate::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
 
 use anyhow::bail;
@@ -340,6 +340,31 @@ impl acp::Agent for HarnxAgent {
                     })
                     .collect()
             } else {
+                let source = Some(UiOutputSource {
+                    agent: self.agent_name.clone(),
+                    session_id: Some(session_key.clone()),
+                });
+
+                // Notify the parent about each tool call so it appears in the
+                // parent transcript.  The `emit_ui_output_event` inside
+                // `eval_mcp_async` only works when a UI sink is installed
+                // (i.e. in the TUI process).  In ACP-server mode there is no
+                // UI sink, so we send the notification directly over the ACP
+                // connection.
+                let conn = self.connection.borrow().clone();
+                if let Some(conn) = conn {
+                    for call in &tool_calls {
+                        let tool_call_id = call.id.clone().unwrap_or_else(|| call.name.clone());
+                        let tc = acp::ToolCall::new(tool_call_id, call.name.clone())
+                            .raw_input(call.arguments.clone());
+                        let notification = acp::SessionNotification::new(
+                            acp::SessionId::new(session_key.clone()),
+                            acp::SessionUpdate::ToolCall(tc),
+                        );
+                        let _ = conn.session_notification(notification).await;
+                    }
+                }
+
                 let acp_manager = self.config.read().acp_manager.clone();
                 let result = if let Some(ref manager) = acp_manager {
                     let (mut chunk_rx, subscription_id) = manager.subscribe_chunks().await;
@@ -373,15 +398,20 @@ impl acp::Agent for HarnxAgent {
                         }
                     });
 
-                    let result =
-                        eval_tool_calls_async(&self.config, tool_calls, &abort_signal).await;
+                    let result = eval_tool_calls_async(
+                        &self.config,
+                        tool_calls,
+                        &abort_signal,
+                        source.clone(),
+                    )
+                    .await;
 
                     manager.unsubscribe_chunks(subscription_id).await;
                     let _ = forward_task.await;
 
                     result
                 } else {
-                    eval_tool_calls_async(&self.config, tool_calls, &abort_signal).await
+                    eval_tool_calls_async(&self.config, tool_calls, &abort_signal, source).await
                 };
 
                 match result {
@@ -462,7 +492,12 @@ async fn nested_ui_event_to_session_update(
             }
             Some(acp::SessionUpdate::AgentThoughtChunk(chunk))
         }
-        UiOutputEventKind::ToolCallUpdate { title, status, raw } => {
+        UiOutputEventKind::ToolCallUpdate {
+            tool_call_id,
+            title,
+            status,
+            raw,
+        } => {
             let mut update = if let Some(update) = raw {
                 *update
             } else {
@@ -478,7 +513,8 @@ async fn nested_ui_event_to_session_update(
                     };
                     fields = fields.status(status);
                 }
-                acp::ToolCallUpdate::new("status", fields)
+                let stable_tool_call_id = tool_call_id.unwrap_or_else(|| "status".to_string());
+                acp::ToolCallUpdate::new(stable_tool_call_id, fields)
             };
             if let Some(meta) = source_meta.clone() {
                 update = update.meta(meta);
@@ -538,6 +574,7 @@ async fn eval_tool_calls_async(
     config: &GlobalConfig,
     mut calls: Vec<ToolCall>,
     abort_signal: &AbortSignal,
+    source: Option<UiOutputSource>,
 ) -> anyhow::Result<Vec<ToolResult>> {
     let mut output = vec![];
     if calls.is_empty() {
@@ -553,7 +590,7 @@ async fn eval_tool_calls_async(
         if abort_signal.aborted() {
             bail!("Tool execution cancelled");
         }
-        let result = eval_mcp_async(config, &call, abort_signal).await;
+        let result = eval_mcp_async(config, &call, abort_signal, source.clone()).await;
         match result {
             Ok(mut value) => {
                 if value.is_null() {
@@ -578,6 +615,7 @@ async fn eval_mcp_async(
     config: &GlobalConfig,
     call: &ToolCall,
     abort_signal: &AbortSignal,
+    source: Option<UiOutputSource>,
 ) -> anyhow::Result<Value> {
     let json_data = if call.arguments.is_null() {
         Value::Null
@@ -613,6 +651,15 @@ async fn eval_mcp_async(
         Some(m) => m,
         None => bail!("No tool provider configured for '{}'", call.name),
     };
+
+    emit_ui_output_event(UiOutputEvent {
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: call.name.clone(),
+            input_yaml: None,
+            raw: None,
+        },
+        source,
+    });
 
     tokio::select! {
         result = manager.call_tool(&call.name, json_data) => result,

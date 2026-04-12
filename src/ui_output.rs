@@ -35,6 +35,7 @@ pub enum UiOutputEventKind {
         raw: Option<Box<acp::ToolCall>>,
     },
     ToolCallUpdate {
+        tool_call_id: Option<String>,
         title: Option<String>,
         status: Option<String>,
         raw: Option<Box<acp::ToolCallUpdate>>,

@@ -368,12 +368,22 @@ async fn info_commands_render_into_tui_transcript() {
         tui.handle_tui_event(event).await.unwrap();
     }
 
-    let has_session_output = tui
+    let rendered = tui
         .app
         .transcript
         .iter()
-        .any(|entry| matches!(entry, TranscriptItem::SystemText(text) if !text.is_empty()));
-    assert!(has_session_output);
+        .flat_map(Tui::render_entry)
+        .filter_map(|line| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            (!text.is_empty()).then_some(text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.trim().is_empty());
 }
 
 #[tokio::test]
@@ -855,6 +865,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
     .unwrap();
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
         kind: UiOutputEventKind::ToolCallUpdate {
+            tool_call_id: Some("call-1".to_string()),
             title: Some("argus_session_prompt".to_string()),
             status: Some("completed".to_string()),
             raw: None,
@@ -946,6 +957,77 @@ async fn structured_ui_output_variants_render_in_transcript() {
     assert!(system_entries.contains(&"   command: ls".to_string()));
     assert!(system_entries.contains(&"   line one".to_string()));
     assert!(system_entries.contains(&"   line two".to_string()));
+}
+
+#[tokio::test]
+async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: "pytheas_session_prompt".to_string(),
+            input_yaml: Some("message: Count files in /tmp".to_string()),
+            raw: None,
+        },
+        source: None,
+    }))
+    .await
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: "bash".to_string(),
+            input_yaml: Some("command: ls -1 /tmp | wc -l".to_string()),
+            raw: None,
+        },
+        source: Some(UiOutputSource {
+            agent: "pytheas".to_string(),
+            session_id: Some("session-nested".to_string()),
+        }),
+    }))
+    .await
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cached_tokens: 0,
+            session_label: Some("> pytheas ▸ session-nested".to_string()),
+        },
+        source: Some(UiOutputSource {
+            agent: "pytheas".to_string(),
+            session_id: Some("session-nested".to_string()),
+        }),
+    }))
+    .await
+    .unwrap();
+
+    let rendered: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .filter_map(|line| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            (!text.is_empty()).then_some(text)
+        })
+        .collect();
+
+    assert!(rendered.contains(&"->️ pytheas_session_prompt".to_string()));
+    assert!(rendered.contains(&"> pytheas ▸ session-nested".to_string()));
+    assert!(rendered.contains(&"->️ bash".to_string()));
+    assert!(rendered.contains(&"   command: ls -1 /tmp | wc -l".to_string()));
+    assert!(
+        rendered.contains(&"> pytheas ▸ session-nested   in 10   out 20".to_string()),
+        "rendered transcript missing nested usage line: {rendered:?}"
+    );
 }
 
 #[tokio::test]
@@ -1687,29 +1769,23 @@ async fn test_ctrl_c_cancels_streaming() {
     }
     harness.render();
 
-    // Now simulate Ctrl+C after streaming is done
-    // This tests the Ctrl+C handling when llm_busy is true
-    harness.tui().abort_signal.set_ctrlc();
-
-    // Manually trigger the Ctrl+C handling (same as handle_key for Ctrl+C)
+    // Now simulate Ctrl+C after streaming is done.
+    // Exercise the same cancellation path used in production key handling.
     harness
         .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::SystemText(
-            "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
-        ));
-    harness.tui().app.llm_busy = false;
-    harness.tui().abort_signal.reset();
+        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
 
     harness.render();
     let screen = harness.screen_contents();
 
-    // The transcript should show the abort message
+    // The transcript should show the abort message and busy state should be cleared.
     assert!(
         screen.contains("aborted") || screen.contains("Ctrl+C"),
         "Screen should show abort message, got: {screen}"
     );
+    assert!(!harness.tui().app.llm_busy, "Ctrl+C should clear llm_busy");
 
     harness.drain_and_settle().await.unwrap();
 }

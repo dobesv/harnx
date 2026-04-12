@@ -128,6 +128,14 @@ path = "src/bin/harnx-mcp-time/main.rs"
 name = "harnx-acp-test"
 path = "src/bin/harnx-acp-test/main.rs"
 
+[[bin]]
+name = "harnx-mock-llm"
+path = "src/bin/harnx-mock-llm/main.rs"
+
+[[bin]]
+name = "harnx-mcp-repro249"
+path = "src/bin/harnx-mcp-repro249/main.rs"
+
 [profile.release]
 lto = true
 strip = true
