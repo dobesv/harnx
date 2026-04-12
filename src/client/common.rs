@@ -18,6 +18,131 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 use std::time::Duration;
+
+/// Structured error from LLM API calls, carrying HTTP status and retry-after info.
+#[derive(Debug)]
+pub struct LlmError {
+    pub status: u16,
+    pub message: String,
+    pub retry_after: Option<Duration>,
+}
+
+impl LlmError {
+    /// Returns true for transient/retryable HTTP status codes.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self.status, 429 | 500 | 502 | 503 | 529)
+    }
+
+    /// Returns true for authentication/authorization errors (missing API key, etc).
+    pub fn is_auth_error(&self) -> bool {
+        matches!(self.status, 401 | 403)
+    }
+}
+
+impl std::fmt::Display for LlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (status: {})", self.message, self.status)
+    }
+}
+
+impl std::error::Error for LlmError {}
+
+/// Parse retry/cooldown duration from HTTP response headers.
+///
+/// Checks `Retry-After` (seconds or HTTP-date), `x-ratelimit-reset-requests`,
+/// and `x-ratelimit-reset-tokens`, returning the maximum duration found.
+pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let mut max_duration: Option<Duration> = None;
+
+    let mut consider = |d: Duration| {
+        max_duration = Some(match max_duration {
+            Some(current) => current.max(d),
+            None => d,
+        });
+    };
+
+    // Standard Retry-After header (seconds integer or HTTP-date)
+    if let Some(val) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
+        if let Ok(secs) = val.parse::<u64>() {
+            consider(Duration::from_secs(secs));
+        } else if let Some(d) = safe_duration_from_secs_f64(val.parse::<f64>().ok()) {
+            consider(d);
+        } else if let Some(d) = parse_http_date_retry_after(val) {
+            consider(d);
+        }
+    }
+
+    // OpenAI-style rate limit reset headers (values in seconds or duration strings like "1s", "2m")
+    for header_name in ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"] {
+        if let Some(val) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
+            if let Some(d) = parse_duration_value(val) {
+                consider(d);
+            }
+        }
+    }
+
+    max_duration
+}
+
+/// Convert an `Option<f64>` to a `Duration`, returning `None` for negative, NaN, or infinite values.
+fn safe_duration_from_secs_f64(val: Option<f64>) -> Option<Duration> {
+    let v = val?;
+    if v.is_finite() && v >= 0.0 {
+        Some(Duration::from_secs_f64(v))
+    } else {
+        None
+    }
+}
+
+/// Parse an RFC 2616 / RFC 7231 HTTP-date `Retry-After` value into a duration from now.
+fn parse_http_date_retry_after(val: &str) -> Option<Duration> {
+    use chrono::{DateTime, Utc};
+    // Try common HTTP date formats: RFC 2822, RFC 850, asctime
+    let target = DateTime::parse_from_rfc2822(val)
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|_| {
+            DateTime::parse_from_str(val, "%A, %d-%b-%y %T GMT").map(|dt| dt.with_timezone(&Utc))
+        })
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(val, "%a %b %e %T %Y").map(|ndt| ndt.and_utc())
+        })
+        .ok()?;
+    let now = Utc::now();
+    if target > now {
+        let diff = target - now;
+        diff.to_std().ok()
+    } else {
+        Some(Duration::ZERO)
+    }
+}
+
+/// Parse a duration value that may be seconds (integer/float) or a simple duration string like "1s", "2m", "500ms".
+fn parse_duration_value(val: &str) -> Option<Duration> {
+    let val = val.trim();
+    if let Some(d) = safe_duration_from_secs_f64(val.parse::<f64>().ok()) {
+        return Some(d);
+    }
+    if let Some(s) = val.strip_suffix("ms") {
+        let ms = s.trim().parse::<f64>().ok()?;
+        return if ms.is_finite() && ms >= 0.0 {
+            Some(Duration::from_secs_f64(ms / 1000.0))
+        } else {
+            None
+        };
+    }
+    if let Some(s) = val.strip_suffix('s') {
+        return safe_duration_from_secs_f64(s.trim().parse::<f64>().ok());
+    }
+    if let Some(s) = val.strip_suffix('m') {
+        let mins = s.trim().parse::<f64>().ok()?;
+        return if mins.is_finite() && mins >= 0.0 {
+            Some(Duration::from_secs_f64(mins * 60.0))
+        } else {
+            None
+        };
+    }
+    None
+}
 use tokio::sync::mpsc::unbounded_channel;
 
 const MODELS_YAML: &str = include_str!("../../models.yaml");
@@ -693,46 +818,58 @@ pub async fn noop_rerank(_builder: RequestBuilder, _model: &Model) -> Result<Rer
     bail!("The client doesn't support rerank api")
 }
 
-pub fn catch_error(data: &Value, status: u16) -> Result<()> {
+pub fn catch_error(data: &Value, status: u16, retry_after: Option<Duration>) -> Result<()> {
     if (200..300).contains(&status) {
         return Ok(());
     }
     debug!("Invalid response, status: {status}, data: {data}");
-    if let Some(error) = data["error"].as_object() {
+    let message = if let Some(error) = data["error"].as_object() {
         if let (Some(typ), Some(message)) = (
             json_str_from_map(error, "type"),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (type: {typ})");
+            format!("{message} (type: {typ})")
         } else if let (Some(typ), Some(message)) = (
             json_str_from_map(error, "code"),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (code: {typ})");
+            format!("{message} (code: {typ})")
+        } else {
+            format!("Invalid response data: {data} (status: {status})")
         }
     } else if let Some(error) = data["errors"][0].as_object() {
         if let (Some(code), Some(message)) = (
             error.get("code").and_then(|v| v.as_u64()),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (status: {code})")
+            format!("{message} (status: {code})")
+        } else {
+            format!("Invalid response data: {data} (status: {status})")
         }
     } else if let Some(error) = data[0]["error"].as_object() {
-        if let (Some(status), Some(message)) = (
+        if let (Some(err_status), Some(message)) = (
             json_str_from_map(error, "status"),
             json_str_from_map(error, "message"),
         ) {
-            bail!("{message} (status: {status})")
+            format!("{message} (status: {err_status})")
+        } else {
+            format!("Invalid response data: {data} (status: {status})")
         }
-    } else if let (Some(detail), Some(status)) = (data["detail"].as_str(), data["status"].as_i64())
-    {
-        bail!("{detail} (status: {status})");
+    } else if let (Some(detail), Some(code)) = (data["detail"].as_str(), data["status"].as_i64()) {
+        format!("{detail} (status: {code})")
     } else if let Some(error) = data["error"].as_str() {
-        bail!("{error}");
+        error.to_string()
     } else if let Some(message) = data["message"].as_str() {
-        bail!("{message}");
+        message.to_string()
+    } else {
+        format!("Invalid response data: {data} (status: {status})")
+    };
+    Err(LlmError {
+        status,
+        message,
+        retry_after,
     }
-    bail!("Invalid response data: {data} (status: {status})");
+    .into())
 }
 
 pub fn json_str_from_map<'a>(

@@ -283,6 +283,11 @@ impl Input {
         &self.agent
     }
 
+    #[cfg(test)]
+    pub fn agent_mut(&mut self) -> &mut Agent {
+        &mut self.agent
+    }
+
     pub fn set_agent(&mut self, agent: Agent) {
         self.with_agent = !agent.name().trim().is_empty();
         self.agent = agent;

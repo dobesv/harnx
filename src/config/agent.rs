@@ -17,6 +17,36 @@ use std::{
 
 pub const TEMP_AGENT_NAME: &str = "%%";
 
+fn default_retry_attempts() -> u32 {
+    3
+}
+fn default_initial_delay_ms() -> u64 {
+    1000
+}
+fn default_max_delay_ms() -> u64 {
+    60000
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RetryConfig {
+    #[serde(default = "default_retry_attempts")]
+    pub attempts: u32,
+    #[serde(default = "default_initial_delay_ms")]
+    pub initial_delay_ms: u64,
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            attempts: default_retry_attempts(),
+            initial_delay_ms: default_initial_delay_ms(),
+            max_delay_ms: default_max_delay_ms(),
+        }
+    }
+}
+
 pub const CREATE_TITLE_AGENT: &str = "%create-title%";
 
 const CREATE_TITLE_PROMPT: &str = r#"Create a concise, 3-6 word title.
@@ -46,6 +76,10 @@ pub struct Agent {
         skip_serializing_if = "Option::is_none"
     )]
     model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    model_fallbacks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry: Option<RetryConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,6 +143,8 @@ impl Agent {
         Self {
             name: name.to_string(),
             model_id: frontmatter.model_id,
+            model_fallbacks: frontmatter.model_fallbacks,
+            retry: frontmatter.retry,
             temperature: frontmatter.temperature,
             top_p: frontmatter.top_p,
             use_tools: frontmatter.use_tools,
@@ -380,6 +416,19 @@ impl Agent {
         self.model_id.as_deref()
     }
 
+    pub fn model_fallbacks(&self) -> &[String] {
+        &self.model_fallbacks
+    }
+
+    pub fn retry_config(&self) -> RetryConfig {
+        self.retry.clone().unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn set_model_fallbacks(&mut self, fallbacks: Vec<String>) {
+        self.model_fallbacks = fallbacks;
+    }
+
     pub fn use_tools(&self) -> Option<Vec<String>> {
         self.use_tools.clone()
     }
@@ -552,6 +601,10 @@ struct AgentFrontMatter {
         skip_serializing_if = "Option::is_none"
     )]
     model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    model_fallbacks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry: Option<RetryConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -584,6 +637,8 @@ impl AgentFrontMatter {
     fn from_agent(agent: &Agent) -> Self {
         Self {
             model_id: agent.model_id.clone(),
+            model_fallbacks: agent.model_fallbacks.clone(),
+            retry: agent.retry.clone(),
             temperature: agent.temperature,
             top_p: agent.top_p,
             use_tools: agent.use_tools.clone(),
@@ -600,6 +655,8 @@ impl AgentFrontMatter {
 
     fn is_empty(&self) -> bool {
         self.model_id.is_none()
+            && self.model_fallbacks.is_empty()
+            && self.retry.is_none()
             && self.temperature.is_none()
             && self.top_p.is_none()
             && self.use_tools.is_none()

@@ -125,7 +125,7 @@ async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<Embedding
     let status = res.status();
     let data: Value = res.json().await?;
     if !status.is_success() {
-        catch_error(&data, status.as_u16())?;
+        catch_error(&data, status.as_u16(), None)?;
     }
     let res_body: EmbeddingsResBody =
         serde_json::from_value(data).context("Invalid embeddings data")?;

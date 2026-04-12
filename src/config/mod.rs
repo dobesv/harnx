@@ -2,7 +2,7 @@ mod agent;
 mod input;
 pub mod session;
 
-pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
+pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables, RetryConfig};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
@@ -244,6 +244,8 @@ pub struct Config {
     pub hooks: Option<HooksConfig>,
 
     #[serde(skip)]
+    pub model_cooldowns: std::sync::Arc<parking_lot::Mutex<crate::client::retry::ModelCooldownMap>>,
+    #[serde(skip)]
     pub macro_flag: bool,
     #[serde(skip)]
     pub info_flag: bool,
@@ -378,6 +380,7 @@ impl Clone for Config {
             mcp_servers: self.mcp_servers.clone(),
             acp_servers: self.acp_servers.clone(),
             hooks: self.hooks.clone(),
+            model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
             info_flag: self.info_flag,
             agent_variables: self.agent_variables.clone(),
@@ -450,6 +453,7 @@ impl Default for Config {
 
             hooks: None,
 
+            model_cooldowns: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
             macro_flag: false,
             info_flag: false,
             agent_variables: None,

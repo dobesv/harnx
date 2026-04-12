@@ -324,6 +324,9 @@ pub struct ModelData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<Vec<String>>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_cooldown_secs: Option<u64>,
+
     // embedding-only properties
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens_per_chunk: Option<usize>,
