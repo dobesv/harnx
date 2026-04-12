@@ -2729,7 +2729,8 @@ impl Config {
 
         // Config::clients is #[serde(skip)], so it's empty after from_value.
         // We must populate it manually.
-        config.clients = vec![serde_json::from_value(client).context("Failed to parse client config")?];
+        config.clients =
+            vec![serde_json::from_value(client).context("Failed to parse client config")?];
 
         let config_dir = Self::config_dir();
         config.mcp_servers =
@@ -3294,9 +3295,8 @@ async fn create_config_file(config_path: &Path) -> Result<()> {
     let (model, clients_config) = create_client_config(client).await?;
     let config = serde_json::json!({ "model": model });
     let config_data = serde_yaml::to_string(&config).with_context(|| "Failed to create config")?;
-    let config_data = format!(
-        "# see https://github.com/dobesv/harnx/blob/main/example_config\n\n{config_data}"
-    );
+    let config_data =
+        format!("# see https://github.com/dobesv/harnx/blob/main/example_config\n\n{config_data}");
 
     ensure_parent_exists_async(config_path).await?;
     tokio::fs::write(config_path, config_data)
