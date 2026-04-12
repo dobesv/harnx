@@ -1,0 +1,7 @@
+command: harnx-mcp-bash
+roots:
+  - "$HOME"
+description: >-
+  Allow the agent to run commands or script snippets
+rename_tools:
+  exec: Bash

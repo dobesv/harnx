@@ -1,0 +1,10 @@
+command: uvx
+args:
+  - "--python"
+  - "3.13"
+  - "wet-mcp"
+enabled: true
+description: >
+  Web Extended Toolkit. Uses SearXNG to aggregate results from Google, Bing,
+  DuckDuckGo, and Brave. Converts web pages into clean Markdown/Text.
+  Performs multi-page BFS crawling with depth control.

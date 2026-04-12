@@ -1,0 +1,32 @@
+# ---- llm ----
+model: openai:gpt-4o             # Specify the LLM to use
+stream: true
+
+# ---- behavior ----
+save_session: true
+keybindings: emacs
+
+# ---- tool-use ----
+tool_use: true
+use_tools: '*'
+toolsets:
+  fs_read:
+    - Read
+    - ListDirectory
+    - Grep
+    - Glob
+  fs_write:
+    - Write
+    - Edit
+
+# ---- default sessions ----
+# cmd_default_session: $GIT_BRANCH-$GIT_PATH
+# agent_default_session: $GIT_BRANCH-$GIT_PATH
+
+# ---- hooks ----
+# hooks:
+#   entries:
+#   - event: PreToolUse
+#     type: claude-command
+#     matcher: "Bash"
+#     command: "dcg"

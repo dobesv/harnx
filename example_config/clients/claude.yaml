@@ -1,0 +1,9 @@
+type: claude
+# api_key: xxx   # or set CLAUDE_API_KEY in .env
+# api_base: https://api.anthropic.com/v1   # optional
+patch:
+  chat_completions:
+    '.*':
+      body:
+        cache_control:
+          type: ephemeral

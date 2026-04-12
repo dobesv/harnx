@@ -1,0 +1,12 @@
+command: harnx-mcp-fs
+roots:
+  - "$HOME"
+description: >-
+  Agent filesystem access
+rename_tools:
+  read: Read
+  write: Write
+  edit: Edit
+  ls: ListDirectory
+  grep: Grep
+  find: Glob

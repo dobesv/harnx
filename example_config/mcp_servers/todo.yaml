@@ -1,0 +1,8 @@
+command: harnx-mcp-todo
+enabled: true
+description: >-
+  File-based todo/plan management. Provides todo_list, todo_get, todo_create,
+  todo_update, todo_append, todo_delete, read_plan, write_plan, and plan_add_note.
+args:
+  - "--dir"
+  - ".agent/todos"
