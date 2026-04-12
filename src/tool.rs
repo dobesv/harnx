@@ -287,6 +287,48 @@ impl JsonSchema {
             None => true,
         }
     }
+
+    /// Simplify the schema for providers that don't support `anyOf` (e.g. Gemini).
+    ///
+    /// * `anyOf: [<schema>, {"type":"null"}]` → the non-null schema (makes
+    ///   `Option<T>` transparent).
+    /// * Recursively applied to `properties` and `items`.
+    pub fn flatten_any_of(mut self) -> Self {
+        // Resolve top-level anyOf with a single non-null variant
+        if let Some(variants) = self.any_of.take() {
+            let non_null: Vec<JsonSchema> = variants
+                .into_iter()
+                .filter(|v| v.type_value.as_deref() != Some("null"))
+                .collect();
+            if non_null.len() == 1 {
+                let mut inner = non_null.into_iter().next().unwrap().flatten_any_of();
+                // Preserve description from the outer schema if the inner one lacks it
+                if inner.description.is_none() {
+                    inner.description = self.description;
+                }
+                return inner;
+            }
+            // Put back if we can't simplify
+            self.any_of = Some(non_null.into_iter().map(|v| v.flatten_any_of()).collect());
+        }
+
+        // Recurse into properties
+        if let Some(properties) = self.properties.take() {
+            self.properties = Some(
+                properties
+                    .into_iter()
+                    .map(|(k, v)| (k, v.flatten_any_of()))
+                    .collect(),
+            );
+        }
+
+        // Recurse into items
+        if let Some(items) = self.items.take() {
+            self.items = Some(Box::new((*items).flatten_any_of()));
+        }
+
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -832,5 +874,60 @@ mod tests {
         }
 
         clear_ui_output_sender();
+    }
+
+    #[test]
+    fn test_flatten_any_of_nullable_array() {
+        // Simulates Option<Vec<String>> schema: anyOf: [{type: "array", items: {type: "string"}}, {type: "null"}]
+        let schema = JsonSchema {
+            type_value: Some("object".to_string()),
+            properties: Some(IndexMap::from([(
+                "tags".to_string(),
+                JsonSchema {
+                    description: Some("Optional tags".to_string()),
+                    any_of: Some(vec![
+                        JsonSchema {
+                            type_value: Some("array".to_string()),
+                            items: Some(Box::new(JsonSchema {
+                                type_value: Some("string".to_string()),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                        JsonSchema {
+                            type_value: Some("null".to_string()),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                },
+            )])),
+            ..Default::default()
+        };
+
+        let flattened = schema.flatten_any_of();
+        let props = flattened.properties.unwrap();
+        let tags = props.get("tags").unwrap();
+
+        // anyOf should be resolved: the property should now be a plain array
+        assert!(tags.any_of.is_none());
+        assert_eq!(tags.type_value.as_deref(), Some("array"));
+        assert_eq!(tags.description.as_deref(), Some("Optional tags"));
+        assert_eq!(
+            tags.items.as_ref().and_then(|i| i.type_value.as_deref()),
+            Some("string")
+        );
+    }
+
+    #[test]
+    fn test_flatten_any_of_no_change_for_plain_schema() {
+        let schema = JsonSchema {
+            type_value: Some("string".to_string()),
+            description: Some("A name".to_string()),
+            ..Default::default()
+        };
+        let flattened = schema.flatten_any_of();
+        assert_eq!(flattened.type_value.as_deref(), Some("string"));
+        assert_eq!(flattened.description.as_deref(), Some("A name"));
     }
 }

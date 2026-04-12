@@ -467,6 +467,7 @@ pub fn gemini_build_chat_completions_body(
 
     if let Some(functions) = functions {
         // Gemini doesn't support functions with parameters that have empty properties, so we need to patch it.
+        // It also doesn't support `anyOf`, so we flatten nullable wrappers (e.g. Option<Vec<String>>).
         let function_declarations: Vec<_> = functions
             .into_iter()
             .map(|function| {
@@ -476,7 +477,9 @@ pub fn gemini_build_chat_completions_body(
                         "description": function.description,
                     })
                 } else {
-                    json!(function)
+                    let mut func = function;
+                    func.parameters = func.parameters.flatten_any_of();
+                    json!(func)
                 }
             })
             .collect();
