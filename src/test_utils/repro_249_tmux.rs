@@ -68,35 +68,39 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
     tmux.send_keys(&["Enter"])?;
 
     // Step 2: Export PATH and cd to repo root for subsequent commands
+    //
+    // Each step uses a unique marker. The wait_for predicate requires the
+    // marker to appear at least twice in the pane: once in the echoed command
+    // line and once as actual output, ensuring the command has finished.
     tmux.send_text(&format!(
-        "export PATH={} && cd {}; printf '__READY__\\n'",
+        "export PATH={} && cd {}; printf '__READY_2__\\n'",
         shell_escape(&path_env),
         shell_escape(repo_root.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| screen.contains("__READY__"))?;
+    tmux.wait_for(Duration::from_secs(5), |screen| {
+        count_occurrences(screen, "__READY_2__") >= 2
+    })?;
 
     // Step 3: Run diagnostics - list agents
     tmux.send_text(&format!(
-        "{}; printf '__READY__\\n'",
-        format!(
-            "{} --list-agents",
-            shell_escape(harnx_bin.to_string_lossy().as_ref())
-        )
+        "{} --list-agents; printf '__READY_3__\\n'",
+        shell_escape(harnx_bin.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| screen.contains("__READY__"))?;
+    tmux.wait_for(Duration::from_secs(5), |screen| {
+        count_occurrences(screen, "__READY_3__") >= 2
+    })?;
 
     // Step 4: Run diagnostics - list models
     tmux.send_text(&format!(
-        "{}; printf '__READY__\\n'",
-        format!(
-            "{} --list-models",
-            shell_escape(harnx_bin.to_string_lossy().as_ref())
-        )
+        "{} --list-models; printf '__READY_4__\\n'",
+        shell_escape(harnx_bin.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| screen.contains("__READY__"))?;
+    tmux.wait_for(Duration::from_secs(5), |screen| {
+        count_occurrences(screen, "__READY_4__") >= 2
+    })?;
 
     // Step 5: Launch the test agent
     tmux.send_text(&format!(
@@ -174,10 +178,17 @@ impl TestPaths {
 }
 
 fn script() -> MockOpenAiScript {
+    // The mock LLM is shared between the parent and sub-agent processes.
+    // Turns are consumed in order across both processes:
+    //   Turn 0 (parent)    : delegate to the sub-agent via ACP tool call
+    //   Turn 1 (sub-agent) : call the MCP tool repro249_unique_mcp_tool
+    //   Turn 2 (sub-agent) : summarize the MCP tool result (ends the sub-agent)
+    //   Turn 3 (parent)    : final summary after delegation returns
     MockOpenAiScript {
         turns: vec![
+            // Turn 0: parent delegates to sub-agent
             MockOpenAiTurn {
-                text_chunks: vec!["I'll delegate this to pytheas.".to_string()],
+                text_chunks: vec!["I'll delegate this to the sub-agent.".to_string()],
                 tool_calls: vec![MockOpenAiToolCall {
                     name: format!("{}_session_prompt", TEST_SUB_AGENT_NAME),
                     arguments: json!({
@@ -188,6 +199,23 @@ fn script() -> MockOpenAiScript {
                     id: Some("call_delegate_1".to_string()),
                 }],
             },
+            // Turn 1: sub-agent calls the MCP tool
+            MockOpenAiTurn {
+                text_chunks: vec!["Let me call the tool.".to_string()],
+                tool_calls: vec![MockOpenAiToolCall {
+                    name: REPRO_249_MCP_TOOL_NAME.to_string(),
+                    arguments: json!({}),
+                    id: Some("call_mcp_1".to_string()),
+                }],
+            },
+            // Turn 2: sub-agent summarizes after getting MCP tool result
+            MockOpenAiTurn {
+                text_chunks: vec![format!(
+                    "The tool returned: {REPRO_249_MCP_TOOL_RESPONSE}"
+                )],
+                tool_calls: vec![],
+            },
+            // Turn 3: parent summarizes after delegation returns
             MockOpenAiTurn {
                 text_chunks: vec![format!(
                     "The child used {REPRO_249_MCP_TOOL_NAME} and got: {REPRO_249_MCP_TOOL_RESPONSE}"
@@ -227,8 +255,9 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::write(
         paths.agents_dir.join(format!("{}.md", TEST_AGENT_NAME)),
         format!(
-            "---\nname: {}\nmodel: mock-llm:test\n---\nYou are {}. Delegate the task to {} and then summarize the result.\n",
+            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate the task to {} and then summarize the result.\n",
             TEST_AGENT_NAME,
+            TEST_SUB_AGENT_NAME,
             TEST_AGENT_NAME,
             TEST_SUB_AGENT_NAME,
         ),
@@ -236,8 +265,9 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::write(
         paths.agents_dir.join(format!("{}.md", TEST_SUB_AGENT_NAME)),
         format!(
-            "---\nname: {}\nmodel: mock-llm:test\n---\nYou are {}. Always call the MCP tool named {REPRO_249_MCP_TOOL_NAME} before replying.\n",
+            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}\n---\nYou are {}. Always call the MCP tool named {REPRO_249_MCP_TOOL_NAME} before replying.\n",
             TEST_SUB_AGENT_NAME,
+            REPRO_249_MCP_TOOL_NAME,
             TEST_SUB_AGENT_NAME,
         ),
     )?;
@@ -261,10 +291,8 @@ fn usage_line_present(screen: &str) -> bool {
 fn nested_mcp_tool_present(screen: &str) -> bool {
     // The nested tool call must appear as a real tool-call row in the parent
     // transcript, NOT just as text inside a response string.
-    // A real tool call row looks like "->️ repro249_unique_mcp_tool" or
-    // "-> repro249_unique_mcp_tool" (with the arrow prefix).
+    // A real tool call row looks like "->️ repro249_unique_mcp_tool"
     screen.contains(&format!("->️ {}", REPRO_249_MCP_TOOL_NAME))
-        || screen.contains(&format!("-> {}", REPRO_249_MCP_TOOL_NAME))
 }
 
 fn repo_root() -> Result<PathBuf> {
@@ -287,6 +315,10 @@ fn shell_escape(input: &str) -> String {
     }
     // Escape single quotes for shell by replacing ' with '"'"'
     format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
 }
 
 fn yaml_escape(input: &str) -> String {

@@ -168,10 +168,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
             Ok(n) => {
                 buffer.extend_from_slice(&temp_buf[..n]);
                 // Check if we have the full headers (ending with \r\n\r\n)
-                if let Some(pos) = buffer
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                {
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
                     break pos + 4;
                 }
                 // Prevent unbounded growth while waiting for headers
@@ -192,7 +189,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) {
 
     let mut content_length = 0usize;
     for line in headers_str.lines() {
-        if let Some(value) = line.strip_prefix("Content-Length:") {
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
             content_length = value.trim().parse().unwrap_or(0);
             break;
         }
@@ -269,7 +266,6 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut Tcp
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let turn = state.next_turn();
-    let full_text = turn.text_chunks.join("");
     let tool_calls: Vec<Value> = turn
         .tool_calls
         .iter()
@@ -287,8 +283,14 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut Tcp
         .collect();
 
     if is_stream {
-        write_streaming_response(stream, &full_text, &tool_calls);
+        write_streaming_response(
+            stream,
+            &turn.text_chunks,
+            state.script.chunk_delay_ms,
+            &tool_calls,
+        );
     } else {
+        let full_text = turn.text_chunks.join("");
         write_json_response(
             stream,
             &build_non_streaming_response(&full_text, tool_calls),
@@ -296,11 +298,28 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut Tcp
     }
 }
 
-fn write_streaming_response(stream: &mut TcpStream, text: &str, tool_calls: &[Value]) {
-    let mut body = String::new();
+fn write_streaming_response(
+    stream: &mut TcpStream,
+    text_chunks: &[String],
+    chunk_delay_ms: u64,
+    tool_calls: &[Value],
+) {
+    // Write HTTP headers for SSE (no Content-Length so we can flush per-event).
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.flush();
 
-    if !text.is_empty() {
-        body.push_str(&format!(
+    let delay = Duration::from_millis(chunk_delay_ms);
+
+    // Emit one SSE event per text chunk, preserving ordering.
+    for (i, chunk) in text_chunks.iter().enumerate() {
+        if chunk.is_empty() {
+            continue;
+        }
+        if i > 0 && chunk_delay_ms > 0 {
+            thread::sleep(delay);
+        }
+        let event = format!(
             "data: {}\n\n",
             json!({
                 "id": "chatcmpl-mock",
@@ -309,15 +328,21 @@ fn write_streaming_response(stream: &mut TcpStream, text: &str, tool_calls: &[Va
                 "model": "mock-llm",
                 "choices": [{
                     "index": 0,
-                    "delta": {"role": "assistant", "content": text},
+                    "delta": {"role": "assistant", "content": chunk},
                     "finish_reason": Value::Null
                 }]
             })
-        ));
+        );
+        let _ = stream.write_all(event.as_bytes());
+        let _ = stream.flush();
     }
 
+    // Emit tool_calls or stop event.
     if !tool_calls.is_empty() {
-        body.push_str(&format!(
+        if chunk_delay_ms > 0 && !text_chunks.is_empty() {
+            thread::sleep(delay);
+        }
+        let event = format!(
             "data: {}\n\n",
             json!({
                 "id": "chatcmpl-mock",
@@ -330,9 +355,11 @@ fn write_streaming_response(stream: &mut TcpStream, text: &str, tool_calls: &[Va
                     "finish_reason": "tool_calls"
                 }]
             })
-        ));
+        );
+        let _ = stream.write_all(event.as_bytes());
+        let _ = stream.flush();
     } else {
-        body.push_str(&format!(
+        let event = format!(
             "data: {}\n\n",
             json!({
                 "id": "chatcmpl-mock",
@@ -345,11 +372,13 @@ fn write_streaming_response(stream: &mut TcpStream, text: &str, tool_calls: &[Va
                     "finish_reason": "stop"
                 }]
             })
-        ));
+        );
+        let _ = stream.write_all(event.as_bytes());
+        let _ = stream.flush();
     }
 
-    body.push_str("data: [DONE]\n\n");
-    write_http_response(stream, "200 OK", "text/event-stream", &body);
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+    let _ = stream.flush();
 }
 
 fn build_non_streaming_response(text: &str, tool_calls: Vec<Value>) -> Value {

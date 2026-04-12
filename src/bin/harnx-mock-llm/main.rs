@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -325,9 +326,6 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut std
         },
     };
 
-    // Combine text chunks
-    let full_text = turn.text_chunks.join("");
-
     // Build tool calls array
     let tool_calls: Vec<Value> = turn
         .tool_calls
@@ -346,8 +344,14 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut std
         .collect();
 
     if is_stream {
-        write_streaming_response(stream, &full_text, &tool_calls);
+        write_streaming_response(
+            stream,
+            &turn.text_chunks,
+            state.script.chunk_delay_ms,
+            &tool_calls,
+        );
     } else {
+        let full_text = turn.text_chunks.join("");
         let response = build_non_streaming_response(&full_text, tool_calls);
         let response_str = response.to_string();
         let http_response = format!(
@@ -360,11 +364,28 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut std
     }
 }
 
-fn write_streaming_response(stream: &mut std::net::TcpStream, text: &str, tool_calls: &[Value]) {
-    let mut body = String::new();
+fn write_streaming_response(
+    stream: &mut std::net::TcpStream,
+    text_chunks: &[String],
+    chunk_delay_ms: u64,
+    tool_calls: &[Value],
+) {
+    // Write HTTP headers for SSE (no Content-Length so we can flush per-event).
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.flush();
 
-    if !text.is_empty() {
-        body.push_str(&format!(
+    let delay = Duration::from_millis(chunk_delay_ms);
+
+    // Emit one SSE event per text chunk, preserving ordering.
+    for (i, chunk) in text_chunks.iter().enumerate() {
+        if chunk.is_empty() {
+            continue;
+        }
+        if i > 0 && chunk_delay_ms > 0 {
+            thread::sleep(delay);
+        }
+        let event = format!(
             "data: {}\n\n",
             json!({
                 "id": "chatcmpl-mock",
@@ -373,15 +394,21 @@ fn write_streaming_response(stream: &mut std::net::TcpStream, text: &str, tool_c
                 "model": "mock-llm",
                 "choices": [{
                     "index": 0,
-                    "delta": {"role": "assistant", "content": text},
+                    "delta": {"role": "assistant", "content": chunk},
                     "finish_reason": serde_json::Value::Null
                 }]
             })
-        ));
+        );
+        let _ = stream.write_all(event.as_bytes());
+        let _ = stream.flush();
     }
 
+    // Emit tool_calls or stop event.
     if !tool_calls.is_empty() {
-        body.push_str(&format!(
+        if chunk_delay_ms > 0 && !text_chunks.is_empty() {
+            thread::sleep(delay);
+        }
+        let event = format!(
             "data: {}\n\n",
             json!({
                 "id": "chatcmpl-mock",
@@ -394,9 +421,11 @@ fn write_streaming_response(stream: &mut std::net::TcpStream, text: &str, tool_c
                     "finish_reason": "tool_calls"
                 }]
             })
-        ));
+        );
+        let _ = stream.write_all(event.as_bytes());
+        let _ = stream.flush();
     } else {
-        body.push_str(&format!(
+        let event = format!(
             "data: {}\n\n",
             json!({
                 "id": "chatcmpl-mock",
@@ -409,17 +438,12 @@ fn write_streaming_response(stream: &mut std::net::TcpStream, text: &str, tool_c
                     "finish_reason": "stop"
                 }]
             })
-        ));
+        );
+        let _ = stream.write_all(event.as_bytes());
+        let _ = stream.flush();
     }
 
-    body.push_str("data: [DONE]\n\n");
-
-    let http_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(http_response.as_bytes());
+    let _ = stream.write_all(b"data: [DONE]\n\n");
     let _ = stream.flush();
 }
 

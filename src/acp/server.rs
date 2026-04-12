@@ -344,6 +344,27 @@ impl acp::Agent for HarnxAgent {
                     agent: self.agent_name.clone(),
                     session_id: Some(session_key.clone()),
                 });
+
+                // Notify the parent about each tool call so it appears in the
+                // parent transcript.  The `emit_ui_output_event` inside
+                // `eval_mcp_async` only works when a UI sink is installed
+                // (i.e. in the TUI process).  In ACP-server mode there is no
+                // UI sink, so we send the notification directly over the ACP
+                // connection.
+                let conn = self.connection.borrow().clone();
+                if let Some(conn) = conn {
+                    for call in &tool_calls {
+                        let tool_call_id = call.id.clone().unwrap_or_else(|| call.name.clone());
+                        let tc = acp::ToolCall::new(tool_call_id, call.name.clone())
+                            .raw_input(call.arguments.clone());
+                        let notification = acp::SessionNotification::new(
+                            acp::SessionId::new(session_key.clone()),
+                            acp::SessionUpdate::ToolCall(tc),
+                        );
+                        let _ = conn.session_notification(notification).await;
+                    }
+                }
+
                 let acp_manager = self.config.read().acp_manager.clone();
                 let result = if let Some(ref manager) = acp_manager {
                     let (mut chunk_rx, subscription_id) = manager.subscribe_chunks().await;
@@ -377,8 +398,13 @@ impl acp::Agent for HarnxAgent {
                         }
                     });
 
-                    let result =
-                        eval_tool_calls_async(&self.config, tool_calls, &abort_signal, source.clone()).await;
+                    let result = eval_tool_calls_async(
+                        &self.config,
+                        tool_calls,
+                        &abort_signal,
+                        source.clone(),
+                    )
+                    .await;
 
                     manager.unsubscribe_chunks(subscription_id).await;
                     let _ = forward_task.await;
