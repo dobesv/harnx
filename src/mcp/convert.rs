@@ -19,10 +19,16 @@ pub fn mcp_tool_to_declaration(
 }
 
 fn convert_json_schema(schema: &Value) -> Result<JsonSchema> {
-    let type_value = schema
-        .get("type")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+    let type_value = schema.get("type").and_then(|v| match v {
+        Value::String(s) => Some(s.clone()),
+        // schemars 1.x encodes `Option<T>` as `"type": ["<actual>", "null"]`
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|s| *s != "null")
+            .map(ToOwned::to_owned),
+        _ => None,
+    });
     let description = schema
         .get("description")
         .and_then(Value::as_str)
@@ -169,6 +175,27 @@ mod tests {
                 .get("format")
                 .and_then(|schema| schema.enum_value.as_deref()),
             Some(&["json".to_string(), "text".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn mcp_convert_json_schema_handles_nullable_array_type() {
+        // schemars 1.x produces `"type": ["array", "null"]` for `Option<Vec<String>>`
+        let schema = json!({
+            "type": ["array", "null"],
+            "items": {
+                "type": "string"
+            }
+        });
+
+        let converted = convert_json_schema(&schema).expect("convert schema");
+        assert_eq!(converted.type_value.as_deref(), Some("array"));
+        assert_eq!(
+            converted
+                .items
+                .as_ref()
+                .and_then(|i| i.type_value.as_deref()),
+            Some("string")
         );
     }
 
