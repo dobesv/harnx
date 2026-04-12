@@ -130,10 +130,7 @@ impl AcpNotificationClient {
 
         // Always emit to the parent UI sink so the TUI transcript shows nested
         // sub-agent events (tool calls, thoughts, etc.) regardless of whether
-        // a chunk forwarder is also registered.  This fixes issue #249 where
-        // delegated sub-agent internal MCP tool calls were invisible in the
-        // parent transcript because the forwarder was treated as an exclusive
-        // destination.
+        // a chunk forwarder is also registered.
         let emitted_to_ui = emit_ui_output_event(event.clone());
 
         // Also forward to any registered chunk forwarders (e.g. the REPL
