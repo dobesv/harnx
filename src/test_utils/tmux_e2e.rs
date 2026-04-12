@@ -1,14 +1,14 @@
 #![cfg(test)]
 
+use crate::acp::AcpServerConfig;
+use crate::mcp::McpServerConfig;
 use crate::test_utils::{
     MockOpenAiScript, MockOpenAiServer, MockOpenAiToolCall, MockOpenAiTurn, TmuxHarness,
 };
 
 use anyhow::{Context, Result};
 use insta::assert_snapshot;
-use serde::Serialize;
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -174,48 +174,6 @@ struct TestPaths {
     port: u16,
 }
 
-#[derive(Serialize)]
-struct FixtureConfig {
-    save: bool,
-    clients: Vec<FixtureClient>,
-    mcp_servers: Vec<FixtureMcpServer>,
-    acp_servers: Vec<FixtureAcpServer>,
-}
-
-#[derive(Serialize)]
-struct FixtureClient {
-    #[serde(rename = "type")]
-    client_type: &'static str,
-    name: &'static str,
-    api_base: String,
-    api_key: &'static str,
-    models: Vec<FixtureModel>,
-}
-
-#[derive(Serialize)]
-struct FixtureModel {
-    name: &'static str,
-    max_input_tokens: u32,
-    max_output_tokens: u32,
-    supports_tool_use: bool,
-}
-
-#[derive(Serialize)]
-struct FixtureMcpServer {
-    name: &'static str,
-    command: String,
-    enabled: bool,
-    rename_tools: BTreeMap<&'static str, &'static str>,
-}
-
-#[derive(Serialize)]
-struct FixtureAcpServer {
-    name: &'static str,
-    command: String,
-    args: Vec<String>,
-    enabled: bool,
-}
-
 impl TestPaths {
     fn new(temp_root: &Path, port: u16) -> Result<Self> {
         let harnx_config_dir = temp_root.join("harnx");
@@ -295,37 +253,98 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
         .join("debug")
         .join(binary_name("harnx"));
 
-    let mut rename_tools = BTreeMap::new();
-    rename_tools.insert(REPRO_249_MCP_TOOL_NAME, REPRO_249_MCP_TOOL_NAME);
+    std::fs::write(
+        &paths.config_path,
+        "save: false
+",
+    )?;
 
-    let config = FixtureConfig {
-        save: false,
-        clients: vec![FixtureClient {
-            client_type: "openai-compatible",
-            name: "mock-llm",
-            api_base: format!("http://127.0.0.1:{}/v1", paths.port),
-            api_key: "dummy",
-            models: vec![FixtureModel {
-                name: "test",
-                max_input_tokens: 32000,
-                max_output_tokens: 4096,
-                supports_tool_use: true,
-            }],
-        }],
-        mcp_servers: vec![FixtureMcpServer {
-            name: "repro249",
-            command: fake_mcp_server.to_string_lossy().into_owned(),
-            enabled: true,
-            rename_tools,
-        }],
-        acp_servers: vec![FixtureAcpServer {
-            name: TEST_SUB_AGENT_NAME,
-            command: harnx_bin.to_string_lossy().into_owned(),
-            args: vec!["--acp".to_string(), TEST_SUB_AGENT_NAME.to_string()],
-            enabled: true,
-        }],
+    let clients_dir = paths.harnx_config_dir.join("clients");
+    let mcp_servers_dir = paths.harnx_config_dir.join("mcp_servers");
+    let acp_servers_dir = paths.harnx_config_dir.join("acp_servers");
+    std::fs::create_dir_all(&clients_dir)?;
+    std::fs::create_dir_all(&mcp_servers_dir)?;
+    std::fs::create_dir_all(&acp_servers_dir)?;
+    let client = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
+        (
+            serde_yaml::Value::String("type".to_string()),
+            serde_yaml::Value::String("openai-compatible".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("name".to_string()),
+            serde_yaml::Value::String("mock-llm".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("api_base".to_string()),
+            serde_yaml::Value::String(format!("http://127.0.0.1:{}/v1", paths.port)),
+        ),
+        (
+            serde_yaml::Value::String("api_key".to_string()),
+            serde_yaml::Value::String("dummy".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("models".to_string()),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(
+                serde_yaml::Mapping::from_iter([
+                    (
+                        serde_yaml::Value::String("name".to_string()),
+                        serde_yaml::Value::String("test".to_string()),
+                    ),
+                    (
+                        serde_yaml::Value::String("max_input_tokens".to_string()),
+                        serde_yaml::Value::Number(32000.into()),
+                    ),
+                    (
+                        serde_yaml::Value::String("max_output_tokens".to_string()),
+                        serde_yaml::Value::Number(4096.into()),
+                    ),
+                    (
+                        serde_yaml::Value::String("supports_tool_use".to_string()),
+                        serde_yaml::Value::Bool(true),
+                    ),
+                ]),
+            )]),
+        ),
+    ]));
+    std::fs::write(
+        clients_dir.join("mock-llm.yaml"),
+        serde_yaml::to_string(&client)?,
+    )?;
+
+    let mut rename_tools = std::collections::HashMap::new();
+    rename_tools.insert(
+        REPRO_249_MCP_TOOL_NAME.to_string(),
+        REPRO_249_MCP_TOOL_NAME.to_string(),
+    );
+    let mcp_server = McpServerConfig {
+        name: "repro249".to_string(),
+        command: fake_mcp_server.to_string_lossy().into_owned(),
+        args: vec![],
+        env: Default::default(),
+        roots: vec![],
+        enabled: true,
+        description: None,
+        rename_tools,
     };
-    std::fs::write(&paths.config_path, serde_yaml::to_string(&config)?)?;
+    std::fs::write(
+        mcp_servers_dir.join("repro249.yaml"),
+        serde_yaml::to_string(&mcp_server)?,
+    )?;
+
+    let acp_server = AcpServerConfig {
+        name: TEST_SUB_AGENT_NAME.to_string(),
+        command: harnx_bin.to_string_lossy().into_owned(),
+        args: vec!["--acp".to_string(), TEST_SUB_AGENT_NAME.to_string()],
+        env: Default::default(),
+        enabled: true,
+        description: None,
+        idle_timeout_secs: 300,
+        operation_timeout_secs: 3600,
+    };
+    std::fs::write(
+        acp_servers_dir.join(format!("{}.yaml", TEST_SUB_AGENT_NAME)),
+        serde_yaml::to_string(&acp_server)?,
+    )?;
     std::fs::write(
         paths.agents_dir.join(format!("{}.md", TEST_AGENT_NAME)),
         format!(
@@ -647,29 +666,76 @@ fn write_handoff_fixture_files(paths: &TestPaths) -> Result<()> {
         .join("debug")
         .join(binary_name("harnx"));
 
-    let config = FixtureConfig {
-        save: false,
-        clients: vec![FixtureClient {
-            client_type: "openai-compatible",
-            name: "mock-llm",
-            api_base: format!("http://127.0.0.1:{}/v1", paths.port),
-            api_key: "dummy",
-            models: vec![FixtureModel {
-                name: "test",
-                max_input_tokens: 32000,
-                max_output_tokens: 4096,
-                supports_tool_use: true,
-            }],
-        }],
-        mcp_servers: vec![],
-        acp_servers: vec![FixtureAcpServer {
-            name: HANDOFF_SUB_AGENT_NAME,
-            command: harnx_bin.to_string_lossy().into_owned(),
-            args: vec!["--acp".to_string(), HANDOFF_SUB_AGENT_NAME.to_string()],
-            enabled: true,
-        }],
+    std::fs::write(
+        &paths.config_path,
+        "save: false
+",
+    )?;
+
+    let clients_dir = paths.harnx_config_dir.join("clients");
+    let acp_servers_dir = paths.harnx_config_dir.join("acp_servers");
+    std::fs::create_dir_all(&clients_dir)?;
+    std::fs::create_dir_all(&acp_servers_dir)?;
+    let client = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
+        (
+            serde_yaml::Value::String("type".to_string()),
+            serde_yaml::Value::String("openai-compatible".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("name".to_string()),
+            serde_yaml::Value::String("mock-llm".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("api_base".to_string()),
+            serde_yaml::Value::String(format!("http://127.0.0.1:{}/v1", paths.port)),
+        ),
+        (
+            serde_yaml::Value::String("api_key".to_string()),
+            serde_yaml::Value::String("dummy".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("models".to_string()),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(
+                serde_yaml::Mapping::from_iter([
+                    (
+                        serde_yaml::Value::String("name".to_string()),
+                        serde_yaml::Value::String("test".to_string()),
+                    ),
+                    (
+                        serde_yaml::Value::String("max_input_tokens".to_string()),
+                        serde_yaml::Value::Number(32000.into()),
+                    ),
+                    (
+                        serde_yaml::Value::String("max_output_tokens".to_string()),
+                        serde_yaml::Value::Number(4096.into()),
+                    ),
+                    (
+                        serde_yaml::Value::String("supports_tool_use".to_string()),
+                        serde_yaml::Value::Bool(true),
+                    ),
+                ]),
+            )]),
+        ),
+    ]));
+    std::fs::write(
+        clients_dir.join("mock-llm.yaml"),
+        serde_yaml::to_string(&client)?,
+    )?;
+
+    let acp_server = AcpServerConfig {
+        name: HANDOFF_SUB_AGENT_NAME.to_string(),
+        command: harnx_bin.to_string_lossy().into_owned(),
+        args: vec!["--acp".to_string(), HANDOFF_SUB_AGENT_NAME.to_string()],
+        env: Default::default(),
+        enabled: true,
+        description: None,
+        idle_timeout_secs: 300,
+        operation_timeout_secs: 3600,
     };
-    std::fs::write(&paths.config_path, serde_yaml::to_string(&config)?)?;
+    std::fs::write(
+        acp_servers_dir.join(format!("{}.yaml", HANDOFF_SUB_AGENT_NAME)),
+        serde_yaml::to_string(&acp_server)?,
+    )?;
     std::fs::write(
         paths.agents_dir.join(format!("{}.md", HANDOFF_AGENT_NAME)),
         format!(
