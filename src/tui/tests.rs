@@ -960,6 +960,77 @@ async fn structured_ui_output_variants_render_in_transcript() {
 }
 
 #[tokio::test]
+async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: "pytheas_session_prompt".to_string(),
+            input_yaml: Some("message: Count files in /tmp".to_string()),
+            raw: None,
+        },
+        source: None,
+    }))
+    .await
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: "bash".to_string(),
+            input_yaml: Some("command: ls -1 /tmp | wc -l".to_string()),
+            raw: None,
+        },
+        source: Some(UiOutputSource {
+            agent: "pytheas".to_string(),
+            session_id: Some("session-nested".to_string()),
+        }),
+    }))
+    .await
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cached_tokens: 0,
+            session_label: Some("> pytheas ▸ session-nested".to_string()),
+        },
+        source: Some(UiOutputSource {
+            agent: "pytheas".to_string(),
+            session_id: Some("session-nested".to_string()),
+        }),
+    }))
+    .await
+    .unwrap();
+
+    let rendered: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .filter_map(|line| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            (!text.is_empty()).then_some(text)
+        })
+        .collect();
+
+    assert!(rendered.contains(&"->️ pytheas_session_prompt".to_string()));
+    assert!(rendered.contains(&"> pytheas ▸ session-nested".to_string()));
+    assert!(rendered.contains(&"->️ bash".to_string()));
+    assert!(rendered.contains(&"   command: ls -1 /tmp | wc -l".to_string()));
+    assert!(
+        rendered.contains(&"> pytheas ▸ session-nested   in 10   out 20".to_string()),
+        "rendered transcript missing nested usage line: {rendered:?}"
+    );
+}
+
+#[tokio::test]
 async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));

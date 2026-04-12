@@ -1089,6 +1089,7 @@ fn format_ui_event_for_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::Client as _;
     use serde_json::json;
 
     #[test]
@@ -1202,5 +1203,100 @@ mod tests {
         assert!(rendered.contains("Line one from sub-agent"));
         assert!(rendered.contains("Line two from sub-agent"));
         assert!(rendered.contains('\n'));
+    }
+
+    #[test]
+    fn resolve_notification_source_uses_nested_tool_call_metadata() {
+        let notification = acp::SessionNotification::new(
+            acp::SessionId::new("outer-session"),
+            acp::SessionUpdate::ToolCall(acp::ToolCall::new("ls", "path: /tmp").meta(
+                serde_json::Map::from_iter([
+                    ("agent".to_string(), json!("pytheas")),
+                    (
+                        "session".to_string(),
+                        json!("608e48b6-c880-4168-b028-1bda3469be07"),
+                    ),
+                ]),
+            )),
+        );
+
+        let source = resolve_notification_source("working", &notification);
+        assert_eq!(source.agent, "pytheas");
+        assert_eq!(
+            source.session_id.as_deref(),
+            Some("608e48b6-c880-4168-b028-1bda3469be07")
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_tool_call_notification_preserves_structured_event_for_tui_pipeline() {
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::ui_output::install_ui_output_sender(ui_tx);
+
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = acp::SessionNotification::new(
+            acp::SessionId::new("outer-session"),
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("call-1", "pytheas_session_prompt")
+                    .raw_input(json!({
+                        "message": "Count files in /tmp using ls first.",
+                        "session_id": "608e48b6-c880-4168-b028-1bda3469be07",
+                    }))
+                    .meta(serde_json::Map::from_iter([
+                        ("agent".to_string(), json!("pytheas")),
+                        (
+                            "session".to_string(),
+                            json!("608e48b6-c880-4168-b028-1bda3469be07"),
+                        ),
+                    ])),
+            ),
+        );
+
+        client.session_notification(notification).await.unwrap();
+
+        let forwarded = chunk_rx.recv().await.expect("forwarded nested ACP event");
+        let forwarded_event = match forwarded {
+            NestedAcpEvent::Ui(event) => event,
+            other => panic!("unexpected nested ACP event: {other:?}"),
+        };
+
+        match &forwarded_event.kind {
+            UiOutputEventKind::ToolCall {
+                tool_name,
+                input_yaml,
+                ..
+            } => {
+                assert_eq!(tool_name, "pytheas_session_prompt");
+                assert_eq!(
+                    input_yaml.as_deref(),
+                    Some(
+                        "message: Count files in /tmp using ls first.\nsession_id: 608e48b6-c880-4168-b028-1bda3469be07"
+                    )
+                );
+            }
+            other => panic!("unexpected forwarded event kind: {other:?}"),
+        }
+        assert_eq!(
+            forwarded_event.source.as_ref().map(|s| s.agent.as_str()),
+            Some("pytheas")
+        );
+        assert_eq!(
+            forwarded_event
+                .source
+                .as_ref()
+                .and_then(|s| s.session_id.as_deref()),
+            Some("608e48b6-c880-4168-b028-1bda3469be07")
+        );
     }
 }

@@ -386,8 +386,9 @@ impl Tui {
             }
             TuiEvent::ToolRoundComplete => {
                 // Intermediate tool round — prompt loop continues, don't clear llm_busy.
-                // Keep the current assistant streaming entry so follow-up text can
-                // continue without inserting a blank separator or synthetic status line.
+                // Flush any pending thought so follow-up thought after tool results
+                // starts a fresh block instead of appending to the earlier one.
+                self.flush_pending_thought();
                 self.pin_transcript_to_bottom();
             }
         }
