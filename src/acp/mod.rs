@@ -117,30 +117,6 @@ impl AcpManager {
                 session_prompt_with_abort(&client, session_id, message, tokio::signal::ctrl_c())
                     .await
             }
-            "session_handoff" => {
-                let message = required_string(&arguments, "prompt")?.to_owned();
-                let session_id = match optional_string(&arguments, "session_id")? {
-                    Some(session_id) => session_id.to_owned(),
-                    None => client.session_new().await?,
-                };
-
-                let mut response = session_prompt_with_abort(
-                    &client,
-                    session_id.clone(),
-                    message,
-                    tokio::signal::ctrl_c(),
-                )
-                .await?;
-                if let Some(obj) = response.as_object_mut() {
-                    obj.insert("action".to_string(), json!("switch_agent"));
-                    obj.insert(
-                        "agent".to_string(),
-                        json!(name.strip_suffix("_session_handoff").unwrap_or(name)),
-                    );
-                    obj.insert("session_id".to_string(), json!(session_id));
-                }
-                Ok(response)
-            }
             "session_load" => {
                 let session_id = required_string(&arguments, "session_id")?.to_owned();
                 client.session_load(&session_id).await?;
@@ -169,8 +145,7 @@ impl AcpManager {
                 continue;
             };
             match method {
-                "session_new" | "session_prompt" | "session_handoff" | "session_load"
-                | "session_cancel" => {
+                "session_new" | "session_prompt" | "session_load" | "session_cancel" => {
                     return Some((Arc::clone(client), method.to_string()));
                 }
                 _ => continue,

@@ -210,6 +210,7 @@ fn script() -> MockOpenAiScript {
                     }),
                     id: Some("call_delegate_1".to_string()),
                 }],
+                error: None,
             },
             // Turn 1: sub-agent calls the MCP tool
             MockOpenAiTurn {
@@ -219,6 +220,7 @@ fn script() -> MockOpenAiScript {
                     arguments: json!({}),
                     id: Some("call_mcp_1".to_string()),
                 }],
+                error: None,
             },
             // Turn 2: sub-agent summarizes after getting MCP tool result
             MockOpenAiTurn {
@@ -226,6 +228,7 @@ fn script() -> MockOpenAiScript {
                     "The tool returned: {REPRO_249_MCP_TOOL_RESPONSE}"
                 )],
                 tool_calls: vec![],
+                error: None,
             },
             // Turn 3: parent summarizes after delegation returns
             MockOpenAiTurn {
@@ -233,6 +236,7 @@ fn script() -> MockOpenAiScript {
                     "The child used {REPRO_249_MCP_TOOL_NAME} and got: {REPRO_249_MCP_TOOL_RESPONSE}"
                 )],
                 tool_calls: vec![],
+                error: None,
             },
         ],
         fallback_text: "No more scripted responses.".to_string(),
@@ -643,14 +647,17 @@ fn handoff_script() -> MockOpenAiScript {
                     }),
                     id: Some("call_handoff_1".to_string()),
                 }],
+                error: None,
             },
             MockOpenAiTurn {
                 text_chunks: vec![HANDOFF_FINAL_RESPONSE.to_string()],
                 tool_calls: vec![],
+                error: None,
             },
             MockOpenAiTurn {
                 text_chunks: vec![HANDOFF_REUSE_FOLLOWUP_RESPONSE.to_string()],
                 tool_calls: vec![],
+                error: None,
             },
         ],
         fallback_text: "No more scripted responses.".to_string(),

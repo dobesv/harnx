@@ -62,10 +62,27 @@ impl Tui {
         mut resume_count: u32,
         mut with_embeddings: bool,
     ) -> Result<()> {
+        let mut pending_switch: Option<crate::tool::SwitchAgentData> = None;
         loop {
             if input.is_empty() {
                 break;
             }
+
+            // Apply a deferred agent switch from the previous tool round.
+            if let Some(switch) = pending_switch.take() {
+                ctx.config.write().exit_agent()?;
+                Config::use_agent(
+                    &ctx.config,
+                    &switch.agent,
+                    switch.session_id.as_deref(),
+                    ctx.abort_signal.clone(),
+                )
+                .await?;
+                if switch.session_id.is_none() {
+                    ctx.config.write().empty_session()?;
+                }
+            }
+
             if with_embeddings {
                 input.use_embeddings(ctx.abort_signal.clone()).await?;
             }
@@ -159,19 +176,13 @@ impl Tui {
             };
 
             if !tool_results.is_empty() {
-                let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
-                if let Some(switch_agent) = switch_agent {
-                    ctx.config.write().exit_agent()?;
-                    Config::use_agent(
-                        &ctx.config,
-                        &switch_agent.agent,
-                        switch_agent.session_id.as_deref(),
-                        ctx.abort_signal.clone(),
-                    )
-                    .await?;
-                }
+                let merged_input = input.merge_tool_results(output, thought, tool_results.clone());
                 let _ = ctx.event_tx.send(TuiEvent::ToolRoundComplete);
-                input = input.merge_tool_results(output, thought, tool_results);
+                // Defer agent switch to the top of the next iteration so the
+                // TUI has a chance to render the tool-call row before the new
+                // agent's streaming output begins.
+                pending_switch = tool_results.iter().find_map(|v| v.switch_agent.clone());
+                input = merged_input;
                 with_embeddings = false;
                 continue;
             } else {

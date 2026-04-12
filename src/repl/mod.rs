@@ -1252,6 +1252,7 @@ async fn ask_inner(
     if !tool_results.is_empty() {
         let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
         if let Some(switch_agent) = switch_agent {
+            let merged_input = input.merge_tool_results(output, thought, tool_results.clone());
             config.write().exit_agent()?;
             crate::config::Config::use_agent(
                 config,
@@ -1263,11 +1264,10 @@ async fn ask_inner(
             if switch_agent.session_id.is_none() {
                 config.write().empty_session()?;
             }
-            let new_input = Input::from_str(config, &switch_agent.prompt, None);
             return Box::pin(ask_inner(
                 config,
                 abort_signal,
-                new_input,
+                merged_input,
                 true,
                 async_manager,
                 persistent_manager,

@@ -1,6 +1,6 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 807
+assertion_line: 832
 expression: rendered
 ---
 Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.

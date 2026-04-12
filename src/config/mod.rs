@@ -191,7 +191,7 @@ fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
             ToolDeclaration {
                 name: format!("{agent_name}_session_handoff"),
                 description: format!(
-                    "Exit the current interactive agent session and hand off to the '{agent_name}' agent. Auto-creates a target session if session_id is not provided, then sends the prompt and continues interaction in that agent session."
+                    "Exit the current interactive agent session and hand off to the '{agent_name}' agent. Resolves the target session internally (reusing session_id when provided, otherwise the current session), then continues interaction in that agent session with the supplied prompt."
                 ),
                 parameters: crate::tool::JsonSchema {
                     type_value: Some("object".to_string()),
