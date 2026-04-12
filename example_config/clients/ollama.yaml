@@ -1,0 +1,11 @@
+type: openai-compatible
+name: ollama
+api_base: http://localhost:11434/v1
+models:
+  - name: llama3.1
+    max_input_tokens: 128000
+    supports_tool_use: true
+  - name: nomic-embed-text
+    type: embedding
+    default_chunk_size: 1000
+    max_batch_size: 50

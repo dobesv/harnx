@@ -1,0 +1,7 @@
+# Note: set EXA_API_KEY in .env in the config folder
+command: npx
+args:
+  - "-y"
+  - "exa-mcp-server"
+enabled: true
+description: "Web search via Exa API"
