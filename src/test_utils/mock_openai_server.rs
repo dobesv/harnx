@@ -292,13 +292,13 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut Tcp
         });
         let body_str = body.to_string();
         let status_text = match error.status {
-            401 => "401 Unauthorized",
-            403 => "403 Forbidden",
-            429 => "429 Too Many Requests",
-            500 => "500 Internal Server Error",
-            502 => "502 Bad Gateway",
-            503 => "503 Service Unavailable",
-            _ => "400 Bad Request",
+            401 => format!("{} Unauthorized", error.status),
+            403 => format!("{} Forbidden", error.status),
+            429 => format!("{} Too Many Requests", error.status),
+            500 => format!("{} Internal Server Error", error.status),
+            502 => format!("{} Bad Gateway", error.status),
+            503 => format!("{} Service Unavailable", error.status),
+            other => format!("{other} Error"),
         };
         let mut extra_headers = String::new();
         for (key, value) in &error.headers {

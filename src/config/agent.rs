@@ -143,6 +143,8 @@ impl Agent {
         Self {
             name: name.to_string(),
             model_id: frontmatter.model_id,
+            model_fallbacks: frontmatter.model_fallbacks,
+            retry: frontmatter.retry,
             temperature: frontmatter.temperature,
             top_p: frontmatter.top_p,
             use_tools: frontmatter.use_tools,
@@ -599,6 +601,10 @@ struct AgentFrontMatter {
         skip_serializing_if = "Option::is_none"
     )]
     model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    model_fallbacks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry: Option<RetryConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -631,6 +637,8 @@ impl AgentFrontMatter {
     fn from_agent(agent: &Agent) -> Self {
         Self {
             model_id: agent.model_id.clone(),
+            model_fallbacks: agent.model_fallbacks.clone(),
+            retry: agent.retry.clone(),
             temperature: agent.temperature,
             top_p: agent.top_p,
             use_tools: agent.use_tools.clone(),
@@ -647,6 +655,8 @@ impl AgentFrontMatter {
 
     fn is_empty(&self) -> bool {
         self.model_id.is_none()
+            && self.model_fallbacks.is_empty()
+            && self.retry.is_none()
             && self.temperature.is_none()
             && self.top_p.is_none()
             && self.use_tools.is_none()

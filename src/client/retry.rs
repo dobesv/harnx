@@ -4,7 +4,7 @@ use super::{
 };
 use crate::config::{GlobalConfig, Input, RetryConfig};
 use crate::tool::ToolResult;
-use crate::utils::AbortSignal;
+use crate::utils::{wait_abort_signal, AbortSignal};
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -75,7 +75,12 @@ pub async fn call_with_retry_and_fallback(
 
     for model_id in &model_ids {
         // Skip models on cooldown
-        if config.read().model_cooldowns.is_on_cooldown(model_id) {
+        if config
+            .read()
+            .model_cooldowns
+            .lock()
+            .is_on_cooldown(model_id)
+        {
             debug!("Skipping model '{}' (on cooldown)", model_id);
             continue;
         }
@@ -89,8 +94,9 @@ pub async fn call_with_retry_and_fallback(
                     model_id, err
                 );
                 config
-                    .write()
+                    .read()
                     .model_cooldowns
+                    .lock()
                     .set_infinite_cooldown(model_id);
                 last_error = Some(err);
                 continue;
@@ -102,16 +108,17 @@ pub async fn call_with_retry_and_fallback(
         {
             Ok(result) => return Ok(result),
             Err(err) => {
-                let cooldown = compute_cooldown(&err, config, model_id);
-                config
-                    .write()
-                    .model_cooldowns
-                    .set_cooldown(model_id, cooldown);
-
                 if is_non_retryable_non_auth(&err) {
-                    // Non-retryable errors (400, 404) should not try fallbacks
+                    // Non-retryable errors (400, 404) should not sideline the model
                     return Err(err);
                 }
+
+                let cooldown = compute_cooldown(&err, config, model_id);
+                config
+                    .read()
+                    .model_cooldowns
+                    .lock()
+                    .set_cooldown(model_id, cooldown);
 
                 warn!(
                     "Model '{}' exhausted retries, cooldown {}s. Trying next fallback.",
@@ -146,8 +153,10 @@ async fn try_model_with_retries(
     CompletionTokenUsage,
 )> {
     let mut last_error: Option<anyhow::Error> = None;
+    // Ensure at least one attempt even if configured as 0
+    let attempts = retry_config.attempts.max(1);
 
-    for attempt in 0..retry_config.attempts {
+    for attempt in 0..attempts {
         let result = if input.stream() {
             call_chat_completions_streaming(input, client, abort_signal.clone()).await
         } else {
@@ -168,29 +177,39 @@ async fn try_model_with_retries(
                         return Err(err);
                     }
                     // Retryable error
-                    if attempt + 1 < retry_config.attempts {
+                    if attempt + 1 < attempts {
                         let delay = compute_backoff_delay(retry_config, attempt);
                         warn!(
                             "Retryable error (status {}), attempt {}/{}. Retrying in {}ms...",
                             llm_err.status,
                             attempt + 1,
-                            retry_config.attempts,
+                            attempts,
                             delay.as_millis()
                         );
-                        tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            () = tokio::time::sleep(delay) => {}
+                            () = wait_abort_signal(&abort_signal) => {
+                                return Err(err);
+                            }
+                        }
                     }
                 } else {
                     // Non-LlmError (network timeout, DNS, etc): treat as retryable
-                    if attempt + 1 < retry_config.attempts {
+                    if attempt + 1 < attempts {
                         let delay = compute_backoff_delay(retry_config, attempt);
                         warn!(
                             "Network error, attempt {}/{}. Retrying in {}ms: {}",
                             attempt + 1,
-                            retry_config.attempts,
+                            attempts,
                             delay.as_millis(),
                             err
                         );
-                        tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            () = tokio::time::sleep(delay) => {}
+                            () = wait_abort_signal(&abort_signal) => {
+                                return Err(err);
+                            }
+                        }
                     }
                 }
                 last_error = Some(err);

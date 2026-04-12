@@ -65,10 +65,11 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
     if let Some(val) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
         if let Ok(secs) = val.parse::<u64>() {
             consider(Duration::from_secs(secs));
-        } else if let Ok(secs) = val.parse::<f64>() {
-            consider(Duration::from_secs_f64(secs));
+        } else if let Some(d) = safe_duration_from_secs_f64(val.parse::<f64>().ok()) {
+            consider(d);
+        } else if let Some(d) = parse_http_date_retry_after(val) {
+            consider(d);
         }
-        // HTTP-date parsing omitted for simplicity; integer seconds covers most providers
     }
 
     // OpenAI-style rate limit reset headers (values in seconds or duration strings like "1s", "2m")
@@ -83,29 +84,62 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
     max_duration
 }
 
+/// Convert an `Option<f64>` to a `Duration`, returning `None` for negative, NaN, or infinite values.
+fn safe_duration_from_secs_f64(val: Option<f64>) -> Option<Duration> {
+    let v = val?;
+    if v.is_finite() && v >= 0.0 {
+        Some(Duration::from_secs_f64(v))
+    } else {
+        None
+    }
+}
+
+/// Parse an RFC 2616 / RFC 7231 HTTP-date `Retry-After` value into a duration from now.
+fn parse_http_date_retry_after(val: &str) -> Option<Duration> {
+    use chrono::{DateTime, Utc};
+    // Try common HTTP date formats: RFC 2822, RFC 850, asctime
+    let target = DateTime::parse_from_rfc2822(val)
+        .map(|dt| dt.with_timezone(&Utc))
+        .or_else(|_| {
+            DateTime::parse_from_str(val, "%A, %d-%b-%y %T GMT").map(|dt| dt.with_timezone(&Utc))
+        })
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(val, "%a %b %e %T %Y").map(|ndt| ndt.and_utc())
+        })
+        .ok()?;
+    let now = Utc::now();
+    if target > now {
+        let diff = target - now;
+        diff.to_std().ok()
+    } else {
+        Some(Duration::ZERO)
+    }
+}
+
 /// Parse a duration value that may be seconds (integer/float) or a simple duration string like "1s", "2m", "500ms".
 fn parse_duration_value(val: &str) -> Option<Duration> {
     let val = val.trim();
-    if let Ok(secs) = val.parse::<f64>() {
-        return Some(Duration::from_secs_f64(secs));
+    if let Some(d) = safe_duration_from_secs_f64(val.parse::<f64>().ok()) {
+        return Some(d);
     }
     if let Some(s) = val.strip_suffix("ms") {
-        return s
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .map(Duration::from_secs_f64)
-            .map(|d| d / 1000);
+        let ms = s.trim().parse::<f64>().ok()?;
+        return if ms.is_finite() && ms >= 0.0 {
+            Some(Duration::from_secs_f64(ms / 1000.0))
+        } else {
+            None
+        };
     }
     if let Some(s) = val.strip_suffix('s') {
-        return s.trim().parse::<f64>().ok().map(Duration::from_secs_f64);
+        return safe_duration_from_secs_f64(s.trim().parse::<f64>().ok());
     }
     if let Some(s) = val.strip_suffix('m') {
-        return s
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .map(|v| Duration::from_secs_f64(v * 60.0));
+        let mins = s.trim().parse::<f64>().ok()?;
+        return if mins.is_finite() && mins >= 0.0 {
+            Some(Duration::from_secs_f64(mins * 60.0))
+        } else {
+            None
+        };
     }
     None
 }

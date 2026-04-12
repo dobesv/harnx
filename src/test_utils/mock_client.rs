@@ -81,13 +81,17 @@ impl MockResponseEvent {
                 // Try to downcast to a concrete error type that implements Clone.
                 // For LlmError (the most common test case), reconstruct it to preserve
                 // the error type through the anyhow chain.
-                if let Some(llm_err) = err.downcast_ref::<crate::client::LlmError>() {
-                    return Err(crate::client::LlmError {
-                        status: llm_err.status,
-                        message: llm_err.message.clone(),
-                        retry_after: llm_err.retry_after,
+                // Walk the error chain to find LlmError (it may be
+                // wrapped by .with_context() or other anyhow layers).
+                for cause in err.chain() {
+                    if let Some(llm_err) = cause.downcast_ref::<crate::client::LlmError>() {
+                        return Err(crate::client::LlmError {
+                            status: llm_err.status,
+                            message: llm_err.message.clone(),
+                            retry_after: llm_err.retry_after,
+                        }
+                        .into());
                     }
-                    .into());
                 }
                 // Fallback: create a new error from the display string
                 let msg = err.to_string();

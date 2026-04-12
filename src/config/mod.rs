@@ -244,7 +244,7 @@ pub struct Config {
     pub hooks: Option<HooksConfig>,
 
     #[serde(skip)]
-    pub model_cooldowns: crate::client::retry::ModelCooldownMap,
+    pub model_cooldowns: std::sync::Arc<parking_lot::Mutex<crate::client::retry::ModelCooldownMap>>,
     #[serde(skip)]
     pub macro_flag: bool,
     #[serde(skip)]
@@ -453,7 +453,7 @@ impl Default for Config {
 
             hooks: None,
 
-            model_cooldowns: Default::default(),
+            model_cooldowns: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
             macro_flag: false,
             info_flag: false,
             agent_variables: None,
