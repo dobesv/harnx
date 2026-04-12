@@ -117,6 +117,30 @@ impl AcpManager {
                 session_prompt_with_abort(&client, session_id, message, tokio::signal::ctrl_c())
                     .await
             }
+            "session_handoff" => {
+                let message = required_string(&arguments, "prompt")?.to_owned();
+                let session_id = match optional_string(&arguments, "session_id")? {
+                    Some(session_id) => session_id.to_owned(),
+                    None => client.session_new().await?,
+                };
+
+                let mut response = session_prompt_with_abort(
+                    &client,
+                    session_id.clone(),
+                    message,
+                    tokio::signal::ctrl_c(),
+                )
+                .await?;
+                if let Some(obj) = response.as_object_mut() {
+                    obj.insert("action".to_string(), json!("switch_agent"));
+                    obj.insert(
+                        "agent".to_string(),
+                        json!(name.strip_suffix("_session_handoff").unwrap_or(name)),
+                    );
+                    obj.insert("session_id".to_string(), json!(session_id));
+                }
+                Ok(response)
+            }
             "session_load" => {
                 let session_id = required_string(&arguments, "session_id")?.to_owned();
                 client.session_load(&session_id).await?;
@@ -145,7 +169,8 @@ impl AcpManager {
                 continue;
             };
             match method {
-                "session_new" | "session_prompt" | "session_load" | "session_cancel" => {
+                "session_new" | "session_prompt" | "session_handoff" | "session_load"
+                | "session_cancel" => {
                     return Some((Arc::clone(client), method.to_string()));
                 }
                 _ => continue,
@@ -206,6 +231,40 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                 ..Default::default()
             },
             mcp_tool_name: Some("session_prompt".to_string()),
+        },
+        ToolDeclaration {
+            name: format!("{server_name}_session_handoff"),
+            description: format!(
+                "Exit the current interactive agent session and hand off to the '{server_name}' ACP agent. Auto-creates a target session if session_id is not provided, then sends the prompt and continues interaction in that agent session."
+            ),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some({
+                    let mut props = IndexMap::new();
+                    props.insert(
+                        "prompt".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some("The new prompt to start the target agent session with.".to_string()),
+                            ..Default::default()
+                        },
+                    );
+                    props.insert(
+                        "session_id".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some(
+                                "Optional existing target session ID. If omitted, a new session is created automatically.".to_string(),
+                            ),
+                            ..Default::default()
+                        },
+                    );
+                    props
+                }),
+                required: Some(vec!["prompt".to_string()]),
+                ..Default::default()
+            },
+            mcp_tool_name: Some("session_handoff".to_string()),
         },
         ToolDeclaration {
             name: format!("{server_name}_session_load"),
@@ -452,11 +511,12 @@ enabled: false
     fn test_generate_acp_tools() {
         let tools = generate_acp_tools("myagent");
 
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
 
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
         assert!(names.contains(&"myagent_session_new"));
         assert!(names.contains(&"myagent_session_prompt"));
+        assert!(names.contains(&"myagent_session_handoff"));
         assert!(names.contains(&"myagent_session_load"));
         assert!(names.contains(&"myagent_session_cancel"));
     }
@@ -539,7 +599,7 @@ enabled: false
 
         let tools = manager.get_all_tools_blocking();
 
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 10);
     }
 
     #[test]

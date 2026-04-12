@@ -165,7 +165,7 @@ impl Tui {
                     Config::use_agent(
                         &ctx.config,
                         &switch_agent.agent,
-                        None,
+                        switch_agent.session_id.as_deref(),
                         ctx.abort_signal.clone(),
                     )
                     .await?;

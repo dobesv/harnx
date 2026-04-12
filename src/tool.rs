@@ -132,6 +132,10 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
                             result_obj.switch_agent = Some(SwitchAgentData {
                                 agent: agent.to_string(),
                                 prompt: prompt.to_string(),
+                                session_id: obj
+                                    .get("session_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(ToString::to_string),
                             });
                         }
                     }
@@ -193,7 +197,7 @@ pub fn trigger_agent_tool_declaration() -> ToolDeclaration {
     );
     ToolDeclaration {
         name: TRIGGER_AGENT_TOOL_NAME.to_string(),
-        description: "Transfer the session to another agent with a new prompt in an empty session."
+        description: "Deprecated compatibility tool. Prefer per-agent *_session_handoff tools for interactive delegation."
             .to_string(),
         parameters: JsonSchema {
             type_value: Some("object".to_string()),
@@ -217,6 +221,8 @@ pub struct ToolResult {
 pub struct SwitchAgentData {
     pub agent: String,
     pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl ToolResult {
@@ -444,6 +450,14 @@ impl ToolCall {
                     tokio::runtime::Handle::current().block_on(async {
                         let has_ui_output = has_ui_output_sink();
                         let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
+
+                        // Give the parent tool-call event a chance to be
+                        // consumed by the UI before nested ACP output from the
+                        // delegated session starts arriving. This keeps the
+                        // visible transcript ordering causal: the handoff tool
+                        // row should appear before any child output it triggers.
+                        tokio::task::yield_now().await;
+
                         let (chunk_rx, subscription_id) = manager.subscribe_chunks().await;
 
                         // Spawn a spinner only in non-TUI terminal mode.
@@ -655,7 +669,7 @@ mod tests {
     async fn test_eval_tool_calls_partial_error_handling() {
         let _guard = crate::client::TestStateGuard::new(None).await;
         let config = Arc::new(RwLock::new(Config::default()));
-        // trigger_agent is handled internally and should succeed
+        // ACP handoff tools should be handled via the ACP manager and unknown tools still error.
         let call1 = ToolCall::new(
             TRIGGER_AGENT_TOOL_NAME.to_string(),
             json!({"agent": "test", "prompt": "test"}),

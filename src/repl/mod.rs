@@ -1256,11 +1256,13 @@ async fn ask_inner(
             crate::config::Config::use_agent(
                 config,
                 &switch_agent.agent,
-                None,
+                switch_agent.session_id.as_deref(),
                 abort_signal.clone(),
             )
             .await?;
-            config.write().empty_session()?;
+            if switch_agent.session_id.is_none() {
+                config.write().empty_session()?;
+            }
             let new_input = Input::from_str(config, &switch_agent.prompt, None);
             return Box::pin(ask_inner(
                 config,
