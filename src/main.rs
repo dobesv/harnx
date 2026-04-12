@@ -23,9 +23,7 @@ extern crate log;
 pub mod test_utils;
 
 use crate::cli::Cli;
-use crate::client::{
-    list_models, retry::call_with_retry_and_fallback, ModelType,
-};
+use crate::client::{list_models, retry::call_with_retry_and_fallback, ModelType};
 use crate::config::{
     ensure_parent_exists, list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
     WorkingMode, TEMP_SESSION_NAME,

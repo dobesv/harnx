@@ -1149,7 +1149,7 @@ async fn ask_inner(
         )
     };
     let (output, thought, tool_results, usage) =
-        match call_with_retry_and_fallback(&input, &config, abort_signal.clone()).await {
+        match call_with_retry_and_fallback(&input, config, abort_signal.clone()).await {
             Ok(result) => result,
             Err(err) => {
                 let event = HookEvent::StopFailure {

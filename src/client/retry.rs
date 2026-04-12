@@ -26,7 +26,7 @@ impl ModelCooldownMap {
     pub fn is_on_cooldown(&self, model_id: &str) -> bool {
         self.cooldowns
             .get(model_id)
-            .map_or(false, |expires| Instant::now() < *expires)
+            .is_some_and(|expires| Instant::now() < *expires)
     }
 
     pub fn set_cooldown(&mut self, model_id: &str, duration: Duration) {
@@ -54,17 +54,19 @@ pub async fn call_with_retry_and_fallback(
     input: &Input,
     config: &GlobalConfig,
     abort_signal: AbortSignal,
-) -> Result<(String, Option<String>, Vec<ToolResult>, CompletionTokenUsage)> {
+) -> Result<(
+    String,
+    Option<String>,
+    Vec<ToolResult>,
+    CompletionTokenUsage,
+)> {
     let agent = input.agent();
     let retry_config = agent.retry_config();
 
     // Build model list: primary model + fallbacks
     let primary_model_id = {
         let cfg = config.read();
-        agent
-            .model_id()
-            .unwrap_or(&cfg.model_id)
-            .to_string()
+        agent.model_id().unwrap_or(&cfg.model_id).to_string()
     };
     let mut model_ids: Vec<String> = vec![primary_model_id];
     model_ids.extend(agent.model_fallbacks().iter().cloned());
@@ -137,7 +139,12 @@ async fn try_model_with_retries(
     client: &dyn Client,
     retry_config: &RetryConfig,
     abort_signal: AbortSignal,
-) -> Result<(String, Option<String>, Vec<ToolResult>, CompletionTokenUsage)> {
+) -> Result<(
+    String,
+    Option<String>,
+    Vec<ToolResult>,
+    CompletionTokenUsage,
+)> {
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 0..retry_config.attempts {
@@ -263,8 +270,10 @@ mod tests {
     fn test_cooldown_map_expired() {
         let mut map = ModelCooldownMap::default();
         // Set cooldown that has already expired (0 duration)
-        map.cooldowns
-            .insert("model-a".to_string(), Instant::now() - Duration::from_secs(1));
+        map.cooldowns.insert(
+            "model-a".to_string(),
+            Instant::now() - Duration::from_secs(1),
+        );
         assert!(!map.is_on_cooldown("model-a"));
     }
 
@@ -282,10 +291,22 @@ mod tests {
             initial_delay_ms: 1000,
             max_delay_ms: 60000,
         };
-        assert_eq!(compute_backoff_delay(&config, 0), Duration::from_millis(1000));
-        assert_eq!(compute_backoff_delay(&config, 1), Duration::from_millis(2000));
-        assert_eq!(compute_backoff_delay(&config, 2), Duration::from_millis(4000));
-        assert_eq!(compute_backoff_delay(&config, 10), Duration::from_millis(60000)); // clamped
+        assert_eq!(
+            compute_backoff_delay(&config, 0),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            compute_backoff_delay(&config, 1),
+            Duration::from_millis(2000)
+        );
+        assert_eq!(
+            compute_backoff_delay(&config, 2),
+            Duration::from_millis(4000)
+        );
+        assert_eq!(
+            compute_backoff_delay(&config, 10),
+            Duration::from_millis(60000)
+        ); // clamped
     }
 
     use crate::client::TestStateGuard;
@@ -296,8 +317,10 @@ mod tests {
     use std::sync::Arc;
 
     fn make_config() -> GlobalConfig {
-        let mut config = Config::default();
-        config.stream = false;
+        let config = Config {
+            stream: false,
+            ..Default::default()
+        };
         Arc::new(RwLock::new(config))
     }
 
@@ -331,8 +354,7 @@ mod tests {
             initial_delay_ms: 10,
             max_delay_ms: 100,
         };
-        let result =
-            try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
+        let result = try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
         assert!(
             result.is_ok(),
             "Expected success after retries, got: {:?}",
@@ -350,11 +372,7 @@ mod tests {
             retry_after: None,
         }
         .into();
-        let mock = Arc::new(
-            MockClient::builder()
-                .error_on_stream(auth_err)
-                .build(),
-        );
+        let mock = Arc::new(MockClient::builder().error_on_stream(auth_err).build());
         let _guard = TestStateGuard::new(Some(mock)).await;
 
         let config = make_config();
@@ -367,8 +385,7 @@ mod tests {
             initial_delay_ms: 10,
             max_delay_ms: 100,
         };
-        let result =
-            try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
+        let result = try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
         assert!(result.is_err());
 
         let err = result.unwrap_err();
@@ -381,9 +398,30 @@ mod tests {
     async fn test_all_retries_exhausted_returns_error() {
         let mock = Arc::new(
             MockClient::builder()
-                .error_on_stream(LlmError { status: 500, message: "err".into(), retry_after: None }.into())
-                .error_on_stream(LlmError { status: 500, message: "err".into(), retry_after: None }.into())
-                .error_on_stream(LlmError { status: 500, message: "err".into(), retry_after: None }.into())
+                .error_on_stream(
+                    LlmError {
+                        status: 500,
+                        message: "err".into(),
+                        retry_after: None,
+                    }
+                    .into(),
+                )
+                .error_on_stream(
+                    LlmError {
+                        status: 500,
+                        message: "err".into(),
+                        retry_after: None,
+                    }
+                    .into(),
+                )
+                .error_on_stream(
+                    LlmError {
+                        status: 500,
+                        message: "err".into(),
+                        retry_after: None,
+                    }
+                    .into(),
+                )
                 .build(),
         );
         let _guard = TestStateGuard::new(Some(mock)).await;
@@ -398,9 +436,11 @@ mod tests {
             initial_delay_ms: 10,
             max_delay_ms: 100,
         };
-        let result =
-            try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
-        assert!(result.is_err(), "Expected error after all retries exhausted");
+        let result = try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
+        assert!(
+            result.is_err(),
+            "Expected error after all retries exhausted"
+        );
 
         let err = result.unwrap_err();
         let llm_err = find_llm_error(&err);
@@ -433,8 +473,7 @@ mod tests {
             initial_delay_ms: 10,
             max_delay_ms: 100,
         };
-        let result =
-            try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
+        let result = try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
         assert!(result.is_err());
 
         let err = result.unwrap_err();

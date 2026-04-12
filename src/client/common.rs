@@ -72,10 +72,7 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
     }
 
     // OpenAI-style rate limit reset headers (values in seconds or duration strings like "1s", "2m")
-    for header_name in [
-        "x-ratelimit-reset-requests",
-        "x-ratelimit-reset-tokens",
-    ] {
+    for header_name in ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"] {
         if let Some(val) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
             if let Some(d) = parse_duration_value(val) {
                 consider(d);
@@ -93,13 +90,22 @@ fn parse_duration_value(val: &str) -> Option<Duration> {
         return Some(Duration::from_secs_f64(secs));
     }
     if let Some(s) = val.strip_suffix("ms") {
-        return s.trim().parse::<f64>().ok().map(Duration::from_secs_f64).map(|d| d / 1000);
+        return s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(Duration::from_secs_f64)
+            .map(|d| d / 1000);
     }
     if let Some(s) = val.strip_suffix('s') {
         return s.trim().parse::<f64>().ok().map(Duration::from_secs_f64);
     }
     if let Some(s) = val.strip_suffix('m') {
-        return s.trim().parse::<f64>().ok().map(|v| Duration::from_secs_f64(v * 60.0));
+        return s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|v| Duration::from_secs_f64(v * 60.0));
     }
     None
 }
