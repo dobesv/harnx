@@ -40,8 +40,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   ├── utils/                  # Shared utilities (crypto, clipboard, HTTP helpers, etc.)
 │   └── bin/                    # Additional binaries (harnx-mcp-todo, harnx-mcp-bash, etc.)
 ├── models.yaml                 # Model catalog (providers, pricing, capabilities)
-├── config.example.yaml         # Example user configuration
-├── config.agent.example.md     # Example agent definition (Markdown + YAML front matter)
+├── example_config/             # Example user configuration
 ├── docs/                       # User-facing documentation
 ├── scripts/                    # Shell completions and shell-integration scripts
 ├── Argcfile.sh                 # Developer task runner (argc-based)

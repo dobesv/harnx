@@ -562,16 +562,23 @@ impl Config {
         }
     }
 
+    pub fn config_dir_path() -> PathBuf {
+        Self::config_file()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(Self::config_dir)
+    }
+
     pub fn clients_dir() -> PathBuf {
-        Self::local_path(CLIENTS_DIR_NAME)
+        Self::config_dir_path().join(CLIENTS_DIR_NAME)
     }
 
     pub fn mcp_servers_dir() -> PathBuf {
-        Self::local_path(MCP_SERVERS_DIR_NAME)
+        Self::config_dir_path().join(MCP_SERVERS_DIR_NAME)
     }
 
     pub fn acp_servers_dir() -> PathBuf {
-        Self::local_path(ACP_SERVERS_DIR_NAME)
+        Self::config_dir_path().join(ACP_SERVERS_DIR_NAME)
     }
 
     pub fn macro_file(name: &str) -> PathBuf {
@@ -2684,12 +2691,17 @@ impl Config {
     }
 
     fn sorted_yaml_files(dir: &Path) -> Result<Vec<PathBuf>> {
-        let mut paths: Vec<PathBuf> = read_dir(dir)
-            .with_context(|| format!("Failed to read directory '{}'", dir.display()))?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("yaml"))
-            .collect();
+        let entries = read_dir(dir)
+            .with_context(|| format!("Failed to read directory '{}'", dir.display()))?;
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("Failed to read entry in '{}'", dir.display()))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("yaml") {
+                paths.push(path);
+            }
+        }
         paths.sort();
         Ok(paths)
     }
@@ -2707,13 +2719,18 @@ impl Config {
         } else {
             json!({ "type": provider })
         };
-        let config = json!({
+        let config_value = json!({
             "model": model_id.to_string(),
             "save": false,
-            "clients": vec![client],
+            "clients": vec![client.clone()],
         });
-        let mut config: Self =
-            serde_json::from_value(config).with_context(|| "Failed to load config from env")?;
+        let mut config: Self = serde_json::from_value(config_value)
+            .with_context(|| "Failed to load config from env")?;
+
+        // Config::clients is #[serde(skip)], so it's empty after from_value.
+        // We must populate it manually.
+        config.clients = vec![serde_json::from_value(client).context("Failed to parse client config")?];
+
         let config_dir = Self::config_dir();
         config.mcp_servers =
             Self::load_mcp_servers_from_dir(&config_dir.join(MCP_SERVERS_DIR_NAME))?;
@@ -3278,18 +3295,20 @@ async fn create_config_file(config_path: &Path) -> Result<()> {
     let config = serde_json::json!({ "model": model });
     let config_data = serde_yaml::to_string(&config).with_context(|| "Failed to create config")?;
     let config_data = format!(
-        "# see https://github.com/dobesv/harnx/blob/main/config.example.yaml\n\n{config_data}"
+        "# see https://github.com/dobesv/harnx/blob/main/example_config\n\n{config_data}"
     );
 
-    ensure_parent_exists(config_path)?;
-    std::fs::write(config_path, config_data)
+    ensure_parent_exists_async(config_path).await?;
+    tokio::fs::write(config_path, config_data)
+        .await
         .with_context(|| format!("Failed to write to '{}'", config_path.display()))?;
 
     let clients_dir = config_path
         .parent()
         .unwrap_or(config_path)
         .join(CLIENTS_DIR_NAME);
-    std::fs::create_dir_all(&clients_dir)
+    tokio::fs::create_dir_all(&clients_dir)
+        .await
         .with_context(|| format!("Failed to create '{}'", clients_dir.display()))?;
     let client_filename = clients_config
         .get("name")
@@ -3299,19 +3318,38 @@ async fn create_config_file(config_path: &Path) -> Result<()> {
     let client_path = clients_dir.join(format!("{client_filename}.yaml"));
     let client_data =
         serde_yaml::to_string(&clients_config).with_context(|| "Failed to create client config")?;
-    std::fs::write(&client_path, client_data)
+    tokio::fs::write(&client_path, client_data)
+        .await
         .with_context(|| format!("Failed to write to '{}'", client_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::prelude::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(config_path, perms.clone())?;
-        std::fs::set_permissions(&client_path, perms)?;
+        tokio::fs::set_permissions(config_path, perms.clone()).await?;
+        tokio::fs::set_permissions(&client_path, perms).await?;
     }
 
     println!("✓ Saved the config file to '{}'.", config_path.display());
     println!("✓ Saved the client config to '{}'.", client_path.display());
 
+    Ok(())
+}
+
+pub(crate) async fn ensure_parent_exists_async(path: &Path) -> Result<()> {
+    if tokio::fs::metadata(path).await.is_ok() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Failed to write to '{}', No parent path", path.display()))?;
+    if tokio::fs::metadata(parent).await.is_err() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "Failed to write to '{}', Cannot create parent directory",
+                path.display()
+            )
+        })?;
+    }
     Ok(())
 }
 

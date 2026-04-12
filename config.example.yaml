@@ -172,12 +172,17 @@ save_shell_history: true                    # Whether to save shell execution co
 sync_models_url: https://raw.githubusercontent.com/dobesv/harnx/refs/heads/main/models.yaml
 
 # ---- clients ----
-# Create one file per client in clients/<name>.yaml under the config directory.
-# The filename (without .yaml) is used to identify the client.
+# Each file in clients/<name>.yaml under the config directory contains a single client configuration.
+# The filename is for organization; the client's identity and its use in model IDs (e.g., "myclient:gpt-4")
+# is determined by the `name` field within the file's ClientConfig.
+#
+# Recommendation: Add a `name: <client_id>` field in each client file if you want to use that ID
+# in your `model` setting. For implementation details, see `load_clients_from_dir()` and 
+# the `ClientConfig` struct in `src/config/mod.rs`.
 #
 # All clients support the following configuration:
 # type: xxxx
-# name: xxxx                                      # Only use it to distinguish clients with the same client type. Optional
+# name: xxxx                                      # The unique identifier for this client (used in model IDs).
 # models:
 #   - name: xxxx                                  # Chat model
 #     max_input_tokens: 100000
