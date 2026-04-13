@@ -133,16 +133,26 @@ impl Tui {
                     // Add to history (fix #4)
                     self.push_history(text.clone());
                     if self.app.llm_busy {
-                        // Queue the message to send when LLM finishes
-                        // Keep the text in input so user can see/edit it
+                        // Queue the message to send when LLM finishes or
+                        // after the next tool round completes.
+                        // Keep the text in input so user can see/edit it.
                         let pending_attachments = self.app.attachments.clone();
                         let pending_attachment_dir = self.app.attachment_dir.clone();
-                        self.app.pending_message = Some(crate::tui::types::PendingMessage {
+                        let pending = crate::tui::types::PendingMessage {
                             text,
                             attachments: pending_attachments,
                             attachment_dir: pending_attachment_dir,
                             paste_count: self.app.paste_count,
-                        });
+                        };
+                        self.app.pending_message = Some(pending.clone());
+                        // Publish to shared state so the prompt task can
+                        // pick it up between tool rounds.
+                        {
+                            let shared = self.shared_pending_message.clone();
+                            tokio::spawn(async move {
+                                *shared.lock().await = Some(pending);
+                            });
+                        }
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through repl command handler
@@ -173,6 +183,7 @@ impl Tui {
                     self.app.attachments = pending.attachments;
                     self.app.attachment_dir = pending.attachment_dir;
                     self.app.paste_count = pending.paste_count;
+                    self.clear_shared_pending_message();
                     self.refresh_input_chrome();
                 }
                 self.app.input.input(TextInput {
@@ -186,6 +197,7 @@ impl Tui {
                     self.app.attachments = pending.attachments;
                     self.app.attachment_dir = pending.attachment_dir;
                     self.app.paste_count = pending.paste_count;
+                    self.clear_shared_pending_message();
                     self.refresh_input_chrome();
                 }
                 // Clear completions on any non-tab key
@@ -395,6 +407,16 @@ impl Tui {
                 self.app.streaming_assistant_idx = None;
                 self.pin_transcript_to_bottom();
             }
+            TuiEvent::PendingMessageConsumed(text) => {
+                // The prompt task consumed our pending message during a tool
+                // round.  Clear the local pending state, reset the input field,
+                // and show the consumed text in the transcript.
+                self.app.pending_message = None;
+                self.app.input = Self::new_input();
+                self.app.transcript.push(TranscriptItem::UserText(text));
+                self.pin_transcript_to_bottom();
+                self.refresh_input_chrome();
+            }
         }
         Ok(())
     }
@@ -435,6 +457,15 @@ impl Tui {
             self.start_prompt(pending).await?;
         }
         Ok(())
+    }
+
+    /// Clear the shared pending message so the prompt task does not consume a
+    /// stale value after the user cancels or edits the pending draft.
+    fn clear_shared_pending_message(&self) {
+        let shared = self.shared_pending_message.clone();
+        tokio::spawn(async move {
+            *shared.lock().await = None;
+        });
     }
 
     fn render_submitted_attachments(&mut self, attachments: &[crate::tui::types::Attachment]) {
@@ -716,24 +747,19 @@ impl Tui {
     ) -> Result<()> {
         self.app.llm_busy = true;
 
-        let config = self.config.clone();
-        let abort_signal = self.abort_signal.clone();
-        let async_manager = self.async_manager.clone();
-        let persistent_manager = self.persistent_manager.clone();
-        let pending_async_context = self.pending_async_context.clone();
         let event_tx = self.event_tx.clone();
+        let ctx = crate::tui::prompt::PromptTaskContext {
+            config: self.config.clone(),
+            abort_signal: self.abort_signal.clone(),
+            async_manager: self.async_manager.clone(),
+            persistent_manager: self.persistent_manager.clone(),
+            pending_async_context: self.pending_async_context.clone(),
+            shared_pending_message: self.shared_pending_message.clone(),
+            event_tx: event_tx.clone(),
+        };
 
         tokio::spawn(async move {
-            let result: Result<()> = Self::run_prompt_task(
-                msg,
-                config,
-                abort_signal,
-                async_manager,
-                persistent_manager,
-                pending_async_context,
-                event_tx.clone(),
-            )
-            .await;
+            let result: Result<()> = Self::run_prompt_task(msg, ctx).await;
             if let Err(err) = result {
                 let _ = event_tx.send(TuiEvent::UiOutput(UiOutputEvent {
                     kind: UiOutputEventKind::LlmError(err.to_string()),

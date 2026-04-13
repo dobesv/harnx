@@ -20,6 +20,8 @@ pub struct Tui {
     pub(super) async_manager: Arc<Mutex<AsyncHookManager>>,
     pub(super) persistent_manager: Arc<Mutex<PersistentHookManager>>,
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
+    /// Shared state so the prompt task can consume a pending message mid-tool-loop.
+    pub(super) shared_pending_message: Arc<Mutex<Option<PendingMessage>>>,
     #[cfg(test)]
     #[allow(private_interfaces)]
     pub(crate) app: App,
@@ -126,6 +128,8 @@ pub(crate) enum TuiEvent {
     UiOutput(UiOutputEvent),
     /// Intermediate tool round completed; the prompt loop continues.
     ToolRoundComplete,
+    /// The prompt task consumed the pending message during a tool round.
+    PendingMessageConsumed(String),
 }
 
 #[cfg(not(test))]
@@ -133,4 +137,6 @@ pub(super) enum TuiEvent {
     UiOutput(UiOutputEvent),
     /// Intermediate tool round completed; the prompt loop continues.
     ToolRoundComplete,
+    /// The prompt task consumed the pending message during a tool round.
+    PendingMessageConsumed(String),
 }

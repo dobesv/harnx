@@ -807,6 +807,17 @@ impl Session {
                 });
                 self.messages.push(tool_msg);
             }
+            if let Some(injected) = input.injected_user_text() {
+                let injected_msg = Message::new(
+                    MessageRole::User,
+                    MessageContent::Text(injected.to_string()),
+                );
+                all_appended &= self.append_event(&SessionLogEntry::Message {
+                    role: injected_msg.role,
+                    content: injected_msg.content.clone(),
+                });
+                self.messages.push(injected_msg);
+            }
             let content = match thought {
                 Some(v) => MessageContent::Text(format!("<think>\n{v}\n</think>\n{output}")),
                 _ => MessageContent::Text(output.to_string()),

@@ -201,6 +201,70 @@ async fn pending_dot_command_restores_attachments_before_running() {
 }
 
 #[tokio::test]
+async fn pending_message_consumed_clears_pending_and_shows_in_transcript() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    tui.app.llm_busy = true;
+    tui.queue_pending_message("interject here".to_string());
+    assert!(tui.app.pending_message.is_some());
+
+    // Simulate the prompt task consuming the pending message during a tool round.
+    tui.handle_tui_event(TuiEvent::PendingMessageConsumed(
+        "interject here".to_string(),
+    ))
+    .await
+    .unwrap();
+
+    // Pending message should be cleared.
+    assert!(tui.app.pending_message.is_none());
+    // Input field should be cleared.
+    assert!(tui.app.input.lines().join("").is_empty());
+    // The consumed text should appear in the transcript as a UserText entry.
+    let has_user_entry =
+        tui.app.transcript.iter().any(
+            |entry| matches!(entry, TranscriptItem::UserText(text) if text == "interject here"),
+        );
+    assert!(has_user_entry);
+}
+
+#[tokio::test]
+async fn pending_message_not_double_submitted_after_consumed() {
+    // When the prompt task consumes a pending message mid-tool-loop,
+    // the subsequent LlmFinal should NOT re-submit it.
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    tui.app.llm_busy = true;
+    tui.queue_pending_message("once only".to_string());
+
+    // Prompt task consumed it.
+    tui.handle_tui_event(TuiEvent::PendingMessageConsumed("once only".to_string()))
+        .await
+        .unwrap();
+
+    // Now LlmFinal arrives.
+    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+        kind: UiOutputEventKind::LlmFinal {
+            output: "final answer".to_string(),
+            usage: Default::default(),
+        },
+        source: None,
+    }))
+    .await
+    .unwrap();
+
+    // The user text should appear exactly once in the transcript.
+    let user_text_count = tui
+        .app
+        .transcript
+        .iter()
+        .filter(|entry| matches!(entry, TranscriptItem::UserText(text) if text == "once only"))
+        .count();
+    assert_eq!(user_text_count, 1);
+}
+
+#[tokio::test]
 async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));

@@ -6,11 +6,17 @@ use crate::tui::types::{App, TranscriptItem, TuiEvent, SPINNER_FRAMES, TICK_RATE
 impl Tui {
     #[cfg(test)]
     pub(super) fn queue_pending_message(&mut self, text: String) {
-        self.app.pending_message = Some(crate::tui::types::PendingMessage {
+        let pending = crate::tui::types::PendingMessage {
             text: text.clone(),
             attachments: vec![],
             attachment_dir: None,
             paste_count: self.app.paste_count,
+        };
+        self.app.pending_message = Some(pending.clone());
+        // Also publish to the shared state so the prompt task can consume it.
+        let shared = self.shared_pending_message.clone();
+        tokio::spawn(async move {
+            *shared.lock().await = Some(pending);
         });
         // Also set the input text so it remains visible (new behavior)
         self.set_input_text(&text);
@@ -51,6 +57,7 @@ impl Tui {
             async_manager: Arc::new(Mutex::new(async_manager)),
             persistent_manager,
             pending_async_context: Arc::new(Mutex::new(None)),
+            shared_pending_message: Arc::new(Mutex::new(None)),
             app: App {
                 transcript: initial_transcript,
                 input: Self::new_input(),

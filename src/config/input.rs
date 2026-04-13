@@ -31,6 +31,10 @@ pub struct Input {
     rag_name: Option<String>,
     with_session: bool,
     with_agent: bool,
+    /// User text injected after tool-call results (pending message consumed
+    /// mid-tool-loop).  Appended as a trailing User message in
+    /// `build_messages()`.
+    injected_user_text: Option<String>,
 }
 
 impl Input {
@@ -51,6 +55,7 @@ impl Input {
             rag_name: None,
             with_session,
             with_agent,
+            injected_user_text: None,
         }
     }
 
@@ -118,6 +123,7 @@ impl Input {
             rag_name: None,
             with_session,
             with_agent,
+            injected_user_text: None,
         })
     }
 
@@ -226,6 +232,14 @@ impl Input {
         self
     }
 
+    pub fn set_injected_user_text(&mut self, text: String) {
+        self.injected_user_text = Some(text);
+    }
+
+    pub fn injected_user_text(&self) -> Option<&str> {
+        self.injected_user_text.as_deref()
+    }
+
     pub fn create_client(&self) -> Result<Box<dyn Client>> {
         init_client(&self.config, Some(self.agent().model().clone()))
     }
@@ -266,6 +280,12 @@ impl Input {
             messages.push(Message::new(
                 MessageRole::Assistant,
                 MessageContent::ToolCalls(tool_calls.clone()),
+            ))
+        }
+        if let Some(text) = &self.injected_user_text {
+            messages.push(Message::new(
+                MessageRole::User,
+                MessageContent::Text(text.clone()),
             ))
         }
         Ok(messages)
