@@ -183,7 +183,7 @@ fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
                 crate::tool::JsonSchema {
                     type_value: Some("string".to_string()),
                     description: Some(
-                        "Optional existing target session ID. If omitted, a new session is created automatically.".to_string(),
+                        "Optional target session ID. If provided, the handoff reuses that session; if omitted, the current interactive session is reused.".to_string(),
                     ),
                     ..Default::default()
                 },

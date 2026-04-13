@@ -1261,7 +1261,7 @@ async fn ask_inner(
                 abort_signal.clone(),
             )
             .await?;
-            if switch_agent.session_id.is_none() {
+            if switch_agent.session_id.is_none() && config.read().session.is_some() {
                 config.write().empty_session()?;
             }
             return Box::pin(ask_inner(

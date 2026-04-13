@@ -78,7 +78,7 @@ impl Tui {
                     ctx.abort_signal.clone(),
                 )
                 .await?;
-                if switch.session_id.is_none() {
+                if switch.session_id.is_none() && ctx.config.read().session.is_some() {
                     ctx.config.write().empty_session()?;
                 }
             }
@@ -183,7 +183,7 @@ impl Tui {
                 // agent's streaming output begins.
                 pending_switch = tool_results.iter().find_map(|v| v.switch_agent.clone());
                 input = merged_input;
-                with_embeddings = false;
+                with_embeddings = pending_switch.is_some();
                 continue;
             } else {
                 let _ = ctx

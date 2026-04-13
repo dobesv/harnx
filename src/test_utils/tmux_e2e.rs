@@ -371,19 +371,6 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-fn usage_line_present(screen: &str) -> bool {
-    let compact = screen.replace('\n', " ");
-    let Some(in_pos) = compact.find(" in ") else {
-        return false;
-    };
-    let Some(out_pos) = compact[in_pos..].find(" out ") else {
-        return false;
-    };
-    compact[in_pos + out_pos + 5..]
-        .chars()
-        .any(|c| c.is_ascii_digit())
-}
 
 fn nested_mcp_tool_present(screen: &str) -> bool {
     // The nested tool call must appear as a real tool-call row in the parent

@@ -1563,6 +1563,11 @@ async fn test_tool_result_switch_agent_parsing() {
         Some("thought-sig".to_string()),
     );
 
+    // eval_tool_calls returns an error result here because the test has no
+    // agent definition file on disk, so specialist_session_handoff isn't in the
+    // allowed tools set.  Override the output manually to exercise the
+    // switch_agent parsing path that runs in eval_tool_calls (line 126-141 of
+    // tool.rs) on the result object.
     let mut results = eval_tool_calls(&config, vec![call]).unwrap();
     results[0].output = serde_json::json!({
         "action": "switch_agent",
