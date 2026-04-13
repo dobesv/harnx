@@ -81,6 +81,9 @@ impl Tui {
                 if switch.session_id.is_none() && ctx.config.read().session.is_some() {
                     ctx.config.write().empty_session()?;
                 }
+                // Reset so the new agent starts fresh, matching REPL/CMD
+                // paths which pass 0 when recursing after a handoff.
+                resume_count = 0;
             }
 
             if with_embeddings {
