@@ -129,7 +129,7 @@ pub(crate) enum TuiEvent {
     /// Intermediate tool round completed; the prompt loop continues.
     ToolRoundComplete,
     /// The prompt task consumed the pending message during a tool round.
-    PendingMessageConsumed(String),
+    PendingMessageConsumed(PendingMessage),
 }
 
 #[cfg(not(test))]
@@ -138,5 +138,5 @@ pub(super) enum TuiEvent {
     /// Intermediate tool round completed; the prompt loop continues.
     ToolRoundComplete,
     /// The prompt task consumed the pending message during a tool round.
-    PendingMessageConsumed(String),
+    PendingMessageConsumed(PendingMessage),
 }

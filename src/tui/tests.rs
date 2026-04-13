@@ -85,7 +85,8 @@ async fn pending_message_is_rendered_with_input_highlight_and_no_status_text() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
     tui.app.llm_busy = true;
-    tui.queue_pending_message("queued message".to_string());
+    tui.queue_pending_message("queued message".to_string())
+        .await;
 
     let title = line_to_plain(&tui.build_input_title());
     assert!(!title.contains("Pending message queued"));
@@ -100,7 +101,8 @@ async fn pending_message_is_cleared_when_user_edits_again() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
     tui.app.llm_busy = true;
-    tui.queue_pending_message("queued message".to_string());
+    tui.queue_pending_message("queued message".to_string())
+        .await;
 
     // Input should still contain the pending message text (new behavior)
     assert_eq!(tui.app.input.lines().join("\n"), "queued message");
@@ -136,7 +138,7 @@ async fn pending_message_is_auto_sent_after_finish() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
     tui.app.llm_busy = true;
-    tui.queue_pending_message("follow up".to_string());
+    tui.queue_pending_message("follow up".to_string()).await;
 
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
         kind: UiOutputEventKind::LlmFinal {
@@ -206,12 +208,18 @@ async fn pending_message_consumed_clears_pending_and_shows_in_transcript() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
     tui.app.llm_busy = true;
-    tui.queue_pending_message("interject here".to_string());
+    tui.queue_pending_message("interject here".to_string())
+        .await;
     assert!(tui.app.pending_message.is_some());
 
     // Simulate the prompt task consuming the pending message during a tool round.
     tui.handle_tui_event(TuiEvent::PendingMessageConsumed(
-        "interject here".to_string(),
+        crate::tui::types::PendingMessage {
+            text: "interject here".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        },
     ))
     .await
     .unwrap();
@@ -236,12 +244,19 @@ async fn pending_message_not_double_submitted_after_consumed() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
     tui.app.llm_busy = true;
-    tui.queue_pending_message("once only".to_string());
+    tui.queue_pending_message("once only".to_string()).await;
 
     // Prompt task consumed it.
-    tui.handle_tui_event(TuiEvent::PendingMessageConsumed("once only".to_string()))
-        .await
-        .unwrap();
+    tui.handle_tui_event(TuiEvent::PendingMessageConsumed(
+        crate::tui::types::PendingMessage {
+            text: "once only".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        },
+    ))
+    .await
+    .unwrap();
 
     // Now LlmFinal arrives.
     tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
@@ -262,6 +277,73 @@ async fn pending_message_not_double_submitted_after_consumed() {
         .filter(|entry| matches!(entry, TranscriptItem::UserText(text) if text == "once only"))
         .count();
     assert_eq!(user_text_count, 1);
+}
+
+#[tokio::test]
+async fn pending_dot_command_not_consumed_mid_tool_loop() {
+    // Dot-commands should NOT be consumed mid-tool-loop; they must wait
+    // for LlmFinal where submit_pending_message_inner handles them.
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    tui.app.llm_busy = true;
+
+    // Queue a dot-command as pending.
+    let pending = crate::tui::types::PendingMessage {
+        text: ".info model".to_string(),
+        attachments: vec![],
+        attachment_dir: None,
+        paste_count: 0,
+    };
+    tui.app.pending_message = Some(pending.clone());
+    *tui.shared_pending_message.lock().await = Some(pending);
+
+    // Verify the shared state still holds the dot-command (the prompt
+    // task would skip it because it starts with '.').
+    let guard = tui.shared_pending_message.lock().await;
+    assert!(guard.is_some());
+    assert!(guard.as_ref().unwrap().text.starts_with('.'));
+    drop(guard);
+
+    // The app-side pending message should still be present so LlmFinal
+    // can pick it up.
+    assert!(tui.app.pending_message.is_some());
+}
+
+#[tokio::test]
+async fn pending_message_with_attachments_not_consumed_mid_tool_loop() {
+    // Messages with attachments should NOT be consumed mid-tool-loop;
+    // they must wait for LlmFinal where submit_pending_message_inner
+    // handles them with full attachment processing.
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    tui.app.llm_busy = true;
+
+    let pending = crate::tui::types::PendingMessage {
+        text: "check this file".to_string(),
+        attachments: vec![Attachment {
+            path: PathBuf::from("/tmp/test.txt"),
+            display_name: "test.txt".to_string(),
+        }],
+        attachment_dir: None,
+        paste_count: 0,
+    };
+    tui.app.pending_message = Some(pending.clone());
+    *tui.shared_pending_message.lock().await = Some(pending);
+
+    // Verify the shared state still holds it (prompt task would skip
+    // because it has attachments).
+    let guard = tui.shared_pending_message.lock().await;
+    assert!(guard.is_some());
+    assert!(!guard.as_ref().unwrap().attachments.is_empty());
+    drop(guard);
+
+    // The app-side pending message should still be present.
+    assert!(tui.app.pending_message.is_some());
 }
 
 #[tokio::test]
@@ -1776,7 +1858,8 @@ async fn test_pending_message_busy_state_snapshot() {
     harness.tui().app.llm_busy = true;
     harness
         .tui()
-        .queue_pending_message("queued follow-up message".to_string());
+        .queue_pending_message("queued follow-up message".to_string())
+        .await;
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());

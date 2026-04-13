@@ -147,12 +147,7 @@ impl Tui {
                         self.app.pending_message = Some(pending.clone());
                         // Publish to shared state so the prompt task can
                         // pick it up between tool rounds.
-                        {
-                            let shared = self.shared_pending_message.clone();
-                            tokio::spawn(async move {
-                                *shared.lock().await = Some(pending);
-                            });
-                        }
+                        *self.shared_pending_message.lock().await = Some(pending);
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through repl command handler
@@ -183,7 +178,7 @@ impl Tui {
                     self.app.attachments = pending.attachments;
                     self.app.attachment_dir = pending.attachment_dir;
                     self.app.paste_count = pending.paste_count;
-                    self.clear_shared_pending_message();
+                    self.clear_shared_pending_message().await;
                     self.refresh_input_chrome();
                 }
                 self.app.input.input(TextInput {
@@ -197,7 +192,7 @@ impl Tui {
                     self.app.attachments = pending.attachments;
                     self.app.attachment_dir = pending.attachment_dir;
                     self.app.paste_count = pending.paste_count;
-                    self.clear_shared_pending_message();
+                    self.clear_shared_pending_message().await;
                     self.refresh_input_chrome();
                 }
                 // Clear completions on any non-tab key
@@ -407,13 +402,17 @@ impl Tui {
                 self.app.streaming_assistant_idx = None;
                 self.pin_transcript_to_bottom();
             }
-            TuiEvent::PendingMessageConsumed(text) => {
+            TuiEvent::PendingMessageConsumed(pending) => {
                 // The prompt task consumed our pending message during a tool
                 // round.  Clear the local pending state, reset the input field,
-                // and show the consumed text in the transcript.
+                // and show the consumed text (and any attachments) in the
+                // transcript.
                 self.app.pending_message = None;
                 self.app.input = Self::new_input();
-                self.app.transcript.push(TranscriptItem::UserText(text));
+                self.app
+                    .transcript
+                    .push(TranscriptItem::UserText(pending.text.clone()));
+                self.render_submitted_attachments(&pending.attachments);
                 self.pin_transcript_to_bottom();
                 self.refresh_input_chrome();
             }
@@ -461,11 +460,8 @@ impl Tui {
 
     /// Clear the shared pending message so the prompt task does not consume a
     /// stale value after the user cancels or edits the pending draft.
-    fn clear_shared_pending_message(&self) {
-        let shared = self.shared_pending_message.clone();
-        tokio::spawn(async move {
-            *shared.lock().await = None;
-        });
+    async fn clear_shared_pending_message(&self) {
+        *self.shared_pending_message.lock().await = None;
     }
 
     fn render_submitted_attachments(&mut self, attachments: &[crate::tui::types::Attachment]) {

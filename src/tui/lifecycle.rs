@@ -5,7 +5,7 @@ use crate::tui::types::{App, TranscriptItem, TuiEvent, SPINNER_FRAMES, TICK_RATE
 
 impl Tui {
     #[cfg(test)]
-    pub(super) fn queue_pending_message(&mut self, text: String) {
+    pub(super) async fn queue_pending_message(&mut self, text: String) {
         let pending = crate::tui::types::PendingMessage {
             text: text.clone(),
             attachments: vec![],
@@ -14,10 +14,7 @@ impl Tui {
         };
         self.app.pending_message = Some(pending.clone());
         // Also publish to the shared state so the prompt task can consume it.
-        let shared = self.shared_pending_message.clone();
-        tokio::spawn(async move {
-            *shared.lock().await = Some(pending);
-        });
+        *self.shared_pending_message.lock().await = Some(pending);
         // Also set the input text so it remains visible (new behavior)
         self.set_input_text(&text);
         self.refresh_input_chrome();

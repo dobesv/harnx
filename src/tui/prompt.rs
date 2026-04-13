@@ -173,11 +173,21 @@ impl Tui {
                 // Check if the user queued a message while tools were running.
                 // If so, inject it as a trailing user message so the LLM sees
                 // it right after the tool results.
-                if let Some(pending) = ctx.shared_pending_message.lock().await.take() {
-                    merged_input.set_injected_user_text(pending.text.clone());
-                    let _ = ctx
-                        .event_tx
-                        .send(TuiEvent::PendingMessageConsumed(pending.text));
+                //
+                // Skip dot-commands and messages with attachments — those need
+                // the full submit_pending_message_inner() flow which runs on
+                // the TUI side after LlmFinal.
+                {
+                    let mut guard = ctx.shared_pending_message.lock().await;
+                    if let Some(pending) = guard.as_ref() {
+                        let is_dot_command = pending.text.trim_start().starts_with('.');
+                        let has_attachments = !pending.attachments.is_empty();
+                        if !is_dot_command && !has_attachments {
+                            let pending = guard.take().unwrap();
+                            merged_input.set_injected_user_text(pending.text.clone());
+                            let _ = ctx.event_tx.send(TuiEvent::PendingMessageConsumed(pending));
+                        }
+                    }
                 }
 
                 input = merged_input;
