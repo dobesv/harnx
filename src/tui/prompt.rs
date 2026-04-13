@@ -8,29 +8,25 @@ pub(super) struct PromptTaskContext {
     pub(super) async_manager: Arc<Mutex<AsyncHookManager>>,
     pub(super) persistent_manager: Arc<Mutex<PersistentHookManager>>,
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
+    pub(super) shared_pending_message: Arc<Mutex<Option<crate::tui::types::PendingMessage>>>,
     pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
 }
 
 impl Tui {
     pub(super) async fn run_prompt_task(
         msg: crate::tui::types::PendingMessage,
-        config: GlobalConfig,
-        abort_signal: AbortSignal,
-        async_manager: Arc<Mutex<AsyncHookManager>>,
-        persistent_manager: Arc<Mutex<PersistentHookManager>>,
-        pending_async_context: Arc<Mutex<Option<String>>>,
-        event_tx: mpsc::UnboundedSender<TuiEvent>,
+        ctx: PromptTaskContext,
     ) -> Result<()> {
         let attachment_dir = msg.attachment_dir.clone();
         let input_res = if msg.attachments.is_empty() {
-            Ok(Input::from_str(&config, &msg.text, None))
+            Ok(Input::from_str(&ctx.config, &msg.text, None))
         } else {
             let paths: Vec<String> = msg
                 .attachments
                 .iter()
                 .map(|a| a.path.to_string_lossy().to_string())
                 .collect();
-            Input::from_files(&config, &msg.text, paths, None).await
+            Input::from_files(&ctx.config, &msg.text, paths, None).await
         };
         if let Some(dir) = attachment_dir {
             let cleanup_dir = dir.clone();
@@ -40,20 +36,7 @@ impl Tui {
             .await;
         }
         let input = input_res?;
-        Self::run_prompt_inner(
-            PromptTaskContext {
-                config,
-                abort_signal,
-                async_manager,
-                persistent_manager,
-                pending_async_context,
-                event_tx,
-            },
-            input,
-            0,
-            true,
-        )
-        .await
+        Self::run_prompt_inner(ctx, input, 0, true).await
     }
 
     async fn run_prompt_inner(
@@ -179,12 +162,34 @@ impl Tui {
             };
 
             if !tool_results.is_empty() {
-                let merged_input = input.merge_tool_results(output, thought, tool_results.clone());
+                let mut merged_input =
+                    input.merge_tool_results(output, thought, tool_results.clone());
                 let _ = ctx.event_tx.send(TuiEvent::ToolRoundComplete);
                 // Defer agent switch to the top of the next iteration so the
                 // TUI has a chance to render the tool-call row before the new
                 // agent's streaming output begins.
                 pending_switch = tool_results.iter().find_map(|v| v.switch_agent.clone());
+
+                // Check if the user queued a message while tools were running.
+                // If so, inject it as a trailing user message so the LLM sees
+                // it right after the tool results.
+                //
+                // Skip dot-commands and messages with attachments — those need
+                // the full submit_pending_message_inner() flow which runs on
+                // the TUI side after LlmFinal.
+                {
+                    let mut guard = ctx.shared_pending_message.lock().await;
+                    if let Some(pending) = guard.as_ref() {
+                        let is_dot_command = pending.text.trim_start().starts_with('.');
+                        let has_attachments = !pending.attachments.is_empty();
+                        if !is_dot_command && !has_attachments {
+                            let pending = guard.take().unwrap();
+                            merged_input.set_injected_user_text(pending.text.clone());
+                            let _ = ctx.event_tx.send(TuiEvent::PendingMessageConsumed(pending));
+                        }
+                    }
+                }
+
                 input = merged_input;
                 with_embeddings = pending_switch.is_some();
                 continue;
