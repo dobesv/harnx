@@ -62,10 +62,30 @@ impl Tui {
         mut resume_count: u32,
         mut with_embeddings: bool,
     ) -> Result<()> {
+        let mut pending_switch: Option<crate::tool::SwitchAgentData> = None;
         loop {
             if input.is_empty() {
                 break;
             }
+
+            // Apply a deferred agent switch from the previous tool round.
+            if let Some(switch) = pending_switch.take() {
+                ctx.config.write().exit_agent()?;
+                Config::use_agent(
+                    &ctx.config,
+                    &switch.agent,
+                    switch.session_id.as_deref(),
+                    ctx.abort_signal.clone(),
+                )
+                .await?;
+                if switch.session_id.is_none() && ctx.config.read().session.is_some() {
+                    ctx.config.write().empty_session()?;
+                }
+                // Reset so the new agent starts fresh, matching REPL/CMD
+                // paths which pass 0 when recursing after a handoff.
+                resume_count = 0;
+            }
+
             if with_embeddings {
                 input.use_embeddings(ctx.abort_signal.clone()).await?;
             }
@@ -159,20 +179,14 @@ impl Tui {
             };
 
             if !tool_results.is_empty() {
-                let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
-                if let Some(switch_agent) = switch_agent {
-                    ctx.config.write().exit_agent()?;
-                    Config::use_agent(
-                        &ctx.config,
-                        &switch_agent.agent,
-                        None,
-                        ctx.abort_signal.clone(),
-                    )
-                    .await?;
-                }
+                let merged_input = input.merge_tool_results(output, thought, tool_results.clone());
                 let _ = ctx.event_tx.send(TuiEvent::ToolRoundComplete);
-                input = input.merge_tool_results(output, thought, tool_results);
-                with_embeddings = false;
+                // Defer agent switch to the top of the next iteration so the
+                // TUI has a chance to render the tool-call row before the new
+                // agent's streaming output begins.
+                pending_switch = tool_results.iter().find_map(|v| v.switch_agent.clone());
+                input = merged_input;
+                with_embeddings = pending_switch.is_some();
                 continue;
             } else {
                 let _ = ctx

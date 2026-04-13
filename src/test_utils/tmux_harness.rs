@@ -31,9 +31,11 @@ impl TmuxHarness {
 
     /// Creates a new detached tmux session with an isolated socket.
     ///
-    /// The session is created under the ambient environment. Tests should apply
-    /// any custom environment variables when launching their test subject inside
-    /// the pane (e.g., via `send_text` with `env VAR=val ...`).
+    /// The shell itself is started in a deterministic test mode: bash skips user
+    /// startup files, prompt hooks are cleared, history is disabled, and the prompt
+    /// is forced to a stable value. Tests should still apply any custom environment
+    /// variables needed by their test subject inside the pane (e.g., via `send_text`
+    /// with `env VAR=val ...`).
     pub fn new(cwd: impl AsRef<Path>, cols: u16, rows: u16) -> Result<Self> {
         let session_name = unique_name("harnx-test");
         let socket_path = std::env::temp_dir().join(format!("{}.sock", unique_name("tmux")));
@@ -50,8 +52,19 @@ impl TmuxHarness {
             .arg(cols.to_string())
             .arg("-y")
             .arg(rows.to_string())
-            // `bash -i` stays alive in detached mode and accepts `send-keys` input.
+            .arg("env")
+            .arg("-u")
+            .arg("BASH_ENV")
+            .arg("-u")
+            .arg("ENV")
+            .arg("PS1=[harnx-test] ")
+            .arg("PROMPT_COMMAND=")
+            .arg("TERM=dumb")
+            .arg("HISTFILE=/dev/null")
+            // Bash stays alive in detached mode and accepts `send-keys` input.
             .arg("bash")
+            .arg("--noprofile")
+            .arg("--norc")
             .arg("-i")
             .current_dir(cwd.as_ref());
 

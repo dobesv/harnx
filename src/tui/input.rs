@@ -389,6 +389,10 @@ impl Tui {
                 // Flush any pending thought so follow-up thought after tool results
                 // starts a fresh block instead of appending to the earlier one.
                 self.flush_pending_thought();
+                // Reset streaming index so the next LLM turn creates a fresh
+                // AssistantText item instead of appending to the previous one.
+                // This keeps tool-call rows visually between the two turns.
+                self.app.streaming_assistant_idx = None;
                 self.pin_transcript_to_bottom();
             }
         }
