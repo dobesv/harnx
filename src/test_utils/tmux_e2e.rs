@@ -371,7 +371,6 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     Ok(())
 }
 
-
 fn nested_mcp_tool_present(screen: &str) -> bool {
     // The nested tool call must appear as a real tool-call row in the parent
     // transcript, NOT just as text inside a response string.
