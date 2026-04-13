@@ -1870,6 +1870,64 @@ async fn test_pending_message_busy_state_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_submitted_message_with_text_attachment_snapshot() {
+    use std::io::Write;
+
+    // Create a real temp file so render_attachment_preview can read it.
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("notes.txt");
+    {
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        writeln!(f, "Line 1 of notes").unwrap();
+        writeln!(f, "Line 2 of notes").unwrap();
+    }
+
+    let mut harness = TuiTestHarness::with_size(60, 18);
+
+    // Directly push transcript items that submit_pending_message_inner
+    // would create: UserText, then AttachmentHeader + AttachmentItem +
+    // AttachmentPreviewLines.
+    let tui = harness.tui();
+    tui.app
+        .transcript
+        .push(TranscriptItem::UserText("check this file".to_string()));
+    tui.app.transcript.push(TranscriptItem::AttachmentHeader(
+        "Attachments (1)".to_string(),
+    ));
+    tui.app
+        .transcript
+        .push(TranscriptItem::AttachmentItem("notes.txt".to_string()));
+    tui.app
+        .transcript
+        .push(TranscriptItem::AttachmentPreviewLine(
+            "Line 1 of notes".to_string(),
+        ));
+    tui.app
+        .transcript
+        .push(TranscriptItem::AttachmentPreviewLine(
+            "Line 2 of notes".to_string(),
+        ));
+    tui.app
+        .transcript
+        .push(TranscriptItem::AssistantText("Got it, thanks!".to_string()));
+
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+
+    // The attachment info should be visible in the rendered output.
+    assert!(
+        rendered.contains("notes.txt"),
+        "expected attachment name visible: {rendered}"
+    );
+    assert!(
+        rendered.contains("Line 1 of notes"),
+        "expected attachment preview visible: {rendered}"
+    );
+
+    insta::assert_snapshot!("submitted_message_with_text_attachment", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_input_word_wraps_long_line() {
     // Use a narrow viewport (30 cols) so a long single-line input must wrap
     let mut harness = TuiTestHarness::with_size(30, 10);
