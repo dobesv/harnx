@@ -1,22 +1,6 @@
 use super::*;
 use crate::tui::types::{App, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES};
 
-/// Estimate the number of terminal rows a set of lines will occupy
-/// after word-wrapping to the given width.
-fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
-    let mut total = 0usize;
-    for line in lines {
-        let line_len: usize = line.spans.iter().map(|s| s.content.len()).sum();
-        if width == 0 {
-            total += 1;
-        } else {
-            let wrapped = line_len.div_ceil(width as usize);
-            total += wrapped.max(1);
-        }
-    }
-    total
-}
-
 impl Tui {
     fn render_text_entry(
         prefix: &str,
@@ -136,9 +120,18 @@ impl Tui {
                 tool_name,
                 input_yaml,
             } => {
+                // Use the plain rightwards arrow `→` (U+2192) as the
+                // tool-call marker.  The previous glyph was `->` followed by
+                // VS16 (U+FE0F), which requests an emoji-style presentation
+                // and causes unicode-width vs. terminal-rendered-width
+                // disagreement in some terminals.  That off-by-one width
+                // mismatch propagates through every subsequent line of the
+                // same frame, leaving stray glyphs (stray letters, corrupted
+                // words) at columns the next render doesn't explicitly
+                // repaint.
                 let mut lines = Self::render_text_entry(
                     "",
-                    &format!("->️ {tool_name}"),
+                    &format!("→ {tool_name}"),
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::DIM),
@@ -214,7 +207,13 @@ impl Tui {
             .scroll_state
             .render(frame, chunks[0], &transcript_entries, |lines| {
                 let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-                let height = wrapped_line_count(lines, chunks[0].width);
+                // Use Paragraph's own wrap-aware line count so the height we
+                // report to the scroll widget exactly matches what the widget
+                // will actually render.  Disagreement here causes the scroll
+                // widget to allocate a mis-sized buffer, which in turn leaves
+                // stale cells in the terminal and produces character-level
+                // rendering artifacts (stray letters, corrupted words).
+                let height = paragraph.line_count(chunks[0].width);
                 (height, paragraph)
             });
 

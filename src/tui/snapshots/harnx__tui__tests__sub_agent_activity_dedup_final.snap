@@ -1,0 +1,32 @@
+---
+source: src/tui/tests.rs
+expression: rendered_final
+---
+I'll look into that for you. Delegating now.
+
+→ researcher_session_prompt
+   message: investigate the data
+> researcher ▸ research-session-1
+<think>Let me analyze the situation carefully.</think>
+→ bash
+   command: find /data -name '*.csv'
+→ read_file
+   path: /data/results.csv
+<think>Now I see the pattern in the data.</think>
+→ write_file
+   path: /data/summary.md
+Here are my findings: the data shows a clear trend.
+
+> researcher ▸ research-session-1   in 500   out 200   cache 100
+Based on the research, the data clearly shows an upward trend.
+
+
+
+
+
+
+
+
+
+
+• 🤖  coordinator ▸ dedup-test-session

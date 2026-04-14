@@ -801,7 +801,7 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         system_entries,
         vec![
             "<think>thinking before tool</think>",
-            "->️ argus_session_prompt",
+            "→ argus_session_prompt",
             "   message: delegate",
             "<think>thinking after tool</think>",
         ]
@@ -880,7 +880,7 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         vec![
             "> argus ▸ session-1",
             "<think>thinking before tool</think>",
-            "->️ argus_session_prompt",
+            "→ argus_session_prompt",
             "   message: delegate",
             "<think>thinking after tool</think>",
         ]
@@ -1092,14 +1092,14 @@ async fn structured_ui_output_variants_render_in_transcript() {
         .collect();
 
     assert!(system_entries.contains(&"> argus ▸ session-1".to_string()));
-    assert!(system_entries.contains(&"->️ argus_session_prompt".to_string()));
+    assert!(system_entries.contains(&"→ argus_session_prompt".to_string()));
     assert!(system_entries.contains(&"   message: hello".to_string()));
     assert!(system_entries.contains(&"<think>thinking hard</think>".to_string()));
     assert!(system_entries.contains(&"-> argus_session_prompt completed".to_string()));
     assert!(system_entries.contains(&"Plan:".to_string()));
     assert!(system_entries.contains(&"  [in_progress] Refactor ACP formatting".to_string()));
     assert!(system_entries.contains(&"> argus ▸ session-1   in 12   out 34   cache 5".to_string()));
-    assert!(system_entries.contains(&"->️ bash".to_string()));
+    assert!(system_entries.contains(&"→ bash".to_string()));
     assert!(system_entries.contains(&"   command: ls".to_string()));
     assert!(system_entries.contains(&"   line one".to_string()));
     assert!(system_entries.contains(&"   line two".to_string()));
@@ -1166,9 +1166,9 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
         })
         .collect();
 
-    assert!(rendered.contains(&"->️ pytheas_session_prompt".to_string()));
+    assert!(rendered.contains(&"→ pytheas_session_prompt".to_string()));
     assert!(rendered.contains(&"> pytheas ▸ session-nested".to_string()));
-    assert!(rendered.contains(&"->️ bash".to_string()));
+    assert!(rendered.contains(&"→ bash".to_string()));
     assert!(rendered.contains(&"   command: ls -1 /tmp | wc -l".to_string()));
     assert!(
         rendered.contains(&"> pytheas ▸ session-nested   in 10   out 20".to_string()),
@@ -2821,4 +2821,257 @@ async fn detach_completes_attachment_names() {
         "Should complete attachment names, got: {:?}",
         names
     );
+}
+
+/// Reproduce potential duplicate sub-agent activity in the TUI.
+///
+/// Simulates a realistic flow where:
+/// - Top-level agent streams a few message fragments
+/// - Sub-agent emits several streaming thought fragments
+/// - Sub-agent makes two tool calls
+/// - Sub-agent emits more streaming thoughts
+/// - Sub-agent makes another tool call
+/// - Sub-agent sends a final message
+/// - Top-level agent streams its final response in several parts
+///
+/// Insta snapshots are taken at several points to allow visual verification
+/// that each activity type appears exactly once (no duplicates).
+#[tokio::test(flavor = "multi_thread")]
+async fn sub_agent_activity_no_duplicates_snapshot() {
+    let config = test_config_with_mock_client_and_agent("coordinator", Some("dedup-test-session"));
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(80, 30);
+    harness.tui().config = config;
+    harness.tui().persistent_manager = persistent;
+    harness.tui().clear_transcript();
+
+    let sub_source = Some(UiOutputSource {
+        agent: "researcher".to_string(),
+        session_id: Some("research-session-1".to_string()),
+    });
+
+    // ── Phase 1: Top-level agent streams opening message ─────────────
+    for chunk in ["I'll look into ", "that for you. ", "Delegating now."] {
+        harness
+            .tui()
+            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+                kind: UiOutputEventKind::MessageChunk {
+                    text: chunk.to_string(),
+                    raw: None,
+                },
+                source: None,
+            }))
+            .await
+            .unwrap();
+    }
+
+    // ── Phase 2: Top-level delegation tool call ──────────────────────
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::ToolCall {
+                tool_name: "researcher_session_prompt".to_string(),
+                input_yaml: Some("message: investigate the data".to_string()),
+                raw: None,
+            },
+            source: None,
+        }))
+        .await
+        .unwrap();
+
+    // ── Phase 3: Sub-agent thinks in several fragments ───────────────
+    for chunk in ["Let me ", "analyze ", "the situation ", "carefully."] {
+        harness
+            .tui()
+            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+                kind: UiOutputEventKind::ThoughtChunk {
+                    text: chunk.to_string(),
+                    raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
+                },
+                source: sub_source.clone(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    // ── Phase 4: Sub-agent makes two tool calls ──────────────────────
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::ToolCall {
+                tool_name: "bash".to_string(),
+                input_yaml: Some("command: find /data -name '*.csv'".to_string()),
+                raw: None,
+            },
+            source: sub_source.clone(),
+        }))
+        .await
+        .unwrap();
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::ToolCall {
+                tool_name: "read_file".to_string(),
+                input_yaml: Some("path: /data/results.csv".to_string()),
+                raw: None,
+            },
+            source: sub_source.clone(),
+        }))
+        .await
+        .unwrap();
+
+    // Snapshot after initial sub-agent activity (thoughts + two tool calls)
+    harness.tui().flush_pending_thought_for_test();
+    harness.render();
+    let rendered_mid1 = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("sub_agent_activity_dedup_after_first_tools", rendered_mid1);
+
+    // ── Phase 5: Sub-agent thinks more ───────────────────────────────
+    for chunk in ["Now I see ", "the pattern ", "in the data."] {
+        harness
+            .tui()
+            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+                kind: UiOutputEventKind::ThoughtChunk {
+                    text: chunk.to_string(),
+                    raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
+                },
+                source: sub_source.clone(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    // ── Phase 6: Sub-agent makes one more tool call ──────────────────
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::ToolCall {
+                tool_name: "write_file".to_string(),
+                input_yaml: Some("path: /data/summary.md".to_string()),
+                raw: None,
+            },
+            source: sub_source.clone(),
+        }))
+        .await
+        .unwrap();
+
+    // Snapshot after all sub-agent tool calls
+    harness.tui().flush_pending_thought_for_test();
+    harness.render();
+    let rendered_mid2 = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("sub_agent_activity_dedup_after_all_tools", rendered_mid2);
+
+    // ── Phase 7: Sub-agent sends final message ───────────────────────
+    for chunk in [
+        "Here are ",
+        "my findings: ",
+        "the data shows a clear trend.",
+    ] {
+        harness
+            .tui()
+            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+                kind: UiOutputEventKind::MessageChunk {
+                    text: chunk.to_string(),
+                    raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
+                },
+                source: sub_source.clone(),
+            }))
+            .await
+            .unwrap();
+    }
+
+    // ── Phase 8: Sub-agent usage line ────────────────────────────────
+    harness
+        .tui()
+        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+            kind: UiOutputEventKind::Usage {
+                input_tokens: 500,
+                output_tokens: 200,
+                cached_tokens: 100,
+                session_label: Some("> researcher ▸ research-session-1".to_string()),
+            },
+            source: sub_source.clone(),
+        }))
+        .await
+        .unwrap();
+
+    // ── Phase 9: Top-level agent streams final response ──────────────
+    for chunk in [
+        "Based on the ",
+        "research, ",
+        "the data clearly shows ",
+        "an upward trend.",
+    ] {
+        harness
+            .tui()
+            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
+                kind: UiOutputEventKind::MessageChunk {
+                    text: chunk.to_string(),
+                    raw: None,
+                },
+                source: None,
+            }))
+            .await
+            .unwrap();
+    }
+
+    // Final snapshot showing the complete flow
+    harness.render();
+    let rendered_final = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("sub_agent_activity_dedup_final", rendered_final);
+
+    // ── Verify no duplicate entries ──────────────────────────────────
+    let all_entries: Vec<_> = harness
+        .tui()
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .filter_map(|line| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            if text.is_empty() || text.starts_with("Welcome to harnx") || text.starts_with('•') {
+                None
+            } else {
+                Some(text)
+            }
+        })
+        .collect();
+
+    // The sub-agent heading should appear exactly once
+    let heading_count = all_entries
+        .iter()
+        .filter(|e| *e == "> researcher ▸ research-session-1")
+        .count();
+    assert_eq!(
+        heading_count, 1,
+        "sub-agent heading should appear exactly once, got {heading_count}. entries: {all_entries:?}"
+    );
+
+    // Each tool call should appear exactly once
+    for tool_name in ["bash", "read_file", "write_file"] {
+        let tool_count = all_entries
+            .iter()
+            .filter(|e| *e == &format!("→ {tool_name}"))
+            .count();
+        assert_eq!(
+            tool_count, 1,
+            "tool call {tool_name} should appear exactly once, got {tool_count}. entries: {all_entries:?}"
+        );
+    }
+
+    // The delegation tool call (top-level) should appear exactly once
+    let delegation_count = all_entries
+        .iter()
+        .filter(|e| *e == "→ researcher_session_prompt")
+        .count();
+    assert_eq!(
+        delegation_count, 1,
+        "delegation tool call should appear exactly once, got {delegation_count}. entries: {all_entries:?}"
+    );
+
+    harness.drain_and_settle().await.unwrap();
 }

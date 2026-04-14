@@ -92,7 +92,7 @@ pub(crate) fn event_fallback_text(
             input_yaml,
             ..
         } => {
-            let mut lines = vec![format!("->️ {tool_name}")];
+            let mut lines = vec![format!("→ {tool_name}")];
             if let Some(input_yaml) = input_yaml {
                 lines.extend(input_yaml.lines().map(|line| format!("   {line}")));
             }

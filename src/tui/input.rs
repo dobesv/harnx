@@ -510,6 +510,23 @@ impl Tui {
     async fn render_ui_output_event(&mut self, event: UiOutputEvent) {
         let is_thought = matches!(&event.kind, UiOutputEventKind::ThoughtChunk { .. });
         let is_usage = matches!(&event.kind, UiOutputEventKind::Usage { .. });
+        // Tool calls (and plan updates) from sub-agents represent a turn-like
+        // boundary in the sub-agent's output: text streamed *before* the tool
+        // call belongs visually above it, text streamed *after* belongs
+        // visually below.  Reset the streaming-assistant index here so a
+        // subsequent MessageChunk starts a fresh AssistantText rather than
+        // being appended to the text that preceded the tool call.  We
+        // deliberately do NOT reset for display-only events (TranscriptText,
+        // ToolResultText, Usage, ToolCallUpdate) so that LLM text chunks
+        // with trailing-newline completion still coalesce correctly across
+        // those events.
+        let is_turn_boundary = matches!(
+            &event.kind,
+            UiOutputEventKind::ToolCall { .. } | UiOutputEventKind::Plan { .. }
+        );
+        if is_turn_boundary {
+            self.app.streaming_assistant_idx = None;
+        }
         if !is_thought {
             self.flush_pending_thought();
         }
@@ -703,6 +720,16 @@ impl Tui {
                     .push(TranscriptItem::SourceHeading(source.clone()));
             }
             self.app.last_ui_output_source = source;
+            // Reset streaming-assistant tracking: a source change means the
+            // next MessageChunk event belongs to a different agent than
+            // whatever the previous AssistantText entry was aggregating, so
+            // it must start a new AssistantText entry (rendered below the
+            // just-inserted SourceHeading) rather than being appended to the
+            // previous agent's text.  Without this reset, sub-agent message
+            // chunks get concatenated onto the parent's AssistantText,
+            // producing a single run-on paragraph that mixes content from
+            // multiple agents on the top-level row.
+            self.app.streaming_assistant_idx = None;
         }
         if !is_usage {
             self.clear_usage_tracking();
