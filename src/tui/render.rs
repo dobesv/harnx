@@ -203,15 +203,6 @@ impl Tui {
             self.app.transcript.iter().map(Self::render_entry).collect()
         };
 
-        // Clear the ENTIRE frame buffer before any widget renders into it.
-        // This guards against character-level rendering artifacts (stray
-        // letters, corrupted words) that can otherwise appear when a row's
-        // content shrinks between frames: ratatui's Paragraph widget only
-        // writes cells that contain actual text glyphs and doesn't pad
-        // trailing cells, so without an explicit clear those cells can
-        // retain glyphs from a previous render.
-        frame.render_widget(ratatui::widgets::Clear, size);
-
         self.app
             .scroll_state
             .render(frame, chunks[0], &transcript_entries, |lines| {

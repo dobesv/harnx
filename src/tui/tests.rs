@@ -2838,8 +2838,7 @@ async fn detach_completes_attachment_names() {
 /// that each activity type appears exactly once (no duplicates).
 #[tokio::test(flavor = "multi_thread")]
 async fn sub_agent_activity_no_duplicates_snapshot() {
-    let config =
-        test_config_with_mock_client_and_agent("coordinator", Some("dedup-test-session"));
+    let config = test_config_with_mock_client_and_agent("coordinator", Some("dedup-test-session"));
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut harness = TuiTestHarness::with_size(80, 30);
     harness.tui().config = config;
@@ -2963,7 +2962,11 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     insta::assert_snapshot!("sub_agent_activity_dedup_after_all_tools", rendered_mid2);
 
     // ── Phase 7: Sub-agent sends final message ───────────────────────
-    for chunk in ["Here are ", "my findings: ", "the data shows a clear trend."] {
+    for chunk in [
+        "Here are ",
+        "my findings: ",
+        "the data shows a clear trend.",
+    ] {
         harness
             .tui()
             .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {

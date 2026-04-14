@@ -389,9 +389,7 @@ fn normalize_screen(screen: &str) -> String {
 /// Replace spinner glyphs (animated braille chars and the idle "•" bullet)
 /// with a fixed placeholder so snapshots are deterministic across runs.
 fn normalize_spinner_chars(text: &str) -> String {
-    const SPINNER_CHARS: &[char] = &[
-        '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '•',
-    ];
+    const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '•'];
     text.chars()
         .map(|c| if SPINNER_CHARS.contains(&c) { '*' } else { c })
         .collect()
@@ -931,25 +929,18 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
         screen
     );
 
-    let normalized =
-        normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen)));
+    let normalized = normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen)));
     assert_snapshot!("nested_sub_agent_activity_no_duplicates", normalized);
 
     // ── Duplication assertions ───────────────────────────────────────────────
     // Each delegation tool call should appear exactly once.
     assert_eq!(
-        count_occurrences(
-            &screen,
-            &format!("{}_session_prompt", NESTED_SUB_AGENT)
-        ),
+        count_occurrences(&screen, &format!("{}_session_prompt", NESTED_SUB_AGENT)),
         1,
         "researcher delegation tool call appears more than once:\n{screen}"
     );
     assert_eq!(
-        count_occurrences(
-            &screen,
-            &format!("{}_session_prompt", NESTED_SUB_SUB_AGENT)
-        ),
+        count_occurrences(&screen, &format!("{}_session_prompt", NESTED_SUB_SUB_AGENT)),
         1,
         "analyst delegation tool call appears more than once:\n{screen}"
     );
