@@ -41,10 +41,7 @@ pub(crate) mod render_helpers;
 mod terminal;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
 pub(crate) mod types;
-#[cfg(not(test))]
-mod types;
 
 pub use self::types::Tui;
 

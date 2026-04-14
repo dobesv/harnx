@@ -1,0 +1,53 @@
+---
+source: tests/tmux_e2e.rs
+assertion_line: 1642
+expression: normalized
+---
+Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
+# retry-agent v
+🤖 retry-agent
+> hello
+
+⚠ Retryable error (status 500, Primary down (type: server_error)), attempt 1/2. Retrying in 10ms...
+⚠ Model 'mock-llm:primary' exhausted retries (error: Failed to call chat-completions api (client: mock-llm, model:
+mock-llm:primary)), cooldown 60s. Trying next fallback.
+FALLBACK_SUCCESS: The fallback model handled it!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+* 🤖 retry-agent

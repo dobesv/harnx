@@ -19,5 +19,4 @@ pub mod ui_output;
 #[macro_use]
 pub mod utils;
 
-#[cfg(test)]
 pub mod test_utils;
