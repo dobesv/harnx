@@ -9,7 +9,7 @@ Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
 
 I'll hand this off to the specialist.
 
-->️ handoff-sub-agent_session_handoff
+→ handoff-sub-agent_session_handoff
    prompt: Take over and answer how many files are in /tmp.
    session_id: handoff-session-1
    Handing off to handoff-sub-agent…

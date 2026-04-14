@@ -128,13 +128,12 @@ impl AcpNotificationClient {
             source,
         };
 
-        // Always emit to the parent UI sink so the TUI transcript shows nested
-        // sub-agent events (tool calls, thoughts, etc.) regardless of whether
-        // a chunk forwarder is also registered.
-        let emitted_to_ui = emit_ui_output_event(event.clone());
-
-        // Also forward to any registered chunk forwarders (e.g. the REPL
-        // command-line path that prints sub-agent output to stdout).
+        // Prefer delivery through a registered chunk forwarder when one is
+        // present.  Registered forwarders (e.g. `forward_acp_chunks` in
+        // `tool.rs` for the parent TUI, or `forward_task` in `server.rs` for
+        // nested ACP relay) already know how to surface the event to the
+        // right destination — emitting directly here would cause the same
+        // event to appear twice in the parent transcript.
         let mut forwarded_to_chunk = false;
         forwarders.retain(|_, tx| match tx.send(NestedAcpEvent::Ui(event.clone())) {
             Ok(()) => {
@@ -144,8 +143,16 @@ impl AcpNotificationClient {
             Err(_) => false,
         });
 
+        // When no forwarder is registered (e.g. direct parent TUI mode with
+        // no tool call in flight), fall back to the UI output sink so the
+        // event still reaches the transcript.
+        let mut emitted_to_ui = false;
+        if !forwarded_to_chunk {
+            emitted_to_ui = emit_ui_output_event(event);
+        }
+
         // Fall back to stderr only if neither path accepted the event.
-        if !emitted_to_ui && !forwarded_to_chunk {
+        if !forwarded_to_chunk && !emitted_to_ui {
             eprint!("{}", text_fallback);
         }
     }

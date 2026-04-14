@@ -703,6 +703,16 @@ impl Tui {
                     .push(TranscriptItem::SourceHeading(source.clone()));
             }
             self.app.last_ui_output_source = source;
+            // Reset streaming-assistant tracking: a source change means the
+            // next MessageChunk event belongs to a different agent than
+            // whatever the previous AssistantText entry was aggregating, so
+            // it must start a new AssistantText entry (rendered below the
+            // just-inserted SourceHeading) rather than being appended to the
+            // previous agent's text.  Without this reset, sub-agent message
+            // chunks get concatenated onto the parent's AssistantText,
+            // producing a single run-on paragraph that mixes content from
+            // multiple agents on the top-level row.
+            self.app.streaming_assistant_idx = None;
         }
         if !is_usage {
             self.clear_usage_tracking();
