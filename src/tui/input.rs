@@ -376,13 +376,7 @@ impl Tui {
         }
     }
 
-    #[cfg(test)]
     pub(crate) async fn handle_tui_event(&mut self, event: TuiEvent) -> Result<()> {
-        self.handle_tui_event_inner(event).await
-    }
-
-    #[cfg(not(test))]
-    pub(super) async fn handle_tui_event(&mut self, event: TuiEvent) -> Result<()> {
         self.handle_tui_event_inner(event).await
     }
 

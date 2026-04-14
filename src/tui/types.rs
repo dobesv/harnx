@@ -22,20 +22,10 @@ pub struct Tui {
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
     /// Shared state so the prompt task can consume a pending message mid-tool-loop.
     pub(super) shared_pending_message: Arc<Mutex<Option<PendingMessage>>>,
-    #[cfg(test)]
     #[allow(private_interfaces)]
     pub(crate) app: App,
-    #[cfg(not(test))]
-    #[allow(dead_code)]
-    pub(super) app: App,
-    #[cfg(test)]
     pub(crate) event_tx: mpsc::UnboundedSender<TuiEvent>,
-    #[cfg(not(test))]
-    pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
-    #[cfg(test)]
     pub(crate) event_rx: mpsc::UnboundedReceiver<TuiEvent>,
-    #[cfg(not(test))]
-    pub(super) event_rx: mpsc::UnboundedReceiver<TuiEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,17 +113,7 @@ pub(crate) enum TranscriptItem {
     AttachmentPreviewLine(String),
 }
 
-#[cfg(test)]
 pub(crate) enum TuiEvent {
-    UiOutput(UiOutputEvent),
-    /// Intermediate tool round completed; the prompt loop continues.
-    ToolRoundComplete,
-    /// The prompt task consumed the pending message during a tool round.
-    PendingMessageConsumed(PendingMessage),
-}
-
-#[cfg(not(test))]
-pub(super) enum TuiEvent {
     UiOutput(UiOutputEvent),
     /// Intermediate tool round completed; the prompt loop continues.
     ToolRoundComplete,

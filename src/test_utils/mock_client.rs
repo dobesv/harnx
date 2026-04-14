@@ -42,11 +42,10 @@
 //! ```
 
 use crate::client::{
-    ChatCompletionsData, ChatCompletionsOutput, Client, ExtraConfig, Model, RequestPatch, SseEvent,
+    ChatCompletionsData, ChatCompletionsOutput, Client, ExtraConfig, Model, RequestPatch,
     SseHandler, ToolCall,
 };
 use crate::config::{Config, GlobalConfig};
-use crate::utils::create_abort_signal;
 
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -488,7 +487,8 @@ impl MockClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{Message, MessageContent, MessageRole};
+    use crate::client::{Message, MessageContent, MessageRole, SseEvent};
+    use crate::utils::create_abort_signal;
     use tokio::sync::mpsc::unbounded_channel;
 
     #[tokio::test(flavor = "multi_thread")]

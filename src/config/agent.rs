@@ -424,7 +424,6 @@ impl Agent {
         self.retry.clone().unwrap_or_default()
     }
 
-    #[cfg(test)]
     pub fn set_model_fallbacks(&mut self, fallbacks: Vec<String>) {
         self.model_fallbacks = fallbacks;
     }

@@ -1,5 +1,6 @@
 ---
-source: src/test_utils/tmux_e2e.rs
+source: tests/tmux_e2e.rs
+assertion_line: 887
 expression: normalized
 ---
 Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.

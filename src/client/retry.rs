@@ -4,14 +4,47 @@ use super::{
 };
 use crate::config::{GlobalConfig, Input, RetryConfig};
 use crate::tool::ToolResult;
-use crate::utils::{wait_abort_signal, AbortSignal};
+use crate::ui_output::{
+    emit_ui_output_event, has_ui_output_sink, UiOutputEvent, UiOutputEventKind,
+};
+use crate::utils::{wait_abort_signal, warning_text, AbortSignal};
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+type CallFuture<'a> = Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<(
+                    String,
+                    Option<String>,
+                    Vec<ToolResult>,
+                    CompletionTokenUsage,
+                )>,
+            > + Send
+            + 'a,
+    >,
+>;
+
 const DEFAULT_COOLDOWN_SECS: u64 = 60;
+
+/// Emit a warning message to the TUI transcript if a UI sink is installed,
+/// otherwise fall back to stderr.
+fn emit_retry_warning(msg: &str) {
+    if has_ui_output_sink() {
+        emit_ui_output_event(UiOutputEvent {
+            kind: UiOutputEventKind::TranscriptText {
+                text: format!("⚠ {msg}"),
+            },
+            source: None,
+        });
+    } else {
+        eprintln!("{}", warning_text(&format!("⚠ {msg}")));
+    }
+}
 
 /// A far-future instant used as "infinite" cooldown (~100 years from process start).
 static INFINITE_INSTANT: LazyLock<Instant> =
@@ -60,6 +93,32 @@ pub async fn call_with_retry_and_fallback(
     Vec<ToolResult>,
     CompletionTokenUsage,
 )> {
+    call_with_retry_and_fallback_custom(input, config, abort_signal, |input, client, abort| {
+        Box::pin(default_call_fn(input, client, abort))
+    })
+    .await
+}
+
+/// Like [`call_with_retry_and_fallback`] but accepts a custom call function.
+///
+/// The `call_fn` closure is invoked for each attempt and receives the current
+/// `Input`, a reference to the resolved `Client`, and the `AbortSignal`.  This
+/// allows callers (e.g. the TUI) to supply their own streaming implementation
+/// while still benefiting from the retry/fallback loop.
+pub async fn call_with_retry_and_fallback_custom<F>(
+    input: &Input,
+    config: &GlobalConfig,
+    abort_signal: AbortSignal,
+    call_fn: F,
+) -> Result<(
+    String,
+    Option<String>,
+    Vec<ToolResult>,
+    CompletionTokenUsage,
+)>
+where
+    F: for<'a> Fn(&'a Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
+{
     let agent = input.agent();
     let retry_config = agent.retry_config();
 
@@ -71,9 +130,29 @@ pub async fn call_with_retry_and_fallback(
     let mut model_ids: Vec<String> = vec![primary_model_id];
     model_ids.extend(agent.model_fallbacks().iter().cloned());
 
+    // Eagerly validate all fallback model IDs so the user gets immediate
+    // feedback about typos / missing models instead of a silent skip.
+    for model_id in model_ids.iter().skip(1) {
+        let valid = {
+            let cfg = config.read();
+            Model::retrieve_model(&cfg, model_id, ModelType::Chat).is_ok()
+        };
+        if !valid {
+            emit_retry_warning(&format!(
+                "Invalid fallback model '{}' in agent config — this model does not exist and will be skipped.",
+                model_id
+            ));
+            config
+                .read()
+                .model_cooldowns
+                .lock()
+                .set_infinite_cooldown(model_id);
+        }
+    }
+
     let mut last_error: Option<anyhow::Error> = None;
 
-    for model_id in &model_ids {
+    for (idx, model_id) in model_ids.iter().enumerate() {
         // Skip models on cooldown
         if config
             .read()
@@ -81,30 +160,56 @@ pub async fn call_with_retry_and_fallback(
             .lock()
             .is_on_cooldown(model_id)
         {
-            debug!("Skipping model '{}' (on cooldown)", model_id);
+            emit_retry_warning(&format!("Skipping model '{}' (on cooldown)", model_id));
             continue;
         }
 
-        // Resolve model and create client
-        let client = match resolve_client(config, model_id) {
-            Ok(client) => client,
-            Err(err) => {
-                warn!(
-                    "Failed to initialize client for model '{}': {}. Setting infinite cooldown.",
-                    model_id, err
-                );
-                config
-                    .read()
-                    .model_cooldowns
-                    .lock()
-                    .set_infinite_cooldown(model_id);
-                last_error = Some(err);
-                continue;
+        // For the primary model (idx 0), use the already-resolved model from
+        // the input.  For fallbacks, resolve from the model catalog.
+        let client = if idx == 0 {
+            match input.create_client() {
+                Ok(client) => client,
+                Err(err) => {
+                    emit_retry_warning(&format!(
+                        "Invalid model '{}': {}. This fallback will never be used — check your agent config.",
+                        model_id, err
+                    ));
+                    config
+                        .read()
+                        .model_cooldowns
+                        .lock()
+                        .set_infinite_cooldown(model_id);
+                    last_error = Some(err);
+                    continue;
+                }
+            }
+        } else {
+            match resolve_client(config, model_id) {
+                Ok(client) => client,
+                Err(err) => {
+                    emit_retry_warning(&format!(
+                        "Invalid fallback model '{}': {}. This fallback will never be used — check your agent config.",
+                        model_id, err
+                    ));
+                    config
+                        .read()
+                        .model_cooldowns
+                        .lock()
+                        .set_infinite_cooldown(model_id);
+                    last_error = Some(err);
+                    continue;
+                }
             }
         };
 
-        match try_model_with_retries(input, client.as_ref(), &retry_config, abort_signal.clone())
-            .await
+        match try_model_with_retries_custom(
+            input,
+            client.as_ref(),
+            &retry_config,
+            abort_signal.clone(),
+            &call_fn,
+        )
+        .await
         {
             Ok(result) => return Ok(result),
             Err(err) => {
@@ -120,17 +225,35 @@ pub async fn call_with_retry_and_fallback(
                     .lock()
                     .set_cooldown(model_id, cooldown);
 
-                warn!(
-                    "Model '{}' exhausted retries, cooldown {}s. Trying next fallback.",
+                emit_retry_warning(&format!(
+                    "Model '{}' exhausted retries (error: {}), cooldown {}s. Trying next fallback.",
                     model_id,
+                    err,
                     cooldown.as_secs()
-                );
+                ));
                 last_error = Some(err);
             }
         }
     }
 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All models are on cooldown")))
+}
+
+async fn default_call_fn(
+    input: &Input,
+    client: &dyn Client,
+    abort_signal: AbortSignal,
+) -> Result<(
+    String,
+    Option<String>,
+    Vec<ToolResult>,
+    CompletionTokenUsage,
+)> {
+    if input.stream() {
+        call_chat_completions_streaming(input, client, abort_signal).await
+    } else {
+        call_chat_completions(input, true, false, client, abort_signal).await
+    }
 }
 
 fn resolve_client(config: &GlobalConfig, model_id: &str) -> Result<Box<dyn Client>> {
@@ -141,27 +264,27 @@ fn resolve_client(config: &GlobalConfig, model_id: &str) -> Result<Box<dyn Clien
     init_client(config, Some(model))
 }
 
-async fn try_model_with_retries(
+async fn try_model_with_retries_custom<F>(
     input: &Input,
     client: &dyn Client,
     retry_config: &RetryConfig,
     abort_signal: AbortSignal,
+    call_fn: &F,
 ) -> Result<(
     String,
     Option<String>,
     Vec<ToolResult>,
     CompletionTokenUsage,
-)> {
+)>
+where
+    F: for<'a> Fn(&'a Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
+{
     let mut last_error: Option<anyhow::Error> = None;
     // Ensure at least one attempt even if configured as 0
     let attempts = retry_config.attempts.max(1);
 
     for attempt in 0..attempts {
-        let result = if input.stream() {
-            call_chat_completions_streaming(input, client, abort_signal.clone()).await
-        } else {
-            call_chat_completions(input, true, false, client, abort_signal.clone()).await
-        };
+        let result = call_fn(input, client, abort_signal.clone()).await;
 
         match result {
             Ok(result) => return Ok(result),
@@ -179,13 +302,14 @@ async fn try_model_with_retries(
                     // Retryable error
                     if attempt + 1 < attempts {
                         let delay = compute_backoff_delay(retry_config, attempt);
-                        warn!(
-                            "Retryable error (status {}), attempt {}/{}. Retrying in {}ms...",
+                        emit_retry_warning(&format!(
+                            "Retryable error (status {}, {}), attempt {}/{}. Retrying in {}ms...",
                             llm_err.status,
+                            llm_err.message,
                             attempt + 1,
                             attempts,
                             delay.as_millis()
-                        );
+                        ));
                         tokio::select! {
                             () = tokio::time::sleep(delay) => {}
                             () = wait_abort_signal(&abort_signal) => {
@@ -197,13 +321,13 @@ async fn try_model_with_retries(
                     // Non-LlmError (network timeout, DNS, etc): treat as retryable
                     if attempt + 1 < attempts {
                         let delay = compute_backoff_delay(retry_config, attempt);
-                        warn!(
+                        emit_retry_warning(&format!(
                             "Network error, attempt {}/{}. Retrying in {}ms: {}",
                             attempt + 1,
                             attempts,
                             delay.as_millis(),
                             err
-                        );
+                        ));
                         tokio::select! {
                             () = tokio::time::sleep(delay) => {}
                             () = wait_abort_signal(&abort_signal) => {
@@ -345,6 +469,23 @@ mod tests {
 
     fn make_input(config: &GlobalConfig) -> Input {
         Input::from_str(config, "hello", None)
+    }
+
+    async fn try_model_with_retries(
+        input: &Input,
+        client: &dyn Client,
+        retry_config: &RetryConfig,
+        abort_signal: AbortSignal,
+    ) -> Result<(
+        String,
+        Option<String>,
+        Vec<ToolResult>,
+        CompletionTokenUsage,
+    )> {
+        try_model_with_retries_custom(input, client, retry_config, abort_signal, &|i, c, a| {
+            Box::pin(default_call_fn(i, c, a))
+        })
+        .await
     }
 
     #[tokio::test]
@@ -537,5 +678,53 @@ mod tests {
         let config = make_config();
         let cooldown = compute_cooldown(&err, &config, "unknown-model");
         assert_eq!(cooldown, Duration::from_secs(DEFAULT_COOLDOWN_SECS));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_fallback_model_reports_warning_and_skips() {
+        // Primary model fails with a retryable error; the only fallback is an
+        // invalid model name that cannot be resolved.  The function should:
+        //   1. Emit a warning about the invalid fallback model up-front.
+        //   2. Still fail with the primary model's error (not silently succeed).
+        let mock = Arc::new(
+            MockClient::builder()
+                .error_on_stream(
+                    LlmError {
+                        status: 429,
+                        message: "Rate limit".into(),
+                        retry_after: None,
+                    }
+                    .into(),
+                )
+                .build(),
+        );
+        let _guard = TestStateGuard::new(Some(mock)).await;
+
+        let config = make_config();
+        let mut input = make_input(&config);
+        input
+            .agent_mut()
+            .set_model_fallbacks(vec!["nonexistent-client:bogus-model".to_string()]);
+
+        let abort = create_abort_signal();
+        let result = call_with_retry_and_fallback_custom(&input, &config, abort, |i, c, a| {
+            Box::pin(default_call_fn(i, c, a))
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Expected error when primary fails and fallback is invalid"
+        );
+
+        // The invalid fallback should have been placed on infinite cooldown.
+        assert!(
+            config
+                .read()
+                .model_cooldowns
+                .lock()
+                .is_on_cooldown("nonexistent-client:bogus-model"),
+            "Invalid fallback model should be on cooldown"
+        );
     }
 }

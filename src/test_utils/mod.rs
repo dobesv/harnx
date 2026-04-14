@@ -61,7 +61,6 @@ pub mod mock_acp;
 pub mod mock_client;
 pub mod mock_openai_server;
 pub mod sync;
-mod tmux_e2e;
 pub mod tmux_harness;
 pub mod tui_harness;
 

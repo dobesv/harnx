@@ -43,6 +43,8 @@ pub enum SessionLogEntry {
         agent_variables: AgentVariables,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         agent_instructions: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        model_fallbacks: Vec<String>,
     },
     #[serde(rename = "message")]
     Message {
@@ -82,6 +84,8 @@ pub struct Session {
     agent_variables: AgentVariables,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     agent_instructions: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    model_fallbacks: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     compressed_messages: Vec<Message>,
@@ -175,6 +179,7 @@ impl Session {
                     agent_name,
                     agent_variables,
                     agent_instructions,
+                    model_fallbacks,
                 } => {
                     session.model_id = model_id;
                     session.temperature = temperature;
@@ -185,6 +190,7 @@ impl Session {
                     session.agent_name = agent_name;
                     session.agent_variables = agent_variables;
                     session.agent_instructions = agent_instructions;
+                    session.model_fallbacks = model_fallbacks;
                 }
                 SessionLogEntry::Message { role, content } => {
                     session.messages.push(Message::new(role, content));
@@ -231,6 +237,9 @@ impl Session {
                 session.agent_prompt = agent.interpolated_instructions();
                 if session.use_tools.is_none() {
                     session.use_tools = agent.use_tools();
+                }
+                if session.model_fallbacks.is_empty() {
+                    session.model_fallbacks = agent.model_fallbacks().to_vec();
                 }
             }
         }
@@ -301,6 +310,7 @@ impl Session {
             agent_name: self.agent_name.clone(),
             agent_variables: self.agent_variables.clone(),
             agent_instructions: self.agent_instructions.clone(),
+            model_fallbacks: self.model_fallbacks.clone(),
         }
     }
 
@@ -394,6 +404,15 @@ impl Session {
                     .collect(),
             );
         }
+        if !self.model_fallbacks.is_empty() {
+            data["model_fallbacks"] = serde_json::Value::Array(
+                self.model_fallbacks
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
         if let Some(save_session) = self.save_session() {
             data["save_session"] = save_session.into();
         }
@@ -438,6 +457,10 @@ impl Session {
 
         if let Some(use_tools) = self.use_tools() {
             items.push(("use_tools", use_tools.join(",")));
+        }
+
+        if !self.model_fallbacks.is_empty() {
+            items.push(("model_fallbacks", self.model_fallbacks.join(",")));
         }
 
         if let Some(save_session) = self.save_session() {
@@ -509,6 +532,7 @@ impl Session {
         self.temperature = agent.temperature();
         self.top_p = agent.top_p();
         self.use_tools = agent.use_tools();
+        self.model_fallbacks = agent.model_fallbacks().to_vec();
         self.model = agent.model().clone();
         self.agent_name = convert_option_string(agent.name());
         self.agent_prompt = agent.interpolated_instructions();
@@ -901,6 +925,7 @@ impl Session {
         agent.set_temperature(self.temperature);
         agent.set_top_p(self.top_p);
         agent.set_use_tools(self.use_tools.clone());
+        agent.set_model_fallbacks(self.model_fallbacks.clone());
         agent.set_shared_variables(self.agent_variables.clone());
         agent
     }
@@ -949,6 +974,120 @@ impl Session {
             self.use_tools = value;
             self.dirty = true;
         }
+    }
+
+    #[cfg(test)]
+    pub fn model_fallbacks(&self) -> &[String] {
+        &self.model_fallbacks
+    }
+
+    pub fn set_model_fallbacks(&mut self, value: Vec<String>) {
+        if self.model_fallbacks != value {
+            self.model_fallbacks = value;
+            self.dirty = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_session() -> Session {
+        Session::new(&Config::default(), "test")
+    }
+
+    #[test]
+    fn set_agent_to_agent_round_trip_preserves_model_fallbacks() {
+        let agent = Agent::from_markdown(
+            "test",
+            "---\nmodel: openai:gpt-4o\nmodel_fallbacks:\n  - anthropic:claude\n  - google:gemini\n---\nYou are a test agent.",
+        );
+        let mut session = test_session();
+
+        session.set_agent(&agent);
+        let round_tripped_agent = session.to_agent();
+
+        assert_eq!(
+            round_tripped_agent.model_fallbacks(),
+            agent.model_fallbacks()
+        );
+    }
+
+    #[test]
+    fn session_header_serde_round_trip_preserves_model_fallbacks() {
+        let mut session = test_session();
+        session.set_model_fallbacks(vec![
+            "anthropic:claude".to_string(),
+            "google:gemini".to_string(),
+        ]);
+
+        let yaml = serde_yaml::to_string(&session.build_header_entry()).unwrap();
+        let entry: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        match entry {
+            SessionLogEntry::Header {
+                model_fallbacks, ..
+            } => {
+                assert_eq!(
+                    model_fallbacks,
+                    vec!["anthropic:claude".to_string(), "google:gemini".to_string()]
+                );
+            }
+            _ => panic!("expected header entry"),
+        }
+    }
+
+    #[test]
+    fn export_shows_model_fallbacks() {
+        let mut session = test_session();
+        session.set_model_fallbacks(vec![
+            "anthropic:claude".to_string(),
+            "google:gemini".to_string(),
+        ]);
+
+        let output = session.export().unwrap();
+
+        assert!(output.contains("model_fallbacks:"));
+        assert!(output.contains("- anthropic:claude"));
+        assert!(output.contains("- google:gemini"));
+    }
+
+    #[test]
+    fn set_model_fallbacks_updates_session_and_marks_dirty() {
+        let mut session = test_session();
+
+        assert!(session.model_fallbacks().is_empty());
+
+        session.set_model_fallbacks(vec!["anthropic:claude".to_string()]);
+
+        assert_eq!(session.model_fallbacks(), &["anthropic:claude".to_string()]);
+        assert!(session.dirty);
+    }
+
+    #[test]
+    fn render_shows_model_fallbacks() {
+        use crate::render::{MarkdownRender, RenderOptions};
+
+        let mut session = test_session();
+        session.set_model_fallbacks(vec![
+            "anthropic:claude".to_string(),
+            "google:gemini".to_string(),
+        ]);
+
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let agent_info: Option<(String, Vec<String>)> = None;
+        let output = session.render(&mut render, &agent_info).unwrap();
+
+        assert!(
+            output.contains("model_fallbacks"),
+            "render output should contain model_fallbacks key: {output}"
+        );
+        assert!(
+            output.contains("anthropic:claude,google:gemini"),
+            "render output should contain comma-separated fallback values: {output}"
+        );
     }
 }
 

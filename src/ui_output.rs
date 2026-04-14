@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::utils::warning_text;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UiOutputSource {
     pub agent: String,
@@ -123,10 +125,44 @@ pub fn emit_ui_output_event(event: UiOutputEvent) -> bool {
     }
 }
 
-#[cfg(test)]
+/// Install a CLI-mode UI output sink that renders events to stderr.
+///
+/// This should be called once for non-TUI, non-ACP modes (i.e. `Cmd` and
+/// `Repl` working modes) so that retry/fallback warnings and other
+/// transcript events are printed to stderr instead of being silently dropped.
+pub fn install_cli_ui_output_sink() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    install_ui_output_sender(tx);
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            match event.kind {
+                UiOutputEventKind::TranscriptText { text } => {
+                    eprintln!("{}", warning_text(&text));
+                }
+                UiOutputEventKind::LlmError(text) => {
+                    eprintln!("{}", warning_text(&format!("LLM error: {text}")));
+                }
+                // Other event kinds are handled inline by the CLI/REPL
+                // callers (streaming output, tool calls, etc.) and don't
+                // need to be duplicated here.
+                _ => {}
+            }
+        }
+    });
+}
+
+#[allow(dead_code)]
 pub fn clear_ui_output_sender() {
-    let mut guard = UI_OUTPUT_SENDER
-        .lock()
-        .expect("UI_OUTPUT_SENDER mutex poisoned");
-    *guard = None;
+    #[cfg(test)]
+    {
+        let mut guard = UI_OUTPUT_SENDER
+            .lock()
+            .expect("UI_OUTPUT_SENDER mutex poisoned");
+        *guard = None;
+    }
+    #[cfg(not(test))]
+    {
+        // OnceLock cannot be cleared; this is a no-op in production.
+        // In production, each process has exactly one sender for its lifetime.
+    }
 }

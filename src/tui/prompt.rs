@@ -80,7 +80,6 @@ impl Tui {
                 inject_pending_async_context(&mut input, &mut pending_guard);
             }
 
-            let client = input.create_client()?;
             ctx.config.write().before_chat_completion(&input)?;
             let (hooks, session_id, cwd) = Self::hook_dispatch_context(&ctx.config);
             let event = HookEvent::UserPromptSubmit {
@@ -112,23 +111,44 @@ impl Tui {
                 }
             }
 
-            let (output, thought, tool_results, usage) = if !input.stream() {
-                call_chat_completions(
-                    &input,
-                    true,
-                    false,
-                    client.as_ref(),
-                    ctx.abort_signal.clone(),
-                )
-                .await?
-            } else {
-                Self::call_chat_completions_streaming_tui(
-                    &input,
-                    client.as_ref(),
-                    ctx.abort_signal.clone(),
-                    ctx.event_tx.clone(),
-                )
-                .await?
+            let event_tx = ctx.event_tx.clone();
+            let llm_result = crate::client::retry::call_with_retry_and_fallback_custom(
+                &input,
+                &ctx.config,
+                ctx.abort_signal.clone(),
+                |input: &Input, client: &dyn crate::client::Client, abort_signal| {
+                    let event_tx = event_tx.clone();
+                    Box::pin(async move {
+                        if input.stream() {
+                            Self::call_chat_completions_streaming_tui(
+                                input,
+                                client,
+                                abort_signal,
+                                event_tx,
+                            )
+                            .await
+                        } else {
+                            call_chat_completions(input, true, false, client, abort_signal).await
+                        }
+                    })
+                },
+            )
+            .await;
+
+            let (output, thought, tool_results, usage) = match llm_result {
+                Ok(result) => result,
+                Err(err) => {
+                    // Persist the user message to the session log even on
+                    // LLM failure so it is not lost.
+                    let _ = ctx.config.write().after_chat_completion(
+                        &input,
+                        "",
+                        None,
+                        &[],
+                        &Default::default(),
+                    );
+                    return Err(err);
+                }
             };
 
             ctx.config.write().after_chat_completion(

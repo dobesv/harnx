@@ -929,6 +929,19 @@ impl Config {
                 };
                 config.write().set_use_tools(value);
             }
+            "model_fallbacks" => {
+                let value: Vec<String> = if value == "null" {
+                    vec![]
+                } else {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                };
+                config.write().set_model_fallbacks(value);
+            }
             "max_output_tokens" => {
                 let value = parse_value(value)?;
                 config.write().set_max_output_tokens(value);
@@ -1078,6 +1091,14 @@ impl Config {
             agent.set_use_tools(value);
         } else {
             self.use_tools = value;
+        }
+    }
+
+    pub fn set_model_fallbacks(&mut self, value: Vec<String>) {
+        if let Some(session) = self.session.as_mut() {
+            session.set_model_fallbacks(value);
+        } else if let Some(agent) = self.agent.as_mut() {
+            agent.set_model_fallbacks(value);
         }
     }
 

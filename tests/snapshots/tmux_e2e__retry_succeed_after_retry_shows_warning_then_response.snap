@@ -1,0 +1,53 @@
+---
+source: tests/tmux_e2e.rs
+assertion_line: 1547
+expression: normalized
+---
+Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
+# retry-agent v
+🤖 retry-agent
+> hello
+
+⚠ Retryable error (status 500, Temporary failure (type: server_error)), attempt 1/3. Retrying in 10ms...
+RETRY_SUCCESS_RESPONSE: Hello from the retried model!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+* 🤖 retry-agent

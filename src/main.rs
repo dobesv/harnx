@@ -203,6 +203,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     config.write().apply_default_session()?;
     match is_repl {
         false => {
+            ui_output::install_cli_ui_output_sink();
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
             let mut async_manager = AsyncHookManager::new();
             let persistent_manager =

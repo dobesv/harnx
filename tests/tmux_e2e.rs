@@ -1,9 +1,8 @@
-#![cfg(test)]
-
-use crate::acp::AcpServerConfig;
-use crate::mcp::McpServerConfig;
-use crate::test_utils::{
-    MockOpenAiScript, MockOpenAiServer, MockOpenAiToolCall, MockOpenAiTurn, TmuxHarness,
+use harnx::acp::AcpServerConfig;
+use harnx::mcp::McpServerConfig;
+use harnx::test_utils::{
+    MockOpenAiError, MockOpenAiScript, MockOpenAiServer, MockOpenAiToolCall, MockOpenAiTurn,
+    TmuxHarness,
 };
 
 use anyhow::{Context, Result};
@@ -20,34 +19,14 @@ const TEST_SUB_AGENT_NAME: &str = "test-sub-agent";
 
 #[test]
 fn repro_249_top_level_delegation_markers() -> Result<()> {
-    if option_env!("CARGO_BIN_NAME") == Some("harnx") {
-        eprintln!(
-            "skipping repro_249_top_level_delegation_markers in binary test target to avoid duplicate tmux sessions"
-        );
-        return Ok(());
-    }
-
     if !TmuxHarness::is_available() {
         eprintln!("skipping repro_249_top_level_delegation_markers: tmux is unavailable");
         return Ok(());
     }
 
     let repo_root = repo_root()?;
-    let target_dir = repo_root.join("target").join("debug");
-    let harnx_bin = target_dir.join(binary_name("harnx"));
-
-    if !harnx_bin.is_file() {
-        eprintln!("skipping repro_249_top_level_delegation_markers: harnx binary is missing");
-        return Ok(());
-    }
-
-    let harnx_mcp_bin = target_dir.join(binary_name("harnx-mcp-repro249"));
-    if !harnx_mcp_bin.is_file() {
-        eprintln!(
-            "skipping repro_249_top_level_delegation_markers: harnx-mcp-repro249 binary is missing"
-        );
-        return Ok(());
-    }
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let _harnx_mcp_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-repro249"));
 
     let temp = TempDir::new().context("failed to create temp dir")?;
     let mock = MockOpenAiServer::start(script())?;
@@ -56,7 +35,10 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
 
     let path_env = format!(
         "{}:{}",
-        target_dir.display(),
+        harnx_bin
+            .parent()
+            .context("harnx binary missing parent directory")?
+            .display(),
         std::env::var("PATH").unwrap_or_default()
     );
 
@@ -247,15 +229,9 @@ fn script() -> MockOpenAiScript {
 fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
-    let fake_mcp_server = repo_root()?
-        .join("target")
-        .join("debug")
-        .join(binary_name("harnx-mcp-repro249"));
+    let fake_mcp_server = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-repro249"));
 
-    let harnx_bin = repo_root()?
-        .join("target")
-        .join("debug")
-        .join(binary_name("harnx"));
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
 
     std::fs::write(
         &paths.config_path,
@@ -446,14 +422,6 @@ fn repo_root() -> Result<PathBuf> {
         .context("failed to resolve repo root")
 }
 
-fn binary_name(stem: &str) -> String {
-    if cfg!(windows) {
-        format!("{stem}.exe")
-    } else {
-        stem.to_string()
-    }
-}
-
 fn shell_escape(input: &str) -> String {
     if input.is_empty() {
         return "''".to_string();
@@ -621,14 +589,7 @@ fn setup_handoff_tmux_session(test_name: &str) -> Result<Option<HandoffTmuxSessi
         return Ok(None);
     }
 
-    let repo_root = repo_root()?;
-    let target_dir = repo_root.join("target").join("debug");
-    let harnx_bin = target_dir.join(binary_name("harnx"));
-
-    if !harnx_bin.is_file() {
-        eprintln!("skipping {test_name}: harnx binary is missing");
-        return Ok(None);
-    }
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
 
     let temp = TempDir::new().context("failed to create temp dir")?;
     let mock = MockOpenAiServer::start(handoff_script())?;
@@ -637,11 +598,15 @@ fn setup_handoff_tmux_session(test_name: &str) -> Result<Option<HandoffTmuxSessi
 
     let path_env = format!(
         "{}:{}",
-        target_dir.display(),
+        harnx_bin
+            .parent()
+            .context("harnx binary missing parent directory")?
+            .display(),
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let tmux = match TmuxHarness::new(&repo_root, 120, 35) {
+    let root = repo_root()?;
+    let tmux = match TmuxHarness::new(&root, 120, 35) {
         Ok(tmux) => tmux,
         Err(err) => {
             eprintln!("skipping {test_name}: tmux is unavailable or unusable ({err:#})");
@@ -659,7 +624,7 @@ fn setup_handoff_tmux_session(test_name: &str) -> Result<Option<HandoffTmuxSessi
     tmux.send_text(&format!(
         "export PATH={} && cd {}; printf '__HANDOFF_READY__\\n'",
         shell_escape(&path_env),
-        shell_escape(repo_root.to_string_lossy().as_ref())
+        shell_escape(root.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
     tmux.wait_for(Duration::from_secs(5), |screen| {
@@ -708,10 +673,7 @@ fn handoff_script() -> MockOpenAiScript {
 fn write_handoff_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
-    let harnx_bin = repo_root()?
-        .join("target")
-        .join("debug")
-        .join(binary_name("harnx"));
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
 
     std::fs::write(
         &paths.config_path,
@@ -825,20 +787,8 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
         return Ok(());
     }
 
-    let repo_root = repo_root()?;
-    let target_dir = repo_root.join("target").join("debug");
-    let harnx_bin = target_dir.join(binary_name("harnx"));
-    if !harnx_bin.is_file() {
-        eprintln!("skipping nested_sub_agent_activity_no_duplicates: harnx binary is missing");
-        return Ok(());
-    }
-    let harnx_mcp_bin = target_dir.join(binary_name("harnx-mcp-repro249"));
-    if !harnx_mcp_bin.is_file() {
-        eprintln!(
-            "skipping nested_sub_agent_activity_no_duplicates: harnx-mcp-repro249 binary missing"
-        );
-        return Ok(());
-    }
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let _harnx_mcp_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-repro249"));
 
     let temp = TempDir::new().context("failed to create temp dir")?;
     let mock = MockOpenAiServer::start(nested_script())?;
@@ -847,11 +797,15 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
 
     let path_env = format!(
         "{}:{}",
-        target_dir.display(),
+        harnx_bin
+            .parent()
+            .context("harnx binary missing parent directory")?
+            .display(),
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let tmux = match TmuxHarness::new(&repo_root, 120, 80) {
+    let root = repo_root()?;
+    let tmux = match TmuxHarness::new(&root, 120, 80) {
         Ok(tmux) => tmux,
         Err(err) => {
             eprintln!("skipping nested_sub_agent_activity_no_duplicates: tmux unusable ({err:#})");
@@ -871,7 +825,7 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
     tmux.send_text(&format!(
         "export PATH={} && cd {}; printf '__NESTED_READY__\\n'",
         shell_escape(&path_env),
-        shell_escape(repo_root.to_string_lossy().as_ref())
+        shell_escape(root.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
     tmux.wait_for(Duration::from_secs(5), |screen| {
@@ -1124,15 +1078,9 @@ fn nested_script() -> MockOpenAiScript {
 fn write_nested_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
-    let fake_mcp_server = repo_root()?
-        .join("target")
-        .join("debug")
-        .join(binary_name("harnx-mcp-repro249"));
+    let fake_mcp_server = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-repro249"));
 
-    let harnx_bin = repo_root()?
-        .join("target")
-        .join("debug")
-        .join(binary_name("harnx"));
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
 
     std::fs::write(&paths.config_path, "save: false\n")?;
 
@@ -1283,6 +1231,373 @@ fn write_nested_fixture_files(paths: &TestPaths) -> Result<()> {
             REPRO_249_MCP_TOOL_NAME,
         ),
     )?;
+
+    Ok(())
+}
+
+// ── Retry / fallback TUI tests ──────────────────────────────────────────────
+//
+// These tests verify that retry and fallback warning messages appear correctly
+// in the TUI transcript under various failure scenarios.
+
+const RETRY_AGENT_NAME: &str = "retry-agent";
+
+/// Helper: set up a tmux session running harnx with a given mock script and
+/// agent markdown frontmatter.  Returns the harness, mock server, and temp dir.
+struct RetryTmuxSession {
+    _temp: TempDir,
+    _mock: MockOpenAiServer,
+    tmux: TmuxHarness,
+    harnx_bin: PathBuf,
+}
+
+#[allow(clippy::type_complexity)]
+fn setup_retry_tmux_session(
+    test_name: &str,
+    script: MockOpenAiScript,
+    agent_frontmatter: &str,
+    extra_setup: Option<&dyn Fn(&TestPaths) -> Result<()>>,
+) -> Result<Option<RetryTmuxSession>> {
+    if option_env!("CARGO_BIN_NAME") == Some("harnx") {
+        eprintln!("skipping {test_name} in binary test target");
+        return Ok(None);
+    }
+    if !TmuxHarness::is_available() {
+        eprintln!("skipping {test_name}: tmux is unavailable");
+        return Ok(None);
+    }
+
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+
+    let temp = TempDir::new().context("failed to create temp dir")?;
+    let mock = MockOpenAiServer::start(script)?;
+    let paths = TestPaths::new(temp.path(), mock.port())?;
+
+    // Write config.yaml
+    std::fs::write(&paths.config_path, "save: false\n")?;
+
+    // Write client config with two models: "primary" and "fallback"
+    let clients_dir = paths.harnx_config_dir.join("clients");
+    std::fs::create_dir_all(&clients_dir)?;
+    let client_yaml = format!(
+        r#"type: openai-compatible
+name: mock-llm
+api_base: "http://127.0.0.1:{}/v1"
+api_key: dummy
+models:
+  - name: primary
+    max_input_tokens: 32000
+    max_output_tokens: 4096
+    supports_tool_use: true
+  - name: fallback
+    max_input_tokens: 32000
+    max_output_tokens: 4096
+    supports_tool_use: true
+"#,
+        paths.port
+    );
+    std::fs::write(clients_dir.join("mock-llm.yaml"), client_yaml)?;
+
+    // Write agent markdown
+    std::fs::write(
+        paths.agents_dir.join(format!("{RETRY_AGENT_NAME}.md")),
+        agent_frontmatter,
+    )?;
+
+    if let Some(setup_fn) = extra_setup {
+        setup_fn(&paths)?;
+    }
+
+    let path_env = format!(
+        "{}:{}",
+        harnx_bin
+            .parent()
+            .context("harnx binary missing parent directory")?
+            .display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let root = repo_root()?;
+    let tmux = match TmuxHarness::new(&root, 120, 50) {
+        Ok(tmux) => tmux,
+        Err(err) => {
+            eprintln!("skipping {test_name}: tmux unusable ({err:#})");
+            return Ok(None);
+        }
+    };
+    tmux.send_keys(&["C-l"])?;
+
+    tmux.send_text(&format!(
+        "export HARNX_CONFIG_DIR={}",
+        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref())
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+
+    tmux.send_text(&format!(
+        "export PATH={} && cd {}; printf '__RETRY_READY__\\n'",
+        shell_escape(&path_env),
+        shell_escape(root.to_string_lossy().as_ref())
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for(Duration::from_secs(5), |screen| {
+        count_occurrences(screen, "__RETRY_READY__") >= 2
+    })?;
+
+    Ok(Some(RetryTmuxSession {
+        _temp: temp,
+        _mock: mock,
+        tmux,
+        harnx_bin,
+    }))
+}
+
+/// Test: all retries and fallbacks fail — error messages appear in transcript.
+#[test]
+fn retry_all_fail_shows_warnings_in_tui() -> Result<()> {
+    // Script: 6 error turns (3 retries for primary + 3 retries for fallback)
+    let script = MockOpenAiScript {
+        turns: (0..6)
+            .map(|_| MockOpenAiTurn {
+                text_chunks: vec![],
+                tool_calls: vec![],
+                error: Some(MockOpenAiError {
+                    status: 500,
+                    message: "Internal Server Error".to_string(),
+                    error_type: "server_error".to_string(),
+                    headers: vec![],
+                }),
+            })
+            .collect(),
+        fallback_text: "Should not reach here.".to_string(),
+        chunk_delay_ms: 0,
+    };
+
+    let agent_md = format!(
+        "---\nname: {RETRY_AGENT_NAME}\nmodel: mock-llm:primary\nmodel_fallbacks:\n  - mock-llm:fallback\nretry:\n  attempts: 3\n  initial_delay_ms: 10\n  max_delay_ms: 50\n---\nYou are a test agent.\n"
+    );
+
+    let session = setup_retry_tmux_session(
+        "retry_all_fail_shows_warnings_in_tui",
+        script,
+        &agent_md,
+        None,
+    )?;
+    let session = match session {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    // Launch agent
+    session.tmux.send_text(&format!(
+        "{} -a {RETRY_AGENT_NAME} || echo HARNX_EXIT:$?",
+        shell_escape(session.harnx_bin.to_string_lossy().as_ref()),
+    ))?;
+    session.tmux.send_keys(&["Enter"])?;
+    session
+        .tmux
+        .wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
+
+    session.tmux.send_text("hello")?;
+    session.tmux.send_keys(&["Enter"])?;
+
+    // Wait for the error to appear — all models should fail and we should see
+    // retry warnings and fallback transition messages.
+    let screen = session.tmux.wait_for_stable(
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+        |screen| {
+            screen.contains("error: Failed to call chat-completions api")
+                || screen.contains("HARNX_EXIT:")
+        },
+    )?;
+
+    // Verify retry warnings appeared in the transcript
+    assert!(
+        screen.contains("Retryable error"),
+        "retry warning not visible in TUI transcript:\n{screen}"
+    );
+
+    // Verify fallback transition message appeared
+    assert!(
+        screen.contains("exhausted retries"),
+        "fallback exhaustion message not visible in TUI transcript:\n{screen}"
+    );
+
+    let normalized = normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen)));
+    assert_snapshot!("retry_all_fail_shows_warnings_in_tui", normalized);
+
+    Ok(())
+}
+
+/// Test: succeed after retry — first attempt fails, second succeeds.
+#[test]
+fn retry_succeed_after_retry_shows_warning_then_response() -> Result<()> {
+    let script = MockOpenAiScript {
+        turns: vec![
+            // First attempt: error
+            MockOpenAiTurn {
+                text_chunks: vec![],
+                tool_calls: vec![],
+                error: Some(MockOpenAiError {
+                    status: 500,
+                    message: "Temporary failure".to_string(),
+                    error_type: "server_error".to_string(),
+                    headers: vec![],
+                }),
+            },
+            // Second attempt: success
+            MockOpenAiTurn {
+                text_chunks: vec![
+                    "RETRY_SUCCESS_RESPONSE: Hello from the retried model!".to_string()
+                ],
+                tool_calls: vec![],
+                error: None,
+            },
+        ],
+        fallback_text: "Should not reach here.".to_string(),
+        chunk_delay_ms: 0,
+    };
+
+    let agent_md = format!(
+        "---\nname: {RETRY_AGENT_NAME}\nmodel: mock-llm:primary\nretry:\n  attempts: 3\n  initial_delay_ms: 10\n  max_delay_ms: 50\n---\nYou are a test agent.\n"
+    );
+
+    let session = setup_retry_tmux_session(
+        "retry_succeed_after_retry_shows_warning_then_response",
+        script,
+        &agent_md,
+        None,
+    )?;
+    let session = match session {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    session.tmux.send_text(&format!(
+        "{} -a {RETRY_AGENT_NAME} || echo HARNX_EXIT:$?",
+        shell_escape(session.harnx_bin.to_string_lossy().as_ref()),
+    ))?;
+    session.tmux.send_keys(&["Enter"])?;
+    session
+        .tmux
+        .wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
+
+    session.tmux.send_text("hello")?;
+    session.tmux.send_keys(&["Enter"])?;
+
+    let screen = session.tmux.wait_for_stable(
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+        |screen| screen.contains("RETRY_SUCCESS_RESPONSE"),
+    )?;
+
+    // Verify the retry warning appeared before the successful response
+    assert!(
+        screen.contains("Retryable error"),
+        "retry warning not visible in TUI transcript:\n{screen}"
+    );
+    assert!(
+        screen.contains("RETRY_SUCCESS_RESPONSE"),
+        "successful response not visible after retry:\n{screen}"
+    );
+
+    let normalized = normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen)));
+    assert_snapshot!(
+        "retry_succeed_after_retry_shows_warning_then_response",
+        normalized
+    );
+
+    Ok(())
+}
+
+/// Test: succeed after fallback — primary model fails all retries, fallback succeeds.
+#[test]
+fn retry_succeed_after_fallback_shows_transition() -> Result<()> {
+    let script = MockOpenAiScript {
+        turns: vec![
+            // Primary model: 2 attempts both fail (retry attempts = 2)
+            MockOpenAiTurn {
+                text_chunks: vec![],
+                tool_calls: vec![],
+                error: Some(MockOpenAiError {
+                    status: 500,
+                    message: "Primary down".to_string(),
+                    error_type: "server_error".to_string(),
+                    headers: vec![],
+                }),
+            },
+            MockOpenAiTurn {
+                text_chunks: vec![],
+                tool_calls: vec![],
+                error: Some(MockOpenAiError {
+                    status: 500,
+                    message: "Primary still down".to_string(),
+                    error_type: "server_error".to_string(),
+                    headers: vec![],
+                }),
+            },
+            // Fallback model: succeeds on first attempt
+            MockOpenAiTurn {
+                text_chunks: vec!["FALLBACK_SUCCESS: The fallback model handled it!".to_string()],
+                tool_calls: vec![],
+                error: None,
+            },
+        ],
+        fallback_text: "Should not reach here.".to_string(),
+        chunk_delay_ms: 0,
+    };
+
+    let agent_md = format!(
+        "---\nname: {RETRY_AGENT_NAME}\nmodel: mock-llm:primary\nmodel_fallbacks:\n  - mock-llm:fallback\nretry:\n  attempts: 2\n  initial_delay_ms: 10\n  max_delay_ms: 50\n---\nYou are a test agent.\n"
+    );
+
+    let session = setup_retry_tmux_session(
+        "retry_succeed_after_fallback_shows_transition",
+        script,
+        &agent_md,
+        None,
+    )?;
+    let session = match session {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    session.tmux.send_text(&format!(
+        "{} -a {RETRY_AGENT_NAME} || echo HARNX_EXIT:$?",
+        shell_escape(session.harnx_bin.to_string_lossy().as_ref()),
+    ))?;
+    session.tmux.send_keys(&["Enter"])?;
+    session
+        .tmux
+        .wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
+
+    session.tmux.send_text("hello")?;
+    session.tmux.send_keys(&["Enter"])?;
+
+    let screen = session.tmux.wait_for_stable(
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+        |screen| screen.contains("FALLBACK_SUCCESS"),
+    )?;
+
+    // Verify retry warnings for primary model
+    assert!(
+        screen.contains("Retryable error"),
+        "retry warning for primary model not visible:\n{screen}"
+    );
+    // Verify fallback transition message
+    assert!(
+        screen.contains("exhausted retries"),
+        "fallback transition message not visible:\n{screen}"
+    );
+    // Verify fallback response appeared
+    assert!(
+        screen.contains("FALLBACK_SUCCESS"),
+        "fallback model response not visible:\n{screen}"
+    );
+
+    let normalized = normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen)));
+    assert_snapshot!("retry_succeed_after_fallback_shows_transition", normalized);
 
     Ok(())
 }

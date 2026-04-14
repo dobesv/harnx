@@ -152,6 +152,54 @@ impl TmuxHarness {
         }
     }
 
+    /// Like `wait_for`, but after the predicate matches, keeps polling until
+    /// the screen content stops changing for `settle` duration.  This avoids
+    /// capturing an intermediate frame while the TUI is still rendering.
+    pub fn wait_for_stable<F>(
+        &self,
+        timeout: Duration,
+        settle: Duration,
+        predicate: F,
+    ) -> Result<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+
+        // Phase 1: wait for predicate
+        let mut last_capture;
+        loop {
+            last_capture = self.capture_pane()?;
+            if predicate(&last_capture) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out waiting for tmux predicate. Last capture:\n{}",
+                    last_capture
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        // Phase 2: wait for screen to stabilize
+        let mut stable_since = Instant::now();
+        loop {
+            thread::sleep(Duration::from_millis(50));
+            let current = self.capture_pane()?;
+            if current != last_capture {
+                last_capture = current;
+                stable_since = Instant::now();
+            }
+            if stable_since.elapsed() >= settle {
+                return Ok(last_capture);
+            }
+            if Instant::now() >= deadline {
+                return Ok(last_capture);
+            }
+        }
+    }
+
     fn tmux<I, S>(&self, args: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,

@@ -136,6 +136,11 @@ path = "src/bin/harnx-mock-llm/main.rs"
 name = "harnx-mcp-repro249"
 path = "src/bin/harnx-mcp-repro249/main.rs"
 
+[[bin]]
+name = "harnx-test-ratatui"
+path = "src/bin/harnx-test-ratatui.rs"
+install = false
+
 [profile.release]
 lto = true
 strip = true
