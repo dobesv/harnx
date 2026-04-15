@@ -1,5 +1,6 @@
 use chrono::{Datelike, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
+use jiff::{civil, Span, Timestamp};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
     PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
@@ -57,85 +58,72 @@ impl TimeServer {
         ]))
     }
 
-    fn convert_time_impl(
-        &self,
-        source_tz: &str,
-        time_str: &str,
-        target_tz: &str,
-    ) -> Result<CallToolResult, ErrorData> {
-        let source: Tz = source_tz.parse().map_err(|_| {
-            ErrorData::invalid_params(format!("Invalid source timezone: {source_tz}"), None)
-        })?;
-        let target: Tz = target_tz.parse().map_err(|_| {
-            ErrorData::invalid_params(format!("Invalid target timezone: {target_tz}"), None)
-        })?;
+    fn convert_time_impl(&self, args: ConvertTimeParams) -> Result<CallToolResult, ErrorData> {
+        let base_inputs = [
+            args.iso_timestamp.is_some(),
+            args.unix_timestamp.is_some(),
+            args.epoch_millis.is_some(),
+        ];
+        let provided_count = base_inputs.into_iter().filter(|provided| *provided).count();
 
-        let parts: Vec<&str> = time_str.split(':').collect();
-        if parts.len() != 2 {
+        if provided_count > 1 {
             return Err(ErrorData::invalid_params(
-                "Invalid time format. Expected HH:MM (24-hour)",
-                None,
-            ));
-        }
-        let hour: u32 = parts[0]
-            .parse()
-            .map_err(|_| ErrorData::invalid_params("Invalid hour", None))?;
-        let minute: u32 = parts[1]
-            .parse()
-            .map_err(|_| ErrorData::invalid_params("Invalid minute", None))?;
-
-        if hour >= 24 || minute >= 60 {
-            return Err(ErrorData::invalid_params(
-                "Hour must be 0-23, minute must be 0-59",
+                "Provide at most one of isoTimestamp, unixTimestamp, or epochMillis",
                 None,
             ));
         }
 
-        let now_utc = Utc::now();
-        let now_source = now_utc.with_timezone(&source);
-        let source_dt = source
-            .with_ymd_and_hms(
-                now_source.year(),
-                now_source.month(),
-                now_source.day(),
-                hour,
-                minute,
-                0,
-            )
-            .single()
-            .ok_or_else(|| ErrorData::invalid_params("Ambiguous or invalid local time", None))?;
-
-        let target_dt = source_dt.with_timezone(&target);
-
-        let source_offset = source_dt.offset().fix().local_minus_utc() as f64 / 3600.0;
-        let target_offset = target_dt.offset().fix().local_minus_utc() as f64 / 3600.0;
-        let diff = target_offset - source_offset;
-
-        let time_diff_str = if diff.fract() == 0.0 {
-            format!("{:+.1}h", diff)
+        let timestamp = if let Some(iso_timestamp) = args.iso_timestamp.as_deref() {
+            parse_iso_timestamp(iso_timestamp, args.source_timezone.as_deref())?
+        } else if let Some(unix_timestamp) = args.unix_timestamp {
+            parse_unix_timestamp(unix_timestamp)?
+        } else if let Some(epoch_millis) = args.epoch_millis {
+            parse_epoch_millis(epoch_millis)?
         } else {
-            let s = format!("{:+.2}", diff);
-            format!("{}h", s.trim_end_matches('0').trim_end_matches('.'))
+            Timestamp::now()
         };
 
-        let source_time_str = source_dt.format("%H:%M %Z").to_string();
-        let target_time_str = target_dt.format("%H:%M %Z").to_string();
+        let mut span = Span::new();
+        if let Some(days) = args.offset_days {
+            span = span.try_days(days).map_err(invalid_params)?;
+        }
+        if let Some(hours) = args.offset_hours {
+            span = span.try_hours(hours).map_err(invalid_params)?;
+        }
+        if let Some(minutes) = args.offset_minutes {
+            span = span.try_minutes(minutes).map_err(invalid_params)?;
+        }
+        if let Some(seconds) = args.offset_seconds {
+            span = span.try_seconds(seconds).map_err(invalid_params)?;
+        }
+
+        let timestamp = timestamp.checked_add(span).map_err(invalid_params)?;
+
+        let formatted_timestamp = if let Some(timezone) = args.timezone.as_deref() {
+            timestamp
+                .in_tz(timezone)
+                .map_err(invalid_params)?
+                .to_string()
+        } else {
+            timestamp.to_string()
+        };
+
+        let unix_timestamp = timestamp.as_second();
+        let epoch_millis = timestamp.as_millisecond();
+
         let result = serde_json::json!({
-            "source": {
-                "timezone": source_tz,
-                "datetime": source_dt.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
-                "day_of_week": source_dt.format("%A").to_string(),
-            },
-            "target": {
-                "timezone": target_tz,
-                "datetime": target_dt.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
-                "day_of_week": target_dt.format("%A").to_string(),
-            },
-            "time_difference": time_diff_str,
+            "timestamp": formatted_timestamp,
+            "unixTimestamp": unix_timestamp,
+            "epochMillis": epoch_millis,
         });
 
         let full = serde_json::to_string_pretty(&result).unwrap_or_default();
-        let summary = format!("{source_time_str} → {target_time_str} ({time_diff_str})");
+        let summary = format!(
+            "{} (unix: {}, epochMillis: {})",
+            result["timestamp"].as_str().unwrap_or_default(),
+            unix_timestamp,
+            epoch_millis,
+        );
         Ok(CallToolResult::success(vec![
             Content::text(full).with_audience(vec![Role::Assistant]),
             Content::text(summary).with_audience(vec![Role::User]),
@@ -178,7 +166,6 @@ impl TimeServer {
         let target_naive = chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%dT%H:%M:%S")
             .or_else(|_| chrono::NaiveDateTime::parse_from_str(time_str, "%Y-%m-%dT%H:%M"))
             .or_else(|_| {
-                // HH:MM — assume today (or tomorrow if already passed)
                 time_str
                     .parse::<chrono::NaiveTime>()
                     .map(|t| now.date_naive().and_time(t))
@@ -198,7 +185,6 @@ impl TimeServer {
         let mut actual_target = target_dt;
         let wait_duration = actual_target.signed_duration_since(now);
 
-        // If HH:MM was given and the time already passed today, target tomorrow
         let wait_duration = if wait_duration < chrono::Duration::zero() && !time_str.contains('-') {
             actual_target += chrono::Duration::days(1);
             actual_target.signed_duration_since(now)
@@ -251,7 +237,7 @@ impl ServerHandler for TimeServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Time utilities: get current time, convert between timezones, and wait/sleep.",
+                "Time utilities: get current time, convert timestamps, and wait/sleep.",
             )
     }
 
@@ -287,30 +273,60 @@ impl ServerHandler for TimeServer {
             .annotate(read_only.clone()),
             Tool::new(
                 "convert_time",
-                "Convert time between timezones",
+                "Convert, offset, and reformat timestamps",
                 schema_object(
                     vec![
                         (
-                            "source_timezone",
+                            "isoTimestamp",
+                            "string",
+                            Some("ISO formatted timestamp string. If it omits a timezone, sourceTimezone may be used to interpret it.".to_string()),
+                        ),
+                        (
+                            "unixTimestamp",
+                            "number",
+                            Some("Unix timestamp in epoch seconds.".to_string()),
+                        ),
+                        (
+                            "epochMillis",
+                            "integer",
+                            Some("JavaScript-style timestamp in epoch milliseconds.".to_string()),
+                        ),
+                        (
+                            "offsetSeconds",
+                            "integer",
+                            Some("Number of seconds to add.".to_string()),
+                        ),
+                        (
+                            "offsetMinutes",
+                            "integer",
+                            Some("Number of minutes to add.".to_string()),
+                        ),
+                        (
+                            "offsetHours",
+                            "integer",
+                            Some("Number of hours to add.".to_string()),
+                        ),
+                        (
+                            "offsetDays",
+                            "integer",
+                            Some("Number of days to add.".to_string()),
+                        ),
+                        (
+                            "timezone",
                             "string",
                             Some(format!(
-                                "Source IANA timezone name. Use '{local_tz}' for local timezone."
+                                "Target IANA timezone for output formatting. Defaults to UTC. Use '{local_tz}' for local timezone."
                             )),
                         ),
                         (
-                            "time",
-                            "string",
-                            Some("Time in 24-hour format (HH:MM)".to_string()),
-                        ),
-                        (
-                            "target_timezone",
+                            "sourceTimezone",
                             "string",
                             Some(format!(
-                                "Target IANA timezone name. Use '{local_tz}' for local timezone."
+                                "If isoTimestamp has no timezone, interpret it in this IANA timezone before converting. Use '{local_tz}' for local timezone."
                             )),
                         ),
                     ],
-                    &["source_timezone", "time", "target_timezone"],
+                    &[],
                 ),
             )
             .annotate(read_only.clone()),
@@ -382,7 +398,7 @@ impl ServerHandler for TimeServer {
             }
             "convert_time" => {
                 let args = parse_arguments::<ConvertTimeParams>(request.arguments)?;
-                self.convert_time_impl(&args.source_timezone, &args.time, &args.target_timezone)
+                self.convert_time_impl(args)
             }
             "wait" => {
                 let args = parse_arguments::<WaitParams>(request.arguments)?;
@@ -408,9 +424,24 @@ struct GetCurrentTimeParams {
 
 #[derive(serde::Deserialize)]
 struct ConvertTimeParams {
-    source_timezone: String,
-    time: String,
-    target_timezone: String,
+    #[serde(rename = "isoTimestamp", default)]
+    iso_timestamp: Option<String>,
+    #[serde(rename = "unixTimestamp", default)]
+    unix_timestamp: Option<f64>,
+    #[serde(rename = "epochMillis", default)]
+    epoch_millis: Option<i64>,
+    #[serde(rename = "offsetSeconds", default)]
+    offset_seconds: Option<i64>,
+    #[serde(rename = "offsetMinutes", default)]
+    offset_minutes: Option<i64>,
+    #[serde(rename = "offsetHours", default)]
+    offset_hours: Option<i64>,
+    #[serde(rename = "offsetDays", default)]
+    offset_days: Option<i64>,
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(rename = "sourceTimezone", default)]
+    source_timezone: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -423,6 +454,59 @@ struct WaitUntilParams {
     time: String,
     #[serde(default)]
     timezone: Option<String>,
+}
+
+fn parse_iso_timestamp(
+    iso_timestamp: &str,
+    source_timezone: Option<&str>,
+) -> Result<Timestamp, ErrorData> {
+    if let Ok(timestamp) = iso_timestamp.parse::<Timestamp>() {
+        return Ok(timestamp);
+    }
+
+    let source_timezone = source_timezone.ok_or_else(|| {
+        ErrorData::invalid_params(
+            "isoTimestamp is missing timezone information; provide sourceTimezone",
+            None,
+        )
+    })?;
+
+    let datetime = iso_timestamp.parse::<civil::DateTime>().map_err(|_| {
+        ErrorData::invalid_params(format!("Invalid isoTimestamp: {iso_timestamp}"), None)
+    })?;
+
+    datetime
+        .in_tz(source_timezone)
+        .map(|zoned| zoned.timestamp())
+        .map_err(invalid_params)
+}
+
+fn parse_unix_timestamp(unix_timestamp: f64) -> Result<Timestamp, ErrorData> {
+    if !unix_timestamp.is_finite() {
+        return Err(ErrorData::invalid_params(
+            "unixTimestamp must be a finite number",
+            None,
+        ));
+    }
+
+    let total_nanos = unix_timestamp * 1_000_000_000.0;
+    if !total_nanos.is_finite() || total_nanos < i128::MIN as f64 || total_nanos > i128::MAX as f64
+    {
+        return Err(ErrorData::invalid_params(
+            "unixTimestamp is out of range",
+            None,
+        ));
+    }
+
+    Timestamp::from_nanosecond(total_nanos.round() as i128).map_err(invalid_params)
+}
+
+fn parse_epoch_millis(epoch_millis: i64) -> Result<Timestamp, ErrorData> {
+    Timestamp::from_millisecond(epoch_millis).map_err(invalid_params)
+}
+
+fn invalid_params<E: std::fmt::Display>(err: E) -> ErrorData {
+    ErrorData::invalid_params(err.to_string(), None)
 }
 
 fn parse_arguments<T: DeserializeOwned>(
@@ -575,17 +659,172 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_time_basic() {
+    fn test_convert_time_from_unix_timestamp() {
         let server = TimeServer::new();
         let result = server
-            .convert_time_impl("UTC", "12:30", "America/New_York")
+            .convert_time_impl(ConvertTimeParams {
+                iso_timestamp: None,
+                unix_timestamp: Some(1_704_067_200.0),
+                epoch_millis: None,
+                offset_seconds: None,
+                offset_minutes: None,
+                offset_hours: None,
+                offset_days: None,
+                timezone: None,
+                source_timezone: None,
+            })
             .unwrap();
         let text = text_content(&result);
         let json: Value = serde_json::from_str(&text).unwrap();
 
-        assert_eq!(json["source"]["timezone"], "UTC");
-        assert_eq!(json["target"]["timezone"], "America/New_York");
-        assert!(json["time_difference"].as_str().unwrap().ends_with('h'));
+        assert_eq!(json["timestamp"], "2024-01-01T00:00:00Z");
+        assert_eq!(json["unixTimestamp"], 1_704_067_200);
+        assert_eq!(json["epochMillis"], 1_704_067_200_000i64);
+    }
+
+    #[test]
+    fn test_convert_time_with_timezone_and_offset() {
+        let server = TimeServer::new();
+        let result = server
+            .convert_time_impl(ConvertTimeParams {
+                iso_timestamp: Some("2024-01-02T00:00:00Z".to_string()),
+                unix_timestamp: None,
+                epoch_millis: None,
+                offset_seconds: None,
+                offset_minutes: Some(30),
+                offset_hours: Some(1),
+                offset_days: None,
+                timezone: Some("America/New_York".to_string()),
+                source_timezone: None,
+            })
+            .unwrap();
+        let text = text_content(&result);
+        let json: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(
+            json["timestamp"],
+            "2024-01-01T20:30:00-05:00[America/New_York]"
+        );
+        assert_eq!(json["unixTimestamp"], 1_704_159_000);
+        assert_eq!(json["epochMillis"], 1_704_159_000_000i64);
+    }
+
+    #[test]
+    fn test_convert_time_naive_iso_with_source_timezone() {
+        let server = TimeServer::new();
+        let result = server
+            .convert_time_impl(ConvertTimeParams {
+                iso_timestamp: Some("2024-01-02T00:00:00".to_string()),
+                unix_timestamp: None,
+                epoch_millis: None,
+                offset_seconds: None,
+                offset_minutes: None,
+                offset_hours: None,
+                offset_days: None,
+                timezone: None,
+                source_timezone: Some("America/New_York".to_string()),
+            })
+            .unwrap();
+        let text = text_content(&result);
+        let json: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["timestamp"], "2024-01-02T05:00:00Z");
+        assert_eq!(json["unixTimestamp"], 1_704_171_600);
+        assert_eq!(json["epochMillis"], 1_704_171_600_000i64);
+    }
+
+    #[test]
+    fn test_convert_time_rejects_conflicting_inputs() {
+        let server = TimeServer::new();
+        let error = server
+            .convert_time_impl(ConvertTimeParams {
+                iso_timestamp: Some("2024-01-02T00:00:00Z".to_string()),
+                unix_timestamp: Some(1_704_067_200.0),
+                epoch_millis: None,
+                offset_seconds: None,
+                offset_minutes: None,
+                offset_hours: None,
+                offset_days: None,
+                timezone: None,
+                source_timezone: None,
+            })
+            .unwrap_err();
+
+        assert!(error
+            .message
+            .contains("Provide at most one of isoTimestamp, unixTimestamp, or epochMillis"));
+    }
+
+    #[test]
+    fn test_convert_time_negative_fractional_unix_timestamp() {
+        let server = TimeServer::new();
+        let result = server
+            .convert_time_impl(ConvertTimeParams {
+                iso_timestamp: None,
+                unix_timestamp: Some(-0.5),
+                epoch_millis: None,
+                offset_seconds: None,
+                offset_minutes: None,
+                offset_hours: None,
+                offset_days: None,
+                timezone: None,
+                source_timezone: None,
+            })
+            .unwrap();
+        let text = text_content(&result);
+        let json: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["timestamp"], "1969-12-31T23:59:59.5Z");
+        assert_eq!(json["unixTimestamp"], 0);
+        assert_eq!(json["epochMillis"], -500);
+    }
+
+    #[test]
+    fn test_convert_time_negative_fractional_unix_timestamp_with_more_precision() {
+        let server = TimeServer::new();
+        let result = server
+            .convert_time_impl(ConvertTimeParams {
+                iso_timestamp: None,
+                unix_timestamp: Some(-1.25),
+                epoch_millis: None,
+                offset_seconds: None,
+                offset_minutes: None,
+                offset_hours: None,
+                offset_days: None,
+                timezone: None,
+                source_timezone: None,
+            })
+            .unwrap();
+        let text = text_content(&result);
+        let json: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["timestamp"], "1969-12-31T23:59:58.75Z");
+        assert_eq!(json["unixTimestamp"], -1);
+        assert_eq!(json["epochMillis"], -1250);
+    }
+
+    #[test]
+    fn test_convert_time_preserves_sub_millisecond_unix_precision() {
+        let server = TimeServer::new();
+        let result = server
+            .convert_time_impl(ConvertTimeParams {
+                iso_timestamp: None,
+                unix_timestamp: Some(1_704_153_600.000_4),
+                epoch_millis: None,
+                offset_seconds: None,
+                offset_minutes: None,
+                offset_hours: None,
+                offset_days: None,
+                timezone: None,
+                source_timezone: None,
+            })
+            .unwrap();
+        let text = text_content(&result);
+        let json: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["timestamp"], "2024-01-02T00:00:00.000400128Z");
+        assert_eq!(json["unixTimestamp"], 1_704_153_600);
+        assert_eq!(json["epochMillis"], 1_704_153_600_000i64);
     }
 
     #[tokio::test]
