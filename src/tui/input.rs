@@ -151,16 +151,22 @@ impl Tui {
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through repl command handler
+                        let attachments_snapshot = self.app.attachments.clone();
                         self.app
                             .transcript
                             .push(TranscriptItem::UserText(text.clone()));
+                        self.render_submitted_attachments(&attachments_snapshot);
+                        self.pin_transcript_to_bottom();
                         self.app.input = Self::new_input();
                         self.run_repl_command(&text).await?;
                         self.refresh_input_chrome();
                     } else {
+                        let attachments_snapshot = self.app.attachments.clone();
                         self.app
                             .transcript
                             .push(TranscriptItem::UserText(text.clone()));
+                        self.render_submitted_attachments(&attachments_snapshot);
+                        self.pin_transcript_to_bottom();
                         self.app.input = Self::new_input();
                         let msg = crate::tui::types::PendingMessage {
                             text,

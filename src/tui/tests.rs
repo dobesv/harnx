@@ -2439,6 +2439,82 @@ async fn attach_command_preserves_draft_text() {
 }
 
 #[tokio::test]
+async fn direct_submit_with_attachments_renders_attachment_entries_in_transcript() {
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.attachments = vec![Attachment {
+        path: PathBuf::from("/tmp/example.txt"),
+        display_name: "example.txt".to_string(),
+    }];
+    tui.set_input_text("check attachment");
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    let user_index = tui
+        .app
+        .transcript
+        .iter()
+        .position(
+            |item| matches!(item, TranscriptItem::UserText(text) if text == "check attachment"),
+        )
+        .expect("expected submitted user text in transcript");
+
+    assert!(matches!(
+        tui.app.transcript.get(user_index + 1),
+        Some(TranscriptItem::AttachmentHeader(text)) if text == "Attachments (1)"
+    ));
+    assert!(matches!(
+        tui.app.transcript.get(user_index + 2),
+        Some(TranscriptItem::AttachmentItem(text)) if text == "example.txt"
+    ));
+}
+
+#[tokio::test]
+async fn dot_command_with_attachments_renders_attachment_entries_in_transcript() {
+    use crate::tui::types::Attachment;
+    use std::path::PathBuf;
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.attachments = vec![Attachment {
+        path: PathBuf::from("/tmp/example.txt"),
+        display_name: "example.txt".to_string(),
+    }];
+    tui.set_input_text(".info attachments");
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    let user_index = tui
+        .app
+        .transcript
+        .iter()
+        .position(
+            |item| matches!(item, TranscriptItem::UserText(text) if text == ".info attachments"),
+        )
+        .expect("expected dot-command user text in transcript");
+
+    assert!(matches!(
+        tui.app.transcript.get(user_index + 1),
+        Some(TranscriptItem::AttachmentHeader(text)) if text == "Attachments (1)"
+    ));
+    assert!(matches!(
+        tui.app.transcript.get(user_index + 2),
+        Some(TranscriptItem::AttachmentItem(text)) if text == "example.txt"
+    ));
+}
+
+#[tokio::test]
 async fn attach_nonexistent_file_shows_error() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));

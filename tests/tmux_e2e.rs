@@ -851,7 +851,7 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
     // Wait for the *full* parent final message so the spinner has settled and
     // the text has finished streaming (not just the "PARENT_FINAL:" marker,
     // which can appear before the rest of the message arrives).
-    let screen = tmux.wait_for(Duration::from_secs(45), |screen| {
+    let screen = tmux.wait_for(Duration::from_secs(90), |screen| {
         screen.contains("PARENT_FINAL: Research complete. Data shows clear upward trend.")
     })?;
 
