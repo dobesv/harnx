@@ -3,6 +3,27 @@
 #  - https://platform.openai.com/docs/api-reference/chat
 - provider: openai
   models:
+    - name: gpt-5.4
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 2.5
+      output_price: 15
+      supports_vision: true
+      supports_tool_use: true
+    - name: gpt-5.4-mini
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      input_price: 0.75
+      output_price: 4.5
+      supports_vision: true
+      supports_tool_use: true
+    - name: gpt-5.4-nano
+      max_input_tokens: 400000
+      max_output_tokens: 128000
+      input_price: 0.2
+      output_price: 1.25
+      supports_vision: true
+      supports_tool_use: true
     - name: gpt-5.2
       max_input_tokens: 400000
       max_output_tokens: 128000
@@ -38,25 +59,26 @@
       output_price: 8
       supports_vision: true
       supports_tool_use: true
+    - name: gpt-4.1-mini
+      max_input_tokens: 1047576
+      max_output_tokens: 32768
+      input_price: 0.4
+      output_price: 1.6
+      supports_vision: true
+      supports_tool_use: true
+    - name: gpt-4.1-nano
+      max_input_tokens: 1047576
+      max_output_tokens: 32768
+      input_price: 0.1
+      output_price: 0.4
+      supports_vision: true
+      supports_tool_use: true
     - name: gpt-4o
       max_input_tokens: 128000
       max_output_tokens: 16384
       input_price: 2.5
       output_price: 10
       supports_vision: true
-      supports_tool_use: true
-    - name: gpt-4-turbo
-      max_input_tokens: 128000
-      max_output_tokens: 4096
-      input_price: 10
-      output_price: 30
-      supports_vision: true
-      supports_tool_use: true
-    - name: gpt-3.5-turbo
-      max_input_tokens: 16385
-      max_output_tokens: 4096
-      input_price: 0.5
-      output_price: 1.5
       supports_tool_use: true
     - name: text-embedding-3-large
       type: embedding
@@ -98,7 +120,11 @@
       output_price: 0
       supports_vision: true
       supports_tool_use: true
-    - name: gemini-3-pro-preview
+    - name: gemini-3.1-pro-preview
+      max_input_tokens: 1048576
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-3.1-flash-lite-preview
       max_input_tokens: 1048576
       supports_vision: true
       supports_tool_use: true
@@ -137,9 +163,33 @@
 #  - https://docs.anthropic.com/en/api/messages
 - provider: claude
   models:
+    - name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-opus-4-7:thinking
+      real_name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+          thinking:
+            type: enabled
+            budget_tokens: 16000
     - name: claude-opus-4-6
       max_input_tokens: 200000
-      max_output_tokens: 8192
+      max_output_tokens: 128000
       require_max_tokens: true
       input_price: 5
       output_price: 25
@@ -395,6 +445,18 @@
 #  - https://docs.x.ai/docs/api-reference#chat-completions
 - provider: xai
   models:
+    - name: grok-4.20-0309-reasoning
+      max_input_tokens: 2000000
+      input_price: 2
+      output_price: 6
+      supports_vision: true
+      supports_tool_use: true
+    - name: grok-4.20-0309-non-reasoning
+      max_input_tokens: 2000000
+      input_price: 2
+      output_price: 6
+      supports_vision: true
+      supports_tool_use: true
     - name: grok-4-1-fast-non-reasoning
       max_input_tokens: 2000000
       input_price: 0.2
@@ -510,7 +572,11 @@
       output_price: 0.4
       supports_vision: true
       supports_tool_use: true
-    - name: gemini-3-pro-preview
+    - name: gemini-3.1-pro-preview
+      max_input_tokens: 1048576
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-3.1-flash-lite-preview
       max_input_tokens: 1048576
       supports_vision: true
       supports_tool_use: true
@@ -532,9 +598,32 @@
       output_price: 0.3
       supports_vision: true
       supports_tool_use: true
+    - name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-opus-4-7:thinking
+      real_name: claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      patch:
+        body:
+          temperature: null
+          top_p: null
+          thinking:
+            type: enabled
+            budget_tokens: 16000
     - name: claude-opus-4-6
       max_input_tokens: 200000
-      max_output_tokens: 8192
+      max_output_tokens: 128000
       require_max_tokens: true
       input_price: 5
       output_price: 25
@@ -669,9 +758,34 @@
 #  - https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-call.html
 - provider: bedrock
   models:
+    - name: us.anthropic.claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
+    - name: us.anthropic.claude-opus-4-7:thinking
+      real_name: us.anthropic.claude-opus-4-7
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      patch:
+        body:
+          inferenceConfig:
+            temperature: null
+            topP: null
+          additionalModelRequestFields:
+            thinking:
+              type: enabled
+              budget_tokens: 16000
     - name: us.anthropic.claude-opus-4-6-v1
       max_input_tokens: 200000
-      max_output_tokens: 8192
+      max_output_tokens: 128000
       require_max_tokens: true
       input_price: 5
       output_price: 25
@@ -1296,9 +1410,17 @@
       max_input_tokens: 131072
       input_price: 0.1
       output_price: 0.2
+    - name: anthropic/claude-opus-4.7
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      require_max_tokens: true
+      input_price: 5
+      output_price: 25
+      supports_vision: true
+      supports_tool_use: true
     - name: anthropic/claude-opus-4.6
       max_input_tokens: 200000
-      max_output_tokens: 8192
+      max_output_tokens: 128000
       require_max_tokens: true
       input_price: 5
       output_price: 25
@@ -1905,19 +2027,3 @@
       max_input_tokens: 8000
       input_price: 0.02
 
-- provider: google
-  models:
-    - name: gemini-1.5-pro
-      max_input_tokens: 1000000
-      max_output_tokens: 8192
-      input_price: 0.0035 # Example price
-      output_price: 0.0105 # Example price
-      supports_vision: true
-      supports_tool_use: true
-    - name: gemini-1.5-flash
-      max_input_tokens: 1000000
-      max_output_tokens: 8192
-      input_price: 0.00035 # Example price
-      output_price: 0.00105 # Example price
-      supports_vision: true
-      supports_tool_use: true
