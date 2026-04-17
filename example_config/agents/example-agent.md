@@ -15,6 +15,7 @@ use_tools:                       # Which MCP tools to allow
 description: ""                  # Short description of the agent
 version: ""                      # Agent version string
 agent_default_session: null      # Set a session to use when starting the agent
+# compaction_agent: null          # Agent to use for context compression (uses its model/system prompt)
 instructions: null               # Override the instructions below
 
 variables:                       # Agent variables (prompted on first use)

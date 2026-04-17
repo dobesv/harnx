@@ -106,6 +106,8 @@ pub struct Agent {
     instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hooks: Option<HooksConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_agent: Option<String>,
     #[serde(default)]
     prompt: String,
 
@@ -156,6 +158,7 @@ impl Agent {
             agent_default_session: frontmatter.agent_default_session,
             instructions: frontmatter.instructions,
             hooks: frontmatter.hooks,
+            compaction_agent: frontmatter.compaction_agent,
             prompt,
             ..Default::default()
         }
@@ -183,6 +186,69 @@ impl Agent {
             .and_then(|value| value.to_str())
             .ok_or_else(|| anyhow!("Invalid agent file name: '{}'", path.display()))?;
         Ok(Self::from_markdown(name, &contents))
+    }
+
+    /// Resolve file-backed variable defaults and populate `shared_variables`.
+    ///
+    /// This performs the synchronous subset of `init()` that loads variable
+    /// values from files (the `path:` field on agent variables) and then
+    /// runs `init_agent_variables` with `no_interaction: true`.  It does NOT
+    /// touch MCP, RAG, or model resolution — call `retrieve_agent` for the
+    /// model and this method for variables when you need a lightweight agent
+    /// suitable for non-interactive use (e.g. compaction).
+    pub fn resolve_variables(&mut self) -> Result<()> {
+        let agent_file_path = Config::agent_file(self.name());
+        let agent_dir = agent_file_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(Config::agents_data_dir);
+
+        Self::resolve_file_backed_variables(&mut self.variables, &agent_dir)?;
+
+        let new_variables = Self::init_agent_variables(
+            &self.variables,
+            &self.shared_variables,
+            true, // no_interaction
+        )?;
+        self.set_shared_variables(new_variables);
+        Ok(())
+    }
+
+    /// Load file-backed defaults for variables that have a `path:` field.
+    fn resolve_file_backed_variables(
+        variables: &mut [AgentVariable],
+        agent_dir: &Path,
+    ) -> Result<()> {
+        for variable in variables.iter_mut() {
+            if let Some(path_str) = &variable.path {
+                if variable.default.is_some() {
+                    log::warn!(
+                        "Variable '{}': both 'path' and 'default' set, using 'path'",
+                        variable.name
+                    );
+                }
+
+                let resolved_path = safe_join_path(agent_dir, path_str).ok_or_else(|| {
+                    anyhow!(
+                        "Variable '{}': path '{}' is not allowed (must be relative, no '..' traversal)",
+                        variable.name,
+                        path_str
+                    )
+                })?;
+
+                let content = std::fs::read_to_string(&resolved_path).with_context(|| {
+                    format!(
+                        "Failed to load file '{}' (resolved to '{}') for variable '{}'",
+                        path_str,
+                        resolved_path.display(),
+                        variable.name
+                    )
+                })?;
+
+                variable.default = Some(content);
+            }
+        }
+        Ok(())
     }
 
     pub async fn init(
@@ -229,35 +295,7 @@ impl Agent {
             .map(Path::to_path_buf)
             .unwrap_or_else(Config::agents_data_dir);
 
-        for variable in &mut agent.variables {
-            if let Some(path_str) = &variable.path {
-                if variable.default.is_some() {
-                    log::warn!(
-                        "Variable '{}': both 'path' and 'default' set, using 'path'",
-                        variable.name
-                    );
-                }
-
-                let resolved_path = safe_join_path(&agent_dir, path_str).ok_or_else(|| {
-                    anyhow!(
-                        "Variable '{}': path '{}' is not allowed (must be relative, no '..' traversal)",
-                        variable.name,
-                        path_str
-                    )
-                })?;
-
-                let content = std::fs::read_to_string(&resolved_path).with_context(|| {
-                    format!(
-                        "Failed to load file '{}' (resolved to '{}') for variable '{}'",
-                        path_str,
-                        resolved_path.display(),
-                        variable.name
-                    )
-                })?;
-
-                variable.default = Some(content);
-            }
-        }
+        Self::resolve_file_backed_variables(&mut agent.variables, &agent_dir)?;
 
         agent.rag = if rag_path.exists() {
             Some(Arc::new(Rag::load(config, DEFAULT_AGENT_NAME, &rag_path)?))
@@ -428,12 +466,20 @@ impl Agent {
         self.model_fallbacks = fallbacks;
     }
 
+    pub fn set_compaction_agent(&mut self, value: Option<String>) {
+        self.compaction_agent = value;
+    }
+
     pub fn use_tools(&self) -> Option<Vec<String>> {
         self.use_tools.clone()
     }
 
     pub fn hooks(&self) -> Option<&HooksConfig> {
         self.hooks.as_ref()
+    }
+
+    pub fn compaction_agent(&self) -> Option<&str> {
+        self.compaction_agent.as_deref()
     }
 
     pub fn has_args(&self) -> bool {
@@ -571,6 +617,20 @@ impl Agent {
         self.session_variables = None;
     }
 
+    /// Compute the full system-message text (prompt + tools summary), matching
+    /// the logic in `build_messages` but without producing a User message.
+    /// Used by `Session::build_messages` when `inject_system_prompt` is true.
+    pub fn system_text(&self) -> String {
+        let prompt = self.interpolated_instructions();
+        let tools_text = self.tools_text();
+        match (&tools_text, prompt.is_empty()) {
+            (Some(tools), false) => format!("{prompt}\n\n{tools}"),
+            (Some(tools), true) => tools.clone(),
+            (None, false) => prompt,
+            (None, true) => String::new(),
+        }
+    }
+
     fn tools_text(&self) -> Option<String> {
         let declarations = self.tools.declarations();
         if declarations.is_empty() {
@@ -630,6 +690,8 @@ struct AgentFrontMatter {
     instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hooks: Option<HooksConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_agent: Option<String>,
 }
 
 impl AgentFrontMatter {
@@ -649,6 +711,7 @@ impl AgentFrontMatter {
             agent_default_session: agent.agent_default_session.clone(),
             instructions: agent.instructions.clone(),
             hooks: agent.hooks.clone(),
+            compaction_agent: agent.compaction_agent.clone(),
         }
     }
 
@@ -667,6 +730,7 @@ impl AgentFrontMatter {
             && self.agent_default_session.is_none()
             && self.instructions.is_none()
             && self.hooks.is_none()
+            && self.compaction_agent.is_none()
     }
 }
 
@@ -901,6 +965,34 @@ mod tests {
             agent.use_tools(),
             Some(vec!["fs_*".to_string(), "bash_exec".to_string()])
         );
+    }
+
+    #[test]
+    fn test_agent_compaction_agent_set() {
+        let content = "---\ncompaction_agent: my-compactor\n---\nYou are a test agent.";
+        let agent = Agent::from_markdown("test-agent", content);
+        assert_eq!(agent.compaction_agent(), Some("my-compactor"));
+    }
+
+    #[test]
+    fn test_agent_compaction_agent_unset() {
+        let content = "---\nmodel: openai:gpt-4o\n---\nYou are a test agent.";
+        let agent = Agent::from_markdown("test-agent", content);
+        assert!(agent.compaction_agent().is_none());
+    }
+
+    #[test]
+    fn test_agent_compaction_agent_roundtrip() {
+        let content =
+            "---\ncompaction_agent: my-compactor\nmodel: openai:gpt-4o\n---\nYou are a test agent.";
+        let agent = Agent::from_markdown("test-agent", content);
+
+        // Export and re-parse
+        let exported = agent.export().unwrap();
+        let reparsed = Agent::from_markdown("test-agent", &exported);
+
+        assert_eq!(reparsed.compaction_agent(), Some("my-compactor"));
+        assert_eq!(reparsed.model_id(), Some("openai:gpt-4o"));
     }
 
     #[test]

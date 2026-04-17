@@ -45,6 +45,8 @@ pub enum SessionLogEntry {
         agent_instructions: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         model_fallbacks: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_agent: Option<String>,
     },
     #[serde(rename = "message")]
     Message {
@@ -86,6 +88,8 @@ pub struct Session {
     agent_instructions: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     model_fallbacks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_agent: Option<String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     compressed_messages: Vec<Message>,
@@ -180,6 +184,7 @@ impl Session {
                     agent_variables,
                     agent_instructions,
                     model_fallbacks,
+                    compaction_agent,
                 } => {
                     session.model_id = model_id;
                     session.temperature = temperature;
@@ -191,6 +196,7 @@ impl Session {
                     session.agent_variables = agent_variables;
                     session.agent_instructions = agent_instructions;
                     session.model_fallbacks = model_fallbacks;
+                    session.compaction_agent = compaction_agent;
                 }
                 SessionLogEntry::Message { role, content } => {
                     session.messages.push(Message::new(role, content));
@@ -240,6 +246,9 @@ impl Session {
                 }
                 if session.model_fallbacks.is_empty() {
                     session.model_fallbacks = agent.model_fallbacks().to_vec();
+                }
+                if session.compaction_agent.is_none() {
+                    session.compaction_agent = agent.compaction_agent().map(str::to_string);
                 }
             }
         }
@@ -311,6 +320,7 @@ impl Session {
             agent_variables: self.agent_variables.clone(),
             agent_instructions: self.agent_instructions.clone(),
             model_fallbacks: self.model_fallbacks.clone(),
+            compaction_agent: self.compaction_agent.clone(),
         }
     }
 
@@ -533,6 +543,7 @@ impl Session {
         self.top_p = agent.top_p();
         self.use_tools = agent.use_tools();
         self.model_fallbacks = agent.model_fallbacks().to_vec();
+        self.compaction_agent = agent.compaction_agent().map(str::to_string);
         self.model = agent.model().clone();
         self.agent_name = convert_option_string(agent.name());
         self.agent_prompt = agent.interpolated_instructions();
@@ -562,6 +573,17 @@ impl Session {
 
     pub fn set_save_session_this_time(&mut self) {
         self.save_session_this_time = true;
+    }
+
+    /// Test-only helper: directly inject a message into the session without
+    /// going through the full save/log machinery.  Used to set up compaction
+    /// test scenarios.
+    #[cfg(test)]
+    pub(crate) fn push_message_for_test(&mut self, role: crate::client::MessageRole, text: String) {
+        self.messages.push(crate::client::Message::new(
+            role,
+            crate::client::MessageContent::Text(text),
+        ));
     }
 
     pub fn set_compress_threshold(&mut self, value: Option<usize>) {
@@ -906,6 +928,20 @@ impl Session {
             }
         }
         if need_add_msg {
+            // When the agent was swapped after construction (e.g. compaction),
+            // inject_system_prompt is true and we must prepend the agent's
+            // system prompt — session messages won't already contain it.
+            // On normal session turns the system prompt was stored on turn 1
+            // by save_message(), so inject_system_prompt stays false.
+            if input.inject_system_prompt() {
+                let system_text = input.agent().system_text();
+                if !system_text.is_empty() {
+                    messages.insert(
+                        0,
+                        Message::new(MessageRole::System, MessageContent::Text(system_text)),
+                    );
+                }
+            }
             messages.push(Message::new(MessageRole::User, input.message_content()));
         }
         messages
@@ -926,6 +962,7 @@ impl Session {
         agent.set_top_p(self.top_p);
         agent.set_use_tools(self.use_tools.clone());
         agent.set_model_fallbacks(self.model_fallbacks.clone());
+        agent.set_compaction_agent(self.compaction_agent.clone());
         agent.set_shared_variables(self.agent_variables.clone());
         agent
     }
@@ -984,6 +1021,13 @@ impl Session {
     pub fn set_model_fallbacks(&mut self, value: Vec<String>) {
         if self.model_fallbacks != value {
             self.model_fallbacks = value;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_compaction_agent(&mut self, value: Option<String>) {
+        if self.compaction_agent != value {
+            self.compaction_agent = value;
             self.dirty = true;
         }
     }
