@@ -271,7 +271,7 @@ impl Tui {
         }
 
         Config::maybe_autoname_session(ctx.config.clone());
-        Config::maybe_compress_session(ctx.config.clone());
+        Config::maybe_compact_session(ctx.config.clone());
         Ok(())
     }
 

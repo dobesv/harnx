@@ -65,9 +65,8 @@ const SERVE_ADDR: &str = "127.0.0.1:8000";
 const SYNC_MODELS_URL: &str =
     "https://raw.githubusercontent.com/dobesv/harnx/refs/heads/main/models.yaml";
 
-const SUMMARIZE_PROMPT: &str =
+const DEFAULT_COMPACT_PROMPT: &str =
     "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.";
-const SUMMARY_PROMPT: &str = "This is a summary of the chat history as a recap: ";
 
 const RAG_TEMPLATE: &str = r#"Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
 
@@ -246,8 +245,6 @@ pub struct Config {
 
     pub save_session: Option<bool>,
     pub compress_threshold: usize,
-    pub summarize_prompt: Option<String>,
-    pub summary_prompt: Option<String>,
 
     pub rag_embedding_model: Option<String>,
     pub rag_reranker_model: Option<String>,
@@ -339,8 +336,6 @@ impl std::fmt::Debug for Config {
             .field("agent_default_session", &self.agent_default_session)
             .field("save_session", &self.save_session)
             .field("compress_threshold", &self.compress_threshold)
-            .field("summarize_prompt", &self.summarize_prompt)
-            .field("summary_prompt", &self.summary_prompt)
             .field("rag_embedding_model", &self.rag_embedding_model)
             .field("rag_reranker_model", &self.rag_reranker_model)
             .field("rag_top_k", &self.rag_top_k)
@@ -398,8 +393,6 @@ impl Clone for Config {
             agent_default_session: self.agent_default_session.clone(),
             save_session: self.save_session,
             compress_threshold: self.compress_threshold,
-            summarize_prompt: self.summarize_prompt.clone(),
-            summary_prompt: self.summary_prompt.clone(),
             rag_embedding_model: self.rag_embedding_model.clone(),
             rag_reranker_model: self.rag_reranker_model.clone(),
             rag_top_k: self.rag_top_k,
@@ -464,8 +457,6 @@ impl Default for Config {
 
             save_session: Some(true),
             compress_threshold: 180000,
-            summarize_prompt: None,
-            summary_prompt: None,
 
             rag_embedding_model: None,
             rag_reranker_model: None,
@@ -942,6 +933,10 @@ impl Config {
                 };
                 config.write().set_model_fallbacks(value);
             }
+            "compaction_agent" => {
+                let value = parse_value(value)?;
+                config.write().set_compaction_agent(value);
+            }
             "max_output_tokens" => {
                 let value = parse_value(value)?;
                 config.write().set_max_output_tokens(value);
@@ -1099,6 +1094,14 @@ impl Config {
             session.set_model_fallbacks(value);
         } else if let Some(agent) = self.agent.as_mut() {
             agent.set_model_fallbacks(value);
+        }
+    }
+
+    pub fn set_compaction_agent(&mut self, value: Option<String>) {
+        if let Some(session) = self.session.as_mut() {
+            session.set_compaction_agent(value);
+        } else if let Some(agent) = self.agent.as_mut() {
+            agent.set_compaction_agent(value);
         }
     }
 
@@ -1602,19 +1605,19 @@ impl Config {
         list_file_names(self.sessions_dir().join("_"), ".yaml")
     }
 
-    pub fn maybe_compress_session(config: GlobalConfig) {
-        let mut need_compress = false;
+    pub fn maybe_compact_session(config: GlobalConfig) {
+        let mut need_compact = false;
         {
             let mut config = config.write();
             let compress_threshold = config.compress_threshold;
             if let Some(session) = config.session.as_mut() {
                 if session.need_compress(compress_threshold) {
                     session.set_compressing(true);
-                    need_compress = true;
+                    need_compact = true;
                 }
             }
         };
-        if !need_compress {
+        if !need_compact {
             return;
         }
         let color = if config.read().light_theme() {
@@ -1622,13 +1625,10 @@ impl Config {
         } else {
             nu_ansi_term::Color::DarkGray
         };
-        print!(
-            "\n📢 {}\n",
-            color.italic().paint("Compressing the session."),
-        );
+        print!("\n📢 {}\n", color.italic().paint("Compacting the session."),);
         tokio::spawn(async move {
-            if let Err(err) = Config::compress_session(&config).await {
-                warn!("Failed to compress the session: {err}");
+            if let Err(err) = Config::compact_session(&config).await {
+                warn!("Failed to compact the session: {err}");
             }
             if let Some(session) = config.write().session.as_mut() {
                 session.set_compressing(false);
@@ -1636,36 +1636,62 @@ impl Config {
         });
     }
 
-    pub async fn compress_session(config: &GlobalConfig) -> Result<()> {
+    pub async fn compact_session(config: &GlobalConfig) -> Result<()> {
         match config.read().session.as_ref() {
             Some(session) => {
                 if !session.has_user_messages() {
-                    bail!("No need to compress since there are no messages in the session")
+                    bail!("No need to compact since there are no messages in the session")
                 }
             }
             None => bail!("No session"),
         }
 
-        let prompt = config
+        // Check if the current agent has a compaction_agent configured
+        let compaction_agent_name = config
             .read()
-            .summarize_prompt
-            .clone()
-            .unwrap_or_else(|| SUMMARIZE_PROMPT.into());
-        let input = Input::from_str(config, &prompt, None);
+            .extract_agent()
+            .compaction_agent()
+            .map(str::to_owned);
+
+        let (prompt, agent_override) = if let Some(name) = compaction_agent_name {
+            match config.read().retrieve_agent(&name) {
+                Ok(mut compaction_agent) => {
+                    if let Err(e) = compaction_agent.resolve_variables() {
+                        warn!("Failed to resolve variables for compaction_agent '{name}': {e}");
+                    }
+                    // Keep the normal compaction prompt text so session-aware
+                    // message building still has non-empty user content, while
+                    // the agent override provides the specialized system prompt.
+                    (DEFAULT_COMPACT_PROMPT.to_string(), Some(compaction_agent))
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load compaction_agent '{name}': {e}; falling back to default compaction"
+                    );
+                    (DEFAULT_COMPACT_PROMPT.to_string(), None)
+                }
+            }
+        } else {
+            (DEFAULT_COMPACT_PROMPT.to_string(), None)
+        };
+
+        // Build the Input without an agent override so that with_session=true is
+        // preserved — the compaction LLM must see the full session history to
+        // summarise it.  Then swap the agent (model/params/prompt) in place
+        // without disturbing the with_session flag.
+        let mut input = Input::from_str(config, &prompt, None);
+        if let Some(compaction_agent) = agent_override {
+            input.set_agent(compaction_agent);
+        }
         let summary = input.fetch_chat_text().await?;
-        let summary_prompt = config
-            .read()
-            .summary_prompt
-            .clone()
-            .unwrap_or_else(|| SUMMARY_PROMPT.into());
         if let Some(session) = config.write().session.as_mut() {
-            session.compress(format!("{summary_prompt}{summary}"));
+            session.compress(summary);
         }
         config.write().discontinuous_last_message();
         Ok(())
     }
 
-    pub fn is_compressing_session(&self) -> bool {
+    pub fn is_compacting_session(&self) -> bool {
         self.session
             .as_ref()
             .map(|v| v.compressing())
@@ -2156,6 +2182,8 @@ impl Config {
                         "use_tools",
                         "save_session",
                         "compress_threshold",
+                        "compaction_agent",
+                        "model_fallbacks",
                         "rag_reranker_model",
                         "rag_top_k",
                         "max_output_tokens",
@@ -2879,12 +2907,6 @@ impl Config {
         if let Some(Some(v)) = read_env_value::<usize>(&get_env_name("compress_threshold")) {
             self.compress_threshold = v;
         }
-        if let Some(v) = read_env_value::<String>(&get_env_name("summarize_prompt")) {
-            self.summarize_prompt = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("summary_prompt")) {
-            self.summary_prompt = v;
-        }
 
         if let Some(v) = read_env_value::<String>(&get_env_name("rag_embedding_model")) {
             self.rag_embedding_model = v;
@@ -3572,5 +3594,175 @@ mod tests {
         assert_eq!(roots[0], cwd);
         assert_eq!(roots[1], "/extra");
         assert_eq!(roots[2], "/existing");
+    }
+
+    // ── compact_session tests ────────────────────────────────────────────────
+
+    use crate::client::{MessageContent, MessageRole};
+
+    /// Helper: create a GlobalConfig with a session that already has one user
+    /// message in it, suitable for compaction tests.
+    fn make_config_with_session() -> GlobalConfig {
+        let mut config = Config {
+            stream: false,
+            ..Default::default()
+        };
+        let mut session = Session::new(&config, "test-session");
+        session.push_message_for_test(
+            MessageRole::User,
+            "Tell me about the Rust ownership model.".to_string(),
+        );
+        config.session = Some(session);
+        Arc::new(RwLock::new(config))
+    }
+
+    /// compact_session (no compaction_agent) must send the session history to
+    /// the LLM — i.e. the user message from the conversation must appear in
+    /// the ChatCompletionsData that the mock receives.
+    #[tokio::test]
+    async fn test_compact_session_default_includes_session_history() {
+        use crate::client::TestStateGuard;
+        use crate::test_utils::{MockClient, MockTurnBuilder};
+
+        let mock = Arc::new(
+            MockClient::builder()
+                .add_turn(MockTurnBuilder::new().add_text_chunk("Summary.").build())
+                .build(),
+        );
+        let _guard = TestStateGuard::new(Some(mock.clone())).await;
+        let config = make_config_with_session();
+
+        Config::compact_session(&config).await.unwrap();
+
+        let history = mock.conversation_history();
+        assert_eq!(
+            history.conversation_history.len(),
+            1,
+            "expected exactly one LLM call"
+        );
+        let messages = &history.conversation_history[0].messages;
+        let has_history = messages.iter().any(|m| {
+            if let MessageContent::Text(t) = &m.content {
+                t.contains("Rust ownership model")
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_history,
+            "session history must be forwarded to the compaction LLM; messages: {messages:?}"
+        );
+    }
+
+    /// compact_session with a compaction_agent must also send the session
+    /// history — `set_agent` must not drop `with_session`.
+    #[tokio::test]
+    async fn test_compact_session_with_compaction_agent_includes_session_history() {
+        use crate::client::TestStateGuard;
+        use crate::test_utils::{MockClient, MockTurnBuilder};
+        use std::io::Write as _;
+
+        // Write a minimal compaction agent file to a temp dir and point the
+        // config's agents directory at it via HARNX_CONFIG_DIR.
+        let temp = tempfile::TempDir::new().unwrap();
+        let agents_dir = temp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+
+        let agent_content = "---\nmodel: gemini:gemini-3.1-flash-lite-preview\n---\nYou are a specialized compaction agent. Produce a concise summary.\n";
+        let mut f = std::fs::File::create(agents_dir.join("my-compactor.md")).unwrap();
+        f.write_all(agent_content.as_bytes()).unwrap();
+
+        // Build a config where the current (non-session) agent has
+        // compaction_agent = "my-compactor".
+        let mut main_agent = Agent::from_markdown(
+            "main",
+            "---\nmodel: gemini:gemini-3.1-flash-lite-preview\ncompaction_agent: my-compactor\n---\nYou are the main agent.",
+        );
+        main_agent.set_model(crate::client::Model::new(
+            "gemini",
+            "gemini-3.1-flash-lite-preview",
+        ));
+
+        let mut config = Config {
+            stream: false,
+            ..Default::default()
+        };
+        // Point Config::agent_file() at the temp dir via HARNX_CONFIG_DIR.
+        // Use an RAII guard so the env var is restored even on panic.
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn new(key: &'static str, value: &std::path::Path) -> Self {
+                let prev = std::env::var_os(key);
+                // SAFETY: test-only; concurrent env mutation is accepted.
+                unsafe { std::env::set_var(key, value) };
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => unsafe { std::env::set_var(self.key, v) },
+                    None => unsafe { std::env::remove_var(self.key) },
+                }
+            }
+        }
+        let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+
+        config.agent = Some(main_agent);
+
+        let mut session = Session::new(&config, "test-session");
+        session.push_message_for_test(
+            MessageRole::User,
+            "Tell me about the Rust ownership model.".to_string(),
+        );
+        config.session = Some(session);
+        let config = Arc::new(RwLock::new(config));
+
+        let mock = Arc::new(
+            MockClient::builder()
+                .add_turn(MockTurnBuilder::new().add_text_chunk("Compacted.").build())
+                .build(),
+        );
+        let _guard = TestStateGuard::new(Some(mock.clone())).await;
+
+        Config::compact_session(&config).await.unwrap();
+
+        let history = mock.conversation_history();
+        assert_eq!(
+            history.conversation_history.len(),
+            1,
+            "expected exactly one LLM call"
+        );
+        let messages = &history.conversation_history[0].messages;
+
+        // The session history must be present.
+        let has_history = messages.iter().any(|m| {
+            if let MessageContent::Text(t) = &m.content {
+                t.contains("Rust ownership model")
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_history,
+            "session history must be forwarded even when a compaction_agent is configured; messages: {messages:?}"
+        );
+
+        // The compaction agent's system prompt must also be present.
+        let has_system = messages.iter().any(|m| {
+            m.role == MessageRole::System
+                && if let MessageContent::Text(t) = &m.content {
+                    t.contains("specialized compaction agent")
+                } else {
+                    false
+                }
+        });
+        assert!(
+            has_system,
+            "compaction agent's system prompt must be in the messages; messages: {messages:?}"
+        );
     }
 }

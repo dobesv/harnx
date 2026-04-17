@@ -112,8 +112,8 @@ pub static REPL_COMMANDS: LazyLock<[ReplCommand; 39]> = LazyLock::new(|| {
             AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
         ),
         ReplCommand::new(
-            ".compress session",
-            "Compress session messages",
+            ".compact session",
+            "Compact session messages using configured compaction agent",
             AssertState::True(StateFlags::SESSION),
         ),
         ReplCommand::new(
@@ -674,17 +674,17 @@ pub async fn run_repl_command_with_output(
                     _ => writeln!(output, r#"Usage: .edit <config|agent|session|rag-docs>"#)?,
                 }
             }
-            ".compress" => match args {
+            ".compact" => match args {
                 Some("session") => {
                     abortable_run_with_spinner(
-                        Config::compress_session(config),
-                        "Compressing",
+                        Config::compact_session(config),
+                        "Compacting",
                         abort_signal.clone(),
                     )
                     .await?;
-                    writeln!(output, "✓ Successfully compressed the session.")?;
+                    writeln!(output, "✓ Successfully compacted the session.")?;
                 }
-                _ => writeln!(output, r#"Usage: .compress session"#)?,
+                _ => writeln!(output, r#"Usage: .compact session"#)?,
             },
             ".empty" => match args {
                 Some("session") => {
@@ -1127,7 +1127,7 @@ async fn ask_inner(
     if with_embeddings {
         input.use_embeddings(abort_signal.clone()).await?;
     }
-    while config.read().is_compressing_session() {
+    while config.read().is_compacting_session() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
@@ -1343,7 +1343,7 @@ async fn ask_inner(
         }
 
         Config::maybe_autoname_session(config.clone());
-        Config::maybe_compress_session(config.clone());
+        Config::maybe_compact_session(config.clone());
         Ok(())
     }
 }

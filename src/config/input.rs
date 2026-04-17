@@ -5,7 +5,7 @@ use crate::client::{
     MessageContentPart, MessageContentToolCalls, MessageRole, Model,
 };
 use crate::tool::ToolResult;
-use crate::utils::{base64_encode, is_loader_protocol, sha256, AbortSignal};
+use crate::utils::{base64_encode, create_abort_signal, is_loader_protocol, sha256, AbortSignal};
 
 use anyhow::{bail, Context, Result};
 use indexmap::IndexSet;
@@ -31,6 +31,11 @@ pub struct Input {
     rag_name: Option<String>,
     with_session: bool,
     with_agent: bool,
+    /// When true, `Session::build_messages` will prepend the agent's system
+    /// prompt even though the session already has messages.  Set by
+    /// `set_agent()` — the only path that swaps agents after construction
+    /// (e.g. compaction).
+    inject_system_prompt: bool,
     /// User text injected after tool-call results (pending message consumed
     /// mid-tool-loop).  Appended as a trailing User message in
     /// `build_messages()`.
@@ -55,6 +60,7 @@ impl Input {
             rag_name: None,
             with_session,
             with_agent,
+            inject_system_prompt: false,
             injected_user_text: None,
         }
     }
@@ -123,6 +129,7 @@ impl Input {
             rag_name: None,
             with_session,
             with_agent,
+            inject_system_prompt: false,
             injected_user_text: None,
         })
     }
@@ -244,9 +251,13 @@ impl Input {
         init_client(&self.config, Some(self.agent().model().clone()))
     }
 
+    /// Fetch chat text with retry and model fallback support.
+    /// Uses the agent's configured fallback models if the primary model fails.
     pub async fn fetch_chat_text(&self) -> Result<String> {
-        let client = self.create_client()?;
-        let text = client.chat_completions(self.clone()).await?.text;
+        let abort_signal = create_abort_signal();
+        let (text, _, _, _) =
+            crate::client::retry::call_with_retry_and_fallback(self, &self.config, abort_signal)
+                .await?;
         let text = strip_think_tag(&text).to_string();
         Ok(text)
     }
@@ -310,6 +321,8 @@ impl Input {
 
     pub fn set_agent(&mut self, agent: Agent) {
         self.with_agent = !agent.name().trim().is_empty();
+        self.with_session = self.with_session || self.config.read().session.is_some();
+        self.inject_system_prompt = true;
         self.agent = agent;
     }
 
@@ -327,6 +340,10 @@ impl Input {
 
     pub fn with_agent(&self) -> bool {
         self.with_agent
+    }
+
+    pub fn inject_system_prompt(&self) -> bool {
+        self.inject_system_prompt
     }
 
     pub fn summary(&self) -> String {
