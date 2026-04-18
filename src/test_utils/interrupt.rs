@@ -293,6 +293,56 @@ pub fn wait_for_prompt_return(tmux: &TmuxHarness, budget: Duration) -> Result<()
     }
 }
 
+/// Spawns `harnx "<prompt>"` non-interactively. Returns the `Child` —
+/// caller is responsible for `wait_for_exit` or kill.
+pub fn spawn_oneshot(
+    paths: &ConfigPaths,
+    harnx_bin: &Path,
+    prompt: &str,
+) -> Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+    Command::new(harnx_bin)
+        .arg(prompt)
+        .env("HARNX_CONFIG_DIR", &paths.harnx_config_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn harnx one-shot")
+}
+
+/// Sends SIGINT to a running child via `libc::kill`. Unix-only.
+#[cfg(unix)]
+pub fn send_sigint(child: &std::process::Child) -> Result<()> {
+    let pid = child.id() as i32;
+    let rc = unsafe { libc::kill(pid, libc::SIGINT) };
+    if rc != 0 {
+        anyhow::bail!(
+            "kill({pid}, SIGINT) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+/// Polls `Child::try_wait` until the child exits or the budget elapses.
+pub fn wait_for_exit(
+    child: &mut std::process::Child,
+    budget: Duration,
+) -> Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            anyhow::bail!("child did not exit within {:?}", budget);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SPINNER_FRAMES;

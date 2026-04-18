@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use harnx::test_utils::interrupt::{
     script_call_sub_agent, script_call_trivial_tool, script_call_wait_tool, script_stall_streaming,
-    spawn_tui, wait_for_prompt_return, write_minimal_config, write_with_blocking_hook,
-    write_with_sub_agent, write_with_wait_tool,
+    send_sigint, spawn_oneshot, spawn_tui, wait_for_exit, wait_for_prompt_return,
+    write_minimal_config, write_with_blocking_hook, write_with_sub_agent, write_with_wait_tool,
 };
 use harnx::test_utils::mock_openai_server::MockOpenAiServer;
 use harnx::test_utils::tmux_harness::TmuxHarness;
@@ -150,5 +150,105 @@ fn interrupt_tui_during_sub_agent() -> Result<()> {
     tmux.send_keys(&["C-c"])?;
 
     wait_for_prompt_return(&tmux, Duration::from_secs(2))?;
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn interrupt_oneshot_during_streaming() -> Result<()> {
+    let mock = MockOpenAiServer::start(script_stall_streaming())?;
+    let tmp = tempfile::tempdir()?;
+    let paths = write_minimal_config(tmp.path(), &format!("http://127.0.0.1:{}/v1", mock.port()))?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mut child = spawn_oneshot(&paths, &harnx_bin, "hello")?;
+
+    // Give harnx time to make the LLM call and start streaming.
+    std::thread::sleep(Duration::from_millis(500));
+
+    send_sigint(&child)?;
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(2))?;
+    assert!(!status.success(), "expected non-zero exit after SIGINT");
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+#[ignore = "pending interrupt fix (#292): SIGINT during tool exits zero"]
+fn interrupt_oneshot_during_tool() -> Result<()> {
+    let mock = MockOpenAiServer::start(script_call_wait_tool(30))?;
+    let tmp = tempfile::tempdir()?;
+    let mcp_time_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"));
+    let paths = write_with_wait_tool(
+        tmp.path(),
+        &format!("http://127.0.0.1:{}/v1", mock.port()),
+        &mcp_time_bin,
+    )?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mut child = spawn_oneshot(&paths, &harnx_bin, "wait please")?;
+
+    // Allow the LLM round-trip + tool dispatch (~1s in practice).
+    std::thread::sleep(Duration::from_millis(1500));
+
+    send_sigint(&child)?;
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(2))?;
+    assert!(!status.success(), "expected non-zero exit after SIGINT");
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn interrupt_oneshot_during_hook() -> Result<()> {
+    let mock = MockOpenAiServer::start(script_call_trivial_tool())?;
+    let tmp = tempfile::tempdir()?;
+    let mcp_time_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"));
+    let paths = write_with_blocking_hook(
+        tmp.path(),
+        &format!("http://127.0.0.1:{}/v1", mock.port()),
+        &mcp_time_bin,
+    )?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mut child = spawn_oneshot(&paths, &harnx_bin, "call a tool")?;
+
+    // Allow LLM response + hook to start (sleep 30 in block.sh).
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Hook should have fired by now.
+    assert!(
+        paths.dir.join("hook_fired").exists(),
+        "PreToolUse hook never fired (sentinel missing)"
+    );
+
+    send_sigint(&child)?;
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(2))?;
+    assert!(!status.success(), "expected non-zero exit after SIGINT");
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+#[ignore = "pending interrupt fix (#292): SIGINT during sub-agent exits zero"]
+fn interrupt_oneshot_during_sub_agent() -> Result<()> {
+    let parent_mock = MockOpenAiServer::start(script_call_sub_agent("child"))?;
+    let child_mock = MockOpenAiServer::start(script_stall_streaming())?;
+    let tmp = tempfile::tempdir()?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let paths = write_with_sub_agent(
+        tmp.path(),
+        &format!("http://127.0.0.1:{}/v1", parent_mock.port()),
+        &format!("http://127.0.0.1:{}/v1", child_mock.port()),
+        &harnx_bin,
+    )?;
+    let mut child = spawn_oneshot(&paths, &harnx_bin, "delegate")?;
+
+    // Allow parent LLM + ACP handshake + child startup + child streaming.
+    std::thread::sleep(Duration::from_millis(2500));
+
+    send_sigint(&child)?;
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(2))?;
+    assert!(!status.success(), "expected non-zero exit after SIGINT");
     Ok(())
 }
