@@ -1,11 +1,11 @@
 //! End-to-end tests that characterise interrupt handling (Ctrl-C, SIGINT,
 //! and ACP `session/cancel`) across TUI, one-shot, and ACP-server modes.
 //!
-//! Tests that currently fail against `main` are marked with
-//! `#[ignore = "pending interrupt fix (#292)"]`. Run the full suite with
-//!   cargo nextest run --test interrupt_e2e --run-ignored=all
-//! to see the pre-fix baseline. As fixes land, individual tests are
-//! un-ignored in the same PR.
+//! Unix-only: these tests rely on SIGINT delivery via `libc::kill` and
+//! `tmux` (which is not available in our Windows CI image). The whole
+//! module is gated so `cargo test` on Windows still links cleanly.
+
+#![cfg(unix)]
 
 use anyhow::Result;
 use std::path::PathBuf;
