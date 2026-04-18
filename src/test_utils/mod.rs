@@ -57,6 +57,7 @@
 //! }).await?;
 //! ```
 
+pub mod interrupt;
 pub mod mock_acp;
 pub mod mock_client;
 pub mod mock_openai_server;
