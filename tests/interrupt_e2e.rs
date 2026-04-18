@@ -101,16 +101,16 @@ fn interrupt_tui_during_hook() -> Result<()> {
     // Wait for the LLM's streamed text — proves the LLM has responded
     // and harnx is about to dispatch the tool, which triggers the hook.
     tmux.wait_for_contains("Listing", Duration::from_secs(5))?;
-    // Pause to ensure the PreToolUse hook (sleep 30) has actually started.
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Confirm the hook actually fired before asserting cancellation.
-    // (Without this, a false-positive could occur if the hook is silently
-    // skipped — the test would pass for the wrong reason.)
-    assert!(
-        paths.dir.join("hook_fired").exists(),
-        "PreToolUse hook never wrote sentinel — hook may not be wired in"
-    );
+    // Poll for the hook's sentinel so the test doesn't race the hook
+    // subprocess on slow CI runners.
+    let sentinel = paths.dir.join("hook_fired");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !sentinel.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("PreToolUse hook never fired (sentinel missing after 10s)");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     tmux.send_keys(&["C-c"])?;
 
@@ -210,14 +210,18 @@ fn interrupt_oneshot_during_hook() -> Result<()> {
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
     let mut child = spawn_oneshot(&paths, &harnx_bin, "call a tool")?;
 
-    // Allow LLM response + hook to start (sleep 30 in block.sh).
-    std::thread::sleep(Duration::from_millis(1500));
-
-    // Hook should have fired by now.
-    assert!(
-        paths.dir.join("hook_fired").exists(),
-        "PreToolUse hook never fired (sentinel missing)"
-    );
+    // Poll for the hook's sentinel rather than a fixed sleep — CI runners
+    // are slower than local for harnx startup + LLM round-trip + hook
+    // spawn. Once the sentinel exists we know block.sh is actively
+    // sleeping, so it's safe to deliver SIGINT and assert cancellation.
+    let sentinel = paths.dir.join("hook_fired");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !sentinel.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("PreToolUse hook never fired (sentinel missing after 10s)");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     send_sigint(&child)?;
 
