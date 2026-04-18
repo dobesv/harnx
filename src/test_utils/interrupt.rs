@@ -3,9 +3,11 @@
 //! This module is compiled only under `cfg(test)` via `src/test_utils/mod.rs`.
 //! It intentionally does not expose anything outside the crate.
 
+use crate::acp::AcpServerConfig;
 use crate::test_utils::mock_openai_server::{MockOpenAiScript, MockOpenAiTurn};
 use crate::test_utils::tmux_harness::TmuxHarness;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -192,6 +194,81 @@ pub fn spawn_tui(paths: &ConfigPaths, harnx_bin: &Path, repo_root: &Path) -> Res
 
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// A mock-LLM response that emits one short text chunk and immediately
+/// issues a `<agent_name>_session_prompt` tool call to delegate to a
+/// sub-agent via ACP.
+pub fn script_call_sub_agent(agent_name: &str) -> MockOpenAiScript {
+    use crate::test_utils::mock_openai_server::MockOpenAiToolCall;
+    MockOpenAiScript {
+        turns: vec![MockOpenAiTurn {
+            text_chunks: vec!["Delegating...".to_string()],
+            tool_calls: vec![MockOpenAiToolCall {
+                name: format!("{agent_name}_session_prompt"),
+                arguments: serde_json::json!({ "message": "do the thing" }),
+                id: None,
+            }],
+            error: None,
+        }],
+        fallback_text: "sub-agent script exhausted".to_string(),
+        chunk_delay_ms: 0,
+    }
+}
+
+/// Sets up two config dirs (child and parent) for a sub-agent delegation test.
+///
+/// - Child dir: `dir/child` — minimal config pointing at `child_mock_url`,
+///   plus an agent file at `agents/child.md` (required by `harnx --acp child`).
+/// - Parent dir: `dir/parent` — minimal config pointing at `parent_mock_url`,
+///   plus an `acp_servers/child.yaml` that spawns another harnx with
+///   `--acp child` and `HARNX_CONFIG_DIR` pointing at the child config dir.
+///
+/// Returns the PARENT's `ConfigPaths` so `spawn_tui` launches the parent.
+pub fn write_with_sub_agent(
+    dir: &Path,
+    parent_mock_url: &str,
+    child_mock_url: &str,
+    harnx_bin: &Path,
+) -> Result<ConfigPaths> {
+    // Child config (lives in <dir>/child/harnx-config).
+    let child_paths = write_minimal_config(&dir.join("child"), child_mock_url)?;
+    // The child needs an agent file matching the agent name passed to --acp.
+    std::fs::create_dir_all(child_paths.harnx_config_dir.join("agents"))?;
+    std::fs::write(
+        child_paths.harnx_config_dir.join("agents/child.md"),
+        "---\nname: child\nmodel: mock-llm:test\nuse_tools: '*'\n---\nYou are the child.\n",
+    )?;
+
+    // Parent config (lives in <dir>/parent/harnx-config).
+    let parent_paths = write_minimal_config(&dir.join("parent"), parent_mock_url)?;
+
+    // ACP server entry on the parent — points at another harnx --acp child
+    // with the child's HARNX_CONFIG_DIR.
+    let acp_servers_dir = parent_paths.harnx_config_dir.join("acp_servers");
+    std::fs::create_dir_all(&acp_servers_dir)?;
+    let mut env = HashMap::new();
+    env.insert(
+        "HARNX_CONFIG_DIR".to_string(),
+        child_paths.harnx_config_dir.to_string_lossy().into_owned(),
+    );
+    let acp_server = AcpServerConfig {
+        name: "child".to_string(),
+        command: harnx_bin.to_string_lossy().into_owned(),
+        args: vec!["--acp".to_string(), "child".to_string()],
+        env,
+        enabled: true,
+        description: None,
+        idle_timeout_secs: 60,
+        operation_timeout_secs: 60,
+    };
+    std::fs::write(
+        acp_servers_dir.join("child.yaml"),
+        serde_yaml::to_string(&acp_server)
+            .context("failed to serialize child ACP server config")?,
+    )?;
+
+    Ok(parent_paths)
 }
 
 /// Polls the pane until no SPINNER_FRAME char is visible in the most
