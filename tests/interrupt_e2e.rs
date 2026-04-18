@@ -141,11 +141,11 @@ fn interrupt_tui_during_sub_agent() -> Result<()> {
 
     tmux.send_text("delegate please")?;
     tmux.send_keys(&["Enter"])?;
-    // Wait for the parent's "Delegating..." text — proves the parent LLM
-    // responded and is about to invoke the sub-agent ACP tool.
+    // "Delegating..." proves the parent LLM responded.
     tmux.wait_for_contains("Delegating", Duration::from_secs(10))?;
-    // Allow time for the child harnx process to start and begin streaming.
-    std::thread::sleep(Duration::from_millis(2000));
+    // "Thinking" only comes from the child's mock — proves the ACP
+    // delegation reached the child and the child started streaming.
+    tmux.wait_for_contains("Thinking", Duration::from_secs(5))?;
 
     tmux.send_keys(&["C-c"])?;
 
