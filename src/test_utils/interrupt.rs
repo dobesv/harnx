@@ -14,6 +14,26 @@ use std::time::{Duration, Instant};
 /// the TUI is currently busy.
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// A mock-LLM response that emits one short text chunk and immediately
+/// issues a `wait` tool call (chunk_delay_ms is 0 so the tool call fires
+/// without delay).
+pub fn script_call_wait_tool(seconds: u32) -> MockOpenAiScript {
+    use crate::test_utils::mock_openai_server::MockOpenAiToolCall;
+    MockOpenAiScript {
+        turns: vec![MockOpenAiTurn {
+            text_chunks: vec!["Waiting...".to_string()],
+            tool_calls: vec![MockOpenAiToolCall {
+                name: "wait".to_string(),
+                arguments: serde_json::json!({ "seconds": seconds }),
+                id: None,
+            }],
+            error: None,
+        }],
+        fallback_text: "wait-tool script exhausted".to_string(),
+        chunk_delay_ms: 0,
+    }
+}
+
 /// A mock-LLM response that emits one short chunk then holds the stream
 /// open. The per-chunk delay is applied between chunks, so the harness
 /// sees the first chunk almost immediately and then stalls.
@@ -61,6 +81,29 @@ pub fn write_minimal_config(dir: &Path, mock_base_url: &str) -> Result<ConfigPat
         dir: dir.to_path_buf(),
         harnx_config_dir,
     })
+}
+
+/// Like `write_minimal_config`, but also registers the workspace-built
+/// `harnx-mcp-time` binary as an MCP server so the `wait` tool is available.
+///
+/// `mcp_time_bin` should be the path to the compiled `harnx-mcp-time` binary,
+/// typically obtained via `PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"))`
+/// in the calling test (the `env!` macro for `CARGO_BIN_EXE_*` is only
+/// available in integration-test compilation units, not in library code).
+pub fn write_with_wait_tool(
+    dir: &Path,
+    mock_base_url: &str,
+    mcp_time_bin: &Path,
+) -> Result<ConfigPaths> {
+    let paths = write_minimal_config(dir, mock_base_url)?;
+    let mcp_servers_dir = paths.harnx_config_dir.join("mcp_servers");
+    std::fs::create_dir_all(&mcp_servers_dir).context("failed to create mcp_servers dir")?;
+    std::fs::write(
+        mcp_servers_dir.join("time.yaml"),
+        format!("command: {}\n", mcp_time_bin.display()),
+    )
+    .context("failed to write mcp_servers/time.yaml")?;
+    Ok(paths)
 }
 
 /// Starts tmux + bash, exports `HARNX_CONFIG_DIR`, and launches harnx in
