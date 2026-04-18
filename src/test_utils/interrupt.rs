@@ -83,6 +83,26 @@ pub fn write_minimal_config(dir: &Path, mock_base_url: &str) -> Result<ConfigPat
     })
 }
 
+/// A mock-LLM response that emits one short text chunk and one tool call
+/// with a 1-second wait. Used to exercise the PreToolUse hook path without
+/// risking a 30-second hang if cancellation fails.
+pub fn script_call_trivial_tool() -> MockOpenAiScript {
+    use crate::test_utils::mock_openai_server::MockOpenAiToolCall;
+    MockOpenAiScript {
+        turns: vec![MockOpenAiTurn {
+            text_chunks: vec!["Listing...".to_string()],
+            tool_calls: vec![MockOpenAiToolCall {
+                name: "time_wait".to_string(),
+                arguments: serde_json::json!({ "seconds": 1 }),
+                id: None,
+            }],
+            error: None,
+        }],
+        fallback_text: "trivial-tool script exhausted".to_string(),
+        chunk_delay_ms: 0,
+    }
+}
+
 /// Like `write_minimal_config`, but also registers the workspace-built
 /// `harnx-mcp-time` binary as an MCP server so the `wait` tool is available.
 ///
@@ -103,6 +123,38 @@ pub fn write_with_wait_tool(
         format!("command: {}\n", mcp_time_bin.display()),
     )
     .context("failed to write mcp_servers/time.yaml")?;
+    Ok(paths)
+}
+
+/// Like `write_with_wait_tool`, but also overwrites `config.yaml` with a
+/// `hooks:` block that registers a PreToolUse hook pointing at a
+/// `block.sh` script (runs `sleep 30`) in the same temp dir. The hook's
+/// timeout is set to 300s so the harness's per-hook timeout does not kill
+/// the hook before our Ctrl-C budget expires.
+pub fn write_with_blocking_hook(
+    dir: &Path,
+    mock_base_url: &str,
+    mcp_time_bin: &Path,
+) -> Result<ConfigPaths> {
+    let paths = write_with_wait_tool(dir, mock_base_url, mcp_time_bin)?;
+    let block_sh = paths.dir.join("block.sh");
+    std::fs::write(&block_sh, "#!/bin/sh\nsleep 30\n").context("failed to write block.sh")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&block_sh)?.permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&block_sh, perm)?;
+    }
+    std::fs::write(
+        paths.harnx_config_dir.join("config.yaml"),
+        format!(
+            "save: false\nclient: mock-llm\nmodel: mock-llm:test\ntool_use: true\nuse_tools: '*'\n\
+             hooks:\n  entries:\n    - event: PreToolUse\n      type: claude-command\n      command: {}\n      timeout: 300\n",
+            block_sh.display()
+        ),
+    )
+    .context("failed to write config.yaml with hook")?;
     Ok(paths)
 }
 

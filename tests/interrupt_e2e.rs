@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use harnx::test_utils::interrupt::{
-    script_call_wait_tool, script_stall_streaming, spawn_tui, wait_for_prompt_return,
-    write_minimal_config, write_with_wait_tool,
+    script_call_trivial_tool, script_call_wait_tool, script_stall_streaming, spawn_tui,
+    wait_for_prompt_return, write_minimal_config, write_with_blocking_hook, write_with_wait_tool,
 };
 use harnx::test_utils::mock_openai_server::MockOpenAiServer;
 use harnx::test_utils::tmux_harness::TmuxHarness;
@@ -67,6 +67,40 @@ fn interrupt_tui_during_tool() -> Result<()> {
     // pause so the wait tool actually starts executing in the MCP server
     // (not just the LLM text being on screen).
     tmux.wait_for_contains("Waiting", Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    tmux.send_keys(&["C-c"])?;
+
+    wait_for_prompt_return(&tmux, Duration::from_secs(2))?;
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn interrupt_tui_during_hook() -> Result<()> {
+    if !TmuxHarness::is_available() {
+        eprintln!("tmux unavailable; skipping interrupt_tui_during_hook");
+        return Ok(());
+    }
+
+    let mock = MockOpenAiServer::start(script_call_trivial_tool())?;
+    let tmp = tempfile::tempdir()?;
+    let mcp_time_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"));
+    let paths = write_with_blocking_hook(
+        tmp.path(),
+        &format!("http://127.0.0.1:{}/v1", mock.port()),
+        &mcp_time_bin,
+    )?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let tmux = spawn_tui(&paths, &harnx_bin, &repo_root)?;
+
+    tmux.send_text("go")?;
+    tmux.send_keys(&["Enter"])?;
+    // Wait for the LLM's streamed text — proves the LLM has responded
+    // and harnx is about to dispatch the tool, which triggers the hook.
+    tmux.wait_for_contains("Listing", Duration::from_secs(5))?;
+    // Pause to ensure the PreToolUse hook (sleep 30) has actually started.
     std::thread::sleep(Duration::from_millis(500));
 
     tmux.send_keys(&["C-c"])?;
