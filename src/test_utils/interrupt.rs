@@ -325,6 +325,50 @@ pub fn send_sigint(child: &std::process::Child) -> Result<()> {
     Ok(())
 }
 
+/// Writes an agent markdown file under `<harnx_config_dir>/agents/<name>.md`
+/// pointing at the `mock-llm:test` model with `use_tools: '*'`. Required
+/// before launching `harnx --acp <name>`.
+pub fn write_acp_agent(paths: &ConfigPaths, name: &str) -> Result<()> {
+    let agents = paths.harnx_config_dir.join("agents");
+    std::fs::create_dir_all(&agents).context("failed to create agents dir")?;
+    std::fs::write(
+        agents.join(format!("{name}.md")),
+        format!("---\nname: {name}\nmodel: mock-llm:test\nuse_tools: '*'\n---\nYou are {name}.\n"),
+    )
+    .context("failed to write agent file")?;
+    Ok(())
+}
+
+/// Builds a connected `AcpClient` against a `harnx --acp <agent>` child
+/// using the given config dir.
+pub async fn spawn_acp_client(
+    paths: &ConfigPaths,
+    harnx_bin: &Path,
+    agent: &str,
+) -> Result<crate::acp::AcpClient> {
+    let mut env = HashMap::new();
+    env.insert(
+        "HARNX_CONFIG_DIR".to_string(),
+        paths.harnx_config_dir.to_string_lossy().into_owned(),
+    );
+    let config = AcpServerConfig {
+        name: format!("test-{agent}"),
+        command: harnx_bin.to_string_lossy().into_owned(),
+        args: vec!["--acp".to_string(), agent.to_string()],
+        env,
+        enabled: true,
+        description: None,
+        idle_timeout_secs: 300,
+        operation_timeout_secs: 60,
+    };
+    let client = crate::acp::AcpClient::new(config);
+    client
+        .connect()
+        .await
+        .context("failed to connect test ACP client")?;
+    Ok(client)
+}
+
 /// Polls `Child::try_wait` until the child exits or the budget elapses.
 pub fn wait_for_exit(
     child: &mut std::process::Child,
