@@ -13,11 +13,13 @@ use std::time::Duration;
 
 use harnx::test_utils::interrupt::{
     script_call_sub_agent, script_call_trivial_tool, script_call_wait_tool, script_stall_streaming,
-    send_sigint, spawn_oneshot, spawn_tui, wait_for_exit, wait_for_prompt_return,
-    write_minimal_config, write_with_blocking_hook, write_with_sub_agent, write_with_wait_tool,
+    send_sigint, spawn_acp_client, spawn_oneshot, spawn_tui, wait_for_exit, wait_for_prompt_return,
+    write_acp_agent, write_minimal_config, write_with_blocking_hook, write_with_sub_agent,
+    write_with_wait_tool,
 };
 use harnx::test_utils::mock_openai_server::MockOpenAiServer;
 use harnx::test_utils::tmux_harness::TmuxHarness;
+use tokio::time::{timeout, Duration as TokioDuration};
 
 #[test]
 fn interrupt_tui_during_streaming() -> Result<()> {
@@ -255,9 +257,6 @@ fn interrupt_oneshot_during_sub_agent() -> Result<()> {
     Ok(())
 }
 
-use harnx::test_utils::interrupt::{spawn_acp_client, write_acp_agent};
-use tokio::time::{timeout, Duration as TokioDuration};
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
 async fn interrupt_acp_session_cancel_during_streaming() -> Result<()> {
@@ -334,6 +333,14 @@ async fn interrupt_acp_session_cancel_during_hook() -> Result<()> {
 
     let prompt_fut = client.session_prompt(Some(&session), "call tool");
     tokio::pin!(prompt_fut);
+
+    // Note: ACP's `eval_tool_calls_async` does NOT currently dispatch
+    // PreToolUse hooks (see src/acp/server.rs:661), so the `hook_fired`
+    // sentinel used by the TUI / one-shot tests never appears here.
+    // We instead wait long enough for the blocking `time_wait` tool to
+    // be in flight, then send the cancel. If ACP gains hook support
+    // later, swap this sleep for sentinel polling to match the other
+    // hook tests.
     tokio::time::sleep(TokioDuration::from_millis(1000)).await;
 
     client.session_cancel(&session).await?;
