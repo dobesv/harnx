@@ -1394,6 +1394,32 @@ mod tests {
             doc_count >= 4,
             "file should have at least 4 YAML documents (header + user + assistant + tool + assistant); got {doc_count}"
         );
+
+        // Exercise the deserializer to catch parser/serde regressions.
+        // We parse the YAML log entries directly (same path `Session::load`
+        // uses internally via `SessionLogEntry::deserialize`) rather than
+        // calling `Session::load`, because that also performs model
+        // resolution which depends on the global model catalog and is not
+        // available in this test's minimal `Config::default`.
+        use serde::Deserialize;
+        let mut parsed_messages: Vec<Message> = Vec::new();
+        for document in serde_yaml::Deserializer::from_str(&content) {
+            let entry =
+                SessionLogEntry::deserialize(document).expect("log entry should round-trip");
+            if let SessionLogEntry::Message { role, content } = entry {
+                parsed_messages.push(Message::new(role, content));
+            }
+        }
+        assert_eq!(
+            parsed_messages.len(),
+            session.messages.len(),
+            "reloaded messages should match the original count"
+        );
+        assert_eq!(
+            parsed_messages.last().unwrap().content.to_text(),
+            "found results",
+            "final reloaded message should preserve the last assistant output"
+        );
     }
 
     /// Simulates the ACP server flow: save_message with &[] for the

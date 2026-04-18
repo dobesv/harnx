@@ -437,9 +437,6 @@ impl acp::Agent for HarnxAgent {
             // Persist tool results to the session so the is_continuation
             // detection in add_message works on the next round and duplicate
             // User messages are avoided (#293).
-            // Persist tool results to the session so the is_continuation
-            // detection in add_message works on the next round and duplicate
-            // User messages are avoided (#293).
             if !tool_results.is_empty() {
                 let config = self.config.clone();
                 let output_for_save = output.clone();
@@ -1147,6 +1144,9 @@ mod tests {
         std::fs::write(agents_dir.join("vartest.md"), agent_content).unwrap();
 
         // Point HARNX_CONFIG_DIR at the temp dir so retrieve_agent finds it.
+        // The env mutation must be serialized with other tests that touch
+        // HARNX_CONFIG_DIR — we do this by creating the guard *inside* the
+        // region where `TEST_CLIENT_LOCK` is held (via `TestStateGuard`).
         struct EnvGuard(&'static str, Option<std::ffi::OsString>);
         impl EnvGuard {
             fn new(key: &'static str, val: &std::path::Path) -> Self {
@@ -1163,9 +1163,9 @@ mod tests {
                 }
             }
         }
-        let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
         let config = test_config();
+        let temp_path = temp.path().to_path_buf();
 
         run_local(async move {
             let _guard = TestStateGuard::new(Some(Arc::new(
@@ -1178,6 +1178,7 @@ mod tests {
                     .build(),
             )))
             .await;
+            let _env = EnvGuard::new("HARNX_CONFIG_DIR", &temp_path);
 
             let (client_conn, _chunks, server_handle, client_handle) =
                 setup_roundtrip("vartest", config.clone());

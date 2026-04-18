@@ -3777,7 +3777,9 @@ mod tests {
             ..Default::default()
         };
         // Point Config::agent_file() at the temp dir via HARNX_CONFIG_DIR.
-        // Use an RAII guard so the env var is restored even on panic.
+        // Use an RAII guard so the env var is restored even on panic.  The
+        // guard is created *after* `TestStateGuard` acquires the global test
+        // lock so concurrent tests cannot race on the env var.
         struct EnvGuard {
             key: &'static str,
             prev: Option<std::ffi::OsString>,
@@ -3785,7 +3787,8 @@ mod tests {
         impl EnvGuard {
             fn new(key: &'static str, value: &std::path::Path) -> Self {
                 let prev = std::env::var_os(key);
-                // SAFETY: test-only; concurrent env mutation is accepted.
+                // SAFETY: test-only; concurrent env mutation is prevented by
+                // holding `TEST_CLIENT_LOCK` while the guard is alive.
                 unsafe { std::env::set_var(key, value) };
                 Self { key, prev }
             }
@@ -3798,7 +3801,6 @@ mod tests {
                 }
             }
         }
-        let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
         config.agent = Some(main_agent);
 
@@ -3816,6 +3818,7 @@ mod tests {
                 .build(),
         );
         let _guard = TestStateGuard::new(Some(mock.clone())).await;
+        let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
         Config::compact_session(&config).await.unwrap();
 

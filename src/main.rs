@@ -343,8 +343,12 @@ async fn acp_server_main(config: GlobalConfig, agent_name: String) -> Result<()>
     let result = io_task.await;
 
     // Persist any remaining session state on shutdown (#232).
-    if let Err(e) = config_for_cleanup.write().exit_session() {
-        warn!("Failed to persist ACP session on exit: {e}");
+    // `exit_session` performs blocking file I/O, so run it on the blocking
+    // pool rather than stalling the async runtime thread.
+    match tokio::task::spawn_blocking(move || config_for_cleanup.write().exit_session()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Failed to persist ACP session on exit: {e}"),
+        Err(e) => warn!("Failed to persist ACP session on exit: {e}"),
     }
 
     result.map_err(|err| anyhow!("ACP server I/O error: {err}"))?;
