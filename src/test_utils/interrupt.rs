@@ -138,7 +138,12 @@ pub fn write_with_blocking_hook(
 ) -> Result<ConfigPaths> {
     let paths = write_with_wait_tool(dir, mock_base_url, mcp_time_bin)?;
     let block_sh = paths.dir.join("block.sh");
-    std::fs::write(&block_sh, "#!/bin/sh\nsleep 30\n").context("failed to write block.sh")?;
+    let sentinel = paths.dir.join("hook_fired");
+    std::fs::write(
+        &block_sh,
+        format!("#!/bin/sh\ntouch {}\nsleep 30\n", sentinel.display()),
+    )
+    .context("failed to write block.sh")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

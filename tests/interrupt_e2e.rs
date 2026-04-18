@@ -103,6 +103,14 @@ fn interrupt_tui_during_hook() -> Result<()> {
     // Pause to ensure the PreToolUse hook (sleep 30) has actually started.
     std::thread::sleep(Duration::from_millis(500));
 
+    // Confirm the hook actually fired before asserting cancellation.
+    // (Without this, a false-positive could occur if the hook is silently
+    // skipped — the test would pass for the wrong reason.)
+    assert!(
+        paths.dir.join("hook_fired").exists(),
+        "PreToolUse hook never wrote sentinel — hook may not be wired in"
+    );
+
     tmux.send_keys(&["C-c"])?;
 
     wait_for_prompt_return(&tmux, Duration::from_secs(2))?;
