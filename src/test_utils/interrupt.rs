@@ -115,3 +115,21 @@ pub fn wait_for_prompt_return(tmux: &TmuxHarness, budget: Duration) -> Result<()
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SPINNER_FRAMES;
+
+    #[test]
+    fn spinner_frames_match_tui() {
+        let expected: Vec<char> = crate::tui::types::SPINNER_FRAMES
+            .iter()
+            .flat_map(|frame| frame.chars())
+            .collect();
+        let actual: Vec<char> = SPINNER_FRAMES.to_vec();
+        assert_eq!(
+            expected, actual,
+            "src/test_utils/interrupt.rs SPINNER_FRAMES drifted from src/tui/types.rs"
+        );
+    }
+}
