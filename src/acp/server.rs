@@ -273,11 +273,20 @@ impl acp::Agent for HarnxAgent {
             }
         }
 
-        let agent = self
+        let mut agent = self
             .config
             .read()
             .retrieve_agent(&self.agent_name)
             .map_err(|e| acp::Error::new(-32603, format!("Failed to retrieve agent: {e}")))?;
+        // Resolve agent variables so they are expanded in the system prompt.
+        // In non-ACP flows this happens via init_agent_session_variables; in
+        // ACP mode we do it here since the agent is not stored on the config.
+        if let Err(e) = agent.resolve_variables() {
+            warn!(
+                "Failed to resolve variables for agent '{}': {e}",
+                self.agent_name
+            );
+        }
 
         let mut input = Input::from_str(&self.config, &prompt_text, None);
         input.set_agent(agent);
@@ -309,6 +318,7 @@ impl acp::Agent for HarnxAgent {
                     &input_for_save,
                     &output_for_save,
                     thought_for_save.as_deref(),
+                    &[],
                 )
             })
             .await
@@ -423,6 +433,39 @@ impl acp::Agent for HarnxAgent {
                     }
                 }
             };
+
+            // Persist tool results to the session so the is_continuation
+            // detection in add_message works on the next round and duplicate
+            // User messages are avoided (#293).
+            if !tool_results.is_empty() {
+                let config = self.config.clone();
+                let output_for_save = output.clone();
+                let thought_for_save = thought.clone();
+                let tool_results_for_save = tool_results.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut config = config.write();
+                    let sessions_dir = config.sessions_dir();
+                    if let Some(session) = config.session.as_mut() {
+                        session.set_sessions_dir(sessions_dir);
+                        let tool_calls_content = crate::client::MessageContent::ToolCalls(
+                            crate::client::MessageContentToolCalls::new(
+                                tool_results_for_save,
+                                output_for_save,
+                                thought_for_save,
+                            ),
+                        );
+                        let tool_msg = crate::client::Message::new(
+                            crate::client::MessageRole::Tool,
+                            tool_calls_content,
+                        );
+                        session.append_tool_round(&tool_msg);
+                    }
+                })
+                .await
+                .map_err(|e| {
+                    acp::Error::new(-32603, format!("Failed to persist tool results: {e}"))
+                })?;
+            }
 
             input = input.merge_tool_results(output, thought, tool_results);
         }
@@ -1067,6 +1110,129 @@ mod tests {
                 session_path.exists(),
                 "ACP prompt should persist the session to disk at {}",
                 session_path.display()
+            );
+
+            // Verify session file actually contains conversation content.
+            let session_content =
+                std::fs::read_to_string(&session_path).expect("read session file");
+            assert!(
+                session_content.contains("hello from client"),
+                "session file should contain the user prompt; got:\n{session_content}"
+            );
+            assert!(
+                session_content.contains("mock roundtrip response"),
+                "session file should contain the assistant response; got:\n{session_content}"
+            );
+
+            server_handle.abort();
+            client_handle.abort();
+        });
+    }
+
+    /// Verify that system-level variables (e.g. `{{__os__}}`) are expanded in
+    /// the agent's system prompt when running in ACP mode.  The session file
+    /// should contain the expanded OS name, not the raw `{{__os__}}` template.
+    #[test]
+    fn test_acp_prompt_expands_system_variables_in_session() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let agents_dir = temp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+
+        // Write an agent whose prompt contains {{__os__}}.
+        let agent_content =
+            "---\nmodel: openai:gpt-4o\n---\nYou are running on {{__os__}}. Help the user.\n";
+        std::fs::write(agents_dir.join("vartest.md"), agent_content).unwrap();
+
+        // Point HARNX_CONFIG_DIR at the temp dir so retrieve_agent finds it.
+        // The env mutation must be serialized with other tests that touch
+        // HARNX_CONFIG_DIR — we do this by creating the guard *inside* the
+        // region where `TEST_CLIENT_LOCK` is held (via `TestStateGuard`).
+        struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+        impl EnvGuard {
+            fn new(key: &'static str, val: &std::path::Path) -> Self {
+                let prev = std::env::var_os(key);
+                unsafe { std::env::set_var(key, val) };
+                Self(key, prev)
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => unsafe { std::env::set_var(self.0, v) },
+                    None => unsafe { std::env::remove_var(self.0) },
+                }
+            }
+        }
+
+        let config = test_config();
+        let temp_path = temp.path().to_path_buf();
+
+        run_local(async move {
+            let _guard = TestStateGuard::new(Some(Arc::new(
+                MockClient::builder()
+                    .add_turn(
+                        MockTurnBuilder::new()
+                            .add_text_chunk("variable expansion response")
+                            .build(),
+                    )
+                    .build(),
+            )))
+            .await;
+            let _env = EnvGuard::new("HARNX_CONFIG_DIR", &temp_path);
+
+            let (client_conn, _chunks, server_handle, client_handle) =
+                setup_roundtrip("vartest", config.clone());
+
+            timeout(
+                Duration::from_secs(5),
+                client_conn.initialize(
+                    acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
+                        acp::Implementation::new("test-client", "0.1.0").title("Test Client"),
+                    ),
+                ),
+            )
+            .await
+            .expect("initialize should not hang")
+            .expect("initialize should succeed");
+
+            let session = timeout(
+                Duration::from_secs(5),
+                client_conn.new_session(acp::NewSessionRequest::new(
+                    std::env::current_dir().expect("current dir"),
+                )),
+            )
+            .await
+            .expect("new_session should not hang")
+            .expect("new_session should succeed");
+
+            let _response = timeout(
+                Duration::from_secs(5),
+                client_conn.prompt(acp::PromptRequest::new(
+                    session.session_id.to_string(),
+                    vec![acp::ContentBlock::from("expand variables test")],
+                )),
+            )
+            .await
+            .expect("prompt should not hang")
+            .expect("prompt should succeed");
+
+            // The session file should contain the expanded OS name
+            // (e.g. "linux", "macos") instead of the raw template.
+            let session_path = config.read().session_file(&session.session_id.to_string());
+            assert!(
+                session_path.exists(),
+                "session file should exist at {}",
+                session_path.display()
+            );
+            let content = std::fs::read_to_string(&session_path).expect("read session");
+            assert!(
+                !content.contains("{{__os__}}"),
+                "session should not contain unexpanded {{{{__os__}}}} variable; got:\n{content}"
+            );
+            let current_os = std::env::consts::OS;
+            assert!(
+                content.contains(current_os),
+                "session should contain expanded OS name '{current_os}'; got:\n{content}"
             );
 
             server_handle.abort();

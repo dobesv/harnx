@@ -1261,7 +1261,10 @@ async fn ask_inner(
                 abort_signal.clone(),
             )
             .await?;
-            if switch_agent.session_id.is_none() && config.read().session.is_some() {
+            // Always empty the session on handoff so the new agent starts
+            // fresh — the prior agent's system prompt and messages should
+            // not bleed into the new agent's session (#291).
+            if config.read().session.is_some() {
                 config.write().empty_session()?;
             }
             return Box::pin(ask_inner(

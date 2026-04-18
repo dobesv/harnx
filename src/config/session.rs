@@ -586,6 +586,20 @@ impl Session {
         ));
     }
 
+    /// Append a pre-built Tool message to the session log.
+    /// Used by the ACP server to persist tool results separately from
+    /// the main `add_message` flow.
+    pub fn append_tool_round(&mut self, tool_msg: &Message) {
+        if !self.append_event(&SessionLogEntry::Message {
+            role: tool_msg.role,
+            content: tool_msg.content.clone(),
+        }) {
+            self.dirty = true;
+        }
+        self.messages.push(tool_msg.clone());
+        self.update_tokens();
+    }
+
     pub fn set_compress_threshold(&mut self, value: Option<usize>) {
         if self.compress_threshold != value {
             self.compress_threshold = value;
@@ -795,6 +809,7 @@ impl Session {
         input: &Input,
         output: &str,
         thought: Option<&str>,
+        tool_results: &[crate::tool::ToolResult],
     ) -> Result<()> {
         if input.continue_output().is_some() {
             if let Some(message) = self.messages.last_mut() {
@@ -815,6 +830,13 @@ impl Session {
             self.dirty = true;
         } else {
             let mut all_appended = true;
+            // Detect continuation rounds: if the last saved message is a Tool
+            // message, we're continuing after tool execution and should NOT add
+            // a duplicate user message.
+            let is_continuation = self
+                .messages
+                .last()
+                .is_some_and(|m| m.role == MessageRole::Tool);
             if self.messages.is_empty() {
                 if self.name == TEMP_SESSION_NAME && self.save_session != Some(false) {
                     let raw_input = input.raw();
@@ -829,7 +851,7 @@ impl Session {
                     });
                 }
                 self.messages.extend(agent_messages);
-            } else {
+            } else if !is_continuation {
                 let user_msg = Message::new(MessageRole::User, input.message_content());
                 all_appended &= self.append_event(&SessionLogEntry::Message {
                     role: user_msg.role,
@@ -844,14 +866,21 @@ impl Session {
                 });
             }
             self.data_urls.extend(new_data_urls);
-            if let Some(tool_calls) = input.tool_calls().clone() {
-                let tool_msg =
-                    Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls));
-                all_appended &= self.append_event(&SessionLogEntry::Message {
-                    role: tool_msg.role,
-                    content: tool_msg.content.clone(),
-                });
-                self.messages.push(tool_msg);
+            // Only process input.tool_calls() when this is NOT a
+            // continuation round.  On continuation rounds the tool results
+            // were already persisted incrementally via the `tool_results`
+            // parameter in the previous round, so replaying them from the
+            // merged input would create duplicates.
+            if !is_continuation {
+                if let Some(tool_calls) = input.tool_calls().clone() {
+                    let tool_msg =
+                        Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls));
+                    all_appended &= self.append_event(&SessionLogEntry::Message {
+                        role: tool_msg.role,
+                        content: tool_msg.content.clone(),
+                    });
+                    self.messages.push(tool_msg);
+                }
             }
             if let Some(injected) = input.injected_user_text() {
                 let injected_msg = Message::new(
@@ -874,6 +903,21 @@ impl Session {
                 content: assistant_msg.content.clone(),
             });
             self.messages.push(assistant_msg);
+            // Append tool results from this round (incremental persistence).
+            if !tool_results.is_empty() {
+                let tool_calls_content =
+                    MessageContent::ToolCalls(crate::client::MessageContentToolCalls::new(
+                        tool_results.to_vec(),
+                        output.to_string(),
+                        thought.map(str::to_string),
+                    ));
+                let tool_msg = Message::new(MessageRole::Tool, tool_calls_content);
+                all_appended &= self.append_event(&SessionLogEntry::Message {
+                    role: tool_msg.role,
+                    content: tool_msg.content.clone(),
+                });
+                self.messages.push(tool_msg);
+            }
             // Only clear dirty if all events were appended; otherwise the
             // full-save fallback in exit() will persist the data.
             self.dirty = !all_appended;
@@ -1107,6 +1151,369 @@ mod tests {
 
         assert_eq!(session.model_fallbacks(), &["anthropic:claude".to_string()]);
         assert!(session.dirty);
+    }
+
+    #[test]
+    fn add_message_with_tool_results_saves_incrementally() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+
+        // Round 1: user input + assistant output with tool calls
+        let input = Input::from_str(
+            &std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
+            "hello",
+            Some(agent.clone()),
+        );
+        let tool_results = vec![ToolResult::new(
+            ToolCall {
+                name: "test_tool".to_string(),
+                arguments: json!({"arg": "val"}),
+                id: Some("call_1".to_string()),
+                thought_signature: None,
+            },
+            json!({"result": "ok"}),
+        )];
+        session
+            .add_message(&input, "I'll call a tool", None, &tool_results)
+            .unwrap();
+
+        // Session should have: system/user msgs, assistant, tool
+        assert!(
+            session.messages.len() >= 3,
+            "expected at least 3 messages (agent setup + assistant + tool), got {}",
+            session.messages.len()
+        );
+        // Last message should be Tool role
+        assert_eq!(
+            session.messages.last().unwrap().role,
+            MessageRole::Tool,
+            "last message after tool round should be Tool role"
+        );
+
+        // The session file should exist and contain the intermediate state
+        assert!(session.path.is_some(), "session file should be created");
+        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(
+            content.contains("I'll call a tool"),
+            "session file should contain assistant output from intermediate round"
+        );
+        assert!(
+            content.contains("test_tool"),
+            "session file should contain tool call info"
+        );
+
+        // Round 2: continuation (no new user msg), final assistant output
+        let input2 = Input::from_str(
+            &std::sync::Arc::new(parking_lot::RwLock::new(config)),
+            "hello",
+            Some(agent),
+        );
+        session
+            .add_message(&input2, "Here is the result", None, &[])
+            .unwrap();
+
+        // Should NOT have a duplicate user message
+        let user_count = session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .count();
+        assert_eq!(
+            user_count, 1,
+            "should have exactly 1 user message, not duplicates from continuation"
+        );
+
+        // Should have the final assistant message
+        assert_eq!(
+            session.messages.last().unwrap().role,
+            MessageRole::Assistant
+        );
+        assert_eq!(
+            session.messages.last().unwrap().content.to_text(),
+            "Here is the result"
+        );
+    }
+
+    /// Verify that when the continuation round's input carries merged
+    /// tool_calls (from merge_tool_results), they don't create duplicate
+    /// Tool messages — the tool results were already saved in round 1.
+    #[test]
+    fn continuation_with_merged_tool_calls_does_not_duplicate_tool_messages() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+
+        let tool_results = vec![ToolResult::new(
+            ToolCall {
+                name: "my_tool".to_string(),
+                arguments: json!({"x": 1}),
+                id: Some("call_1".to_string()),
+                thought_signature: None,
+            },
+            json!("tool output"),
+        )];
+
+        // Round 1: save with tool_results — creates assistant + tool messages.
+        let input1 = Input::from_str(&global_config, "hello", Some(agent.clone()));
+        session
+            .add_message(&input1, "calling tool", None, &tool_results)
+            .unwrap();
+
+        let tool_count_after_round1 = session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .count();
+        assert_eq!(
+            tool_count_after_round1, 1,
+            "round 1 should produce exactly 1 Tool message"
+        );
+
+        // Round 2: simulate what happens in the real prompt loop —
+        // merge_tool_results puts the tool data onto the input's tool_calls,
+        // then add_message is called with empty tool_results for the final
+        // round.
+        let input2 = Input::from_str(&global_config, "hello", Some(agent));
+        let merged_input =
+            input2.merge_tool_results("calling tool".to_string(), None, tool_results);
+        assert!(
+            merged_input.tool_calls().is_some(),
+            "merged input should have tool_calls set"
+        );
+        session
+            .add_message(&merged_input, "final answer", None, &[])
+            .unwrap();
+
+        let tool_count_after_round2 = session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .count();
+        assert_eq!(
+            tool_count_after_round2, 1,
+            "round 2 should NOT add another Tool message — tool results were already saved in round 1; got {} Tool messages",
+            tool_count_after_round2
+        );
+
+        // Verify on-disk content doesn't have duplicates either.
+        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        let tool_entry_count = content.matches("my_tool").count();
+        // The tool name appears once in the tool results entry.
+        assert!(
+            tool_entry_count <= 2,
+            "session file should not have excessive duplicates of tool data; found {tool_entry_count} occurrences of 'my_tool'"
+        );
+    }
+
+    /// Verify that session file round-trips correctly after incremental
+    /// saving: load the saved file and check messages match.
+    #[test]
+    fn incremental_session_round_trips_through_load() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+
+        let tool_results = vec![ToolResult::new(
+            ToolCall {
+                name: "search".to_string(),
+                arguments: json!({"query": "test"}),
+                id: Some("c1".to_string()),
+                thought_signature: None,
+            },
+            json!({"results": ["a", "b"]}),
+        )];
+
+        // Round 1: intermediate save with tool results
+        let input1 = Input::from_str(&global_config, "find test", Some(agent.clone()));
+        session
+            .add_message(&input1, "searching...", None, &tool_results)
+            .unwrap();
+
+        // Round 2: final answer
+        let input2 = Input::from_str(&global_config, "find test", Some(agent));
+        session
+            .add_message(&input2, "found results", None, &[])
+            .unwrap();
+
+        // Verify the saved session file contains all expected content
+        // in correct order (header, messages from both rounds).
+        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+
+        // Must have the header
+        assert!(
+            content.starts_with("type: header"),
+            "file should start with header"
+        );
+
+        // Must contain the user input, both assistant outputs, and tool data
+        assert!(
+            content.contains("find test"),
+            "file should contain user input"
+        );
+        assert!(
+            content.contains("searching..."),
+            "file should contain round 1 assistant output"
+        );
+        assert!(
+            content.contains("found results"),
+            "file should contain round 2 assistant output"
+        );
+        assert!(
+            content.contains("search"),
+            "file should contain tool call name"
+        );
+
+        // Count the YAML document separators to ensure the right number
+        // of entries were written (header + N messages).
+        let doc_count = content.matches("\n---\n").count() + 1; // +1 for first doc
+        assert!(
+            doc_count >= 4,
+            "file should have at least 4 YAML documents (header + user + assistant + tool + assistant); got {doc_count}"
+        );
+
+        // Exercise the deserializer to catch parser/serde regressions.
+        // We parse the YAML log entries directly (same path `Session::load`
+        // uses internally via `SessionLogEntry::deserialize`) rather than
+        // calling `Session::load`, because that also performs model
+        // resolution which depends on the global model catalog and is not
+        // available in this test's minimal `Config::default`.
+        use serde::Deserialize;
+        let mut parsed_messages: Vec<Message> = Vec::new();
+        for document in serde_yaml::Deserializer::from_str(&content) {
+            let entry =
+                SessionLogEntry::deserialize(document).expect("log entry should round-trip");
+            if let SessionLogEntry::Message { role, content } = entry {
+                parsed_messages.push(Message::new(role, content));
+            }
+        }
+        assert_eq!(
+            parsed_messages.len(),
+            session.messages.len(),
+            "reloaded messages should match the original count"
+        );
+        assert_eq!(
+            parsed_messages.last().unwrap().content.to_text(),
+            "found results",
+            "final reloaded message should preserve the last assistant output"
+        );
+    }
+
+    /// Simulates the ACP server flow: save_message with &[] for the
+    /// assistant output, then append_tool_round separately, then
+    /// save_message again for the next round.  The session should have
+    /// no duplicate messages and continuation detection should work.
+    #[test]
+    fn append_tool_round_enables_continuation_detection() {
+        use crate::client::MessageContentToolCalls;
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+
+        // Round 1: save assistant output (as ACP server does with &[])
+        let input1 = Input::from_str(&global_config, "hello", Some(agent.clone()));
+        session
+            .add_message(&input1, "calling tool", None, &[])
+            .unwrap();
+        assert_eq!(
+            session.messages.last().unwrap().role,
+            MessageRole::Assistant,
+            "after add_message with no tool_results, last msg should be Assistant"
+        );
+
+        // ACP server then appends tool results via append_tool_round
+        let tool_results = vec![ToolResult::new(
+            ToolCall {
+                name: "acp_tool".to_string(),
+                arguments: json!({"q": "test"}),
+                id: Some("tc1".to_string()),
+                thought_signature: None,
+            },
+            json!("tool output"),
+        )];
+        let tool_msg = Message::new(
+            MessageRole::Tool,
+            crate::client::MessageContent::ToolCalls(MessageContentToolCalls::new(
+                tool_results,
+                "calling tool".to_string(),
+                None,
+            )),
+        );
+        session.append_tool_round(&tool_msg);
+        assert_eq!(
+            session.messages.last().unwrap().role,
+            MessageRole::Tool,
+            "after append_tool_round, last msg should be Tool"
+        );
+
+        // Round 2: save final answer — should detect continuation and
+        // NOT add a duplicate user message.
+        let input2 = Input::from_str(&global_config, "hello", Some(agent));
+        session
+            .add_message(&input2, "final answer", None, &[])
+            .unwrap();
+
+        let user_count = session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .count();
+        assert_eq!(
+            user_count, 1,
+            "should have exactly 1 user message (from round 1), not duplicates from continuation"
+        );
+
+        let tool_count = session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .count();
+        assert_eq!(
+            tool_count, 1,
+            "should have exactly 1 tool message (from append_tool_round)"
+        );
+
+        // Verify the file contains the expected content
+        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(
+            content.contains("acp_tool"),
+            "file should contain the tool call name"
+        );
+        assert!(
+            content.contains("final answer"),
+            "file should contain the final assistant output"
+        );
     }
 
     #[test]

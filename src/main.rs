@@ -313,6 +313,7 @@ async fn acp_server_main(config: GlobalConfig, agent_name: String) -> Result<()>
     use agent_client_protocol as acp;
     use std::rc::Rc;
 
+    let config_for_cleanup = config.clone();
     let agent = Rc::new(HarnxAgent::new(agent_name, config));
     let agent_for_conn = Rc::clone(&agent);
     let stdin = tokio::io::stdin();
@@ -339,9 +340,18 @@ async fn acp_server_main(config: GlobalConfig, agent_name: String) -> Result<()>
     );
 
     agent.set_connection(Rc::new(conn));
-    io_task
-        .await
-        .map_err(|err| anyhow!("ACP server I/O error: {err}"))?;
+    let result = io_task.await;
+
+    // Persist any remaining session state on shutdown (#232).
+    // `exit_session` performs blocking file I/O, so run it on the blocking
+    // pool rather than stalling the async runtime thread.
+    match tokio::task::spawn_blocking(move || config_for_cleanup.write().exit_session()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Failed to persist ACP session on exit: {e}"),
+        Err(e) => warn!("Failed to persist ACP session on exit: {e}"),
+    }
+
+    result.map_err(|err| anyhow!("ACP server I/O error: {err}"))?;
     Ok(())
 }
 
@@ -578,7 +588,10 @@ async fn start_directive_inner(
                 abort_signal.clone(),
             )
             .await?;
-            if switch_agent.session_id.is_none() && config.read().session.is_some() {
+            // Always empty the session on handoff so the new agent starts
+            // fresh — the prior agent's system prompt and messages should
+            // not bleed into the new agent's session (#291).
+            if config.read().session.is_some() {
                 config.write().empty_session()?;
             }
             return Box::pin(start_directive_inner(
