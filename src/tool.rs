@@ -1,7 +1,7 @@
 use crate::{
     acp::NestedAcpEvent,
     config::GlobalConfig,
-    hooks::{dispatch::dispatch_hooks, HookEvent, HookResultControl},
+    hooks::{dispatch::dispatch_hooks, HookEvent, HookOutcome, HookResult, HookResultControl},
     mcp_safety::{truncate_output, TruncateOpts},
     tui::render_helpers::event_fallback_text,
     ui_output::{
@@ -20,7 +20,11 @@ use std::io::Write as _;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Result<Vec<ToolResult>> {
+pub fn eval_tool_calls(
+    config: &GlobalConfig,
+    mut calls: Vec<ToolCall>,
+    abort_signal: &AbortSignal,
+) -> Result<Vec<ToolResult>> {
     let mut output = vec![];
     if calls.is_empty() {
         return Ok(output);
@@ -45,13 +49,21 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
             tool_use_id: tool_use_id.clone(),
         };
         let pre_outcome = tokio::task::block_in_place(|| {
-            Handle::current().block_on(dispatch_hooks(
-                &pre_event,
-                &hooks.entries,
-                &session_id,
-                &cwd,
-            ))
+            Handle::current().block_on(async {
+                tokio::select! {
+                    outcome = dispatch_hooks(&pre_event, &hooks.entries, &session_id, &cwd) => outcome,
+                    _ = wait_abort_signal(abort_signal) => HookOutcome {
+                        control: HookResultControl::Block {
+                            reason: "cancelled by user".to_string(),
+                        },
+                        result: HookResult::default(),
+                    },
+                }
+            })
         });
+        if abort_signal.aborted() {
+            bail!("interrupted during pre-tool hook");
+        }
         if let HookResultControl::Block { reason } = pre_outcome.control {
             let blocked_result = json!({"error": reason, "blocked_by_hook": true});
             output.push(ToolResult::new(call, blocked_result));
@@ -72,7 +84,12 @@ pub fn eval_tool_calls(config: &GlobalConfig, mut calls: Vec<ToolCall>) -> Resul
             }
         }
 
-        let eval_result = call.eval_mcp(config);
+        // Short-circuit remaining tool calls if a cancel already fired.
+        if abort_signal.aborted() {
+            bail!("tool execution aborted by user");
+        }
+
+        let eval_result = call.eval_mcp(config, abort_signal);
         match eval_result {
             Ok(mut result) => {
                 let post_event = HookEvent::PostToolUse {
@@ -380,7 +397,11 @@ impl ToolCall {
         }
     }
 
-    fn eval_mcp(&self, config: &GlobalConfig) -> Result<Value, ToolError> {
+    fn eval_mcp(
+        &self,
+        config: &GlobalConfig,
+        abort_signal: &AbortSignal,
+    ) -> Result<Value, ToolError> {
         let json_data = if self.arguments.is_null() {
             Value::Null
         } else if self.arguments.is_object() {
@@ -568,7 +589,7 @@ impl ToolCall {
             tokio::runtime::Handle::current().block_on(async {
                 tokio::select! {
                     result = manager.call_tool(&tool_name, json_data) => result.map_err(ToolError::Recoverable),
-                    _ = tokio::signal::ctrl_c() => {
+                    _ = wait_abort_signal(abort_signal) => {
                         Err(ToolError::Fatal(anyhow!("MCP tool call aborted by user")))
                     }
                 }
@@ -699,7 +720,8 @@ mod tests {
         );
         let calls = vec![call];
 
-        let result = eval_tool_calls(&config, calls).unwrap();
+        let abort_signal = create_abort_signal();
+        let result = eval_tool_calls(&config, calls, &abort_signal).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].call.name, "unknown_tool");
         assert!(result[0].output.is_object());
@@ -729,7 +751,8 @@ mod tests {
         );
         let calls = vec![call1, call2];
 
-        let result = eval_tool_calls(&config, calls).unwrap();
+        let abort_signal = create_abort_signal();
+        let result = eval_tool_calls(&config, calls, &abort_signal).unwrap();
         assert_eq!(result.len(), 2);
 
         assert_eq!(result[0].call.name, TRIGGER_AGENT_TOOL_NAME);

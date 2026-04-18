@@ -174,7 +174,6 @@ fn interrupt_oneshot_during_streaming() -> Result<()> {
 
 #[test]
 #[cfg(unix)]
-#[ignore = "pending interrupt fix (#292): SIGINT during tool exits zero"]
 fn interrupt_oneshot_during_tool() -> Result<()> {
     let mock = MockOpenAiServer::start(script_call_wait_tool(30))?;
     let tmp = tempfile::tempdir()?;
@@ -229,7 +228,6 @@ fn interrupt_oneshot_during_hook() -> Result<()> {
 
 #[test]
 #[cfg(unix)]
-#[ignore = "pending interrupt fix (#292): SIGINT during sub-agent exits zero"]
 fn interrupt_oneshot_during_sub_agent() -> Result<()> {
     let parent_mock = MockOpenAiServer::start(script_call_sub_agent("child"))?;
     let child_mock = MockOpenAiServer::start(script_stall_streaming())?;
@@ -258,7 +256,6 @@ use tokio::time::{timeout, Duration as TokioDuration};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
-#[ignore = "pending interrupt fix (#292): session/cancel during streaming hangs"]
 async fn interrupt_acp_session_cancel_during_streaming() -> Result<()> {
     let mock = MockOpenAiServer::start(script_stall_streaming())?;
     let tmp = tempfile::tempdir()?;
@@ -285,7 +282,6 @@ async fn interrupt_acp_session_cancel_during_streaming() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
-#[ignore = "pending interrupt fix (#292): session/cancel during tool hangs"]
 async fn interrupt_acp_session_cancel_during_tool() -> Result<()> {
     let mock = MockOpenAiServer::start(script_call_wait_tool(30))?;
     let tmp = tempfile::tempdir()?;
@@ -348,7 +344,6 @@ async fn interrupt_acp_session_cancel_during_hook() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
-#[ignore = "pending interrupt fix (#292): session/cancel does not propagate to sub-agent"]
 async fn interrupt_acp_session_cancel_propagates_to_sub_agent() -> Result<()> {
     let parent_mock = MockOpenAiServer::start(script_call_sub_agent("child"))?;
     let child_mock = MockOpenAiServer::start(script_stall_streaming())?;

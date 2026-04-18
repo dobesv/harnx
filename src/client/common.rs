@@ -286,6 +286,11 @@ pub trait Client: Sync + Send {
     ) -> Result<()> {
         let abort_signal = handler.abort();
         let input = input.clone();
+        let ptr = std::sync::Arc::as_ptr(&abort_signal) as usize;
+        let _ = std::fs::write(
+            format!("/tmp/harnx_stream_debug_{}", std::process::id()),
+            format!("stream start ptr={ptr:x}\n"),
+        );
         tokio::select! {
             ret = async {
                 if self.global_config().read().dry_run {
@@ -297,10 +302,18 @@ pub trait Client: Sync + Send {
                 let data = input.prepare_completion_data(self.model(), true)?;
                 self.chat_completions_streaming_inner(&client, handler, data).await
             } => {
+                let _ = std::fs::write(
+                    format!("/tmp/harnx_stream_done_{}", std::process::id()),
+                    format!("inner completed ret_ok={}\n", ret.is_ok()),
+                );
                 handler.done();
                 ret.with_context(|| format!("Failed to call chat-completions api (client: {}, model: {})", self.name(), self.model().id()))
             }
             _ = wait_abort_signal(&abort_signal) => {
+                let _ = std::fs::write(
+                    format!("/tmp/harnx_stream_abort_{}", std::process::id()),
+                    "wait_abort_signal fired\n",
+                );
                 handler.done();
                 Ok(())
             },
@@ -704,7 +717,7 @@ pub async fn call_chat_completions(
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
         &spinner_message,
-        abort_signal,
+        abort_signal.clone(),
     )
     .await;
 
@@ -739,7 +752,7 @@ pub async fn call_chat_completions(
             Ok((
                 text,
                 thought,
-                eval_tool_calls(client.global_config(), tool_calls)?,
+                eval_tool_calls(client.global_config(), tool_calls, &abort_signal)?,
                 usage,
             ))
         }
@@ -791,7 +804,7 @@ pub async fn call_chat_completions_streaming(
             Ok((
                 text,
                 thought,
-                eval_tool_calls(client.global_config(), tool_calls)?,
+                eval_tool_calls(client.global_config(), tool_calls, &abort_signal)?,
                 usage,
             ))
         }

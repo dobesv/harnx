@@ -1714,7 +1714,8 @@ async fn test_tool_result_switch_agent_parsing() {
     // allowed tools set.  Override the output manually to exercise the
     // switch_agent parsing path that runs in eval_tool_calls (line 126-141 of
     // tool.rs) on the result object.
-    let mut results = eval_tool_calls(&config, vec![call]).unwrap();
+    let abort_signal = crate::utils::create_abort_signal();
+    let mut results = eval_tool_calls(&config, vec![call], &abort_signal).unwrap();
     results[0].output = serde_json::json!({
         "action": "switch_agent",
         "agent": "specialist",
