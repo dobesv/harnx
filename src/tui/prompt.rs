@@ -61,7 +61,10 @@ impl Tui {
                     ctx.abort_signal.clone(),
                 )
                 .await?;
-                if switch.session_id.is_none() && ctx.config.read().session.is_some() {
+                // Always empty the session on handoff so the new agent starts
+                // fresh — the prior agent's system prompt and messages should
+                // not bleed into the new agent's session (#291).
+                if ctx.config.read().session.is_some() {
                     ctx.config.write().empty_session()?;
                 }
                 // Reset so the new agent starts fresh, matching REPL/CMD

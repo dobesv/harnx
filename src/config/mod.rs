@@ -1425,7 +1425,7 @@ impl Config {
                         .with_default(false)
                         .prompt()?;
                         if ans {
-                            session.add_message(input, output, None)?;
+                            session.add_message(input, output, None, &[])?;
                         }
                     }
                 }
@@ -2531,12 +2531,11 @@ impl Config {
         if let Some(session) = &mut self.session {
             session.add_completion_usage(usage);
         }
-        if !tool_results.is_empty() {
-            return Ok(());
+        if tool_results.is_empty() {
+            self.last_message = Some(LastMessage::new(input.clone(), output.to_string()));
         }
-        self.last_message = Some(LastMessage::new(input.clone(), output.to_string()));
         if !self.dry_run {
-            self.save_message(input, output, thought)?;
+            self.save_message(input, output, thought, tool_results)?;
         }
         Ok(())
     }
@@ -2552,6 +2551,7 @@ impl Config {
         input: &Input,
         output: &str,
         thought: Option<&str>,
+        tool_results: &[crate::tool::ToolResult],
     ) -> Result<()> {
         let mut input = input.clone();
         input.clear_patch();
@@ -2559,7 +2559,7 @@ impl Config {
         if input.with_session() {
             if let Some(session) = self.session.as_mut() {
                 session.set_sessions_dir(sessions_dir);
-                session.add_message(&input, output, thought)?;
+                session.add_message(&input, output, thought, tool_results)?;
                 return Ok(());
             }
         }
@@ -3594,6 +3594,95 @@ mod tests {
         assert_eq!(roots[0], cwd);
         assert_eq!(roots[1], "/extra");
         assert_eq!(roots[2], "/existing");
+    }
+
+    // ── handoff session emptying tests ─────────────────────────────────────
+
+    /// Verify that empty_session clears messages from a session that was loaded
+    /// with an existing name (simulating the handoff path with session_id).
+    /// This is the unit-level guarantee behind the #291 fix: after handoff the
+    /// new agent starts with a blank session even when a session_id was provided.
+    #[test]
+    fn empty_session_clears_named_session_with_messages() {
+        let mut config = Config::default();
+        let mut session = Session::new(&config, "handoff-target");
+        session.push_message_for_test(MessageRole::System, "You are agent A.".to_string());
+        session.push_message_for_test(MessageRole::User, "Hello from old session".to_string());
+        session.push_message_for_test(MessageRole::Assistant, "Response from agent A".to_string());
+        assert!(!session.is_empty());
+        config.session = Some(session);
+
+        config.empty_session().unwrap();
+
+        let session = config.session.as_ref().unwrap();
+        assert!(
+            session.is_empty(),
+            "session should be empty after empty_session"
+        );
+    }
+
+    // ── after_chat_completion incremental persistence tests ─────────────────
+
+    /// Verify that after_chat_completion persists intermediate rounds
+    /// (non-empty tool_results) to the session, not just the final round.
+    #[test]
+    fn after_chat_completion_saves_intermediate_tool_rounds() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            stream: false,
+            save_session: Some(true),
+            ..Default::default()
+        };
+        let mut session = Session::new(&config, "test-intermediate");
+        session.set_sessions_dir(tmp.path().to_path_buf());
+        config.session = Some(session);
+
+        let _agent = config.extract_agent();
+        let global_config: GlobalConfig = Arc::new(RwLock::new(config));
+        let input = Input::from_str(&global_config, "do something", None);
+
+        let tool_results = vec![ToolResult::new(
+            ToolCall {
+                name: "my_tool".to_string(),
+                arguments: json!({"key": "val"}),
+                id: Some("tc1".to_string()),
+                thought_signature: None,
+            },
+            json!("tool output"),
+        )];
+
+        // Call after_chat_completion with non-empty tool_results.
+        // Previously this returned early without saving; now it should persist.
+        global_config
+            .write()
+            .after_chat_completion(
+                &input,
+                "intermediate output",
+                None,
+                &tool_results,
+                &Default::default(),
+            )
+            .unwrap();
+
+        let config_guard = global_config.read();
+        let session = config_guard.session.as_ref().unwrap();
+        assert!(
+            !session.is_empty(),
+            "session should have messages after intermediate round"
+        );
+        // Verify content via the session's export (which serializes messages).
+        let export = session.export().unwrap();
+        assert!(
+            export.contains("intermediate output"),
+            "session export should contain assistant output; got:\n{export}"
+        );
+        assert!(
+            export.contains("my_tool"),
+            "session export should contain tool call info; got:\n{export}"
+        );
     }
 
     // ── compact_session tests ────────────────────────────────────────────────
