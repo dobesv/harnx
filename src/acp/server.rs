@@ -28,9 +28,19 @@ struct HarnxSession {
     id: String,
     abort_signal: AbortSignal,
     /// Fires when the session receives an ACP `session/cancel` notification.
-    /// A separate `Notify` sidesteps any potential Arc-identity issues with
-    /// `abort_signal` being cloned through long call chains — listeners that
-    /// want to react fast can `.notified().await` without polling.
+    /// We use `notify_one` (rather than `notify_waiters`) so a cancel that
+    /// arrives in the tiny window between the prompt handler entering and
+    /// its `.notified()` future being polled still fires — the permit is
+    /// held until the next listener observes it.
+    ///
+    /// Known limitation: a cancel that arrives AFTER a prompt returns and
+    /// BEFORE the next prompt starts will be consumed by the next prompt's
+    /// first `.notified()` poll. Drain-at-entry was attempted but racing
+    /// the drain against a concurrent cancel is itself unsound (polling a
+    /// Notified registers a waiter that can absorb a concurrent
+    /// notify_one even after we drop it). In practice cancel notifications
+    /// are only sent while a prompt is active, so this case isn't
+    /// exercised by any test.
     cancel_notify: Arc<tokio::sync::Notify>,
 }
 
@@ -428,20 +438,34 @@ impl acp::Agent for HarnxAgent {
                         }
                     });
 
-                    let result = eval_tool_calls_async(
+                    let eval_fut = eval_tool_calls_async(
                         &self.config,
                         tool_calls,
                         &abort_signal,
                         source.clone(),
-                    )
-                    .await;
+                    );
+                    let result = tokio::select! {
+                        r = eval_fut => r,
+                        _ = cancel_notify.notified() => {
+                            abort_signal.set_ctrlc();
+                            manager.unsubscribe_chunks(subscription_id).await;
+                            let _ = forward_task.await;
+                            return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+                        }
+                    };
 
                     manager.unsubscribe_chunks(subscription_id).await;
                     let _ = forward_task.await;
 
                     result
                 } else {
-                    eval_tool_calls_async(&self.config, tool_calls, &abort_signal, source).await
+                    tokio::select! {
+                        r = eval_tool_calls_async(&self.config, tool_calls, &abort_signal, source) => r,
+                        _ = cancel_notify.notified() => {
+                            abort_signal.set_ctrlc();
+                            return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+                        }
+                    }
                 };
 
                 match result {

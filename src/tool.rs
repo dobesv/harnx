@@ -543,11 +543,20 @@ impl ToolCall {
                             is_terminal,
                         ));
 
-                        let call_result = manager.call_tool(&tool_name, json_data).await;
+                        // Race the sub-agent call against our abort_signal
+                        // so Ctrl-C interrupts nested ACP delegations the
+                        // same way it interrupts MCP tools.
+                        let call_result = tokio::select! {
+                            result = manager.call_tool(&tool_name, json_data) => result,
+                            _ = wait_abort_signal(abort_signal) => {
+                                Err(anyhow!("ACP tool call aborted by user"))
+                            }
+                        };
 
                         // Tear down: unsubscribe first (closes the
                         // channel), then await the forward task.
                         manager.unsubscribe_chunks(subscription_id).await;
+                        forward_handle.abort();
                         let _ = forward_handle.await;
 
                         if let Some(s) = spinner {
