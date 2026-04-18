@@ -61,10 +61,13 @@ fn interrupt_tui_during_tool() -> Result<()> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let tmux = spawn_tui(&paths, &harnx_bin, &repo_root)?;
 
-    tmux.send_text("run wait tool")?;
+    tmux.send_text("go")?;
     tmux.send_keys(&["Enter"])?;
-    // Wait until the tool call is visible — the activity log shows the tool name.
-    tmux.wait_for_contains("wait", Duration::from_secs(5))?;
+    // Wait for the LLM's text chunk "Waiting..." to render and brief
+    // pause so the wait tool actually starts executing in the MCP server
+    // (not just the LLM text being on screen).
+    tmux.wait_for_contains("Waiting", Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_millis(500));
 
     tmux.send_keys(&["C-c"])?;
 

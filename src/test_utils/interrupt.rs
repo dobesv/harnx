@@ -23,7 +23,7 @@ pub fn script_call_wait_tool(seconds: u32) -> MockOpenAiScript {
         turns: vec![MockOpenAiTurn {
             text_chunks: vec!["Waiting...".to_string()],
             tool_calls: vec![MockOpenAiToolCall {
-                name: "wait".to_string(),
+                name: "time_wait".to_string(),
                 arguments: serde_json::json!({ "seconds": seconds }),
                 id: None,
             }],
@@ -67,7 +67,7 @@ pub fn write_minimal_config(dir: &Path, mock_base_url: &str) -> Result<ConfigPat
         .context("failed to create harnx config dir")?;
     std::fs::write(
         harnx_config_dir.join("config.yaml"),
-        "save: false\nclient: mock-llm\nmodel: mock-llm:test\n",
+        "save: false\nclient: mock-llm\nmodel: mock-llm:test\ntool_use: true\nuse_tools: '*'\n",
     )
     .context("failed to write config.yaml")?;
     std::fs::write(
