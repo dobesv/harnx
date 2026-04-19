@@ -54,13 +54,13 @@ fn interrupt_tui_during_tool() -> Result<()> {
 
     let mock = MockOpenAiServer::start(script_call_wait_tool(30))?;
     let tmp = tempfile::tempdir()?;
-    let mcp_time_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"));
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mcp_time_bin = harnx::test_utils::interrupt::harnx_mcp_time_bin(&harnx_bin);
     let paths = write_with_wait_tool(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
         &mcp_time_bin,
     )?;
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let tmux = spawn_tui(&paths, &harnx_bin, &repo_root)?;
 
@@ -88,13 +88,13 @@ fn interrupt_tui_during_hook() -> Result<()> {
 
     let mock = MockOpenAiServer::start(script_call_trivial_tool())?;
     let tmp = tempfile::tempdir()?;
-    let mcp_time_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"));
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mcp_time_bin = harnx::test_utils::interrupt::harnx_mcp_time_bin(&harnx_bin);
     let paths = write_with_blocking_hook(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
         &mcp_time_bin,
     )?;
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let tmux = spawn_tui(&paths, &harnx_bin, &repo_root)?;
 
@@ -179,13 +179,13 @@ fn interrupt_oneshot_during_streaming() -> Result<()> {
 fn interrupt_oneshot_during_tool() -> Result<()> {
     let mock = MockOpenAiServer::start(script_call_wait_tool(30))?;
     let tmp = tempfile::tempdir()?;
-    let mcp_time_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"));
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mcp_time_bin = harnx::test_utils::interrupt::harnx_mcp_time_bin(&harnx_bin);
     let paths = write_with_wait_tool(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
         &mcp_time_bin,
     )?;
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
     let mut child = spawn_oneshot(&paths, &harnx_bin, "wait please")?;
 
     // Allow the LLM round-trip + tool dispatch (~1s in practice).
@@ -203,13 +203,13 @@ fn interrupt_oneshot_during_tool() -> Result<()> {
 fn interrupt_oneshot_during_hook() -> Result<()> {
     let mock = MockOpenAiServer::start(script_call_trivial_tool())?;
     let tmp = tempfile::tempdir()?;
-    let mcp_time_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"));
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mcp_time_bin = harnx::test_utils::interrupt::harnx_mcp_time_bin(&harnx_bin);
     let paths = write_with_blocking_hook(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
         &mcp_time_bin,
     )?;
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
     let mut child = spawn_oneshot(&paths, &harnx_bin, "call a tool")?;
 
     // Poll for the hook's sentinel rather than a fixed sleep — CI runners
@@ -288,14 +288,14 @@ async fn interrupt_acp_session_cancel_during_streaming() -> Result<()> {
 async fn interrupt_acp_session_cancel_during_tool() -> Result<()> {
     let mock = MockOpenAiServer::start(script_call_wait_tool(30))?;
     let tmp = tempfile::tempdir()?;
-    let mcp_time_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"));
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mcp_time_bin = harnx::test_utils::interrupt::harnx_mcp_time_bin(&harnx_bin);
     let paths = write_with_wait_tool(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
         &mcp_time_bin,
     )?;
     write_acp_agent(&paths, "default")?;
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
 
     let client = spawn_acp_client(&paths, &harnx_bin, "default").await?;
     let session = client.session_new().await?;
@@ -319,14 +319,14 @@ async fn interrupt_acp_session_cancel_during_tool() -> Result<()> {
 async fn interrupt_acp_session_cancel_during_hook() -> Result<()> {
     let mock = MockOpenAiServer::start(script_call_trivial_tool())?;
     let tmp = tempfile::tempdir()?;
-    let mcp_time_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"));
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let mcp_time_bin = harnx::test_utils::interrupt::harnx_mcp_time_bin(&harnx_bin);
     let paths = write_with_blocking_hook(
         tmp.path(),
         &format!("http://127.0.0.1:{}/v1", mock.port()),
         &mcp_time_bin,
     )?;
     write_acp_agent(&paths, "default")?;
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
 
     let client = spawn_acp_client(&paths, &harnx_bin, "default").await?;
     let session = client.session_new().await?;

@@ -16,6 +16,20 @@ use std::time::{Duration, Instant};
 /// the TUI is currently busy.
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// Locate the `harnx-mcp-time` binary given the already-resolved `harnx`
+/// binary path.
+///
+/// The `harnx-mcp-time` binary lives in its own crate, so
+/// `CARGO_BIN_EXE_harnx-mcp-time` isn't visible from `harnx`'s test context.
+/// Because Cargo builds every workspace member into the same target dir, the
+/// binary sits next to the `harnx` binary. Callers are responsible for
+/// ensuring it has been built (e.g. via `cargo build --workspace` or
+/// `cargo nextest run --workspace`, which is what CI uses).
+pub fn harnx_mcp_time_bin(harnx_bin: &Path) -> PathBuf {
+    let ext = std::env::consts::EXE_SUFFIX;
+    harnx_bin.with_file_name(format!("harnx-mcp-time{ext}"))
+}
+
 /// A mock-LLM response that emits one short text chunk and immediately
 /// issues a `wait` tool call (chunk_delay_ms is 0 so the tool call fires
 /// without delay).

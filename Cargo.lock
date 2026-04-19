@@ -1629,6 +1629,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-mcp-time"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "iana-time-zone",
+ "jiff",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "harnx-mcp-todo"
 version = "0.30.0"
 dependencies = [
