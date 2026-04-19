@@ -11,6 +11,7 @@ pub mod error;
 pub mod event;
 pub mod hooks;
 pub mod message;
+pub mod model;
 pub mod path;
 pub mod text;
 pub mod tool;

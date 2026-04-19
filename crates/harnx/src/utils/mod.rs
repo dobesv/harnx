@@ -26,7 +26,7 @@ pub use harnx_core::path::{
     expand_glob_paths, get_patch_extension, list_file_names, resolve_home_dir, safe_join_path,
     to_absolute_path,
 };
-pub use harnx_core::text::{estimate_token_length, strip_think_tag};
+pub use harnx_core::text::strip_think_tag;
 
 use anyhow::{Context, Result};
 use fancy_regex::Regex;

@@ -397,15 +397,6 @@ pub struct ExtraConfig {
     pub client_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct RequestPatch {
-    pub chat_completions: Option<ApiPatch>,
-    pub embeddings: Option<ApiPatch>,
-    pub rerank: Option<ApiPatch>,
-}
-
-pub type ApiPatch = IndexMap<String, Value>;
-
 pub struct RequestData {
     pub url: String,
     pub headers: IndexMap<String, String>,
