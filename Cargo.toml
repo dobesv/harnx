@@ -38,7 +38,7 @@ nu-ansi-term = "0.50.0"
 async-trait = "0.1.74"
 textwrap = "0.16.0"
 ansi_colours = "1.2.2"
-reqwest-eventsource = { git = "https://github.com/jpopesculian/reqwest-eventsource", rev = "356e2f61827b193bd5ab389c38059bcc2eed90aa" }
+reqwest-eventsource = { git = "https://github.com/jpopesculian/reqwest-eventsource", rev = "ce0b972450fd16a417e2cfbe1cc522feef26545d" }
 simplelog = "0.12.1"
 log = "0.4.20"
 shell-words = "1.1.0"
