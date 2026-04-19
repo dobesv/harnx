@@ -89,7 +89,7 @@ pub fn eval_tool_calls(
             bail!("tool execution aborted by user");
         }
 
-        let eval_result = call.eval_mcp(config, abort_signal);
+        let eval_result = eval_tool_call_mcp(&call, config, abort_signal);
         match eval_result {
             Ok(mut result) => {
                 let post_event = HookEvent::PostToolUse {
@@ -396,217 +396,217 @@ impl ToolCall {
             thought_signature,
         }
     }
+}
 
-    fn eval_mcp(
-        &self,
-        config: &GlobalConfig,
-        abort_signal: &AbortSignal,
-    ) -> Result<Value, ToolError> {
-        let json_data = if self.arguments.is_null() {
-            Value::Null
-        } else if self.arguments.is_object() {
-            self.arguments.clone()
-        } else if let Some(arguments) = self.arguments.as_str() {
-            serde_json::from_str(arguments).map_err(|_| {
-                ToolError::Recoverable(anyhow!(
-                    "The call '{}' has invalid arguments: {arguments}",
-                    self.name
-                ))
-            })?
-        } else {
-            return Err(ToolError::Recoverable(anyhow!(
-                "The call '{}' has invalid arguments: {}",
-                self.name,
-                self.arguments
-            )));
-        };
+fn eval_tool_call_mcp(
+    call: &ToolCall,
+    config: &GlobalConfig,
+    abort_signal: &AbortSignal,
+) -> Result<Value, ToolError> {
+    let json_data = if call.arguments.is_null() {
+        Value::Null
+    } else if call.arguments.is_object() {
+        call.arguments.clone()
+    } else if let Some(arguments) = call.arguments.as_str() {
+        serde_json::from_str(arguments).map_err(|_| {
+            ToolError::Recoverable(anyhow!(
+                "The call '{}' has invalid arguments: {arguments}",
+                call.name
+            ))
+        })?
+    } else {
+        return Err(ToolError::Recoverable(anyhow!(
+            "The call '{}' has invalid arguments: {}",
+            call.name,
+            call.arguments
+        )));
+    };
 
-        // Emit tool call info to TUI or terminal
-        let event = UiOutputEvent {
-            kind: UiOutputEventKind::ToolCall {
-                tool_name: self.name.clone(),
-                input_yaml: match json_data {
-                    Value::Null => None,
-                    _ => Some(pretty_yaml_block(&json_data)),
-                },
-                raw: None,
+    // Emit tool call info to TUI or terminal
+    let event = UiOutputEvent {
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: call.name.clone(),
+            input_yaml: match json_data {
+                Value::Null => None,
+                _ => Some(pretty_yaml_block(&json_data)),
             },
-            source: None,
-        };
-        let text = event_fallback_text(&event.kind, event.source.as_ref());
-        if !emit_ui_output_event(event) && *IS_STDOUT_TERMINAL {
-            print!("{text}");
-        }
+            raw: None,
+        },
+        source: None,
+    };
+    let text = event_fallback_text(&event.kind, event.source.as_ref());
+    if !emit_ui_output_event(event) && *IS_STDOUT_TERMINAL {
+        print!("{text}");
+    }
 
-        if self.name == TRIGGER_AGENT_TOOL_NAME {
-            let agent = json_data["agent"].as_str().ok_or_else(|| {
-                ToolError::Recoverable(anyhow!("Missing 'agent' argument for trigger_agent"))
-            })?;
-            let prompt = json_data["prompt"].as_str().ok_or_else(|| {
-                ToolError::Recoverable(anyhow!("Missing 'prompt' argument for trigger_agent"))
-            })?;
-
-            return Ok(json!({
-                "status": "success",
-                "message": format!("Transferring session to agent '{}'...", agent),
-                "action": "switch_agent",
-                "agent": agent,
-                "prompt": prompt
-            }));
-        }
-
-        let allowed_tool_names: std::collections::HashSet<String> = {
-            let guard = config.read();
-            let use_tools = guard.extract_agent().use_tools().map(|v| v.join(","));
-            guard
-                .tool_declarations_for_use_tools(use_tools.as_deref())
-                .into_iter()
-                .map(|decl| decl.name)
-                .collect()
-        };
-
-        if self.name.ends_with("_session_handoff") {
-            if !allowed_tool_names.contains(&self.name) {
-                return Err(ToolError::Recoverable(anyhow!(
-                    "No tool provider configured for '{}'",
-                    self.name
-                )));
-            }
-            let agent = self.name.trim_end_matches("_session_handoff");
-            let prompt = json_data["prompt"].as_str().ok_or_else(|| {
-                ToolError::Recoverable(anyhow!("Missing 'prompt' argument for session handoff"))
-            })?;
-            let session_id = json_data["session_id"]
-                .as_str()
-                .map(ToString::to_string)
-                .or_else(|| {
-                    config
-                        .read()
-                        .session
-                        .as_ref()
-                        .map(|session| session.name().to_string())
-                });
-
-            return Ok(json!({
-                "content": [{
-                    "type": "text",
-                    "text": format!("Handing off to {}…", agent),
-                    "annotations": { "audience": ["user"] }
-                }],
-                "action": "switch_agent",
-                "agent": agent,
-                "prompt": prompt,
-                "session_id": session_id,
-            }));
-        }
-
-        let acp_manager = config.read().acp_manager.clone();
-        if let Some(manager) = acp_manager {
-            if manager.find_client_for_tool(&self.name).is_some() {
-                let tool_name = self.name.clone();
-                // call_tool internally races session_prompt against
-                // Ctrl+C and cancels the ACP session (including
-                // auto-created sessions) when the user aborts.
-                //
-                // Subscribe to ACP chunk notifications so that tool calls,
-                // agent thoughts, plan updates, and text chunks from the
-                // sub-agent (and any nested sub-sub-agents) are printed to
-                // stdout in real-time instead of being silently swallowed.
-                let result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        let has_ui_output = has_ui_output_sink();
-                        let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
-
-                        // Give the parent tool-call event a chance to be
-                        // consumed by the UI before nested ACP output from the
-                        // delegated session starts arriving. This keeps the
-                        // visible transcript ordering causal: the handoff tool
-                        // row should appear before any child output it triggers.
-                        tokio::task::yield_now().await;
-
-                        let (chunk_rx, subscription_id) = manager.subscribe_chunks().await;
-
-                        // Spawn a spinner only in non-TUI terminal mode.
-                        let spinner = if is_terminal {
-                            Some(spawn_spinner(&format!("  {} working…", tool_name)))
-                        } else {
-                            None
-                        };
-
-                        // Forward chunks either to TUI output sink or stdout.
-                        let spinner_clone = spinner.clone();
-                        let spinner_msg = format!("  {} working…", tool_name);
-                        let forward_handle = tokio::spawn(forward_acp_chunks(
-                            chunk_rx,
-                            spinner_clone,
-                            spinner_msg,
-                            is_terminal,
-                        ));
-
-                        // Race the sub-agent call against our abort_signal
-                        // so Ctrl-C interrupts nested ACP delegations the
-                        // same way it interrupts MCP tools.
-                        let call_result = tokio::select! {
-                            result = manager.call_tool(&tool_name, json_data) => result,
-                            _ = wait_abort_signal(abort_signal) => {
-                                Err(anyhow!("ACP tool call aborted by user"))
-                            }
-                        };
-
-                        // Tear down: unsubscribe first (closes the
-                        // channel), then await the forward task.
-                        manager.unsubscribe_chunks(subscription_id).await;
-                        forward_handle.abort();
-                        let _ = forward_handle.await;
-
-                        if let Some(s) = spinner {
-                            s.stop();
-                        }
-
-                        call_result
-                    })
-                })
-                .map_err(|err| {
-                    // Only user-initiated aborts (Ctrl+C) are fatal and should
-                    // stop the entire tool batch.  Other failures (timeouts,
-                    // connection errors, bad arguments) are recoverable so the
-                    // LLM receives the error message and can retry.
-                    if err.to_string().contains("aborted by user") {
-                        ToolError::Fatal(err)
-                    } else {
-                        ToolError::Recoverable(err)
-                    }
-                })?;
-
-                return Ok(result);
-            }
-        }
-
-        let mcp_manager = config.read().mcp_manager.clone();
-        let manager = match mcp_manager {
-            Some(m) => m,
-            None => {
-                return Err(ToolError::Recoverable(anyhow!(
-                    "No tool provider configured for '{}'",
-                    self.name
-                )))
-            }
-        };
-
-        let tool_name = self.name.clone();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                tokio::select! {
-                    result = manager.call_tool(&tool_name, json_data) => result.map_err(ToolError::Recoverable),
-                    _ = wait_abort_signal(abort_signal) => {
-                        Err(ToolError::Fatal(anyhow!("MCP tool call aborted by user")))
-                    }
-                }
-            })
+    if call.name == TRIGGER_AGENT_TOOL_NAME {
+        let agent = json_data["agent"].as_str().ok_or_else(|| {
+            ToolError::Recoverable(anyhow!("Missing 'agent' argument for trigger_agent"))
+        })?;
+        let prompt = json_data["prompt"].as_str().ok_or_else(|| {
+            ToolError::Recoverable(anyhow!("Missing 'prompt' argument for trigger_agent"))
         })?;
 
-        Ok(result)
+        return Ok(json!({
+            "status": "success",
+            "message": format!("Transferring session to agent '{}'...", agent),
+            "action": "switch_agent",
+            "agent": agent,
+            "prompt": prompt
+        }));
     }
+
+    let allowed_tool_names: std::collections::HashSet<String> = {
+        let guard = config.read();
+        let use_tools = guard.extract_agent().use_tools().map(|v| v.join(","));
+        guard
+            .tool_declarations_for_use_tools(use_tools.as_deref())
+            .into_iter()
+            .map(|decl| decl.name)
+            .collect()
+    };
+
+    if call.name.ends_with("_session_handoff") {
+        if !allowed_tool_names.contains(&call.name) {
+            return Err(ToolError::Recoverable(anyhow!(
+                "No tool provider configured for '{}'",
+                call.name
+            )));
+        }
+        let agent = call.name.trim_end_matches("_session_handoff");
+        let prompt = json_data["prompt"].as_str().ok_or_else(|| {
+            ToolError::Recoverable(anyhow!("Missing 'prompt' argument for session handoff"))
+        })?;
+        let session_id = json_data["session_id"]
+            .as_str()
+            .map(ToString::to_string)
+            .or_else(|| {
+                config
+                    .read()
+                    .session
+                    .as_ref()
+                    .map(|session| session.name().to_string())
+            });
+
+        return Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": format!("Handing off to {}…", agent),
+                "annotations": { "audience": ["user"] }
+            }],
+            "action": "switch_agent",
+            "agent": agent,
+            "prompt": prompt,
+            "session_id": session_id,
+        }));
+    }
+
+    let acp_manager = config.read().acp_manager.clone();
+    if let Some(manager) = acp_manager {
+        if manager.find_client_for_tool(&call.name).is_some() {
+            let tool_name = call.name.clone();
+            // call_tool internally races session_prompt against
+            // Ctrl+C and cancels the ACP session (including
+            // auto-created sessions) when the user aborts.
+            //
+            // Subscribe to ACP chunk notifications so that tool calls,
+            // agent thoughts, plan updates, and text chunks from the
+            // sub-agent (and any nested sub-sub-agents) are printed to
+            // stdout in real-time instead of being silently swallowed.
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let has_ui_output = has_ui_output_sink();
+                    let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
+
+                    // Give the parent tool-call event a chance to be
+                    // consumed by the UI before nested ACP output from the
+                    // delegated session starts arriving. This keeps the
+                    // visible transcript ordering causal: the handoff tool
+                    // row should appear before any child output it triggers.
+                    tokio::task::yield_now().await;
+
+                    let (chunk_rx, subscription_id) = manager.subscribe_chunks().await;
+
+                    // Spawn a spinner only in non-TUI terminal mode.
+                    let spinner = if is_terminal {
+                        Some(spawn_spinner(&format!("  {} working…", tool_name)))
+                    } else {
+                        None
+                    };
+
+                    // Forward chunks either to TUI output sink or stdout.
+                    let spinner_clone = spinner.clone();
+                    let spinner_msg = format!("  {} working…", tool_name);
+                    let forward_handle = tokio::spawn(forward_acp_chunks(
+                        chunk_rx,
+                        spinner_clone,
+                        spinner_msg,
+                        is_terminal,
+                    ));
+
+                    // Race the sub-agent call against our abort_signal
+                    // so Ctrl-C interrupts nested ACP delegations the
+                    // same way it interrupts MCP tools.
+                    let call_result = tokio::select! {
+                        result = manager.call_tool(&tool_name, json_data) => result,
+                        _ = wait_abort_signal(abort_signal) => {
+                            Err(anyhow!("ACP tool call aborted by user"))
+                        }
+                    };
+
+                    // Tear down: unsubscribe first (closes the
+                    // channel), then await the forward task.
+                    manager.unsubscribe_chunks(subscription_id).await;
+                    forward_handle.abort();
+                    let _ = forward_handle.await;
+
+                    if let Some(s) = spinner {
+                        s.stop();
+                    }
+
+                    call_result
+                })
+            })
+            .map_err(|err| {
+                // Only user-initiated aborts (Ctrl+C) are fatal and should
+                // stop the entire tool batch.  Other failures (timeouts,
+                // connection errors, bad arguments) are recoverable so the
+                // LLM receives the error message and can retry.
+                if err.to_string().contains("aborted by user") {
+                    ToolError::Fatal(err)
+                } else {
+                    ToolError::Recoverable(err)
+                }
+            })?;
+
+            return Ok(result);
+        }
+    }
+
+    let mcp_manager = config.read().mcp_manager.clone();
+    let manager = match mcp_manager {
+        Some(m) => m,
+        None => {
+            return Err(ToolError::Recoverable(anyhow!(
+                "No tool provider configured for '{}'",
+                call.name
+            )))
+        }
+    };
+
+    let tool_name = call.name.clone();
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            tokio::select! {
+                result = manager.call_tool(&tool_name, json_data) => result.map_err(ToolError::Recoverable),
+                _ = wait_abort_signal(abort_signal) => {
+                    Err(ToolError::Fatal(anyhow!("MCP tool call aborted by user")))
+                }
+            }
+        })
+    })?;
+
+    Ok(result)
 }
 
 /// Forwards ACP chunk notifications to stdout with spinner management.
