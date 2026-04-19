@@ -1675,6 +1675,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-mcp-fs"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "fancy-regex 0.17.0",
+ "glob",
+ "harnx-mcp",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "harnx-mcp-time"
 version = "0.30.0"
 dependencies = [

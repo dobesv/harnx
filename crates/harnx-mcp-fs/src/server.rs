@@ -1,4 +1,4 @@
-use harnx::mcp_safety::{
+use harnx_mcp::safety::{
     file_uri_to_path, format_size, is_binary_content, sanitize_output_text, truncate_line,
     truncate_output, validate_path, validate_write_path, TruncateOpts, DEFAULT_FIND_LIMIT,
     DEFAULT_GREP_LIMIT, DEFAULT_LS_LIMIT, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
@@ -1115,7 +1115,7 @@ fn search_file(
 mod tests {
     use super::*;
 
-    use harnx::mcp_safety::path_to_file_uri;
+    use harnx_mcp::safety::path_to_file_uri;
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
         CallToolRequestParams, ClientCapabilities, InitializeRequestParams, ListRootsResult, Root,

@@ -102,6 +102,3 @@ rand = "0.10.0"
 tokio-test = "0.4"
 tempfile = "3"
 
-[[bin]]
-name = "harnx-mcp-fs"
-path = "src/bin/harnx-mcp-fs/main.rs"
