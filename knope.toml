@@ -1,6 +1,6 @@
 [[packages]]
 name = "harnx"
-version_file = "Cargo.toml"
+version_file = "crates/harnx/Cargo.toml"
 changelog = "CHANGELOG.md"
 tag_prefix = "v"
 
