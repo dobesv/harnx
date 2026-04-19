@@ -11,3 +11,4 @@ pub mod error;
 pub mod event;
 pub mod hooks;
 pub mod path;
+pub mod tool;
