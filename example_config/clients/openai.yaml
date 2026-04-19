@@ -1,3 +1,12 @@
 type: openai
 # api_key: xxx   # or set OPENAI_API_KEY in .env
 # api_base: https://api.openai.com/v1   # optional
+
+# Use patch to set per-model options like reasoning_effort.
+# Keys under chat_completions are regex patterns matched against the full model name
+# (anchored with ^ and $). Use '.*' wildcards to match partial names.
+# patch:
+#   chat_completions:
+#     gpt-5.4:
+#       body:
+#         reasoning_effort: high
