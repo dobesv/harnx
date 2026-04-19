@@ -26,20 +26,17 @@ pub use harnx_core::path::{
     expand_glob_paths, get_patch_extension, list_file_names, resolve_home_dir, safe_join_path,
     to_absolute_path,
 };
+pub use harnx_core::text::{estimate_token_length, strip_think_tag};
 
 use anyhow::{Context, Result};
 use fancy_regex::Regex;
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use is_terminal::IsTerminal;
-use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::{env, path::PathBuf, process};
-use unicode_segmentation::UnicodeSegmentation;
 
 pub static CODE_BLOCK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?ms)```\w*(.*)```").unwrap());
-pub static THINK_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)^\s*<think>.*?</think>(\s*|$)").unwrap());
 pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| std::io::stdout().is_terminal());
 pub static NO_COLOR: LazyLock<bool> = LazyLock::new(|| {
     env::var("NO_COLOR")
@@ -67,28 +64,6 @@ pub fn parse_bool(value: &str) -> Option<bool> {
         "0" | "false" => Some(false),
         _ => None,
     }
-}
-
-pub fn estimate_token_length(text: &str) -> usize {
-    let words: Vec<&str> = text.unicode_words().collect();
-    let mut output: f32 = 0.0;
-    for word in words {
-        if word.is_ascii() {
-            output += 1.3;
-        } else {
-            let count = word.chars().count();
-            if count == 1 {
-                output += 1.0
-            } else {
-                output += (count as f32) * 0.5;
-            }
-        }
-    }
-    output.ceil() as usize
-}
-
-pub fn strip_think_tag(text: &str) -> Cow<'_, str> {
-    THINK_TAG_RE.replace_all(text, "")
 }
 
 pub fn extract_code_block(text: &str) -> &str {

@@ -1638,6 +1638,7 @@ dependencies = [
  "base64",
  "clap",
  "dirs",
+ "fancy-regex 0.17.0",
  "hmac",
  "indexmap",
  "path-absolutize",
@@ -1645,6 +1646,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tokio",
+ "unicode-segmentation",
  "urlencoding",
 ]
 
