@@ -31,7 +31,7 @@ Explore powerful command-line functionalities with Harnx's CMD mode.
 
 Experience an interactive chat TUI with features like tab autocompletion of dot-commands, multi-line input support, history, and attachments.
 
-![harnx-repl](https://github.com/user-attachments/assets/218fab08-cdae-4c3b-bcf8-39b6651f1362)
+![harnx-tui](https://github.com/user-attachments/assets/218fab08-cdae-4c3b-bcf8-39b6651f1362)
 
 ### Multi-Form Input
 

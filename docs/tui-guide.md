@@ -14,7 +14,7 @@ There is no readline-based REPL.
   - `.model <tab>` to complete chat models.
   - `.set <tab>` to complete config keys.
   - `.set key <tab>` to complete config values.
-- **Multi-line input** via paste (bracketed-paste terminals) or `{ctrl,shift,alt}+enter` / `ctrl+j` to insert a newline.
+- **Multi-line input** via paste (bracketed-paste terminals) or `Shift+Enter` / `Ctrl+J` to insert a newline.
 - **History:** `↑` / `↓` to navigate prior submissions.
 - **Attachments:** `.attach <path>` to attach a file to the next message; `.detach` to remove.
 
@@ -145,7 +145,7 @@ If the response is interrupted or unsatisfactory, you can regenerate it with `.r
 
 ### `.exit` - exit the current scope
 
-```
+```text
 .exit session            Exit active session
 .exit agent              Exit active agent
 .exit rag                Leave RAG

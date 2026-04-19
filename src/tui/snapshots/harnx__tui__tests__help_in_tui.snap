@@ -2,6 +2,7 @@
 source: src/tui/tests.rs
 expression: rendered
 ---
+.exit agent              Leave agent
 .rag                     Initialize or access RAG
 .edit rag-docs           Add or remove documents from an existing RAG
 .rebuild rag             Rebuild RAG for document changes
@@ -21,6 +22,5 @@ expression: rendered
 .exit                    Exit the interactive session
 
 Type ::: to start multi-line editing, type ::: to finish it.
-Press Ctrl+O to open an editor for editing the input buffer.
 Press Ctrl+C to cancel the response, Ctrl+D to exit.
 • Input

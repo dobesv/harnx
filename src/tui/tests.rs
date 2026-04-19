@@ -1366,7 +1366,7 @@ async fn help_renders_in_tui_snapshot() {
 }
 
 #[tokio::test]
-async fn representative_repl_commands_render_into_tui_transcript() {
+async fn representative_commands_render_into_tui_transcript() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let commands = [".help", ".info session", ".mcp list"];

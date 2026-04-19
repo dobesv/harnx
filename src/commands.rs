@@ -24,7 +24,7 @@ pub enum CommandOutcome {
     Exit,
 }
 
-pub static COMMANDS: LazyLock<[Command; 39]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 40]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -42,9 +42,10 @@ pub static COMMANDS: LazyLock<[Command; 39]> = LazyLock::new(|| {
         Command::new(".session", "Start or switch to a session"),
         Command::new(".empty session", "Clear session messages"),
         Command::new(
-            ".reset repl",
+            ".reset session",
             "Reset session to initial state (re-expands variables)",
         ),
+        Command::new(".reset repl", "Alias for .reset session"),
         Command::new(
             ".compact session",
             "Compact session messages using configured compaction agent",
@@ -318,11 +319,11 @@ pub async fn run_command_with_output(
                 _ => writeln!(output, r#"Usage: .empty session"#)?,
             },
             ".reset" => match args {
-                Some("repl") => {
+                Some("session") | Some("repl") => {
                     config.write().reset_session()?;
                 }
                 _ => {
-                    writeln!(output, r#"Usage: .reset repl"#)?;
+                    writeln!(output, r#"Usage: .reset session"#)?;
                 }
             },
             ".rebuild" => match args {
@@ -991,7 +992,6 @@ fn dump_help(output: &mut (dyn Write + Send)) -> Result<()> {
         r###"{head}
 
 Type ::: to start multi-line editing, type ::: to finish it.
-Press Ctrl+O to open an editor for editing the input buffer.
 Press Ctrl+C to cancel the response, Ctrl+D to exit."###,
     )?;
     Ok(())
