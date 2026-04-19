@@ -3,5 +3,6 @@
 //! `docs/superpowers/specs/2026-04-19-monorepo-refactor-design.md` for the
 //! role this crate plays in the multi-crate split.
 
+pub mod abort;
 pub mod crypto;
 pub mod path;
