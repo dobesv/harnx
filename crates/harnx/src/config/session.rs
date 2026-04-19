@@ -221,7 +221,7 @@ impl Session {
             }
         }
 
-        session.model = Model::retrieve_model(config, &session.model_id, ModelType::Chat)?;
+        session.model = crate::client::retrieve_model(config, &session.model_id, ModelType::Chat)?;
         Self::apply_name_and_path(&mut session, name, path, config);
         session.update_tokens();
         Ok(session)

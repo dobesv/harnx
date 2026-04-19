@@ -483,8 +483,11 @@ impl Server {
 
         let config = Arc::new(RwLock::new(self.config.clone()));
 
-        let embedding_model =
-            Model::retrieve_model(&config.read(), &embedding_model_id, ModelType::Embedding)?;
+        let embedding_model = crate::client::retrieve_model(
+            &config.read(),
+            &embedding_model_id,
+            ModelType::Embedding,
+        )?;
 
         let texts = match input {
             EmbeddingsReqBodyInput::Single(v) => vec![v],
@@ -544,7 +547,7 @@ impl Server {
         let config = Arc::new(RwLock::new(self.config.clone()));
 
         let reranker_model =
-            Model::retrieve_model(&config.read(), &reranker_model_id, ModelType::Reranker)?;
+            crate::client::retrieve_model(&config.read(), &reranker_model_id, ModelType::Reranker)?;
 
         let client = init_client(&config, Some(reranker_model))?;
         let data = client

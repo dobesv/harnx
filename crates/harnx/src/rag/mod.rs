@@ -109,8 +109,11 @@ impl Rag {
     pub fn create(config: &GlobalConfig, name: &str, path: &Path, data: RagData) -> Result<Self> {
         let hnsw = data.build_hnsw();
         let bm25 = data.build_bm25();
-        let embedding_model =
-            Model::retrieve_model(&config.read(), &data.embedding_model, ModelType::Embedding)?;
+        let embedding_model = crate::client::retrieve_model(
+            &config.read(),
+            &data.embedding_model,
+            ModelType::Embedding,
+        )?;
         let rag = Rag {
             config: config.clone(),
             name: name.to_string(),
@@ -171,8 +174,11 @@ impl Rag {
                 select_embedding_model(&models)?
             }
         };
-        let embedding_model =
-            Model::retrieve_model(&config.read(), &embedding_model_id, ModelType::Embedding)?;
+        let embedding_model = crate::client::retrieve_model(
+            &config.read(),
+            &embedding_model_id,
+            ModelType::Embedding,
+        )?;
 
         let chunk_size = match chunk_size {
             Some(value) => {
@@ -529,8 +535,11 @@ impl Rag {
 
         let ids = match rerank_model {
             Some(model_id) => {
-                let model =
-                    Model::retrieve_model(&self.config.read(), model_id, ModelType::Reranker)?;
+                let model = crate::client::retrieve_model(
+                    &self.config.read(),
+                    model_id,
+                    ModelType::Reranker,
+                )?;
                 let client = init_client(&self.config, Some(model))?;
                 let ids: IndexSet<DocumentId> = [vector_search_ids, keyword_search_ids]
                     .concat()

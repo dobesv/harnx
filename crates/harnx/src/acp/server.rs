@@ -759,7 +759,7 @@ async fn eval_mcp_async(
 mod tests {
     use super::*;
     use crate::{
-        client::{ClientConfig, Model, ModelType, TestStateGuard},
+        client::{ClientConfig, ModelType, TestStateGuard},
         config::{Config, CREATE_TITLE_AGENT},
         test_utils::{MockClient, MockTurnBuilder},
     };
@@ -879,7 +879,7 @@ mod tests {
 
         let mut config = Config::default();
         config.clients = clients;
-        config.model = Model::retrieve_model(&config, "openai:gpt-4o", ModelType::Chat)
+        config.model = crate::client::retrieve_model(&config, "openai:gpt-4o", ModelType::Chat)
             .expect("load test model");
         config.save_session = Some(true);
 

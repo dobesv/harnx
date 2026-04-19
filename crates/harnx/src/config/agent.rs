@@ -275,7 +275,9 @@ impl Agent {
         let model = {
             let config = config.read();
             match agent.model_id.as_ref() {
-                Some(model_id) => Model::retrieve_model(&config, model_id, ModelType::Chat)?,
+                Some(model_id) => {
+                    crate::client::retrieve_model(&config, model_id, ModelType::Chat)?
+                }
                 None => {
                     if agent.temperature.is_none() {
                         agent.temperature = config.temperature;

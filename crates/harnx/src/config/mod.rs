@@ -1144,7 +1144,7 @@ impl Config {
 
     pub fn set_rag_reranker_model(config: &GlobalConfig, value: Option<String>) -> Result<()> {
         if let Some(id) = &value {
-            Model::retrieve_model(&config.read(), id, ModelType::Reranker)?;
+            crate::client::retrieve_model(&config.read(), id, ModelType::Reranker)?;
         }
         let has_rag = config.read().rag.is_some();
         match has_rag {
@@ -1198,7 +1198,7 @@ impl Config {
     }
 
     pub fn set_model(&mut self, model_id: &str) -> Result<()> {
-        let model = Model::retrieve_model(self, model_id, ModelType::Chat)?;
+        let model = crate::client::retrieve_model(self, model_id, ModelType::Chat)?;
         if let Some(session) = self.session.as_mut() {
             session.set_model(model);
         } else if let Some(agent) = self.agent.as_mut() {
@@ -1235,7 +1235,7 @@ impl Config {
         match agent.model_id() {
             Some(model_id) => {
                 if current_model.id() != model_id {
-                    let model = Model::retrieve_model(self, model_id, ModelType::Chat)?;
+                    let model = crate::client::retrieve_model(self, model_id, ModelType::Chat)?;
                     agent.set_model(model);
                 } else {
                     agent.set_model(current_model);
