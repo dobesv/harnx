@@ -101,10 +101,6 @@ tokio-test = "0.4"
 tempfile = "3"
 
 [[bin]]
-name = "harnx-mcp-todo"
-path = "src/bin/harnx-mcp-todo/main.rs"
-
-[[bin]]
 name = "harnx-mcp-bash"
 path = "src/bin/harnx-mcp-bash/main.rs"
 

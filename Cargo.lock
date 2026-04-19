@@ -1629,6 +1629,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-mcp-todo"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
