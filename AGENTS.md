@@ -11,7 +11,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 - **HTTP client:** reqwest (rustls-tls)
 - **CLI framework:** clap (derive)
 - **Serialization:** serde + serde_json + serde_yaml
-- **REPL:** reedline
+- **TUI:** ratatui + crossterm
 - **RAG:** hnsw_rs + bm25
 - **MCP SDK:** rmcp
 - **CI:** GitHub Actions (see `.github/workflows/ci.yaml`)
@@ -32,7 +32,8 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   ├── client/                 # LLM provider clients (OpenAI, Claude, Gemini, Bedrock, etc.)
 │   ├── config/                 # Configuration loading, agent/session management
 │   ├── render/                 # Markdown rendering and streaming output
-│   ├── repl/                   # Interactive REPL (completer, highlighter, prompt)
+│   ├── tui/                    # Interactive TUI (ratatui-based)
+│   ├── commands.rs             # Dot-command handlers (.help, .model, .session, …) used by TUI and macros
 │   ├── rag/                    # RAG pipeline (splitter, vector search)
 │   ├── mcp/                    # MCP client/server integration
 │   ├── acp/                    # ACP client/server integration

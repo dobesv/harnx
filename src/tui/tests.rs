@@ -509,7 +509,7 @@ async fn info_commands_render_into_tui_transcript() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    tui.run_repl_command(".info session").await.unwrap();
+    tui.run_command(".info session").await.unwrap();
     while let Ok(event) = tui.event_rx.try_recv() {
         tui.handle_tui_event(event).await.unwrap();
     }
@@ -538,7 +538,7 @@ async fn info_session_does_not_print_raw_output_in_tui_mode() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    tui.run_repl_command(".info session").await.unwrap();
+    tui.run_command(".info session").await.unwrap();
     while let Ok(event) = tui.event_rx.try_recv() {
         tui.handle_tui_event(event).await.unwrap();
     }
@@ -565,11 +565,7 @@ async fn info_session_without_session_renders_in_tui_snapshot() {
     harness.tui().config = config.clone();
     harness.tui().persistent_manager = persistent;
 
-    harness
-        .tui()
-        .run_repl_command(".info session")
-        .await
-        .unwrap();
+    harness.tui().run_command(".info session").await.unwrap();
     while let Ok(event) = harness.tui().event_rx.try_recv() {
         harness.tui().handle_tui_event(event).await.unwrap();
     }
@@ -590,18 +586,14 @@ async fn info_session_with_session_renders_in_tui_snapshot() {
 
     harness
         .tui()
-        .run_repl_command(".session info-session-with-session-test")
+        .run_command(".session info-session-with-session-test")
         .await
         .unwrap();
     while let Ok(event) = harness.tui().event_rx.try_recv() {
         harness.tui().handle_tui_event(event).await.unwrap();
     }
 
-    harness
-        .tui()
-        .run_repl_command(".info session")
-        .await
-        .unwrap();
+    harness.tui().run_command(".info session").await.unwrap();
     while let Ok(event) = harness.tui().event_rx.try_recv() {
         harness.tui().handle_tui_event(event).await.unwrap();
     }
@@ -1362,7 +1354,7 @@ async fn help_renders_in_tui_snapshot() {
     harness.tui().config = config.clone();
     harness.tui().persistent_manager = persistent;
 
-    harness.tui().run_repl_command(".help").await.unwrap();
+    harness.tui().run_command(".help").await.unwrap();
     while let Ok(event) = harness.tui().event_rx.try_recv() {
         harness.tui().handle_tui_event(event).await.unwrap();
     }
@@ -1374,14 +1366,14 @@ async fn help_renders_in_tui_snapshot() {
 }
 
 #[tokio::test]
-async fn representative_repl_commands_render_into_tui_transcript() {
+async fn representative_commands_render_into_tui_transcript() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let commands = [".help", ".info session", ".mcp list"];
 
     for command in commands {
         let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent.clone()).unwrap();
-        tui.run_repl_command(command).await.unwrap();
+        tui.run_command(command).await.unwrap();
         while let Ok(event) = tui.event_rx.try_recv() {
             tui.handle_tui_event(event).await.unwrap();
         }

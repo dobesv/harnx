@@ -1,479 +1,105 @@
-#[allow(dead_code)]
-mod completer;
-#[allow(dead_code)]
-mod highlighter;
-#[allow(dead_code)]
-mod prompt;
-
-use self::completer::ReplCompleter;
-use self::highlighter::ReplHighlighter;
-use self::prompt::ReplPrompt;
 use std::io::Write;
 
 use crate::client::retry::call_with_retry_and_fallback;
-use crate::config::{
-    macro_execute, AgentVariables, AssertState, Config, GlobalConfig, Input, LastMessage,
-    StateFlags,
-};
+use crate::config::{macro_execute, AgentVariables, Config, GlobalConfig, Input, LastMessage};
 use crate::hooks::{
     dispatch_hooks_with_count_and_manager, dispatch_hooks_with_managers, drain_async_results,
     inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
     PersistentHookManager,
 };
 use crate::render::render_error;
-use crate::utils::{
-    abortable_run_with_spinner, create_abort_signal, dimmed_text, set_text, temp_file, AbortSignal,
-};
+use crate::utils::{abortable_run_with_spinner, dimmed_text, set_text, AbortSignal};
 
 use anyhow::{anyhow, bail, Context, Result};
-use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
-use reedline::CursorConfig;
-use reedline::{
-    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
-    ColumnarMenu, EditCommand, EditMode, Emacs, KeyCode, KeyModifiers, Keybindings, Reedline,
-    ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi,
-};
-use reedline::{MenuBuilder, Signal};
-use std::io::Write as _;
+use std::env;
 use std::sync::LazyLock;
-use std::{env, process};
 
-const MENU_NAME: &str = "completion_menu";
-
-/// Outcome of running a REPL command.
-/// Used to signal special actions (like TUI reset) beyond simple continue/exit.
+/// Outcome of running a dot-command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandOutcome {
-    /// Continue the REPL loop normally.
+    /// Continue normally.
     Continue,
-    /// Exit the REPL loop.
+    /// Exit the interactive session.
     Exit,
-    /// An async resume prompt was handled and the loop should iterate again.
-    ResumeHandled,
 }
 
-pub static REPL_COMMANDS: LazyLock<[ReplCommand; 39]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 40]> = LazyLock::new(|| {
     [
-        ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
-        ReplCommand::new(".info", "Show system info", AssertState::pass()),
-        ReplCommand::new(
-            ".info tools",
-            "List all available tools and their status",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".use tool",
-            "Add a tool or toolset to the active tools",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
+        Command::new(".help", "Show this help guide"),
+        Command::new(".info", "Show system info"),
+        Command::new(".info tools", "List all available tools and their status"),
+        Command::new(".use tool", "Add a tool or toolset to the active tools"),
+        Command::new(
             ".drop tool",
             "Remove a tool or toolset from the active tools",
-            AssertState::pass(),
         ),
-        ReplCommand::new(
-            ".edit config",
-            "Modify configuration file",
-            AssertState::False(StateFlags::AGENT),
-        ),
-        ReplCommand::new(".model", "Switch LLM model", AssertState::pass()),
-        ReplCommand::new(
-            ".prompt",
-            "Set a temporary agent using a prompt",
-            AssertState::False(StateFlags::SESSION | StateFlags::AGENT),
-        ),
-        ReplCommand::new(
-            ".edit agent",
-            "Modify current agent",
-            AssertState::TrueFalse(StateFlags::AGENT, StateFlags::SESSION),
-        ),
-        ReplCommand::new(
-            ".save agent",
-            "Save current agent to file",
-            AssertState::TrueFalse(
-                StateFlags::AGENT,
-                StateFlags::SESSION_EMPTY | StateFlags::SESSION,
-            ),
-        ),
-        ReplCommand::new(
-            ".session",
-            "Start or switch to a session",
-            AssertState::False(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
-        ),
-        ReplCommand::new(
-            ".empty session",
-            "Clear session messages",
-            AssertState::True(StateFlags::SESSION),
-        ),
-        ReplCommand::new(
-            ".reset repl",
+        Command::new(".edit config", "Modify configuration file"),
+        Command::new(".model", "Switch LLM model"),
+        Command::new(".prompt", "Set a temporary agent using a prompt"),
+        Command::new(".edit agent", "Modify current agent"),
+        Command::new(".save agent", "Save current agent to file"),
+        Command::new(".session", "Start or switch to a session"),
+        Command::new(".empty session", "Clear session messages"),
+        Command::new(
+            ".reset session",
             "Reset session to initial state (re-expands variables)",
-            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
         ),
-        ReplCommand::new(
+        Command::new(".reset repl", "Alias for .reset session"),
+        Command::new(
             ".compact session",
             "Compact session messages using configured compaction agent",
-            AssertState::True(StateFlags::SESSION),
         ),
-        ReplCommand::new(
-            ".info session",
-            "Show session info",
-            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
-        ),
-        ReplCommand::new(
-            ".edit session",
-            "Modify current session",
-            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
-        ),
-        ReplCommand::new(
-            ".save session",
-            "Save current session to file",
-            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
-        ),
-        ReplCommand::new(
-            ".exit session",
-            "Exit active session",
-            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
-        ),
-        ReplCommand::new(".agent", "Use an agent", AssertState::bare()),
-        ReplCommand::new(
-            ".starter",
-            "Use a conversation starter",
-            AssertState::True(StateFlags::AGENT),
-        ),
-        ReplCommand::new(
-            ".info agent",
-            "Show agent info",
-            AssertState::True(StateFlags::AGENT),
-        ),
-        ReplCommand::new(
-            ".exit agent",
-            "Leave agent",
-            AssertState::True(StateFlags::AGENT),
-        ),
-        ReplCommand::new(
-            ".rag",
-            "Initialize or access RAG",
-            AssertState::False(StateFlags::AGENT),
-        ),
-        ReplCommand::new(
+        Command::new(".info session", "Show session info"),
+        Command::new(".edit session", "Modify current session"),
+        Command::new(".save session", "Save current session to file"),
+        Command::new(".exit session", "Exit active session"),
+        Command::new(".agent", "Use an agent"),
+        Command::new(".starter", "Use a conversation starter"),
+        Command::new(".info agent", "Show agent info"),
+        Command::new(".exit agent", "Leave agent"),
+        Command::new(".rag", "Initialize or access RAG"),
+        Command::new(
             ".edit rag-docs",
             "Add or remove documents from an existing RAG",
-            AssertState::TrueFalse(StateFlags::RAG, StateFlags::AGENT),
         ),
-        ReplCommand::new(
-            ".rebuild rag",
-            "Rebuild RAG for document changes",
-            AssertState::True(StateFlags::RAG),
-        ),
-        ReplCommand::new(
-            ".sources rag",
-            "Show citation sources used in last query",
-            AssertState::True(StateFlags::RAG),
-        ),
-        ReplCommand::new(
-            ".info rag",
-            "Show RAG info",
-            AssertState::True(StateFlags::RAG),
-        ),
-        ReplCommand::new(
-            ".exit rag",
-            "Leave RAG",
-            AssertState::TrueFalse(StateFlags::RAG, StateFlags::AGENT),
-        ),
-        ReplCommand::new(
-            ".attach",
-            "Attach a file to the next message",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(".detach", "Remove attached files", AssertState::pass()),
-        ReplCommand::new(".macro", "Execute a macro", AssertState::pass()),
-        ReplCommand::new(".mcp", "Manage MCP servers", AssertState::pass()),
-        ReplCommand::new(
-            ".file",
-            "Include files, directories, URLs or commands",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".continue",
-            "Continue previous response",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".regenerate",
-            "Regenerate last response",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(".copy", "Copy last response", AssertState::pass()),
-        ReplCommand::new(".set", "Modify runtime settings", AssertState::pass()),
-        ReplCommand::new(
-            ".delete",
-            "Delete agents, sessions, RAGs, or macros",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(".exit", "Exit REPL", AssertState::pass()),
+        Command::new(".rebuild rag", "Rebuild RAG for document changes"),
+        Command::new(".sources rag", "Show citation sources used in last query"),
+        Command::new(".info rag", "Show RAG info"),
+        Command::new(".exit rag", "Leave RAG"),
+        Command::new(".attach", "Attach a file to the next message"),
+        Command::new(".detach", "Remove attached files"),
+        Command::new(".macro", "Execute a macro"),
+        Command::new(".mcp", "Manage MCP servers"),
+        Command::new(".file", "Include files, directories, URLs or commands"),
+        Command::new(".continue", "Continue previous response"),
+        Command::new(".regenerate", "Regenerate last response"),
+        Command::new(".copy", "Copy last response"),
+        Command::new(".set", "Modify runtime settings"),
+        Command::new(".delete", "Delete agents, sessions, RAGs, or macros"),
+        Command::new(".exit", "Exit the interactive session"),
     ]
 });
 static COMMAND_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\.\S*)\s*").unwrap());
 static MULTILINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*:::\s*(.*)\s*:::\s*$").unwrap());
 
-pub struct Repl {
-    config: GlobalConfig,
-    editor: Reedline,
-    prompt: ReplPrompt,
-    abort_signal: AbortSignal,
-    async_manager: AsyncHookManager,
-    persistent_manager: std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    pending_async_context: Option<String>,
-}
-
-impl Repl {
-    pub fn init(
-        config: &GlobalConfig,
-        async_manager: AsyncHookManager,
-        persistent_manager: std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
-    ) -> Result<Self> {
-        let editor = Self::create_editor(config)?;
-
-        let prompt = ReplPrompt::new(config);
-        let abort_signal = create_abort_signal();
-
-        Ok(Self {
-            config: config.clone(),
-            editor,
-            prompt,
-            abort_signal,
-            async_manager,
-            persistent_manager,
-            pending_async_context: None,
-        })
-    }
-
-    pub fn async_manager(&self) -> &AsyncHookManager {
-        &self.async_manager
-    }
-
-    pub async fn run(&mut self) -> Result<()> {
-        if AssertState::False(StateFlags::AGENT | StateFlags::RAG)
-            .assert(self.config.read().state())
-        {
-            print!(
-                r#"Welcome to {} {}
-Type ".help" for additional help.
-"#,
-                env!("CARGO_CRATE_NAME"),
-                env!("CARGO_PKG_VERSION"),
-            )
-        }
-
-        // Print initial session/agent status line
-        {
-            let status = self.config.read().render_status_line(true);
-            if !status.is_empty() {
-                eprintln!("{}", dimmed_text(&status));
-            }
-        }
-
-        loop {
-            if self.abort_signal.aborted_ctrld() {
-                break;
-            }
-            match self.process_pending_async_resume().await? {
-                CommandOutcome::ResumeHandled => continue,
-                CommandOutcome::Exit => break,
-                CommandOutcome::Continue => {}
-            }
-            let sig = self.editor.read_line(&self.prompt);
-            match sig {
-                Ok(Signal::Success(line)) => {
-                    self.abort_signal.reset();
-                    match run_repl_command(
-                        &self.config,
-                        self.abort_signal.clone(),
-                        &line,
-                        &mut self.async_manager,
-                        &self.persistent_manager,
-                        &mut self.pending_async_context,
-                    )
-                    .await
-                    {
-                        Ok(outcome) => {
-                            if matches!(outcome, CommandOutcome::Exit) {
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            render_error(err);
-                            println!()
-                        }
-                    }
-                }
-                Ok(Signal::CtrlC) => {
-                    self.abort_signal.set_ctrlc();
-                    println!("(To exit, press Ctrl+D or enter \".exit\")\n");
-                }
-                Ok(Signal::CtrlD) => {
-                    self.abort_signal.set_ctrld();
-                    break;
-                }
-                _ => {}
-            }
-        }
-        self.config.write().exit_session()?;
-        Ok(())
-    }
-
-    async fn process_pending_async_resume(&mut self) -> Result<CommandOutcome> {
-        let (should_resume, max_resume) = {
-            let config = self.config.read();
-            let hooks = config.resolved_hooks();
-            (
-                drain_async_results(&mut self.async_manager, &mut self.pending_async_context),
-                hooks.max_resume.unwrap_or(5),
-            )
-        };
-        if !should_resume {
-            return Ok(CommandOutcome::Continue);
-        }
-
-        if self.abort_signal.aborted() {
-            return Ok(CommandOutcome::Exit);
-        }
-
-        let context = self
-            .pending_async_context
-            .take()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-        let input = Input::from_str(&self.config, &context, None);
-        ask(
-            &self.config,
-            self.abort_signal.clone(),
-            input,
-            true,
-            &mut self.async_manager,
-            &self.persistent_manager,
-            &mut self.pending_async_context,
-            max_resume,
-        )
-        .await?;
-        Ok(CommandOutcome::ResumeHandled)
-    }
-
-    fn create_editor(config: &GlobalConfig) -> Result<Reedline> {
-        let completer = ReplCompleter::new(config);
-        let highlighter = ReplHighlighter::new(config);
-        let menu = Self::create_menu();
-        let edit_mode = Self::create_edit_mode(config);
-        let cursor_config = CursorConfig {
-            vi_insert: Some(SetCursorStyle::BlinkingBar),
-            vi_normal: Some(SetCursorStyle::SteadyBlock),
-            emacs: None,
-        };
-        let mut editor = Reedline::create()
-            .with_completer(Box::new(completer))
-            .with_highlighter(Box::new(highlighter))
-            .with_menu(menu)
-            .with_edit_mode(edit_mode)
-            .with_cursor_config(cursor_config)
-            .with_quick_completions(true)
-            .with_partial_completions(true)
-            .use_bracketed_paste(true)
-            .with_validator(Box::new(ReplValidator))
-            .with_ansi_colors(true);
-
-        if let Ok(cmd) = config.read().editor() {
-            let temp_file = temp_file("-repl-", ".md");
-            let command = process::Command::new(cmd);
-            editor = editor.with_buffer_editor(command, temp_file);
-        }
-
-        Ok(editor)
-    }
-
-    fn extra_keybindings(keybindings: &mut Keybindings) {
-        keybindings.add_binding(
-            KeyModifiers::NONE,
-            KeyCode::Tab,
-            ReedlineEvent::UntilFound(vec![
-                ReedlineEvent::Menu(MENU_NAME.to_string()),
-                ReedlineEvent::MenuNext,
-            ]),
-        );
-        keybindings.add_binding(
-            KeyModifiers::SHIFT,
-            KeyCode::BackTab,
-            ReedlineEvent::MenuPrevious,
-        );
-        keybindings.add_binding(
-            KeyModifiers::CONTROL,
-            KeyCode::Enter,
-            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
-        );
-        keybindings.add_binding(
-            KeyModifiers::CONTROL,
-            KeyCode::Char('j'),
-            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
-        );
-    }
-
-    fn create_edit_mode(config: &GlobalConfig) -> Box<dyn EditMode> {
-        let edit_mode: Box<dyn EditMode> = if config.read().keybindings == "vi" {
-            let mut insert_keybindings = default_vi_insert_keybindings();
-            Self::extra_keybindings(&mut insert_keybindings);
-            Box::new(Vi::new(insert_keybindings, default_vi_normal_keybindings()))
-        } else {
-            let mut keybindings = default_emacs_keybindings();
-            Self::extra_keybindings(&mut keybindings);
-            Box::new(Emacs::new(keybindings))
-        };
-        edit_mode
-    }
-
-    fn create_menu() -> ReedlineMenu {
-        let completion_menu = ColumnarMenu::default().with_name(MENU_NAME);
-        ReedlineMenu::EngineCompleter(Box::new(completion_menu))
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct ReplCommand {
+pub struct Command {
     pub name: &'static str,
     pub description: &'static str,
-    state: AssertState,
 }
 
-impl ReplCommand {
-    fn new(name: &'static str, desc: &'static str, state: AssertState) -> Self {
+impl Command {
+    const fn new(name: &'static str, desc: &'static str) -> Self {
         Self {
             name,
             description: desc,
-            state,
-        }
-    }
-
-    fn is_valid(&self, flags: StateFlags) -> bool {
-        self.state.assert(flags)
-    }
-}
-
-/// A default validator which checks for mismatched quotes and brackets
-struct ReplValidator;
-
-impl Validator for ReplValidator {
-    fn validate(&self, line: &str) -> ValidationResult {
-        let line = line.trim();
-        if line.starts_with(r#":::"#) && !line[3..].ends_with(r#":::"#) {
-            ValidationResult::Incomplete
-        } else {
-            ValidationResult::Complete
         }
     }
 }
 
-pub async fn run_repl_command(
+pub async fn run_command(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
     line: &str,
@@ -482,7 +108,7 @@ pub async fn run_repl_command(
     pending_async_context: &mut Option<String>,
 ) -> Result<CommandOutcome> {
     let mut stdout_sink = std::io::stdout();
-    run_repl_command_with_output(
+    run_command_with_output(
         config,
         abort_signal,
         line,
@@ -494,7 +120,7 @@ pub async fn run_repl_command(
     .await
 }
 
-pub async fn run_repl_command_with_output(
+pub async fn run_command_with_output(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
     mut line: &str,
@@ -512,7 +138,7 @@ pub async fn run_repl_command_with_output(
     match parse_command(line) {
         Some((cmd, args)) => match cmd {
             ".help" => {
-                dump_repl_help(output)?;
+                dump_help(output)?;
             }
             ".info" => match args {
                 Some("session") => {
@@ -693,11 +319,11 @@ pub async fn run_repl_command_with_output(
                 _ => writeln!(output, r#"Usage: .empty session"#)?,
             },
             ".reset" => match args {
-                Some("repl") => {
+                Some("session") | Some("repl") => {
                     config.write().reset_session()?;
                 }
                 _ => {
-                    writeln!(output, r#"Usage: .reset repl"#)?;
+                    writeln!(output, r#"Usage: .reset session"#)?;
                 }
             },
             ".rebuild" => match args {
@@ -1242,7 +868,7 @@ async fn ask_inner(
             .filter(|value| !value.is_empty())
         {
             debug!(
-                "Captured Stop hook additional context for later auto-continue in REPL: {additional_context}"
+                "Captured Stop hook additional context for later auto-continue: {additional_context}"
             );
         }
         Some(stop_outcome)
@@ -1355,8 +981,8 @@ fn unknown_command() -> Result<()> {
     bail!(r#"Unknown command. Type ".help" for additional help."#);
 }
 
-fn dump_repl_help(output: &mut (dyn Write + Send)) -> Result<()> {
-    let head = REPL_COMMANDS
+fn dump_help(output: &mut (dyn Write + Send)) -> Result<()> {
+    let head = COMMANDS
         .iter()
         .map(|cmd| format!("{:<24} {}", cmd.name, cmd.description))
         .collect::<Vec<String>>()
@@ -1366,8 +992,7 @@ fn dump_repl_help(output: &mut (dyn Write + Send)) -> Result<()> {
         r###"{head}
 
 Type ::: to start multi-line editing, type ::: to finish it.
-Press Ctrl+O to open an editor for editing the input buffer.
-Press Ctrl+C to cancel the response, Ctrl+D to exit the REPL."###,
+Press Ctrl+C to cancel the response, Ctrl+D to exit."###,
     )?;
     Ok(())
 }

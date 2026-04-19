@@ -75,7 +75,7 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 | `description` | `string` | `""` | Short description shown in agent listings. |
 | `version` | `string` | `""` | Version identifier for the agent. |
 | `variables` | `list` | `[]` | Variables prompted on first use. See [Variables](#variables). |
-| `conversation_starters` | `list` | `[]` | Suggested prompts shown when starting the agent in REPL mode. |
+| `conversation_starters` | `list` | `[]` | Suggested prompts shown when starting the agent in TUI mode. |
 | `documents` | `list` | `[]` | Document paths for RAG integration. See [Documents](#documents-rag). |
 | `agent_default_session` | `string` | none | Session to auto-load when starting this agent (e.g. `temp`, `default`). |
 | `instructions` | `string` | none | If set, overrides the Markdown body as the system prompt. |
@@ -296,7 +296,7 @@ You can also pass variable values directly:
 harnx --agent coder --agent-variable language=rust "write a web server"
 ```
 
-### From the REPL
+### From the TUI
 
 ```
 .agent <name>        Switch to an agent

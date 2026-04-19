@@ -127,9 +127,9 @@ pub fn emit_ui_output_event(event: UiOutputEvent) -> bool {
 
 /// Install a CLI-mode UI output sink that renders events to stderr.
 ///
-/// This should be called once for non-TUI, non-ACP modes (i.e. `Cmd` and
-/// `Repl` working modes) so that retry/fallback warnings and other
-/// transcript events are printed to stderr instead of being silently dropped.
+/// This should be called once for `Cmd` working mode so that retry/fallback
+/// warnings and other transcript events are printed to stderr instead of
+/// being silently dropped.
 pub fn install_cli_ui_output_sink() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     install_ui_output_sender(tx);
@@ -142,9 +142,9 @@ pub fn install_cli_ui_output_sink() {
                 UiOutputEventKind::LlmError(text) => {
                     eprintln!("{}", warning_text(&format!("LLM error: {text}")));
                 }
-                // Other event kinds are handled inline by the CLI/REPL
-                // callers (streaming output, tool calls, etc.) and don't
-                // need to be duplicated here.
+                // Other event kinds are handled inline by the CLI callers
+                // (streaming output, tool calls, etc.) and don't need to be
+                // duplicated here.
                 _ => {}
             }
         }

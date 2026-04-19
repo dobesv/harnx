@@ -363,10 +363,6 @@ impl Session {
         self.agent_name.as_deref()
     }
 
-    pub fn dirty(&self) -> bool {
-        self.dirty
-    }
-
     pub fn save_session(&self) -> Option<bool> {
         self.save_session
     }
@@ -389,10 +385,6 @@ impl Session {
 
     pub fn has_user_messages(&self) -> bool {
         self.messages.iter().any(|v| v.role.is_user())
-    }
-
-    pub fn user_messages_len(&self) -> usize {
-        self.messages.iter().filter(|v| v.role.is_user()).count()
     }
 
     pub fn export(&self) -> Result<String> {
@@ -675,13 +667,13 @@ impl Session {
         self.autoname = Some(AutoName::new(name));
     }
 
-    pub fn exit(&mut self, session_dir: &Path, is_repl: bool) -> Result<()> {
+    pub fn exit(&mut self, session_dir: &Path, is_tui: bool) -> Result<()> {
         if self.save_session == Some(false) && !self.save_session_this_time {
             return Ok(());
         }
         if !self.dirty {
             // Nothing new to persist, but print the path if the log file exists.
-            if is_repl {
+            if is_tui {
                 if let Some(path) = &self.path {
                     println!("✓ Session saved at '{path}'.");
                 }
@@ -692,13 +684,13 @@ impl Session {
         // callers or sessions that didn't go through init_log). Do a full save.
         let (session_dir, session_name) = self.resolve_save_path(session_dir);
         let session_path = session_dir.join(format!("{session_name}.yaml"));
-        self.save(&session_name, &session_path, is_repl)?;
+        self.save(&session_name, &session_path, is_tui)?;
         Ok(())
     }
 
     /// Full save: rewrites the entire session file in log format.
     /// Used as a fallback when events were not incrementally appended.
-    pub fn save(&mut self, session_name: &str, session_path: &Path, is_repl: bool) -> Result<()> {
+    pub fn save(&mut self, session_name: &str, session_path: &Path, is_tui: bool) -> Result<()> {
         ensure_parent_exists(session_path)?;
 
         self.path = Some(session_path.display().to_string());
@@ -784,7 +776,7 @@ impl Session {
             )
         })?;
 
-        if is_repl {
+        if is_tui {
             println!("✓ Saved the session to '{}'.", session_path.display());
         }
 

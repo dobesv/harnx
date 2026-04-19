@@ -27,17 +27,17 @@ Explore powerful command-line functionalities with Harnx's CMD mode.
 
 ![harnx-cmd](https://github.com/user-attachments/assets/6c58c549-1564-43cf-b772-e1c9fe91d19c)
 
-### REPL Mode
+### TUI Mode
 
-Experience an interactive Chat-REPL with features like tab autocompletion, multi-line input support, history search, configurable keybindings, and custom REPL prompts.
+Experience an interactive chat TUI with features like tab autocompletion of dot-commands, multi-line input support, history, and attachments.
 
-![harnx-repl](https://github.com/user-attachments/assets/218fab08-cdae-4c3b-bcf8-39b6651f1362)
+![harnx-tui](https://github.com/user-attachments/assets/218fab08-cdae-4c3b-bcf8-39b6651f1362)
 
 ### Multi-Form Input
 
 Accept diverse input forms such as stdin, local files and directories, and remote URLs, allowing flexibility in data handling.
 
-| Input             | CMD                                  | REPL                             |
+| Input             | CMD                                  | TUI                              |
 | ----------------- | ------------------------------------ | -------------------------------- |
 | CMD               | `harnx hello`                       |                                  |
 | STDIN             | `cat data.txt \| harnx`             |                                  |
@@ -66,7 +66,7 @@ Maintain context-aware conversations through sessions, ensuring continuity in in
 
 ### Macro
 
-Streamline repetitive tasks by combining a series of REPL commands into a custom macro.
+Streamline repetitive tasks by combining a series of dot-commands into a custom macro.
 
 ![harnx-macro](https://github.com/user-attachments/assets/23c2a08f-5bd7-4bf3-817c-c484aa74a651)
 
@@ -141,7 +141,7 @@ Harnx supports custom dark and light themes, which highlight response text and c
 
 ## Documentation
 
-- [Chat-REPL Guide](docs/chat-repl-guide.md)
+- [TUI & Dot-Commands Guide](docs/tui-guide.md)
 - [Command-Line Guide](docs/command-line-guide.md)
 - [Agent Guide](docs/agent-guide.md)
 - [Macro Guide](docs/macro-guide.md)
@@ -149,7 +149,6 @@ Harnx supports custom dark and light themes, which highlight response text and c
 - [Environment Variables](docs/environment-variables.md)
 - [Configuration Guide](docs/configuration-guide.md)
 - [Custom Theme](docs/custom-theme.md)
-- [Custom REPL Prompt](docs/custom-repl-prompt.md)
 - [FAQ](docs/faq.md)
 
 ## Contributing

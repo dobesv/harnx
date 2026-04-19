@@ -1,24 +1,24 @@
-# Chat REPL Guide
+# TUI & Dot-Commands Guide
 
-The core of Harnx is Chat-REPL.
+Harnx has two runtime modes:
 
-## REPL Features
+- **CLI mode** – non-interactive, one-shot. Invoked when you pass a prompt, a file (`-f`), or STDIN. Runs the request and exits.
+- **TUI mode** – interactive chat UI (ratatui-based). Entered by running `harnx` with no prompt or input. Inside the TUI you type messages or `.`-prefixed **dot-commands**.
 
-- **Tab Autocompletion:** All REPL commands have completions.
-  - `.<tab>` to complete REPL commands.
+There is no readline-based REPL.
+
+## TUI Features
+
+- **Tab Autocompletion** for dot-commands:
+  - `.<tab>` to complete command names.
   - `.model <tab>` to complete chat models.
   - `.set <tab>` to complete config keys.
   - `.set key <tab>` to complete config values.
-- **Multi-line Support:** Input multi-line text in the following ways:
-  - Press `ctrl+o` to edit buffer with an external editor (recommend).
-  - Paste multi-line text (requires terminal support for bracketed paste).
-  - Type `:::` to start multi-line editing, type `:::` to finish it.
-  - Use hotkey `{ctrl,shift,alt}+enter` or `ctrl+j` to insert a newline directly.
-- **History Search:** Press `ctrl+r` to search the history. Use `↑↓` to navigate through the history.
-- **Configurable Keybinding:** Emacs-style bindings and basic VI-style.
-- **[Custom REPL Prompt](custom-repl-prompt.md):** Display information about the current context in the prompt.
+- **Multi-line input** via paste (bracketed-paste terminals) or `Shift+Enter` / `Ctrl+J` to insert a newline.
+- **History:** `↑` / `↓` to navigate prior submissions.
+- **Attachments:** `.attach <path>` to attach a file to the next message; `.detach` to remove.
 
-## REPL Commands
+## Dot-Commands
 
 ### `.model` - change the current LLM
 
@@ -43,7 +43,7 @@ openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
 ```
 .session                 Start or switch to a session
 .empty session           Clear session messages
-.compress session        Compress session messages
+.compact session         Compact session messages using configured compaction agent
 .info session            Show session info
 .edit session            Modify current session
 .save session            Save current session to file
@@ -93,8 +93,6 @@ Usage: .file <file|dir|url|%%|cmd>... [-- <text>...]
 .file https://github.com/dobesv/harnx/blob/main/README.md -- what are the features of Harnx?
 ```
 
-> NOTE: `%%` and `cmd` are supported starting from V0.27.0.
-
 ### `.continue` - continue previous response
 
 This command is often used to resume generation that was interrupted due to the response exceeding the length limit.
@@ -142,15 +140,16 @@ If the response is interrupted or unsatisfactory, you can regenerate it with `.r
 .info session            Show session info
 .info agent              Show agent info
 .info rag                Show RAG info
+.info tools              List available tools and their active state
 ```
 
-### `.exit` - exit session/agent/RAG/REPL
+### `.exit` - exit the current scope
 
-```
+```text
 .exit session            Exit active session
 .exit agent              Exit active agent
 .exit rag                Leave RAG
-.exit                    Exit REPL
+.exit                    Exit the interactive session
 ```
 
 ### `.help` - show help guide

@@ -1,14 +1,13 @@
 mod acp;
 mod cli;
 mod client;
+mod commands;
 mod config;
 mod hooks;
 mod mcp;
 pub mod mcp_safety;
 mod rag;
 mod render;
-#[allow(dead_code, unused_imports)]
-mod repl;
 mod serve;
 mod tool;
 mod tui;
@@ -60,7 +59,7 @@ async fn main() -> Result<()> {
     } else if cli.serve.is_some() {
         WorkingMode::Serve
     } else if text.is_none() && cli.file.is_empty() {
-        WorkingMode::Repl
+        WorkingMode::Tui
     } else {
         WorkingMode::Cmd
     };
@@ -206,10 +205,10 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     if let Some(addr) = cli.serve {
         return serve::run(config, addr).await;
     }
-    let is_repl = config.read().working_mode.is_repl();
+    let is_tui = config.read().working_mode.is_tui();
     if cli.rebuild_rag {
         Config::rebuild_rag(&config, abort_signal.clone()).await?;
-        if is_repl {
+        if is_tui {
             return Ok(());
         }
     }
@@ -218,7 +217,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         return Ok(());
     }
     config.write().apply_default_session()?;
-    match is_repl {
+    match is_tui {
         false => {
             ui_output::install_cli_ui_output_sink();
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
@@ -246,7 +245,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         }
         true => {
             if !*IS_STDOUT_TERMINAL {
-                bail!("No TTY for REPL")
+                bail!("No TTY for TUI")
             }
             start_interactive(&config).await
         }
@@ -698,7 +697,7 @@ async fn start_directive_inner(
 async fn start_interactive(config: &GlobalConfig) -> Result<()> {
     let async_manager = AsyncHookManager::new();
     let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
-    dispatch_session_start(config, "repl", &async_manager, &persistent_manager).await;
+    dispatch_session_start(config, "tui", &async_manager, &persistent_manager).await;
     let mut tui: Tui = Tui::init(config, async_manager, persistent_manager.clone())?;
     let result = tui.run().await;
     let async_manager = tui.async_manager().lock().await;
