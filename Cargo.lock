@@ -1635,11 +1635,9 @@ version = "0.30.0"
 dependencies = [
  "anyhow",
  "async-recursion",
- "async-trait",
  "base64",
  "clap",
  "dirs",
- "fancy-regex 0.17.0",
  "hmac",
  "indexmap",
  "path-absolutize",
