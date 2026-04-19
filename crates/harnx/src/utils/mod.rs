@@ -1,7 +1,6 @@
 mod abort_signal;
 mod clipboard;
 mod command;
-mod crypto;
 mod html_to_md;
 mod loader;
 mod path;
@@ -13,13 +12,13 @@ mod variables;
 pub use self::abort_signal::*;
 pub use self::clipboard::set_text;
 pub use self::command::*;
-pub use self::crypto::*;
 pub use self::html_to_md::*;
 pub use self::loader::*;
 pub use self::path::*;
 pub use self::request::*;
 pub use self::spinner::*;
 pub use self::variables::*;
+pub use harnx_core::crypto::*;
 
 use anyhow::{Context, Result};
 use fancy_regex::Regex;

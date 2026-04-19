@@ -76,6 +76,7 @@ libc = { workspace = true }
 agent-client-protocol = { workspace = true }
 glob = { workspace = true }
 globset = { workspace = true }
+harnx-core = { path = "../harnx-core" }
 shellexpand = { workspace = true }
 schemars = { workspace = true }
 ratatui-textarea = { workspace = true }
