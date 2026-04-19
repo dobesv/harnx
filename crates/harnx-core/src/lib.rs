@@ -4,3 +4,4 @@
 //! role this crate plays in the multi-crate split.
 
 pub mod crypto;
+pub mod path;
