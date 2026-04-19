@@ -704,7 +704,7 @@ pub async fn call_chat_completions(
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
         &spinner_message,
-        abort_signal,
+        abort_signal.clone(),
     )
     .await;
 
@@ -739,7 +739,7 @@ pub async fn call_chat_completions(
             Ok((
                 text,
                 thought,
-                eval_tool_calls(client.global_config(), tool_calls)?,
+                eval_tool_calls(client.global_config(), tool_calls, &abort_signal)?,
                 usage,
             ))
         }
@@ -791,7 +791,7 @@ pub async fn call_chat_completions_streaming(
             Ok((
                 text,
                 thought,
-                eval_tool_calls(client.global_config(), tool_calls)?,
+                eval_tool_calls(client.global_config(), tool_calls, &abort_signal)?,
                 usage,
             ))
         }

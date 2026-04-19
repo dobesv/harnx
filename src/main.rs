@@ -85,6 +85,23 @@ async fn main() -> Result<()> {
 async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {
     let abort_signal = create_abort_signal();
 
+    // Install a process-wide SIGINT watcher ONLY for one-shot (Cmd) mode:
+    // set the abort flag that `eval_tool_calls` and sibling async sites
+    // poll, letting the in-flight work exit cleanly with a non-zero status.
+    // TUI has its own Ctrl-C path via the terminal; ACP server runs on a
+    // separate thread with its own runtime — for it we let SIGINT use the
+    // default handler (kill the process) so the parent sees a terminated
+    // child within the expected window.
+    let working_mode = config.read().working_mode.clone();
+    if matches!(working_mode, WorkingMode::Cmd) {
+        let abort_for_signal = abort_signal.clone();
+        tokio::spawn(async move {
+            while tokio::signal::ctrl_c().await.is_ok() {
+                abort_for_signal.set_ctrlc();
+            }
+        });
+    }
+
     if cli.sync_models {
         let url = config.read().sync_models_url();
         return Config::sync_models(&url, abort_signal.clone()).await;
@@ -210,6 +227,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
                 Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
             let mut pending_async_context = None;
             dispatch_session_start(&config, "cmd", &async_manager, &persistent_manager).await;
+            let aborted_check = abort_signal.clone();
             let result = start_directive(
                 &config,
                 input,
@@ -221,6 +239,9 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
             .await;
             exit_session_with_hook(&config, &async_manager, &persistent_manager).await?;
             persistent_manager.lock().await.shutdown();
+            if aborted_check.aborted() {
+                bail!("interrupted by user");
+            }
             result
         }
         true => {

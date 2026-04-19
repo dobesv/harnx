@@ -1,6 +1,6 @@
 use super::NestedAcpEvent;
 use agent_client_protocol::{self as acp, Client as _};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use uuid::Uuid;
 
 use crate::client::{Client, SseEvent, SseHandler};
@@ -27,6 +27,21 @@ pub struct HarnxAgent {
 struct HarnxSession {
     id: String,
     abort_signal: AbortSignal,
+    /// Fires when the session receives an ACP `session/cancel` notification.
+    /// We use `notify_one` (rather than `notify_waiters`) so a cancel that
+    /// arrives in the tiny window between the prompt handler entering and
+    /// its `.notified()` future being polled still fires — the permit is
+    /// held until the next listener observes it.
+    ///
+    /// Known limitation: a cancel that arrives AFTER a prompt returns and
+    /// BEFORE the next prompt starts will be consumed by the next prompt's
+    /// first `.notified()` poll. Drain-at-entry was attempted but racing
+    /// the drain against a concurrent cancel is itself unsound (polling a
+    /// Notified registers a waiter that can absorb a concurrent
+    /// notify_one even after we drop it). In practice cancel notifications
+    /// are only sent while a prompt is active, so this case isn't
+    /// exercised by any test.
+    cancel_notify: Arc<tokio::sync::Notify>,
 }
 
 impl HarnxAgent {
@@ -231,6 +246,7 @@ impl acp::Agent for HarnxAgent {
         let session = HarnxSession {
             id: session_id.clone(),
             abort_signal: AbortSignalInner::new(),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
         };
         self.sessions
             .borrow_mut()
@@ -249,13 +265,13 @@ impl acp::Agent for HarnxAgent {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let abort_signal = {
+        let (abort_signal, cancel_notify) = {
             let sessions = self.sessions.borrow();
             let session = sessions
                 .get(session_key.as_str())
                 .ok_or_else(acp::Error::invalid_params)?;
             session.abort_signal.reset();
-            session.abort_signal.clone()
+            (session.abort_signal.clone(), session.cancel_notify.clone())
         };
 
         {
@@ -300,12 +316,26 @@ impl acp::Agent for HarnxAgent {
                 return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
             }
 
-            let (output, thought, tool_calls) = if input.stream() {
-                self.execute_llm_streaming(&session_key, &input, client.as_ref(), &abort_signal)
-                    .await?
-            } else {
-                self.execute_llm_non_streaming(&session_key, &input, client.as_ref(), &abort_signal)
-                    .await?
+            let exec_fut = async {
+                if input.stream() {
+                    self.execute_llm_streaming(&session_key, &input, client.as_ref(), &abort_signal)
+                        .await
+                } else {
+                    self.execute_llm_non_streaming(
+                        &session_key,
+                        &input,
+                        client.as_ref(),
+                        &abort_signal,
+                    )
+                    .await
+                }
+            };
+            let (output, thought, tool_calls) = tokio::select! {
+                result = exec_fut => result?,
+                _ = cancel_notify.notified() => {
+                    abort_signal.set_ctrlc();
+                    return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+                }
             };
 
             let config = self.config.clone();
@@ -408,20 +438,34 @@ impl acp::Agent for HarnxAgent {
                         }
                     });
 
-                    let result = eval_tool_calls_async(
+                    let eval_fut = eval_tool_calls_async(
                         &self.config,
                         tool_calls,
                         &abort_signal,
                         source.clone(),
-                    )
-                    .await;
+                    );
+                    let result = tokio::select! {
+                        r = eval_fut => r,
+                        _ = cancel_notify.notified() => {
+                            abort_signal.set_ctrlc();
+                            manager.unsubscribe_chunks(subscription_id).await;
+                            let _ = forward_task.await;
+                            return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+                        }
+                    };
 
                     manager.unsubscribe_chunks(subscription_id).await;
                     let _ = forward_task.await;
 
                     result
                 } else {
-                    eval_tool_calls_async(&self.config, tool_calls, &abort_signal, source).await
+                    tokio::select! {
+                        r = eval_tool_calls_async(&self.config, tool_calls, &abort_signal, source) => r,
+                        _ = cancel_notify.notified() => {
+                            abort_signal.set_ctrlc();
+                            return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+                        }
+                    }
                 };
 
                 match result {
@@ -478,6 +522,7 @@ impl acp::Agent for HarnxAgent {
             .get(session_id.as_ref())
             .ok_or_else(acp::Error::invalid_params)?;
         session.abort_signal.set_ctrlc();
+        session.cancel_notify.notify_one();
         Ok(())
     }
 }

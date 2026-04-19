@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 pub(super) const MIN_INPUT_HEIGHT: u16 = 3;
 pub(super) const MAX_INPUT_HEIGHT: u16 = 8;
 pub(super) const TICK_RATE: Duration = Duration::from_millis(80);
-pub(super) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub struct Tui {
     pub(super) config: GlobalConfig,
