@@ -1,8 +1,8 @@
 use harnx::acp::AcpServerConfig;
 use harnx::mcp::McpServerConfig;
 use harnx::test_utils::{
-    MockOpenAiError, MockOpenAiScript, MockOpenAiServer, MockOpenAiToolCall, MockOpenAiTurn,
-    TmuxHarness,
+    harnx_mcp_repro249_bin, MockOpenAiError, MockOpenAiScript, MockOpenAiServer,
+    MockOpenAiToolCall, MockOpenAiTurn, TmuxHarness,
 };
 
 use anyhow::{Context, Result};
@@ -26,7 +26,6 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
 
     let repo_root = repo_root()?;
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-    let _harnx_mcp_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-repro249"));
 
     let temp = TempDir::new().context("failed to create temp dir")?;
     let mock = MockOpenAiServer::start(script())?;
@@ -229,9 +228,8 @@ fn script() -> MockOpenAiScript {
 fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
-    let fake_mcp_server = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-repro249"));
-
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let fake_mcp_server = harnx_mcp_repro249_bin(&harnx_bin);
 
     std::fs::write(
         &paths.config_path,
@@ -788,7 +786,6 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
     }
 
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-    let _harnx_mcp_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-repro249"));
 
     let temp = TempDir::new().context("failed to create temp dir")?;
     let mock = MockOpenAiServer::start(nested_script())?;
@@ -1078,9 +1075,8 @@ fn nested_script() -> MockOpenAiScript {
 fn write_nested_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
-    let fake_mcp_server = PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-repro249"));
-
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let fake_mcp_server = harnx_mcp_repro249_bin(&harnx_bin);
 
     std::fs::write(&paths.config_path, "save: false\n")?;
 

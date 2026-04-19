@@ -1657,6 +1657,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-test-bins"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "ratatui",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

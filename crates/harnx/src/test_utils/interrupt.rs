@@ -30,6 +30,20 @@ pub fn harnx_mcp_time_bin(harnx_bin: &Path) -> PathBuf {
     harnx_bin.with_file_name(format!("harnx-mcp-time{ext}"))
 }
 
+/// Locate the `harnx-mcp-repro249` binary given the already-resolved `harnx`
+/// binary path.
+///
+/// The `harnx-mcp-repro249` binary lives in the `harnx-test-bins` crate, so
+/// `CARGO_BIN_EXE_harnx-mcp-repro249` isn't visible from `harnx`'s test
+/// context. Because Cargo builds every workspace member into the same target
+/// dir, the binary sits next to the `harnx` binary. Callers are responsible
+/// for ensuring it has been built (e.g. via `cargo build --workspace` or
+/// `cargo nextest run --workspace`, which is what CI uses).
+pub fn harnx_mcp_repro249_bin(harnx_bin: &Path) -> PathBuf {
+    let ext = std::env::consts::EXE_SUFFIX;
+    harnx_bin.with_file_name(format!("harnx-mcp-repro249{ext}"))
+}
+
 /// A mock-LLM response that emits one short text chunk and immediately
 /// issues a `wait` tool call (chunk_delay_ms is 0 so the tool call fires
 /// without delay).
@@ -123,9 +137,11 @@ pub fn script_call_trivial_tool() -> MockOpenAiScript {
 /// `harnx-mcp-time` binary as an MCP server so the `wait` tool is available.
 ///
 /// `mcp_time_bin` should be the path to the compiled `harnx-mcp-time` binary,
-/// typically obtained via `PathBuf::from(env!("CARGO_BIN_EXE_harnx-mcp-time"))`
-/// in the calling test (the `env!` macro for `CARGO_BIN_EXE_*` is only
-/// available in integration-test compilation units, not in library code).
+/// typically obtained via the `harnx_mcp_time_bin(harnx_bin)` helper in the
+/// calling test. (The `env!("CARGO_BIN_EXE_harnx-mcp-time")` macro is not
+/// available here because `harnx-mcp-time` lives in a separate workspace
+/// crate; the helper computes the sibling path from the resolved `harnx`
+/// binary instead.)
 pub fn write_with_wait_tool(
     dir: &Path,
     mock_base_url: &str,
