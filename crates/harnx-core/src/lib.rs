@@ -6,4 +6,5 @@
 pub mod abort;
 pub mod cli;
 pub mod crypto;
+pub mod event;
 pub mod path;
