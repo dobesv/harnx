@@ -8,4 +8,5 @@ pub mod cli;
 pub mod context;
 pub mod crypto;
 pub mod event;
+pub mod hooks;
 pub mod path;

@@ -51,7 +51,7 @@ pub mod executor;
 pub mod matcher;
 pub mod persistent;
 pub mod prompt;
-pub mod types;
+// `types` module moved to harnx-core; re-exported below.
 
 #[allow(unused_imports)]
 pub use async_manager::{
@@ -66,7 +66,7 @@ pub use dispatch::{
 };
 #[allow(unused_imports)]
 pub use executor::execute_command_hook;
+pub use harnx_core::hooks::*;
 pub use matcher::CompiledMatcher;
 #[allow(unused_imports)]
 pub use persistent::PersistentHookManager;
-pub use types::*;
