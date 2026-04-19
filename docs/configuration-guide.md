@@ -75,10 +75,44 @@ api_key: sk-...           # Optional if <NAME>_API_KEY env var is set
 api_base: https://...     # Optional custom endpoint
 patch:                    # Patch API requests (url, headers, body)
   chat_completions:
-    body:
-      cache_control:
-        type: ephemeral
+    '.*':                 # Regex pattern matched against the model name
+      body:
+        cache_control:
+          type: ephemeral
 ```
+
+### Per-Model Patches
+
+The keys under `patch.chat_completions` (and `patch.embeddings`, `patch.rerank`) are **regex patterns** matched against the model name. Each pattern must match the **entire** model name (patterns are automatically anchored with `^` and `$`), so `o3` matches only the model named exactly `o3`, not `o3-mini`. Use `o3.*` to match all models starting with `o3`. This lets you apply different settings to different models within the same client.
+
+For example, to set different `reasoning_effort` values per model:
+
+```yaml
+type: openai
+patch:
+  chat_completions:
+    o4-mini:
+      body:
+        reasoning_effort: low
+    o3:
+      body:
+        reasoning_effort: medium
+    gpt-4.1:
+      body:
+        reasoning_effort: high
+```
+
+You can also use regex patterns to match multiple models at once:
+
+```yaml
+patch:
+  chat_completions:
+    'gpt-5.*':            # Match all GPT 5 models
+      body:
+        reasoning_effort: high
+```
+
+**Note:** Only the first matching pattern is applied, so place more specific patterns before broader ones.
 
 ## MCP Servers (`mcp_servers/`)
 
