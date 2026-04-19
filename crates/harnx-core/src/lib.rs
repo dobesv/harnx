@@ -7,6 +7,7 @@ pub mod abort;
 pub mod cli;
 pub mod context;
 pub mod crypto;
+pub mod error;
 pub mod event;
 pub mod hooks;
 pub mod path;
