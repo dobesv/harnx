@@ -1,4 +1,4 @@
-use harnx::mcp_safety::{
+use harnx_mcp::safety::{
     file_uri_to_path, format_size, sanitize_output_text, truncate_output, validate_path,
     TruncateOpts,
 };

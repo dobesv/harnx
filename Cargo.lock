@@ -1659,6 +1659,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-mcp-bash"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "fancy-regex 0.17.0",
+ "harnx-mcp",
+ "libc",
+ "process-wrap",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "harnx-mcp-time"
 version = "0.30.0"
 dependencies = [
