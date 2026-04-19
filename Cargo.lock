@@ -1629,6 +1629,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-core"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "clap",
+ "fancy-regex 0.17.0",
+ "hmac",
+ "indexmap",
+ "path-absolutize",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
 name = "harnx-mcp-time"
 version = "0.30.0"
 dependencies = [
