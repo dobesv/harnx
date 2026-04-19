@@ -1,7 +1,9 @@
 use super::input::*;
 use super::*;
 
-use crate::client::{CompletionTokenUsage, Message, MessageContent, MessageRole};
+use crate::client::{
+    render_message_input, CompletionTokenUsage, Message, MessageContent, MessageRole,
+};
 use crate::render::MarkdownRender;
 
 use anyhow::{bail, Context, Result};
@@ -490,10 +492,11 @@ impl Session {
             for message in &self.messages {
                 match message.role {
                     MessageRole::System => {
-                        lines.push(
-                            render
-                                .render(&message.content.render_input(resolve_url_fn, agent_info)),
-                        );
+                        lines.push(render.render(&render_message_input(
+                            &message.content,
+                            resolve_url_fn,
+                            agent_info,
+                        )));
                     }
                     MessageRole::Assistant => {
                         if let MessageContent::Text(text) = &message.content {
@@ -504,11 +507,15 @@ impl Session {
                     MessageRole::User => {
                         lines.push(format!(
                             ">> {}",
-                            message.content.render_input(resolve_url_fn, agent_info)
+                            render_message_input(&message.content, resolve_url_fn, agent_info)
                         ));
                     }
                     MessageRole::Tool => {
-                        lines.push(message.content.render_input(resolve_url_fn, agent_info));
+                        lines.push(render_message_input(
+                            &message.content,
+                            resolve_url_fn,
+                            agent_info,
+                        ));
                     }
                 }
             }

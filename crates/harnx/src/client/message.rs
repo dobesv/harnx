@@ -89,53 +89,6 @@ pub enum MessageContent {
 }
 
 impl MessageContent {
-    pub fn render_input(
-        &self,
-        resolve_url_fn: impl Fn(&str) -> String,
-        agent_info: &Option<(String, Vec<String>)>,
-    ) -> String {
-        match self {
-            MessageContent::Text(text) => multiline_text(text),
-            MessageContent::Array(list) => {
-                let (mut concated_text, mut files) = (String::new(), vec![]);
-                for item in list {
-                    match item {
-                        MessageContentPart::Text { text } => {
-                            concated_text = format!("{concated_text} {text}")
-                        }
-                        MessageContentPart::ImageUrl { image_url } => {
-                            files.push(resolve_url_fn(&image_url.url))
-                        }
-                    }
-                }
-                if !concated_text.is_empty() {
-                    concated_text = format!(" -- {}", multiline_text(&concated_text))
-                }
-                format!(".file {}{}", files.join(" "), concated_text)
-            }
-            MessageContent::ToolCalls(MessageContentToolCalls {
-                tool_results, text, ..
-            }) => {
-                let mut lines = vec![];
-                if !text.is_empty() {
-                    lines.push(text.clone())
-                }
-                for tool_result in tool_results {
-                    let mut parts = vec!["Call".to_string()];
-                    if let Some((agent_name, functions)) = agent_info {
-                        if functions.contains(&tool_result.call.name) {
-                            parts.push(agent_name.clone())
-                        }
-                    }
-                    parts.push(tool_result.call.name.clone());
-                    parts.push(tool_result.call.arguments.to_string());
-                    lines.push(dimmed_text(&parts.join(" ")));
-                }
-                lines.join("\n")
-            }
-        }
-    }
-
     pub fn to_text(&self) -> String {
         match self {
             MessageContent::Text(text) => text.to_string(),
@@ -149,6 +102,53 @@ impl MessageContent {
                 parts.join("\n\n")
             }
             MessageContent::ToolCalls(_) => String::new(),
+        }
+    }
+}
+
+pub fn render_message_input(
+    content: &MessageContent,
+    resolve_url_fn: impl Fn(&str) -> String,
+    agent_info: &Option<(String, Vec<String>)>,
+) -> String {
+    match content {
+        MessageContent::Text(text) => multiline_text(text),
+        MessageContent::Array(list) => {
+            let (mut concated_text, mut files) = (String::new(), vec![]);
+            for item in list {
+                match item {
+                    MessageContentPart::Text { text } => {
+                        concated_text = format!("{concated_text} {text}")
+                    }
+                    MessageContentPart::ImageUrl { image_url } => {
+                        files.push(resolve_url_fn(&image_url.url))
+                    }
+                }
+            }
+            if !concated_text.is_empty() {
+                concated_text = format!(" -- {}", multiline_text(&concated_text))
+            }
+            format!(".file {}{}", files.join(" "), concated_text)
+        }
+        MessageContent::ToolCalls(MessageContentToolCalls {
+            tool_results, text, ..
+        }) => {
+            let mut lines = vec![];
+            if !text.is_empty() {
+                lines.push(text.clone())
+            }
+            for tool_result in tool_results {
+                let mut parts = vec!["Call".to_string()];
+                if let Some((agent_name, functions)) = agent_info {
+                    if functions.contains(&tool_result.call.name) {
+                        parts.push(agent_name.clone())
+                    }
+                }
+                parts.push(tool_result.call.name.clone());
+                parts.push(tool_result.call.arguments.to_string());
+                lines.push(dimmed_text(&parts.join(" ")));
+            }
+            lines.join("\n")
         }
     }
 }
