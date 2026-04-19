@@ -1,6 +1,6 @@
 # Macro Guide
 
-Macros are predefined sequences of REPL commands that automate repetitive tasks or workflows, enabling efficient execution of a series of commands with customizable variables and isolated execution contexts.
+Macros are predefined sequences of dot-commands that automate repetitive tasks or workflows, enabling efficient execution of a series of commands with customizable variables and isolated execution contexts.
 
 ## Macro Definition
 
@@ -9,7 +9,7 @@ Macros are defined using YAML files stored in the `<harnx-config-dir>/macros/` d
 The YAML file for a macro consists of two main sections:
 
 - **`steps`** (Required):
-   An array of strings, where each string represents a single REPL command to be executed in sequence. These commands must be valid REPL commands.
+   An array of strings, where each string represents a single dot-command to be executed in sequence. These must be valid dot-commands.
 
 - **`variables`** (Optional):
    An array of variable definitions that can be used within the macro. Each variable has the following properties:

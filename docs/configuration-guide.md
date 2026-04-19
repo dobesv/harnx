@@ -134,7 +134,7 @@ This directory includes:
 
 ### Default Session
 
-- **repl_default_session**: Session spec applied when entering REPL mode.
+- **tui_default_session**: Session spec applied when entering TUI mode. (Accepted under the legacy alias `repl_default_session` for backward compatibility.)
 - **cmd_default_session**: Session spec applied when entering CMD mode.
 - **agent_default_session**: Session identifier used when starting an agent.
 
@@ -146,7 +146,3 @@ See the [RAG Guide](rag-guide.md) for detailed setup instructions.
 
 - **highlight**: Whether to enable syntax highlighting.
 - **light_theme**: Whether to use the light theme.
-- **left_prompt**: Custom left prompt for REPL mode.
-- **right_prompt**: Custom right prompt for REPL mode.
-
-See [Custom REPL Prompt](custom-repl-prompt.md) for prompt customization details.

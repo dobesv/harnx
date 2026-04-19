@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 690
 expression: rendered
 ---
 .rag                     Initialize or access RAG
@@ -19,9 +18,9 @@ expression: rendered
 .copy                    Copy last response
 .set                     Modify runtime settings
 .delete                  Delete agents, sessions, RAGs, or macros
-.exit                    Exit REPL
+.exit                    Exit the interactive session
 
 Type ::: to start multi-line editing, type ::: to finish it.
 Press Ctrl+O to open an editor for editing the input buffer.
-Press Ctrl+C to cancel the response, Ctrl+D to exit the REPL.
+Press Ctrl+C to cancel the response, Ctrl+D to exit.
 • Input

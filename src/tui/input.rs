@@ -150,7 +150,7 @@ impl Tui {
                         *self.shared_pending_message.lock().await = Some(pending);
                         self.refresh_input_chrome();
                     } else if text.trim_start().starts_with('.') {
-                        // Dot-command: route through repl command handler
+                        // Dot-command: route through command handler
                         let attachments_snapshot = self.app.attachments.clone();
                         self.app
                             .transcript
@@ -158,7 +158,7 @@ impl Tui {
                         self.render_submitted_attachments(&attachments_snapshot);
                         self.pin_transcript_to_bottom();
                         self.app.input = Self::new_input();
-                        self.run_repl_command(&text).await?;
+                        self.run_command(&text).await?;
                         self.refresh_input_chrome();
                     } else {
                         let attachments_snapshot = self.app.attachments.clone();
@@ -450,7 +450,7 @@ impl Tui {
             self.app.attachments = pending.attachments;
             self.app.attachment_dir = pending.attachment_dir;
             self.app.paste_count = pending.paste_count;
-            self.run_repl_command(&pending.text).await?;
+            self.run_command(&pending.text).await?;
             self.refresh_input_chrome();
         } else {
             self.start_prompt(pending).await?;
@@ -969,7 +969,7 @@ impl Tui {
         // If we're still typing the first word starting with '.', complete commands
         if parts.len() == 1 && cmd.starts_with('.') {
             let filter = cmd;
-            let commands: Vec<(String, Option<String>)> = crate::repl::REPL_COMMANDS
+            let commands: Vec<(String, Option<String>)> = crate::commands::COMMANDS
                 .iter()
                 .filter(|c| c.name.starts_with(filter))
                 .map(|c| (format!("{} ", c.name), Some(c.description.to_string())))
@@ -977,7 +977,7 @@ impl Tui {
             return commands;
         }
 
-        // For multi-part commands, delegate to config's repl_complete
+        // For multi-part commands, delegate to config's command_complete
         if cmd.starts_with('.') {
             let args: Vec<&str> = parts[1..].iter().map(|p| p.0).collect();
 
@@ -1035,13 +1035,13 @@ impl Tui {
             }
 
             let filter = args.last().copied().unwrap_or("");
-            return self.config.read().repl_complete(cmd, &args, filter);
+            return self.config.read().command_complete(cmd, &args, filter);
         }
 
         vec![]
     }
 
-    pub(super) async fn run_repl_command(&mut self, line: &str) -> Result<()> {
+    pub(super) async fn run_command(&mut self, line: &str) -> Result<()> {
         // Run the command inside a block that owns the lock guards so they are
         // dropped before we touch `self` again for transcript / UI updates.
         let (result, captured) = {
@@ -1051,7 +1051,7 @@ impl Tui {
             let mut pending_async_context = self.pending_async_context.lock().await;
             let mut output = Vec::<u8>::new();
 
-            let result = crate::repl::run_repl_command_with_output(
+            let result = crate::commands::run_command_with_output(
                 &config,
                 abort_signal,
                 line,
@@ -1075,7 +1075,7 @@ impl Tui {
 
         match result {
             Ok(outcome) => {
-                if matches!(outcome, crate::repl::CommandOutcome::Exit) {
+                if matches!(outcome, crate::commands::CommandOutcome::Exit) {
                     self.app.should_quit = true;
                 }
                 let llm_busy = self.app.llm_busy;

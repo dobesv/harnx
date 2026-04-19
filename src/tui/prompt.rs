@@ -67,8 +67,8 @@ impl Tui {
                 if ctx.config.read().session.is_some() {
                     ctx.config.write().empty_session()?;
                 }
-                // Reset so the new agent starts fresh, matching REPL/CMD
-                // paths which pass 0 when recursing after a handoff.
+                // Reset so the new agent starts fresh, matching the CMD
+                // path which passes 0 when recursing after a handoff.
                 resume_count = 0;
             }
 

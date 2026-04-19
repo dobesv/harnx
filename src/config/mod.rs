@@ -12,11 +12,11 @@ use crate::client::{
     create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
     Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
 };
+use crate::commands::{run_command, split_args_text};
 use crate::hooks::{AsyncHookManager, HooksConfig};
 use crate::mcp::{McpManager, McpServerConfig};
 use crate::rag::Rag;
 use crate::render::{MarkdownRender, RenderOptions};
-use crate::repl::{run_repl_command, split_args_text};
 use crate::tool::{ToolDeclaration, ToolResult, Tools};
 use crate::utils::*;
 
@@ -86,9 +86,6 @@ __CONTEXT__
 <user_query>
 __INPUT__
 </user_query>"#;
-
-const LEFT_PROMPT: &str = "{color.cyan}>{color.reset} ";
-const RIGHT_PROMPT: &str = "";
 
 static EDITOR: OnceLock<Option<String>> = OnceLock::new();
 
@@ -239,7 +236,8 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_use_tools")]
     pub use_tools: Option<Vec<String>>,
 
-    pub repl_default_session: Option<String>,
+    #[serde(alias = "repl_default_session")]
+    pub tui_default_session: Option<String>,
     pub cmd_default_session: Option<String>,
     pub agent_default_session: Option<String>,
 
@@ -258,8 +256,6 @@ pub struct Config {
 
     pub highlight: bool,
     pub theme: Option<String>,
-    pub left_prompt: Option<String>,
-    pub right_prompt: Option<String>,
 
     pub serve_addr: Option<String>,
     pub user_agent: Option<String>,
@@ -331,7 +327,7 @@ impl std::fmt::Debug for Config {
             .field("tool_use", &self.tool_use)
             .field("toolsets", &self.toolsets)
             .field("use_tools", &self.use_tools)
-            .field("repl_default_session", &self.repl_default_session)
+            .field("tui_default_session", &self.tui_default_session)
             .field("cmd_default_session", &self.cmd_default_session)
             .field("agent_default_session", &self.agent_default_session)
             .field("save_session", &self.save_session)
@@ -345,8 +341,6 @@ impl std::fmt::Debug for Config {
             .field("document_loaders", &self.document_loaders)
             .field("highlight", &self.highlight)
             .field("theme", &self.theme)
-            .field("left_prompt", &self.left_prompt)
-            .field("right_prompt", &self.right_prompt)
             .field("serve_addr", &self.serve_addr)
             .field("user_agent", &self.user_agent)
             .field("save_shell_history", &self.save_shell_history)
@@ -388,7 +382,7 @@ impl Clone for Config {
             tool_use: self.tool_use,
             toolsets: self.toolsets.clone(),
             use_tools: self.use_tools.clone(),
-            repl_default_session: self.repl_default_session.clone(),
+            tui_default_session: self.tui_default_session.clone(),
             cmd_default_session: self.cmd_default_session.clone(),
             agent_default_session: self.agent_default_session.clone(),
             save_session: self.save_session,
@@ -402,8 +396,6 @@ impl Clone for Config {
             document_loaders: self.document_loaders.clone(),
             highlight: self.highlight,
             theme: self.theme.clone(),
-            left_prompt: self.left_prompt.clone(),
-            right_prompt: self.right_prompt.clone(),
             serve_addr: self.serve_addr.clone(),
             user_agent: self.user_agent.clone(),
             save_shell_history: self.save_shell_history,
@@ -451,7 +443,7 @@ impl Default for Config {
             toolsets: Default::default(),
             use_tools: None,
 
-            repl_default_session: None,
+            tui_default_session: None,
             cmd_default_session: None,
             agent_default_session: None,
 
@@ -469,8 +461,6 @@ impl Default for Config {
 
             highlight: true,
             theme: None,
-            left_prompt: None,
-            right_prompt: None,
 
             serve_addr: None,
             user_agent: None,
@@ -1309,7 +1299,7 @@ impl Config {
             let editor = this.editor()?;
             edit_file(&editor, &agent_path)
         })?;
-        if self.working_mode.is_repl() {
+        if self.working_mode.is_tui() {
             println!("✓ Saved the agent to '{}'.", agent_path.display());
         }
         Ok(())
@@ -1354,7 +1344,7 @@ impl Config {
                 )
             })?;
             agent.set_name(&agent_name);
-            if self.working_mode.is_repl() {
+            if self.working_mode.is_tui() {
                 println!("✓ Saved the agent to '{}'.", agent_path.display());
             }
         }
@@ -1458,7 +1448,7 @@ impl Config {
     pub fn exit_session(&mut self) -> Result<()> {
         if let Some(mut session) = self.session.take() {
             let sessions_dir = self.sessions_dir();
-            session.exit(&sessions_dir, self.working_mode.is_repl())?;
+            session.exit(&sessions_dir, self.working_mode.is_tui())?;
             self.discontinuous_last_message();
         }
         Ok(())
@@ -1477,7 +1467,7 @@ impl Config {
         };
         let session_path = self.session_file(&session_name);
         if let Some(session) = self.session.as_mut() {
-            session.save(&session_name, &session_path, self.working_mode.is_repl())?;
+            session.save(&session_name, &session_path, self.working_mode.is_tui())?;
         }
         Ok(())
     }
@@ -1569,7 +1559,7 @@ impl Config {
                 .filter(|v| !v.is_empty())
         } else {
             let default_session = match self.working_mode {
-                WorkingMode::Repl => self.repl_default_session.as_ref(),
+                WorkingMode::Tui => self.tui_default_session.as_ref(),
                 WorkingMode::Cmd => self.cmd_default_session.as_ref(),
                 WorkingMode::Serve | WorkingMode::Acp(_) => None,
             };
@@ -1939,7 +1929,7 @@ impl Config {
         config.write().rag = agent.rag();
         config.write().agent = Some(agent);
         if let Some(session) = session {
-            // Exit any existing session (e.g. from repl_default_session) before
+            // Exit any existing session (e.g. from tui_default_session) before
             // switching to the agent's session.
             config.write().exit_session()?;
             config.write().use_session(Some(&session))?;
@@ -1978,7 +1968,7 @@ impl Config {
         self.exit_session()?;
         if let Some(agent) = self.agent.as_mut() {
             agent.exit_session();
-            if self.working_mode.is_repl() {
+            if self.working_mode.is_tui() {
                 self.init_agent_shared_variables()?;
             }
         }
@@ -2027,7 +2017,7 @@ impl Config {
             return Ok(());
         }
         let default_session = match self.working_mode {
-            WorkingMode::Repl => self.repl_default_session.as_ref(),
+            WorkingMode::Tui => self.tui_default_session.as_ref(),
             WorkingMode::Cmd => self.cmd_default_session.as_ref(),
             WorkingMode::Serve => return Ok(()),
             WorkingMode::Acp(_) => self.agent_default_session.as_ref(),
@@ -2124,7 +2114,7 @@ impl Config {
         .ok_or_else(|| anyhow!("Editor not found. Please add the `editor` configuration or set the $EDITOR or $VISUAL environment variable."))
     }
 
-    pub fn repl_complete(
+    pub fn command_complete(
         &self,
         cmd: &str,
         args: &[&str],
@@ -2377,18 +2367,6 @@ impl Config {
         Ok(RenderOptions::new(theme, wrap, self.wrap_code, truecolor))
     }
 
-    pub fn render_prompt_left(&self) -> String {
-        let variables = self.generate_prompt_context();
-        let left_prompt = self.left_prompt.as_deref().unwrap_or(LEFT_PROMPT);
-        render_prompt(left_prompt, &variables)
-    }
-
-    pub fn render_prompt_right(&self) -> String {
-        let variables = self.generate_prompt_context();
-        let right_prompt = self.right_prompt.as_deref().unwrap_or(RIGHT_PROMPT);
-        render_prompt(right_prompt, &variables)
-    }
-
     /// Render a status line showing agent name and session ID.
     ///
     /// When `use_icons` is true, an appropriate icon leads the line:
@@ -2429,90 +2407,6 @@ impl Config {
             println!("{text}");
         }
         Ok(())
-    }
-
-    fn generate_prompt_context(&self) -> HashMap<&str, String> {
-        let mut output = HashMap::new();
-        let agent = self.extract_agent();
-        output.insert("model", agent.model().id());
-        output.insert("client_name", agent.model().client_name().to_string());
-        output.insert("model_name", agent.model().name().to_string());
-        output.insert(
-            "max_input_tokens",
-            agent
-                .model()
-                .max_input_tokens()
-                .unwrap_or_default()
-                .to_string(),
-        );
-        if let Some(temperature) = agent.temperature() {
-            if temperature != 0.0 {
-                output.insert("temperature", temperature.to_string());
-            }
-        }
-        if let Some(top_p) = agent.top_p() {
-            if top_p != 0.0 {
-                output.insert("top_p", top_p.to_string());
-            }
-        }
-        if self.dry_run {
-            output.insert("dry_run", "true".to_string());
-        }
-        if self.stream {
-            output.insert("stream", "true".to_string());
-        }
-        if self.save {
-            output.insert("save", "true".to_string());
-        }
-        if let Some(wrap) = &self.wrap {
-            if wrap != "no" {
-                output.insert("wrap", wrap.clone());
-            }
-        }
-        if agent.name() != TEMP_AGENT_NAME {
-            output.insert("agent", agent.name().to_string());
-        }
-        if let Some(session) = &self.session {
-            output.insert("session", session.name().to_string());
-            if let Some(autoname) = session.autoname() {
-                output.insert("session_autoname", autoname.to_string());
-            }
-            output.insert("dirty", session.dirty().to_string());
-            let (tokens, percent) = session.tokens_usage();
-            output.insert("consume_tokens", tokens.to_string());
-            output.insert("consume_percent", percent.to_string());
-            output.insert("user_messages_len", session.user_messages_len().to_string());
-        }
-        if let Some(rag) = &self.rag {
-            output.insert("rag", rag.name().to_string());
-        }
-        if let Some(agent) = &self.agent {
-            output.insert("agent", agent.name().to_string());
-        }
-
-        if self.highlight {
-            output.insert("color.reset", "\u{1b}[0m".to_string());
-            output.insert("color.black", "\u{1b}[30m".to_string());
-            output.insert("color.dark_gray", "\u{1b}[90m".to_string());
-            output.insert("color.red", "\u{1b}[31m".to_string());
-            output.insert("color.light_red", "\u{1b}[91m".to_string());
-            output.insert("color.green", "\u{1b}[32m".to_string());
-            output.insert("color.light_green", "\u{1b}[92m".to_string());
-            output.insert("color.yellow", "\u{1b}[33m".to_string());
-            output.insert("color.light_yellow", "\u{1b}[93m".to_string());
-            output.insert("color.blue", "\u{1b}[34m".to_string());
-            output.insert("color.light_blue", "\u{1b}[94m".to_string());
-            output.insert("color.purple", "\u{1b}[35m".to_string());
-            output.insert("color.light_purple", "\u{1b}[95m".to_string());
-            output.insert("color.magenta", "\u{1b}[35m".to_string());
-            output.insert("color.light_magenta", "\u{1b}[95m".to_string());
-            output.insert("color.cyan", "\u{1b}[36m".to_string());
-            output.insert("color.light_cyan", "\u{1b}[96m".to_string());
-            output.insert("color.white", "\u{1b}[37m".to_string());
-            output.insert("color.light_gray", "\u{1b}[97m".to_string());
-        }
-
-        output
     }
 
     pub fn before_chat_completion(&mut self, input: &Input) -> Result<()> {
@@ -2891,8 +2785,10 @@ impl Config {
             }
         }
 
-        if let Some(v) = read_env_value::<String>(&get_env_name("repl_default_session")) {
-            self.repl_default_session = v;
+        if let Some(v) = read_env_value::<String>(&get_env_name("tui_default_session"))
+            .or_else(|| read_env_value::<String>(&get_env_name("repl_default_session")))
+        {
+            self.tui_default_session = v;
         }
         if let Some(v) = read_env_value::<String>(&get_env_name("cmd_default_session")) {
             self.cmd_default_session = v;
@@ -2952,13 +2848,6 @@ impl Config {
                 }
             }
         }
-        if let Some(v) = read_env_value::<String>(&get_env_name("left_prompt")) {
-            self.left_prompt = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("right_prompt")) {
-            self.right_prompt = v;
-        }
-
         if let Some(v) = read_env_value::<String>(&get_env_name("serve_addr")) {
             self.serve_addr = v;
         }
@@ -3173,7 +3062,7 @@ pub fn load_env_file() -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkingMode {
     Cmd,
-    Repl,
+    Tui,
     Serve,
     Acp(String),
 }
@@ -3182,8 +3071,8 @@ impl WorkingMode {
     pub fn is_cmd(&self) -> bool {
         matches!(self, WorkingMode::Cmd)
     }
-    pub fn is_repl(&self) -> bool {
-        matches!(self, WorkingMode::Repl)
+    pub fn is_tui(&self) -> bool {
+        matches!(self, WorkingMode::Tui)
     }
     pub fn is_serve(&self) -> bool {
         matches!(self, WorkingMode::Serve)
@@ -3229,7 +3118,7 @@ pub async fn macro_execute(
     for step in &macro_value.steps {
         let command = Macro::interpolate_command(step, &variables);
         println!(">> {}", multiline_text(&command));
-        run_repl_command(
+        run_command(
             &config,
             abort_signal.clone(),
             &command,
@@ -3336,36 +3225,6 @@ bitflags::bitflags! {
         const SESSION = 1 << 1;
         const RAG = 1 << 2;
         const AGENT = 1 << 3;
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AssertState {
-    True(StateFlags),
-    False(StateFlags),
-    TrueFalse(StateFlags, StateFlags),
-    Equal(StateFlags),
-}
-
-impl AssertState {
-    pub fn pass() -> Self {
-        AssertState::False(StateFlags::empty())
-    }
-
-    pub fn bare() -> Self {
-        AssertState::Equal(StateFlags::empty())
-    }
-
-    pub fn assert(self, flags: StateFlags) -> bool {
-        match self {
-            AssertState::True(true_flags) => true_flags & flags != StateFlags::empty(),
-            AssertState::False(false_flags) => false_flags & flags == StateFlags::empty(),
-            AssertState::TrueFalse(true_flags, false_flags) => {
-                (true_flags & flags != StateFlags::empty())
-                    && (false_flags & flags == StateFlags::empty())
-            }
-            AssertState::Equal(check_flags) => check_flags == flags,
-        }
     }
 }
 

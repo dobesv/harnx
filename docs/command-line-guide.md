@@ -38,7 +38,7 @@ Options:
 ## Examples
 
 ```
-harnx                                          # Enter REPL
+harnx                                          # Enter the interactive TUI
 harnx Tell a joke                              # Generate response
 
 harnx --serve                                  # Run server
