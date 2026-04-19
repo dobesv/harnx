@@ -1573,6 +1573,7 @@ dependencies = [
  "glob",
  "globset",
  "harnx-core",
+ "harnx-mcp",
  "hmac",
  "hnsw_rs",
  "html_to_markdown",
@@ -1648,6 +1649,13 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "urlencoding",
+]
+
+[[package]]
+name = "harnx-mcp"
+version = "0.30.0"
+dependencies = [
+ "uuid",
 ]
 
 [[package]]

@@ -5,7 +5,6 @@ mod commands;
 mod config;
 mod hooks;
 mod mcp;
-pub mod mcp_safety;
 mod rag;
 mod render;
 mod serve;
@@ -20,6 +19,8 @@ extern crate log;
 
 #[cfg(test)]
 pub mod test_utils;
+
+pub use harnx_mcp::safety as mcp_safety;
 
 use crate::cli::Cli;
 use crate::client::{list_models, retry::call_with_retry_and_fallback, ModelType};

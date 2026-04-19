@@ -1,0 +1,13 @@
+[package]
+name = "harnx-mcp"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP (Model Context Protocol) support for harnx: safety/validation utilities and (future) client glue"
+
+[dependencies]
+
+[dev-dependencies]
+uuid = { workspace = true }
