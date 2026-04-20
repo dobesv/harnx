@@ -3,6 +3,7 @@ extern crate log;
 
 pub mod acp;
 pub mod cli;
+pub mod cli_event_sink;
 pub mod client;
 pub mod commands;
 pub mod config;
