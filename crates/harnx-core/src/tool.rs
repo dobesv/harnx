@@ -180,3 +180,232 @@ impl ToolCall {
         }
     }
 }
+
+pub const TRIGGER_AGENT_TOOL_NAME: &str = "trigger_agent";
+
+/// Builds the deprecated `trigger_agent` tool declaration for
+/// backward-compatible agent handoff. Prefer per-agent `*_session_handoff`
+/// tools for interactive delegation; this declaration is kept for older
+/// configs that still reference it by name.
+pub fn trigger_agent_tool_declaration() -> ToolDeclaration {
+    let mut properties = IndexMap::new();
+    properties.insert(
+        "agent".to_string(),
+        JsonSchema {
+            type_value: Some("string".to_string()),
+            description: Some("The name of the agent to transfer the session to.".to_string()),
+            ..Default::default()
+        },
+    );
+    properties.insert(
+        "prompt".to_string(),
+        JsonSchema {
+            type_value: Some("string".to_string()),
+            description: Some("The new prompt to start the new agent with.".to_string()),
+            ..Default::default()
+        },
+    );
+    ToolDeclaration {
+        name: TRIGGER_AGENT_TOOL_NAME.to_string(),
+        description: "Deprecated compatibility tool. Prefer per-agent *_session_handoff tools for interactive delegation."
+            .to_string(),
+        parameters: JsonSchema {
+            type_value: Some("object".to_string()),
+            properties: Some(properties),
+            required: Some(vec!["agent".to_string(), "prompt".to_string()]),
+            ..Default::default()
+        },
+        mcp_tool_name: None,
+    }
+}
+
+/// Extracts user-visible text from an MCP `CallToolResult` value.
+///
+/// The result value has the shape:
+/// ```json
+/// { "content": [{ "type": "text", "text": "...", "annotations": { "audience": ["user"] } }] }
+/// ```
+///
+/// Content parts whose `annotations.audience` exists but does NOT contain
+/// `"user"` are skipped. Parts with no annotations or with audience
+/// containing `"user"` are included. Returns `Some(joined_text)` if any
+/// text was extracted, `None` otherwise.
+pub fn extract_user_display_text(result: &Value) -> Option<String> {
+    let content = result.get("content")?.as_array()?;
+    let mut parts: Vec<&str> = Vec::new();
+    for item in content {
+        // Check audience annotation: if present and does NOT contain "user", skip
+        if let Some(annotations) = item.get("annotations") {
+            if let Some(audience) = annotations.get("audience") {
+                if let Some(audience_arr) = audience.as_array() {
+                    if !audience_arr.iter().any(|v| v.as_str() == Some("user")) {
+                        continue;
+                    }
+                }
+            }
+        }
+        // Extract text from this content part
+        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_extract_user_display_text_basic() {
+        let result = json!({
+            "content": [
+                {"type": "text", "text": "hello world"}
+            ],
+            "isError": false
+        });
+        assert_eq!(
+            extract_user_display_text(&result),
+            Some("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_user_display_text_multiple_parts() {
+        let result = json!({
+            "content": [
+                {"type": "text", "text": "line one"},
+                {"type": "text", "text": "line two"}
+            ]
+        });
+        assert_eq!(
+            extract_user_display_text(&result),
+            Some("line one\nline two".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_user_display_text_user_audience() {
+        let result = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "visible",
+                    "annotations": {"audience": ["user"]}
+                }
+            ]
+        });
+        assert_eq!(
+            extract_user_display_text(&result),
+            Some("visible".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_user_display_text_assistant_only_audience() {
+        let result = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "hidden from display",
+                    "annotations": {"audience": ["assistant"]}
+                }
+            ]
+        });
+        assert_eq!(extract_user_display_text(&result), None);
+    }
+
+    #[test]
+    fn test_extract_user_display_text_mixed_audiences() {
+        let result = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "user sees this",
+                    "annotations": {"audience": ["user"]}
+                },
+                {
+                    "type": "text",
+                    "text": "assistant only",
+                    "annotations": {"audience": ["assistant"]}
+                },
+                {
+                    "type": "text",
+                    "text": "no annotations"
+                }
+            ]
+        });
+        assert_eq!(
+            extract_user_display_text(&result),
+            Some("user sees this\nno annotations".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_user_display_text_both_audiences() {
+        let result = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "for both",
+                    "annotations": {"audience": ["user", "assistant"]}
+                }
+            ]
+        });
+        assert_eq!(
+            extract_user_display_text(&result),
+            Some("for both".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_user_display_text_no_content() {
+        let result = json!({"isError": false});
+        assert_eq!(extract_user_display_text(&result), None);
+    }
+
+    #[test]
+    fn test_extract_user_display_text_empty_content() {
+        let result = json!({"content": []});
+        assert_eq!(extract_user_display_text(&result), None);
+    }
+
+    #[test]
+    fn test_extract_user_display_text_non_mcp_value() {
+        // Plain string value — not MCP format
+        let result = json!("just a string");
+        assert_eq!(extract_user_display_text(&result), None);
+    }
+
+    #[test]
+    fn test_extract_user_display_text_content_without_text() {
+        let result = json!({
+            "content": [
+                {"type": "image", "data": "base64..."}
+            ]
+        });
+        assert_eq!(extract_user_display_text(&result), None);
+    }
+
+    #[test]
+    fn test_extract_user_display_text_annotations_without_audience() {
+        let result = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "has annotations but no audience",
+                    "annotations": {"priority": 0.5}
+                }
+            ]
+        });
+        assert_eq!(
+            extract_user_display_text(&result),
+            Some("has annotations but no audience".to_string())
+        );
+    }
+}
