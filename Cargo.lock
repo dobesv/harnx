@@ -1691,6 +1691,7 @@ dependencies = [
  "sys-locale",
  "tokio",
  "unicode-segmentation",
+ "unicode-width",
  "urlencoding",
 ]
 

@@ -9,6 +9,8 @@ pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
 #[allow(unused_imports)]
+pub use harnx_core::last_message::LastMessage;
+#[allow(unused_imports)]
 pub use harnx_core::macros::{Macro, MacroVariable};
 pub use harnx_core::model::ModelsOverride;
 pub use harnx_core::working_mode::WorkingMode;
@@ -3072,23 +3074,6 @@ pub async fn macro_execute(
     }
     persistent_manager.lock().await.shutdown();
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub struct LastMessage {
-    pub input: Input,
-    pub output: String,
-    pub continuous: bool,
-}
-
-impl LastMessage {
-    pub fn new(input: Input, output: String) -> Self {
-        Self {
-            input,
-            output,
-            continuous: true,
-        }
-    }
 }
 
 bitflags::bitflags! {

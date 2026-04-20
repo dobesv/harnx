@@ -26,4 +26,5 @@ sha2 = { workspace = true }
 sys-locale = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
 urlencoding = { workspace = true }

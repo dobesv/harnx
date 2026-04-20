@@ -1,45 +1,18 @@
 use super::*;
 
 use crate::client::{
-    init_client, patch_messages, ChatCompletionsData, Client, ImageUrl, Message, MessageContent,
-    MessageContentPart, MessageContentToolCalls, MessageRole, Model,
+    init_client, patch_messages, ChatCompletionsData, Client, Message, MessageContent, MessageRole,
+    Model,
 };
-use crate::tool::ToolResult;
-use crate::utils::{base64_encode, create_abort_signal, is_loader_protocol, sha256, AbortSignal};
+use crate::utils::{create_abort_signal, is_loader_protocol, AbortSignal};
+
+pub use harnx_core::input::{resolve_data_url, Input};
 
 use anyhow::{bail, Context, Result};
 use indexmap::IndexSet;
 use std::{collections::HashMap, fs::File, io::Read};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
-const SUMMARY_MAX_WIDTH: usize = 80;
-
-#[derive(Debug, Clone)]
-pub struct Input {
-    text: String,
-    raw: (String, Vec<String>),
-    patched_text: Option<String>,
-    last_reply: Option<String>,
-    continue_output: Option<String>,
-    regenerate: bool,
-    medias: Vec<String>,
-    data_urls: HashMap<String, String>,
-    tool_calls: Option<MessageContentToolCalls>,
-    agent: AgentConfig,
-    rag_name: Option<String>,
-    with_session: bool,
-    with_agent: bool,
-    /// When true, `Session::build_messages` will prepend the agent's system
-    /// prompt even though the session already has messages.  Set by
-    /// `set_agent()` — the only path that swaps agents after construction
-    /// (e.g. compaction).
-    inject_system_prompt: bool,
-    /// User text injected after tool-call results (pending message consumed
-    /// mid-tool-loop).  Appended as a trailing User message in
-    /// `build_messages()`.
-    injected_user_text: Option<String>,
-}
 
 pub fn from_str(config: &GlobalConfig, text: &str, agent: Option<Agent>) -> Input {
     let (agent, with_session, with_agent) = resolve_agent(&config.read(), agent);
@@ -145,186 +118,6 @@ pub async fn from_files_with_spinner(
     .await
 }
 
-impl Input {
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.medias.is_empty()
-    }
-
-    pub fn data_urls(&self) -> HashMap<String, String> {
-        self.data_urls.clone()
-    }
-
-    pub fn tool_calls(&self) -> &Option<MessageContentToolCalls> {
-        &self.tool_calls
-    }
-
-    pub fn text(&self) -> String {
-        match self.patched_text.clone() {
-            Some(text) => text,
-            None => self.text.clone(),
-        }
-    }
-
-    pub fn clear_patch(&mut self) {
-        self.patched_text = None;
-    }
-
-    pub fn set_text(&mut self, text: String) {
-        self.text = text;
-    }
-
-    pub fn continue_output(&self) -> Option<&str> {
-        self.continue_output.as_deref()
-    }
-
-    pub fn set_continue_output(&mut self, output: &str) {
-        let output = match &self.continue_output {
-            Some(v) => format!("{v}{output}"),
-            None => output.to_string(),
-        };
-        self.continue_output = Some(output);
-    }
-
-    pub fn regenerate(&self) -> bool {
-        self.regenerate
-    }
-
-    pub fn rag_name(&self) -> Option<&str> {
-        self.rag_name.as_deref()
-    }
-
-    pub fn merge_tool_results(
-        mut self,
-        output: String,
-        thought: Option<String>,
-        tool_results: Vec<ToolResult>,
-    ) -> Self {
-        match self.tool_calls.as_mut() {
-            Some(exist_tool_results) => {
-                exist_tool_results.merge(tool_results, output, thought);
-            }
-            None => {
-                self.tool_calls = Some(MessageContentToolCalls::new(tool_results, output, thought))
-            }
-        }
-        self
-    }
-
-    pub fn set_injected_user_text(&mut self, text: String) {
-        self.injected_user_text = Some(text);
-    }
-
-    pub fn injected_user_text(&self) -> Option<&str> {
-        self.injected_user_text.as_deref()
-    }
-
-    pub fn agent(&self) -> &AgentConfig {
-        &self.agent
-    }
-
-    #[cfg(test)]
-    pub fn agent_mut(&mut self) -> &mut AgentConfig {
-        &mut self.agent
-    }
-
-    pub fn session<'a>(&self, session: &'a Option<Session>) -> Option<&'a Session> {
-        if self.with_session {
-            session.as_ref()
-        } else {
-            None
-        }
-    }
-
-    pub fn with_session(&self) -> bool {
-        self.with_session
-    }
-
-    pub fn with_agent(&self) -> bool {
-        self.with_agent
-    }
-
-    pub fn inject_system_prompt(&self) -> bool {
-        self.inject_system_prompt
-    }
-
-    pub fn summary(&self) -> String {
-        let text: String = self
-            .text
-            .trim()
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
-        if text.width_cjk() > SUMMARY_MAX_WIDTH {
-            let mut sum_width = 0;
-            let mut chars = vec![];
-            for c in text.chars() {
-                sum_width += c.width_cjk().unwrap_or(1);
-                if sum_width > SUMMARY_MAX_WIDTH - 3 {
-                    chars.extend(['.', '.', '.']);
-                    break;
-                }
-                chars.push(c);
-            }
-            chars.into_iter().collect()
-        } else {
-            text
-        }
-    }
-
-    pub fn raw(&self) -> String {
-        let (text, files) = &self.raw;
-        let mut segments = files.to_vec();
-        if !segments.is_empty() {
-            segments.insert(0, ".file".into());
-        }
-        if !text.is_empty() {
-            if !segments.is_empty() {
-                segments.push("--".into());
-            }
-            segments.push(text.clone());
-        }
-        segments.join(" ")
-    }
-
-    pub fn render(&self) -> String {
-        let text = self.text();
-        if self.medias.is_empty() {
-            return text;
-        }
-        let tail_text = if text.is_empty() {
-            String::new()
-        } else {
-            format!(" -- {text}")
-        };
-        let files: Vec<String> = self
-            .medias
-            .iter()
-            .cloned()
-            .map(|url| resolve_data_url(&self.data_urls, url))
-            .collect();
-        format!(".file {}{}", files.join(" "), tail_text)
-    }
-
-    pub fn message_content(&self) -> MessageContent {
-        if self.medias.is_empty() {
-            MessageContent::Text(self.text())
-        } else {
-            let mut list: Vec<MessageContentPart> = self
-                .medias
-                .iter()
-                .cloned()
-                .map(|url| MessageContentPart::ImageUrl {
-                    image_url: ImageUrl { url },
-                })
-                .collect();
-            if !self.text.is_empty() {
-                list.insert(0, MessageContentPart::Text { text: self.text() });
-            }
-            MessageContent::Array(list)
-        }
-    }
-}
-
 pub fn stream(input: &Input, config: &GlobalConfig) -> bool {
     config.read().stream && !input.agent().model().no_stream()
 }
@@ -390,7 +183,7 @@ pub fn prepare_completion_data(
 }
 
 pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Message>> {
-    let mut messages = if let Some(session) = input.session(&config.read().session) {
+    let mut messages = if let Some(session) = session_of(input, &config.read().session) {
         session.build_messages(input)
     } else {
         crate::config::agent::build_messages(input.agent(), input)
@@ -411,10 +204,21 @@ pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Messag
 }
 
 pub fn echo_messages(input: &Input, config: &GlobalConfig) -> String {
-    if let Some(session) = input.session(&config.read().session) {
+    if let Some(session) = session_of(input, &config.read().session) {
         session.echo_messages(input)
     } else {
         crate::config::agent::echo_messages(input.agent(), input)
+    }
+}
+
+/// Returns the session to use for this input, if any. Replaces the
+/// previous `Input::session(&self, &Option<Session>)` method — kept in
+/// harnx because `Session` is a harnx-only type.
+pub fn session_of<'a>(input: &Input, session: &'a Option<Session>) -> Option<&'a Session> {
+    if input.with_session() {
+        session.as_ref()
+    } else {
+        None
     }
 }
 
@@ -551,18 +355,6 @@ async fn load_documents(
     }
 
     Ok((files, medias, data_urls))
-}
-
-pub fn resolve_data_url(data_urls: &HashMap<String, String>, data_url: String) -> String {
-    if data_url.starts_with("data:") {
-        let hash = sha256(&data_url);
-        if let Some(path) = data_urls.get(&hash) {
-            return path.to_string();
-        }
-        data_url
-    } else {
-        data_url
-    }
 }
 
 fn is_image(path: &str) -> bool {
