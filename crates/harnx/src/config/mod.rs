@@ -8,6 +8,7 @@ pub use self::input::Input;
 use self::session::Session;
 #[allow(unused_imports)]
 pub use harnx_core::macros::{Macro, MacroVariable};
+pub use harnx_core::model::ModelsOverride;
 pub use harnx_core::working_mode::WorkingMode;
 
 use crate::acp::{AcpManager, AcpServerConfig};
@@ -28,7 +29,7 @@ use globset::GlobBuilder;
 use indexmap::IndexMap;
 use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use parking_lot::RwLock;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use simplelog::LevelFilter;
 use std::collections::{HashMap, HashSet};
@@ -3115,12 +3116,6 @@ pub async fn macro_execute(
     }
     persistent_manager.lock().await.shutdown();
     Ok(())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelsOverride {
-    pub version: String,
-    pub list: Vec<ProviderModels>,
 }
 
 #[derive(Debug, Clone)]

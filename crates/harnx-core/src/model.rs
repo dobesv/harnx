@@ -374,3 +374,11 @@ where
         None => "-".to_string(),
     }
 }
+
+/// User-provided override file (models-override.yaml) that can add or
+/// replace entries in the built-in provider-model catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsOverride {
+    pub version: String,
+    pub list: Vec<ProviderModels>,
+}
