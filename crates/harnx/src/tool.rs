@@ -1,14 +1,9 @@
 use crate::{
-    acp::AcpManager,
     config::GlobalConfig,
     hooks::{HookEvent, HookOutcome, HookResult, HookResultControl},
-    mcp::McpManager,
     mcp_safety::{truncate_output, TruncateOpts},
     tui::render_helpers::event_fallback_text,
-    ui_output::{
-        emit_ui_output_event, has_ui_output_sink, pretty_yaml_block, UiOutputEvent,
-        UiOutputEventKind,
-    },
+    ui_output::{emit_ui_output_event, pretty_yaml_block, UiOutputEvent, UiOutputEventKind},
     utils::*,
 };
 
@@ -20,6 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
+use harnx_core::tool::ToolProvider;
 pub use harnx_core::tool::{
     extract_user_display_text, trigger_agent_tool_declaration, JsonSchema, SwitchAgentData,
     ToolCall, ToolDeclaration, ToolError, ToolResult, Tools, TRIGGER_AGENT_TOOL_NAME,
@@ -50,8 +46,7 @@ pub type DispatchHookFn =
 /// as prep for moving the loop into `harnx-engine` — at that point
 /// the loop can be moved without any Config dep.
 pub struct ToolEvalContext {
-    pub acp_manager: Option<Arc<AcpManager>>,
-    pub mcp_manager: Option<Arc<McpManager>>,
+    pub providers: Vec<Arc<dyn ToolProvider>>,
     pub session_name: Option<String>,
     pub allowed_tool_names: HashSet<String>,
     /// Called when a tool is about to be dispatched. Receives the tool
@@ -88,6 +83,24 @@ impl ToolEvalContext {
             .map(|decl| decl.name)
             .collect();
         let hooks = guard.resolved_hooks();
+        let acp_manager = guard.acp_manager.clone();
+        let mcp_manager = guard.mcp_manager.clone();
+        let session_name = guard
+            .session
+            .as_ref()
+            .map(|session| session.name().to_string());
+        drop(guard);
+
+        // Build the provider list in ACP-first order so ACP sub-agent
+        // handoffs take priority over any namespaced MCP tool with the
+        // same name.
+        let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
+        if let Some(acp) = acp_manager {
+            providers.push(acp as Arc<dyn ToolProvider>);
+        }
+        if let Some(mcp) = mcp_manager {
+            providers.push(mcp as Arc<dyn ToolProvider>);
+        }
 
         // Capture owned state for the dispatch callback so the
         // returned future is `'static` and `Send`.
@@ -105,12 +118,8 @@ impl ToolEvalContext {
         });
 
         Self {
-            acp_manager: guard.acp_manager.clone(),
-            mcp_manager: guard.mcp_manager.clone(),
-            session_name: guard
-                .session
-                .as_ref()
-                .map(|session| session.name().to_string()),
+            providers,
+            session_name,
             allowed_tool_names,
             emit_tool_call_fn: Arc::new(default_emit_tool_call),
             emit_tool_result_fn: Arc::new(default_emit_tool_result),
@@ -377,112 +386,26 @@ fn eval_tool_call_mcp(
         }));
     }
 
-    let acp_manager = ctx.acp_manager.clone();
-    if let Some(manager) = acp_manager {
-        if manager.find_client_for_tool(&call.name).is_some() {
-            let tool_name = call.name.clone();
-            // call_tool internally races session_prompt against
-            // Ctrl+C and cancels the ACP session (including
-            // auto-created sessions) when the user aborts.
-            //
-            // Subscribe to ACP chunk notifications so that tool calls,
-            // agent thoughts, plan updates, and text chunks from the
-            // sub-agent (and any nested sub-sub-agents) are printed to
-            // stdout in real-time instead of being silently swallowed.
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let has_ui_output = has_ui_output_sink();
-                    let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
-
-                    // Give the parent tool-call event a chance to be
-                    // consumed by the UI before nested ACP output from the
-                    // delegated session starts arriving. This keeps the
-                    // visible transcript ordering causal: the handoff tool
-                    // row should appear before any child output it triggers.
-                    tokio::task::yield_now().await;
-
-                    let (chunk_rx, subscription_id) = manager.subscribe_chunks().await;
-
-                    // Spawn a spinner only in non-TUI terminal mode.
-                    let spinner = if is_terminal {
-                        Some(spawn_spinner(&format!("  {} working…", tool_name)))
-                    } else {
-                        None
-                    };
-
-                    // Forward chunks either to TUI output sink or stdout.
-                    let spinner_clone = spinner.clone();
-                    let spinner_msg = format!("  {} working…", tool_name);
-                    let forward_handle = tokio::spawn(crate::acp::forward_acp_chunks(
-                        chunk_rx,
-                        spinner_clone,
-                        spinner_msg,
-                        is_terminal,
-                    ));
-
-                    // Race the sub-agent call against our abort_signal
-                    // so Ctrl-C interrupts nested ACP delegations the
-                    // same way it interrupts MCP tools.
-                    let call_result = tokio::select! {
-                        result = manager.call_tool(&tool_name, json_data) => result,
-                        _ = wait_abort_signal(abort_signal) => {
-                            Err(anyhow!("ACP tool call aborted by user"))
-                        }
-                    };
-
-                    // Tear down: unsubscribe first (closes the
-                    // channel), then await the forward task.
-                    manager.unsubscribe_chunks(subscription_id).await;
-                    forward_handle.abort();
-                    let _ = forward_handle.await;
-
-                    if let Some(s) = spinner {
-                        s.stop();
-                    }
-
-                    call_result
-                })
-            })
-            .map_err(|err| {
-                // Only user-initiated aborts (Ctrl+C) are fatal and should
-                // stop the entire tool batch.  Other failures (timeouts,
-                // connection errors, bad arguments) are recoverable so the
-                // LLM receives the error message and can retry.
-                if err.to_string().contains("aborted by user") {
-                    ToolError::Fatal(err)
-                } else {
-                    ToolError::Recoverable(err)
-                }
-            })?;
-
-            return Ok(result);
+    for provider in &ctx.providers {
+        if !provider.has_tool(&call.name) {
+            continue;
         }
+        let tool_name = call.name.clone();
+        let args = json_data.clone();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(provider.call_tool(
+                &tool_name,
+                args,
+                abort_signal,
+            ))
+        })?;
+        return Ok(result);
     }
 
-    let mcp_manager = ctx.mcp_manager.clone();
-    let manager = match mcp_manager {
-        Some(m) => m,
-        None => {
-            return Err(ToolError::Recoverable(anyhow!(
-                "No tool provider configured for '{}'",
-                call.name
-            )))
-        }
-    };
-
-    let tool_name = call.name.clone();
-    let result = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            tokio::select! {
-                result = manager.call_tool(&tool_name, json_data) => result.map_err(ToolError::Recoverable),
-                _ = wait_abort_signal(abort_signal) => {
-                    Err(ToolError::Fatal(anyhow!("MCP tool call aborted by user")))
-                }
-            }
-        })
-    })?;
-
-    Ok(result)
+    Err(ToolError::Recoverable(anyhow!(
+        "No tool provider configured for '{}'",
+        call.name
+    )))
 }
 
 #[cfg(test)]
