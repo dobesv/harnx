@@ -142,43 +142,6 @@ impl Agent {
         agent
     }
 
-    /// Load file-backed defaults for variables that have a `path:` field.
-    fn resolve_file_backed_variables(
-        variables: &mut [AgentVariable],
-        agent_dir: &Path,
-    ) -> Result<()> {
-        for variable in variables.iter_mut() {
-            if let Some(path_str) = &variable.path {
-                if variable.default.is_some() {
-                    log::warn!(
-                        "Variable '{}': both 'path' and 'default' set, using 'path'",
-                        variable.name
-                    );
-                }
-
-                let resolved_path = safe_join_path(agent_dir, path_str).ok_or_else(|| {
-                    anyhow!(
-                        "Variable '{}': path '{}' is not allowed (must be relative, no '..' traversal)",
-                        variable.name,
-                        path_str
-                    )
-                })?;
-
-                let content = std::fs::read_to_string(&resolved_path).with_context(|| {
-                    format!(
-                        "Failed to load file '{}' (resolved to '{}') for variable '{}'",
-                        path_str,
-                        resolved_path.display(),
-                        variable.name
-                    )
-                })?;
-
-                variable.default = Some(content);
-            }
-        }
-        Ok(())
-    }
-
     pub fn export(&self) -> Result<String> {
         let metadata = AgentFrontMatter::from_agent(self);
         if metadata.is_empty() {
@@ -457,6 +420,40 @@ pub fn load(path: &Path) -> Result<Agent> {
     Ok(Agent::from_markdown(name, &contents))
 }
 
+/// Load file-backed defaults for variables that have a `path:` field.
+fn resolve_file_backed_variables(variables: &mut [AgentVariable], agent_dir: &Path) -> Result<()> {
+    for variable in variables.iter_mut() {
+        if let Some(path_str) = &variable.path {
+            if variable.default.is_some() {
+                log::warn!(
+                    "Variable '{}': both 'path' and 'default' set, using 'path'",
+                    variable.name
+                );
+            }
+
+            let resolved_path = safe_join_path(agent_dir, path_str).ok_or_else(|| {
+                anyhow!(
+                    "Variable '{}': path '{}' is not allowed (must be relative, no '..' traversal)",
+                    variable.name,
+                    path_str
+                )
+            })?;
+
+            let content = std::fs::read_to_string(&resolved_path).with_context(|| {
+                format!(
+                    "Failed to load file '{}' (resolved to '{}') for variable '{}'",
+                    path_str,
+                    resolved_path.display(),
+                    variable.name
+                )
+            })?;
+
+            variable.default = Some(content);
+        }
+    }
+    Ok(())
+}
+
 /// Resolve file-backed variable defaults and populate `shared_variables`.
 ///
 /// This performs the synchronous subset of `init()` that loads variable
@@ -472,7 +469,7 @@ pub fn resolve_variables(agent: &mut Agent) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(Config::agents_data_dir);
 
-    Agent::resolve_file_backed_variables(&mut agent.variables, &agent_dir)?;
+    resolve_file_backed_variables(&mut agent.variables, &agent_dir)?;
 
     let new_variables = init_agent_variables(
         &agent.variables,
@@ -525,7 +522,7 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
         .map(Path::to_path_buf)
         .unwrap_or_else(Config::agents_data_dir);
 
-    Agent::resolve_file_backed_variables(&mut agent.variables, &agent_dir)?;
+    resolve_file_backed_variables(&mut agent.variables, &agent_dir)?;
 
     agent.rag = if rag_path.exists() {
         Some(Arc::new(Rag::load(config, DEFAULT_AGENT_NAME, &rag_path)?))

@@ -1,4 +1,4 @@
-pub mod agent;
+pub(crate) mod agent;
 pub mod input;
 pub mod session;
 
