@@ -1,10 +1,7 @@
 use crate::{
     acp::{AcpManager, NestedAcpEvent},
     config::GlobalConfig,
-    hooks::{
-        dispatch::dispatch_hooks, HookEvent, HookOutcome, HookResult, HookResultControl,
-        HooksConfig,
-    },
+    hooks::{HookEvent, HookOutcome, HookResult, HookResultControl},
     mcp::McpManager,
     mcp_safety::{truncate_output, TruncateOpts},
     tui::render_helpers::event_fallback_text,
@@ -18,7 +15,9 @@ use crate::{
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::future::Future;
 use std::io::Write as _;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -38,13 +37,21 @@ pub type ToolCallEmitFn = dyn Fn(&ToolCall, &Value) + Send + Sync;
 /// Returns `true` if the user allows the tool; `false` otherwise.
 pub type ConfirmToolUseFn = dyn Fn(&str, &Value, Option<&str>) -> bool + Send + Sync;
 
+/// Callback that dispatches a hook event and resolves to an outcome.
+/// Takes the `HookEvent` by value (events are constructed fresh at
+/// each site) and returns a boxed future. Captured state (hook
+/// entries, session id, cwd) is owned by the closure so the returned
+/// future is `'static` and can cross `tokio::select!` and
+/// `block_in_place` boundaries.
+pub type DispatchHookFn =
+    dyn Fn(HookEvent) -> Pin<Box<dyn Future<Output = HookOutcome> + Send>> + Send + Sync;
+
 /// Narrow view of `GlobalConfig` used by the tool-call loop. Callers
 /// construct this once per batch via `ToolEvalContext::from_config`
 /// and pass it through. This decouples the loop from `GlobalConfig`
 /// as prep for moving the loop into `harnx-engine` — at that point
 /// the loop can be moved without any Config dep.
 pub struct ToolEvalContext {
-    pub hooks: HooksConfig,
     pub acp_manager: Option<Arc<AcpManager>>,
     pub mcp_manager: Option<Arc<McpManager>>,
     pub session_name: Option<String>,
@@ -65,6 +72,12 @@ pub struct ToolEvalContext {
     /// the user allows the tool; `false` otherwise. Harnx's default
     /// uses an `inquire`-based terminal prompt.
     pub confirm_tool_use_fn: Arc<ConfirmToolUseFn>,
+    /// Called to dispatch a hook event (PreToolUse, PostToolUse,
+    /// PostToolUseFailure). Harnx's default captures `hooks.entries`,
+    /// `session_id` (currently always `"cmd"`), and the process cwd
+    /// at context-construction time and forwards to
+    /// `hooks::dispatch::dispatch_hooks`.
+    pub dispatch_hook_fn: Arc<DispatchHookFn>,
 }
 
 impl ToolEvalContext {
@@ -76,8 +89,24 @@ impl ToolEvalContext {
             .into_iter()
             .map(|decl| decl.name)
             .collect();
+        let hooks = guard.resolved_hooks();
+
+        // Capture owned state for the dispatch callback so the
+        // returned future is `'static` and `Send`.
+        let hooks_entries = hooks.entries.clone();
+        let session_id = "cmd".to_string();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let dispatch_hook_fn: Arc<DispatchHookFn> = Arc::new(move |event: HookEvent| {
+            let hooks_entries = hooks_entries.clone();
+            let session_id = session_id.clone();
+            let cwd = cwd.clone();
+            Box::pin(async move {
+                crate::hooks::dispatch::dispatch_hooks(&event, &hooks_entries, &session_id, &cwd)
+                    .await
+            })
+        });
+
         Self {
-            hooks: guard.resolved_hooks(),
             acp_manager: guard.acp_manager.clone(),
             mcp_manager: guard.mcp_manager.clone(),
             session_name: guard
@@ -88,6 +117,7 @@ impl ToolEvalContext {
             emit_tool_call_fn: Arc::new(default_emit_tool_call),
             emit_tool_result_fn: Arc::new(default_emit_tool_result),
             confirm_tool_use_fn: Arc::new(default_confirm_tool_use),
+            dispatch_hook_fn,
         }
     }
 }
@@ -158,10 +188,6 @@ pub fn eval_tool_calls(
         bail!("The request was aborted because an infinite loop of function calls was detected.")
     }
 
-    let hooks = &ctx.hooks;
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let session_id = "cmd".to_string();
-
     let mut is_all_null = true;
     for call in calls {
         let tool_input = call.arguments.clone();
@@ -175,7 +201,7 @@ pub fn eval_tool_calls(
         let pre_outcome = tokio::task::block_in_place(|| {
             Handle::current().block_on(async {
                 tokio::select! {
-                    outcome = dispatch_hooks(&pre_event, &hooks.entries, &session_id, &cwd) => outcome,
+                    outcome = (ctx.dispatch_hook_fn)(pre_event) => outcome,
                     _ = wait_abort_signal(abort_signal) => HookOutcome {
                         control: HookResultControl::Block {
                             reason: "cancelled by user".to_string(),
@@ -219,12 +245,7 @@ pub fn eval_tool_calls(
                     tool_use_id: tool_use_id.clone(),
                 };
                 let _ = tokio::task::block_in_place(|| {
-                    Handle::current().block_on(dispatch_hooks(
-                        &post_event,
-                        &hooks.entries,
-                        &session_id,
-                        &cwd,
-                    ))
+                    Handle::current().block_on((ctx.dispatch_hook_fn)(post_event))
                 });
 
                 // Emit tool result to TUI or terminal
@@ -264,12 +285,7 @@ pub fn eval_tool_calls(
                     error: error_display.clone(),
                 };
                 let _ = tokio::task::block_in_place(|| {
-                    Handle::current().block_on(dispatch_hooks(
-                        &fail_event,
-                        &hooks.entries,
-                        &session_id,
-                        &cwd,
-                    ))
+                    Handle::current().block_on((ctx.dispatch_hook_fn)(fail_event))
                 });
 
                 is_all_null = false;
