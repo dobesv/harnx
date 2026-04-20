@@ -28,6 +28,11 @@ pub use harnx_core::tool::{
     ToolCall, ToolDeclaration, ToolError, ToolResult, Tools, TRIGGER_AGENT_TOOL_NAME,
 };
 
+/// Callback invoked with a `&ToolCall` and the parsed arguments JSON.
+/// Used for both "tool is about to dispatch" and "tool returned a
+/// result" UI emission hooks on `ToolEvalContext`.
+pub type ToolCallEmitFn = dyn Fn(&ToolCall, &Value) + Send + Sync;
+
 /// Narrow view of `GlobalConfig` used by the tool-call loop. Callers
 /// construct this once per batch via `ToolEvalContext::from_config`
 /// and pass it through. This decouples the loop from `GlobalConfig`
@@ -39,6 +44,17 @@ pub struct ToolEvalContext {
     pub mcp_manager: Option<Arc<McpManager>>,
     pub session_name: Option<String>,
     pub allowed_tool_names: HashSet<String>,
+    /// Called when a tool is about to be dispatched. Receives the tool
+    /// call and the parsed arguments JSON. Harnx's default formats
+    /// input as YAML and emits a `ToolCall` UiOutputEvent, falling
+    /// back to stdout if no UI sink is installed.
+    pub emit_tool_call_fn: Arc<ToolCallEmitFn>,
+    /// Called when a tool call returns a result. Receives the tool
+    /// call and the raw result JSON. Harnx's default extracts
+    /// user-display text (or YAML-pretty-prints the JSON), truncates
+    /// to terminal dimensions, dims the text, and emits a
+    /// `ToolResultText` UiOutputEvent with stdout fallback.
+    pub emit_tool_result_fn: Arc<ToolCallEmitFn>,
 }
 
 impl ToolEvalContext {
@@ -59,8 +75,58 @@ impl ToolEvalContext {
                 .as_ref()
                 .map(|session| session.name().to_string()),
             allowed_tool_names,
+            emit_tool_call_fn: Arc::new(default_emit_tool_call),
+            emit_tool_result_fn: Arc::new(default_emit_tool_result),
         }
     }
+}
+
+fn default_emit_tool_call(call: &ToolCall, json_data: &Value) {
+    let event = UiOutputEvent {
+        kind: UiOutputEventKind::ToolCall {
+            tool_name: call.name.clone(),
+            input_yaml: match json_data {
+                Value::Null => None,
+                _ => Some(pretty_yaml_block(json_data)),
+            },
+            raw: None,
+        },
+        source: None,
+    };
+    let text = event_fallback_text(&event.kind, event.source.as_ref());
+    if !emit_ui_output_event(event) && *IS_STDOUT_TERMINAL {
+        print!("{text}");
+    }
+}
+
+fn default_emit_tool_result(call: &ToolCall, result: &Value) {
+    let mut opts = TruncateOpts::default();
+    let marker = " [...] ";
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        opts.head_lines = 5.max((rows / 2) as usize);
+        opts.tail_lines = 0;
+        // "<= " prefix is 3 chars, marker is 7 chars; total overhead = 10
+        // line_head_bytes + marker.len() + prefix.len() must fit in cols
+        opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
+        opts.line_tail_bytes = 0;
+        opts.marker = Some(marker.to_string());
+    }
+    let output_str = extract_user_display_text(result).unwrap_or_else(|| match result {
+        Value::String(s) => s.clone(),
+        _ => pretty_yaml_block(result),
+    });
+    let truncated = truncate_output(&output_str, &opts);
+    let text = format!("{}\n", dimmed_text(&truncated));
+    let event = UiOutputEvent {
+        kind: UiOutputEventKind::ToolResultText { text: text.clone() },
+        source: None,
+    };
+    if !emit_ui_output_event(event) && *IS_STDOUT_TERMINAL {
+        print!("{text}");
+    }
+    // `call` parameter is unused by the default implementation but
+    // kept in the signature so custom callbacks can route per-call.
+    let _ = call;
 }
 
 pub fn eval_tool_calls(
@@ -151,31 +217,7 @@ pub fn eval_tool_calls(
                 });
 
                 // Emit tool result to TUI or terminal
-                let mut opts = TruncateOpts::default();
-                let marker = " [...] ";
-                if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    opts.head_lines = 5.max((rows / 2) as usize);
-                    opts.tail_lines = 0;
-                    // "<= " prefix is 3 chars, marker is 7 chars; total overhead = 10
-                    // line_head_bytes + marker.len() + prefix.len() must fit in cols
-                    opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
-                    opts.line_tail_bytes = 0;
-                    opts.marker = Some(marker.to_string());
-                }
-                let output_str =
-                    extract_user_display_text(&result).unwrap_or_else(|| match &result {
-                        Value::String(s) => s.clone(),
-                        _ => pretty_yaml_block(&result),
-                    });
-                let truncated = truncate_output(&output_str, &opts);
-                let text = format!("{}\n", dimmed_text(&truncated));
-                let event = UiOutputEvent {
-                    kind: UiOutputEventKind::ToolResultText { text: text.clone() },
-                    source: None,
-                };
-                if !emit_ui_output_event(event) && *IS_STDOUT_TERMINAL {
-                    print!("{text}");
-                }
+                (ctx.emit_tool_result_fn)(&call, &result);
 
                 if result.is_null() {
                     result = json!("DONE");
@@ -260,21 +302,7 @@ fn eval_tool_call_mcp(
     };
 
     // Emit tool call info to TUI or terminal
-    let event = UiOutputEvent {
-        kind: UiOutputEventKind::ToolCall {
-            tool_name: call.name.clone(),
-            input_yaml: match json_data {
-                Value::Null => None,
-                _ => Some(pretty_yaml_block(&json_data)),
-            },
-            raw: None,
-        },
-        source: None,
-    };
-    let text = event_fallback_text(&event.kind, event.source.as_ref());
-    if !emit_ui_output_event(event) && *IS_STDOUT_TERMINAL {
-        print!("{text}");
-    }
+    (ctx.emit_tool_call_fn)(call, &json_data);
 
     if call.name == TRIGGER_AGENT_TOOL_NAME {
         let agent = json_data["agent"].as_str().ok_or_else(|| {
