@@ -503,6 +503,10 @@ impl Config {
         info_flag: bool,
         mut mcp_root: Vec<String>,
     ) -> Result<Self> {
+        // Install any user-supplied models-override list before the
+        // harnx-client `ALL_PROVIDER_MODELS` lazy-lock is first accessed.
+        crate::client::install_models_override();
+
         let config_path = Self::config_file();
         let mut config = if !config_path.exists() {
             match env::var(get_env_name("provider"))

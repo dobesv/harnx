@@ -76,6 +76,7 @@ libc = { workspace = true }
 agent-client-protocol = { workspace = true }
 glob = { workspace = true }
 globset = { workspace = true }
+harnx-client = { path = "../harnx-client" }
 harnx-core = { path = "../harnx-core" }
 harnx-engine = { path = "../harnx-engine" }
 harnx-mcp = { path = "../harnx-mcp" }

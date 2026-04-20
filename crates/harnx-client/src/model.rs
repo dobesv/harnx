@@ -1,4 +1,4 @@
-use super::{list_all_models, list_client_names, ClientConfig};
+use crate::{list_all_models, list_client_names, ClientConfig};
 
 use anyhow::{bail, Result};
 

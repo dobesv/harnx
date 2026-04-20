@@ -19,16 +19,14 @@ pub use self::variables::*;
 pub use harnx_core::abort::{
     create_abort_signal, wait_abort_signal, AbortSignal, AbortSignalInner,
 };
-pub use harnx_core::crypto::{
-    base64_decode, base64_encode, encode_uri, hex_encode, hmac_sha256, sha256,
-};
+pub use harnx_core::crypto::{base64_encode, sha256};
 pub use harnx_core::path::{
     expand_glob_paths, get_patch_extension, list_file_names, resolve_home_dir, safe_join_path,
     to_absolute_path,
 };
 pub use harnx_core::text::strip_think_tag;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use fancy_regex::Regex;
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use is_terminal::IsTerminal;
@@ -176,18 +174,6 @@ pub fn temp_file(prefix: &str, suffix: &str) -> PathBuf {
 
 pub fn is_url(path: &str) -> bool {
     path.starts_with("http://") || path.starts_with("https://")
-}
-
-pub fn set_proxy(
-    mut builder: reqwest::ClientBuilder,
-    proxy: &str,
-) -> Result<reqwest::ClientBuilder> {
-    builder = builder.no_proxy();
-    if !proxy.is_empty() && proxy != "-" {
-        builder = builder
-            .proxy(reqwest::Proxy::all(proxy).with_context(|| format!("Invalid proxy `{proxy}`"))?);
-    };
-    Ok(builder)
 }
 
 pub fn decode_bin<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T> {

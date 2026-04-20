@@ -1,6 +1,6 @@
-use super::*;
+use crate::*;
 
-use crate::utils::strip_think_tag;
+use harnx_core::text::strip_think_tag;
 
 use anyhow::{bail, Context, Result};
 use reqwest::RequestBuilder;

@@ -1,17 +1,34 @@
-mod access_token;
-mod common;
-mod message;
-#[macro_use]
-mod macros;
-mod model;
-pub mod retry;
-mod stream;
+//! harnx-local orchestration for the client layer. Provider trait +
+//! impls live in `harnx-client`. This module adds the `call_chat_completions`
+//! orchestrator (uses `&GlobalConfig` — an engine-level concern that
+//! will migrate to `harnx-engine` in a later plan) + the `retry`
+//! fallback wrapper + `message` rendering helpers, and preserves a
+//! `crate::client::init_client` path that routes through the
+//! test-client override (installed by harnx's test harness).
 
-pub use crate::tool::ToolCall;
-pub use common::*;
-pub use message::*;
-pub use model::*;
-pub use stream::*;
+pub use harnx_client::*;
+
+pub mod common;
+pub mod message;
+pub mod retry;
+
+pub use common::{
+    call_chat_completions, call_chat_completions_streaming, chat_completions_streaming_with_input,
+    chat_completions_with_input, create_client_config, install_models_override,
+};
+pub use message::{patch_messages, render_message_input};
+
+// Shadow harnx-client's `init_client` with a harnx-side wrapper that
+// first consults the test-client override. All call sites inside harnx
+// use `crate::client::init_client` and therefore pick up this wrapper.
+pub fn init_client(clients: &[ClientConfig], model: &Model) -> anyhow::Result<Box<dyn Client>> {
+    #[cfg(test)]
+    if let Some(client) = take_test_client() {
+        return Ok(Box::new(TestClient::new(client)));
+    }
+
+    harnx_client::init_client(clients, model)
+}
 
 #[cfg(test)]
 static TEST_CLIENT: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<dyn Client>>>> =
@@ -142,52 +159,3 @@ impl Client for TestClient {
         self.inner.rerank_inner(client, data).await
     }
 }
-
-register_client!(
-    (openai, "openai", OpenAIConfig, OpenAIClient),
-    (
-        openai_compatible,
-        "openai-compatible",
-        OpenAICompatibleConfig,
-        OpenAICompatibleClient
-    ),
-    (gemini, "gemini", GeminiConfig, GeminiClient),
-    (claude, "claude", ClaudeConfig, ClaudeClient),
-    (cohere, "cohere", CohereConfig, CohereClient),
-    (
-        azure_openai,
-        "azure-openai",
-        AzureOpenAIConfig,
-        AzureOpenAIClient
-    ),
-    (vertexai, "vertexai", VertexAIConfig, VertexAIClient),
-    (bedrock, "bedrock", BedrockConfig, BedrockClient),
-);
-
-pub const OPENAI_COMPATIBLE_PROVIDERS: [(&str, &str); 18] = [
-    ("ai21", "https://api.ai21.com/studio/v1"),
-    (
-        "cloudflare",
-        "https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1",
-    ),
-    ("deepinfra", "https://api.deepinfra.com/v1/openai"),
-    ("deepseek", "https://api.deepseek.com"),
-    ("ernie", "https://qianfan.baidubce.com/v2"),
-    ("github", "https://models.inference.ai.azure.com"),
-    ("groq", "https://api.groq.com/openai/v1"),
-    ("hunyuan", "https://api.hunyuan.cloud.tencent.com/v1"),
-    ("minimax", "https://api.minimax.chat/v1"),
-    ("mistral", "https://api.mistral.ai/v1"),
-    ("moonshot", "https://api.moonshot.cn/v1"),
-    ("openrouter", "https://openrouter.ai/api/v1"),
-    ("perplexity", "https://api.perplexity.ai"),
-    (
-        "qianwen",
-        "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    ),
-    ("xai", "https://api.x.ai/v1"),
-    ("zhipuai", "https://open.bigmodel.cn/api/paas/v4"),
-    // RAG-dedicated
-    ("jina", "https://api.jina.ai/v1"),
-    ("voyageai", "https://api.voyageai.com/v1"),
-];

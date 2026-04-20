@@ -1,5 +1,5 @@
-use super::{catch_error, parse_retry_after, CompletionTokenUsage, ToolCall};
-use crate::utils::AbortSignal;
+use crate::{catch_error, parse_retry_after, CompletionTokenUsage, ToolCall};
+use harnx_core::abort::AbortSignal;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{Stream, StreamExt};

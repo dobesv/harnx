@@ -1,5 +1,5 @@
-use super::openai::*;
-use super::*;
+use crate::openai::*;
+use crate::*;
 
 use anyhow::{Context, Result};
 use reqwest::RequestBuilder;

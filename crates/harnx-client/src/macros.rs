@@ -4,7 +4,7 @@ macro_rules! register_client {
         $(($module:ident, $name:literal, $config:ident, $client:ident),)+
     ) => {
         $(
-            mod $module;
+            pub mod $module;
         )+
         $(
             use harnx_core::provider_config::$module::$config;
@@ -25,13 +25,13 @@ macro_rules! register_client {
             #[derive(Debug)]
             pub struct $client {
                 config: $config,
-                model: $crate::client::Model,
+                model: $crate::Model,
             }
 
             impl $client {
                 pub const NAME: &'static str = $name;
 
-                pub fn init(clients: &[ClientConfig], model: &$crate::client::Model) -> Option<Box<dyn Client>> {
+                pub fn init(clients: &[ClientConfig], model: &$crate::Model) -> Option<Box<dyn Client>> {
                     let config = clients.iter().find_map(|client_config| {
                         if let ClientConfig::$config(c) = client_config {
                             if Self::name(c) == model.client_name() {
@@ -50,7 +50,7 @@ macro_rules! register_client {
                 pub fn list_models(local_config: &$config) -> Vec<Model> {
                     let client_name = Self::name(local_config);
                     let mut models = if local_config.models.is_empty() {
-                        if let Some(v) = $crate::client::ALL_PROVIDER_MODELS.iter().find(|v| {
+                        if let Some(v) = $crate::ALL_PROVIDER_MODELS.iter().find(|v| {
                             v.provider == $name ||
                                 ($name == OpenAICompatibleClient::NAME
                                     && local_config.name.as_ref().map(|name| name.starts_with(&v.provider)).unwrap_or_default())
@@ -80,12 +80,10 @@ macro_rules! register_client {
 
         )+
 
-        pub fn init_client(clients: &[ClientConfig], model: &$crate::client::Model) -> anyhow::Result<Box<dyn Client>> {
-            #[cfg(test)]
-            if let Some(client) = $crate::client::take_test_client() {
-                return Ok(Box::new($crate::client::TestClient::new(client)));
-            }
-
+        /// Core client dispatch. The host (harnx) may wrap this with
+        /// additional behaviors (e.g., a test-only override that returns
+        /// a mock client) before calling it.
+        pub fn init_client(clients: &[ClientConfig], model: &$crate::Model) -> anyhow::Result<Box<dyn Client>> {
             None
             $(.or_else(|| $client::init(clients, model)))+
             .ok_or_else(|| {
@@ -95,20 +93,8 @@ macro_rules! register_client {
 
         pub fn list_client_types() -> Vec<&'static str> {
             let mut client_types: Vec<_> = vec![$($client::NAME,)+];
-            client_types.extend($crate::client::OPENAI_COMPATIBLE_PROVIDERS.iter().map(|(name, _)| *name));
+            client_types.extend($crate::OPENAI_COMPATIBLE_PROVIDERS.iter().map(|(name, _)| *name));
             client_types
-        }
-
-        pub async fn create_client_config(client: &str) -> anyhow::Result<(String, serde_json::Value)> {
-            $(
-                if client == $client::NAME && client != $crate::client::OpenAICompatibleClient::NAME {
-                    return create_config(&$client::PROMPTS, $client::NAME).await
-                }
-            )+
-            if let Some(ret) = create_openai_compatible_client_config(client).await? {
-                return Ok(ret);
-            }
-            anyhow::bail!("Unknown client '{}'", client)
         }
 
         static ALL_CLIENT_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -126,9 +112,9 @@ macro_rules! register_client {
             names.iter().collect()
         }
 
-        static ALL_MODELS: std::sync::OnceLock<Vec<$crate::client::Model>> = std::sync::OnceLock::new();
+        static ALL_MODELS: std::sync::OnceLock<Vec<$crate::Model>> = std::sync::OnceLock::new();
 
-        pub fn list_all_models(clients: &[ClientConfig]) -> Vec<&'static $crate::client::Model> {
+        pub fn list_all_models(clients: &[ClientConfig]) -> Vec<&'static $crate::Model> {
             let models = ALL_MODELS.get_or_init(|| {
                 clients
                     .iter()
@@ -141,8 +127,20 @@ macro_rules! register_client {
             models.iter().collect()
         }
 
-        pub fn list_models(clients: &[ClientConfig], model_type: $crate::client::ModelType) -> Vec<&'static $crate::client::Model> {
+        pub fn list_models(clients: &[ClientConfig], model_type: $crate::ModelType) -> Vec<&'static $crate::Model> {
             list_all_models(clients).into_iter().filter(|v| v.model_type() == model_type).collect()
+        }
+
+        /// All provider `PROMPTS` lists, paired with each client's public
+        /// `NAME`. Used by harnx's `create_client_config` dispatcher to
+        /// drive the interactive provider setup flow without requiring
+        /// the client layer to depend on `inquire`/spinner UI crates.
+        pub fn client_prompts() -> &'static [(&'static str, &'static [$crate::PromptAction<'static>])] {
+            &[
+                $(
+                    ($client::NAME, &$client::PROMPTS),
+                )+
+            ]
         }
     };
 }
@@ -150,11 +148,11 @@ macro_rules! register_client {
 #[macro_export]
 macro_rules! client_common_fns {
     () => {
-        fn extra_config(&self) -> Option<&$crate::client::ExtraConfig> {
+        fn extra_config(&self) -> Option<&$crate::ExtraConfig> {
             self.config.extra.as_ref()
         }
 
-        fn patch_config(&self) -> Option<&$crate::client::RequestPatch> {
+        fn patch_config(&self) -> Option<&$crate::RequestPatch> {
             self.config.patch.as_ref()
         }
 
@@ -181,14 +179,14 @@ macro_rules! impl_client_trait {
         ($prepare_rerank:path, $rerank:path),
     ) => {
         #[async_trait::async_trait]
-        impl $crate::client::Client for $crate::client::$client {
-            client_common_fns!();
+        impl $crate::Client for $crate::$client {
+            $crate::client_common_fns!();
 
             async fn chat_completions_inner(
                 &self,
                 client: &reqwest::Client,
-                data: $crate::client::ChatCompletionsData,
-            ) -> anyhow::Result<$crate::client::ChatCompletionsOutput> {
+                data: $crate::ChatCompletionsData,
+            ) -> anyhow::Result<$crate::ChatCompletionsOutput> {
                 let request_data = $prepare_chat_completions(self, data)?;
                 let builder = self.request_builder(client, request_data)?;
                 $chat_completions(builder, self.model()).await
@@ -197,8 +195,8 @@ macro_rules! impl_client_trait {
             async fn chat_completions_streaming_inner(
                 &self,
                 client: &reqwest::Client,
-                handler: &mut $crate::client::SseHandler,
-                data: $crate::client::ChatCompletionsData,
+                handler: &mut $crate::SseHandler,
+                data: $crate::ChatCompletionsData,
             ) -> Result<()> {
                 let request_data = $prepare_chat_completions(self, data)?;
                 let builder = self.request_builder(client, request_data)?;
@@ -208,8 +206,8 @@ macro_rules! impl_client_trait {
             async fn embeddings_inner(
                 &self,
                 client: &reqwest::Client,
-                data: &$crate::client::EmbeddingsData,
-            ) -> Result<$crate::client::EmbeddingsOutput> {
+                data: &$crate::EmbeddingsData,
+            ) -> Result<$crate::EmbeddingsOutput> {
                 let request_data = $prepare_embeddings(self, data)?;
                 let builder = self.request_builder(client, request_data)?;
                 $embeddings(builder, self.model()).await
@@ -218,8 +216,8 @@ macro_rules! impl_client_trait {
             async fn rerank_inner(
                 &self,
                 client: &reqwest::Client,
-                data: &$crate::client::RerankData,
-            ) -> Result<$crate::client::RerankOutput> {
+                data: &$crate::RerankData,
+            ) -> Result<$crate::RerankOutput> {
                 let request_data = $prepare_rerank(self, data)?;
                 let builder = self.request_builder(client, request_data)?;
                 $rerank(builder, self.model()).await

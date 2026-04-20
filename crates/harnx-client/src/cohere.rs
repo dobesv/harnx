@@ -1,6 +1,6 @@
-use super::openai::*;
-use super::openai_compatible::*;
-use super::*;
+use crate::openai::*;
+use crate::openai_compatible::*;
+use crate::*;
 
 use anyhow::{bail, Context, Result};
 use reqwest::RequestBuilder;

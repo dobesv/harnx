@@ -1,11 +1,8 @@
-use super::Model;
+use super::{
+    Message, MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole, Model,
+};
 
 use crate::utils::{dimmed_text, multiline_text};
-
-pub use harnx_core::message::{
-    extract_system_message, ImageUrl, Message, MessageContent, MessageContentPart,
-    MessageContentToolCalls, MessageRole,
-};
 
 pub fn render_message_input(
     content: &MessageContent,
@@ -90,6 +87,7 @@ pub fn patch_messages(messages: &mut Vec<Message>, model: &Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harnx_core::message::extract_system_message;
 
     #[test]
     fn extract_system_message_text_returns_vec() {

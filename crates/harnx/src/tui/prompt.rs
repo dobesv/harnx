@@ -324,9 +324,13 @@ impl Tui {
             user_agent: user_agent.as_deref(),
             dry_run,
         };
-        let send_ret = client
-            .chat_completions_streaming(input, &mut handler, &call_ctx)
-            .await;
+        let send_ret = crate::client::chat_completions_streaming_with_input(
+            client,
+            input,
+            &mut handler,
+            &call_ctx,
+        )
+        .await;
         let aborted = handler.abort().aborted();
         let (text, thought, tool_calls, usage) = handler.take();
         let _ = sender.await;

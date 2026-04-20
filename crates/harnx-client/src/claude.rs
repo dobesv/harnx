@@ -1,6 +1,6 @@
-use super::*;
+use crate::*;
 
-use crate::utils::strip_think_tag;
+use harnx_core::text::strip_think_tag;
 
 use anyhow::{bail, Context, Result};
 use reqwest::RequestBuilder;
@@ -392,7 +392,7 @@ system_prompt_prefix:
 
     #[test]
     fn claude_body_has_array_system_blocks() {
-        use crate::client::message::{Message, MessageContent, MessageContentPart, MessageRole};
+        use harnx_core::message::{Message, MessageContent, MessageContentPart, MessageRole};
 
         let messages = vec![
             Message::new(

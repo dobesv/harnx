@@ -137,7 +137,7 @@ impl HarnxAgent {
         };
 
         let (send_ret, _) = tokio::join!(
-            client.chat_completions_streaming(input, &mut handler, &ctx),
+            crate::client::chat_completions_streaming_with_input(client, input, &mut handler, &ctx),
             async {
                 while let Some(event) = rx.recv().await {
                     match event {
@@ -194,7 +194,7 @@ impl HarnxAgent {
         };
 
         let output = tokio::select! {
-            result = client.chat_completions(input.clone(), &ctx) => {
+            result = crate::client::chat_completions_with_input(client, input.clone(), &ctx) => {
                 result.map_err(|e| acp::Error::new(-32603, e.to_string()))?
             }
             _ = wait_abort_signal(abort_signal) => {
