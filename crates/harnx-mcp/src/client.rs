@@ -1,9 +1,11 @@
 use crate::config::McpServerConfig;
 use crate::convert::mcp_tool_to_declaration;
 use crate::safety::path_to_file_uri;
-use harnx_core::tool::ToolDeclaration;
+use harnx_core::abort::{wait_abort_signal, AbortSignal};
+use harnx_core::tool::{ToolDeclaration, ToolError, ToolProvider};
 
 use anyhow::{anyhow, bail, Context, Result};
+use async_trait::async_trait;
 use parking_lot::RwLock;
 use process_wrap::tokio::CommandWrap;
 #[cfg(unix)]
@@ -845,5 +847,32 @@ impl McpManager {
 impl Default for McpManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait]
+impl ToolProvider for McpManager {
+    fn name(&self) -> &str {
+        "mcp"
+    }
+
+    fn has_tool(&self, tool_name: &str) -> bool {
+        self.find_client_for_tool(tool_name).is_some()
+    }
+
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        abort: &AbortSignal,
+    ) -> Result<Value, ToolError> {
+        tokio::select! {
+            result = McpManager::call_tool(self, tool_name, arguments) => {
+                result.map_err(ToolError::Recoverable)
+            }
+            _ = wait_abort_signal(abort) => {
+                Err(ToolError::Fatal(anyhow!("MCP tool call aborted by user")))
+            }
+        }
     }
 }

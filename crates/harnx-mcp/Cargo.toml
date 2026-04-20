@@ -9,6 +9,7 @@ description = "MCP (Model Context Protocol) support for harnx: safety/validation
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 indexmap = { workspace = true }

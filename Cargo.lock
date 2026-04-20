@@ -1714,6 +1714,7 @@ name = "harnx-mcp"
 version = "0.30.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs",
  "futures-util",
  "harnx-core",
