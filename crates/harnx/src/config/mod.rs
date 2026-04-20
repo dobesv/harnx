@@ -6,6 +6,7 @@ pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariabl
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
+pub use harnx_core::working_mode::WorkingMode;
 
 use crate::acp::{AcpManager, AcpServerConfig};
 use crate::client::{
@@ -3062,29 +3063,6 @@ pub fn load_env_file() -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum WorkingMode {
-    Cmd,
-    Tui,
-    Serve,
-    Acp(String),
-}
-
-impl WorkingMode {
-    pub fn is_cmd(&self) -> bool {
-        matches!(self, WorkingMode::Cmd)
-    }
-    pub fn is_tui(&self) -> bool {
-        matches!(self, WorkingMode::Tui)
-    }
-    pub fn is_serve(&self) -> bool {
-        matches!(self, WorkingMode::Serve)
-    }
-    pub fn is_acp(&self) -> bool {
-        matches!(self, WorkingMode::Acp(_))
-    }
 }
 
 #[async_recursion::async_recursion]

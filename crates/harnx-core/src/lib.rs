@@ -18,3 +18,4 @@ pub mod provider_config;
 pub mod retry_config;
 pub mod text;
 pub mod tool;
+pub mod working_mode;
