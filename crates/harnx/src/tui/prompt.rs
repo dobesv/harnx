@@ -124,10 +124,10 @@ impl Tui {
                 &input,
                 &ctx.config,
                 ctx.abort_signal.clone(),
-                |input: &Input,
-                 client: &dyn crate::client::Client,
-                 config: &crate::config::GlobalConfig,
-                 abort_signal| {
+                move |input: &Input,
+                      client: &dyn crate::client::Client,
+                      config: &crate::config::GlobalConfig,
+                      abort_signal| {
                     let event_tx = event_tx.clone();
                     Box::pin(async move {
                         if crate::config::input::stream(input, config) {

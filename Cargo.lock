@@ -1703,6 +1703,7 @@ dependencies = [
  "futures-util",
  "harnx-client",
  "harnx-core",
+ "parking_lot",
  "tokio",
  "tokio-stream",
 ]

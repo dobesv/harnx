@@ -1,34 +1,20 @@
-use super::{
-    call_chat_completions, call_chat_completions_streaming, init_client, Client, ModelType,
-};
-use crate::config::{GlobalConfig, Input, RetryConfig};
+use super::{call_chat_completions, call_chat_completions_streaming, Client};
+use crate::config::{GlobalConfig, Input};
 use crate::tool::ToolResult;
 use crate::ui_output::{
     emit_ui_output_event, has_ui_output_sink, UiOutputEvent, UiOutputEventKind,
 };
-use crate::utils::{wait_abort_signal, warning_text, AbortSignal};
+use crate::utils::{warning_text, AbortSignal};
 
 use anyhow::Result;
-use std::pin::Pin;
-use std::time::Duration;
+use std::sync::Arc;
 
-use harnx_engine::retry::{compute_backoff_delay, find_llm_error, is_non_retryable_non_auth};
+use harnx_engine::retry::{CallFuture, TurnContext};
 
 pub use harnx_core::retry_config::ModelCooldownMap;
 
-type CallFuture<'a> = Pin<
-    Box<
-        dyn std::future::Future<
-                Output = Result<(
-                    String,
-                    Option<String>,
-                    Vec<ToolResult>,
-                    CompletionTokenUsage,
-                )>,
-            > + Send
-            + 'a,
-    >,
->;
+/// Token usage from a completion call.
+pub use super::CompletionTokenUsage;
 
 /// Emit a warning message to the TUI transcript if a UI sink is installed,
 /// otherwise fall back to stderr.
@@ -45,8 +31,26 @@ fn emit_retry_warning(msg: &str) {
     }
 }
 
-/// Token usage from a completion call.
-pub use super::CompletionTokenUsage;
+/// Build a [`TurnContext`] snapshot from the global harnx config. The
+/// resulting context holds a clone of the clients list plus a shared
+/// handle to the cooldown map (so mutations propagate back to the
+/// Config), and a warn callback that routes through harnx's UI /
+/// stderr channel.
+fn build_turn_context(config: &GlobalConfig) -> TurnContext {
+    let cfg = config.read();
+    TurnContext {
+        default_model_id: cfg.model_id.clone(),
+        clients: cfg.clients.clone(),
+        model_cooldowns: cfg.model_cooldowns.clone(),
+        warn_fn: Arc::new(|msg: &str| emit_retry_warning(msg)),
+        // Route through harnx's `crate::client::init_client` wrapper so
+        // the test-client override installed by `TestStateGuard` is
+        // honoured. In production this delegates to
+        // `harnx_client::init_client`; in tests it short-circuits to the
+        // installed `MockClient`.
+        init_client_fn: Arc::new(super::init_client),
+    }
+}
 
 /// Attempt an LLM call with retry (exponential backoff) and model fallback.
 ///
@@ -72,9 +76,13 @@ pub async fn call_with_retry_and_fallback(
 /// Like [`call_with_retry_and_fallback`] but accepts a custom call function.
 ///
 /// The `call_fn` closure is invoked for each attempt and receives the current
-/// `Input`, a reference to the resolved `Client`, and the `AbortSignal`.  This
-/// allows callers (e.g. the TUI) to supply their own streaming implementation
-/// while still benefiting from the retry/fallback loop.
+/// `Input`, a reference to the resolved `Client`, the `GlobalConfig`, and the
+/// `AbortSignal`.  This allows callers (e.g. the TUI) to supply their own
+/// streaming implementation while still benefiting from the retry/fallback loop.
+///
+/// The 4-arg closure shape is a harnx convenience — the underlying engine
+/// loop takes a 3-arg closure `(input, client, abort)` and this wrapper
+/// adapts by capturing `config` in the forwarded closure.
 pub async fn call_with_retry_and_fallback_custom<F>(
     input: &Input,
     config: &GlobalConfig,
@@ -87,134 +95,34 @@ pub async fn call_with_retry_and_fallback_custom<F>(
     CompletionTokenUsage,
 )>
 where
-    F: for<'a> Fn(&'a Input, &'a dyn Client, &'a GlobalConfig, AbortSignal) -> CallFuture<'a>,
+    F: for<'a> Fn(&'a Input, &'a dyn Client, &'a GlobalConfig, AbortSignal) -> CallFuture<'a>
+        + Send
+        + Sync
+        + 'static,
 {
-    let agent = input.agent();
-    let retry_config = agent.retry_config();
-
-    // Build model list: primary model + fallbacks
-    let primary_model_id = {
-        let cfg = config.read();
-        agent.model_id().unwrap_or(&cfg.model_id).to_string()
-    };
-    let mut model_ids: Vec<String> = vec![primary_model_id];
-    model_ids.extend(agent.model_fallbacks().iter().cloned());
-
-    // Eagerly validate all fallback model IDs so the user gets immediate
-    // feedback about typos / missing models instead of a silent skip.
-    for model_id in model_ids.iter().skip(1) {
-        let valid = {
-            let cfg = config.read();
-            crate::client::retrieve_model(&cfg.clients, model_id, ModelType::Chat).is_ok()
-        };
-        if !valid {
-            emit_retry_warning(&format!(
-                "Invalid fallback model '{}' in agent config — this model does not exist and will be skipped.",
-                model_id
-            ));
-            config
-                .read()
-                .model_cooldowns
-                .lock()
-                .set_infinite_cooldown(model_id);
-        }
-    }
-
-    let mut last_error: Option<anyhow::Error> = None;
-
-    for (idx, model_id) in model_ids.iter().enumerate() {
-        // Skip models on cooldown
-        if config
-            .read()
-            .model_cooldowns
-            .lock()
-            .is_on_cooldown(model_id)
-        {
-            emit_retry_warning(&format!("Skipping model '{}' (on cooldown)", model_id));
-            continue;
-        }
-
-        // For the primary model (idx 0), use the already-resolved model from
-        // the input.  For fallbacks, resolve from the model catalog.
-        let client = if idx == 0 {
-            match crate::config::input::create_client(input, config) {
-                Ok(client) => client,
-                Err(err) => {
-                    emit_retry_warning(&format!(
-                        "Invalid model '{}': {}. This fallback will never be used — check your agent config.",
-                        model_id, err
-                    ));
-                    config
-                        .read()
-                        .model_cooldowns
-                        .lock()
-                        .set_infinite_cooldown(model_id);
-                    last_error = Some(err);
-                    continue;
-                }
-            }
-        } else {
-            match resolve_client(config, model_id) {
-                Ok(client) => client,
-                Err(err) => {
-                    emit_retry_warning(&format!(
-                        "Invalid fallback model '{}': {}. This fallback will never be used — check your agent config.",
-                        model_id, err
-                    ));
-                    config
-                        .read()
-                        .model_cooldowns
-                        .lock()
-                        .set_infinite_cooldown(model_id);
-                    last_error = Some(err);
-                    continue;
-                }
-            }
-        };
-
-        match try_model_with_retries_custom(
-            input,
-            client.as_ref(),
-            config,
-            &retry_config,
-            abort_signal.clone(),
-            &call_fn,
-        )
-        .await
-        {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                if is_non_retryable_non_auth(&err) {
-                    // Non-retryable errors (400, 404) should not sideline the model
-                    return Err(err);
-                }
-
-                let cooldown = compute_cooldown(&err, config, model_id);
-                config
-                    .read()
-                    .model_cooldowns
-                    .lock()
-                    .set_cooldown(model_id, cooldown);
-
-                emit_retry_warning(&format!(
-                    "Model '{}' exhausted retries (error: {}), cooldown {}s. Trying next fallback.",
-                    model_id,
-                    err,
-                    cooldown.as_secs()
-                ));
-                // Yield so the TUI event loop has a chance to process the
-                // warning message (sent via emit_ui_output_event) before the
-                // final error event arrives through a separate channel.
-                // Without this yield, the LlmError can race ahead of the last
-                // "exhausted retries" TranscriptText event and appear in the
-                // wrong order in the transcript.
-                tokio::task::yield_now().await;
-                last_error = Some(err);
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All models are on cooldown")))
+    let turn_ctx = build_turn_context(config);
+    // Adapter: the engine's call_fn signature drops `&GlobalConfig`.
+    // The caller's 4-arg closure expects `&'a GlobalConfig` that lives
+    // for the same `'a` as input/client. A direct borrow of the outer
+    // `config` reference cannot satisfy the HRTB (the borrow has one
+    // fixed lifetime, but the engine closure is `for<'a>`). Instead we
+    // clone the Arc-backed `GlobalConfig` once per LLM attempt and move
+    // the clone into an `async move` block so the returned future is
+    // fully self-owning. `call_fn` itself is wrapped in an Arc so it
+    // can be cheaply cloned into each per-attempt future.
+    let call_fn = Arc::new(call_fn);
+    let config_for_closure: GlobalConfig = config.clone();
+    harnx_engine::retry::call_with_retry_and_fallback_custom(
+        input,
+        &turn_ctx,
+        abort_signal,
+        move |input, client, abort| {
+            let call_fn = call_fn.clone();
+            let config_owned = config_for_closure.clone();
+            Box::pin(async move { call_fn(input, client, &config_owned, abort).await })
+        },
+    )
+    .await
 }
 
 async fn default_call_fn(
@@ -235,102 +143,6 @@ async fn default_call_fn(
     }
 }
 
-fn resolve_client(config: &GlobalConfig, model_id: &str) -> Result<Box<dyn Client>> {
-    let cfg = config.read();
-    let model = crate::client::retrieve_model(&cfg.clients, model_id, ModelType::Chat)?;
-    init_client(&cfg.clients, &model)
-}
-
-async fn try_model_with_retries_custom<F>(
-    input: &Input,
-    client: &dyn Client,
-    config: &GlobalConfig,
-    retry_config: &RetryConfig,
-    abort_signal: AbortSignal,
-    call_fn: &F,
-) -> Result<(
-    String,
-    Option<String>,
-    Vec<ToolResult>,
-    CompletionTokenUsage,
-)>
-where
-    F: for<'a> Fn(&'a Input, &'a dyn Client, &'a GlobalConfig, AbortSignal) -> CallFuture<'a>,
-{
-    let mut last_error: Option<anyhow::Error> = None;
-    // Ensure at least one attempt even if configured as 0
-    let attempts = retry_config.attempts.max(1);
-
-    for attempt in 0..attempts {
-        let result = call_fn(input, client, config, abort_signal.clone()).await;
-
-        match result {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                // Check if this is a retryable error
-                if let Some(llm_err) = find_llm_error(&err) {
-                    if llm_err.is_auth_error() {
-                        // Auth errors: don't retry, let caller set infinite cooldown
-                        return Err(err);
-                    }
-                    if !llm_err.is_retryable() {
-                        // Non-retryable (400, 404, etc): fail immediately
-                        return Err(err);
-                    }
-                    // Retryable error
-                    if attempt + 1 < attempts {
-                        let delay = compute_backoff_delay(retry_config, attempt);
-                        emit_retry_warning(&format!(
-                            "Retryable error (status {}, {}), attempt {}/{}. Retrying in {}ms...",
-                            llm_err.status,
-                            llm_err.message,
-                            attempt + 1,
-                            attempts,
-                            delay.as_millis()
-                        ));
-                        tokio::select! {
-                            () = tokio::time::sleep(delay) => {}
-                            () = wait_abort_signal(&abort_signal) => {
-                                return Err(err);
-                            }
-                        }
-                    }
-                } else {
-                    // Non-LlmError (network timeout, DNS, etc): treat as retryable
-                    if attempt + 1 < attempts {
-                        let delay = compute_backoff_delay(retry_config, attempt);
-                        emit_retry_warning(&format!(
-                            "Network error, attempt {}/{}. Retrying in {}ms: {}",
-                            attempt + 1,
-                            attempts,
-                            delay.as_millis(),
-                            err
-                        ));
-                        tokio::select! {
-                            () = tokio::time::sleep(delay) => {}
-                            () = wait_abort_signal(&abort_signal) => {
-                                return Err(err);
-                            }
-                        }
-                    }
-                }
-                last_error = Some(err);
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All retry attempts failed")))
-}
-
-/// Thin wrapper around [`harnx_engine::retry::compute_cooldown`] that
-/// extracts the `clients` slice from `GlobalConfig`. Kept here so call
-/// sites (including tests) stay readable — the pure helper lives in
-/// `harnx-engine` alongside the other retry helpers.
-fn compute_cooldown(err: &anyhow::Error, config: &GlobalConfig, model_id: &str) -> Duration {
-    let cfg = config.read();
-    harnx_engine::retry::compute_cooldown(err, &cfg.clients, model_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,8 +152,10 @@ mod tests {
     use crate::config::Config;
     use crate::test_utils::{MockClient, MockTurnBuilder};
     use crate::utils::create_abort_signal;
+    use harnx_core::retry_config::RetryConfig;
     use parking_lot::RwLock;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn make_config() -> GlobalConfig {
         let config = Config {
@@ -355,6 +169,11 @@ mod tests {
         crate::config::input::from_str(config, "hello", None)
     }
 
+    /// Test-support wrapper around the engine's inner retry loop that
+    /// builds a `TurnContext` from `GlobalConfig` so test code can keep
+    /// its existing `&GlobalConfig` calling style. Uses the same
+    /// Arc-clone HRTB-friendly adapter pattern as
+    /// [`call_with_retry_and_fallback_custom`].
     async fn try_model_with_retries(
         input: &Input,
         client: &dyn Client,
@@ -367,15 +186,31 @@ mod tests {
         Vec<ToolResult>,
         CompletionTokenUsage,
     )> {
-        try_model_with_retries_custom(
+        let turn_ctx = build_turn_context(config);
+        let config_for_closure: GlobalConfig = config.clone();
+        harnx_engine::retry::try_model_with_retries_custom(
             input,
             client,
-            config,
+            &turn_ctx,
             retry_config,
             abort_signal,
-            &|i, c, cfg, a| Box::pin(default_call_fn(i, c, cfg, a)),
+            &move |i, c, a| {
+                let config_owned = config_for_closure.clone();
+                Box::pin(async move { default_call_fn(i, c, &config_owned, a).await })
+            },
         )
         .await
+    }
+
+    /// Test-only access to the engine's `compute_cooldown` with a
+    /// `GlobalConfig` adapter so cooldown assertions stay readable.
+    fn compute_cooldown(err: &anyhow::Error, config: &GlobalConfig, model_id: &str) -> Duration {
+        let cfg = config.read();
+        harnx_engine::retry::compute_cooldown(err, &cfg.clients, model_id)
+    }
+
+    fn find_llm_error(err: &anyhow::Error) -> Option<&LlmError> {
+        harnx_engine::retry::find_llm_error(err)
     }
 
     #[tokio::test]

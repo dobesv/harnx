@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 futures-util = { workspace = true }
 harnx-client = { path = "../harnx-client" }
 harnx-core = { path = "../harnx-core" }
+parking_lot = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 

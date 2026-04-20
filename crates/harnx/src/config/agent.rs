@@ -10,8 +10,6 @@ use std::{
 
 pub use harnx_core::agent_config::{AgentConfig, AgentVariable, AgentVariables, TEMP_AGENT_NAME};
 
-pub use harnx_core::retry_config::RetryConfig;
-
 /// Built-in agent name: routes to the title-creation prompt.
 pub const CREATE_TITLE_AGENT: &str = harnx_core::agent_config::CREATE_TITLE_AGENT_NAME;
 

@@ -2,9 +2,7 @@ pub(crate) mod agent;
 pub mod input;
 pub mod session;
 
-pub use self::agent::{
-    complete_agent_variables, list_agents, Agent, AgentConfig, AgentVariables, RetryConfig,
-};
+pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentConfig, AgentVariables};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
