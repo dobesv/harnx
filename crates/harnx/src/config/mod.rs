@@ -2,7 +2,9 @@ pub(crate) mod agent;
 pub mod input;
 pub mod session;
 
-pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables, RetryConfig};
+pub use self::agent::{
+    complete_agent_variables, list_agents, Agent, AgentConfig, AgentVariables, RetryConfig,
+};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
@@ -776,7 +778,7 @@ impl Config {
         } else if let Some(agent) = self.agent.as_ref() {
             agent.clone()
         } else {
-            let mut agent = Agent::from_prompt("");
+            let mut agent = Agent::new(AgentConfig::from_prompt(""));
             agent.set_model(self.model.clone());
             agent.set_temperature(self.temperature);
             agent.set_top_p(self.top_p);
@@ -1218,7 +1220,7 @@ impl Config {
     }
 
     pub fn use_prompt(&mut self, prompt: &str) -> Result<()> {
-        let mut agent = Agent::from_prompt(prompt);
+        let mut agent = Agent::new(AgentConfig::from_prompt(prompt));
         agent.set_model(self.current_model().clone());
         if agent.temperature().is_none() {
             agent.set_temperature(self.temperature);
@@ -1361,12 +1363,12 @@ impl Config {
         Ok(())
     }
 
-    pub fn all_agents() -> Vec<Agent> {
-        let mut agents: HashMap<String, Agent> = HashMap::new();
+    pub fn all_agents() -> Vec<AgentConfig> {
+        let mut agents: HashMap<String, AgentConfig> = HashMap::new();
         for name in list_agents() {
             let path = Self::agent_file(&name);
             if let Ok(agent) = self::agent::load(&path) {
-                agents.insert(name, agent);
+                agents.insert(name, agent.into_config());
             }
         }
         let mut agents: Vec<_> = agents.into_values().collect();
@@ -3539,10 +3541,10 @@ mod tests {
 
         // Build a config where the current (non-session) agent has
         // compaction_agent = "my-compactor".
-        let mut main_agent = Agent::from_markdown(
+        let mut main_agent = Agent::new(AgentConfig::from_markdown(
             "main",
             "---\nmodel: gemini:gemini-3.1-flash-lite-preview\ncompaction_agent: my-compactor\n---\nYou are the main agent.",
-        );
+        ));
         main_agent.set_model(crate::client::Model::new(
             "gemini",
             "gemini-3.1-flash-lite-preview",

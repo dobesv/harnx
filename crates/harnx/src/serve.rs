@@ -67,7 +67,7 @@ pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
 struct Server {
     config: Config,
     models: Vec<Value>,
-    agents: Vec<Agent>,
+    agents: Vec<AgentConfig>,
     rags: Vec<String>,
 }
 

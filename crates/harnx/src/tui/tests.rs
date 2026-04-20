@@ -42,7 +42,7 @@ fn test_config_with_mock_client_and_agent(
         guard.model = model.clone();
 
         // Set up agent for realistic status line.
-        let mut agent = crate::config::Agent::from_prompt("");
+        let mut agent = crate::config::Agent::new(crate::config::AgentConfig::from_prompt(""));
         agent.set_name(agent_name);
         agent.set_model(model.clone());
         guard.agent = Some(agent);

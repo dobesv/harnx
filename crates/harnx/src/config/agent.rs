@@ -41,7 +41,7 @@ static RE_METADATA: LazyLock<Regex> =
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
-pub struct Agent {
+pub struct AgentConfig {
     name: String,
     #[serde(
         rename(serialize = "model", deserialize = "model"),
@@ -90,14 +90,71 @@ pub struct Agent {
     #[serde(skip, default)]
     tools: Tools,
     #[serde(skip, default)]
-    rag: Option<Arc<Rag>>,
-    #[serde(skip, default)]
     model: Model,
-    #[serde(skip, default)]
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Agent {
+    config: AgentConfig,
+    rag: Option<Arc<Rag>>,
     mcp_manager: Option<Arc<McpManager>>,
 }
 
+impl std::ops::Deref for Agent {
+    type Target = AgentConfig;
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+impl std::ops::DerefMut for Agent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.config
+    }
+}
+
 impl Agent {
+    pub fn new(config: AgentConfig) -> Self {
+        Self {
+            config,
+            rag: None,
+            mcp_manager: None,
+        }
+    }
+
+    // Read accessor for the inner pure config; part of the Agent API surface
+    // even though no caller in the harnx bin uses it yet (Task 2 moves
+    // AgentConfig to harnx-core and will exercise this).
+    #[allow(dead_code)]
+    pub fn config(&self) -> &AgentConfig {
+        &self.config
+    }
+
+    pub fn into_config(self) -> AgentConfig {
+        self.config
+    }
+
+    pub fn rag(&self) -> Option<Arc<Rag>> {
+        self.rag.clone()
+    }
+
+    pub fn set_rag(&mut self, rag: Option<Arc<Rag>>) {
+        self.rag = rag;
+    }
+
+    // Read accessor paired with `set_mcp_manager`; part of the Agent API
+    // surface, unused in the harnx bin today (setters are used via init()).
+    #[allow(dead_code)]
+    pub fn mcp_manager(&self) -> Option<Arc<McpManager>> {
+        self.mcp_manager.clone()
+    }
+
+    pub fn set_mcp_manager(&mut self, mcp_manager: Option<Arc<McpManager>>) {
+        self.mcp_manager = mcp_manager;
+    }
+}
+
+impl AgentConfig {
     pub fn from_markdown(name: &str, content: &str) -> Self {
         let mut metadata = "";
         let mut prompt = content.trim();
@@ -316,10 +373,6 @@ impl Agent {
         &self.tools
     }
 
-    pub fn rag(&self) -> Option<Arc<Rag>> {
-        self.rag.clone()
-    }
-
     pub fn conversation_staters(&self) -> &[String] {
         &self.conversation_starters
     }
@@ -407,7 +460,7 @@ pub fn builtin(name: &str) -> Result<Agent> {
         CREATE_TITLE_AGENT => CREATE_TITLE_PROMPT,
         _ => bail!("Unknown built-in agent `{name}`"),
     };
-    Ok(Agent::from_markdown(name, content))
+    Ok(Agent::new(AgentConfig::from_markdown(name, content)))
 }
 
 pub fn load(path: &Path) -> Result<Agent> {
@@ -417,7 +470,7 @@ pub fn load(path: &Path) -> Result<Agent> {
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow!("Invalid agent file name: '{}'", path.display()))?;
-    Ok(Agent::from_markdown(name, &contents))
+    Ok(Agent::new(AgentConfig::from_markdown(name, &contents)))
 }
 
 /// Load file-backed defaults for variables that have a `path:` field.
@@ -489,7 +542,7 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
     };
 
     let mcp_manager = config.read().mcp_manager.clone();
-    agent.mcp_manager = mcp_manager.clone();
+    agent.set_mcp_manager(mcp_manager.clone());
 
     let mcp_tools = match &mcp_manager {
         Some(manager) => Some(manager.get_all_tools().await),
@@ -524,7 +577,7 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
 
     resolve_file_backed_variables(&mut agent.variables, &agent_dir)?;
 
-    agent.rag = if rag_path.exists() {
+    let rag = if rag_path.exists() {
         Some(Arc::new(Rag::load(config, DEFAULT_AGENT_NAME, &rag_path)?))
     } else if !agent.documents.is_empty() && !config.read().info_flag {
         let mut ans = false;
@@ -552,6 +605,7 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
     } else {
         None
     };
+    agent.set_rag(rag);
 
     Ok(agent)
 }
@@ -661,23 +715,23 @@ struct AgentFrontMatter {
 }
 
 impl AgentFrontMatter {
-    fn from_agent(agent: &Agent) -> Self {
+    fn from_agent(config: &AgentConfig) -> Self {
         Self {
-            model_id: agent.model_id.clone(),
-            model_fallbacks: agent.model_fallbacks.clone(),
-            retry: agent.retry.clone(),
-            temperature: agent.temperature,
-            top_p: agent.top_p,
-            use_tools: agent.use_tools.clone(),
-            description: agent.description.clone(),
-            version: agent.version.clone(),
-            variables: agent.variables.clone(),
-            conversation_starters: agent.conversation_starters.clone(),
-            documents: agent.documents.clone(),
-            agent_default_session: agent.agent_default_session.clone(),
-            instructions: agent.instructions.clone(),
-            hooks: agent.hooks.clone(),
-            compaction_agent: agent.compaction_agent.clone(),
+            model_id: config.model_id.clone(),
+            model_fallbacks: config.model_fallbacks.clone(),
+            retry: config.retry.clone(),
+            temperature: config.temperature,
+            top_p: config.top_p,
+            use_tools: config.use_tools.clone(),
+            description: config.description.clone(),
+            version: config.version.clone(),
+            variables: config.variables.clone(),
+            conversation_starters: config.conversation_starters.clone(),
+            documents: config.documents.clone(),
+            agent_default_session: config.agent_default_session.clone(),
+            instructions: config.instructions.clone(),
+            hooks: config.hooks.clone(),
+            compaction_agent: config.compaction_agent.clone(),
         }
     }
 
@@ -845,7 +899,7 @@ mod tests {
     }
 
     fn make_agent_with_tools(prompt: &str, tools: Vec<crate::tool::ToolDeclaration>) -> Agent {
-        let mut agent = Agent::from_markdown("test", prompt);
+        let mut agent = Agent::new(AgentConfig::from_markdown("test", prompt));
         agent.tools =
             crate::tool::Tools::init_from_mcp(if tools.is_empty() { None } else { Some(tools) });
         agent
@@ -854,7 +908,7 @@ mod tests {
     #[test]
     fn test_agent_from_markdown_full() {
         let content = "---\nmodel: openai:gpt-4o\ntemperature: 0.7\ntop_p: 0.9\nuse_tools: fs,web_search\ndescription: A test agent\nversion: '1.0'\n---\nYou are a helpful test agent.";
-        let agent = Agent::from_markdown("test-agent", content);
+        let agent = AgentConfig::from_markdown("test-agent", content);
         assert_eq!(agent.name(), "test-agent");
         assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
         assert_eq!(agent.temperature(), Some(0.7));
@@ -871,7 +925,7 @@ mod tests {
     #[test]
     fn test_agent_from_markdown_minimal() {
         let content = "Just instructions, no front-matter.";
-        let agent = Agent::from_markdown("minimal", content);
+        let agent = AgentConfig::from_markdown("minimal", content);
         assert_eq!(agent.name(), "minimal");
         assert!(agent.model_id().is_none());
         assert!(agent.temperature().is_none());
@@ -884,7 +938,7 @@ mod tests {
     #[test]
     fn test_agent_from_markdown_empty_body() {
         let content = "---\nmodel: openai:gpt-4o\ntemperature: 0.5\n---\n";
-        let agent = Agent::from_markdown("empty-body", content);
+        let agent = AgentConfig::from_markdown("empty-body", content);
         assert_eq!(agent.name(), "empty-body");
         assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
         assert!(agent.interpolated_instructions().is_empty());
@@ -892,7 +946,7 @@ mod tests {
 
     #[test]
     fn test_agent_set_name() {
-        let mut agent = Agent::from_prompt("You are a test agent.");
+        let mut agent = AgentConfig::from_prompt("You are a test agent.");
         assert_eq!(agent.name(), "%%");
         agent.set_name("new-name");
         assert_eq!(agent.name(), "new-name");
@@ -900,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_agent_from_prompt() {
-        let agent = Agent::from_prompt("You are a pirate");
+        let agent = AgentConfig::from_prompt("You are a pirate");
         assert_eq!(agent.name(), "%%");
         assert!(agent
             .interpolated_instructions()
@@ -926,7 +980,7 @@ mod tests {
     #[test]
     fn test_agent_from_markdown_with_use_tools() {
         let content = "---\nuse_tools: fs_*,bash_exec\n---\nHelp with files.";
-        let agent = Agent::from_markdown("tools-agent", content);
+        let agent = AgentConfig::from_markdown("tools-agent", content);
         assert_eq!(
             agent.use_tools(),
             Some(vec!["fs_*".to_string(), "bash_exec".to_string()])
@@ -936,14 +990,14 @@ mod tests {
     #[test]
     fn test_agent_compaction_agent_set() {
         let content = "---\ncompaction_agent: my-compactor\n---\nYou are a test agent.";
-        let agent = Agent::from_markdown("test-agent", content);
+        let agent = AgentConfig::from_markdown("test-agent", content);
         assert_eq!(agent.compaction_agent(), Some("my-compactor"));
     }
 
     #[test]
     fn test_agent_compaction_agent_unset() {
         let content = "---\nmodel: openai:gpt-4o\n---\nYou are a test agent.";
-        let agent = Agent::from_markdown("test-agent", content);
+        let agent = AgentConfig::from_markdown("test-agent", content);
         assert!(agent.compaction_agent().is_none());
     }
 
@@ -951,11 +1005,11 @@ mod tests {
     fn test_agent_compaction_agent_roundtrip() {
         let content =
             "---\ncompaction_agent: my-compactor\nmodel: openai:gpt-4o\n---\nYou are a test agent.";
-        let agent = Agent::from_markdown("test-agent", content);
+        let agent = AgentConfig::from_markdown("test-agent", content);
 
         // Export and re-parse
         let exported = agent.export().unwrap();
-        let reparsed = Agent::from_markdown("test-agent", &exported);
+        let reparsed = AgentConfig::from_markdown("test-agent", &exported);
 
         assert_eq!(reparsed.compaction_agent(), Some("my-compactor"));
         assert_eq!(reparsed.model_id(), Some("openai:gpt-4o"));
@@ -1018,9 +1072,9 @@ mod tests {
     #[test]
     fn test_build_messages_always_uses_system_and_user_format() {
         let config = GlobalConfig::default();
-        let agent = Agent::from_prompt(
+        let agent = Agent::new(AgentConfig::from_prompt(
             "System message\n__INPUT__\n\n### INPUT:\nExample input\n### OUTPUT:\nExample output",
-        );
+        ));
         let input = crate::config::input::from_str(&config, "Real input", Some(agent));
 
         let messages = input.agent().build_messages(&input);

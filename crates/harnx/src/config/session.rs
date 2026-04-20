@@ -1000,7 +1000,7 @@ impl Session {
         } else {
             self.agent_prompt.as_str()
         };
-        let mut agent = Agent::from_markdown(agent_name, prompt);
+        let mut agent = Agent::new(AgentConfig::from_markdown(agent_name, prompt));
         agent.set_model(self.model.clone());
         agent.set_temperature(self.temperature);
         agent.set_top_p(self.top_p);
@@ -1087,10 +1087,10 @@ mod tests {
 
     #[test]
     fn set_agent_to_agent_round_trip_preserves_model_fallbacks() {
-        let agent = Agent::from_markdown(
+        let agent = Agent::new(AgentConfig::from_markdown(
             "test",
             "---\nmodel: openai:gpt-4o\nmodel_fallbacks:\n  - anthropic:claude\n  - google:gemini\n---\nYou are a test agent.",
-        );
+        ));
         let mut session = test_session();
 
         session.set_agent(&agent);
