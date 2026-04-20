@@ -1,4 +1,4 @@
-mod agent;
+pub mod agent;
 pub mod input;
 pub mod session;
 
@@ -1235,9 +1235,9 @@ impl Config {
     pub fn retrieve_agent(&self, name: &str) -> Result<Agent> {
         let path = Self::agent_file(name);
         let mut agent = if path.exists() {
-            Agent::load(&path)?
+            self::agent::load(&path)?
         } else {
-            Agent::builtin(name)?
+            self::agent::builtin(name)?
         };
         let current_model = self.current_model().clone();
         match agent.model_id() {
@@ -1365,7 +1365,7 @@ impl Config {
         let mut agents: HashMap<String, Agent> = HashMap::new();
         for name in list_agents() {
             let path = Self::agent_file(&name);
-            if let Ok(agent) = Agent::load(&path) {
+            if let Ok(agent) = self::agent::load(&path) {
                 agents.insert(name, agent);
             }
         }
@@ -1655,7 +1655,7 @@ impl Config {
         let (prompt, agent_override) = if let Some(name) = compaction_agent_name {
             match config.read().retrieve_agent(&name) {
                 Ok(mut compaction_agent) => {
-                    if let Err(e) = compaction_agent.resolve_variables() {
+                    if let Err(e) = self::agent::resolve_variables(&mut compaction_agent) {
                         warn!("Failed to resolve variables for compaction_agent '{name}': {e}");
                     }
                     // Keep the normal compaction prompt text so session-aware
@@ -1914,7 +1914,7 @@ impl Config {
         if config.read().agent.is_some() {
             bail!("Already in a agent, please run '.exit agent' first to exit the current agent.");
         }
-        let agent = Agent::init(config, agent_name, abort_signal).await?;
+        let agent = self::agent::init(config, agent_name, abort_signal).await?;
         let extra_vars = std::collections::HashMap::from([("AGENT_NAME", agent.name())]);
         let global_agent_session = config.read().agent_default_session.clone();
         let session = session_name.map(|v| v.to_string()).or_else(|| {
@@ -2527,7 +2527,7 @@ impl Config {
             if let Some(v) = &self.agent_variables {
                 config_variables.extend(v.clone());
             }
-            let new_variables = Agent::init_agent_variables(
+            let new_variables = self::agent::init_agent_variables(
                 agent.defined_variables(),
                 &config_variables,
                 self.info_flag,
@@ -2550,7 +2550,7 @@ impl Config {
                     if let Some(v) = &self.agent_variables {
                         config_variables.extend(v.clone());
                     }
-                    let new_variables = Agent::init_agent_variables(
+                    let new_variables = self::agent::init_agent_variables(
                         agent.defined_variables(),
                         &config_variables,
                         self.info_flag,

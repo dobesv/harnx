@@ -142,50 +142,6 @@ impl Agent {
         agent
     }
 
-    pub fn builtin(name: &str) -> Result<Self> {
-        let content = match name {
-            CREATE_TITLE_AGENT => CREATE_TITLE_PROMPT,
-            _ => bail!("Unknown built-in agent `{name}`"),
-        };
-        Ok(Self::from_markdown(name, content))
-    }
-
-    pub fn load(path: &Path) -> Result<Self> {
-        let contents = read_to_string(path)
-            .with_context(|| format!("Failed to read agent file at '{}'", path.display()))?;
-        let name = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| anyhow!("Invalid agent file name: '{}'", path.display()))?;
-        Ok(Self::from_markdown(name, &contents))
-    }
-
-    /// Resolve file-backed variable defaults and populate `shared_variables`.
-    ///
-    /// This performs the synchronous subset of `init()` that loads variable
-    /// values from files (the `path:` field on agent variables) and then
-    /// runs `init_agent_variables` with `no_interaction: true`.  It does NOT
-    /// touch MCP, RAG, or model resolution — call `retrieve_agent` for the
-    /// model and this method for variables when you need a lightweight agent
-    /// suitable for non-interactive use (e.g. compaction).
-    pub fn resolve_variables(&mut self) -> Result<()> {
-        let agent_file_path = Config::agent_file(self.name());
-        let agent_dir = agent_file_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(Config::agents_data_dir);
-
-        Self::resolve_file_backed_variables(&mut self.variables, &agent_dir)?;
-
-        let new_variables = Self::init_agent_variables(
-            &self.variables,
-            &self.shared_variables,
-            true, // no_interaction
-        )?;
-        self.set_shared_variables(new_variables);
-        Ok(())
-    }
-
     /// Load file-backed defaults for variables that have a `path:` field.
     fn resolve_file_backed_variables(
         variables: &mut [AgentVariable],
@@ -221,149 +177,6 @@ impl Agent {
             }
         }
         Ok(())
-    }
-
-    pub async fn init(
-        config: &GlobalConfig,
-        name: &str,
-        abort_signal: AbortSignal,
-    ) -> Result<Self> {
-        let agent_file_path = Config::agent_file(name);
-        let mut agent = if agent_file_path.exists() {
-            Self::load(&agent_file_path)?
-        } else {
-            Self::builtin(name)?
-        };
-
-        let mcp_manager = config.read().mcp_manager.clone();
-        agent.mcp_manager = mcp_manager.clone();
-
-        let mcp_tools = match &mcp_manager {
-            Some(manager) => Some(manager.get_all_tools().await),
-            None => None,
-        };
-        agent.tools = Tools::init_from_mcp(mcp_tools);
-
-        let model = {
-            let config = config.read();
-            match agent.model_id.as_ref() {
-                Some(model_id) => {
-                    crate::client::retrieve_model(&config.clients, model_id, ModelType::Chat)?
-                }
-                None => {
-                    if agent.temperature.is_none() {
-                        agent.temperature = config.temperature;
-                    }
-                    if agent.top_p.is_none() {
-                        agent.top_p = config.top_p;
-                    }
-                    config.current_model().clone()
-                }
-            }
-        };
-        agent.model = model;
-
-        let rag_path = Config::agent_rag_file(name, DEFAULT_AGENT_NAME);
-        let agent_dir = agent_file_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(Config::agents_data_dir);
-
-        Self::resolve_file_backed_variables(&mut agent.variables, &agent_dir)?;
-
-        agent.rag = if rag_path.exists() {
-            Some(Arc::new(Rag::load(config, DEFAULT_AGENT_NAME, &rag_path)?))
-        } else if !agent.documents.is_empty() && !config.read().info_flag {
-            let mut ans = false;
-            if *IS_STDOUT_TERMINAL {
-                ans = Confirm::new("The agent has the documents, init RAG?")
-                    .with_default(true)
-                    .prompt()?;
-            }
-            if ans {
-                let mut document_paths = vec![];
-                for path in &agent.documents {
-                    if is_url(path) {
-                        document_paths.push(path.to_string());
-                    } else {
-                        let new_path = safe_join_path(&agent_dir, path)
-                            .ok_or_else(|| anyhow!("Invalid document path: '{path}'"))?;
-                        document_paths.push(new_path.display().to_string())
-                    }
-                }
-                let rag =
-                    Rag::init(config, "rag", &rag_path, &document_paths, abort_signal).await?;
-                Some(Arc::new(rag))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        Ok(agent)
-    }
-
-    pub fn init_agent_variables(
-        agent_variables: &[AgentVariable],
-        variables: &AgentVariables,
-        no_interaction: bool,
-    ) -> Result<AgentVariables> {
-        let mut output = IndexMap::new();
-        if agent_variables.is_empty() {
-            return Ok(output);
-        }
-        let mut printed = false;
-        let mut unset_variables = vec![];
-        for agent_variable in agent_variables {
-            let key = agent_variable.name.clone();
-            match variables.get(&key) {
-                Some(value) => {
-                    output.insert(key, value.clone());
-                }
-                None => {
-                    if let Some(value) = agent_variable.default.clone() {
-                        output.insert(key, value);
-                        continue;
-                    }
-                    if no_interaction {
-                        continue;
-                    }
-                    if *IS_STDOUT_TERMINAL {
-                        if !printed {
-                            println!("⚙ Init agent variables...");
-                            printed = true;
-                        }
-                        let value = Text::new(&format!(
-                            "{} ({}):",
-                            agent_variable.name, agent_variable.description
-                        ))
-                        .with_validator(|input: &str| {
-                            if input.trim().is_empty() {
-                                Ok(Validation::Invalid("This field is required".into()))
-                            } else {
-                                Ok(Validation::Valid)
-                            }
-                        })
-                        .prompt()?;
-                        output.insert(key, value);
-                    } else {
-                        unset_variables.push(agent_variable)
-                    }
-                }
-            }
-        }
-        if !unset_variables.is_empty() {
-            bail!(
-                "The following agent variables are required:\n{}",
-                unset_variables
-                    .iter()
-                    .map(|v| format!("  - {}: {}", v.name, v.description))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        }
-        Ok(output)
     }
 
     pub fn export(&self) -> Result<String> {
@@ -626,6 +439,188 @@ impl Agent {
     }
 }
 
+pub fn builtin(name: &str) -> Result<Agent> {
+    let content = match name {
+        CREATE_TITLE_AGENT => CREATE_TITLE_PROMPT,
+        _ => bail!("Unknown built-in agent `{name}`"),
+    };
+    Ok(Agent::from_markdown(name, content))
+}
+
+pub fn load(path: &Path) -> Result<Agent> {
+    let contents = read_to_string(path)
+        .with_context(|| format!("Failed to read agent file at '{}'", path.display()))?;
+    let name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("Invalid agent file name: '{}'", path.display()))?;
+    Ok(Agent::from_markdown(name, &contents))
+}
+
+/// Resolve file-backed variable defaults and populate `shared_variables`.
+///
+/// This performs the synchronous subset of `init()` that loads variable
+/// values from files (the `path:` field on agent variables) and then
+/// runs `init_agent_variables` with `no_interaction: true`.  It does NOT
+/// touch MCP, RAG, or model resolution — call `retrieve_agent` for the
+/// model and this method for variables when you need a lightweight agent
+/// suitable for non-interactive use (e.g. compaction).
+pub fn resolve_variables(agent: &mut Agent) -> Result<()> {
+    let agent_file_path = Config::agent_file(agent.name());
+    let agent_dir = agent_file_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(Config::agents_data_dir);
+
+    Agent::resolve_file_backed_variables(&mut agent.variables, &agent_dir)?;
+
+    let new_variables = init_agent_variables(
+        &agent.variables,
+        &agent.shared_variables,
+        true, // no_interaction
+    )?;
+    agent.set_shared_variables(new_variables);
+    Ok(())
+}
+
+pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) -> Result<Agent> {
+    let agent_file_path = Config::agent_file(name);
+    let mut agent = if agent_file_path.exists() {
+        load(&agent_file_path)?
+    } else {
+        builtin(name)?
+    };
+
+    let mcp_manager = config.read().mcp_manager.clone();
+    agent.mcp_manager = mcp_manager.clone();
+
+    let mcp_tools = match &mcp_manager {
+        Some(manager) => Some(manager.get_all_tools().await),
+        None => None,
+    };
+    agent.tools = Tools::init_from_mcp(mcp_tools);
+
+    let model = {
+        let config = config.read();
+        match agent.model_id.as_ref() {
+            Some(model_id) => {
+                crate::client::retrieve_model(&config.clients, model_id, ModelType::Chat)?
+            }
+            None => {
+                if agent.temperature.is_none() {
+                    agent.temperature = config.temperature;
+                }
+                if agent.top_p.is_none() {
+                    agent.top_p = config.top_p;
+                }
+                config.current_model().clone()
+            }
+        }
+    };
+    agent.model = model;
+
+    let rag_path = Config::agent_rag_file(name, DEFAULT_AGENT_NAME);
+    let agent_dir = agent_file_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(Config::agents_data_dir);
+
+    Agent::resolve_file_backed_variables(&mut agent.variables, &agent_dir)?;
+
+    agent.rag = if rag_path.exists() {
+        Some(Arc::new(Rag::load(config, DEFAULT_AGENT_NAME, &rag_path)?))
+    } else if !agent.documents.is_empty() && !config.read().info_flag {
+        let mut ans = false;
+        if *IS_STDOUT_TERMINAL {
+            ans = Confirm::new("The agent has the documents, init RAG?")
+                .with_default(true)
+                .prompt()?;
+        }
+        if ans {
+            let mut document_paths = vec![];
+            for path in &agent.documents {
+                if is_url(path) {
+                    document_paths.push(path.to_string());
+                } else {
+                    let new_path = safe_join_path(&agent_dir, path)
+                        .ok_or_else(|| anyhow!("Invalid document path: '{path}'"))?;
+                    document_paths.push(new_path.display().to_string())
+                }
+            }
+            let rag = Rag::init(config, "rag", &rag_path, &document_paths, abort_signal).await?;
+            Some(Arc::new(rag))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(agent)
+}
+
+pub fn init_agent_variables(
+    agent_variables: &[AgentVariable],
+    variables: &AgentVariables,
+    no_interaction: bool,
+) -> Result<AgentVariables> {
+    let mut output = IndexMap::new();
+    if agent_variables.is_empty() {
+        return Ok(output);
+    }
+    let mut printed = false;
+    let mut unset_variables = vec![];
+    for agent_variable in agent_variables {
+        let key = agent_variable.name.clone();
+        match variables.get(&key) {
+            Some(value) => {
+                output.insert(key, value.clone());
+            }
+            None => {
+                if let Some(value) = agent_variable.default.clone() {
+                    output.insert(key, value);
+                    continue;
+                }
+                if no_interaction {
+                    continue;
+                }
+                if *IS_STDOUT_TERMINAL {
+                    if !printed {
+                        println!("⚙ Init agent variables...");
+                        printed = true;
+                    }
+                    let value = Text::new(&format!(
+                        "{} ({}):",
+                        agent_variable.name, agent_variable.description
+                    ))
+                    .with_validator(|input: &str| {
+                        if input.trim().is_empty() {
+                            Ok(Validation::Invalid("This field is required".into()))
+                        } else {
+                            Ok(Validation::Valid)
+                        }
+                    })
+                    .prompt()?;
+                    output.insert(key, value);
+                } else {
+                    unset_variables.push(agent_variable)
+                }
+            }
+        }
+    }
+    if !unset_variables.is_empty() {
+        bail!(
+            "The following agent variables are required:\n{}",
+            unset_variables
+                .iter()
+                .map(|v| format!("  - {}: {}", v.name, v.description))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+    Ok(output)
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct AgentFrontMatter {
@@ -755,7 +750,7 @@ pub fn list_agents() -> Vec<String> {
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
     let markdown_path = Config::agents_data_dir().join(format!("{agent_name}.md"));
     if markdown_path.exists() {
-        if let Ok(agent) = Agent::load(&markdown_path) {
+        if let Ok(agent) = load(&markdown_path) {
             return agent
                 .variables
                 .iter()
@@ -839,7 +834,7 @@ mod tests {
 
             let config = GlobalConfig::default();
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(Agent::init(&config, agent_name, create_abort_signal()))
+            runtime.block_on(super::init(&config, agent_name, create_abort_signal()))
         })
     }
 
@@ -919,7 +914,7 @@ mod tests {
 
     #[test]
     fn test_agent_builtin_create_title() {
-        let agent = Agent::builtin("%create-title%").unwrap();
+        let agent = super::builtin("%create-title%").unwrap();
         assert_eq!(agent.name(), "%create-title%");
         assert!(!agent.interpolated_instructions().is_empty());
         assert!(agent.interpolated_instructions().contains("concise"));
@@ -927,7 +922,7 @@ mod tests {
 
     #[test]
     fn test_agent_builtin_unknown() {
-        let result = Agent::builtin("unknown-agent");
+        let result = super::builtin("unknown-agent");
         assert!(result.is_err());
     }
 

@@ -321,7 +321,7 @@ impl acp::Agent for HarnxAgent {
         // Resolve agent variables so they are expanded in the system prompt.
         // In non-ACP flows this happens via init_agent_session_variables; in
         // ACP mode we do it here since the agent is not stored on the config.
-        if let Err(e) = agent.resolve_variables() {
+        if let Err(e) = crate::config::agent::resolve_variables(&mut agent) {
             warn!(
                 "Failed to resolve variables for agent '{}': {e}",
                 self.agent_name
