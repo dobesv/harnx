@@ -129,14 +129,6 @@ impl Agent {
     pub fn rag(&self) -> Option<Arc<Rag>> {
         self.rag.clone()
     }
-
-    pub fn set_rag(&mut self, rag: Option<Arc<Rag>>) {
-        self.rag = rag;
-    }
-
-    pub fn set_mcp_manager(&mut self, mcp_manager: Option<Arc<McpManager>>) {
-        self.mcp_manager = mcp_manager;
-    }
 }
 
 impl AgentConfig {
@@ -185,7 +177,7 @@ impl AgentConfig {
     }
 
     pub fn export(&self) -> Result<String> {
-        let metadata = AgentFrontMatter::from_agent(self);
+        let metadata = AgentFrontMatter::from_config(self);
         if metadata.is_empty() {
             Ok(format!("{}\n", self.prompt))
         } else {
@@ -527,7 +519,7 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
     };
 
     let mcp_manager = config.read().mcp_manager.clone();
-    agent.set_mcp_manager(mcp_manager.clone());
+    agent.mcp_manager = mcp_manager.clone();
 
     let mcp_tools = match &mcp_manager {
         Some(manager) => Some(manager.get_all_tools().await),
@@ -590,7 +582,7 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
     } else {
         None
     };
-    agent.set_rag(rag);
+    agent.rag = rag;
 
     Ok(agent)
 }
@@ -700,7 +692,7 @@ struct AgentFrontMatter {
 }
 
 impl AgentFrontMatter {
-    fn from_agent(config: &AgentConfig) -> Self {
+    fn from_config(config: &AgentConfig) -> Self {
         Self {
             model_id: config.model_id.clone(),
             model_fallbacks: config.model_fallbacks.clone(),
