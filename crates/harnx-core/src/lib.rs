@@ -11,6 +11,7 @@ pub mod crypto;
 pub mod error;
 pub mod event;
 pub mod hooks;
+pub mod macros;
 pub mod message;
 pub mod model;
 pub mod path;
