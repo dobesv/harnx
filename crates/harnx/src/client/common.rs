@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     config::{Config, GlobalConfig, Input},
     render::render_stream,
-    tool::{eval_tool_calls, ToolCall, ToolDeclaration, ToolResult},
+    tool::{eval_tool_calls, ToolResult},
     utils::*,
 };
 
@@ -14,11 +14,15 @@ use inquire::{
     list_option::ListOption, required, validator::Validation, MultiSelect, Select, Text,
 };
 use reqwest::{Client as ReqwestClient, RequestBuilder};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 use std::time::Duration;
 
+#[allow(unused_imports)]
+pub use harnx_core::api_types::{
+    ChatCompletionsData, ChatCompletionsOutput, CompletionTokenUsage, EmbeddingsData,
+    EmbeddingsOutput, ExtraConfig, RerankData, RerankOutput, RerankResult,
+};
 pub use harnx_core::error::LlmError;
 
 /// Parse retry/cooldown duration from HTTP response headers.
@@ -430,16 +434,6 @@ impl Default for ClientConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct ExtraConfig {
-    pub proxy: Option<String>,
-    pub connect_timeout: Option<u64>,
-    pub accept_invalid_certs: Option<bool>,
-    pub ca_cert: Option<String>,
-    pub client_cert: Option<String>,
-    pub client_key: Option<String>,
-}
-
 pub struct RequestData {
     pub url: String,
     pub headers: IndexMap<String, String>,
@@ -503,117 +497,6 @@ impl RequestData {
             }
         }
     }
-}
-
-#[derive(Debug)]
-pub struct ChatCompletionsData {
-    pub messages: Vec<Message>,
-    pub temperature: Option<f64>,
-    pub top_p: Option<f64>,
-    pub functions: Option<Vec<ToolDeclaration>>,
-    pub stream: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ChatCompletionsOutput {
-    pub text: String,
-    pub tool_calls: Vec<ToolCall>,
-    pub thought: Option<String>,
-    pub id: Option<String>,
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub cached_tokens: Option<u64>,
-}
-
-impl ChatCompletionsOutput {
-    pub fn new(text: &str) -> Self {
-        Self {
-            text: text.to_string(),
-            ..Default::default()
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CompletionTokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_tokens: u64,
-}
-
-impl CompletionTokenUsage {
-    pub fn new(input: Option<u64>, output: Option<u64>, cached: Option<u64>) -> Self {
-        Self {
-            input_tokens: input.unwrap_or(0),
-            output_tokens: output.unwrap_or(0),
-            cached_tokens: cached.unwrap_or(0),
-        }
-    }
-
-    pub fn accumulate(&mut self, other: &CompletionTokenUsage) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cached_tokens += other.cached_tokens;
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.input_tokens == 0 && self.output_tokens == 0
-    }
-}
-
-impl std::fmt::Display for CompletionTokenUsage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut parts = vec![];
-        if self.input_tokens > 0 {
-            parts.push(format!("📥 {}", self.input_tokens));
-        }
-        if self.output_tokens > 0 {
-            parts.push(format!("📤 {}", self.output_tokens));
-        }
-        if self.cached_tokens > 0 {
-            parts.push(format!("💾 {}", self.cached_tokens));
-        }
-        write!(f, "{}", parts.join("  "))
-    }
-}
-
-#[derive(Debug)]
-pub struct EmbeddingsData {
-    pub texts: Vec<String>,
-    pub query: bool,
-}
-
-impl EmbeddingsData {
-    pub fn new(texts: Vec<String>, query: bool) -> Self {
-        Self { texts, query }
-    }
-}
-
-pub type EmbeddingsOutput = Vec<Vec<f32>>;
-
-#[derive(Debug)]
-pub struct RerankData {
-    pub query: String,
-    pub documents: Vec<String>,
-    pub top_n: usize,
-}
-
-impl RerankData {
-    pub fn new(query: String, documents: Vec<String>, top_n: usize) -> Self {
-        Self {
-            query,
-            documents,
-            top_n,
-        }
-    }
-}
-
-pub type RerankOutput = Vec<RerankResult>;
-
-#[derive(Debug, Deserialize)]
-pub struct RerankResult {
-    pub index: usize,
-    pub relevance_score: f64,
 }
 
 pub type PromptAction<'a> = (&'a str, &'a str, Option<&'a str>);

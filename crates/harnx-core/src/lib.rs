@@ -4,6 +4,7 @@
 //! role this crate plays in the multi-crate split.
 
 pub mod abort;
+pub mod api_types;
 pub mod cli;
 pub mod context;
 pub mod crypto;
