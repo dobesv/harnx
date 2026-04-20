@@ -169,7 +169,7 @@ pub fn prepare_completion_data(
 
 pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Message>> {
     let mut messages = if let Some(session) = session_of(input, &config.read().session) {
-        session.build_messages(input)
+        crate::config::session::build_messages(session, input)
     } else {
         crate::config::agent::build_messages(input.agent(), input)
     };
@@ -190,7 +190,7 @@ pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Messag
 
 pub fn echo_messages(input: &Input, config: &GlobalConfig) -> String {
     if let Some(session) = session_of(input, &config.read().session) {
-        session.echo_messages(input)
+        crate::config::session::echo_messages(session, input)
     } else {
         crate::config::agent::echo_messages(input.agent(), input)
     }

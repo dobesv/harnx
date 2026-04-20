@@ -525,7 +525,7 @@ impl acp::Agent for HarnxAgent {
                             crate::client::MessageRole::Tool,
                             tool_calls_content,
                         );
-                        session.append_tool_round(&tool_msg);
+                        crate::config::session::append_tool_round(session, &tool_msg);
                     }
                 })
                 .await

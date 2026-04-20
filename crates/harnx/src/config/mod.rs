@@ -1381,7 +1381,7 @@ impl Config {
                         .with_default(false)
                         .prompt()?;
                         if ans {
-                            session.add_message(input, output, None, &[])?;
+                            crate::config::session::add_message(session, input, output, None, &[])?;
                         }
                     }
                 }
@@ -1492,7 +1492,7 @@ impl Config {
             if let Some(agent) = self.agent.as_ref() {
                 session.sync_agent(agent);
             }
-            session.clear_messages();
+            crate::config::session::clear_messages(session);
         } else {
             bail!("No session")
         }
@@ -1646,7 +1646,7 @@ impl Config {
         }
         let summary = crate::config::input::fetch_chat_text(&input, config).await?;
         if let Some(session) = config.write().session.as_mut() {
-            session.compress(summary);
+            crate::config::session::compress(session, summary);
         }
         config.write().discontinuous_last_message();
         Ok(())
@@ -2424,7 +2424,13 @@ impl Config {
         if input.with_session() {
             if let Some(session) = self.session.as_mut() {
                 session.set_sessions_dir(sessions_dir);
-                session.add_message(&input, output, thought, tool_results)?;
+                crate::config::session::add_message(
+                    session,
+                    &input,
+                    output,
+                    thought,
+                    tool_results,
+                )?;
                 return Ok(());
             }
         }

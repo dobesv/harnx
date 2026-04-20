@@ -70,14 +70,6 @@ pub fn extract_code_block(text: &str) -> &str {
         .unwrap_or(text)
 }
 
-pub fn convert_option_string(value: &str) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
 pub fn fuzzy_filter<T, F>(values: Vec<T>, get: F, pattern: &str) -> Vec<T>
 where
     F: Fn(&T) -> &str,

@@ -259,7 +259,11 @@ impl Session {
         self.model_fallbacks = agent.model_fallbacks().to_vec();
         self.compaction_agent = agent.compaction_agent().map(str::to_string);
         self.model = agent.model().clone();
-        self.agent_name = convert_option_string(agent.name());
+        self.agent_name = if agent.name().is_empty() {
+            None
+        } else {
+            Some(agent.name().to_string())
+        };
         self.agent_prompt = agent.interpolated_instructions();
         self.agent_variables = agent.variables().clone();
         self.agent_instructions = self.agent_prompt.clone();
@@ -268,7 +272,11 @@ impl Session {
     }
 
     pub fn sync_agent(&mut self, agent: &AgentConfig) {
-        self.agent_name = convert_option_string(agent.name());
+        self.agent_name = if agent.name().is_empty() {
+            None
+        } else {
+            Some(agent.name().to_string())
+        };
         self.agent_prompt = agent.interpolated_instructions();
         self.agent_variables = agent.variables().clone();
         self.agent_instructions = self.agent_prompt.clone();
@@ -300,23 +308,6 @@ impl Session {
         ));
     }
 
-    /// Append a pre-built Tool message to the session log.
-    /// Used by the ACP server to persist tool results separately from
-    /// the main `add_message` flow.
-    pub fn append_tool_round(&mut self, tool_msg: &Message) {
-        if !append_event(
-            self,
-            &SessionLogEntry::Message {
-                role: tool_msg.role,
-                content: tool_msg.content.clone(),
-            },
-        ) {
-            self.dirty = true;
-        }
-        self.messages.push(tool_msg.clone());
-        self.update_tokens();
-    }
-
     pub fn set_compress_threshold(&mut self, value: Option<usize>) {
         if self.compress_threshold != value {
             self.compress_threshold = value;
@@ -341,29 +332,6 @@ impl Session {
 
     pub fn set_compressing(&mut self, compressing: bool) {
         self.compressing = compressing;
-    }
-
-    pub fn compress(&mut self, mut prompt: String) {
-        if let Some(system_prompt) = self.messages.first().and_then(|v| {
-            if MessageRole::System == v.role {
-                let content = v.content.to_text();
-                if !content.is_empty() {
-                    return Some(content);
-                }
-            }
-            None
-        }) {
-            prompt = format!("{system_prompt}\n\n{prompt}",);
-        }
-        self.compressed_messages.append(&mut self.messages);
-        self.messages.push(Message::new(
-            MessageRole::System,
-            MessageContent::Text(prompt.clone()),
-        ));
-        self.update_tokens();
-        if !append_event(self, &SessionLogEntry::Compress { prompt }) {
-            self.dirty = true;
-        }
     }
 
     pub fn need_autoname(&self) -> bool {
@@ -397,214 +365,6 @@ impl Session {
             bail!("Cannot perform this operation because the session has messages, please `.empty session` first.");
         }
         Ok(())
-    }
-
-    pub fn add_message(
-        &mut self,
-        input: &Input,
-        output: &str,
-        thought: Option<&str>,
-        tool_results: &[crate::tool::ToolResult],
-    ) -> Result<()> {
-        if input.continue_output().is_some() {
-            if let Some(message) = self.messages.last_mut() {
-                if let MessageContent::Text(text) = &mut message.content {
-                    *text = format!("{text}{output}");
-                }
-            }
-            // Continue/regenerate are edits to the last message; mark dirty
-            // so the full-save fallback can persist them. We don't append
-            // because they modify an existing entry.
-            self.dirty = true;
-        } else if input.regenerate() {
-            if let Some(message) = self.messages.last_mut() {
-                if let MessageContent::Text(text) = &mut message.content {
-                    *text = output.to_string();
-                }
-            }
-            self.dirty = true;
-        } else {
-            let mut all_appended = true;
-            // Detect continuation rounds: if the last saved message is a Tool
-            // message, we're continuing after tool execution and should NOT add
-            // a duplicate user message.
-            let is_continuation = self
-                .messages
-                .last()
-                .is_some_and(|m| m.role == MessageRole::Tool);
-            if self.messages.is_empty() {
-                if self.name == TEMP_SESSION_NAME && self.save_session != Some(false) {
-                    let raw_input = input.raw();
-                    let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
-                    self.autoname = Some(AutoName::new_from_chat_history(chat_history));
-                }
-                let agent_messages = crate::config::agent::build_messages(input.agent(), input);
-                for msg in &agent_messages {
-                    all_appended &= append_event(
-                        self,
-                        &SessionLogEntry::Message {
-                            role: msg.role,
-                            content: msg.content.clone(),
-                        },
-                    );
-                }
-                self.messages.extend(agent_messages);
-            } else if !is_continuation {
-                let user_msg = Message::new(MessageRole::User, input.message_content());
-                all_appended &= append_event(
-                    self,
-                    &SessionLogEntry::Message {
-                        role: user_msg.role,
-                        content: user_msg.content.clone(),
-                    },
-                );
-                self.messages.push(user_msg);
-            }
-            let new_data_urls = input.data_urls();
-            if !new_data_urls.is_empty() {
-                all_appended &= append_event(
-                    self,
-                    &SessionLogEntry::DataUrls {
-                        urls: new_data_urls.clone(),
-                    },
-                );
-            }
-            self.data_urls.extend(new_data_urls);
-            // Only process input.tool_calls() when this is NOT a
-            // continuation round.  On continuation rounds the tool results
-            // were already persisted incrementally via the `tool_results`
-            // parameter in the previous round, so replaying them from the
-            // merged input would create duplicates.
-            if !is_continuation {
-                if let Some(tool_calls) = input.tool_calls().clone() {
-                    let tool_msg =
-                        Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls));
-                    all_appended &= append_event(
-                        self,
-                        &SessionLogEntry::Message {
-                            role: tool_msg.role,
-                            content: tool_msg.content.clone(),
-                        },
-                    );
-                    self.messages.push(tool_msg);
-                }
-            }
-            if let Some(injected) = input.injected_user_text() {
-                let injected_msg = Message::new(
-                    MessageRole::User,
-                    MessageContent::Text(injected.to_string()),
-                );
-                all_appended &= append_event(
-                    self,
-                    &SessionLogEntry::Message {
-                        role: injected_msg.role,
-                        content: injected_msg.content.clone(),
-                    },
-                );
-                self.messages.push(injected_msg);
-            }
-            let content = match thought {
-                Some(v) => MessageContent::Text(format!("<think>\n{v}\n</think>\n{output}")),
-                _ => MessageContent::Text(output.to_string()),
-            };
-            let assistant_msg = Message::new(MessageRole::Assistant, content);
-            all_appended &= append_event(
-                self,
-                &SessionLogEntry::Message {
-                    role: assistant_msg.role,
-                    content: assistant_msg.content.clone(),
-                },
-            );
-            self.messages.push(assistant_msg);
-            // Append tool results from this round (incremental persistence).
-            if !tool_results.is_empty() {
-                let tool_calls_content =
-                    MessageContent::ToolCalls(crate::client::MessageContentToolCalls::new(
-                        tool_results.to_vec(),
-                        output.to_string(),
-                        thought.map(str::to_string),
-                    ));
-                let tool_msg = Message::new(MessageRole::Tool, tool_calls_content);
-                all_appended &= append_event(
-                    self,
-                    &SessionLogEntry::Message {
-                        role: tool_msg.role,
-                        content: tool_msg.content.clone(),
-                    },
-                );
-                self.messages.push(tool_msg);
-            }
-            // Only clear dirty if all events were appended; otherwise the
-            // full-save fallback in exit() will persist the data.
-            self.dirty = !all_appended;
-        }
-        self.update_tokens();
-        Ok(())
-    }
-
-    pub fn clear_messages(&mut self) {
-        self.messages.clear();
-        self.compressed_messages.clear();
-        self.data_urls.clear();
-        self.autoname = None;
-        self.completion_usage = CompletionTokenUsage::default();
-        self.update_tokens();
-        if !append_event(self, &SessionLogEntry::Clear) {
-            self.dirty = true;
-        }
-    }
-
-    pub fn echo_messages(&self, input: &Input) -> String {
-        let messages = self.build_messages(input);
-        serde_yaml::to_string(&messages).unwrap_or_else(|_| "Unable to echo message".into())
-    }
-
-    pub fn build_messages(&self, input: &Input) -> Vec<Message> {
-        let mut messages = self.messages.clone();
-        if input.continue_output().is_some() {
-            return messages;
-        } else if input.regenerate() {
-            while let Some(last) = messages.last() {
-                if !last.role.is_user() {
-                    messages.pop();
-                } else {
-                    break;
-                }
-            }
-            return messages;
-        }
-        let mut need_add_msg = true;
-        let len = messages.len();
-        if len == 0 {
-            messages = crate::config::agent::build_messages(input.agent(), input);
-            need_add_msg = false;
-        } else if len == 1 && self.compressed_messages.len() >= 2 {
-            if let Some(index) = self
-                .compressed_messages
-                .iter()
-                .rposition(|v| v.role == MessageRole::User)
-            {
-                messages.extend(self.compressed_messages[index..].to_vec());
-            }
-        }
-        if need_add_msg {
-            // When the agent was swapped after construction (e.g. compaction),
-            // inject_system_prompt is true and we must prepend the agent's
-            // system prompt — session messages won't already contain it.
-            // On normal session turns the system prompt was stored on turn 1
-            // by save_message(), so inject_system_prompt stays false.
-            if input.inject_system_prompt() {
-                let system_text = input.agent().system_text();
-                if !system_text.is_empty() {
-                    messages.insert(
-                        0,
-                        Message::new(MessageRole::System, MessageContent::Text(system_text)),
-                    );
-                }
-            }
-            messages.push(Message::new(MessageRole::User, input.message_content()));
-        }
-        messages
     }
 }
 
@@ -1110,6 +870,254 @@ pub fn to_agent(session: &Session) -> Agent {
     Agent::new(session.to_agent_config())
 }
 
+/// Append a pre-built Tool message to the session log.
+/// Used by the ACP server to persist tool results separately from
+/// the main `add_message` flow.
+pub fn append_tool_round(session: &mut Session, tool_msg: &Message) {
+    if !append_event(
+        session,
+        &SessionLogEntry::Message {
+            role: tool_msg.role,
+            content: tool_msg.content.clone(),
+        },
+    ) {
+        session.dirty = true;
+    }
+    session.messages.push(tool_msg.clone());
+    session.update_tokens();
+}
+
+pub fn compress(session: &mut Session, mut prompt: String) {
+    if let Some(system_prompt) = session.messages.first().and_then(|v| {
+        if MessageRole::System == v.role {
+            let content = v.content.to_text();
+            if !content.is_empty() {
+                return Some(content);
+            }
+        }
+        None
+    }) {
+        prompt = format!("{system_prompt}\n\n{prompt}",);
+    }
+    session.compressed_messages.append(&mut session.messages);
+    session.messages.push(Message::new(
+        MessageRole::System,
+        MessageContent::Text(prompt.clone()),
+    ));
+    session.update_tokens();
+    if !append_event(session, &SessionLogEntry::Compress { prompt }) {
+        session.dirty = true;
+    }
+}
+
+pub fn add_message(
+    session: &mut Session,
+    input: &Input,
+    output: &str,
+    thought: Option<&str>,
+    tool_results: &[crate::tool::ToolResult],
+) -> Result<()> {
+    if input.continue_output().is_some() {
+        if let Some(message) = session.messages.last_mut() {
+            if let MessageContent::Text(text) = &mut message.content {
+                *text = format!("{text}{output}");
+            }
+        }
+        // Continue/regenerate are edits to the last message; mark dirty
+        // so the full-save fallback can persist them. We don't append
+        // because they modify an existing entry.
+        session.dirty = true;
+    } else if input.regenerate() {
+        if let Some(message) = session.messages.last_mut() {
+            if let MessageContent::Text(text) = &mut message.content {
+                *text = output.to_string();
+            }
+        }
+        session.dirty = true;
+    } else {
+        let mut all_appended = true;
+        // Detect continuation rounds: if the last saved message is a Tool
+        // message, we're continuing after tool execution and should NOT add
+        // a duplicate user message.
+        let is_continuation = session
+            .messages
+            .last()
+            .is_some_and(|m| m.role == MessageRole::Tool);
+        if session.messages.is_empty() {
+            if session.name == TEMP_SESSION_NAME && session.save_session != Some(false) {
+                let raw_input = input.raw();
+                let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
+                session.autoname = Some(AutoName::new_from_chat_history(chat_history));
+            }
+            let agent_messages = crate::config::agent::build_messages(input.agent(), input);
+            for msg in &agent_messages {
+                all_appended &= append_event(
+                    session,
+                    &SessionLogEntry::Message {
+                        role: msg.role,
+                        content: msg.content.clone(),
+                    },
+                );
+            }
+            session.messages.extend(agent_messages);
+        } else if !is_continuation {
+            let user_msg = Message::new(MessageRole::User, input.message_content());
+            all_appended &= append_event(
+                session,
+                &SessionLogEntry::Message {
+                    role: user_msg.role,
+                    content: user_msg.content.clone(),
+                },
+            );
+            session.messages.push(user_msg);
+        }
+        let new_data_urls = input.data_urls();
+        if !new_data_urls.is_empty() {
+            all_appended &= append_event(
+                session,
+                &SessionLogEntry::DataUrls {
+                    urls: new_data_urls.clone(),
+                },
+            );
+        }
+        session.data_urls.extend(new_data_urls);
+        // Only process input.tool_calls() when this is NOT a
+        // continuation round.  On continuation rounds the tool results
+        // were already persisted incrementally via the `tool_results`
+        // parameter in the previous round, so replaying them from the
+        // merged input would create duplicates.
+        if !is_continuation {
+            if let Some(tool_calls) = input.tool_calls().clone() {
+                let tool_msg =
+                    Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls));
+                all_appended &= append_event(
+                    session,
+                    &SessionLogEntry::Message {
+                        role: tool_msg.role,
+                        content: tool_msg.content.clone(),
+                    },
+                );
+                session.messages.push(tool_msg);
+            }
+        }
+        if let Some(injected) = input.injected_user_text() {
+            let injected_msg = Message::new(
+                MessageRole::User,
+                MessageContent::Text(injected.to_string()),
+            );
+            all_appended &= append_event(
+                session,
+                &SessionLogEntry::Message {
+                    role: injected_msg.role,
+                    content: injected_msg.content.clone(),
+                },
+            );
+            session.messages.push(injected_msg);
+        }
+        let content = match thought {
+            Some(v) => MessageContent::Text(format!("<think>\n{v}\n</think>\n{output}")),
+            _ => MessageContent::Text(output.to_string()),
+        };
+        let assistant_msg = Message::new(MessageRole::Assistant, content);
+        all_appended &= append_event(
+            session,
+            &SessionLogEntry::Message {
+                role: assistant_msg.role,
+                content: assistant_msg.content.clone(),
+            },
+        );
+        session.messages.push(assistant_msg);
+        // Append tool results from this round (incremental persistence).
+        if !tool_results.is_empty() {
+            let tool_calls_content =
+                MessageContent::ToolCalls(crate::client::MessageContentToolCalls::new(
+                    tool_results.to_vec(),
+                    output.to_string(),
+                    thought.map(str::to_string),
+                ));
+            let tool_msg = Message::new(MessageRole::Tool, tool_calls_content);
+            all_appended &= append_event(
+                session,
+                &SessionLogEntry::Message {
+                    role: tool_msg.role,
+                    content: tool_msg.content.clone(),
+                },
+            );
+            session.messages.push(tool_msg);
+        }
+        // Only clear dirty if all events were appended; otherwise the
+        // full-save fallback in exit() will persist the data.
+        session.dirty = !all_appended;
+    }
+    session.update_tokens();
+    Ok(())
+}
+
+pub fn clear_messages(session: &mut Session) {
+    session.messages.clear();
+    session.compressed_messages.clear();
+    session.data_urls.clear();
+    session.autoname = None;
+    session.completion_usage = CompletionTokenUsage::default();
+    session.update_tokens();
+    if !append_event(session, &SessionLogEntry::Clear) {
+        session.dirty = true;
+    }
+}
+
+pub fn echo_messages(session: &Session, input: &Input) -> String {
+    let messages = build_messages(session, input);
+    serde_yaml::to_string(&messages).unwrap_or_else(|_| "Unable to echo message".into())
+}
+
+pub fn build_messages(session: &Session, input: &Input) -> Vec<Message> {
+    let mut messages = session.messages.clone();
+    if input.continue_output().is_some() {
+        return messages;
+    } else if input.regenerate() {
+        while let Some(last) = messages.last() {
+            if !last.role.is_user() {
+                messages.pop();
+            } else {
+                break;
+            }
+        }
+        return messages;
+    }
+    let mut need_add_msg = true;
+    let len = messages.len();
+    if len == 0 {
+        messages = crate::config::agent::build_messages(input.agent(), input);
+        need_add_msg = false;
+    } else if len == 1 && session.compressed_messages.len() >= 2 {
+        if let Some(index) = session
+            .compressed_messages
+            .iter()
+            .rposition(|v| v.role == MessageRole::User)
+        {
+            messages.extend(session.compressed_messages[index..].to_vec());
+        }
+    }
+    if need_add_msg {
+        // When the agent was swapped after construction (e.g. compaction),
+        // inject_system_prompt is true and we must prepend the agent's
+        // system prompt — session messages won't already contain it.
+        // On normal session turns the system prompt was stored on turn 1
+        // by save_message(), so inject_system_prompt stays false.
+        if input.inject_system_prompt() {
+            let system_text = input.agent().system_text();
+            if !system_text.is_empty() {
+                messages.insert(
+                    0,
+                    Message::new(MessageRole::System, MessageContent::Text(system_text)),
+                );
+            }
+        }
+        messages.push(Message::new(MessageRole::User, input.message_content()));
+    }
+    messages
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,9 +1222,14 @@ mod tests {
             },
             json!({"result": "ok"}),
         )];
-        session
-            .add_message(&input, "I'll call a tool", None, &tool_results)
-            .unwrap();
+        super::add_message(
+            &mut session,
+            &input,
+            "I'll call a tool",
+            None,
+            &tool_results,
+        )
+        .unwrap();
 
         // Session should have: system/user msgs, assistant, tool
         assert!(
@@ -1249,9 +1262,7 @@ mod tests {
             "hello",
             Some(agent),
         );
-        session
-            .add_message(&input2, "Here is the result", None, &[])
-            .unwrap();
+        super::add_message(&mut session, &input2, "Here is the result", None, &[]).unwrap();
 
         // Should NOT have a duplicate user message
         let user_count = session
@@ -1304,9 +1315,7 @@ mod tests {
 
         // Round 1: save with tool_results — creates assistant + tool messages.
         let input1 = crate::config::input::from_str(&global_config, "hello", Some(agent.clone()));
-        session
-            .add_message(&input1, "calling tool", None, &tool_results)
-            .unwrap();
+        super::add_message(&mut session, &input1, "calling tool", None, &tool_results).unwrap();
 
         let tool_count_after_round1 = session
             .messages
@@ -1329,9 +1338,7 @@ mod tests {
             merged_input.tool_calls().is_some(),
             "merged input should have tool_calls set"
         );
-        session
-            .add_message(&merged_input, "final answer", None, &[])
-            .unwrap();
+        super::add_message(&mut session, &merged_input, "final answer", None, &[]).unwrap();
 
         let tool_count_after_round2 = session
             .messages
@@ -1383,15 +1390,11 @@ mod tests {
         // Round 1: intermediate save with tool results
         let input1 =
             crate::config::input::from_str(&global_config, "find test", Some(agent.clone()));
-        session
-            .add_message(&input1, "searching...", None, &tool_results)
-            .unwrap();
+        super::add_message(&mut session, &input1, "searching...", None, &tool_results).unwrap();
 
         // Round 2: final answer
         let input2 = crate::config::input::from_str(&global_config, "find test", Some(agent));
-        session
-            .add_message(&input2, "found results", None, &[])
-            .unwrap();
+        super::add_message(&mut session, &input2, "found results", None, &[]).unwrap();
 
         // Verify the saved session file contains all expected content
         // in correct order (header, messages from both rounds).
@@ -1477,9 +1480,7 @@ mod tests {
 
         // Round 1: save assistant output (as ACP server does with &[])
         let input1 = crate::config::input::from_str(&global_config, "hello", Some(agent.clone()));
-        session
-            .add_message(&input1, "calling tool", None, &[])
-            .unwrap();
+        super::add_message(&mut session, &input1, "calling tool", None, &[]).unwrap();
         assert_eq!(
             session.messages.last().unwrap().role,
             MessageRole::Assistant,
@@ -1504,7 +1505,7 @@ mod tests {
                 None,
             )),
         );
-        session.append_tool_round(&tool_msg);
+        super::append_tool_round(&mut session, &tool_msg);
         assert_eq!(
             session.messages.last().unwrap().role,
             MessageRole::Tool,
@@ -1514,9 +1515,7 @@ mod tests {
         // Round 2: save final answer — should detect continuation and
         // NOT add a duplicate user message.
         let input2 = crate::config::input::from_str(&global_config, "hello", Some(agent));
-        session
-            .add_message(&input2, "final answer", None, &[])
-            .unwrap();
+        super::add_message(&mut session, &input2, "final answer", None, &[]).unwrap();
 
         let user_count = session
             .messages
