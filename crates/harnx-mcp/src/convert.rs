@@ -1,4 +1,4 @@
-use crate::tool::{JsonSchema, ToolDeclaration};
+use harnx_core::tool::{JsonSchema, ToolDeclaration};
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;

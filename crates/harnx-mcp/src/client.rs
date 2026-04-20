@@ -1,6 +1,7 @@
-use super::{mcp_tool_to_declaration, McpServerConfig};
-use crate::mcp_safety::path_to_file_uri;
-use crate::tool::ToolDeclaration;
+use crate::config::McpServerConfig;
+use crate::convert::mcp_tool_to_declaration;
+use crate::safety::path_to_file_uri;
+use harnx_core::tool::ToolDeclaration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::RwLock;

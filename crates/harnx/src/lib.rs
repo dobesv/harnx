@@ -8,7 +8,6 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod hooks;
-pub mod mcp;
 pub mod rag;
 pub mod render;
 pub mod serve;
@@ -20,4 +19,5 @@ pub mod utils;
 
 pub mod test_utils;
 
+pub use harnx_mcp as mcp;
 pub use harnx_mcp::safety as mcp_safety;

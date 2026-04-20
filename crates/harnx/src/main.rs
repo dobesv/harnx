@@ -4,7 +4,6 @@ mod client;
 mod commands;
 mod config;
 mod hooks;
-mod mcp;
 mod rag;
 mod render;
 mod serve;
@@ -20,6 +19,7 @@ extern crate log;
 #[cfg(test)]
 pub mod test_utils;
 
+pub use harnx_mcp as mcp;
 pub use harnx_mcp::safety as mcp_safety;
 
 use crate::cli::Cli;
