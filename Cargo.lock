@@ -1701,6 +1701,7 @@ version = "0.30.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "harnx-client",
  "harnx-core",
  "tokio",
  "tokio-stream",

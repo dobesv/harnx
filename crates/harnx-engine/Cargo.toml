@@ -10,6 +10,7 @@ description = "Unified LLM + tool-call loop for harnx, emitting AgentEvent strea
 [dependencies]
 anyhow = { workspace = true }
 futures-util = { workspace = true }
+harnx-client = { path = "../harnx-client" }
 harnx-core = { path = "../harnx-core" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

@@ -11,6 +11,7 @@
 
 pub mod engine;
 pub mod input;
+pub mod retry;
 
 pub use engine::Engine;
 pub use input::EngineInput;

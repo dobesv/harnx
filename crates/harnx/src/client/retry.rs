@@ -1,6 +1,5 @@
 use super::{
-    call_chat_completions, call_chat_completions_streaming, init_client, Client, LlmError,
-    ModelType,
+    call_chat_completions, call_chat_completions_streaming, init_client, Client, ModelType,
 };
 use crate::config::{GlobalConfig, Input, RetryConfig};
 use crate::tool::ToolResult;
@@ -12,6 +11,8 @@ use crate::utils::{wait_abort_signal, warning_text, AbortSignal};
 use anyhow::Result;
 use std::pin::Pin;
 use std::time::Duration;
+
+use harnx_engine::retry::{compute_backoff_delay, find_llm_error, is_non_retryable_non_auth};
 
 pub use harnx_core::retry_config::ModelCooldownMap;
 
@@ -28,8 +29,6 @@ type CallFuture<'a> = Pin<
             + 'a,
     >,
 >;
-
-const DEFAULT_COOLDOWN_SECS: u64 = 60;
 
 /// Emit a warning message to the TUI transcript if a UI sink is installed,
 /// otherwise fall back to stderr.
@@ -323,86 +322,20 @@ where
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All retry attempts failed")))
 }
 
-fn compute_backoff_delay(config: &RetryConfig, attempt: u32) -> Duration {
-    let base = Duration::from_millis(config.initial_delay_ms);
-    let max = Duration::from_millis(config.max_delay_ms);
-    let delay = base.saturating_mul(2u32.saturating_pow(attempt));
-    delay.min(max)
-}
-
+/// Thin wrapper around [`harnx_engine::retry::compute_cooldown`] that
+/// extracts the `clients` slice from `GlobalConfig`. Kept here so call
+/// sites (including tests) stay readable — the pure helper lives in
+/// `harnx-engine` alongside the other retry helpers.
 fn compute_cooldown(err: &anyhow::Error, config: &GlobalConfig, model_id: &str) -> Duration {
-    // Check for LlmError with retry_after from 429 headers
-    if let Some(llm_err) = find_llm_error(err) {
-        if llm_err.is_auth_error() {
-            return Duration::from_secs(100 * 365 * 24 * 3600); // effectively infinite
-        }
-        if let Some(retry_after) = llm_err.retry_after {
-            return retry_after;
-        }
-    }
-
-    // Check model-specific error_cooldown_secs config
     let cfg = config.read();
-    if let Ok(model) = crate::client::retrieve_model(&cfg.clients, model_id, ModelType::Chat) {
-        if let Some(cooldown_secs) = model.data().error_cooldown_secs {
-            return Duration::from_secs(cooldown_secs);
-        }
-    }
-
-    Duration::from_secs(DEFAULT_COOLDOWN_SECS)
-}
-
-/// Search the anyhow error chain for an LlmError.
-/// The Client trait wraps errors with `.with_context()`, so the LlmError
-/// may be a root cause rather than the top-level error.
-fn find_llm_error(err: &anyhow::Error) -> Option<&LlmError> {
-    for cause in err.chain() {
-        if let Some(llm_err) = cause.downcast_ref::<LlmError>() {
-            return Some(llm_err);
-        }
-    }
-    None
-}
-
-/// Returns true if the error is non-retryable AND not an auth error.
-/// These errors (400, 404) should not trigger fallback to next model.
-fn is_non_retryable_non_auth(err: &anyhow::Error) -> bool {
-    if let Some(llm_err) = find_llm_error(err) {
-        !llm_err.is_retryable() && !llm_err.is_auth_error()
-    } else {
-        false
-    }
+    harnx_engine::retry::compute_cooldown(err, &cfg.clients, model_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_backoff_delay() {
-        let config = RetryConfig {
-            attempts: 3,
-            initial_delay_ms: 1000,
-            max_delay_ms: 60000,
-        };
-        assert_eq!(
-            compute_backoff_delay(&config, 0),
-            Duration::from_millis(1000)
-        );
-        assert_eq!(
-            compute_backoff_delay(&config, 1),
-            Duration::from_millis(2000)
-        );
-        assert_eq!(
-            compute_backoff_delay(&config, 2),
-            Duration::from_millis(4000)
-        );
-        assert_eq!(
-            compute_backoff_delay(&config, 10),
-            Duration::from_millis(60000)
-        ); // clamped
-    }
-
+    use super::super::LlmError;
     use crate::client::TestStateGuard;
     use crate::config::Config;
     use crate::test_utils::{MockClient, MockTurnBuilder};
@@ -638,7 +571,10 @@ mod tests {
         .into();
         let config = make_config();
         let cooldown = compute_cooldown(&err, &config, "unknown-model");
-        assert_eq!(cooldown, Duration::from_secs(DEFAULT_COOLDOWN_SECS));
+        assert_eq!(
+            cooldown,
+            Duration::from_secs(harnx_engine::retry::DEFAULT_COOLDOWN_SECS)
+        );
     }
 
     #[tokio::test]
