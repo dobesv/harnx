@@ -75,7 +75,7 @@ impl Server {
     fn new(config: &GlobalConfig) -> Self {
         let mut config = config.read().clone();
         config.tools = Tools::default();
-        let mut models = list_all_models(&config);
+        let mut models = list_all_models(&config.clients);
         let mut default_model = config.model.clone();
         default_model.data_mut().name = DEFAULT_MODEL_NAME.into();
         models.insert(0, &default_model);
@@ -300,7 +300,11 @@ impl Server {
             config.write().set_model(&model_name)?;
         }
 
-        let mut client = init_client(&config, None)?;
+        let mut client = {
+            let guard = config.read();
+            let model = guard.model.clone();
+            init_client(&guard.clients, &model)?
+        };
         if max_tokens.is_some() {
             client.model_mut().set_max_tokens(max_tokens, true);
         }
@@ -492,7 +496,7 @@ impl Server {
         let config = Arc::new(RwLock::new(self.config.clone()));
 
         let embedding_model = crate::client::retrieve_model(
-            &config.read(),
+            &config.read().clients,
             &embedding_model_id,
             ModelType::Embedding,
         )?;
@@ -501,7 +505,7 @@ impl Server {
             EmbeddingsReqBodyInput::Single(v) => vec![v],
             EmbeddingsReqBodyInput::Multiple(v) => v,
         };
-        let client = init_client(&config, Some(embedding_model))?;
+        let client = init_client(&config.read().clients, &embedding_model)?;
         let (emb_dry_run, emb_ua) = {
             let cfg = config.read();
             (cfg.dry_run, cfg.user_agent.clone())
@@ -565,10 +569,13 @@ impl Server {
 
         let config = Arc::new(RwLock::new(self.config.clone()));
 
-        let reranker_model =
-            crate::client::retrieve_model(&config.read(), &reranker_model_id, ModelType::Reranker)?;
+        let reranker_model = crate::client::retrieve_model(
+            &config.read().clients,
+            &reranker_model_id,
+            ModelType::Reranker,
+        )?;
 
-        let client = init_client(&config, Some(reranker_model))?;
+        let client = init_client(&config.read().clients, &reranker_model)?;
         let (rr_dry_run, rr_ua) = {
             let cfg = config.read();
             (cfg.dry_run, cfg.user_agent.clone())

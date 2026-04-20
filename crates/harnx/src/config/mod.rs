@@ -1144,7 +1144,7 @@ impl Config {
 
     pub fn set_rag_reranker_model(config: &GlobalConfig, value: Option<String>) -> Result<()> {
         if let Some(id) = &value {
-            crate::client::retrieve_model(&config.read(), id, ModelType::Reranker)?;
+            crate::client::retrieve_model(&config.read().clients, id, ModelType::Reranker)?;
         }
         let has_rag = config.read().rag.is_some();
         match has_rag {
@@ -1198,7 +1198,7 @@ impl Config {
     }
 
     pub fn set_model(&mut self, model_id: &str) -> Result<()> {
-        let model = crate::client::retrieve_model(self, model_id, ModelType::Chat)?;
+        let model = crate::client::retrieve_model(&self.clients, model_id, ModelType::Chat)?;
         if let Some(session) = self.session.as_mut() {
             session.set_model(model);
         } else if let Some(agent) = self.agent.as_mut() {
@@ -1235,7 +1235,8 @@ impl Config {
         match agent.model_id() {
             Some(model_id) => {
                 if current_model.id() != model_id {
-                    let model = crate::client::retrieve_model(self, model_id, ModelType::Chat)?;
+                    let model =
+                        crate::client::retrieve_model(&self.clients, model_id, ModelType::Chat)?;
                     agent.set_model(model);
                 } else {
                     agent.set_model(current_model);
@@ -2124,7 +2125,7 @@ impl Config {
         let filter = args.last().unwrap_or(&"");
         if args.len() == 1 {
             values = match cmd {
-                ".model" => list_models(self, ModelType::Chat)
+                ".model" => list_models(&self.clients, ModelType::Chat)
                     .into_iter()
                     .map(|v| (v.id(), Some(v.description())))
                     .collect(),
@@ -2235,7 +2236,7 @@ impl Config {
                     };
                     complete_option_bool(save_session)
                 }
-                "rag_reranker_model" => list_models(self, ModelType::Reranker)
+                "rag_reranker_model" => list_models(&self.clients, ModelType::Reranker)
                     .iter()
                     .map(|v| v.id())
                     .collect(),
@@ -3007,7 +3008,7 @@ impl Config {
     fn setup_model(&mut self) -> Result<()> {
         let mut model_id = self.model_id.clone();
         if model_id.is_empty() {
-            let models = list_models(self, ModelType::Chat);
+            let models = list_models(&self.clients, ModelType::Chat);
             if models.is_empty() {
                 bail!("No available model");
             }

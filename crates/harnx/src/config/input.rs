@@ -248,7 +248,7 @@ impl Input {
     }
 
     pub fn create_client(&self) -> Result<Box<dyn Client>> {
-        init_client(&self.config, Some(self.agent().model().clone()))
+        init_client(&self.config.read().clients, self.agent().model())
     }
 
     /// Fetch chat text with retry and model fallback support.

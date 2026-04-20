@@ -117,7 +117,7 @@ impl Rag {
         let hnsw = data.build_hnsw();
         let bm25 = data.build_bm25();
         let embedding_model = crate::client::retrieve_model(
-            &config.read(),
+            &config.read().clients,
             &data.embedding_model,
             ModelType::Embedding,
         )?;
@@ -174,7 +174,7 @@ impl Rag {
                 value
             }
             None => {
-                let models = list_models(&config.read(), ModelType::Embedding);
+                let models = list_models(&config.read().clients, ModelType::Embedding);
                 if models.is_empty() {
                     bail!("No available embedding model");
                 }
@@ -182,7 +182,7 @@ impl Rag {
             }
         };
         let embedding_model = crate::client::retrieve_model(
-            &config.read(),
+            &config.read().clients,
             &embedding_model_id,
             ModelType::Embedding,
         )?;
@@ -543,11 +543,11 @@ impl Rag {
         let ids = match rerank_model {
             Some(model_id) => {
                 let model = crate::client::retrieve_model(
-                    &self.config.read(),
+                    &self.config.read().clients,
                     model_id,
                     ModelType::Reranker,
                 )?;
-                let client = init_client(&self.config, Some(model))?;
+                let client = init_client(&self.config.read().clients, &model)?;
                 let ids: IndexSet<DocumentId> = [vector_search_ids, keyword_search_ids]
                     .concat()
                     .into_iter()
@@ -661,7 +661,7 @@ impl Rag {
         data: EmbeddingsData,
         spinner: Option<Spinner>,
     ) -> Result<EmbeddingsOutput> {
-        let embedding_client = init_client(&self.config, Some(self.embedding_model.clone()))?;
+        let embedding_client = init_client(&self.config.read().clients, &self.embedding_model)?;
         let (dry_run, user_agent) = {
             let cfg = self.config.read();
             (cfg.dry_run, cfg.user_agent.clone())

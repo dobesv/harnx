@@ -135,7 +135,7 @@ where
     for model_id in model_ids.iter().skip(1) {
         let valid = {
             let cfg = config.read();
-            crate::client::retrieve_model(&cfg, model_id, ModelType::Chat).is_ok()
+            crate::client::retrieve_model(&cfg.clients, model_id, ModelType::Chat).is_ok()
         };
         if !valid {
             emit_retry_warning(&format!(
@@ -266,11 +266,9 @@ async fn default_call_fn(
 }
 
 fn resolve_client(config: &GlobalConfig, model_id: &str) -> Result<Box<dyn Client>> {
-    let model = {
-        let cfg = config.read();
-        crate::client::retrieve_model(&cfg, model_id, ModelType::Chat)?
-    };
-    init_client(config, Some(model))
+    let cfg = config.read();
+    let model = crate::client::retrieve_model(&cfg.clients, model_id, ModelType::Chat)?;
+    init_client(&cfg.clients, &model)
 }
 
 async fn try_model_with_retries_custom<F>(
@@ -374,7 +372,7 @@ fn compute_cooldown(err: &anyhow::Error, config: &GlobalConfig, model_id: &str) 
 
     // Check model-specific error_cooldown_secs config
     let cfg = config.read();
-    if let Ok(model) = crate::client::retrieve_model(&cfg, model_id, ModelType::Chat) {
+    if let Ok(model) = crate::client::retrieve_model(&cfg.clients, model_id, ModelType::Chat) {
         if let Some(cooldown_secs) = model.data().error_cooldown_secs {
             return Duration::from_secs(cooldown_secs);
         }

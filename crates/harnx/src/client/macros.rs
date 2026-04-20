@@ -31,8 +31,8 @@ macro_rules! register_client {
             impl $client {
                 pub const NAME: &'static str = $name;
 
-                pub fn init(global_config: &$crate::config::GlobalConfig, model: &$crate::client::Model) -> Option<Box<dyn Client>> {
-                    let config = global_config.read().clients.iter().find_map(|client_config| {
+                pub fn init(clients: &[ClientConfig], model: &$crate::client::Model) -> Option<Box<dyn Client>> {
+                    let config = clients.iter().find_map(|client_config| {
                         if let ClientConfig::$config(c) = client_config {
                             if Self::name(c) == model.client_name() {
                                 return Some(c.clone())
@@ -80,15 +80,14 @@ macro_rules! register_client {
 
         )+
 
-        pub fn init_client(config: &$crate::config::GlobalConfig, model: Option<$crate::client::Model>) -> anyhow::Result<Box<dyn Client>> {
+        pub fn init_client(clients: &[ClientConfig], model: &$crate::client::Model) -> anyhow::Result<Box<dyn Client>> {
             #[cfg(test)]
             if let Some(client) = $crate::client::take_test_client() {
                 return Ok(Box::new($crate::client::TestClient::new(client)));
             }
 
-            let model = model.unwrap_or_else(|| config.read().model.clone());
             None
-            $(.or_else(|| $client::init(config, &model)))+
+            $(.or_else(|| $client::init(clients, model)))+
             .ok_or_else(|| {
                 anyhow::anyhow!("Invalid model '{}'", model.id())
             })
@@ -114,10 +113,9 @@ macro_rules! register_client {
 
         static ALL_CLIENT_NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
-        pub fn list_client_names(config: &$crate::config::Config) -> Vec<&'static String> {
+        pub fn list_client_names(clients: &[ClientConfig]) -> Vec<&'static String> {
             let names = ALL_CLIENT_NAMES.get_or_init(|| {
-                config
-                    .clients
+                clients
                     .iter()
                     .flat_map(|v| match v {
                         $(ClientConfig::$config(c) => vec![$client::name(c).to_string()],)+
@@ -130,10 +128,9 @@ macro_rules! register_client {
 
         static ALL_MODELS: std::sync::OnceLock<Vec<$crate::client::Model>> = std::sync::OnceLock::new();
 
-        pub fn list_all_models(config: &$crate::config::Config) -> Vec<&'static $crate::client::Model> {
+        pub fn list_all_models(clients: &[ClientConfig]) -> Vec<&'static $crate::client::Model> {
             let models = ALL_MODELS.get_or_init(|| {
-                config
-                    .clients
+                clients
                     .iter()
                     .flat_map(|v| match v {
                         $(ClientConfig::$config(c) => $client::list_models(c),)+
@@ -144,8 +141,8 @@ macro_rules! register_client {
             models.iter().collect()
         }
 
-        pub fn list_models(config: &$crate::config::Config, model_type: $crate::client::ModelType) -> Vec<&'static $crate::client::Model> {
-            list_all_models(config).into_iter().filter(|v| v.model_type() == model_type).collect()
+        pub fn list_models(clients: &[ClientConfig], model_type: $crate::client::ModelType) -> Vec<&'static $crate::client::Model> {
+            list_all_models(clients).into_iter().filter(|v| v.model_type() == model_type).collect()
         }
     };
 }

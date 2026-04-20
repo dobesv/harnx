@@ -1,13 +1,15 @@
-use super::{list_all_models, list_client_names};
-
-use crate::config::Config;
+use super::{list_all_models, list_client_names, ClientConfig};
 
 use anyhow::{bail, Result};
 
 pub use harnx_core::model::{Model, ModelType, ProviderModels, RequestPatch};
 
-pub fn retrieve_model(config: &Config, model_id: &str, model_type: ModelType) -> Result<Model> {
-    let models = list_all_models(config);
+pub fn retrieve_model(
+    clients: &[ClientConfig],
+    model_id: &str,
+    model_type: ModelType,
+) -> Result<Model> {
+    let models = list_all_models(clients);
     let (client_name, model_name) = match model_id.split_once(':') {
         Some((client_name, model_name)) => {
             if model_name.is_empty() {
@@ -27,7 +29,7 @@ pub fn retrieve_model(config: &Config, model_id: &str, model_type: ModelType) ->
                     bail!("Model '{model_id}' is not a {model_type} model")
                 }
             }
-            if list_client_names(config)
+            if list_client_names(clients)
                 .into_iter()
                 .any(|v| *v == client_name)
                 && model_type.can_create_from_name()

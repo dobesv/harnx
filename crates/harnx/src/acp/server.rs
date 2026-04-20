@@ -897,8 +897,9 @@ mod tests {
 
         let mut config = Config::default();
         config.clients = clients;
-        config.model = crate::client::retrieve_model(&config, "openai:gpt-4o", ModelType::Chat)
-            .expect("load test model");
+        config.model =
+            crate::client::retrieve_model(&config.clients, "openai:gpt-4o", ModelType::Chat)
+                .expect("load test model");
         config.save_session = Some(true);
 
         Arc::new(RwLock::new(config))
