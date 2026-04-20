@@ -1,7 +1,11 @@
 use crate::{
-    acp::NestedAcpEvent,
+    acp::{AcpManager, NestedAcpEvent},
     config::GlobalConfig,
-    hooks::{dispatch::dispatch_hooks, HookEvent, HookOutcome, HookResult, HookResultControl},
+    hooks::{
+        dispatch::dispatch_hooks, HookEvent, HookOutcome, HookResult, HookResultControl,
+        HooksConfig,
+    },
+    mcp::McpManager,
     mcp_safety::{truncate_output, TruncateOpts},
     tui::render_helpers::event_fallback_text,
     ui_output::{
@@ -13,7 +17,9 @@ use crate::{
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::Write as _;
+use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -22,8 +28,43 @@ pub use harnx_core::tool::{
     ToolCall, ToolDeclaration, ToolError, ToolResult, Tools, TRIGGER_AGENT_TOOL_NAME,
 };
 
+/// Narrow view of `GlobalConfig` used by the tool-call loop. Callers
+/// construct this once per batch via `ToolEvalContext::from_config`
+/// and pass it through. This decouples the loop from `GlobalConfig`
+/// as prep for moving the loop into `harnx-engine` — at that point
+/// the loop can be moved without any Config dep.
+pub struct ToolEvalContext {
+    pub hooks: HooksConfig,
+    pub acp_manager: Option<Arc<AcpManager>>,
+    pub mcp_manager: Option<Arc<McpManager>>,
+    pub session_name: Option<String>,
+    pub allowed_tool_names: HashSet<String>,
+}
+
+impl ToolEvalContext {
+    pub fn from_config(config: &GlobalConfig) -> Self {
+        let guard = config.read();
+        let use_tools = guard.extract_agent().use_tools().map(|v| v.join(","));
+        let allowed_tool_names: HashSet<String> = guard
+            .tool_declarations_for_use_tools(use_tools.as_deref())
+            .into_iter()
+            .map(|decl| decl.name)
+            .collect();
+        Self {
+            hooks: guard.resolved_hooks(),
+            acp_manager: guard.acp_manager.clone(),
+            mcp_manager: guard.mcp_manager.clone(),
+            session_name: guard
+                .session
+                .as_ref()
+                .map(|session| session.name().to_string()),
+            allowed_tool_names,
+        }
+    }
+}
+
 pub fn eval_tool_calls(
-    config: &GlobalConfig,
+    ctx: &ToolEvalContext,
     mut calls: Vec<ToolCall>,
     abort_signal: &AbortSignal,
 ) -> Result<Vec<ToolResult>> {
@@ -36,7 +77,7 @@ pub fn eval_tool_calls(
         bail!("The request was aborted because an infinite loop of function calls was detected.")
     }
 
-    let hooks = config.read().resolved_hooks();
+    let hooks = &ctx.hooks;
     let cwd = std::env::current_dir().unwrap_or_default();
     let session_id = "cmd".to_string();
 
@@ -91,7 +132,7 @@ pub fn eval_tool_calls(
             bail!("tool execution aborted by user");
         }
 
-        let eval_result = eval_tool_call_mcp(&call, config, abort_signal);
+        let eval_result = eval_tool_call_mcp(&call, ctx, abort_signal);
         match eval_result {
             Ok(mut result) => {
                 let post_event = HookEvent::PostToolUse {
@@ -196,7 +237,7 @@ pub fn eval_tool_calls(
 
 fn eval_tool_call_mcp(
     call: &ToolCall,
-    config: &GlobalConfig,
+    ctx: &ToolEvalContext,
     abort_signal: &AbortSignal,
 ) -> Result<Value, ToolError> {
     let json_data = if call.arguments.is_null() {
@@ -252,15 +293,7 @@ fn eval_tool_call_mcp(
         }));
     }
 
-    let allowed_tool_names: std::collections::HashSet<String> = {
-        let guard = config.read();
-        let use_tools = guard.extract_agent().use_tools().map(|v| v.join(","));
-        guard
-            .tool_declarations_for_use_tools(use_tools.as_deref())
-            .into_iter()
-            .map(|decl| decl.name)
-            .collect()
-    };
+    let allowed_tool_names = &ctx.allowed_tool_names;
 
     if call.name.ends_with("_session_handoff") {
         if !allowed_tool_names.contains(&call.name) {
@@ -276,13 +309,7 @@ fn eval_tool_call_mcp(
         let session_id = json_data["session_id"]
             .as_str()
             .map(ToString::to_string)
-            .or_else(|| {
-                config
-                    .read()
-                    .session
-                    .as_ref()
-                    .map(|session| session.name().to_string())
-            });
+            .or_else(|| ctx.session_name.clone());
 
         return Ok(json!({
             "content": [{
@@ -297,7 +324,7 @@ fn eval_tool_call_mcp(
         }));
     }
 
-    let acp_manager = config.read().acp_manager.clone();
+    let acp_manager = ctx.acp_manager.clone();
     if let Some(manager) = acp_manager {
         if manager.find_client_for_tool(&call.name).is_some() {
             let tool_name = call.name.clone();
@@ -379,7 +406,7 @@ fn eval_tool_call_mcp(
         }
     }
 
-    let mcp_manager = config.read().mcp_manager.clone();
+    let mcp_manager = ctx.mcp_manager.clone();
     let manager = match mcp_manager {
         Some(m) => m,
         None => {
@@ -491,7 +518,8 @@ mod tests {
         let calls = vec![call];
 
         let abort_signal = create_abort_signal();
-        let result = eval_tool_calls(&config, calls, &abort_signal).unwrap();
+        let result =
+            eval_tool_calls(&ToolEvalContext::from_config(&config), calls, &abort_signal).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].call.name, "unknown_tool");
         assert!(result[0].output.is_object());
@@ -522,7 +550,8 @@ mod tests {
         let calls = vec![call1, call2];
 
         let abort_signal = create_abort_signal();
-        let result = eval_tool_calls(&config, calls, &abort_signal).unwrap();
+        let result =
+            eval_tool_calls(&ToolEvalContext::from_config(&config), calls, &abort_signal).unwrap();
         assert_eq!(result.len(), 2);
 
         assert_eq!(result[0].call.name, TRIGGER_AGENT_TOOL_NAME);

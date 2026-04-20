@@ -14,7 +14,7 @@ use super::*;
 use crate::{
     config::{Config, GlobalConfig, Input},
     render::render_stream,
-    tool::{eval_tool_calls, ToolResult},
+    tool::{eval_tool_calls, ToolEvalContext, ToolResult},
     utils::*,
 };
 
@@ -190,7 +190,11 @@ pub async fn call_chat_completions(
             Ok((
                 text,
                 thought,
-                eval_tool_calls(config, tool_calls, &abort_signal)?,
+                eval_tool_calls(
+                    &ToolEvalContext::from_config(config),
+                    tool_calls,
+                    &abort_signal,
+                )?,
                 usage,
             ))
         }
@@ -247,7 +251,11 @@ pub async fn call_chat_completions_streaming(
             Ok((
                 text,
                 thought,
-                eval_tool_calls(config, tool_calls, &abort_signal)?,
+                eval_tool_calls(
+                    &ToolEvalContext::from_config(config),
+                    tool_calls,
+                    &abort_signal,
+                )?,
                 usage,
             ))
         }

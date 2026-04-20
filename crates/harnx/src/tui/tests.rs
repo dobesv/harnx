@@ -1673,7 +1673,7 @@ async fn test_sub_agent_delegation_tool_appears() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_tool_result_switch_agent_parsing() {
     use crate::acp::{AcpManager, AcpServerConfig};
-    use crate::tool::{eval_tool_calls, ToolCall};
+    use crate::tool::{eval_tool_calls, ToolCall, ToolEvalContext};
 
     let _guard = TestStateGuard::new(None).await;
     let config = test_config();
@@ -1707,7 +1707,12 @@ async fn test_tool_result_switch_agent_parsing() {
     // switch_agent parsing path that runs in eval_tool_calls (line 126-141 of
     // tool.rs) on the result object.
     let abort_signal = crate::utils::create_abort_signal();
-    let mut results = eval_tool_calls(&config, vec![call], &abort_signal).unwrap();
+    let mut results = eval_tool_calls(
+        &ToolEvalContext::from_config(&config),
+        vec![call],
+        &abort_signal,
+    )
+    .unwrap();
     results[0].output = serde_json::json!({
         "action": "switch_agent",
         "agent": "specialist",

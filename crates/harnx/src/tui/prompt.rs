@@ -349,7 +349,11 @@ impl Tui {
             Ok(_) => Ok((
                 text,
                 thought,
-                crate::tool::eval_tool_calls(config, tool_calls, &abort_signal)?,
+                crate::tool::eval_tool_calls(
+                    &crate::tool::ToolEvalContext::from_config(config),
+                    tool_calls,
+                    &abort_signal,
+                )?,
                 usage,
             )),
             Err(err) => {
