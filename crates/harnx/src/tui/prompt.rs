@@ -19,14 +19,14 @@ impl Tui {
     ) -> Result<()> {
         let attachment_dir = msg.attachment_dir.clone();
         let input_res = if msg.attachments.is_empty() {
-            Ok(Input::from_str(&ctx.config, &msg.text, None))
+            Ok(crate::config::input::from_str(&ctx.config, &msg.text, None))
         } else {
             let paths: Vec<String> = msg
                 .attachments
                 .iter()
                 .map(|a| a.path.to_string_lossy().to_string())
                 .collect();
-            Input::from_files(&ctx.config, &msg.text, paths, None).await
+            crate::config::input::from_files(&ctx.config, &msg.text, paths, None).await
         };
         if let Some(dir) = attachment_dir {
             let cleanup_dir = dir.clone();
@@ -73,7 +73,12 @@ impl Tui {
             }
 
             if with_embeddings {
-                input.use_embeddings(ctx.abort_signal.clone()).await?;
+                crate::config::input::use_embeddings(
+                    &mut input,
+                    &ctx.config,
+                    ctx.abort_signal.clone(),
+                )
+                .await?;
             }
 
             {
@@ -125,7 +130,7 @@ impl Tui {
                  abort_signal| {
                     let event_tx = event_tx.clone();
                     Box::pin(async move {
-                        if input.stream() {
+                        if crate::config::input::stream(input, config) {
                             Self::call_chat_completions_streaming_tui(
                                 input,
                                 client,
@@ -244,7 +249,7 @@ impl Tui {
                         .additional_context
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-                    input = Input::from_str(&ctx.config, &context, None);
+                    input = crate::config::input::from_str(&ctx.config, &context, None);
                     resume_count += 1;
                     with_embeddings = true;
                     continue;
@@ -269,7 +274,7 @@ impl Tui {
                 if ctx.abort_signal.aborted() {
                     break;
                 }
-                input = Input::from_str(&ctx.config, &context, None);
+                input = crate::config::input::from_str(&ctx.config, &context, None);
                 resume_count += 1;
                 with_embeddings = true;
                 continue;
@@ -327,6 +332,7 @@ impl Tui {
         let send_ret = crate::client::chat_completions_streaming_with_input(
             client,
             input,
+            config,
             &mut handler,
             &call_ctx,
         )

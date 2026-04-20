@@ -473,7 +473,7 @@ async fn start_directive_inner(
     with_embeddings: bool,
 ) -> Result<()> {
     if with_embeddings {
-        input.use_embeddings(abort_signal.clone()).await?;
+        crate::config::input::use_embeddings(&mut input, config, abort_signal.clone()).await?;
     }
     drain_async_results(async_manager, pending_async_context);
     inject_pending_async_context(&mut input, pending_async_context);
@@ -653,7 +653,7 @@ async fn start_directive_inner(
                 .additional_context
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-            let new_input = Input::from_str(config, &context, None);
+            let new_input = crate::config::input::from_str(config, &context, None);
             return start_directive_inner(
                 config,
                 new_input,
@@ -678,7 +678,7 @@ async fn start_directive_inner(
             .take()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-        let new_input = Input::from_str(config, &context, None);
+        let new_input = crate::config::input::from_str(config, &context, None);
         return start_directive_inner(
             config,
             new_input,
@@ -714,9 +714,9 @@ async fn create_input(
     abort_signal: AbortSignal,
 ) -> Result<Input> {
     let input = if file.is_empty() {
-        Input::from_str(config, &text.unwrap_or_default(), None)
+        crate::config::input::from_str(config, &text.unwrap_or_default(), None)
     } else {
-        Input::from_files_with_spinner(
+        crate::config::input::from_files_with_spinner(
             config,
             &text.unwrap_or_default(),
             file.to_vec(),

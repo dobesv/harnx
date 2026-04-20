@@ -137,7 +137,13 @@ impl HarnxAgent {
         };
 
         let (send_ret, _) = tokio::join!(
-            crate::client::chat_completions_streaming_with_input(client, input, &mut handler, &ctx),
+            crate::client::chat_completions_streaming_with_input(
+                client,
+                input,
+                &self.config,
+                &mut handler,
+                &ctx
+            ),
             async {
                 while let Some(event) = rx.recv().await {
                     match event {
@@ -194,7 +200,7 @@ impl HarnxAgent {
         };
 
         let output = tokio::select! {
-            result = crate::client::chat_completions_with_input(client, input.clone(), &ctx) => {
+            result = crate::client::chat_completions_with_input(client, input.clone(), &self.config, &ctx) => {
                 result.map_err(|e| acp::Error::new(-32603, e.to_string()))?
             }
             _ = wait_abort_signal(abort_signal) => {
@@ -322,10 +328,9 @@ impl acp::Agent for HarnxAgent {
             );
         }
 
-        let mut input = Input::from_str(&self.config, &prompt_text, None);
-        input.set_agent(agent);
-        let client = input
-            .create_client()
+        let mut input = crate::config::input::from_str(&self.config, &prompt_text, None);
+        crate::config::input::set_agent(&mut input, &self.config, agent);
+        let client = crate::config::input::create_client(&input, &self.config)
             .map_err(|e| acp::Error::new(-32603, format!("Failed to create client: {e}")))?;
 
         let mut round = 0u32;
@@ -335,7 +340,7 @@ impl acp::Agent for HarnxAgent {
             }
 
             let exec_fut = async {
-                if input.stream() {
+                if crate::config::input::stream(&input, &self.config) {
                     self.execute_llm_streaming(&session_key, &input, client.as_ref(), &abort_signal)
                         .await
                 } else {

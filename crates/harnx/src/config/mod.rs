@@ -1,5 +1,5 @@
 mod agent;
-mod input;
+pub mod input;
 pub mod session;
 
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables, RetryConfig};
@@ -1678,11 +1678,11 @@ impl Config {
         // preserved — the compaction LLM must see the full session history to
         // summarise it.  Then swap the agent (model/params/prompt) in place
         // without disturbing the with_session flag.
-        let mut input = Input::from_str(config, &prompt, None);
+        let mut input = crate::config::input::from_str(config, &prompt, None);
         if let Some(compaction_agent) = agent_override {
-            input.set_agent(compaction_agent);
+            crate::config::input::set_agent(&mut input, config, compaction_agent);
         }
-        let summary = input.fetch_chat_text().await?;
+        let summary = crate::config::input::fetch_chat_text(&input, config).await?;
         if let Some(session) = config.write().session.as_mut() {
             session.compress(summary);
         }
@@ -1735,8 +1735,8 @@ impl Config {
             None => bail!("No chat history"),
         };
         let agent = config.read().retrieve_agent(CREATE_TITLE_AGENT)?;
-        let input = Input::from_str(config, &text, Some(agent));
-        let text = input.fetch_chat_text().await?;
+        let input = crate::config::input::from_str(config, &text, Some(agent));
+        let text = crate::config::input::fetch_chat_text(&input, config).await?;
         if let Some(session) = config.write().session.as_mut() {
             session.set_autoname(&text);
         }
@@ -3418,7 +3418,7 @@ mod tests {
 
         let _agent = config.extract_agent();
         let global_config: GlobalConfig = Arc::new(RwLock::new(config));
-        let input = Input::from_str(&global_config, "do something", None);
+        let input = crate::config::input::from_str(&global_config, "do something", None);
 
         let tool_results = vec![ToolResult::new(
             ToolCall {

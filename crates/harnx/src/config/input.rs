@@ -17,7 +17,6 @@ const SUMMARY_MAX_WIDTH: usize = 80;
 
 #[derive(Debug, Clone)]
 pub struct Input {
-    config: GlobalConfig,
     text: String,
     raw: (String, Vec<String>),
     patched_text: Option<String>,
@@ -42,113 +41,111 @@ pub struct Input {
     injected_user_text: Option<String>,
 }
 
+pub fn from_str(config: &GlobalConfig, text: &str, agent: Option<Agent>) -> Input {
+    let (agent, with_session, with_agent) = resolve_agent(&config.read(), agent);
+    Input {
+        text: text.to_string(),
+        raw: (text.to_string(), vec![]),
+        patched_text: None,
+        last_reply: None,
+        continue_output: None,
+        regenerate: false,
+        medias: Default::default(),
+        data_urls: Default::default(),
+        tool_calls: None,
+        agent,
+        rag_name: None,
+        with_session,
+        with_agent,
+        inject_system_prompt: false,
+        injected_user_text: None,
+    }
+}
+
+pub async fn from_files(
+    config: &GlobalConfig,
+    raw_text: &str,
+    paths: Vec<String>,
+    agent: Option<Agent>,
+) -> Result<Input> {
+    let loaders = config.read().document_loaders.clone();
+    let (raw_paths, local_paths, remote_urls, external_cmds, protocol_paths, with_last_reply) =
+        resolve_paths(&loaders, paths)?;
+    let mut last_reply = None;
+    let (documents, medias, data_urls) = load_documents(
+        &loaders,
+        local_paths,
+        remote_urls,
+        external_cmds,
+        protocol_paths,
+    )
+    .await
+    .context("Failed to load files")?;
+    let mut texts = vec![];
+    if !raw_text.is_empty() {
+        texts.push(raw_text.to_string());
+    };
+    if with_last_reply {
+        if let Some(LastMessage { input, output, .. }) = config.read().last_message.as_ref() {
+            if !output.is_empty() {
+                last_reply = Some(output.clone())
+            } else if let Some(v) = input.last_reply.as_ref() {
+                last_reply = Some(v.clone());
+            }
+            if let Some(v) = last_reply.clone() {
+                texts.push(format!("\n{v}"));
+            }
+        }
+        if last_reply.is_none() && documents.is_empty() && medias.is_empty() {
+            bail!("No last reply found");
+        }
+    }
+    let documents_len = documents.len();
+    for (kind, path, contents) in documents {
+        if documents_len == 1 && raw_text.is_empty() {
+            texts.push(format!("\n{contents}"));
+        } else {
+            texts.push(format!(
+                "\n============ {kind}: {path} ============\n{contents}"
+            ));
+        }
+    }
+    let (agent, with_session, with_agent) = resolve_agent(&config.read(), agent);
+    Ok(Input {
+        text: texts.join("\n"),
+        raw: (raw_text.to_string(), raw_paths),
+        patched_text: None,
+        last_reply,
+        continue_output: None,
+        regenerate: false,
+        medias,
+        data_urls,
+        tool_calls: Default::default(),
+        agent,
+        rag_name: None,
+        with_session,
+        with_agent,
+        inject_system_prompt: false,
+        injected_user_text: None,
+    })
+}
+
+pub async fn from_files_with_spinner(
+    config: &GlobalConfig,
+    raw_text: &str,
+    paths: Vec<String>,
+    agent: Option<Agent>,
+    abort_signal: AbortSignal,
+) -> Result<Input> {
+    abortable_run_with_spinner(
+        from_files(config, raw_text, paths, agent),
+        "Loading files",
+        abort_signal,
+    )
+    .await
+}
+
 impl Input {
-    pub fn from_str(config: &GlobalConfig, text: &str, agent: Option<Agent>) -> Self {
-        let (agent, with_session, with_agent) = resolve_agent(&config.read(), agent);
-        Self {
-            config: config.clone(),
-            text: text.to_string(),
-            raw: (text.to_string(), vec![]),
-            patched_text: None,
-            last_reply: None,
-            continue_output: None,
-            regenerate: false,
-            medias: Default::default(),
-            data_urls: Default::default(),
-            tool_calls: None,
-            agent,
-            rag_name: None,
-            with_session,
-            with_agent,
-            inject_system_prompt: false,
-            injected_user_text: None,
-        }
-    }
-
-    pub async fn from_files(
-        config: &GlobalConfig,
-        raw_text: &str,
-        paths: Vec<String>,
-        agent: Option<Agent>,
-    ) -> Result<Self> {
-        let loaders = config.read().document_loaders.clone();
-        let (raw_paths, local_paths, remote_urls, external_cmds, protocol_paths, with_last_reply) =
-            resolve_paths(&loaders, paths)?;
-        let mut last_reply = None;
-        let (documents, medias, data_urls) = load_documents(
-            &loaders,
-            local_paths,
-            remote_urls,
-            external_cmds,
-            protocol_paths,
-        )
-        .await
-        .context("Failed to load files")?;
-        let mut texts = vec![];
-        if !raw_text.is_empty() {
-            texts.push(raw_text.to_string());
-        };
-        if with_last_reply {
-            if let Some(LastMessage { input, output, .. }) = config.read().last_message.as_ref() {
-                if !output.is_empty() {
-                    last_reply = Some(output.clone())
-                } else if let Some(v) = input.last_reply.as_ref() {
-                    last_reply = Some(v.clone());
-                }
-                if let Some(v) = last_reply.clone() {
-                    texts.push(format!("\n{v}"));
-                }
-            }
-            if last_reply.is_none() && documents.is_empty() && medias.is_empty() {
-                bail!("No last reply found");
-            }
-        }
-        let documents_len = documents.len();
-        for (kind, path, contents) in documents {
-            if documents_len == 1 && raw_text.is_empty() {
-                texts.push(format!("\n{contents}"));
-            } else {
-                texts.push(format!(
-                    "\n============ {kind}: {path} ============\n{contents}"
-                ));
-            }
-        }
-        let (agent, with_session, with_agent) = resolve_agent(&config.read(), agent);
-        Ok(Self {
-            config: config.clone(),
-            text: texts.join("\n"),
-            raw: (raw_text.to_string(), raw_paths),
-            patched_text: None,
-            last_reply,
-            continue_output: None,
-            regenerate: false,
-            medias,
-            data_urls,
-            tool_calls: Default::default(),
-            agent,
-            rag_name: None,
-            with_session,
-            with_agent,
-            inject_system_prompt: false,
-            injected_user_text: None,
-        })
-    }
-
-    pub async fn from_files_with_spinner(
-        config: &GlobalConfig,
-        raw_text: &str,
-        paths: Vec<String>,
-        agent: Option<Agent>,
-        abort_signal: AbortSignal,
-    ) -> Result<Self> {
-        abortable_run_with_spinner(
-            Input::from_files(config, raw_text, paths, agent),
-            "Loading files",
-            abort_signal,
-        )
-        .await
-    }
-
     pub fn is_empty(&self) -> bool {
         self.text.is_empty() && self.medias.is_empty()
     }
@@ -176,10 +173,6 @@ impl Input {
         self.text = text;
     }
 
-    pub fn stream(&self) -> bool {
-        self.config.read().stream && !self.agent().model().no_stream()
-    }
-
     pub fn continue_output(&self) -> Option<&str> {
         self.continue_output.as_deref()
     }
@@ -194,28 +187,6 @@ impl Input {
 
     pub fn regenerate(&self) -> bool {
         self.regenerate
-    }
-
-    pub fn set_regenerate(&mut self) {
-        let agent = self.config.read().extract_agent();
-        if agent.name() == self.agent().name() {
-            self.agent = agent;
-        }
-        self.regenerate = true;
-        self.tool_calls = None;
-    }
-
-    pub async fn use_embeddings(&mut self, abort_signal: AbortSignal) -> Result<()> {
-        if self.text.is_empty() {
-            return Ok(());
-        }
-        let rag = self.config.read().rag.clone();
-        if let Some(rag) = rag {
-            let result = Config::search_rag(&self.config, &rag, &self.text, abort_signal).await?;
-            self.patched_text = Some(result);
-            self.rag_name = Some(rag.name().to_string());
-        }
-        Ok(())
     }
 
     pub fn rag_name(&self) -> Option<&str> {
@@ -247,69 +218,6 @@ impl Input {
         self.injected_user_text.as_deref()
     }
 
-    pub fn create_client(&self) -> Result<Box<dyn Client>> {
-        init_client(&self.config.read().clients, self.agent().model())
-    }
-
-    /// Fetch chat text with retry and model fallback support.
-    /// Uses the agent's configured fallback models if the primary model fails.
-    pub async fn fetch_chat_text(&self) -> Result<String> {
-        let abort_signal = create_abort_signal();
-        let (text, _, _, _) =
-            crate::client::retry::call_with_retry_and_fallback(self, &self.config, abort_signal)
-                .await?;
-        let text = strip_think_tag(&text).to_string();
-        Ok(text)
-    }
-
-    pub fn prepare_completion_data(
-        &self,
-        model: &Model,
-        stream: bool,
-    ) -> Result<ChatCompletionsData> {
-        let mut messages = self.build_messages()?;
-        patch_messages(&mut messages, model);
-        model.guard_max_input_tokens(&messages)?;
-        let (temperature, top_p) = (self.agent().temperature(), self.agent().top_p());
-        let functions = self.config.read().select_tools(self.agent());
-        Ok(ChatCompletionsData {
-            messages,
-            temperature,
-            top_p,
-            functions,
-            stream,
-        })
-    }
-
-    pub fn build_messages(&self) -> Result<Vec<Message>> {
-        let mut messages = if let Some(session) = self.session(&self.config.read().session) {
-            session.build_messages(self)
-        } else {
-            self.agent().build_messages(self)
-        };
-        if let Some(tool_calls) = &self.tool_calls {
-            messages.push(Message::new(
-                MessageRole::Assistant,
-                MessageContent::ToolCalls(tool_calls.clone()),
-            ))
-        }
-        if let Some(text) = &self.injected_user_text {
-            messages.push(Message::new(
-                MessageRole::User,
-                MessageContent::Text(text.clone()),
-            ))
-        }
-        Ok(messages)
-    }
-
-    pub fn echo_messages(&self) -> String {
-        if let Some(session) = self.session(&self.config.read().session) {
-            session.echo_messages(self)
-        } else {
-            self.agent().echo_messages(self)
-        }
-    }
-
     pub fn agent(&self) -> &Agent {
         &self.agent
     }
@@ -317,13 +225,6 @@ impl Input {
     #[cfg(test)]
     pub fn agent_mut(&mut self) -> &mut Agent {
         &mut self.agent
-    }
-
-    pub fn set_agent(&mut self, agent: Agent) {
-        self.with_agent = !agent.name().trim().is_empty();
-        self.with_session = self.with_session || self.config.read().session.is_some();
-        self.inject_system_prompt = true;
-        self.agent = agent;
     }
 
     pub fn session<'a>(&self, session: &'a Option<Session>) -> Option<&'a Session> {
@@ -422,6 +323,106 @@ impl Input {
             MessageContent::Array(list)
         }
     }
+}
+
+pub fn stream(input: &Input, config: &GlobalConfig) -> bool {
+    config.read().stream && !input.agent().model().no_stream()
+}
+
+pub fn set_regenerate(input: &mut Input, config: &GlobalConfig) {
+    let agent = config.read().extract_agent();
+    if agent.name() == input.agent().name() {
+        input.agent = agent;
+    }
+    input.regenerate = true;
+    input.tool_calls = None;
+}
+
+pub async fn use_embeddings(
+    input: &mut Input,
+    config: &GlobalConfig,
+    abort_signal: AbortSignal,
+) -> Result<()> {
+    if input.text.is_empty() {
+        return Ok(());
+    }
+    let rag = config.read().rag.clone();
+    if let Some(rag) = rag {
+        let result = Config::search_rag(config, &rag, &input.text, abort_signal).await?;
+        input.patched_text = Some(result);
+        input.rag_name = Some(rag.name().to_string());
+    }
+    Ok(())
+}
+
+pub fn create_client(input: &Input, config: &GlobalConfig) -> Result<Box<dyn Client>> {
+    init_client(&config.read().clients, input.agent().model())
+}
+
+/// Fetch chat text with retry and model fallback support.
+/// Uses the agent's configured fallback models if the primary model fails.
+pub async fn fetch_chat_text(input: &Input, config: &GlobalConfig) -> Result<String> {
+    let abort_signal = create_abort_signal();
+    let (text, _, _, _) =
+        crate::client::retry::call_with_retry_and_fallback(input, config, abort_signal).await?;
+    let text = strip_think_tag(&text).to_string();
+    Ok(text)
+}
+
+pub fn prepare_completion_data(
+    input: &Input,
+    config: &GlobalConfig,
+    model: &Model,
+    stream: bool,
+) -> Result<ChatCompletionsData> {
+    let mut messages = build_messages(input, config)?;
+    patch_messages(&mut messages, model);
+    model.guard_max_input_tokens(&messages)?;
+    let (temperature, top_p) = (input.agent().temperature(), input.agent().top_p());
+    let functions = config.read().select_tools(input.agent());
+    Ok(ChatCompletionsData {
+        messages,
+        temperature,
+        top_p,
+        functions,
+        stream,
+    })
+}
+
+pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Message>> {
+    let mut messages = if let Some(session) = input.session(&config.read().session) {
+        session.build_messages(input)
+    } else {
+        input.agent().build_messages(input)
+    };
+    if let Some(tool_calls) = &input.tool_calls {
+        messages.push(Message::new(
+            MessageRole::Assistant,
+            MessageContent::ToolCalls(tool_calls.clone()),
+        ))
+    }
+    if let Some(text) = &input.injected_user_text {
+        messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Text(text.clone()),
+        ))
+    }
+    Ok(messages)
+}
+
+pub fn echo_messages(input: &Input, config: &GlobalConfig) -> String {
+    if let Some(session) = input.session(&config.read().session) {
+        session.echo_messages(input)
+    } else {
+        input.agent().echo_messages(input)
+    }
+}
+
+pub fn set_agent(input: &mut Input, config: &GlobalConfig, agent: Agent) {
+    input.with_agent = !agent.name().trim().is_empty();
+    input.with_session = input.with_session || config.read().session.is_some();
+    input.inject_system_prompt = true;
+    input.agent = agent;
 }
 
 fn resolve_agent(config: &Config, agent: Option<Agent>) -> (Agent, bool, bool) {

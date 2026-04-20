@@ -167,7 +167,7 @@ where
         // For the primary model (idx 0), use the already-resolved model from
         // the input.  For fallbacks, resolve from the model catalog.
         let client = if idx == 0 {
-            match input.create_client() {
+            match crate::config::input::create_client(input, config) {
                 Ok(client) => client,
                 Err(err) => {
                     emit_retry_warning(&format!(
@@ -258,7 +258,7 @@ async fn default_call_fn(
     Vec<ToolResult>,
     CompletionTokenUsage,
 )> {
-    if input.stream() {
+    if crate::config::input::stream(input, config) {
         call_chat_completions_streaming(input, client, config, abort_signal).await
     } else {
         call_chat_completions(input, true, false, client, config, abort_signal).await
@@ -476,7 +476,7 @@ mod tests {
     }
 
     fn make_input(config: &GlobalConfig) -> Input {
-        Input::from_str(config, "hello", None)
+        crate::config::input::from_str(config, "hello", None)
     }
 
     async fn try_model_with_retries(
@@ -522,7 +522,7 @@ mod tests {
         let input = make_input(&config);
         let abort = create_abort_signal();
 
-        let client = input.create_client().unwrap();
+        let client = crate::config::input::create_client(&input, &config).unwrap();
         let retry_config = RetryConfig {
             attempts: 3,
             initial_delay_ms: 10,
@@ -554,7 +554,7 @@ mod tests {
         let input = make_input(&config);
         let abort = create_abort_signal();
 
-        let client = input.create_client().unwrap();
+        let client = crate::config::input::create_client(&input, &config).unwrap();
         let retry_config = RetryConfig {
             attempts: 3,
             initial_delay_ms: 10,
@@ -606,7 +606,7 @@ mod tests {
         let input = make_input(&config);
         let abort = create_abort_signal();
 
-        let client = input.create_client().unwrap();
+        let client = crate::config::input::create_client(&input, &config).unwrap();
         let retry_config = RetryConfig {
             attempts: 3,
             initial_delay_ms: 10,
@@ -644,7 +644,7 @@ mod tests {
         let input = make_input(&config);
         let abort = create_abort_signal();
 
-        let client = input.create_client().unwrap();
+        let client = crate::config::input::create_client(&input, &config).unwrap();
         let retry_config = RetryConfig {
             attempts: 3,
             initial_delay_ms: 10,

@@ -248,7 +248,7 @@ pub async fn run_command_with_output(
                     match text {
                         Some(text) => {
                             writeln!(output, "{}", dimmed_text(&format!(">> {text}")))?;
-                            let input = Input::from_str(config, &text, None);
+                            let input = crate::config::input::from_str(config, &text, None);
                             ask(
                                 config,
                                 abort_signal.clone(),
@@ -463,7 +463,7 @@ Commands:
             ".file" => match args {
                 Some(args) => {
                     let (files, text) = split_args_text(args, cfg!(windows));
-                    let input = Input::from_files_with_spinner(
+                    let input = crate::config::input::from_files_with_spinner(
                         config,
                         text,
                         files,
@@ -532,7 +532,7 @@ Commands:
                     Some(v) => v,
                     None => bail!("Unable to regenerate the response"),
                 };
-                input.set_regenerate();
+                crate::config::input::set_regenerate(&mut input, config);
                 ask(
                     config,
                     abort_signal.clone(),
@@ -688,7 +688,7 @@ Commands:
                         }
                         _ => line.to_string(),
                     };
-                    let input = Input::from_str(config, &input_text, None);
+                    let input = crate::config::input::from_str(config, &input_text, None);
                     ask(
                         config,
                         abort_signal.clone(),
@@ -751,7 +751,7 @@ async fn ask_inner(
         return Ok(());
     }
     if with_embeddings {
-        input.use_embeddings(abort_signal.clone()).await?;
+        crate::config::input::use_embeddings(&mut input, config, abort_signal.clone()).await?;
     }
     while config.read().is_compacting_session() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -931,7 +931,7 @@ async fn ask_inner(
                     .additional_context
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-                let new_input = Input::from_str(config, &context, None);
+                let new_input = crate::config::input::from_str(config, &context, None);
                 return ask_inner(
                     config,
                     abort_signal,
@@ -956,7 +956,7 @@ async fn ask_inner(
                 .take()
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-            let new_input = Input::from_str(config, &context, None);
+            let new_input = crate::config::input::from_str(config, &context, None);
             return ask_inner(
                 config,
                 abort_signal,

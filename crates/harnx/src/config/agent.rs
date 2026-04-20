@@ -1029,7 +1029,7 @@ mod tests {
         let agent = Agent::from_prompt(
             "System message\n__INPUT__\n\n### INPUT:\nExample input\n### OUTPUT:\nExample output",
         );
-        let input = Input::from_str(&config, "Real input", Some(agent));
+        let input = crate::config::input::from_str(&config, "Real input", Some(agent));
 
         let messages = input.agent().build_messages(&input);
 

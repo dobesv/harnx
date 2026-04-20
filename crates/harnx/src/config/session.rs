@@ -1167,7 +1167,7 @@ mod tests {
         let agent = config.extract_agent();
 
         // Round 1: user input + assistant output with tool calls
-        let input = Input::from_str(
+        let input = crate::config::input::from_str(
             &std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             "hello",
             Some(agent.clone()),
@@ -1211,7 +1211,7 @@ mod tests {
         );
 
         // Round 2: continuation (no new user msg), final assistant output
-        let input2 = Input::from_str(
+        let input2 = crate::config::input::from_str(
             &std::sync::Arc::new(parking_lot::RwLock::new(config)),
             "hello",
             Some(agent),
@@ -1270,7 +1270,7 @@ mod tests {
         )];
 
         // Round 1: save with tool_results — creates assistant + tool messages.
-        let input1 = Input::from_str(&global_config, "hello", Some(agent.clone()));
+        let input1 = crate::config::input::from_str(&global_config, "hello", Some(agent.clone()));
         session
             .add_message(&input1, "calling tool", None, &tool_results)
             .unwrap();
@@ -1289,7 +1289,7 @@ mod tests {
         // merge_tool_results puts the tool data onto the input's tool_calls,
         // then add_message is called with empty tool_results for the final
         // round.
-        let input2 = Input::from_str(&global_config, "hello", Some(agent));
+        let input2 = crate::config::input::from_str(&global_config, "hello", Some(agent));
         let merged_input =
             input2.merge_tool_results("calling tool".to_string(), None, tool_results);
         assert!(
@@ -1348,13 +1348,14 @@ mod tests {
         )];
 
         // Round 1: intermediate save with tool results
-        let input1 = Input::from_str(&global_config, "find test", Some(agent.clone()));
+        let input1 =
+            crate::config::input::from_str(&global_config, "find test", Some(agent.clone()));
         session
             .add_message(&input1, "searching...", None, &tool_results)
             .unwrap();
 
         // Round 2: final answer
-        let input2 = Input::from_str(&global_config, "find test", Some(agent));
+        let input2 = crate::config::input::from_str(&global_config, "find test", Some(agent));
         session
             .add_message(&input2, "found results", None, &[])
             .unwrap();
@@ -1442,7 +1443,7 @@ mod tests {
         let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config));
 
         // Round 1: save assistant output (as ACP server does with &[])
-        let input1 = Input::from_str(&global_config, "hello", Some(agent.clone()));
+        let input1 = crate::config::input::from_str(&global_config, "hello", Some(agent.clone()));
         session
             .add_message(&input1, "calling tool", None, &[])
             .unwrap();
@@ -1479,7 +1480,7 @@ mod tests {
 
         // Round 2: save final answer — should detect continuation and
         // NOT add a duplicate user message.
-        let input2 = Input::from_str(&global_config, "hello", Some(agent));
+        let input2 = crate::config::input::from_str(&global_config, "hello", Some(agent));
         session
             .add_message(&input2, "final answer", None, &[])
             .unwrap();

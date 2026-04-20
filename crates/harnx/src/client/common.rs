@@ -34,14 +34,16 @@ use tokio::sync::mpsc::unbounded_channel;
 pub async fn chat_completions_with_input(
     client: &dyn Client,
     input: Input,
+    config: &GlobalConfig,
     ctx: &ClientCallContext<'_>,
 ) -> Result<ChatCompletionsOutput> {
     if ctx.dry_run {
-        let content = input.echo_messages();
+        let content = crate::config::input::echo_messages(&input, config);
         return Ok(ChatCompletionsOutput::new(&content));
     }
     let reqwest_client = client.build_client(ctx)?;
-    let data = input.prepare_completion_data(client.model(), false)?;
+    let data =
+        crate::config::input::prepare_completion_data(&input, config, client.model(), false)?;
     client
         .chat_completions_inner(&reqwest_client, data)
         .await
@@ -60,6 +62,7 @@ pub async fn chat_completions_with_input(
 pub async fn chat_completions_streaming_with_input(
     client: &dyn Client,
     input: &Input,
+    config: &GlobalConfig,
     handler: &mut SseHandler,
     ctx: &ClientCallContext<'_>,
 ) -> Result<()> {
@@ -68,12 +71,12 @@ pub async fn chat_completions_streaming_with_input(
     tokio::select! {
         ret = async {
             if ctx.dry_run {
-                let content = input.echo_messages();
+                let content = crate::config::input::echo_messages(&input, config);
                 handler.text(&content)?;
                 return Ok(());
             }
             let reqwest_client = client.build_client(ctx)?;
-            let data = input.prepare_completion_data(client.model(), true)?;
+            let data = crate::config::input::prepare_completion_data(&input, config, client.model(), true)?;
             client
                 .chat_completions_streaming_inner(&reqwest_client, handler, data)
                 .await
@@ -151,7 +154,7 @@ pub async fn call_chat_completions(
         dry_run,
     };
     let ret = abortable_run_with_spinner(
-        chat_completions_with_input(client, input.clone(), &ctx),
+        chat_completions_with_input(client, input.clone(), config, &ctx),
         &spinner_message,
         abort_signal.clone(),
     )
@@ -220,7 +223,7 @@ pub async fn call_chat_completions_streaming(
     };
 
     let (send_ret, render_ret) = tokio::join!(
-        chat_completions_streaming_with_input(client, input, &mut handler, &ctx),
+        chat_completions_streaming_with_input(client, input, config, &mut handler, &ctx),
         render_stream(rx, config, abort_signal.clone(), &spinner_message),
     );
 
