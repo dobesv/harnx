@@ -16,23 +16,14 @@ const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
 
 pub fn from_str(config: &GlobalConfig, text: &str, agent: Option<Agent>) -> Input {
     let (agent, with_session, with_agent) = resolve_agent(&config.read(), agent);
-    Input {
-        text: text.to_string(),
-        raw: (text.to_string(), vec![]),
-        patched_text: None,
-        last_reply: None,
-        continue_output: None,
-        regenerate: false,
-        medias: Default::default(),
-        data_urls: Default::default(),
-        tool_calls: None,
-        agent: agent.into_config(),
-        rag_name: None,
-        with_session,
-        with_agent,
-        inject_system_prompt: false,
-        injected_user_text: None,
-    }
+    let mut input = Input::new(
+        text.to_string(),
+        (text.to_string(), vec![]),
+        agent.into_config(),
+    );
+    input.with_session = with_session;
+    input.with_agent = with_agent;
+    input
 }
 
 pub async fn from_files(
@@ -84,23 +75,17 @@ pub async fn from_files(
         }
     }
     let (agent, with_session, with_agent) = resolve_agent(&config.read(), agent);
-    Ok(Input {
-        text: texts.join("\n"),
-        raw: (raw_text.to_string(), raw_paths),
-        patched_text: None,
-        last_reply,
-        continue_output: None,
-        regenerate: false,
-        medias,
-        data_urls,
-        tool_calls: Default::default(),
-        agent: agent.into_config(),
-        rag_name: None,
-        with_session,
-        with_agent,
-        inject_system_prompt: false,
-        injected_user_text: None,
-    })
+    let mut input = Input::new(
+        texts.join("\n"),
+        (raw_text.to_string(), raw_paths),
+        agent.into_config(),
+    );
+    input.last_reply = last_reply;
+    input.medias = medias;
+    input.data_urls = data_urls;
+    input.with_session = with_session;
+    input.with_agent = with_agent;
+    Ok(input)
 }
 
 pub async fn from_files_with_spinner(
@@ -136,13 +121,13 @@ pub async fn use_embeddings(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
 ) -> Result<()> {
-    if input.text.is_empty() {
+    if input.raw_text().is_empty() {
         return Ok(());
     }
     let rag = config.read().rag.clone();
     if let Some(rag) = rag {
-        let result = Config::search_rag(config, &rag, &input.text, abort_signal).await?;
-        input.patched_text = Some(result);
+        let result = Config::search_rag(config, &rag, input.raw_text(), abort_signal).await?;
+        input.set_patched_text(Some(result));
         input.rag_name = Some(rag.name().to_string());
     }
     Ok(())

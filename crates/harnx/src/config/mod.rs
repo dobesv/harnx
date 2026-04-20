@@ -8,7 +8,6 @@ pub use self::agent::{
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
-#[allow(unused_imports)]
 pub use harnx_core::last_message::LastMessage;
 #[allow(unused_imports)]
 pub use harnx_core::macros::{Macro, MacroVariable};

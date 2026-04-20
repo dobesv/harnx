@@ -16,9 +16,9 @@ const SUMMARY_MAX_WIDTH: usize = 80;
 
 #[derive(Debug, Clone)]
 pub struct Input {
-    pub text: String,
+    text: String,
     pub raw: (String, Vec<String>),
-    pub patched_text: Option<String>,
+    patched_text: Option<String>,
     pub last_reply: Option<String>,
     pub continue_output: Option<String>,
     pub regenerate: bool,
@@ -41,6 +41,30 @@ pub struct Input {
 }
 
 impl Input {
+    /// Construct a new `Input` with the given `text`, `raw` (original user
+    /// input + any file paths), and `agent`. All other fields start at their
+    /// defaults (`patched_text: None`, empty medias/data_urls, etc.); callers
+    /// set further fields through the remaining `pub` fields as needed.
+    pub fn new(text: String, raw: (String, Vec<String>), agent: AgentConfig) -> Self {
+        Self {
+            text,
+            raw,
+            patched_text: None,
+            last_reply: None,
+            continue_output: None,
+            regenerate: false,
+            medias: Vec::new(),
+            data_urls: HashMap::new(),
+            tool_calls: None,
+            agent,
+            rag_name: None,
+            with_session: false,
+            with_agent: false,
+            inject_system_prompt: false,
+            injected_user_text: None,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty() && self.medias.is_empty()
     }
@@ -60,8 +84,19 @@ impl Input {
         }
     }
 
+    /// Return the unpatched original text without applying `patched_text`.
+    /// Use this when the caller specifically needs the user's raw input
+    /// (e.g. as a RAG search query that populates `patched_text`).
+    pub fn raw_text(&self) -> &str {
+        &self.text
+    }
+
     pub fn clear_patch(&mut self) {
         self.patched_text = None;
+    }
+
+    pub fn set_patched_text(&mut self, patched_text: Option<String>) {
+        self.patched_text = patched_text;
     }
 
     pub fn set_text(&mut self, text: String) {
