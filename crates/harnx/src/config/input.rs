@@ -26,7 +26,7 @@ pub struct Input {
     medias: Vec<String>,
     data_urls: HashMap<String, String>,
     tool_calls: Option<MessageContentToolCalls>,
-    agent: Agent,
+    agent: AgentConfig,
     rag_name: Option<String>,
     with_session: bool,
     with_agent: bool,
@@ -53,7 +53,7 @@ pub fn from_str(config: &GlobalConfig, text: &str, agent: Option<Agent>) -> Inpu
         medias: Default::default(),
         data_urls: Default::default(),
         tool_calls: None,
-        agent,
+        agent: agent.into_config(),
         rag_name: None,
         with_session,
         with_agent,
@@ -121,7 +121,7 @@ pub async fn from_files(
         medias,
         data_urls,
         tool_calls: Default::default(),
-        agent,
+        agent: agent.into_config(),
         rag_name: None,
         with_session,
         with_agent,
@@ -218,12 +218,12 @@ impl Input {
         self.injected_user_text.as_deref()
     }
 
-    pub fn agent(&self) -> &Agent {
+    pub fn agent(&self) -> &AgentConfig {
         &self.agent
     }
 
     #[cfg(test)]
-    pub fn agent_mut(&mut self) -> &mut Agent {
+    pub fn agent_mut(&mut self) -> &mut AgentConfig {
         &mut self.agent
     }
 
@@ -332,7 +332,7 @@ pub fn stream(input: &Input, config: &GlobalConfig) -> bool {
 pub fn set_regenerate(input: &mut Input, config: &GlobalConfig) {
     let agent = config.read().extract_agent();
     if agent.name() == input.agent().name() {
-        input.agent = agent;
+        input.agent = agent.into_config();
     }
     input.regenerate = true;
     input.tool_calls = None;
@@ -418,7 +418,7 @@ pub fn echo_messages(input: &Input, config: &GlobalConfig) -> String {
     }
 }
 
-pub fn set_agent(input: &mut Input, config: &GlobalConfig, agent: Agent) {
+pub fn set_agent(input: &mut Input, config: &GlobalConfig, agent: AgentConfig) {
     input.with_agent = !agent.name().trim().is_empty();
     input.with_session = input.with_session || config.read().session.is_some();
     input.inject_system_prompt = true;

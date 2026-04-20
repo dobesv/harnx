@@ -329,7 +329,7 @@ impl acp::Agent for HarnxAgent {
         }
 
         let mut input = crate::config::input::from_str(&self.config, &prompt_text, None);
-        crate::config::input::set_agent(&mut input, &self.config, agent);
+        crate::config::input::set_agent(&mut input, &self.config, agent.into_config());
         let client = crate::config::input::create_client(&input, &self.config)
             .map_err(|e| acp::Error::new(-32603, format!("Failed to create client: {e}")))?;
 

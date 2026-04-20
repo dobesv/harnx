@@ -1636,7 +1636,7 @@ impl Config {
         // without disturbing the with_session flag.
         let mut input = crate::config::input::from_str(config, &prompt, None);
         if let Some(compaction_agent) = agent_override {
-            crate::config::input::set_agent(&mut input, config, compaction_agent);
+            crate::config::input::set_agent(&mut input, config, compaction_agent.into_config());
         }
         let summary = crate::config::input::fetch_chat_text(&input, config).await?;
         if let Some(session) = config.write().session.as_mut() {
@@ -2005,7 +2005,7 @@ impl Config {
         Ok(())
     }
 
-    pub fn select_tools(&self, agent: &Agent) -> Option<Vec<ToolDeclaration>> {
+    pub fn select_tools(&self, agent: &AgentConfig) -> Option<Vec<ToolDeclaration>> {
         let mut functions = vec![];
         if self.tool_use {
             if let Some(use_tools) = agent.use_tools() {
