@@ -95,24 +95,7 @@ __INPUT__
 
 static EDITOR: OnceLock<Option<String>> = OnceLock::new();
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum ToolsetValue {
-    String(String),
-    Array(Vec<String>),
-}
-
-fn normalize_toolset_value(value: ToolsetValue) -> Vec<String> {
-    match value {
-        ToolsetValue::String(value) => split_tool_selectors(&value)
-            .into_iter()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .collect(),
-        ToolsetValue::Array(values) => values,
-    }
-}
+use harnx_core::agent_config::{normalize_toolset_value, split_tool_selectors, ToolsetValue};
 
 fn deserialize_toolsets<'de, D>(
     deserializer: D,
@@ -133,28 +116,6 @@ fn parse_toolsets_json(value: &str) -> serde_json::Result<IndexMap<String, Vec<S
         .into_iter()
         .map(|(key, value)| (key, normalize_toolset_value(value)))
         .collect())
-}
-
-/// Split a comma-separated string of tool selectors while respecting `{…}` brace groups.
-///
-/// A comma inside braces (e.g. `fs_{read_file,write_file}`) is *not* treated as a separator.
-fn split_tool_selectors(input: &str) -> Vec<&str> {
-    let mut items = Vec::new();
-    let mut start = 0;
-    let mut depth: usize = 0;
-    for (i, ch) in input.char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                items.push(&input[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    items.push(&input[start..]);
-    items
 }
 
 /// Check whether a glob pattern matches a tool name.
@@ -207,16 +168,6 @@ fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
         .collect()
 }
 
-fn deserialize_use_tools<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<Vec<String>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<ToolsetValue>::deserialize(deserializer)?;
-    Ok(value.map(normalize_toolset_value))
-}
-
 #[derive(Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -239,7 +190,10 @@ pub struct Config {
     #[serde(alias = "mapping_tools")]
     #[serde(deserialize_with = "deserialize_toolsets")]
     pub toolsets: IndexMap<String, Vec<String>>,
-    #[serde(default, deserialize_with = "deserialize_use_tools")]
+    #[serde(
+        default,
+        deserialize_with = "harnx_core::agent_config::deserialize_use_tools"
+    )]
     pub use_tools: Option<Vec<String>>,
 
     #[serde(alias = "repl_default_session")]

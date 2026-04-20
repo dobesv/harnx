@@ -4,7 +4,6 @@
 //! rag) live on the harnx-side `Agent` wrapper.
 
 use crate::hooks::HooksConfig;
-use crate::message::{Message, MessageContent, MessageRole};
 use crate::model::Model;
 use crate::retry_config::RetryConfig;
 use crate::system_vars::interpolate_variables;
@@ -312,7 +311,7 @@ impl AgentConfig {
 
     /// Replace the runtime `Model` without touching the serde `model_id`.
     /// Used by `init` when falling back to the global current model.
-    pub fn set_model_raw(&mut self, model: Model) {
+    pub fn set_resolved_model(&mut self, model: Model) {
         self.model = model;
     }
 
@@ -338,64 +337,6 @@ impl AgentConfig {
 
     pub fn variables_mut(&mut self) -> &mut Vec<AgentVariable> {
         &mut self.variables
-    }
-
-    pub fn build_messages<R: AgentInput>(&self, input: &R) -> Vec<Message> {
-        let prompt = self.interpolated_instructions();
-        let tools_text = self.tools_text();
-        let content = input.message_content();
-        let mut messages = if prompt.is_empty() {
-            let mut messages = vec![];
-            if let Some(tools_text) = &tools_text {
-                messages.push(Message::new(
-                    MessageRole::System,
-                    MessageContent::Text(tools_text.clone()),
-                ));
-            }
-            messages.push(Message::new(MessageRole::User, content));
-            messages
-        } else {
-            let mut messages = vec![];
-            let system_text = match (&tools_text, prompt.is_empty()) {
-                (Some(tools), false) => format!("{prompt}\n\n{tools}"),
-                (Some(tools), true) => tools.clone(),
-                (None, false) => prompt.to_string(),
-                (None, true) => String::new(),
-            };
-            if !system_text.is_empty() {
-                messages.push(Message::new(
-                    MessageRole::System,
-                    MessageContent::Text(system_text),
-                ));
-            }
-            messages.push(Message::new(MessageRole::User, content));
-            messages
-        };
-        if let Some(text) = input.continue_output() {
-            messages.push(Message::new(
-                MessageRole::Assistant,
-                MessageContent::Text(text.into()),
-            ));
-        }
-        messages
-    }
-
-    pub fn echo_messages<R: AgentInput>(&self, input: &R) -> String {
-        let prompt = self.interpolated_instructions();
-        let tools_text = self.tools_text();
-        let input_markdown = input.render();
-
-        if prompt.is_empty() {
-            if let Some(tools) = &tools_text {
-                format!("{tools}\n\n{input_markdown}")
-            } else {
-                input_markdown
-            }
-        } else if let Some(tools) = &tools_text {
-            format!("{prompt}\n\n{tools}\n\n{input_markdown}")
-        } else {
-            format!("{}\n\n{}", prompt, input_markdown)
-        }
     }
 
     pub fn tools(&self) -> &Tools {
@@ -482,16 +423,6 @@ impl AgentConfig {
             .join("\n");
         Some(tools)
     }
-}
-
-/// Minimal view of an `Input` from harnx-core's perspective — lets
-/// `AgentConfig::build_messages` and `echo_messages` work without knowing
-/// about the harnx-side `Input` struct. Harnx implements this trait on
-/// `Input`; harnx-core uses it abstractly.
-pub trait AgentInput {
-    fn render(&self) -> String;
-    fn message_content(&self) -> MessageContent;
-    fn continue_output(&self) -> Option<&str>;
 }
 
 // --- AgentFrontMatter (serialized shape of an agent.md front-matter block) ---

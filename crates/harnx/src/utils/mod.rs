@@ -6,7 +6,6 @@ mod loader;
 mod request;
 pub mod session_name;
 mod spinner;
-mod variables;
 
 pub use self::abort_signal::*;
 pub use self::clipboard::set_text;
@@ -15,8 +14,6 @@ pub use self::html_to_md::*;
 pub use self::loader::*;
 pub use self::request::*;
 pub use self::spinner::*;
-#[allow(unused_imports)]
-pub use self::variables::*;
 pub use harnx_core::abort::{
     create_abort_signal, wait_abort_signal, AbortSignal, AbortSignalInner,
 };

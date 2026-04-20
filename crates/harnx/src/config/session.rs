@@ -74,7 +74,7 @@ pub struct Session {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "super::deserialize_use_tools"
+        deserialize_with = "harnx_core::agent_config::deserialize_use_tools"
     )]
     use_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -843,7 +843,7 @@ impl Session {
                     let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
                     self.autoname = Some(AutoName::new_from_chat_history(chat_history));
                 }
-                let agent_messages = input.agent().build_messages(input);
+                let agent_messages = crate::config::agent::build_messages(input.agent(), input);
                 for msg in &agent_messages {
                     all_appended &= self.append_event(&SessionLogEntry::Message {
                         role: msg.role,
@@ -960,7 +960,7 @@ impl Session {
         let mut need_add_msg = true;
         let len = messages.len();
         if len == 0 {
-            messages = input.agent().build_messages(input);
+            messages = crate::config::agent::build_messages(input.agent(), input);
             need_add_msg = false;
         } else if len == 1 && self.compressed_messages.len() >= 2 {
             if let Some(index) = self
