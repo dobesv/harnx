@@ -729,7 +729,7 @@ impl Config {
 
     pub fn extract_agent(&self) -> Agent {
         if let Some(session) = self.session.as_ref() {
-            session.to_agent()
+            self::session::to_agent(session)
         } else if let Some(agent) = self.agent.as_ref() {
             agent.clone()
         } else {
@@ -1346,14 +1346,14 @@ impl Config {
                         format!("Failed to cleanup previous '{TEMP_SESSION_NAME}' session")
                     })?;
                 }
-                session = Some(Session::new(self, TEMP_SESSION_NAME));
+                session = Some(self::session::new(self, TEMP_SESSION_NAME));
             }
             Some(name) => {
                 let session_path = self.session_file(name);
                 if !session_path.exists() {
-                    session = Some(Session::new(self, name));
+                    session = Some(self::session::new(self, name));
                 } else {
-                    session = Some(Session::load(self, name, &session_path)?);
+                    session = Some(self::session::load(self, name, &session_path)?);
                 }
             }
         }
@@ -1405,7 +1405,7 @@ impl Config {
                     .collect();
                 (agent.name().to_string(), functions)
             });
-            session.render(&mut markdown_render, &agent_info)
+            self::session::render(session, &mut markdown_render, &agent_info)
         } else {
             bail!("No session")
         }
@@ -1414,7 +1414,7 @@ impl Config {
     pub fn exit_session(&mut self) -> Result<()> {
         if let Some(mut session) = self.session.take() {
             let sessions_dir = self.sessions_dir();
-            session.exit(&sessions_dir, self.working_mode.is_tui())?;
+            self::session::exit(&mut session, &sessions_dir, self.working_mode.is_tui())?;
             self.discontinuous_last_message();
         }
         Ok(())
@@ -1433,7 +1433,12 @@ impl Config {
         };
         let session_path = self.session_file(&session_name);
         if let Some(session) = self.session.as_mut() {
-            session.save(&session_name, &session_path, self.working_mode.is_tui())?;
+            self::session::save(
+                session,
+                &session_name,
+                &session_path,
+                self.working_mode.is_tui(),
+            )?;
         }
         Ok(())
     }
@@ -1477,7 +1482,7 @@ impl Config {
                 )
             })
         })?;
-        self.session = Some(Session::load(self, &name, &session_path)?);
+        self.session = Some(self::session::load(self, &name, &session_path)?);
         self.discontinuous_last_message();
         Ok(())
     }
@@ -3321,7 +3326,7 @@ mod tests {
     #[test]
     fn empty_session_clears_named_session_with_messages() {
         let mut config = Config::default();
-        let mut session = Session::new(&config, "handoff-target");
+        let mut session = self::session::new(&config, "handoff-target");
         session.push_message_for_test(MessageRole::System, "You are agent A.".to_string());
         session.push_message_for_test(MessageRole::User, "Hello from old session".to_string());
         session.push_message_for_test(MessageRole::Assistant, "Response from agent A".to_string());
@@ -3352,7 +3357,7 @@ mod tests {
             save_session: Some(true),
             ..Default::default()
         };
-        let mut session = Session::new(&config, "test-intermediate");
+        let mut session = self::session::new(&config, "test-intermediate");
         session.set_sessions_dir(tmp.path().to_path_buf());
         config.session = Some(session);
 
@@ -3412,7 +3417,7 @@ mod tests {
             stream: false,
             ..Default::default()
         };
-        let mut session = Session::new(&config, "test-session");
+        let mut session = self::session::new(&config, "test-session");
         session.push_message_for_test(
             MessageRole::User,
             "Tell me about the Rust ownership model.".to_string(),
@@ -3520,7 +3525,7 @@ mod tests {
 
         config.agent = Some(main_agent);
 
-        let mut session = Session::new(&config, "test-session");
+        let mut session = self::session::new(&config, "test-session");
         session.push_message_for_test(
             MessageRole::User,
             "Tell me about the Rust ownership model.".to_string(),

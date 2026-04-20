@@ -49,7 +49,7 @@ fn test_config_with_mock_client_and_agent(
 
         // Set up session if session_name is provided.
         if let Some(name) = session_name {
-            guard.session = Some(crate::config::session::Session::new(&guard, name));
+            guard.session = Some(crate::config::session::new(&guard, name));
         }
     }
     config
