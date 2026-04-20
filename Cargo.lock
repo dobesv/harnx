@@ -1632,6 +1632,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-client"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-smithy-eventstream",
+ "base64",
+ "bytes",
+ "chrono",
+ "fancy-regex 0.17.0",
+ "futures-util",
+ "harnx-core",
+ "hmac",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "indexmap",
+ "log",
+ "parking_lot",
+ "path-absolutize",
+ "reqwest",
+ "reqwest-eventsource",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "shell-words",
+ "tokio",
+ "tokio-stream",
+ "urlencoding",
+]
+
+[[package]]
 name = "harnx-core"
 version = "0.30.0"
 dependencies = [

@@ -1,0 +1,40 @@
+[package]
+name = "harnx-client"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LLM provider clients (OpenAI, Claude, Gemini, Bedrock, Vertex, Cohere, Azure, OpenAI-compatible) for harnx"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+aws-smithy-eventstream = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+fancy-regex = { workspace = true }
+futures-util = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+hmac = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+indexmap = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+path-absolutize = { workspace = true }
+reqwest = { workspace = true }
+reqwest-eventsource = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+shell-words = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "process"] }
+tokio-stream = { workspace = true }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
