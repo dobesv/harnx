@@ -1652,6 +1652,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-engine"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "harnx-core",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "harnx-mcp"
 version = "0.30.0"
 dependencies = [

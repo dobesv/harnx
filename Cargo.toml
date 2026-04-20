@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/harnx",
     "crates/harnx-core",
+    "crates/harnx-engine",
     "crates/harnx-mcp",
     "crates/harnx-mcp-bash",
     "crates/harnx-mcp-fs",

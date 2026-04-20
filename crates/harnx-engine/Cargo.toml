@@ -1,0 +1,18 @@
+[package]
+name = "harnx-engine"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Unified LLM + tool-call loop for harnx, emitting AgentEvent streams consumed by every front-end (TUI, CLI, HTTP, ACP)"
+
+[dependencies]
+anyhow = { workspace = true }
+futures-util = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
