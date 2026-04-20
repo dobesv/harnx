@@ -11,6 +11,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api_types::CompletionTokenUsage;
+
 // --- top-level ---------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,13 +192,6 @@ pub struct StatusLine {
 pub struct PlanEntry {
     pub status: String,
     pub content: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CompletionTokenUsage {
-    pub input: Option<u64>,
-    pub output: Option<u64>,
-    pub cached: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
