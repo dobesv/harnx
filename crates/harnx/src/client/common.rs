@@ -178,6 +178,36 @@ pub fn interpolate_patch_vars(value: &str, model_name: &str, client_name: &str) 
     Ok(result.into_owned())
 }
 
+/// Per-call configuration values that a `Client` implementation needs
+/// to read during a single `chat_completions` or `embeddings` call.
+///
+/// Populated by the caller from `GlobalConfig` before each call so that
+/// provider clients don't need to hold a reference to `GlobalConfig`.
+/// That independence is what eventually lets the client layer live in
+/// its own crate.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
+pub struct ClientCallContext<'a> {
+    /// Optional `User-Agent` header to send on HTTP requests. Pulled
+    /// from `GlobalConfig.user_agent`.
+    pub user_agent: Option<&'a str>,
+    /// When true, the client short-circuits network calls and returns
+    /// a stub response. Pulled from `GlobalConfig.dry_run`.
+    pub dry_run: bool,
+}
+
+impl<'a> ClientCallContext<'a> {
+    /// Build a context from a `Config` snapshot (obtained via
+    /// `global_config.read()` by the caller).
+    #[allow(dead_code)]
+    pub fn from_config(config: &'a Config) -> Self {
+        Self {
+            user_agent: config.user_agent.as_deref(),
+            dry_run: config.dry_run,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Client: Sync + Send {
     fn global_config(&self) -> &GlobalConfig;
