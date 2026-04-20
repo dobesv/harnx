@@ -310,7 +310,17 @@ impl Tui {
             }
         });
 
-        let send_ret = client.chat_completions_streaming(input, &mut handler).await;
+        let (dry_run, user_agent) = {
+            let cfg = client.global_config().read();
+            (cfg.dry_run, cfg.user_agent.clone())
+        };
+        let call_ctx = crate::client::ClientCallContext {
+            user_agent: user_agent.as_deref(),
+            dry_run,
+        };
+        let send_ret = client
+            .chat_completions_streaming(input, &mut handler, &call_ctx)
+            .await;
         let aborted = handler.abort().aborted();
         let (text, thought, tool_calls, usage) = handler.take();
         let _ = sender.await;

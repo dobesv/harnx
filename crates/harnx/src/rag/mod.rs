@@ -561,7 +561,18 @@ impl Rag {
                     }
                 }
                 let data = RerankData::new(query.to_string(), documents, top_k);
-                let list = client.rerank(&data).await.context("Failed to rerank")?;
+                let (dry_run, user_agent) = {
+                    let cfg = self.config.read();
+                    (cfg.dry_run, cfg.user_agent.clone())
+                };
+                let ctx = crate::client::ClientCallContext {
+                    user_agent: user_agent.as_deref(),
+                    dry_run,
+                };
+                let list = client
+                    .rerank(&data, &ctx)
+                    .await
+                    .context("Failed to rerank")?;
                 let ids: Vec<_> = list
                     .into_iter()
                     .take(top_k)
@@ -651,6 +662,14 @@ impl Rag {
         spinner: Option<Spinner>,
     ) -> Result<EmbeddingsOutput> {
         let embedding_client = init_client(&self.config, Some(self.embedding_model.clone()))?;
+        let (dry_run, user_agent) = {
+            let cfg = self.config.read();
+            (cfg.dry_run, cfg.user_agent.clone())
+        };
+        let ctx = crate::client::ClientCallContext {
+            user_agent: user_agent.as_deref(),
+            dry_run,
+        };
         let EmbeddingsData { texts, query } = data;
         let batch_size = self
             .data
@@ -685,7 +704,7 @@ impl Rag {
             let mut retry = 0;
             let chunk_output = loop {
                 retry += 1;
-                match embedding_client.embeddings(&chunk_data).await {
+                match embedding_client.embeddings(&chunk_data, &ctx).await {
                     Ok(v) => break v,
                     Err(e) if retry < retry_limit => {
                         debug!("retry {retry} failed: {e}");

@@ -186,7 +186,6 @@ pub fn interpolate_patch_vars(value: &str, model_name: &str, client_name: &str) 
 /// That independence is what eventually lets the client layer live in
 /// its own crate.
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)]
 pub struct ClientCallContext<'a> {
     /// Optional `User-Agent` header to send on HTTP requests. Pulled
     /// from `GlobalConfig.user_agent`.
@@ -199,6 +198,13 @@ pub struct ClientCallContext<'a> {
 impl<'a> ClientCallContext<'a> {
     /// Build a context from a `Config` snapshot (obtained via
     /// `global_config.read()` by the caller).
+    ///
+    /// Note: holding the `Config` reference implies holding the
+    /// `RwLockReadGuard` from `global_config.read()`.  Most callers
+    /// should instead snapshot `dry_run` + `user_agent` into owned
+    /// storage and build `ClientCallContext` from those — that avoids
+    /// holding the read guard across `.await` points.  This helper is
+    /// kept for callers that only need the context synchronously.
     #[allow(dead_code)]
     pub fn from_config(config: &'a Config) -> Self {
         Self {
@@ -222,14 +228,14 @@ pub trait Client: Sync + Send {
 
     fn model_mut(&mut self) -> &mut Model;
 
-    fn build_client(&self) -> Result<ReqwestClient> {
+    fn build_client(&self, ctx: &ClientCallContext<'_>) -> Result<ReqwestClient> {
         let mut builder = ReqwestClient::builder();
         let extra = self.extra_config();
         let timeout = extra.and_then(|v| v.connect_timeout).unwrap_or(10);
         if let Some(proxy) = extra.and_then(|v| v.proxy.as_deref()) {
             builder = set_proxy(builder, proxy)?;
         }
-        if let Some(user_agent) = self.global_config().read().user_agent.as_ref() {
+        if let Some(user_agent) = ctx.user_agent {
             builder = builder.user_agent(user_agent);
         }
         if let Some(true) = extra.and_then(|v| v.accept_invalid_certs) {
@@ -265,12 +271,16 @@ pub trait Client: Sync + Send {
         Ok(client)
     }
 
-    async fn chat_completions(&self, input: Input) -> Result<ChatCompletionsOutput> {
-        if self.global_config().read().dry_run {
+    async fn chat_completions(
+        &self,
+        input: Input,
+        ctx: &ClientCallContext<'_>,
+    ) -> Result<ChatCompletionsOutput> {
+        if ctx.dry_run {
             let content = input.echo_messages();
             return Ok(ChatCompletionsOutput::new(&content));
         }
-        let client = self.build_client()?;
+        let client = self.build_client(ctx)?;
         let data = input.prepare_completion_data(self.model(), false)?;
         self.chat_completions_inner(&client, data)
             .await
@@ -287,17 +297,18 @@ pub trait Client: Sync + Send {
         &self,
         input: &Input,
         handler: &mut SseHandler,
+        ctx: &ClientCallContext<'_>,
     ) -> Result<()> {
         let abort_signal = handler.abort();
         let input = input.clone();
         tokio::select! {
             ret = async {
-                if self.global_config().read().dry_run {
+                if ctx.dry_run {
                     let content = input.echo_messages();
                     handler.text(&content)?;
                     return Ok(());
                 }
-                let client = self.build_client()?;
+                let client = self.build_client(ctx)?;
                 let data = input.prepare_completion_data(self.model(), true)?;
                 self.chat_completions_streaming_inner(&client, handler, data).await
             } => {
@@ -311,15 +322,19 @@ pub trait Client: Sync + Send {
         }
     }
 
-    async fn embeddings(&self, data: &EmbeddingsData) -> Result<Vec<Vec<f32>>> {
-        let client = self.build_client()?;
+    async fn embeddings(
+        &self,
+        data: &EmbeddingsData,
+        ctx: &ClientCallContext<'_>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let client = self.build_client(ctx)?;
         self.embeddings_inner(&client, data)
             .await
             .context("Failed to call embeddings api")
     }
 
-    async fn rerank(&self, data: &RerankData) -> Result<RerankOutput> {
-        let client = self.build_client()?;
+    async fn rerank(&self, data: &RerankData, ctx: &ClientCallContext<'_>) -> Result<RerankOutput> {
+        let client = self.build_client(ctx)?;
         self.rerank_inner(&client, data)
             .await
             .context("Failed to call rerank api")
@@ -696,8 +711,18 @@ pub async fn call_chat_completions(
     CompletionTokenUsage,
 )> {
     let spinner_message = spinner_label(client.global_config());
+    // Snapshot the config values we need into owned storage so the ctx
+    // reference can live across the .await without holding the RwLock.
+    let (dry_run, user_agent) = {
+        let cfg = client.global_config().read();
+        (cfg.dry_run, cfg.user_agent.clone())
+    };
+    let ctx = ClientCallContext {
+        user_agent: user_agent.as_deref(),
+        dry_run,
+    };
     let ret = abortable_run_with_spinner(
-        client.chat_completions(input.clone()),
+        client.chat_completions(input.clone(), &ctx),
         &spinner_message,
         abort_signal.clone(),
     )
@@ -756,8 +781,17 @@ pub async fn call_chat_completions_streaming(
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
 
+    let (dry_run, user_agent) = {
+        let cfg = client.global_config().read();
+        (cfg.dry_run, cfg.user_agent.clone())
+    };
+    let ctx = ClientCallContext {
+        user_agent: user_agent.as_deref(),
+        dry_run,
+    };
+
     let (send_ret, render_ret) = tokio::join!(
-        client.chat_completions_streaming(input, &mut handler),
+        client.chat_completions_streaming(input, &mut handler, &ctx),
         render_stream(
             rx,
             client.global_config(),

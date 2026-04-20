@@ -305,7 +305,15 @@ impl Server {
             client.model_mut().set_max_tokens(max_tokens, true);
         }
         let abort_signal = create_abort_signal();
-        let http_client = client.build_client()?;
+        let (dry_run_flag, ua_owned) = {
+            let cfg = client.global_config().read();
+            (cfg.dry_run, cfg.user_agent.clone())
+        };
+        let call_ctx = crate::client::ClientCallContext {
+            user_agent: ua_owned.as_deref(),
+            dry_run: dry_run_flag,
+        };
+        let http_client = client.build_client(&call_ctx)?;
 
         let completion_id = generate_completion_id();
         let created = Utc::now().timestamp();
@@ -494,11 +502,22 @@ impl Server {
             EmbeddingsReqBodyInput::Multiple(v) => v,
         };
         let client = init_client(&config, Some(embedding_model))?;
+        let (emb_dry_run, emb_ua) = {
+            let cfg = client.global_config().read();
+            (cfg.dry_run, cfg.user_agent.clone())
+        };
+        let emb_ctx = crate::client::ClientCallContext {
+            user_agent: emb_ua.as_deref(),
+            dry_run: emb_dry_run,
+        };
         let data = client
-            .embeddings(&EmbeddingsData {
-                query: false,
-                texts,
-            })
+            .embeddings(
+                &EmbeddingsData {
+                    query: false,
+                    texts,
+                },
+                &emb_ctx,
+            )
             .await?;
         let data: Vec<_> = data
             .into_iter()
@@ -550,12 +569,23 @@ impl Server {
             crate::client::retrieve_model(&config.read(), &reranker_model_id, ModelType::Reranker)?;
 
         let client = init_client(&config, Some(reranker_model))?;
+        let (rr_dry_run, rr_ua) = {
+            let cfg = client.global_config().read();
+            (cfg.dry_run, cfg.user_agent.clone())
+        };
+        let rr_ctx = crate::client::ClientCallContext {
+            user_agent: rr_ua.as_deref(),
+            dry_run: rr_dry_run,
+        };
         let data = client
-            .rerank(&RerankData {
-                query,
-                documents: documents.clone(),
-                top_n,
-            })
+            .rerank(
+                &RerankData {
+                    query,
+                    documents: documents.clone(),
+                    top_n,
+                },
+                &rr_ctx,
+            )
             .await?;
 
         let results: Vec<_> = data

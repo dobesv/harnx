@@ -127,8 +127,17 @@ impl HarnxAgent {
         let connection = self.connection.borrow().clone();
         let sid = session_id.to_string();
 
+        let (dry_run, user_agent) = {
+            let cfg = client.global_config().read();
+            (cfg.dry_run, cfg.user_agent.clone())
+        };
+        let ctx = crate::client::ClientCallContext {
+            user_agent: user_agent.as_deref(),
+            dry_run,
+        };
+
         let (send_ret, _) = tokio::join!(
-            client.chat_completions_streaming(input, &mut handler),
+            client.chat_completions_streaming(input, &mut handler, &ctx),
             async {
                 while let Some(event) = rx.recv().await {
                     match event {
@@ -175,8 +184,17 @@ impl HarnxAgent {
         client: &dyn Client,
         abort_signal: &AbortSignal,
     ) -> Result<(String, Option<String>, Vec<ToolCall>), acp::Error> {
+        let (dry_run, user_agent) = {
+            let cfg = client.global_config().read();
+            (cfg.dry_run, cfg.user_agent.clone())
+        };
+        let ctx = crate::client::ClientCallContext {
+            user_agent: user_agent.as_deref(),
+            dry_run,
+        };
+
         let output = tokio::select! {
-            result = client.chat_completions(input.clone()) => {
+            result = client.chat_completions(input.clone(), &ctx) => {
                 result.map_err(|e| acp::Error::new(-32603, e.to_string()))?
             }
             _ = wait_abort_signal(abort_signal) => {
