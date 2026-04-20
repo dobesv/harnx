@@ -216,8 +216,6 @@ impl<'a> ClientCallContext<'a> {
 
 #[async_trait::async_trait]
 pub trait Client: Sync + Send {
-    fn global_config(&self) -> &GlobalConfig;
-
     fn extra_config(&self) -> Option<&ExtraConfig>;
 
     fn patch_config(&self) -> Option<&RequestPatch>;
@@ -703,6 +701,7 @@ pub async fn call_chat_completions(
     print: bool,
     extract_code: bool,
     client: &dyn Client,
+    config: &GlobalConfig,
     abort_signal: AbortSignal,
 ) -> Result<(
     String,
@@ -710,11 +709,11 @@ pub async fn call_chat_completions(
     Vec<ToolResult>,
     CompletionTokenUsage,
 )> {
-    let spinner_message = spinner_label(client.global_config());
+    let spinner_message = spinner_label(config);
     // Snapshot the config values we need into owned storage so the ctx
     // reference can live across the .await without holding the RwLock.
     let (dry_run, user_agent) = {
-        let cfg = client.global_config().read();
+        let cfg = config.read();
         (cfg.dry_run, cfg.user_agent.clone())
     };
     let ctx = ClientCallContext {
@@ -742,8 +741,7 @@ pub async fn call_chat_completions(
             let usage = CompletionTokenUsage::new(input_tokens, output_tokens, cached_tokens);
             if print {
                 if let Some(v) = &thought {
-                    client
-                        .global_config()
+                    config
                         .read()
                         .print_markdown(&format!("<think>\n{}\n</think>\n\n", v))?;
                 }
@@ -753,13 +751,13 @@ pub async fn call_chat_completions(
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
                 }
                 if print {
-                    client.global_config().read().print_markdown(&text)?;
+                    config.read().print_markdown(&text)?;
                 }
             }
             Ok((
                 text,
                 thought,
-                eval_tool_calls(client.global_config(), tool_calls, &abort_signal)?,
+                eval_tool_calls(config, tool_calls, &abort_signal)?,
                 usage,
             ))
         }
@@ -770,6 +768,7 @@ pub async fn call_chat_completions(
 pub async fn call_chat_completions_streaming(
     input: &Input,
     client: &dyn Client,
+    config: &GlobalConfig,
     abort_signal: AbortSignal,
 ) -> Result<(
     String,
@@ -777,12 +776,12 @@ pub async fn call_chat_completions_streaming(
     Vec<ToolResult>,
     CompletionTokenUsage,
 )> {
-    let spinner_message = spinner_label(client.global_config());
+    let spinner_message = spinner_label(config);
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
 
     let (dry_run, user_agent) = {
-        let cfg = client.global_config().read();
+        let cfg = config.read();
         (cfg.dry_run, cfg.user_agent.clone())
     };
     let ctx = ClientCallContext {
@@ -792,12 +791,7 @@ pub async fn call_chat_completions_streaming(
 
     let (send_ret, render_ret) = tokio::join!(
         client.chat_completions_streaming(input, &mut handler, &ctx),
-        render_stream(
-            rx,
-            client.global_config(),
-            abort_signal.clone(),
-            &spinner_message
-        ),
+        render_stream(rx, config, abort_signal.clone(), &spinner_message),
     );
 
     let aborted = handler.abort().aborted();
@@ -820,7 +814,7 @@ pub async fn call_chat_completions_streaming(
             Ok((
                 text,
                 thought,
-                eval_tool_calls(client.global_config(), tool_calls, &abort_signal)?,
+                eval_tool_calls(config, tool_calls, &abort_signal)?,
                 usage,
             ))
         }

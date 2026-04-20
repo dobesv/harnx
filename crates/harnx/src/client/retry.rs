@@ -93,8 +93,8 @@ pub async fn call_with_retry_and_fallback(
     Vec<ToolResult>,
     CompletionTokenUsage,
 )> {
-    call_with_retry_and_fallback_custom(input, config, abort_signal, |input, client, abort| {
-        Box::pin(default_call_fn(input, client, abort))
+    call_with_retry_and_fallback_custom(input, config, abort_signal, |input, client, cfg, abort| {
+        Box::pin(default_call_fn(input, client, cfg, abort))
     })
     .await
 }
@@ -117,7 +117,7 @@ pub async fn call_with_retry_and_fallback_custom<F>(
     CompletionTokenUsage,
 )>
 where
-    F: for<'a> Fn(&'a Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
+    F: for<'a> Fn(&'a Input, &'a dyn Client, &'a GlobalConfig, AbortSignal) -> CallFuture<'a>,
 {
     let agent = input.agent();
     let retry_config = agent.retry_config();
@@ -205,6 +205,7 @@ where
         match try_model_with_retries_custom(
             input,
             client.as_ref(),
+            config,
             &retry_config,
             abort_signal.clone(),
             &call_fn,
@@ -249,6 +250,7 @@ where
 async fn default_call_fn(
     input: &Input,
     client: &dyn Client,
+    config: &GlobalConfig,
     abort_signal: AbortSignal,
 ) -> Result<(
     String,
@@ -257,9 +259,9 @@ async fn default_call_fn(
     CompletionTokenUsage,
 )> {
     if input.stream() {
-        call_chat_completions_streaming(input, client, abort_signal).await
+        call_chat_completions_streaming(input, client, config, abort_signal).await
     } else {
-        call_chat_completions(input, true, false, client, abort_signal).await
+        call_chat_completions(input, true, false, client, config, abort_signal).await
     }
 }
 
@@ -274,6 +276,7 @@ fn resolve_client(config: &GlobalConfig, model_id: &str) -> Result<Box<dyn Clien
 async fn try_model_with_retries_custom<F>(
     input: &Input,
     client: &dyn Client,
+    config: &GlobalConfig,
     retry_config: &RetryConfig,
     abort_signal: AbortSignal,
     call_fn: &F,
@@ -284,14 +287,14 @@ async fn try_model_with_retries_custom<F>(
     CompletionTokenUsage,
 )>
 where
-    F: for<'a> Fn(&'a Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
+    F: for<'a> Fn(&'a Input, &'a dyn Client, &'a GlobalConfig, AbortSignal) -> CallFuture<'a>,
 {
     let mut last_error: Option<anyhow::Error> = None;
     // Ensure at least one attempt even if configured as 0
     let attempts = retry_config.attempts.max(1);
 
     for attempt in 0..attempts {
-        let result = call_fn(input, client, abort_signal.clone()).await;
+        let result = call_fn(input, client, config, abort_signal.clone()).await;
 
         match result {
             Ok(result) => return Ok(result),
@@ -481,6 +484,7 @@ mod tests {
     async fn try_model_with_retries(
         input: &Input,
         client: &dyn Client,
+        config: &GlobalConfig,
         retry_config: &RetryConfig,
         abort_signal: AbortSignal,
     ) -> Result<(
@@ -489,9 +493,14 @@ mod tests {
         Vec<ToolResult>,
         CompletionTokenUsage,
     )> {
-        try_model_with_retries_custom(input, client, retry_config, abort_signal, &|i, c, a| {
-            Box::pin(default_call_fn(i, c, a))
-        })
+        try_model_with_retries_custom(
+            input,
+            client,
+            config,
+            retry_config,
+            abort_signal,
+            &|i, c, cfg, a| Box::pin(default_call_fn(i, c, cfg, a)),
+        )
         .await
     }
 
@@ -521,7 +530,8 @@ mod tests {
             initial_delay_ms: 10,
             max_delay_ms: 100,
         };
-        let result = try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
+        let result =
+            try_model_with_retries(&input, client.as_ref(), &config, &retry_config, abort).await;
         assert!(
             result.is_ok(),
             "Expected success after retries, got: {:?}",
@@ -552,7 +562,8 @@ mod tests {
             initial_delay_ms: 10,
             max_delay_ms: 100,
         };
-        let result = try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
+        let result =
+            try_model_with_retries(&input, client.as_ref(), &config, &retry_config, abort).await;
         assert!(result.is_err());
 
         let err = result.unwrap_err();
@@ -603,7 +614,8 @@ mod tests {
             initial_delay_ms: 10,
             max_delay_ms: 100,
         };
-        let result = try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
+        let result =
+            try_model_with_retries(&input, client.as_ref(), &config, &retry_config, abort).await;
         assert!(
             result.is_err(),
             "Expected error after all retries exhausted"
@@ -640,7 +652,8 @@ mod tests {
             initial_delay_ms: 10,
             max_delay_ms: 100,
         };
-        let result = try_model_with_retries(&input, client.as_ref(), &retry_config, abort).await;
+        let result =
+            try_model_with_retries(&input, client.as_ref(), &config, &retry_config, abort).await;
         assert!(result.is_err());
 
         let err = result.unwrap_err();
@@ -714,8 +727,8 @@ mod tests {
             .set_model_fallbacks(vec!["nonexistent-client:bogus-model".to_string()]);
 
         let abort = create_abort_signal();
-        let result = call_with_retry_and_fallback_custom(&input, &config, abort, |i, c, a| {
-            Box::pin(default_call_fn(i, c, a))
+        let result = call_with_retry_and_fallback_custom(&input, &config, abort, |i, c, cfg, a| {
+            Box::pin(default_call_fn(i, c, cfg, a))
         })
         .await;
 

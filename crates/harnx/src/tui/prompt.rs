@@ -119,19 +119,24 @@ impl Tui {
                 &input,
                 &ctx.config,
                 ctx.abort_signal.clone(),
-                |input: &Input, client: &dyn crate::client::Client, abort_signal| {
+                |input: &Input,
+                 client: &dyn crate::client::Client,
+                 config: &crate::config::GlobalConfig,
+                 abort_signal| {
                     let event_tx = event_tx.clone();
                     Box::pin(async move {
                         if input.stream() {
                             Self::call_chat_completions_streaming_tui(
                                 input,
                                 client,
+                                config,
                                 abort_signal,
                                 event_tx,
                             )
                             .await
                         } else {
-                            call_chat_completions(input, true, false, client, abort_signal).await
+                            call_chat_completions(input, true, false, client, config, abort_signal)
+                                .await
                         }
                     })
                 },
@@ -281,6 +286,7 @@ impl Tui {
     async fn call_chat_completions_streaming_tui(
         input: &Input,
         client: &dyn crate::client::Client,
+        config: &crate::config::GlobalConfig,
         abort_signal: AbortSignal,
         event_tx: mpsc::UnboundedSender<TuiEvent>,
     ) -> Result<(
@@ -311,7 +317,7 @@ impl Tui {
         });
 
         let (dry_run, user_agent) = {
-            let cfg = client.global_config().read();
+            let cfg = config.read();
             (cfg.dry_run, cfg.user_agent.clone())
         };
         let call_ctx = crate::client::ClientCallContext {
@@ -333,7 +339,7 @@ impl Tui {
             Ok(_) => Ok((
                 text,
                 thought,
-                crate::tool::eval_tool_calls(client.global_config(), tool_calls, &abort_signal)?,
+                crate::tool::eval_tool_calls(config, tool_calls, &abort_signal)?,
                 usage,
             )),
             Err(err) => {

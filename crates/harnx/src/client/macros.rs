@@ -24,7 +24,6 @@ macro_rules! register_client {
         $(
             #[derive(Debug)]
             pub struct $client {
-                global_config: $crate::config::GlobalConfig,
                 config: $config,
                 model: $crate::client::Model,
             }
@@ -43,7 +42,6 @@ macro_rules! register_client {
                     })?;
 
                     Some(Box::new(Self {
-                        global_config: global_config.clone(),
                         config,
                         model: model.clone(),
                     }))
@@ -155,10 +153,6 @@ macro_rules! register_client {
 #[macro_export]
 macro_rules! client_common_fns {
     () => {
-        fn global_config(&self) -> &$crate::config::GlobalConfig {
-            &self.global_config
-        }
-
         fn extra_config(&self) -> Option<&$crate::client::ExtraConfig> {
             self.config.extra.as_ref()
         }

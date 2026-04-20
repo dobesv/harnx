@@ -306,7 +306,7 @@ impl Server {
         }
         let abort_signal = create_abort_signal();
         let (dry_run_flag, ua_owned) = {
-            let cfg = client.global_config().read();
+            let cfg = config.read();
             (cfg.dry_run, cfg.user_agent.clone())
         };
         let call_ctx = crate::client::ClientCallContext {
@@ -503,7 +503,7 @@ impl Server {
         };
         let client = init_client(&config, Some(embedding_model))?;
         let (emb_dry_run, emb_ua) = {
-            let cfg = client.global_config().read();
+            let cfg = config.read();
             (cfg.dry_run, cfg.user_agent.clone())
         };
         let emb_ctx = crate::client::ClientCallContext {
@@ -570,7 +570,7 @@ impl Server {
 
         let client = init_client(&config, Some(reranker_model))?;
         let (rr_dry_run, rr_ua) = {
-            let cfg = client.global_config().read();
+            let cfg = config.read();
             (cfg.dry_run, cfg.user_agent.clone())
         };
         let rr_ctx = crate::client::ClientCallContext {

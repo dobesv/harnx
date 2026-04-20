@@ -128,7 +128,7 @@ impl HarnxAgent {
         let sid = session_id.to_string();
 
         let (dry_run, user_agent) = {
-            let cfg = client.global_config().read();
+            let cfg = self.config.read();
             (cfg.dry_run, cfg.user_agent.clone())
         };
         let ctx = crate::client::ClientCallContext {
@@ -185,7 +185,7 @@ impl HarnxAgent {
         abort_signal: &AbortSignal,
     ) -> Result<(String, Option<String>, Vec<ToolCall>), acp::Error> {
         let (dry_run, user_agent) = {
-            let cfg = client.global_config().read();
+            let cfg = self.config.read();
             (cfg.dry_run, cfg.user_agent.clone())
         };
         let ctx = crate::client::ClientCallContext {

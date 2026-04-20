@@ -251,6 +251,9 @@ pub struct MockClientState {
 /// ```
 #[derive(Debug)]
 pub struct MockClient {
+    /// Kept for test builders that still call `.global_config(...)`, but
+    /// no longer exposed via the `Client` trait.
+    #[allow(dead_code)]
     global_config: GlobalConfig,
     model: Model,
     name: String,
@@ -294,10 +297,6 @@ impl MockClient {
 
 #[async_trait::async_trait]
 impl Client for MockClient {
-    fn global_config(&self) -> &GlobalConfig {
-        &self.global_config
-    }
-
     fn extra_config(&self) -> Option<&ExtraConfig> {
         self.extra_config.as_ref()
     }

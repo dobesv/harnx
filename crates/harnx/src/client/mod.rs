@@ -87,10 +87,6 @@ impl TestClient {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl Client for TestClient {
-    fn global_config(&self) -> &crate::config::GlobalConfig {
-        self.inner.global_config()
-    }
-
     fn extra_config(&self) -> Option<&ExtraConfig> {
         self.inner.extra_config()
     }
