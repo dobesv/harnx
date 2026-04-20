@@ -5,17 +5,26 @@ mod config;
 mod server;
 
 use crate::tool::{JsonSchema, ToolDeclaration};
-use crate::ui_output::UiOutputEvent;
+use crate::tui::render_helpers::event_fallback_text;
+use crate::ui_output::{
+    emit_ui_output_event, has_ui_output_sink, UiOutputEvent, UiOutputEventKind,
+};
+use crate::utils::{spawn_spinner, Spinner, IS_STDOUT_TERMINAL};
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use harnx_core::abort::{wait_abort_signal, AbortSignal};
+use harnx_core::tool::{ToolError, ToolProvider};
 use indexmap::IndexMap;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 #[derive(Clone, Debug)]
 pub enum NestedAcpEvent {
@@ -358,6 +367,129 @@ pub use config::AcpServerConfig;
 #[allow(unused_imports)]
 pub use server::HarnxAgent;
 
+/// Forwards ACP chunk notifications to stdout with spinner management.
+///
+/// Each incoming chunk temporarily clears the spinner, prints the chunk,
+/// then restores the spinner.  This gives the user live visibility into
+/// sub-agent (and sub-sub-agent) tool calls, thoughts, and plan updates.
+pub(crate) async fn forward_acp_chunks(
+    mut chunk_rx: UnboundedReceiver<NestedAcpEvent>,
+    spinner: Option<Spinner>,
+    spinner_msg: String,
+    allow_fallback_print: bool,
+) {
+    while let Some(chunk) = chunk_rx.recv().await {
+        // Pause the spinner (clear display but keep task alive) before
+        // printing so output is clean, then resume it afterwards.
+        if let Some(ref s) = spinner {
+            s.pause();
+        }
+        match chunk {
+            NestedAcpEvent::Ui(event) => {
+                let fallback = event_fallback_text(&event.kind, event.source.as_ref());
+                if !emit_ui_output_event(event) && allow_fallback_print {
+                    print!("{fallback}");
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            NestedAcpEvent::Text(text) => {
+                let event = UiOutputEvent {
+                    kind: UiOutputEventKind::TranscriptText { text: text.clone() },
+                    source: None,
+                };
+                if !emit_ui_output_event(event) && allow_fallback_print {
+                    print!("{text}");
+                    let _ = std::io::stdout().flush();
+                }
+            }
+        }
+        // Re-enable the spinner after printing.
+        if let Some(ref s) = spinner {
+            let _ = s.set_message(spinner_msg.clone());
+        }
+    }
+}
+
+#[async_trait]
+impl ToolProvider for AcpManager {
+    fn name(&self) -> &str {
+        "acp"
+    }
+
+    fn has_tool(&self, tool_name: &str) -> bool {
+        self.find_client_for_tool(tool_name).is_some()
+    }
+
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        abort: &AbortSignal,
+    ) -> Result<Value, ToolError> {
+        let has_ui_output = has_ui_output_sink();
+        let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
+
+        // Give the parent tool-call event a chance to be consumed by
+        // the UI before nested ACP output from the delegated session
+        // starts arriving. This keeps the visible transcript ordering
+        // causal: the handoff tool row should appear before any child
+        // output it triggers.
+        tokio::task::yield_now().await;
+
+        let (chunk_rx, subscription_id) = self.subscribe_chunks().await;
+
+        // Spawn a spinner only in non-TUI terminal mode.
+        let spinner = if is_terminal {
+            Some(spawn_spinner(&format!("  {} working…", tool_name)))
+        } else {
+            None
+        };
+
+        // Forward chunks either to TUI output sink or stdout.
+        let spinner_clone = spinner.clone();
+        let spinner_msg = format!("  {} working…", tool_name);
+        let forward_handle = tokio::spawn(forward_acp_chunks(
+            chunk_rx,
+            spinner_clone,
+            spinner_msg,
+            is_terminal,
+        ));
+
+        // Race the sub-agent call against our abort_signal so Ctrl-C
+        // interrupts nested ACP delegations the same way it interrupts
+        // MCP tools.
+        let tool_name_owned = tool_name.to_string();
+        let call_result = tokio::select! {
+            result = AcpManager::call_tool(self, &tool_name_owned, arguments) => result,
+            _ = wait_abort_signal(abort) => {
+                Err(anyhow!("ACP tool call aborted by user"))
+            }
+        };
+
+        // Tear down: unsubscribe first (closes the channel), then
+        // await the forward task.
+        self.unsubscribe_chunks(subscription_id).await;
+        forward_handle.abort();
+        let _ = forward_handle.await;
+
+        if let Some(s) = spinner {
+            s.stop();
+        }
+
+        call_result.map_err(|err| {
+            // Only user-initiated aborts (Ctrl+C) are fatal and should
+            // stop the entire tool batch.  Other failures (timeouts,
+            // connection errors, bad arguments) are recoverable so the
+            // LLM receives the error message and can retry.
+            if err.to_string().contains("aborted by user") {
+                ToolError::Fatal(err)
+            } else {
+                ToolError::Recoverable(err)
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod test_regression_issue_68;
 
@@ -574,5 +706,48 @@ enabled: false
             .expect_err("invalid session_id type should fail before ACP subprocess work");
 
         assert!(err.to_string().contains("session_id"));
+    }
+
+    #[tokio::test]
+    async fn forward_acp_chunks_preserves_structured_nested_events() {
+        use crate::ui_output::{clear_ui_output_sender, install_ui_output_sender};
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (ui_tx, mut ui_rx) = unbounded_channel();
+        install_ui_output_sender(ui_tx);
+
+        let (tx, rx) = unbounded_channel();
+        let forward = tokio::spawn(forward_acp_chunks(rx, None, "working".to_string(), false));
+
+        tx.send(NestedAcpEvent::Ui(UiOutputEvent {
+            kind: UiOutputEventKind::ToolCall {
+                tool_name: "argus_session_prompt".to_string(),
+                input_yaml: Some("message: hi".to_string()),
+                raw: None,
+            },
+            source: Some(crate::ui_output::UiOutputSource {
+                agent: "argus".to_string(),
+                session_id: Some("sess-1".to_string()),
+            }),
+        }))
+        .unwrap();
+        drop(tx);
+
+        forward.await.unwrap();
+
+        let event = ui_rx.recv().await.expect("forwarded UI event");
+        match event.kind {
+            UiOutputEventKind::ToolCall {
+                tool_name,
+                input_yaml,
+                ..
+            } => {
+                assert_eq!(tool_name, "argus_session_prompt");
+                assert_eq!(input_yaml.as_deref(), Some("message: hi"));
+            }
+            other => panic!("unexpected event kind: {other:?}"),
+        }
+
+        clear_ui_output_sender();
     }
 }

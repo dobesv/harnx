@@ -1,5 +1,5 @@
 use crate::{
-    acp::{AcpManager, NestedAcpEvent},
+    acp::AcpManager,
     config::GlobalConfig,
     hooks::{HookEvent, HookOutcome, HookResult, HookResultControl},
     mcp::McpManager,
@@ -16,11 +16,9 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::future::Future;
-use std::io::Write as _;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::UnboundedReceiver;
 
 pub use harnx_core::tool::{
     extract_user_display_text, trigger_agent_tool_declaration, JsonSchema, SwitchAgentData,
@@ -415,7 +413,7 @@ fn eval_tool_call_mcp(
                     // Forward chunks either to TUI output sink or stdout.
                     let spinner_clone = spinner.clone();
                     let spinner_msg = format!("  {} working…", tool_name);
-                    let forward_handle = tokio::spawn(forward_acp_chunks(
+                    let forward_handle = tokio::spawn(crate::acp::forward_acp_chunks(
                         chunk_rx,
                         spinner_clone,
                         spinner_msg,
@@ -487,58 +485,13 @@ fn eval_tool_call_mcp(
     Ok(result)
 }
 
-/// Forwards ACP chunk notifications to stdout with spinner management.
-///
-/// Each incoming chunk temporarily clears the spinner, prints the chunk,
-/// then restores the spinner.  This gives the user live visibility into
-/// sub-agent (and sub-sub-agent) tool calls, thoughts, and plan updates.
-async fn forward_acp_chunks(
-    mut chunk_rx: UnboundedReceiver<NestedAcpEvent>,
-    spinner: Option<Spinner>,
-    spinner_msg: String,
-    allow_fallback_print: bool,
-) {
-    while let Some(chunk) = chunk_rx.recv().await {
-        // Pause the spinner (clear display but keep task alive) before
-        // printing so output is clean, then resume it afterwards.
-        if let Some(ref s) = spinner {
-            s.pause();
-        }
-        match chunk {
-            NestedAcpEvent::Ui(event) => {
-                let fallback = event_fallback_text(&event.kind, event.source.as_ref());
-                if !emit_ui_output_event(event) && allow_fallback_print {
-                    print!("{fallback}");
-                    let _ = std::io::stdout().flush();
-                }
-            }
-            NestedAcpEvent::Text(text) => {
-                let event = UiOutputEvent {
-                    kind: UiOutputEventKind::TranscriptText { text: text.clone() },
-                    source: None,
-                };
-                if !emit_ui_output_event(event) && allow_fallback_print {
-                    print!("{text}");
-                    let _ = std::io::stdout().flush();
-                }
-            }
-        }
-        // Re-enable the spinner after printing.
-        if let Some(ref s) = spinner {
-            let _ = s.set_message(spinner_msg.clone());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::ui_output::{clear_ui_output_sender, install_ui_output_sender};
     use indexmap::IndexMap;
     use parking_lot::RwLock;
     use std::sync::Arc;
-    use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
     fn test_mcp_tool_invocation_terminal_fallback_multiline_yaml() {
@@ -622,46 +575,6 @@ mod tests {
         let event = UiOutputEventKind::ToolResultText { text: text.clone() };
 
         assert_eq!(event_fallback_text(&event, None), text);
-    }
-
-    #[tokio::test]
-    async fn forward_acp_chunks_preserves_structured_nested_events() {
-        let (ui_tx, mut ui_rx) = unbounded_channel();
-        install_ui_output_sender(ui_tx);
-
-        let (tx, rx) = unbounded_channel();
-        let forward = tokio::spawn(forward_acp_chunks(rx, None, "working".to_string(), false));
-
-        tx.send(NestedAcpEvent::Ui(UiOutputEvent {
-            kind: UiOutputEventKind::ToolCall {
-                tool_name: "argus_session_prompt".to_string(),
-                input_yaml: Some("message: hi".to_string()),
-                raw: None,
-            },
-            source: Some(crate::ui_output::UiOutputSource {
-                agent: "argus".to_string(),
-                session_id: Some("sess-1".to_string()),
-            }),
-        }))
-        .unwrap();
-        drop(tx);
-
-        forward.await.unwrap();
-
-        let event = ui_rx.recv().await.expect("forwarded UI event");
-        match event.kind {
-            UiOutputEventKind::ToolCall {
-                tool_name,
-                input_yaml,
-                ..
-            } => {
-                assert_eq!(tool_name, "argus_session_prompt");
-                assert_eq!(input_yaml.as_deref(), Some("message: hi"));
-            }
-            other => panic!("unexpected event kind: {other:?}"),
-        }
-
-        clear_ui_output_sender();
     }
 
     #[test]
