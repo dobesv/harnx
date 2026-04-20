@@ -4,6 +4,8 @@
 //! module is deliberately side-effect-free so it can be linked into any
 //! crate that needs to speak the schema.
 
+use crate::abort::AbortSignal;
+use async_trait::async_trait;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,6 +40,32 @@ impl ToolResult {
 pub enum ToolError {
     Recoverable(anyhow::Error),
     Fatal(anyhow::Error),
+}
+
+/// Dispatch interface for external tool providers (MCP, ACP, or any
+/// future transport). Implementations encapsulate their own client
+/// lookup, abort-racing, and UI plumbing — the tool-call loop only
+/// asks "do you handle this tool?" and "call it".
+#[async_trait]
+pub trait ToolProvider: Send + Sync {
+    /// Short provider identifier used for logging/diagnostics.
+    fn name(&self) -> &str;
+
+    /// Returns true if this provider knows how to dispatch `tool_name`.
+    /// Used by the routing loop to decide which provider gets the call.
+    fn has_tool(&self, tool_name: &str) -> bool;
+
+    /// Dispatches the tool. Races the call against `abort`. On success
+    /// returns the tool's result JSON. On abort, returns a
+    /// `ToolError::Fatal` so the outer batch short-circuits. On other
+    /// failures (timeouts, bad args, connection errors) returns
+    /// `ToolError::Recoverable` so the LLM sees the error and can retry.
+    async fn call_tool(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        abort: &AbortSignal,
+    ) -> Result<Value, ToolError>;
 }
 
 #[derive(Debug, Clone, Default)]
