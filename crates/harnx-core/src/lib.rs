@@ -4,6 +4,7 @@
 //! role this crate plays in the multi-crate split.
 
 pub mod abort;
+pub mod agent_config;
 pub mod api_types;
 pub mod cli;
 pub mod context;
@@ -17,6 +18,7 @@ pub mod model;
 pub mod path;
 pub mod provider_config;
 pub mod retry_config;
+pub mod system_vars;
 pub mod text;
 pub mod tool;
 pub mod working_mode;

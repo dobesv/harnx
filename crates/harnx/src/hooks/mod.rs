@@ -45,20 +45,17 @@
 //! similar but not identical protocols.
 
 pub mod async_manager;
-pub mod config;
 pub mod dispatch;
 pub mod executor;
 pub mod matcher;
 pub mod persistent;
 pub mod prompt;
-// `types` module moved to harnx-core; re-exported below.
+// `types` + `config` modules moved to harnx-core; re-exported below via `hooks::*`.
 
 #[allow(unused_imports)]
 pub use async_manager::{
     append_pending_context, drain_async_results, inject_pending_async_context, AsyncHookManager,
 };
-#[allow(unused_imports)]
-pub use config::{HookConfig, HooksConfig};
 #[allow(unused_imports)]
 pub use dispatch::{
     dispatch_hooks, dispatch_hooks_with_count, dispatch_hooks_with_count_and_manager,

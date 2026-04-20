@@ -11,15 +11,19 @@ description = "Shared domain types, event model, and pure utilities for the harn
 anyhow = { workspace = true }
 async-recursion = { workspace = true }
 base64 = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
 fancy-regex = { workspace = true }
 hmac = { workspace = true }
 indexmap = { workspace = true }
+os_info = { workspace = true }
 path-absolutize = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 sha2 = { workspace = true }
+sys-locale = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 unicode-segmentation = { workspace = true }
 urlencoding = { workspace = true }

@@ -1,73 +1,10 @@
 use super::*;
 
-use std::{collections::HashMap, env, ffi::OsStr, path::Path, process::Command};
+use std::{collections::HashMap, ffi::OsStr, path::Path, process::Command};
 
 use anyhow::{anyhow, bail, Context, Result};
-use std::sync::LazyLock;
 
-pub static SHELL: LazyLock<Shell> = LazyLock::new(detect_shell);
-
-pub struct Shell {
-    pub name: String,
-    pub cmd: String,
-    pub arg: String,
-}
-
-impl Shell {
-    pub fn new(name: &str, cmd: &str, arg: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            cmd: cmd.to_string(),
-            arg: arg.to_string(),
-        }
-    }
-}
-
-pub fn detect_shell() -> Shell {
-    let cmd = env::var(get_env_name("shell")).ok().or_else(|| {
-        if cfg!(windows) {
-            if let Ok(ps_module_path) = env::var("PSModulePath") {
-                let ps_module_path = ps_module_path.to_lowercase();
-                if ps_module_path.starts_with(r"c:\users") {
-                    if ps_module_path.contains(r"\powershell\7\") {
-                        return Some("pwsh.exe".to_string());
-                    } else {
-                        return Some("powershell.exe".to_string());
-                    }
-                }
-            }
-            None
-        } else {
-            env::var("SHELL").ok()
-        }
-    });
-    let name = cmd
-        .as_ref()
-        .and_then(|v| Path::new(v).file_stem().and_then(|v| v.to_str()))
-        .map(|v| {
-            if v == "nu" {
-                "nushell".into()
-            } else {
-                v.to_lowercase()
-            }
-        });
-    let (cmd, name) = match (cmd.as_deref(), name.as_deref()) {
-        (Some(cmd), Some(name)) => (cmd, name),
-        _ => {
-            if cfg!(windows) {
-                ("cmd.exe", "cmd")
-            } else {
-                ("/bin/sh", "sh")
-            }
-        }
-    };
-    let shell_arg = match name {
-        "powershel" => "-Command",
-        "cmd" => "/C",
-        _ => "-c",
-    };
-    Shell::new(name, cmd, shell_arg)
-}
+pub use harnx_core::system_vars::SHELL;
 
 pub fn run_command<T: AsRef<OsStr>>(
     cmd: &str,
