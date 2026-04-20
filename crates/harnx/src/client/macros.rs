@@ -7,7 +7,7 @@ macro_rules! register_client {
             mod $module;
         )+
         $(
-            use self::$module::$config;
+            use harnx_core::provider_config::$module::$config;
         )+
 
         #[derive(Debug, Clone, serde::Deserialize)]

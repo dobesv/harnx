@@ -14,5 +14,6 @@ pub mod hooks;
 pub mod message;
 pub mod model;
 pub mod path;
+pub mod provider_config;
 pub mod text;
 pub mod tool;

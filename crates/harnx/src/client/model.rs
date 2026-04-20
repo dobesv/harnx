@@ -4,7 +4,7 @@ use crate::config::Config;
 
 use anyhow::{bail, Result};
 
-pub use harnx_core::model::{Model, ModelData, ModelType, ProviderModels, RequestPatch};
+pub use harnx_core::model::{Model, ModelType, ProviderModels, RequestPatch};
 
 pub fn retrieve_model(config: &Config, model_id: &str, model_type: ModelType) -> Result<Model> {
     let models = list_all_models(config);
