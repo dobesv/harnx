@@ -33,6 +33,11 @@ pub use harnx_core::tool::{
 /// result" UI emission hooks on `ToolEvalContext`.
 pub type ToolCallEmitFn = dyn Fn(&ToolCall, &Value) + Send + Sync;
 
+/// Callback invoked when a PreToolUse hook returns `Ask { reason }`.
+/// Receives the tool name, parsed arguments, and optional reason.
+/// Returns `true` if the user allows the tool; `false` otherwise.
+pub type ConfirmToolUseFn = dyn Fn(&str, &Value, Option<&str>) -> bool + Send + Sync;
+
 /// Narrow view of `GlobalConfig` used by the tool-call loop. Callers
 /// construct this once per batch via `ToolEvalContext::from_config`
 /// and pass it through. This decouples the loop from `GlobalConfig`
@@ -55,6 +60,11 @@ pub struct ToolEvalContext {
     /// to terminal dimensions, dims the text, and emits a
     /// `ToolResultText` UiOutputEvent with stdout fallback.
     pub emit_tool_result_fn: Arc<ToolCallEmitFn>,
+    /// Called when a PreToolUse hook returns `Ask { reason }` and the
+    /// user needs to confirm before the tool runs. Returns `true` if
+    /// the user allows the tool; `false` otherwise. Harnx's default
+    /// uses an `inquire`-based terminal prompt.
+    pub confirm_tool_use_fn: Arc<ConfirmToolUseFn>,
 }
 
 impl ToolEvalContext {
@@ -77,6 +87,7 @@ impl ToolEvalContext {
             allowed_tool_names,
             emit_tool_call_fn: Arc::new(default_emit_tool_call),
             emit_tool_result_fn: Arc::new(default_emit_tool_result),
+            confirm_tool_use_fn: Arc::new(default_confirm_tool_use),
         }
     }
 }
@@ -127,6 +138,10 @@ fn default_emit_tool_result(call: &ToolCall, result: &Value) {
     // `call` parameter is unused by the default implementation but
     // kept in the signature so custom callbacks can route per-call.
     let _ = call;
+}
+
+fn default_confirm_tool_use(tool_name: &str, arguments: &Value, reason: Option<&str>) -> bool {
+    crate::hooks::prompt::confirm_tool_use(tool_name, arguments, reason)
 }
 
 pub fn eval_tool_calls(
@@ -180,11 +195,7 @@ pub fn eval_tool_calls(
             continue;
         }
         if let HookResultControl::Ask { reason } = pre_outcome.control {
-            if !crate::hooks::prompt::confirm_tool_use(
-                &call.name,
-                &call.arguments,
-                reason.as_deref(),
-            ) {
+            if !(ctx.confirm_tool_use_fn)(&call.name, &call.arguments, reason.as_deref()) {
                 let deny_reason = reason.unwrap_or_else(|| "Denied by user".to_string());
                 let blocked_result = json!({"error": deny_reason, "blocked_by_hook": true});
                 output.push(ToolResult::new(call, blocked_result));
