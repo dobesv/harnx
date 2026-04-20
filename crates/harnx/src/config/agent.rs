@@ -122,14 +122,6 @@ impl Agent {
         }
     }
 
-    // Read accessor for the inner pure config; part of the Agent API surface
-    // even though no caller in the harnx bin uses it yet (Task 2 moves
-    // AgentConfig to harnx-core and will exercise this).
-    #[allow(dead_code)]
-    pub fn config(&self) -> &AgentConfig {
-        &self.config
-    }
-
     pub fn into_config(self) -> AgentConfig {
         self.config
     }
@@ -140,13 +132,6 @@ impl Agent {
 
     pub fn set_rag(&mut self, rag: Option<Arc<Rag>>) {
         self.rag = rag;
-    }
-
-    // Read accessor paired with `set_mcp_manager`; part of the Agent API
-    // surface, unused in the harnx bin today (setters are used via init()).
-    #[allow(dead_code)]
-    pub fn mcp_manager(&self) -> Option<Arc<McpManager>> {
-        self.mcp_manager.clone()
     }
 
     pub fn set_mcp_manager(&mut self, mcp_manager: Option<Arc<McpManager>>) {
