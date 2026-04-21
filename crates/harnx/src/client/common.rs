@@ -269,6 +269,12 @@ pub async fn call_chat_completions_streaming(
         if !text.is_empty() {
             println!();
         }
+        {
+            use harnx_core::event::{AgentEvent, ModelEvent};
+            crate::agent_event_sink::emit_agent_event(AgentEvent::Model(ModelEvent::Error(
+                "aborted".to_string(),
+            )));
+        }
         return Ok((text, thought, vec![], usage));
     }
 
@@ -276,6 +282,25 @@ pub async fn call_chat_completions_streaming(
         Ok(_) => {
             if !text.is_empty() && !text.ends_with('\n') {
                 println!();
+            }
+            {
+                use harnx_core::event::{AgentEvent, ModelEvent};
+                // Streaming already wrote text to stdout via render_stream.
+                // Emit Final with EMPTY output to signal "done, don't re-print".
+                crate::agent_event_sink::emit_agent_event(AgentEvent::Model(ModelEvent::Final {
+                    output: String::new(),
+                    usage: usage.clone(),
+                }));
+                if !usage.is_empty() {
+                    crate::agent_event_sink::emit_agent_event(AgentEvent::Model(
+                        ModelEvent::Usage {
+                            input: usage.input_tokens,
+                            output: usage.output_tokens,
+                            cached: usage.cached_tokens,
+                            session_label: None,
+                        },
+                    ));
+                }
             }
             Ok((
                 text,
@@ -291,6 +316,12 @@ pub async fn call_chat_completions_streaming(
         Err(err) => {
             if !text.is_empty() {
                 println!();
+            }
+            {
+                use harnx_core::event::{AgentEvent, ModelEvent};
+                crate::agent_event_sink::emit_agent_event(AgentEvent::Model(ModelEvent::Error(
+                    err.to_string(),
+                )));
             }
             if text.is_empty() {
                 Err(err)
