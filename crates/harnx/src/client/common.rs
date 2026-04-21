@@ -190,9 +190,6 @@ pub async fn call_chat_completions_streaming(
     CompletionTokenUsage,
 )> {
     let spinner_message = spinner_label(config);
-    let (tx, rx) = unbounded_channel();
-    let mut handler = SseHandler::new(tx, abort_signal.clone());
-
     let (dry_run, user_agent) = {
         let cfg = config.read();
         (cfg.dry_run, cfg.user_agent.clone())
@@ -202,81 +199,59 @@ pub async fn call_chat_completions_streaming(
         dry_run,
     };
 
-    let (send_ret, render_ret) = tokio::join!(
-        chat_completions_streaming_with_input(client, input, config, &mut handler, &ctx),
-        render_stream(rx, config, abort_signal.clone(), &spinner_message),
-    );
-
-    let aborted = handler.abort().aborted();
-
-    let _ = render_ret;
-
-    let (text, thought, tool_calls, usage) = handler.take();
-    if aborted {
-        if !text.is_empty() {
-            println!();
-        }
-        {
-            use harnx_core::event::{AgentEvent, ModelEvent};
-            crate::agent_event_sink::emit_agent_event(AgentEvent::Model(ModelEvent::Error(
-                "aborted".to_string(),
-            )));
-        }
+    // Dry-run: echo messages through the handler + channel so render_stream
+    // still runs and the user sees what would have been sent.
+    if dry_run {
+        let (tx, rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, abort_signal.clone());
+        let content = crate::config::input::echo_messages(input, config);
+        handler.text(&content)?;
+        handler.done();
+        let (_render_ret,) = tokio::join!(render_stream(
+            rx,
+            config,
+            abort_signal.clone(),
+            &spinner_message
+        ),);
+        let (text, thought, _tool_calls, usage) = handler.take();
         return Ok((text, thought, vec![], usage));
     }
 
-    match send_ret {
-        Ok(_) => {
-            if !text.is_empty() && !text.ends_with('\n') {
-                println!();
-            }
-            {
-                use harnx_core::event::{AgentEvent, ModelEvent};
-                // Streaming already wrote text to stdout via render_stream.
-                // Emit Final with EMPTY output to signal "done, don't re-print".
-                crate::agent_event_sink::emit_agent_event(AgentEvent::Model(ModelEvent::Final {
-                    output: String::new(),
-                    usage: usage.clone(),
-                }));
-                if !usage.is_empty() {
-                    crate::agent_event_sink::emit_agent_event(AgentEvent::Model(
-                        ModelEvent::Usage {
-                            input: usage.input_tokens,
-                            output: usage.output_tokens,
-                            cached: usage.cached_tokens,
-                            session_label: None,
-                        },
-                    ));
-                }
-            }
-            Ok((
-                text,
-                thought,
-                eval_tool_calls(
-                    &crate::tool::build_tool_eval_context(config),
-                    tool_calls,
-                    &abort_signal,
-                )?,
-                usage,
-            ))
-        }
-        Err(err) => {
-            if !text.is_empty() {
-                println!();
-            }
-            {
-                use harnx_core::event::{AgentEvent, ModelEvent};
-                crate::agent_event_sink::emit_agent_event(AgentEvent::Model(ModelEvent::Error(
-                    err.to_string(),
-                )));
-            }
-            if text.is_empty() {
-                Err(err)
-            } else {
-                Ok((text, thought, vec![], usage))
-            }
-        }
+    let data = crate::config::input::prepare_completion_data(input, config, client.model(), true)?;
+    let (tx, rx) = unbounded_channel();
+    let handler = SseHandler::new(tx, abort_signal.clone());
+
+    let (engine_ret, _render_ret) = tokio::join!(
+        harnx_engine::chat_completions::run_chat_completion_streaming(
+            client,
+            data,
+            &ctx,
+            handler,
+            abort_signal.clone(),
+        ),
+        render_stream(rx, config, abort_signal.clone(), &spinner_message),
+    );
+
+    let (text, thought, tool_calls, usage, aborted) = engine_ret?;
+
+    // Stdout newline cleanup - streaming writes text via render_stream;
+    // if text didn't end with a newline (or we aborted mid-text), add
+    // one so the shell prompt appears on its own line.
+    if !text.is_empty() && (aborted || !text.ends_with('\n')) {
+        println!();
     }
+
+    let tool_results = if tool_calls.is_empty() {
+        vec![]
+    } else {
+        eval_tool_calls(
+            &crate::tool::build_tool_eval_context(config),
+            tool_calls,
+            &abort_signal,
+        )?
+    };
+
+    Ok((text, thought, tool_results, usage))
 }
 
 pub async fn create_config(
