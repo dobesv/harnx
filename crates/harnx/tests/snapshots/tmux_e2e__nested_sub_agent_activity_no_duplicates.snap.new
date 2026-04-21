@@ -1,0 +1,83 @@
+---
+source: crates/harnx/tests/tmux_e2e.rs
+assertion_line: 884
+expression: normalized
+---
+Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
+# nested-parent v
+🤖 nested-parent
+> investigate the data trends
+
+Let me Let me investigate investigate this. this. Delegating to researcher.Delegating to researcher.
+
+→ nested-researcher_session_prompt
+   message: Investigate the data trends in detail.
+> nested-researcher ▸ <UUID>
+RESEARCHER_TEXT: Let me check the raw data first.
+
+→ repro249_unique_mcp_tool
+   {}
+Got initial data. Need deeper analysis. Delegating to analyst.
+
+→ nested-analyst_session_prompt
+   message: Perform deep analysis on the data trends.
+> nested-analyst ▸ <UUID>
+ANALYST_TEXT: Running deep analysis now.
+
+→ repro249_unique_mcp_tool
+   {}
+Analysis complete. The trend is clearly upward.
+
+> nested-researcher ▸ <UUID>
+Analyst confirmed the upward trend in the data.
+
+   session_id: <UUID>
+   response: 'RESEARCHER_TEXT: Let me check the raw data first.Got initial data. Need deeper analysis. Delegating [...]
+PARENT_FINAL: Research complete. Data shows clear upward trend.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+* 🤖 nested-parent

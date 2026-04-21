@@ -1,0 +1,38 @@
+---
+source: crates/harnx/tests/tmux_e2e.rs
+assertion_line: 490
+expression: normalized
+---
+Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
+# handoff-agent v
+🤖 handoff-agent
+> tell me how many files are in /tmp
+
+I'll hand this off to the specialist.I'll hand this off to the specialist.
+
+→ handoff-sub-agent_session_handoff
+   prompt: Take over and answer how many files are in /tmp.
+   session_id: handoff-session-1
+   Handing off to handoff-sub-agent…
+I took over this session and counted 7 files in /tmp.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• 🤖 handoff-sub-agent ▸ handoff-session-1

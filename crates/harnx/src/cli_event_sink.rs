@@ -5,7 +5,7 @@
 //! dedicated renderer in a later plan.
 
 use harnx_core::event::{
-    AgentEvent, AgentEventSink, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, TurnEvent,
+    AgentEvent, AgentEventSink, ModelEvent, NoticeEvent, ToolEvent, TurnEvent,
 };
 
 use crate::utils::{dimmed_text, warning_text};
@@ -46,12 +46,15 @@ impl AgentEventSink for CliAgentEventSink {
             AgentEvent::Notice(NoticeEvent::Error(msg)) => {
                 eprintln!("{}", warning_text(&format!("error: {msg}")));
             }
-            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
-                for block in blocks {
-                    if let ContentBlock::Text(text) = block {
-                        eprint!("{text}");
-                    }
-                }
+            AgentEvent::Model(ModelEvent::MessageChunk { .. }) => {
+                // CLI streaming mode uses render_stream to write chunks to stdout.
+                // Emitting here (stderr via eprint) would duplicate the display.
+                // Plan 33 will retire render_stream and flip this arm to a stdout
+                // markdown/raw renderer.
+            }
+            AgentEvent::Model(ModelEvent::ThoughtChunk { .. }) => {
+                // Same rationale — render_stream handles thought display via the
+                // channel's prefix/suffix <think>...</think> bracketing.
             }
             AgentEvent::Model(ModelEvent::Final { output, .. }) => {
                 // If streaming produced no chunks, print the full output at once.
@@ -103,6 +106,7 @@ impl AgentEventSink for CliAgentEventSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harnx_core::event::ContentBlock;
 
     // The sink writes to stderr, which is hard to capture in a unit test
     // without subprocess machinery. We verify here only that `emit` doesn't

@@ -44,7 +44,7 @@ pub struct TuiAgentEventSink;
 
 impl AgentEventSink for TuiAgentEventSink {
     fn emit(&self, event: AgentEvent) {
-        use harnx_core::event::{NoticeEvent, ToolEvent};
+        use harnx_core::event::{ModelEvent, NoticeEvent, ToolEvent};
         match event {
             AgentEvent::Notice(notice) => {
                 let text = match notice {
@@ -82,10 +82,30 @@ impl AgentEventSink for TuiAgentEventSink {
                 };
                 emit_ui_output_event(ui_event);
             }
-            // Model, Turn, Session, Status, Plan, other Tool variants
-            // (Progress/Update/Failed): dropped by this bridge. The TUI
-            // consumer still receives everything it needs through
-            // UiOutputEvent emitted directly by harnx code.
+            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
+                let text = concat_text_blocks(&blocks);
+                if !text.is_empty() {
+                    let ui_event = UiOutputEvent {
+                        kind: UiOutputEventKind::MessageChunk { text, raw: None },
+                        source: None,
+                    };
+                    emit_ui_output_event(ui_event);
+                }
+            }
+            AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
+                let text = concat_text_blocks(&blocks);
+                if !text.is_empty() {
+                    let ui_event = UiOutputEvent {
+                        kind: UiOutputEventKind::ThoughtChunk { text, raw: None },
+                        source: None,
+                    };
+                    emit_ui_output_event(ui_event);
+                }
+            }
+            // Model (other variants), Turn, Session, Status, Plan, other
+            // Tool variants (Progress/Update/Failed): dropped by this
+            // bridge. The TUI consumer still receives everything it needs
+            // through UiOutputEvent emitted directly by harnx code.
             _ => {}
         }
     }
@@ -129,4 +149,18 @@ pub fn install_tui_agent_event_sink() {
         has_agent_event_sink(),
         "TUI AgentEventSink must be installed after startup call"
     );
+}
+
+/// Concatenate `ContentBlock::Text(..)` fragments into a single String.
+/// Non-Text blocks (Image, ResourceLink, Opaque) are skipped — the TUI
+/// transcript currently only renders text.
+fn concat_text_blocks(blocks: &[harnx_core::event::ContentBlock]) -> String {
+    use harnx_core::event::ContentBlock;
+    let mut out = String::new();
+    for block in blocks {
+        if let ContentBlock::Text(t) = block {
+            out.push_str(t);
+        }
+    }
+    out
 }
