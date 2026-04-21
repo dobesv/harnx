@@ -183,6 +183,14 @@ impl AgentEventSink for CliAgentEventSink {
             Err(poisoned) => poisoned.into_inner(),
         };
         match event {
+            AgentEvent::Status(line) => match &state.spinner {
+                Some(spinner) => {
+                    let _ = spinner.set_message(line.text);
+                }
+                None => {
+                    state.spinner = Some(spawn_spinner(&line.text));
+                }
+            },
             AgentEvent::Turn(TurnEvent::Started) => {
                 if state.spinner.is_none() {
                     state.spinner = Some(spawn_spinner("Generating"));
@@ -332,7 +340,7 @@ fn need_rows_local(text: &str, columns: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harnx_core::event::ContentBlock;
+    use harnx_core::event::{ContentBlock, StatusLine};
 
     // The sink writes to stderr, which is hard to capture in a unit test
     // without subprocess machinery. We verify here only that `emit` doesn't
@@ -359,5 +367,29 @@ mod tests {
             usage: Default::default(),
         }));
         sink.emit(AgentEvent::Model(ModelEvent::Error("boom".into())));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_event_starts_spinner_without_panic() {
+        let sink = CliAgentEventSink::new(false, RenderOptions::default());
+        sink.emit(AgentEvent::Status(StatusLine {
+            text: "[test-model] generating".into(),
+        }));
+        sink.emit(AgentEvent::Turn(TurnEvent::Started));
+        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
+            outcome: Default::default(),
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_event_updates_existing_spinner() {
+        let sink = CliAgentEventSink::new(false, RenderOptions::default());
+        sink.emit(AgentEvent::Turn(TurnEvent::Started));
+        sink.emit(AgentEvent::Status(StatusLine {
+            text: "[rich-label] generating".into(),
+        }));
+        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
+            outcome: Default::default(),
+        }));
     }
 }
