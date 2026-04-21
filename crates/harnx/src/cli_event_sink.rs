@@ -62,7 +62,26 @@ impl AgentEventSink for CliAgentEventSink {
             AgentEvent::Model(ModelEvent::Error(err)) => {
                 eprintln!("{}", warning_text(&format!("LLM error: {err}")));
             }
-            // Every other variant — Tool, Session, Status, Plan, Usage — still gets
+            AgentEvent::Model(ModelEvent::Usage {
+                input,
+                output,
+                cached,
+                session_label: _,
+            }) => {
+                // Emit a compact one-liner on stderr when we have non-zero usage.
+                if *input > 0 || *output > 0 || *cached > 0 {
+                    let cached_suffix = if *cached > 0 {
+                        format!(" (cached {cached})")
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "{}",
+                        dimmed_text(&format!("[tokens] in={input} out={output}{cached_suffix}"))
+                    );
+                }
+            }
+            // Every other variant — Tool, Session, Status, Plan — still gets
             // captured so nothing silently disappears. These receive dedicated
             // renderers in a future plan.
             other => eprintln!("{}", dimmed_text(&format!("[event] {other:?}"))),
