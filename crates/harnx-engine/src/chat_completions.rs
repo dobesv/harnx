@@ -135,3 +135,64 @@ pub async fn run_chat_completion(
         }
     }
 }
+
+/// Orchestrate one streaming LLM call. Runs `chat_completions_streaming_with_data`
+/// (which consumes the caller-supplied `SseHandler`), then after completion
+/// extracts the response tuple from the handler and emits `AgentEvent::Model`
+/// events via `harnx_core::sink`.
+///
+/// Returns `(text, thought, tool_calls, usage, aborted)`. Caller is responsible
+/// for: tool_call evaluation, stdout newline cleanup, and final Ok/Err shaping.
+/// On abort or partial-response error, `tool_calls` is returned empty.
+pub async fn run_chat_completion_streaming(
+    client: &dyn Client,
+    data: ChatCompletionsData,
+    ctx: &ClientCallContext<'_>,
+    mut handler: SseHandler,
+    _abort_signal: harnx_core::abort::AbortSignal,
+) -> Result<(
+    String,
+    Option<String>,
+    Vec<harnx_core::tool::ToolCall>,
+    CompletionTokenUsage,
+    bool,
+)> {
+    use harnx_core::event::{AgentEvent, ModelEvent};
+    use harnx_core::sink::emit_agent_event;
+
+    let send_ret = chat_completions_streaming_with_data(client, data, &mut handler, ctx).await;
+
+    let aborted = handler.abort().aborted();
+    let (text, thought, tool_calls, usage) = handler.take();
+
+    if aborted {
+        emit_agent_event(AgentEvent::Model(ModelEvent::Error("aborted".to_string())));
+        return Ok((text, thought, vec![], usage, true));
+    }
+
+    match send_ret {
+        Ok(_) => {
+            emit_agent_event(AgentEvent::Model(ModelEvent::Final {
+                output: String::new(),
+                usage: usage.clone(),
+            }));
+            if !usage.is_empty() {
+                emit_agent_event(AgentEvent::Model(ModelEvent::Usage {
+                    input: usage.input_tokens,
+                    output: usage.output_tokens,
+                    cached: usage.cached_tokens,
+                    session_label: None,
+                }));
+            }
+            Ok((text, thought, tool_calls, usage, false))
+        }
+        Err(err) => {
+            emit_agent_event(AgentEvent::Model(ModelEvent::Error(err.to_string())));
+            if text.is_empty() {
+                Err(err)
+            } else {
+                Ok((text, thought, vec![], usage, false))
+            }
+        }
+    }
+}
