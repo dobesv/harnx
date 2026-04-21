@@ -44,26 +44,80 @@ pub struct TuiAgentEventSink;
 
 impl AgentEventSink for TuiAgentEventSink {
     fn emit(&self, event: AgentEvent) {
-        use harnx_core::event::NoticeEvent;
-        // Only Notice variants need translation today — retry warnings
-        // and similar operator-facing messages. Other variants (Turn,
-        // Model, Tool, Session, Status, Plan) are still emitted via
-        // `emit_ui_output_event` directly by the harnx code that
-        // creates them. When those call sites migrate to AgentEvent,
-        // add translation branches here.
-        if let AgentEvent::Notice(notice) = event {
-            let text = match notice {
-                NoticeEvent::Info(msg) => msg,
-                NoticeEvent::Warning(msg) => format!("⚠ {msg}"),
-                NoticeEvent::Error(msg) => format!("error: {msg}"),
-            };
-            let ui_event = UiOutputEvent {
-                kind: UiOutputEventKind::TranscriptText { text },
-                source: None,
-            };
-            emit_ui_output_event(ui_event);
+        use harnx_core::event::{NoticeEvent, ToolEvent};
+        match event {
+            AgentEvent::Notice(notice) => {
+                let text = match notice {
+                    NoticeEvent::Info(msg) => msg,
+                    NoticeEvent::Warning(msg) => format!("⚠ {msg}"),
+                    NoticeEvent::Error(msg) => format!("error: {msg}"),
+                };
+                let ui_event = UiOutputEvent {
+                    kind: UiOutputEventKind::TranscriptText { text },
+                    source: None,
+                };
+                emit_ui_output_event(ui_event);
+            }
+            AgentEvent::Tool(ToolEvent::Started { name, input, .. }) => {
+                let ui_event = UiOutputEvent {
+                    kind: UiOutputEventKind::ToolCall {
+                        tool_name: name,
+                        input_yaml: match &input {
+                            serde_json::Value::Null => None,
+                            _ => Some(crate::ui_output::pretty_yaml_block(&input)),
+                        },
+                        raw: None,
+                    },
+                    source: None,
+                };
+                emit_ui_output_event(ui_event);
+            }
+            AgentEvent::Tool(ToolEvent::Completed {
+                output, content, ..
+            }) => {
+                let text = render_tool_result_text(&output, &content);
+                let ui_event = UiOutputEvent {
+                    kind: UiOutputEventKind::ToolResultText { text },
+                    source: None,
+                };
+                emit_ui_output_event(ui_event);
+            }
+            // Model, Turn, Session, Status, Plan, other Tool variants
+            // (Progress/Update/Failed): dropped by this bridge. The TUI
+            // consumer still receives everything it needs through
+            // UiOutputEvent emitted directly by harnx code.
+            _ => {}
         }
     }
+}
+
+/// Shared Completed formatter. Reconstructs the truncated + dimmed text
+/// that harnx's legacy `default_emit_tool_result` emitted. Used by the
+/// TUI bridge today; CliAgentEventSink may adopt this later if CLI
+/// tool-result rendering grows beyond the compact one-liner.
+fn render_tool_result_text(
+    output: &serde_json::Value,
+    _content: &[harnx_core::event::ContentBlock],
+) -> String {
+    use crate::mcp_safety::{truncate_output, TruncateOpts};
+    use crate::utils::dimmed_text;
+    use harnx_core::tool::extract_user_display_text;
+
+    let mut opts = TruncateOpts::default();
+    let marker = " [...] ";
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        opts.head_lines = 5.max((rows / 2) as usize);
+        opts.tail_lines = 0;
+        opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
+        opts.line_tail_bytes = 0;
+        opts.marker = Some(marker.to_string());
+    }
+    let output_str = extract_user_display_text(output).unwrap_or_else(|| match output {
+        serde_json::Value::String(s) => s.clone(),
+        _ => crate::ui_output::pretty_yaml_block(output),
+    });
+    let truncated = truncate_output(&output_str, &opts);
+    format!("{}\n", dimmed_text(&truncated))
 }
 
 /// Install the `TuiAgentEventSink`. Called by TUI-mode startup

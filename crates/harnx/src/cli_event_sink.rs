@@ -5,7 +5,7 @@
 //! dedicated renderer in a later plan.
 
 use harnx_core::event::{
-    AgentEvent, AgentEventSink, ContentBlock, ModelEvent, NoticeEvent, TurnEvent,
+    AgentEvent, AgentEventSink, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, TurnEvent,
 };
 
 use crate::utils::{dimmed_text, warning_text};
@@ -81,7 +81,18 @@ impl AgentEventSink for CliAgentEventSink {
                     );
                 }
             }
-            // Every other variant — Tool, Session, Status, Plan — still gets
+            AgentEvent::Tool(ToolEvent::Started { name, .. }) => {
+                eprintln!("{}", dimmed_text(&format!("[tool] {name}")));
+            }
+            AgentEvent::Tool(ToolEvent::Failed { error, .. }) => {
+                eprintln!("{}", warning_text(&format!("tool error: {error}")));
+            }
+            // Silent for Progress / Update / Completed: CLI doesn't stream
+            // per-chunk tool updates; Completed's output is usually internal
+            // and shouldn't clutter stderr. Users see tool effects via the
+            // subsequent LLM response.
+            AgentEvent::Tool(_) => {}
+            // Every other variant — Session, Status, Plan — still gets
             // captured so nothing silently disappears. These receive dedicated
             // renderers in a future plan.
             other => eprintln!("{}", dimmed_text(&format!("[event] {other:?}"))),
