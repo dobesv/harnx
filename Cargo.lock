@@ -1705,6 +1705,7 @@ dependencies = [
  "harnx-client",
  "harnx-core",
  "parking_lot",
+ "serde_json",
  "tokio",
  "tokio-stream",
 ]

@@ -12,6 +12,7 @@
 pub mod engine;
 pub mod input;
 pub mod retry;
+pub mod tool;
 
 pub use engine::Engine;
 pub use input::EngineInput;

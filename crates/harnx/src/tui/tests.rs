@@ -1673,7 +1673,7 @@ async fn test_sub_agent_delegation_tool_appears() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_tool_result_switch_agent_parsing() {
     use crate::acp::{AcpManager, AcpServerConfig};
-    use crate::tool::{eval_tool_calls, ToolCall, ToolEvalContext};
+    use crate::tool::{eval_tool_calls, ToolCall};
 
     let _guard = TestStateGuard::new(None).await;
     let config = test_config();
@@ -1708,7 +1708,7 @@ async fn test_tool_result_switch_agent_parsing() {
     // tool.rs) on the result object.
     let abort_signal = crate::utils::create_abort_signal();
     let mut results = eval_tool_calls(
-        &ToolEvalContext::from_config(&config),
+        &crate::tool::build_tool_eval_context(&config),
         vec![call],
         &abort_signal,
     )

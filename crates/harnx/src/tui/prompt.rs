@@ -350,7 +350,7 @@ impl Tui {
                 text,
                 thought,
                 crate::tool::eval_tool_calls(
-                    &crate::tool::ToolEvalContext::from_config(config),
+                    &crate::tool::build_tool_eval_context(config),
                     tool_calls,
                     &abort_signal,
                 )?,
