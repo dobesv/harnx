@@ -9,9 +9,22 @@ use unicode_segmentation::UnicodeSegmentation;
 pub static THINK_TAG_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^\s*<think>.*?</think>(\s*|$)").unwrap());
 
+pub static CODE_BLOCK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?ms)```\w*(.*)```").unwrap());
+
 /// Remove a leading `<think>...</think>` block (if any) from a string.
 pub fn strip_think_tag(text: &str) -> Cow<'_, str> {
     THINK_TAG_RE.replace_all(text, "")
+}
+
+/// Return the contents of the first fenced code block in `text`, or
+/// the whole input if no block is present.
+pub fn extract_code_block(text: &str) -> &str {
+    CODE_BLOCK_RE
+        .captures(text)
+        .ok()
+        .and_then(|v| v?.get(1).map(|v| v.as_str().trim()))
+        .unwrap_or(text)
 }
 
 /// Rough estimate of how many LLM tokens a string represents.

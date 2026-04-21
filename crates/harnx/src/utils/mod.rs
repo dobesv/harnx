@@ -22,17 +22,14 @@ pub use harnx_core::path::{
     expand_glob_paths, get_patch_extension, list_file_names, resolve_home_dir, safe_join_path,
     to_absolute_path,
 };
-pub use harnx_core::text::strip_think_tag;
+pub use harnx_core::text::{extract_code_block, strip_think_tag};
 
 use anyhow::Result;
-use fancy_regex::Regex;
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use is_terminal::IsTerminal;
 use std::sync::LazyLock;
 use std::{env, path::PathBuf, process};
 
-pub static CODE_BLOCK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?ms)```\w*(.*)```").unwrap());
 pub static IS_STDOUT_TERMINAL: LazyLock<bool> = LazyLock::new(|| std::io::stdout().is_terminal());
 pub static NO_COLOR: LazyLock<bool> = LazyLock::new(|| {
     env::var("NO_COLOR")
@@ -60,14 +57,6 @@ pub fn parse_bool(value: &str) -> Option<bool> {
         "0" | "false" => Some(false),
         _ => None,
     }
-}
-
-pub fn extract_code_block(text: &str) -> &str {
-    CODE_BLOCK_RE
-        .captures(text)
-        .ok()
-        .and_then(|v| v?.get(1).map(|v| v.as_str().trim()))
-        .unwrap_or(text)
 }
 
 pub fn fuzzy_filter<T, F>(values: Vec<T>, get: F, pattern: &str) -> Vec<T>
