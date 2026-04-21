@@ -2,8 +2,7 @@ use crate::{
     config::GlobalConfig,
     hooks::HookEvent,
     mcp_safety::{truncate_output, TruncateOpts},
-    tui::render_helpers::event_fallback_text,
-    ui_output::{emit_ui_output_event, pretty_yaml_block, UiOutputEvent, UiOutputEventKind},
+    ui_output::pretty_yaml_block,
     utils::*,
 };
 
@@ -85,51 +84,56 @@ pub fn build_tool_eval_context(config: &GlobalConfig) -> ToolEvalContext {
 }
 
 fn default_emit_tool_call(call: &ToolCall, json_data: &Value) {
-    let event = UiOutputEvent {
-        kind: UiOutputEventKind::ToolCall {
-            tool_name: call.name.clone(),
-            input_yaml: match json_data {
-                Value::Null => None,
-                _ => Some(pretty_yaml_block(json_data)),
-            },
-            raw: None,
-        },
-        source: None,
-    };
-    let text = event_fallback_text(&event.kind, event.source.as_ref());
-    if !emit_ui_output_event(event) && *IS_STDOUT_TERMINAL {
-        print!("{text}");
+    use harnx_core::event::{AgentEvent, ToolEvent, ToolKind};
+    let event = AgentEvent::Tool(ToolEvent::Started {
+        id: call.id.clone().unwrap_or_default(),
+        name: call.name.clone(),
+        kind: ToolKind::Other,
+        title: None,
+        input: json_data.clone(),
+        locations: Vec::new(),
+    });
+    if !crate::agent_event_sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
+        // No sink installed (test context) — keep a visible fallback so
+        // the batch doesn't go dark.
+        let input_yaml = match json_data {
+            Value::Null => None,
+            _ => Some(pretty_yaml_block(json_data)),
+        };
+        let text = match input_yaml {
+            Some(yaml) => format!("[tool] {} {yaml}", call.name),
+            None => format!("[tool] {}", call.name),
+        };
+        println!("{text}");
     }
 }
 
 fn default_emit_tool_result(call: &ToolCall, result: &Value) {
-    let mut opts = TruncateOpts::default();
-    let marker = " [...] ";
-    if let Ok((cols, rows)) = crossterm::terminal::size() {
-        opts.head_lines = 5.max((rows / 2) as usize);
-        opts.tail_lines = 0;
-        // "<= " prefix is 3 chars, marker is 7 chars; total overhead = 10
-        // line_head_bytes + marker.len() + prefix.len() must fit in cols
-        opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
-        opts.line_tail_bytes = 0;
-        opts.marker = Some(marker.to_string());
-    }
-    let output_str = extract_user_display_text(result).unwrap_or_else(|| match result {
-        Value::String(s) => s.clone(),
-        _ => pretty_yaml_block(result),
+    use harnx_core::event::{AgentEvent, ToolEvent};
+    let event = AgentEvent::Tool(ToolEvent::Completed {
+        id: call.id.clone().unwrap_or_default(),
+        output: result.clone(),
+        content: Vec::new(),
     });
-    let truncated = truncate_output(&output_str, &opts);
-    let text = format!("{}\n", dimmed_text(&truncated));
-    let event = UiOutputEvent {
-        kind: UiOutputEventKind::ToolResultText { text: text.clone() },
-        source: None,
-    };
-    if !emit_ui_output_event(event) && *IS_STDOUT_TERMINAL {
+    if !crate::agent_event_sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
+        // No sink installed — fall back to the old format-and-print path.
+        let mut opts = TruncateOpts::default();
+        let marker = " [...] ";
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            opts.head_lines = 5.max((rows / 2) as usize);
+            opts.tail_lines = 0;
+            opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
+            opts.line_tail_bytes = 0;
+            opts.marker = Some(marker.to_string());
+        }
+        let output_str = extract_user_display_text(result).unwrap_or_else(|| match result {
+            Value::String(s) => s.clone(),
+            _ => pretty_yaml_block(result),
+        });
+        let truncated = truncate_output(&output_str, &opts);
+        let text = format!("{}\n", dimmed_text(&truncated));
         print!("{text}");
     }
-    // `call` parameter is unused by the default implementation but
-    // kept in the signature so custom callbacks can route per-call.
-    let _ = call;
 }
 
 fn default_confirm_tool_use(tool_name: &str, arguments: &Value, reason: Option<&str>) -> bool {
@@ -140,6 +144,8 @@ fn default_confirm_tool_use(tool_name: &str, arguments: &Value, reason: Option<&
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::tui::render_helpers::event_fallback_text;
+    use crate::ui_output::UiOutputEventKind;
     use indexmap::IndexMap;
     use parking_lot::RwLock;
     use serde_json::json;
