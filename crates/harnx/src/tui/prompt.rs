@@ -119,7 +119,6 @@ impl Tui {
                 }
             }
 
-            let event_tx = ctx.event_tx.clone();
             let llm_result = crate::client::retry::call_with_retry_and_fallback_custom(
                 &input,
                 &ctx.config,
@@ -128,7 +127,6 @@ impl Tui {
                       client: &dyn crate::client::Client,
                       config: &crate::config::GlobalConfig,
                       abort_signal| {
-                    let event_tx = event_tx.clone();
                     Box::pin(async move {
                         if crate::config::input::stream(input, config) {
                             Self::call_chat_completions_streaming_tui(
@@ -136,7 +134,6 @@ impl Tui {
                                 client,
                                 config,
                                 abort_signal,
-                                event_tx,
                             )
                             .await
                         } else {
@@ -293,7 +290,6 @@ impl Tui {
         client: &dyn crate::client::Client,
         config: &crate::config::GlobalConfig,
         abort_signal: AbortSignal,
-        event_tx: mpsc::UnboundedSender<TuiEvent>,
     ) -> Result<(
         String,
         Option<String>,
@@ -303,21 +299,15 @@ impl Tui {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut handler = crate::client::SseHandler::new(tx, abort_signal.clone());
 
-        let sender = tokio::spawn(async move {
-            while let Some(evt) = rx.recv().await {
-                match evt {
-                    crate::client::SseEvent::Text(text) => {
-                        let _ =
-                            event_tx.send(TuiEvent::UiOutput(crate::ui_output::UiOutputEvent {
-                                kind: crate::ui_output::UiOutputEventKind::MessageChunk {
-                                    text,
-                                    raw: None,
-                                },
-                                source: None,
-                            }));
-                    }
-                    crate::client::SseEvent::Done => break,
-                }
+        // Drain the SseEvent channel in the background so unbounded_send
+        // doesn't fill up. No translation to TuiEvent happens here —
+        // SseHandler emits AgentEvent::Model::{MessageChunk, ThoughtChunk}
+        // via the global sink; TuiAgentEventSink converts those to
+        // UiOutputEvent and forwards through the TUI bridge
+        // (UI_OUTPUT_SENDER) into the event loop.
+        let drainer = tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                // discard — chunk flow goes through the sink.
             }
         });
 
@@ -339,7 +329,7 @@ impl Tui {
         .await;
         let aborted = handler.abort().aborted();
         let (text, thought, tool_calls, usage) = handler.take();
-        let _ = sender.await;
+        let _ = drainer.await;
 
         if aborted {
             return Ok((text, thought, vec![], usage));
