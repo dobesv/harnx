@@ -25,7 +25,10 @@ struct ProxySink {
 impl ProxySink {
     fn new() -> Self {
         Self {
-            inner: harnx::cli_event_sink::CliAgentEventSink,
+            inner: harnx::cli_event_sink::CliAgentEventSink::new(
+                false,
+                harnx::render::RenderOptions::default(),
+            ),
             recorded: Arc::new(Mutex::new(vec![])),
         }
     }

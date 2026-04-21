@@ -223,7 +223,11 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     match is_tui {
         false => {
             ui_output::install_cli_ui_output_sink();
-            agent_event_sink::install_cli_agent_event_sink();
+            let (highlight, render_options) = {
+                let cfg = config.read();
+                (cfg.highlight, cfg.render_options().unwrap_or_default())
+            };
+            agent_event_sink::install_cli_agent_event_sink(highlight, render_options);
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
             let mut async_manager = AsyncHookManager::new();
             let persistent_manager =

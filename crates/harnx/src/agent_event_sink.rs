@@ -21,12 +21,16 @@ use harnx_core::event::AgentEventSink;
 pub use harnx_core::sink::{emit_agent_event, has_agent_event_sink, install_agent_event_sink};
 
 use crate::cli_event_sink::CliAgentEventSink;
+use crate::render::RenderOptions;
 use crate::ui_output::{emit_ui_output_event, UiOutputEvent, UiOutputEventKind};
 
 /// Install the stderr-backed `CliAgentEventSink`. Used by the CLI
-/// (`Cmd`) working mode at process startup.
-pub fn install_cli_agent_event_sink() {
-    install_agent_event_sink(Arc::new(CliAgentEventSink));
+/// (`Cmd`) working mode at process startup. Takes a `highlight` flag
+/// and `RenderOptions` snapshot so the sink can render streaming
+/// Model::MessageChunk / ThoughtChunk events directly to stdout (with
+/// markdown rendering + raw-mode cursor manipulation on terminals).
+pub fn install_cli_agent_event_sink(highlight: bool, render_options: RenderOptions) {
+    install_agent_event_sink(Arc::new(CliAgentEventSink::new(highlight, render_options)));
     debug_assert!(
         has_agent_event_sink(),
         "CLI AgentEventSink must be installed after startup call"
