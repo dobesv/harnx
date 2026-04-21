@@ -22,7 +22,7 @@ pub use harnx_core::path::{
     expand_glob_paths, get_patch_extension, list_file_names, resolve_home_dir, safe_join_path,
     to_absolute_path,
 };
-pub use harnx_core::text::{extract_code_block, strip_think_tag};
+pub use harnx_core::text::strip_think_tag;
 
 use anyhow::Result;
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};

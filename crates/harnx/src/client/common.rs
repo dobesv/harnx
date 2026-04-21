@@ -125,81 +125,56 @@ pub async fn call_chat_completions(
         user_agent: user_agent.as_deref(),
         dry_run,
     };
-    let ret = abortable_run_with_spinner(
-        chat_completions_with_input(client, input.clone(), config, &ctx),
+
+    // Dry-run stays on the harnx side: the echo-message path needs
+    // Input + config to walk the session. The engine only handles the
+    // live LLM call. Match pre-plan behavior: print via print_markdown
+    // when `print=true`.
+    if dry_run {
+        let content = crate::config::input::echo_messages(input, config);
+        let usage = CompletionTokenUsage::default();
+        if print && !content.is_empty() {
+            config.read().print_markdown(&content)?;
+        }
+        return Ok((content, None, vec![], usage));
+    }
+
+    let data = crate::config::input::prepare_completion_data(input, config, client.model(), false)?;
+
+    let engine_ret = abortable_run_with_spinner(
+        harnx_engine::chat_completions::run_chat_completion(
+            client,
+            data,
+            &ctx,
+            extract_code,
+            print, // suppress_final_output = print (we'll display via print_markdown)
+            abort_signal.clone(),
+        ),
         &spinner_message,
         abort_signal.clone(),
     )
     .await;
 
-    match ret {
-        Ok(ret) => {
-            let ChatCompletionsOutput {
-                mut text,
-                tool_calls,
-                thought,
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-                ..
-            } = ret;
-            let usage = CompletionTokenUsage::new(input_tokens, output_tokens, cached_tokens);
+    match engine_ret {
+        Ok((text, thought, tool_calls, usage)) => {
             if print {
                 if let Some(v) = &thought {
                     config
                         .read()
                         .print_markdown(&format!("<think>\n{}\n</think>\n\n", v))?;
                 }
-            }
-            if !text.is_empty() {
-                if extract_code {
-                    text = extract_code_block(&strip_think_tag(&text)).to_string();
-                }
-                if print {
+                if !text.is_empty() {
                     config.read().print_markdown(&text)?;
                 }
             }
-            // Emit Model events via the process-level sink. Plan 27: LLM
-            // orchestration now flows through AgentEvent, unblocking future
-            // harnx-engine migration. We emit Final with EMPTY output when the
-            // text was already printed via `print_markdown` — CliAgentEventSink's
-            // Final handler only prints non-empty outputs, avoiding duplication.
-            {
-                use harnx_core::event::{AgentEvent, ModelEvent};
-                let final_output = if print { String::new() } else { text.clone() };
-                crate::agent_event_sink::emit_agent_event(AgentEvent::Model(ModelEvent::Final {
-                    output: final_output,
-                    usage: usage.clone(),
-                }));
-                if !usage.is_empty() {
-                    crate::agent_event_sink::emit_agent_event(AgentEvent::Model(
-                        ModelEvent::Usage {
-                            input: usage.input_tokens,
-                            output: usage.output_tokens,
-                            cached: usage.cached_tokens,
-                            session_label: None,
-                        },
-                    ));
-                }
-            }
-            Ok((
-                text,
-                thought,
-                eval_tool_calls(
-                    &crate::tool::build_tool_eval_context(config),
-                    tool_calls,
-                    &abort_signal,
-                )?,
-                usage,
-            ))
+            let tool_results = eval_tool_calls(
+                &crate::tool::build_tool_eval_context(config),
+                tool_calls,
+                &abort_signal,
+            )?;
+            Ok((text, thought, tool_results, usage))
         }
-        Err(err) => {
-            use harnx_core::event::{AgentEvent, ModelEvent};
-            crate::agent_event_sink::emit_agent_event(AgentEvent::Model(ModelEvent::Error(
-                err.to_string(),
-            )));
-            Err(err)
-        }
+        Err(err) => Err(err),
     }
 }
 
