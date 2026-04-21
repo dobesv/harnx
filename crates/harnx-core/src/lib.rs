@@ -21,6 +21,7 @@ pub mod path;
 pub mod provider_config;
 pub mod retry_config;
 pub mod session;
+pub mod sink;
 pub mod system_vars;
 pub mod text;
 pub mod tool;
