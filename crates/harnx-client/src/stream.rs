@@ -57,6 +57,17 @@ impl SseHandler {
             }
             return Err(err);
         }
+
+        // Per-chunk AgentEvent emission. Best-effort; no-op if no sink
+        // is installed. Emits the raw chunk text WITHOUT the display
+        // prefix (<think> close / etc.) — that's channel plumbing only.
+        {
+            use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
+            harnx_core::sink::emit_agent_event(AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text(text.to_string())],
+            }));
+        }
+
         Ok(())
     }
 
@@ -80,6 +91,17 @@ impl SseHandler {
             }
             return Err(err);
         }
+
+        // Per-chunk AgentEvent emission. Best-effort; no-op if no sink
+        // is installed. Emits raw thought text WITHOUT the <think>
+        // bracketing — downstream sinks render their own conventions.
+        {
+            use harnx_core::event::{AgentEvent, ContentBlock, ModelEvent};
+            harnx_core::sink::emit_agent_event(AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text(thought.to_string())],
+            }));
+        }
+
         Ok(())
     }
 
