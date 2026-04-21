@@ -13,7 +13,6 @@ use super::*;
 
 use crate::{
     config::{Config, GlobalConfig, Input},
-    render::render_stream,
     tool::{eval_tool_calls, ToolResult},
     utils::*,
 };
@@ -189,7 +188,6 @@ pub async fn call_chat_completions_streaming(
     Vec<ToolResult>,
     CompletionTokenUsage,
 )> {
-    let spinner_message = spinner_label(config);
     let (dry_run, user_agent) = {
         let cfg = config.read();
         (cfg.dry_run, cfg.user_agent.clone())
@@ -199,47 +197,56 @@ pub async fn call_chat_completions_streaming(
         dry_run,
     };
 
-    // Dry-run: echo messages through the handler + channel so render_stream
-    // still runs and the user sees what would have been sent.
+    // Dry-run: just echo the prepared messages to stdout. The streaming
+    // rendering path is unnecessary for a no-LLM echo.
     if dry_run {
-        let (tx, rx) = unbounded_channel();
-        let mut handler = SseHandler::new(tx, abort_signal.clone());
         let content = crate::config::input::echo_messages(input, config);
-        handler.text(&content)?;
-        handler.done();
-        let (_render_ret,) = tokio::join!(render_stream(
-            rx,
-            config,
-            abort_signal.clone(),
-            &spinner_message
-        ),);
-        let (text, thought, _tool_calls, usage) = handler.take();
-        return Ok((text, thought, vec![], usage));
+        if !content.is_empty() {
+            println!("{content}");
+        }
+        return Ok((content, None, vec![], CompletionTokenUsage::default()));
     }
 
     let data = crate::config::input::prepare_completion_data(input, config, client.model(), true)?;
     let (tx, rx) = unbounded_channel();
     let handler = SseHandler::new(tx, abort_signal.clone());
 
-    let (engine_ret, _render_ret) = tokio::join!(
-        harnx_engine::chat_completions::run_chat_completion_streaming(
-            client,
-            data,
-            &ctx,
-            handler,
-            abort_signal.clone(),
-        ),
-        render_stream(rx, config, abort_signal.clone(), &spinner_message),
-    );
-
-    let (text, thought, tool_calls, usage, aborted) = engine_ret?;
-
-    // Stdout newline cleanup - streaming writes text via render_stream;
-    // if text didn't end with a newline (or we aborted mid-text), add
-    // one so the shell prompt appears on its own line.
-    if !text.is_empty() && (aborted || !text.ends_with('\n')) {
-        println!();
+    // Emit Turn::Started so the installed sink starts a "Generating" spinner.
+    {
+        use harnx_core::event::{AgentEvent, TurnEvent};
+        harnx_core::sink::emit_agent_event(AgentEvent::Turn(TurnEvent::Started));
     }
+
+    // Drain the SseHandler's channel — chunk display is now driven by
+    // AgentEvent::Model::MessageChunk/ThoughtChunk emitted by SseHandler,
+    // which the installed sink renders. The channel itself just needs
+    // a consumer so the handler doesn't block on send.
+    let drainer = tokio::spawn(async move {
+        let mut rx = rx;
+        while rx.recv().await.is_some() {}
+    });
+
+    let engine_ret = harnx_engine::chat_completions::run_chat_completion_streaming(
+        client,
+        data,
+        &ctx,
+        handler,
+        abort_signal.clone(),
+    )
+    .await;
+
+    let _ = drainer.await;
+
+    // Emit Turn::Ended so the sink stops the spinner, exits raw mode,
+    // and emits a trailing newline if needed.
+    {
+        use harnx_core::event::{AgentEvent, TurnEvent, TurnOutcome};
+        harnx_core::sink::emit_agent_event(AgentEvent::Turn(TurnEvent::Ended {
+            outcome: TurnOutcome::default(),
+        }));
+    }
+
+    let (text, thought, tool_calls, usage, _aborted) = engine_ret?;
 
     let tool_results = if tool_calls.is_empty() {
         vec![]
