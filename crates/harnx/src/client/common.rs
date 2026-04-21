@@ -187,6 +187,29 @@ pub async fn call_chat_completions(
                     config.read().print_markdown(&text)?;
                 }
             }
+            // Emit Model events via the process-level sink. Plan 27: LLM
+            // orchestration now flows through AgentEvent, unblocking future
+            // harnx-engine migration. We emit Final with EMPTY output when the
+            // text was already printed via `print_markdown` — CliAgentEventSink's
+            // Final handler only prints non-empty outputs, avoiding duplication.
+            {
+                use harnx_core::event::{AgentEvent, ModelEvent};
+                let final_output = if print { String::new() } else { text.clone() };
+                crate::agent_event_sink::emit_agent_event(AgentEvent::Model(ModelEvent::Final {
+                    output: final_output,
+                    usage: usage.clone(),
+                }));
+                if !usage.is_empty() {
+                    crate::agent_event_sink::emit_agent_event(AgentEvent::Model(
+                        ModelEvent::Usage {
+                            input: usage.input_tokens,
+                            output: usage.output_tokens,
+                            cached: usage.cached_tokens,
+                            session_label: None,
+                        },
+                    ));
+                }
+            }
             Ok((
                 text,
                 thought,
@@ -198,7 +221,13 @@ pub async fn call_chat_completions(
                 usage,
             ))
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            use harnx_core::event::{AgentEvent, ModelEvent};
+            crate::agent_event_sink::emit_agent_event(AgentEvent::Model(ModelEvent::Error(
+                err.to_string(),
+            )));
+            Err(err)
+        }
     }
 }
 
