@@ -1,3 +1,4 @@
+use crate::agent_event_sink::install_tui_agent_event_sink;
 use crate::client::{call_chat_completions, CompletionTokenUsage};
 use crate::config::{GlobalConfig, Input};
 use crate::hooks::{

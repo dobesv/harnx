@@ -1,9 +1,6 @@
 use super::{call_chat_completions, call_chat_completions_streaming, Client};
 use crate::config::{GlobalConfig, Input};
 use crate::tool::ToolResult;
-use crate::ui_output::{
-    emit_ui_output_event, has_ui_output_sink, UiOutputEvent, UiOutputEventKind,
-};
 use crate::utils::{warning_text, AbortSignal};
 
 use anyhow::Result;
@@ -16,17 +13,14 @@ pub use harnx_core::retry_config::ModelCooldownMap;
 /// Token usage from a completion call.
 pub use super::CompletionTokenUsage;
 
-/// Emit a warning message to the TUI transcript if a UI sink is installed,
-/// otherwise fall back to stderr.
+/// Emit a warning message as an `AgentEvent::Notice(Warning)` through the
+/// process-wide `AgentEventSink`. If no sink is installed (e.g. a test
+/// context that didn't set one up), fall back to stderr so the warning is
+/// at least visible.
 fn emit_retry_warning(msg: &str) {
-    if has_ui_output_sink() {
-        emit_ui_output_event(UiOutputEvent {
-            kind: UiOutputEventKind::TranscriptText {
-                text: format!("⚠ {msg}"),
-            },
-            source: None,
-        });
-    } else {
+    use harnx_core::event::{AgentEvent, NoticeEvent};
+    let event = AgentEvent::Notice(NoticeEvent::Warning(msg.to_string()));
+    if !crate::agent_event_sink::emit_agent_event(event) {
         eprintln!("{}", warning_text(&format!("⚠ {msg}")));
     }
 }

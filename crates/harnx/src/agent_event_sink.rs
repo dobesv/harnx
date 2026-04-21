@@ -86,6 +86,10 @@ pub fn emit_agent_event(event: AgentEvent) -> bool {
 /// (`Cmd`) working mode at process startup.
 pub fn install_cli_agent_event_sink() {
     install_agent_event_sink(Arc::new(CliAgentEventSink));
+    debug_assert!(
+        has_agent_event_sink(),
+        "CLI AgentEventSink must be installed after startup call"
+    );
 }
 
 /// Sink used by the interactive TUI mode. Translates `AgentEvent`
@@ -126,6 +130,10 @@ impl AgentEventSink for TuiAgentEventSink {
 /// `UiOutputEvent` channel.
 pub fn install_tui_agent_event_sink() {
     install_agent_event_sink(Arc::new(TuiAgentEventSink));
+    debug_assert!(
+        has_agent_event_sink(),
+        "TUI AgentEventSink must be installed after startup call"
+    );
 }
 
 #[cfg(test)]

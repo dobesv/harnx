@@ -1,5 +1,7 @@
 mod acp;
+mod agent_event_sink;
 mod cli;
+mod cli_event_sink;
 mod client;
 mod commands;
 mod config;
@@ -221,6 +223,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     match is_tui {
         false => {
             ui_output::install_cli_ui_output_sink();
+            agent_event_sink::install_cli_agent_event_sink();
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
             let mut async_manager = AsyncHookManager::new();
             let persistent_manager =

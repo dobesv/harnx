@@ -39,6 +39,7 @@ impl Tui {
         let ui_output_tx = event_tx.clone();
         let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
         install_ui_output_sender(bridge_tx);
+        install_tui_agent_event_sink();
         tokio::spawn(async move {
             while let Some(event) = bridge_rx.recv().await {
                 let _ = ui_output_tx.send(TuiEvent::UiOutput(event));
