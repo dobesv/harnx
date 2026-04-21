@@ -18,7 +18,7 @@ use crate::{
     utils::*,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use inquire::{
     list_option::ListOption, required, validator::Validation, MultiSelect, Select, Text,
 };
@@ -41,19 +41,9 @@ pub async fn chat_completions_with_input(
         let content = crate::config::input::echo_messages(&input, config);
         return Ok(ChatCompletionsOutput::new(&content));
     }
-    let reqwest_client = client.build_client(ctx)?;
     let data =
         crate::config::input::prepare_completion_data(&input, config, client.model(), false)?;
-    client
-        .chat_completions_inner(&reqwest_client, data)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to call chat-completions api (client: {}, model: {})",
-                client.name(),
-                client.model().id()
-            )
-        })
+    harnx_engine::chat_completions::chat_completions_with_data(client, data, ctx).await
 }
 
 /// Input-aware streaming wrapper — same role as
@@ -66,33 +56,15 @@ pub async fn chat_completions_streaming_with_input(
     handler: &mut SseHandler,
     ctx: &ClientCallContext<'_>,
 ) -> Result<()> {
-    let abort_signal = handler.abort();
-    let input = input.clone();
-    tokio::select! {
-        ret = async {
-            if ctx.dry_run {
-                let content = crate::config::input::echo_messages(&input, config);
-                handler.text(&content)?;
-                return Ok(());
-            }
-            let reqwest_client = client.build_client(ctx)?;
-            let data = crate::config::input::prepare_completion_data(&input, config, client.model(), true)?;
-            client
-                .chat_completions_streaming_inner(&reqwest_client, handler, data)
-                .await
-        } => {
-            handler.done();
-            ret.with_context(|| format!(
-                "Failed to call chat-completions api (client: {}, model: {})",
-                client.name(),
-                client.model().id()
-            ))
-        }
-        _ = wait_abort_signal(&abort_signal) => {
-            handler.done();
-            Ok(())
-        },
+    if ctx.dry_run {
+        let content = crate::config::input::echo_messages(input, config);
+        handler.text(&content)?;
+        handler.done();
+        return Ok(());
     }
+    let data = crate::config::input::prepare_completion_data(input, config, client.model(), true)?;
+    harnx_engine::chat_completions::chat_completions_streaming_with_data(client, data, handler, ctx)
+        .await
 }
 
 /// Install harnx's models-override (loaded from the user's config dir)
