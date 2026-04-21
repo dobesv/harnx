@@ -211,6 +211,16 @@ pub async fn call_chat_completions_streaming(
     let (tx, rx) = unbounded_channel();
     let handler = SseHandler::new(tx, abort_signal.clone());
 
+    // Compute rich spinner label from config; emit as Status so
+    // CliAgentEventSink picks it up as the spinner message.
+    let spinner_message = spinner_label(config);
+    {
+        use harnx_core::event::{AgentEvent, StatusLine};
+        harnx_core::sink::emit_agent_event(AgentEvent::Status(StatusLine {
+            text: spinner_message,
+        }));
+    }
+
     // Emit Turn::Started so the installed sink starts a "Generating" spinner.
     {
         use harnx_core::event::{AgentEvent, TurnEvent};
