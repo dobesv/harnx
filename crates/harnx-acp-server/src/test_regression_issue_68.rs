@@ -1,4 +1,4 @@
-use super::*;
+use harnx_acp::session_prompt_with_abort_for_test;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

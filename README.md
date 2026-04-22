@@ -3,6 +3,8 @@
 Harnx is a modular command-line LLM agent harness that lets you build your own agents
 from the ground up, giving you total control over the prompt, tools, model, and sub-agents.
 
+It uses and implements standard protocols, meaning that many of the components are also
+usable with other harnesses.
 
 ## Install
 
@@ -13,25 +15,27 @@ from the ground up, giving you total control over the prompt, tools, model, and 
 
 ### Pre-built Binaries
 
-Download pre-built binaries for macOS, Linux, and Windows from [GitHub Releases](https://github.com/dobesv/harnx/releases), extract them, and add the `harnx` binary to your `$PATH`.
+Download pre-built binaries for macOS, Linux, and Windows from [GitHub Releases](https://github.com/dobesv/harnx/releases), extract 
+them, and add the binaries to your `$PATH`.
 
 ## Features
 
 ### Multi-Providers
 
-Integrate seamlessly with over 20 leading LLM providers through a unified interface. Supported providers include OpenAI, Claude, Gemini (Google AI Studio), Ollama, Groq, Azure-OpenAI, VertexAI, Bedrock, Github Models, Mistral, Deepseek, AI21, XAI Grok, Cohere, Perplexity, Cloudflare, OpenRouter, Ernie, Qianwen, Moonshot, ZhipuAI, MiniMax, Deepinfra, VoyageAI, any OpenAI-Compatible API provider.
-
-### CMD Mode
-
-Explore powerful command-line functionalities with Harnx's CMD mode.
-
-![harnx-cmd](https://github.com/user-attachments/assets/6c58c549-1564-43cf-b772-e1c9fe91d19c)
+Integrate seamlessly with over 20 leading LLM providers through a unified interface. Supported 
+providers include OpenAI, Claude, Gemini (Google AI Studio), Ollama, Groq, Azure-OpenAI, 
+VertexAI, Bedrock, Github Models, Mistral, Deepseek, AI21, XAI Grok, Cohere, Perplexity, 
+Cloudflare, OpenRouter, Ernie, Qianwen, Moonshot, ZhipuAI, MiniMax, Deepinfra, VoyageAI, 
+any OpenAI-Compatible API provider.
 
 ### TUI Mode
 
-Experience an interactive chat TUI with features like tab autocompletion of dot-commands, multi-line input support, history, and attachments.
+Experience an interactive chat TUI with features like tab autocompletion of dot-commands, multi-line 
+input support, history, and attachments.
 
-![harnx-tui](https://github.com/user-attachments/assets/218fab08-cdae-4c3b-bcf8-39b6651f1362)
+### CLI Mode
+
+Explore powerful command-line functionalities with Harnx's CMD mode.
 
 ### Multi-Form Input
 
@@ -52,15 +56,11 @@ Accept diverse input forms such as stdin, local files and directories, and remot
 
 Customize agents to tailor LLM behavior, enhancing interaction efficiency and boosting productivity.
 
-![harnx-agent](https://github.com/user-attachments/assets/023df6d2-409c-40bd-ac93-4174fd72f030)
-
 > An agent is a Markdown file combining a system prompt with model configuration, tools, variables, and documents.
 
 ### Session
 
 Maintain context-aware conversations through sessions, ensuring continuity in interactions.
-
-![harnx-session](https://github.com/user-attachments/assets/56583566-0f43-435f-95b3-730ae55df031)
 
 > The left side uses a session, while the right side does not use a session.
 
@@ -68,25 +68,20 @@ Maintain context-aware conversations through sessions, ensuring continuity in in
 
 Streamline repetitive tasks by combining a series of dot-commands into a custom macro.
 
-![harnx-macro](https://github.com/user-attachments/assets/23c2a08f-5bd7-4bf3-817c-c484aa74a651)
-
 ### RAG
 
 Integrate external documents into your LLM conversations for more accurate and contextually relevant responses.
 
-![harnx-rag](https://github.com/user-attachments/assets/359f0cb8-ee37-432f-a89f-96a2ebab01f6)
-
 ### Tool Use
 
-Tool use supercharges LLMs by connecting them to external tools and data sources. This unlocks a world of possibilities, enabling LLMs to go beyond their core capabilities and tackle a wider range of tasks.
-
-We have created a new repository [https://github.com/sigoden/llm-functions](https://github.com/sigoden/llm-functions) to help you make the most of this feature.
+Tool use supercharges LLMs by connecting them to external tools and data sources. This unlocks a 
+world of possibilities, enabling LLMs to go beyond their core capabilities and tackle a wider 
+range of tasks.
 
 #### AI Tools & MCP
 
-Integrate external tools to automate tasks, retrieve information, and perform actions directly within your workflow.
-
-![harnx-tool](https://github.com/user-attachments/assets/7459a111-7258-4ef0-a2dd-624d0f1b4f92)
+Integrate external tools to automate tasks, retrieve information, and perform actions directly 
+within your workflow.
 
 #### AI Agents (CLI version of OpenAI GPTs)
 

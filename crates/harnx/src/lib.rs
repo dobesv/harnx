@@ -1,6 +1,3 @@
-#[macro_use]
-extern crate log;
-
 pub mod acp;
 pub mod agent_event_sink;
 pub mod cli;

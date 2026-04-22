@@ -1573,6 +1573,7 @@ dependencies = [
  "glob",
  "globset",
  "harnx-acp",
+ "harnx-acp-server",
  "harnx-client",
  "harnx-core",
  "harnx-engine",
@@ -1671,7 +1672,10 @@ dependencies = [
  "harnx-core",
  "harnx-runtime",
  "log",
+ "parking_lot",
  "serde_json",
+ "serde_yaml",
+ "tempfile",
  "tokio",
  "uuid",
 ]

@@ -1,12 +1,9 @@
-//! Re-export shim. ACP coordinator (`AcpManager`) now lives in
-//! `harnx-acp::manager` — moved in Plan 46a (step 9 β+). The ACP server
-//! (`HarnxAgent`) still lives at `crates/harnx/src/acp/server.rs` and is
-//! scheduled for its own crate (harnx-acp-server) later.
+//! Re-export shim. ACP protocol bits live in `harnx-acp`; the ACP server
+//! (`HarnxAgent`) lives in `harnx-acp-server` (plan P48). Re-exports
+//! preserve `harnx::acp::X` callsites in integration tests and test_utils.
 
-mod server;
-
-pub use harnx_acp::*;
-pub use server::HarnxAgent;
-
-#[cfg(test)]
-mod test_regression_issue_68;
+// ACP types are used by integration tests (tmux_e2e.rs) and test_utils/
+// (interrupt.rs), but not by the harnx binary itself — hence the allow.
+#[allow(unused_imports)]
+pub use harnx_acp::{AcpClient, AcpManager, AcpServerConfig};
+pub use harnx_acp_server::HarnxAgent;
