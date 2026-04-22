@@ -2,8 +2,7 @@ use super::{AcpServerConfig, NestedAcpEvent};
 
 use crate::tui::render_helpers::event_fallback_text;
 use crate::ui_output::{
-    emit_ui_output_event, pretty_yaml_block, UiOutputEvent, UiOutputEventKind, UiOutputPlanEntry,
-    UiOutputSource,
+    pretty_yaml_block, UiOutputEvent, UiOutputEventKind, UiOutputPlanEntry, UiOutputSource,
 };
 use agent_client_protocol::{self as acp, Agent as _};
 use anyhow::{anyhow, Context, Result};
@@ -144,11 +143,20 @@ impl AcpNotificationClient {
         });
 
         // When no forwarder is registered (e.g. direct parent TUI mode with
-        // no tool call in flight), fall back to the UI output sink so the
-        // event still reaches the transcript.
+        // no tool call in flight), fall back to the unified AgentEvent sink
+        // so the event still reaches the transcript.
         let mut emitted_to_ui = false;
         if !forwarded_to_chunk {
-            emitted_to_ui = emit_ui_output_event(event);
+            use crate::agent_event_sink::ui_output_to_agent_event;
+            use harnx_core::event::AgentSource;
+            use harnx_core::sink::emit_agent_event_with_source;
+
+            let agent_source = event.source.clone().map(|s| AgentSource {
+                agent: s.agent,
+                session_id: s.session_id,
+            });
+            let agent_event = ui_output_to_agent_event(event);
+            emitted_to_ui = emit_agent_event_with_source(agent_event, agent_source);
         }
 
         // Fall back to stderr only if neither path accepted the event.
