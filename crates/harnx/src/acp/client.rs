@@ -1073,7 +1073,11 @@ fn session_info_update_event(
         return None;
     }
 
-    let session_label = Some(crate::tui::render_helpers::source_heading(&source));
+    let agent_source = harnx_core::event::AgentSource {
+        agent: source.agent.clone(),
+        session_id: source.session_id.clone(),
+    };
+    let session_label = Some(crate::tui::render_helpers::source_heading(&agent_source));
 
     Some(UiOutputEvent {
         kind: UiOutputEventKind::Usage {
@@ -1101,7 +1105,11 @@ fn format_ui_event_for_terminal(
     kind: &UiOutputEventKind,
     source: Option<&UiOutputSource>,
 ) -> String {
-    event_fallback_text(kind, source)
+    let agent_source = source.map(|s| harnx_core::event::AgentSource {
+        agent: s.agent.clone(),
+        session_id: s.session_id.clone(),
+    });
+    event_fallback_text(kind, agent_source.as_ref())
 }
 
 #[cfg(test)]

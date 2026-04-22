@@ -1,7 +1,8 @@
 use crate::config::GlobalConfig;
 use crate::hooks::{AsyncHookManager, PersistentHookManager};
-use crate::ui_output::{UiOutputEvent, UiOutputSource};
+use crate::ui_output::UiOutputEvent;
 use crate::utils::AbortSignal;
+use harnx_core::event::{AgentSource, PlanEntry};
 
 use ratatui_textarea::TextArea;
 use std::path::PathBuf;
@@ -50,10 +51,10 @@ pub(super) struct App {
     pub(super) llm_busy: bool,
     pub(super) scroll_state: ratatui_widget_scrolling::ScrollState,
     pub(super) streaming_assistant_idx: Option<usize>,
-    pub(super) last_ui_output_source: Option<UiOutputSource>,
-    pub(super) last_usage_source: Option<UiOutputSource>,
+    pub(super) last_ui_output_source: Option<AgentSource>,
+    pub(super) last_usage_source: Option<AgentSource>,
     pub(super) last_usage_transcript_idx: Option<usize>,
-    pub(super) pending_thought_source: Option<UiOutputSource>,
+    pub(super) pending_thought_source: Option<AgentSource>,
     pub(super) pending_thought_text: String,
     pub(super) pending_message: Option<PendingMessage>,
     pub(super) completions: Vec<(String, Option<String>)>,
@@ -94,7 +95,7 @@ pub(super) fn cleanup_attachment_dir(dir: &std::path::Path) {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TranscriptItem {
-    SourceHeading(UiOutputSource),
+    SourceHeading(AgentSource),
     SystemText(String),
     UserText(String),
     AssistantText(String),
@@ -102,7 +103,7 @@ pub(crate) enum TranscriptItem {
     ThoughtText(String),
     ToolResultText(String),
     StatusLine(String),
-    Plan(Vec<crate::ui_output::UiOutputPlanEntry>),
+    Plan(Vec<PlanEntry>),
     UsageLine(String),
     ToolCall {
         tool_name: String,

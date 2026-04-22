@@ -1,7 +1,8 @@
 use super::*;
 use crate::tui::render_helpers::{render_status_line, render_usage_line};
 use crate::tui::types::{TranscriptItem, TuiEvent};
-use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
+use crate::ui_output::{UiOutputEvent, UiOutputEventKind};
+use harnx_core::event::{AgentSource, PlanEntry};
 use std::path::Path;
 
 const ATTACHMENT_PREVIEW_MAX_CHARS: usize = 800;
@@ -508,6 +509,10 @@ impl Tui {
     }
 
     async fn render_ui_output_event(&mut self, event: UiOutputEvent) {
+        let agent_source = event.source.as_ref().map(|s| AgentSource {
+            agent: s.agent.clone(),
+            session_id: s.session_id.clone(),
+        });
         let is_thought = matches!(&event.kind, UiOutputEventKind::ThoughtChunk { .. });
         let is_usage = matches!(&event.kind, UiOutputEventKind::Usage { .. });
         // Tool calls (and plan updates) from sub-agents represent a turn-like
@@ -530,7 +535,7 @@ impl Tui {
         if !is_thought {
             self.flush_pending_thought();
         }
-        self.render_ui_output_heading(event.source.as_ref(), is_usage);
+        self.render_ui_output_heading(agent_source.as_ref(), is_usage);
 
         let rendered_entries = match event.kind {
             UiOutputEventKind::TranscriptText { text } => {
@@ -635,7 +640,7 @@ impl Tui {
                         text: text.clone(),
                         raw: raw.clone(),
                     },
-                    event.source.as_ref(),
+                    agent_source.as_ref(),
                 );
                 let clean = strip_ansi(&text)
                     .trim_start_matches("<think>")
@@ -644,9 +649,9 @@ impl Tui {
                 if clean.trim().is_empty() {
                     vec![]
                 } else {
-                    if self.app.pending_thought_source != event.source {
+                    if self.app.pending_thought_source != agent_source {
                         self.flush_pending_thought();
-                        self.app.pending_thought_source = event.source.clone();
+                        self.app.pending_thought_source = agent_source.clone();
                     }
                     self.app.pending_thought_text.push_str(&clean);
                     vec![]
@@ -660,7 +665,15 @@ impl Tui {
                     vec![]
                 }
             }
-            UiOutputEventKind::Plan { entries } => vec![TranscriptItem::Plan(entries)],
+            UiOutputEventKind::Plan { entries } => vec![TranscriptItem::Plan(
+                entries
+                    .into_iter()
+                    .map(|e| PlanEntry {
+                        status: e.status,
+                        content: e.content,
+                    })
+                    .collect(),
+            )],
             UiOutputEventKind::Usage {
                 input_tokens,
                 output_tokens,
@@ -672,10 +685,10 @@ impl Tui {
                     output_tokens,
                     cached_tokens,
                     session_label.as_deref(),
-                    event.source.as_ref(),
+                    agent_source.as_ref(),
                 );
                 if let Some(line) = line {
-                    if self.update_existing_usage_line(event.source.as_ref(), &line) {
+                    if self.update_existing_usage_line(agent_source.as_ref(), &line) {
                         vec![]
                     } else {
                         vec![TranscriptItem::UsageLine(line)]
@@ -700,7 +713,7 @@ impl Tui {
             let start_idx = self.app.transcript.len();
             self.app.transcript.extend(rendered_entries);
             if is_usage {
-                self.app.last_usage_source = event.source.clone();
+                self.app.last_usage_source = agent_source.clone();
                 self.app.last_usage_transcript_idx = Some(start_idx);
             } else {
                 self.clear_usage_tracking();
@@ -711,7 +724,7 @@ impl Tui {
         }
     }
 
-    fn render_ui_output_heading(&mut self, source: Option<&UiOutputSource>, is_usage: bool) {
+    fn render_ui_output_heading(&mut self, source: Option<&AgentSource>, is_usage: bool) {
         let source = source.cloned();
         if source != self.app.last_ui_output_source {
             if let Some(source) = &source {
@@ -741,7 +754,7 @@ impl Tui {
         self.app.last_usage_transcript_idx = None;
     }
 
-    fn update_existing_usage_line(&mut self, source: Option<&UiOutputSource>, line: &str) -> bool {
+    fn update_existing_usage_line(&mut self, source: Option<&AgentSource>, line: &str) -> bool {
         if self.app.last_usage_source.as_ref() != source {
             return false;
         }

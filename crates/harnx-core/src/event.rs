@@ -194,7 +194,7 @@ pub struct AgentSource {
     pub session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanEntry {
     pub status: String,
     pub content: String,

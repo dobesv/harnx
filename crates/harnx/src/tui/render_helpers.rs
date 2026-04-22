@@ -1,4 +1,5 @@
-use crate::ui_output::{UiOutputEventKind, UiOutputSource};
+use crate::ui_output::UiOutputEventKind;
+use harnx_core::event::AgentSource;
 
 pub(crate) fn render_status_line(title: Option<&str>, status: Option<&str>) -> Option<String> {
     let line = [title, status]
@@ -9,7 +10,7 @@ pub(crate) fn render_status_line(title: Option<&str>, status: Option<&str>) -> O
     (!line.is_empty()).then_some(format!("-> {line}"))
 }
 
-pub(crate) fn source_heading(source: &UiOutputSource) -> String {
+pub(crate) fn source_heading(source: &AgentSource) -> String {
     match &source.session_id {
         Some(session_id) if !session_id.is_empty() => {
             format!("> {} ▸ {}", source.agent, session_id)
@@ -23,7 +24,7 @@ pub(crate) fn render_usage_line(
     output_tokens: u64,
     cached_tokens: u64,
     session_label: Option<&str>,
-    source: Option<&UiOutputSource>,
+    source: Option<&AgentSource>,
 ) -> Option<String> {
     let mut parts = vec![];
     if let Some(label) = session_label {
@@ -45,7 +46,7 @@ pub(crate) fn render_usage_line(
 
 pub(crate) fn event_fallback_text(
     kind: &UiOutputEventKind,
-    source: Option<&UiOutputSource>,
+    source: Option<&AgentSource>,
 ) -> String {
     match kind {
         UiOutputEventKind::MessageChunk { text, .. }
