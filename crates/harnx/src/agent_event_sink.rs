@@ -175,10 +175,28 @@ fn concat_text_blocks(blocks: &[harnx_core::event::ContentBlock]) -> String {
 
 /// Translate a legacy `UiOutputEvent` into its `AgentEvent` counterpart.
 /// Used by `forward_acp_chunks` to route ACP sub-agent output through
-/// the unified AgentEvent sink. Imperfect mappings (YAML-encoded
-/// ToolCall.input, string-encoded ToolStatus) are best-effort —
-/// invalid inputs fall back to sensible defaults (null JSON, None
-/// status).
+/// the unified AgentEvent sink.
+///
+/// **Known limitations** (preserved from the pre-migration
+/// `UiOutputEvent` contract; not new regressions):
+/// - `Tool::Started` and `Tool::Completed` carry `id: String::new()`.
+///   `UiOutputEventKind::ToolCall` and `ToolResultText` have no tool
+///   call id field upstream, so no correlation id is available. Current
+///   sinks (Cli/Tui) do not correlate Started↔Completed by id, so this
+///   is safe. If a future consumer needs id correlation for ACP-sourced
+///   tool events, extract the id from `UiOutputEventKind::ToolCall.raw:
+///   Option<Box<acp::ToolCall>>`. `ToolCallUpdate` already preserves
+///   its `tool_call_id` (see arm below).
+/// - `yaml_to_json_value` falls back to `Value::String(raw_yaml)` on
+///   parse failure. ACP-originated YAML is emitted via
+///   `pretty_yaml_block` and is always valid, so the fallback is a
+///   safety net rather than an expected path. If downstream consumers
+///   need structured indexing, malformed YAML surfaces as a type
+///   mismatch at the consumer — not silently corrected data.
+/// - `parse_tool_status` accepts both snake_case, PascalCase, and the
+///   `in-progress` kebab form. ACP protocol uses snake_case, but the
+///   `UiOutputEventKind::ToolCallUpdate.status: Option<String>` is
+///   unvalidated at construction, so the parser is permissive.
 // TODO(plan-36-task-4): remove `allow(dead_code)` once `forward_acp_chunks`
 // calls this translator.
 #[allow(dead_code)]
