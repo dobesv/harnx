@@ -47,15 +47,16 @@ pub struct ToolEvalContext {
     pub session_name: Option<String>,
     pub allowed_tool_names: HashSet<String>,
     /// Called when a tool is about to be dispatched. Receives the tool
-    /// call and the parsed arguments JSON. Harnx's default formats
-    /// input as YAML and emits a `ToolCall` UiOutputEvent, falling
-    /// back to stdout if no UI sink is installed.
+    /// call and the parsed arguments JSON. Harnx's default emits an
+    /// `AgentEvent::Tool(Started { .. })` via the unified AgentEvent
+    /// sink, falling back to stdout if no sink is installed.
     pub emit_tool_call_fn: Arc<ToolCallEmitFn>,
     /// Called when a tool call returns a result. Receives the tool
-    /// call and the raw result JSON. Harnx's default extracts
-    /// user-display text (or YAML-pretty-prints the JSON), truncates
-    /// to terminal dimensions, dims the text, and emits a
-    /// `ToolResultText` UiOutputEvent with stdout fallback.
+    /// call and the raw result JSON. Harnx's default emits an
+    /// `AgentEvent::Tool(Completed { .. })` via the unified AgentEvent
+    /// sink; when no sink is installed it extracts user-display text
+    /// (or YAML-pretty-prints the JSON), truncates to terminal
+    /// dimensions, dims the text, and writes to stdout.
     pub emit_tool_result_fn: Arc<ToolCallEmitFn>,
     /// Called when a PreToolUse hook returns `Ask { reason }` and the
     /// user needs to confirm before the tool runs. Returns `true` if

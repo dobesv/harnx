@@ -1,6 +1,5 @@
 use crate::config::GlobalConfig;
 use crate::hooks::{AsyncHookManager, PersistentHookManager};
-use crate::ui_output::UiOutputEvent;
 use crate::utils::AbortSignal;
 use harnx_core::event::{AgentSource, PlanEntry};
 
@@ -115,7 +114,6 @@ pub(crate) enum TranscriptItem {
 }
 
 pub(crate) enum TuiEvent {
-    UiOutput(UiOutputEvent),
     Agent(
         harnx_core::event::AgentEvent,
         Option<harnx_core::event::AgentSource>,

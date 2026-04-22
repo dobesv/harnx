@@ -14,7 +14,6 @@ pub mod render;
 pub mod serve;
 pub mod tool;
 pub mod tui;
-pub mod ui_output;
 #[macro_use]
 pub mod utils;
 

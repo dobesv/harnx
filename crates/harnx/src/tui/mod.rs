@@ -6,7 +6,6 @@ use crate::hooks::{
     AsyncHookManager, HookEvent, HookResultControl, PersistentHookManager,
 };
 use crate::tool::ToolResult;
-use crate::ui_output::install_ui_output_sender;
 use crate::utils::{create_abort_signal, AbortSignal};
 
 use anyhow::Result;

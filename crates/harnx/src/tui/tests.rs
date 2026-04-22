@@ -2,10 +2,7 @@ use super::*;
 use crate::client::{Client, ClientConfig, TestStateGuard};
 use crate::config::Config;
 use crate::test_utils::{MockClient, MockTurnBuilder, TuiTestHarness};
-use crate::tui::render_helpers::event_fallback_text;
 use crate::tui::types::{TranscriptItem, TuiEvent};
-use crate::ui_output::UiOutputEventKind;
-use crate::utils::dimmed_text;
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, PlanEntry, ToolEvent, ToolKind,
     ToolStatus,
@@ -1342,18 +1339,6 @@ async fn submitting_message_with_attachments_renders_attachment_list_and_preview
     assert!(system_entries.contains(&"  - notes.txt".to_string()));
     assert!(system_entries.contains(&"      first line".to_string()));
     assert!(system_entries.contains(&"      second line".to_string()));
-}
-
-#[test]
-fn mcp_tool_result_fallback_uses_multiline_yaml_for_structured_json() {
-    let event = UiOutputEventKind::ToolResultText {
-        text: dimmed_text("content:\n  - type: text\n    text: hello\nisError: false\n"),
-    };
-
-    let rendered = event_fallback_text(&event, None);
-    assert!(rendered.contains("content:"));
-    assert!(rendered.contains("type: text"));
-    assert!(!rendered.contains("{\"content\""));
 }
 
 #[tokio::test(flavor = "multi_thread")]

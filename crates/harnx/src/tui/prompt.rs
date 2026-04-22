@@ -106,15 +106,14 @@ impl Tui {
                 )
                 .await;
                 if matches!(outcome.control, HookResultControl::Block { .. }) {
-                    let _ =
-                        ctx.event_tx
-                            .send(TuiEvent::UiOutput(crate::ui_output::UiOutputEvent {
-                                kind: crate::ui_output::UiOutputEventKind::LlmFinal {
-                                    output: String::new(),
-                                    usage: Default::default(),
-                                },
-                                source: None,
-                            }));
+                    use harnx_core::event::{AgentEvent, ModelEvent};
+                    let _ = ctx.event_tx.send(TuiEvent::Agent(
+                        AgentEvent::Model(ModelEvent::Final {
+                            output: String::new(),
+                            usage: Default::default(),
+                        }),
+                        None,
+                    ));
                     break;
                 }
             }
@@ -224,15 +223,14 @@ impl Tui {
                 with_embeddings = pending_switch.is_some();
                 continue;
             } else {
-                let _ = ctx
-                    .event_tx
-                    .send(TuiEvent::UiOutput(crate::ui_output::UiOutputEvent {
-                        kind: crate::ui_output::UiOutputEventKind::LlmFinal {
-                            output: output.clone(),
-                            usage: usage.clone(),
-                        },
-                        source: None,
-                    }));
+                use harnx_core::event::{AgentEvent, ModelEvent};
+                let _ = ctx.event_tx.send(TuiEvent::Agent(
+                    AgentEvent::Model(ModelEvent::Final {
+                        output: output.clone(),
+                        usage: usage.clone(),
+                    }),
+                    None,
+                ));
             }
 
             let max_resume = hooks.max_resume.unwrap_or(5);
@@ -302,9 +300,9 @@ impl Tui {
         // Drain the SseEvent channel in the background so unbounded_send
         // doesn't fill up. No translation to TuiEvent happens here —
         // SseHandler emits AgentEvent::Model::{MessageChunk, ThoughtChunk}
-        // via the global sink; TuiAgentEventSink converts those to
-        // UiOutputEvent and forwards through the TUI bridge
-        // (UI_OUTPUT_SENDER) into the event loop.
+        // via the global sink; TuiAgentEventSink forwards those directly
+        // into the TuiEvent::Agent channel for render_agent_event to
+        // handle.
         let drainer = tokio::spawn(async move {
             while rx.recv().await.is_some() {
                 // discard — chunk flow goes through the sink.

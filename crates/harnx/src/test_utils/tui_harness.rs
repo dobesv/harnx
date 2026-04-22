@@ -109,14 +109,14 @@ impl TuiTestHarness {
 
     /// Drain any remaining events and allow the spawned prompt task to finish.
     ///
-    /// Disconnects the global UI output sender first so stale spawned tasks
+    /// Disconnects the global AgentEvent sink first so stale spawned tasks
     /// can't inject events into the next test's Tui, then drains remaining
     /// events from the channel.
     pub async fn drain_and_settle(&mut self) -> anyhow::Result<()> {
-        // Disconnect the global UI output sender first. Any stale spawned
-        // task calling emit_ui_output after this will fall back to print!
+        // Disconnect the global AgentEvent sink first. Any stale spawned
+        // task emitting an AgentEvent after this will find no sink
         // instead of injecting events into the next test's Tui.
-        crate::ui_output::clear_ui_output_sender();
+        harnx_core::sink::clear_agent_event_sink();
 
         // Drain any events already in the channel
         let mut quiet_count = 0;

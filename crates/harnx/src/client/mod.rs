@@ -35,7 +35,7 @@ static TEST_CLIENT: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<d
     std::sync::OnceLock::new();
 
 /// Mutex that serializes tests using shared global state (test client,
-/// UI output sender). Tests that call `set_test_client`, `emit_ui_output`,
+/// AgentEvent sink). Tests that call `set_test_client`, install sinks,
 /// or create a `Tui` should acquire this lock for their entire duration.
 /// Prefer using [`TestStateGuard`] instead of acquiring this directly.
 #[cfg(test)]
@@ -43,7 +43,7 @@ pub static TEST_CLIENT_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// RAII guard that holds [`TEST_CLIENT_LOCK`], installs a test client on
-/// creation, and clears both the client and UI output sender on drop.
+/// creation, and clears both the client and AgentEvent sink on drop.
 #[cfg(test)]
 pub struct TestStateGuard<'a> {
     _lock: tokio::sync::MutexGuard<'a, ()>,
@@ -68,7 +68,7 @@ impl TestStateGuard<'_> {
 impl Drop for TestStateGuard<'_> {
     fn drop(&mut self) {
         set_test_client_inner(None);
-        crate::ui_output::clear_ui_output_sender();
+        harnx_core::sink::clear_agent_event_sink();
     }
 }
 

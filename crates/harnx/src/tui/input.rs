@@ -1,7 +1,6 @@
 use super::*;
 use crate::tui::render_helpers::{render_status_line, render_usage_line};
 use crate::tui::types::{TranscriptItem, TuiEvent};
-use crate::ui_output::{UiOutputEvent, UiOutputEventKind};
 use harnx_core::event::{AgentEvent, AgentSource};
 use std::path::Path;
 
@@ -389,9 +388,6 @@ impl Tui {
 
     async fn handle_tui_event_inner(&mut self, event: TuiEvent) -> Result<()> {
         match event {
-            TuiEvent::UiOutput(event) => {
-                self.render_ui_output_event(event).await;
-            }
             TuiEvent::Agent(event, source) => {
                 self.render_agent_event(event, source).await;
             }
@@ -511,17 +507,6 @@ impl Tui {
         self.flush_pending_thought();
     }
 
-    async fn render_ui_output_event(&mut self, event: UiOutputEvent) {
-        use crate::agent_event_sink::ui_output_to_agent_event;
-
-        let source = event.source.as_ref().map(|s| AgentSource {
-            agent: s.agent.clone(),
-            session_id: s.session_id.clone(),
-        });
-        let agent_event = ui_output_to_agent_event(event);
-        self.render_agent_event(agent_event, source).await;
-    }
-
     async fn render_agent_event(&mut self, event: AgentEvent, source: Option<AgentSource>) {
         use harnx_core::event::{ModelEvent, NoticeEvent, ToolEvent};
 
@@ -579,18 +564,16 @@ impl Tui {
             AgentEvent::Tool(ToolEvent::Completed {
                 output, content, ..
             }) => {
-                // Pre-Task-3, the TuiAgentEventSink pre-formatted Tool::Completed
-                // into UiOutputEventKind::ToolResultText via render_tool_result_text
-                // (truncation, matching the legacy default_emit_tool_result).
-                // Now that the sink forwards AgentEvent directly, the formatting
-                // lives here. Strip ANSI from a string-valued output BEFORE
-                // truncation so pre-dimmed test inputs that drive through
-                // ui_output_to_agent_event (which wraps the already-dimmed text
-                // in Value::String) get their ESC-introduced sequences removed
-                // cleanly — otherwise `truncate_output`'s `sanitize_output_text`
-                // strips the ESC char but leaves literal `[2m`/`[0m` markers.
-                // `render_tool_result_text` no longer wraps in ANSI dim: the TUI
-                // renderer applies `Modifier::DIM` via
+                // The TuiAgentEventSink forwards Tool::Completed through
+                // render_agent_event. The truncation + formatting live
+                // here (mirror of default_emit_tool_result). Strip ANSI
+                // from a string-valued output BEFORE truncation so
+                // pre-dimmed test inputs get their ESC-introduced
+                // sequences removed cleanly — otherwise
+                // `truncate_output`'s `sanitize_output_text` strips the
+                // ESC char but leaves literal `[2m`/`[0m` markers.
+                // `render_tool_result_text` no longer wraps in ANSI dim:
+                // the TUI renderer applies `Modifier::DIM` via
                 // `TranscriptItem::ToolResultText`.
                 let raw = match &output {
                     serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
@@ -738,7 +721,7 @@ impl Tui {
             AgentEvent::Tool(ToolEvent::Started { name, input, .. }) => {
                 let input_yaml = match &input {
                     serde_json::Value::Null => None,
-                    _ => Some(crate::ui_output::pretty_yaml_block(&input)),
+                    _ => Some(crate::utils::pretty_yaml_block(&input)),
                 };
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
@@ -838,10 +821,11 @@ impl Tui {
         tokio::spawn(async move {
             let result: Result<()> = Self::run_prompt_task(msg, ctx).await;
             if let Err(err) = result {
-                let _ = event_tx.send(TuiEvent::UiOutput(UiOutputEvent {
-                    kind: UiOutputEventKind::LlmError(err.to_string()),
-                    source: None,
-                }));
+                use harnx_core::event::{AgentEvent, ModelEvent};
+                let _ = event_tx.send(TuiEvent::Agent(
+                    AgentEvent::Model(ModelEvent::Error(err.to_string())),
+                    None,
+                ));
             }
         });
 

@@ -2,7 +2,6 @@ use crate::{
     config::GlobalConfig,
     hooks::HookEvent,
     mcp_safety::{truncate_output, TruncateOpts},
-    ui_output::pretty_yaml_block,
     utils::*,
 };
 
@@ -144,32 +143,10 @@ fn default_confirm_tool_use(tool_name: &str, arguments: &Value, reason: Option<&
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::tui::render_helpers::event_fallback_text;
-    use crate::ui_output::UiOutputEventKind;
     use indexmap::IndexMap;
     use parking_lot::RwLock;
     use serde_json::json;
     use std::sync::Arc;
-
-    #[test]
-    fn test_mcp_tool_invocation_terminal_fallback_multiline_yaml() {
-        let rendered = event_fallback_text(
-            &UiOutputEventKind::ToolCall {
-                tool_name: "argus_session_prompt".to_string(),
-                input_yaml: Some(pretty_yaml_block(&json!({
-                    "message": "Goal — Improve display\nAcceptance criteria — Wrap nicely",
-                    "session_id": "session-1"
-                }))),
-                raw: None,
-            },
-            None,
-        );
-
-        assert!(rendered.contains("argus_session_prompt"));
-        assert!(rendered.contains("message:"));
-        assert!(rendered.contains("Acceptance criteria"));
-        assert!(rendered.contains("session_id:"));
-    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_eval_tool_calls_error_handling() {
@@ -225,14 +202,6 @@ mod tests {
 
         assert_eq!(result[1].call.name, "unknown_tool");
         assert_eq!(result[1].output["is_error"], true);
-    }
-
-    #[test]
-    fn test_tool_result_event_fallback_text_matches_terminal_output() {
-        let text = "\u{1b}[2mtool output\u{1b}[0m\n".to_string();
-        let event = UiOutputEventKind::ToolResultText { text: text.clone() };
-
-        assert_eq!(event_fallback_text(&event, None), text);
     }
 
     #[test]

@@ -5,7 +5,6 @@ mod config;
 mod server;
 
 use crate::tool::{JsonSchema, ToolDeclaration};
-use crate::ui_output::{has_ui_output_sink, UiOutputEvent};
 use crate::utils::{spawn_spinner, Spinner, IS_STDOUT_TERMINAL};
 
 use anyhow::{anyhow, Result};
@@ -22,13 +21,13 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-#[cfg(test)]
-use crate::ui_output::UiOutputEventKind;
-
 #[derive(Clone, Debug)]
 pub enum NestedAcpEvent {
     Text(String),
-    Ui(UiOutputEvent),
+    Agent(
+        harnx_core::event::AgentEvent,
+        Option<harnx_core::event::AgentSource>,
+    ),
 }
 
 pub struct AcpManager {
@@ -379,8 +378,7 @@ pub(crate) async fn forward_acp_chunks(
     spinner_msg: String,
     _allow_fallback_print: bool,
 ) {
-    use crate::agent_event_sink::ui_output_to_agent_event;
-    use harnx_core::event::{AgentEvent, AgentSource, NoticeEvent};
+    use harnx_core::event::{AgentEvent, NoticeEvent};
     use harnx_core::sink::emit_agent_event_with_source;
 
     while let Some(chunk) = chunk_rx.recv().await {
@@ -388,13 +386,7 @@ pub(crate) async fn forward_acp_chunks(
             s.pause();
         }
         let (event, source) = match chunk {
-            NestedAcpEvent::Ui(ui_event) => {
-                let source = ui_event.source.clone().map(|s| AgentSource {
-                    agent: s.agent,
-                    session_id: s.session_id,
-                });
-                (ui_output_to_agent_event(ui_event), source)
-            }
+            NestedAcpEvent::Agent(event, source) => (event, source),
             NestedAcpEvent::Text(text) => (AgentEvent::Notice(NoticeEvent::Info(text)), None),
         };
         emit_agent_event_with_source(event, source);
@@ -420,8 +412,8 @@ impl ToolProvider for AcpManager {
         arguments: Value,
         abort: &AbortSignal,
     ) -> Result<Value, ToolError> {
-        let has_ui_output = has_ui_output_sink();
-        let is_terminal = *IS_STDOUT_TERMINAL && !has_ui_output;
+        let has_sink = crate::agent_event_sink::has_agent_event_sink();
+        let is_terminal = *IS_STDOUT_TERMINAL && !has_sink;
 
         // Give the parent tool-call event a chance to be consumed by
         // the UI before nested ACP output from the delegated session
@@ -704,8 +696,9 @@ enabled: false
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forward_acp_chunks_preserves_structured_nested_events() {
-        use crate::ui_output::UiOutputSource;
-        use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent, ToolEvent};
+        use harnx_core::event::{
+            AgentEvent, AgentEventSink, AgentSource, NoticeEvent, ToolEvent, ToolKind,
+        };
         use std::sync::Mutex;
 
         struct CollectingSink {
@@ -725,17 +718,20 @@ enabled: false
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        tx.send(NestedAcpEvent::Ui(UiOutputEvent {
-            kind: UiOutputEventKind::ToolCall {
-                tool_name: "read_file".to_string(),
-                input_yaml: Some("path: /tmp/x.txt".to_string()),
-                raw: None,
-            },
-            source: Some(UiOutputSource {
+        tx.send(NestedAcpEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: String::new(),
+                name: "read_file".to_string(),
+                kind: ToolKind::Other,
+                title: None,
+                input: serde_json::json!({"path": "/tmp/x.txt"}),
+                locations: vec![],
+            }),
+            Some(AgentSource {
                 agent: "argus".to_string(),
                 session_id: Some("sub-session-1".to_string()),
             }),
-        }))
+        ))
         .unwrap();
         tx.send(NestedAcpEvent::Text("plain text notification".to_string()))
             .unwrap();

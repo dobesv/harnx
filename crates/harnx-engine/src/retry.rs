@@ -248,11 +248,11 @@ where
                     cooldown.as_secs()
                 ));
                 // Yield so the TUI event loop has a chance to process the
-                // warning message (sent via emit_ui_output_event) before the
-                // final error event arrives through a separate channel.
-                // Without this yield, the LlmError can race ahead of the last
-                // "exhausted retries" TranscriptText event and appear in the
-                // wrong order in the transcript.
+                // warning message (emitted via the AgentEvent sink) before
+                // the final error event arrives through a separate channel.
+                // Without this yield, the error can race ahead of the last
+                // "exhausted retries" notice event and appear in the wrong
+                // order in the transcript.
                 tokio::task::yield_now().await;
                 last_error = Some(err);
             }

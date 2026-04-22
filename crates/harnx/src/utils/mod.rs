@@ -43,6 +43,16 @@ pub fn now() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
+/// Render a `serde_json::Value` as a compact YAML block with trailing
+/// whitespace trimmed. Falls back to the Value's Display form if YAML
+/// serialization fails. Used for human-readable tool-call argument
+/// blocks in transcripts and terminal fallback output.
+pub fn pretty_yaml_block(value: &serde_json::Value) -> String {
+    serde_yaml::to_string(value)
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_else(|_| value.to_string())
+}
+
 pub fn get_env_name(key: &str) -> String {
     format!("{}_{key}", env!("CARGO_CRATE_NAME"),).to_ascii_uppercase()
 }

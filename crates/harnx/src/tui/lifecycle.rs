@@ -1,7 +1,7 @@
 use super::*;
 use crate::tui::event_source::{CrosstermEventSource, EventSource};
 use crate::tui::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
-use crate::tui::types::{App, TranscriptItem, TuiEvent, SPINNER_FRAMES, TICK_RATE};
+use crate::tui::types::{App, TranscriptItem, SPINNER_FRAMES, TICK_RATE};
 
 impl Tui {
     #[cfg(test)]
@@ -36,15 +36,7 @@ impl Tui {
         persistent_manager: Arc<Mutex<PersistentHookManager>>,
     ) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let ui_output_tx = event_tx.clone();
-        let (bridge_tx, mut bridge_rx) = mpsc::unbounded_channel();
-        install_ui_output_sender(bridge_tx);
         install_tui_agent_event_sink(event_tx.clone());
-        tokio::spawn(async move {
-            while let Some(event) = bridge_rx.recv().await {
-                let _ = ui_output_tx.send(TuiEvent::UiOutput(event));
-            }
-        });
 
         // Build the initial transcript: welcome + banner (if agent)
         let initial_transcript = Self::build_initial_transcript(config);

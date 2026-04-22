@@ -6,8 +6,12 @@ use uuid::Uuid;
 use crate::client::{Client, SseEvent, SseHandler};
 use crate::config::{GlobalConfig, Input};
 use crate::tool::{ToolCall, ToolResult};
-use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
 use crate::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
+#[cfg(test)]
+use harnx_core::event::PlanEntry as CorePlanEntry;
+use harnx_core::event::{
+    AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, ToolKind, ToolStatus,
+};
 
 use anyhow::bail;
 use serde_json::{json, Value};
@@ -403,7 +407,7 @@ impl acp::Agent for HarnxAgent {
                     })
                     .collect()
             } else {
-                let source = Some(UiOutputSource {
+                let source = Some(AgentSource {
                     agent: self.agent_name.clone(),
                     session_id: Some(session_key.clone()),
                 });
@@ -438,8 +442,8 @@ impl acp::Agent for HarnxAgent {
                         while let Some(chunk) = chunk_rx.recv().await {
                             if let Some(ref conn) = connection {
                                 let update = match chunk {
-                                    NestedAcpEvent::Ui(event) => {
-                                        nested_ui_event_to_session_update(event).await
+                                    NestedAcpEvent::Agent(event, source) => {
+                                        nested_agent_event_to_session_update(event, source)
                                     }
                                     NestedAcpEvent::Text(text) => {
                                         Some(acp::SessionUpdate::AgentMessageChunk(
@@ -561,78 +565,125 @@ fn content_block_to_text(content: &acp::ContentBlock) -> String {
     }
 }
 
-// Async alternative to `crate::tool::eval_tool_calls` that works on
-// single-threaded runtimes (the sync version uses `block_in_place` which
-// panics on `current_thread`). Skips CLI hooks since they are designed
-// for interactive terminal use.
-async fn nested_ui_event_to_session_update(
-    event: crate::ui_output::UiOutputEvent,
+// Map an AgentEvent forwarded from a nested ACP session into an
+// equivalent `acp::SessionUpdate` so it can be re-emitted to the parent
+// ACP client. Returns `None` for events that do not cross the ACP
+// boundary (Tool::Completed, Model::Usage, etc.).
+fn nested_agent_event_to_session_update(
+    event: AgentEvent,
+    source: Option<AgentSource>,
 ) -> Option<acp::SessionUpdate> {
     let source_meta: Option<serde_json::Map<String, serde_json::Value>> =
-        event.source.as_ref().map(|source| {
+        source.as_ref().map(|source| {
             serde_json::Map::from_iter([
                 ("agent".to_string(), json!(source.agent)),
                 ("session".to_string(), json!(source.session_id)),
             ])
         });
 
-    match event.kind {
-        UiOutputEventKind::TranscriptText { text } => {
+    match event {
+        AgentEvent::Notice(NoticeEvent::Info(text)) => {
             let mut chunk = acp::ContentChunk::new(text.into());
             if let Some(meta) = source_meta.clone() {
                 chunk = chunk.meta(meta);
             }
             Some(acp::SessionUpdate::AgentMessageChunk(chunk))
         }
-        UiOutputEventKind::MessageChunk { text, raw } => {
-            let mut chunk = raw
-                .map(|chunk| *chunk)
-                .unwrap_or_else(|| acp::ContentChunk::new(text.into()));
+        AgentEvent::Notice(NoticeEvent::Warning(msg)) => {
+            let mut chunk = acp::ContentChunk::new(format!("[warning] {msg}").into());
             if let Some(meta) = source_meta.clone() {
                 chunk = chunk.meta(meta);
             }
             Some(acp::SessionUpdate::AgentMessageChunk(chunk))
         }
-        UiOutputEventKind::ToolResultText { .. } => None,
-        UiOutputEventKind::ThoughtChunk { text, raw } => {
-            let mut chunk = raw
-                .map(|chunk| *chunk)
-                .unwrap_or_else(|| acp::ContentChunk::new(text.into()));
+        AgentEvent::Notice(NoticeEvent::Error(msg)) => {
+            let mut chunk = acp::ContentChunk::new(format!("[error] {msg}").into());
+            if let Some(meta) = source_meta.clone() {
+                chunk = chunk.meta(meta);
+            }
+            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
+        }
+        AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
+            let text = concat_text_blocks(&blocks);
+            let mut chunk = acp::ContentChunk::new(text.into());
+            if let Some(meta) = source_meta.clone() {
+                chunk = chunk.meta(meta);
+            }
+            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
+        }
+        AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
+            let text = concat_text_blocks(&blocks);
+            let mut chunk = acp::ContentChunk::new(text.into());
             if let Some(meta) = source_meta.clone() {
                 chunk = chunk.meta(meta);
             }
             Some(acp::SessionUpdate::AgentThoughtChunk(chunk))
         }
-        UiOutputEventKind::ToolCallUpdate {
-            tool_call_id,
-            title,
-            status,
-            raw,
-        } => {
-            let mut update = if let Some(update) = raw {
-                *update
-            } else {
-                let mut fields = acp::ToolCallUpdateFields::new();
-                if let Some(title) = title {
-                    fields = fields.title(title);
-                }
-                if let Some(status) = status {
-                    let status = match status.as_str() {
-                        "completed" => acp::ToolCallStatus::Completed,
-                        "in_progress" => acp::ToolCallStatus::InProgress,
-                        _ => acp::ToolCallStatus::Pending,
-                    };
-                    fields = fields.status(status);
-                }
-                let stable_tool_call_id = tool_call_id.unwrap_or_else(|| "status".to_string());
-                acp::ToolCallUpdate::new(stable_tool_call_id, fields)
+        AgentEvent::Model(ModelEvent::Final { output, .. }) => {
+            if output.is_empty() {
+                return None;
+            }
+            let mut chunk = acp::ContentChunk::new(output.into());
+            if let Some(meta) = source_meta.clone() {
+                chunk = chunk.meta(meta);
+            }
+            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
+        }
+        AgentEvent::Model(ModelEvent::Error(err)) => {
+            let mut chunk = acp::ContentChunk::new(format!("[error] {err}").into());
+            if let Some(meta) = source_meta.clone() {
+                chunk = chunk.meta(meta);
+            }
+            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
+        }
+        AgentEvent::Tool(ToolEvent::Started {
+            id, name, input, ..
+        }) => {
+            let stable_id = if id.is_empty() { name.clone() } else { id };
+            let input_yaml = match &input {
+                serde_json::Value::Null => String::new(),
+                _ => crate::utils::pretty_yaml_block(&input),
             };
+            let mut call = acp::ToolCall::new(stable_id, name).raw_input(input);
+            // `raw_input` is the structured form; tools may still want the
+            // formatted YAML body as the call content when `raw_input` is
+            // not present. We pass both paths through the raw_input field
+            // for round-trip fidelity, so the YAML block isn't separately
+            // attached here.
+            let _ = input_yaml;
+            if let Some(meta) = source_meta.clone() {
+                call = call.meta(meta);
+            }
+            Some(acp::SessionUpdate::ToolCall(call))
+        }
+        AgentEvent::Tool(ToolEvent::Update {
+            id, title, status, ..
+        }) => {
+            let mut fields = acp::ToolCallUpdateFields::new();
+            if let Some(title) = title {
+                fields = fields.title(title);
+            }
+            if let Some(status) = status {
+                let acp_status = match status {
+                    ToolStatus::Completed => acp::ToolCallStatus::Completed,
+                    ToolStatus::InProgress => acp::ToolCallStatus::InProgress,
+                    ToolStatus::Failed => acp::ToolCallStatus::Failed,
+                    ToolStatus::Pending => acp::ToolCallStatus::Pending,
+                };
+                fields = fields.status(acp_status);
+            }
+            let stable_tool_call_id = if id.is_empty() {
+                "status".to_string()
+            } else {
+                id
+            };
+            let mut update = acp::ToolCallUpdate::new(stable_tool_call_id, fields);
             if let Some(meta) = source_meta.clone() {
                 update = update.meta(meta);
             }
             Some(acp::SessionUpdate::ToolCallUpdate(update))
         }
-        UiOutputEventKind::Plan { entries } => {
+        AgentEvent::Plan { entries } => {
             let mapped_entries = entries
                 .into_iter()
                 .map(|entry| {
@@ -650,42 +701,30 @@ async fn nested_ui_event_to_session_update(
             }
             Some(acp::SessionUpdate::Plan(plan))
         }
-        UiOutputEventKind::ToolCall {
-            tool_name,
-            input_yaml,
-            raw,
-        } => {
-            let mut call = raw
-                .map(|call| *call)
-                .unwrap_or_else(|| acp::ToolCall::new(tool_name, input_yaml.unwrap_or_default()));
-            if let Some(meta) = source_meta.clone() {
-                call = call.meta(meta);
-            }
-            Some(acp::SessionUpdate::ToolCall(call))
-        }
-        UiOutputEventKind::LlmFinal { output, .. } => {
-            let mut chunk = acp::ContentChunk::new(output.into());
-            if let Some(meta) = source_meta.clone() {
-                chunk = chunk.meta(meta);
-            }
-            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
-        }
-        UiOutputEventKind::LlmError(err) => {
-            let mut chunk = acp::ContentChunk::new(format!("[error] {err}").into());
-            if let Some(meta) = source_meta.clone() {
-                chunk = chunk.meta(meta);
-            }
-            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
-        }
-        UiOutputEventKind::Usage { .. } => None,
+        // Model::Usage, Tool::Completed, Tool::Progress, Tool::Failed,
+        // Turn::*, Session::*, Status are not forwarded as
+        // SessionUpdates (usage crosses as SessionInfoUpdate separately).
+        _ => None,
     }
+}
+
+/// Concatenate text content blocks into a single string. Non-Text blocks
+/// are skipped — the ACP session update path only carries text.
+fn concat_text_blocks(blocks: &[ContentBlock]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        if let ContentBlock::Text(t) = block {
+            out.push_str(t);
+        }
+    }
+    out
 }
 
 async fn eval_tool_calls_async(
     config: &GlobalConfig,
     mut calls: Vec<ToolCall>,
     abort_signal: &AbortSignal,
-    source: Option<UiOutputSource>,
+    source: Option<AgentSource>,
 ) -> anyhow::Result<Vec<ToolResult>> {
     let mut output = vec![];
     if calls.is_empty() {
@@ -726,7 +765,7 @@ async fn eval_mcp_async(
     config: &GlobalConfig,
     call: &ToolCall,
     abort_signal: &AbortSignal,
-    source: Option<UiOutputSource>,
+    source: Option<AgentSource>,
 ) -> anyhow::Result<Value> {
     let json_data = if call.arguments.is_null() {
         Value::Null
@@ -764,23 +803,17 @@ async fn eval_mcp_async(
     };
 
     {
-        use crate::agent_event_sink::ui_output_to_agent_event;
-        use harnx_core::event::AgentSource;
         use harnx_core::sink::emit_agent_event_with_source;
 
-        let agent_source = source.clone().map(|s| AgentSource {
-            agent: s.agent,
-            session_id: s.session_id,
+        let event = AgentEvent::Tool(ToolEvent::Started {
+            id: String::new(),
+            name: call.name.clone(),
+            kind: ToolKind::Other,
+            title: None,
+            input: serde_json::Value::Null,
+            locations: vec![],
         });
-        let event = ui_output_to_agent_event(UiOutputEvent {
-            kind: UiOutputEventKind::ToolCall {
-                tool_name: call.name.clone(),
-                input_yaml: None,
-                raw: None,
-            },
-            source: source.clone(),
-        });
-        emit_agent_event_with_source(event, agent_source);
+        emit_agent_event_with_source(event, source.clone());
     }
 
     tokio::select! {
@@ -1055,64 +1088,60 @@ mod tests {
     }
 
     #[test]
-    fn nested_ui_event_maps_to_structured_session_updates() {
-        run_local(async {
-            let nested_source = crate::ui_output::UiOutputSource {
-                agent: "argus".to_string(),
-                session_id: Some("nested-123".to_string()),
-            };
-            let tool_update = nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
-                kind: UiOutputEventKind::ToolCall {
-                    tool_name: "argus_session_prompt".to_string(),
-                    input_yaml: Some("message: hello".to_string()),
-                    raw: None,
-                },
-                source: Some(nested_source.clone()),
-            })
-            .await
-            .expect("tool update");
+    fn nested_agent_event_maps_to_structured_session_updates() {
+        let nested_source = AgentSource {
+            agent: "argus".to_string(),
+            session_id: Some("nested-123".to_string()),
+        };
+        let tool_update = nested_agent_event_to_session_update(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "call-1".to_string(),
+                name: "argus_session_prompt".to_string(),
+                kind: ToolKind::Other,
+                title: None,
+                input: serde_json::json!({"message": "hello"}),
+                locations: vec![],
+            }),
+            Some(nested_source.clone()),
+        )
+        .expect("tool update");
 
-            match tool_update {
-                acp::SessionUpdate::ToolCall(call) => {
-                    assert!(format!("{:?}", call).contains("argus_session_prompt"));
-                    assert!(format!("{:?}", call).contains("message: hello"));
-                    assert!(format!("{:?}", call).contains("argus"));
-                    assert!(format!("{:?}", call).contains("nested-123"));
-                }
-                other => panic!("unexpected tool update: {other:?}"),
+        match tool_update {
+            acp::SessionUpdate::ToolCall(call) => {
+                assert!(format!("{:?}", call).contains("argus_session_prompt"));
+                assert!(format!("{:?}", call).contains("hello"));
+                assert!(format!("{:?}", call).contains("argus"));
+                assert!(format!("{:?}", call).contains("nested-123"));
             }
+            other => panic!("unexpected tool update: {other:?}"),
+        }
 
-            let thought_update =
-                nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
-                    kind: UiOutputEventKind::ThoughtChunk {
-                        text: "thinking".to_string(),
-                        raw: Some(Box::new(acp::ContentChunk::new("thinking".into()))),
-                    },
-                    source: Some(nested_source.clone()),
-                })
-                .await
-                .expect("thought update");
-            match thought_update {
-                acp::SessionUpdate::AgentThoughtChunk(chunk) => {
-                    assert!(format!("{:?}", chunk).contains("argus"));
-                    assert!(format!("{:?}", chunk).contains("nested-123"));
-                }
-                other => panic!("unexpected thought update: {other:?}"),
+        let thought_update = nested_agent_event_to_session_update(
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text("thinking".to_string())],
+            }),
+            Some(nested_source.clone()),
+        )
+        .expect("thought update");
+        match thought_update {
+            acp::SessionUpdate::AgentThoughtChunk(chunk) => {
+                assert!(format!("{:?}", chunk).contains("argus"));
+                assert!(format!("{:?}", chunk).contains("nested-123"));
             }
+            other => panic!("unexpected thought update: {other:?}"),
+        }
 
-            let plan_update = nested_ui_event_to_session_update(crate::ui_output::UiOutputEvent {
-                kind: UiOutputEventKind::Plan {
-                    entries: vec![crate::ui_output::UiOutputPlanEntry {
-                        status: "in_progress".to_string(),
-                        content: "delegate to argus".to_string(),
-                    }],
-                },
-                source: Some(nested_source),
-            })
-            .await
-            .expect("plan update");
-            assert!(matches!(plan_update, acp::SessionUpdate::Plan(_)));
-        });
+        let plan_update = nested_agent_event_to_session_update(
+            AgentEvent::Plan {
+                entries: vec![CorePlanEntry {
+                    status: "in_progress".to_string(),
+                    content: "delegate to argus".to_string(),
+                }],
+            },
+            Some(nested_source),
+        )
+        .expect("plan update");
+        assert!(matches!(plan_update, acp::SessionUpdate::Plan(_)));
     }
 
     #[test]

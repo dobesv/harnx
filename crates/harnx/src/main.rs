@@ -11,7 +11,6 @@ mod render;
 mod serve;
 mod tool;
 mod tui;
-mod ui_output;
 #[macro_use]
 mod utils;
 
@@ -222,7 +221,6 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     config.write().apply_default_session()?;
     match is_tui {
         false => {
-            ui_output::install_cli_ui_output_sink();
             let (highlight, render_options) = {
                 let cfg = config.read();
                 (cfg.highlight, cfg.render_options().unwrap_or_default())
