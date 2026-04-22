@@ -527,11 +527,6 @@ impl Config {
         paths::macros_dir()
     }
 
-    #[allow(dead_code)]
-    pub fn config_dir_path() -> PathBuf {
-        paths::config_dir_path()
-    }
-
     pub fn clients_dir() -> PathBuf {
         paths::clients_dir()
     }
