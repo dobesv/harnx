@@ -75,43 +75,6 @@ where
     list.into_iter().map(|(v, _)| v).collect()
 }
 
-/// Also inlined in `harnx_render::pretty_error` — keep in sync.
-#[allow(dead_code)]
-pub fn pretty_error(err: &anyhow::Error) -> String {
-    let mut output = vec![];
-    output.push(format!("Error: {err}"));
-    let causes: Vec<_> = err.chain().skip(1).collect();
-    let causes_len = causes.len();
-    if causes_len > 0 {
-        output.push("\nCaused by:".to_string());
-        if causes_len == 1 {
-            output.push(format!("    {}", indent_text(causes[0], 4).trim()));
-        } else {
-            for (i, cause) in causes.into_iter().enumerate() {
-                output.push(format!("{i:5}: {}", indent_text(cause, 7).trim()));
-            }
-        }
-    }
-    output.join("\n")
-}
-
-/// Also inlined in `harnx_render::indent_text` — keep in sync.
-#[allow(dead_code)]
-pub fn indent_text<T: ToString>(s: T, size: usize) -> String {
-    let indent_str = " ".repeat(size);
-    s.to_string()
-        .split('\n')
-        .map(|line| format!("{indent_str}{line}"))
-        .collect::<Vec<String>>()
-        .join("\n")
-}
-
-/// Also inlined in `harnx_render::error_text` — keep in sync.
-#[allow(dead_code)]
-pub fn error_text(input: &str) -> String {
-    color_text(input, nu_ansi_term::Color::Red)
-}
-
 pub fn warning_text(input: &str) -> String {
     color_text(input, nu_ansi_term::Color::Yellow)
 }
