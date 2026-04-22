@@ -1,0 +1,18 @@
+[package]
+name = "harnx-render"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Markdown + ANSI terminal rendering for harnx"
+repository.workspace = true
+
+[dependencies]
+ansi_colours = { workspace = true }
+anyhow = { workspace = true }
+bincode = { workspace = true }
+crossterm = { workspace = true }
+nu-ansi-term = { workspace = true }
+serde = { workspace = true }
+syntect = { workspace = true }
+textwrap = { workspace = true }

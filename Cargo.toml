@@ -11,6 +11,7 @@ members = [
     "crates/harnx-mcp-fs",
     "crates/harnx-mcp-time",
     "crates/harnx-mcp-todo",
+    "crates/harnx-render",
     "crates/harnx-test-bins",
 ]
 
