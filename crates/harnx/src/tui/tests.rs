@@ -4,13 +4,21 @@ use crate::config::Config;
 use crate::test_utils::{MockClient, MockTurnBuilder, TuiTestHarness};
 use crate::tui::render_helpers::event_fallback_text;
 use crate::tui::types::{TranscriptItem, TuiEvent};
-use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
+use crate::ui_output::UiOutputEventKind;
 use crate::utils::dimmed_text;
-use agent_client_protocol as acp;
+use harnx_core::event::{
+    AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, PlanEntry, ToolEvent, ToolKind,
+    ToolStatus,
+};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+fn yaml_to_json(yaml: &str) -> serde_json::Value {
+    serde_yaml::from_str::<serde_json::Value>(yaml)
+        .unwrap_or_else(|_| serde_json::Value::String(yaml.to_string()))
+}
 
 fn test_config() -> GlobalConfig {
     let config = Arc::new(RwLock::new(Config::default()));
@@ -140,13 +148,13 @@ async fn pending_message_is_auto_sent_after_finish() {
     tui.app.llm_busy = true;
     tui.queue_pending_message("follow up".to_string()).await;
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::LlmFinal {
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Final {
             output: "done".to_string(),
             usage: Default::default(),
-        },
-        source: None,
-    }))
+        }),
+        None,
+    ))
     .await
     .unwrap();
 
@@ -186,13 +194,13 @@ async fn pending_dot_command_restores_attachments_before_running() {
     });
     tui.set_input_text(".info attachments");
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::LlmFinal {
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Final {
             output: "done".to_string(),
             usage: Default::default(),
-        },
-        source: None,
-    }))
+        }),
+        None,
+    ))
     .await
     .unwrap();
 
@@ -259,13 +267,13 @@ async fn pending_message_not_double_submitted_after_consumed() {
     .unwrap();
 
     // Now LlmFinal arrives.
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::LlmFinal {
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Final {
             output: "final answer".to_string(),
             usage: Default::default(),
-        },
-        source: None,
-    }))
+        }),
+        None,
+    ))
     .await
     .unwrap();
 
@@ -352,30 +360,26 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::MessageChunk {
-            text: "Hello\nworld".to_string(),
-            raw: None,
-        },
-        source: None,
-    }))
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("Hello\nworld".to_string())],
+        }),
+        None,
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::TranscriptText {
-            text: "tool output".to_string(),
-        },
-        source: None,
-    }))
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Notice(NoticeEvent::Info("tool output".to_string())),
+        None,
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::MessageChunk {
-            text: "\nAgain".to_string(),
-            raw: None,
-        },
-        source: None,
-    }))
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("\nAgain".to_string())],
+        }),
+        None,
+    ))
     .await
     .unwrap();
 
@@ -402,36 +406,30 @@ async fn ui_output_inserts_heading_when_source_changes() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    let source = crate::ui_output::UiOutputSource {
+    let source = AgentSource {
         agent: "argus".to_string(),
         session_id: Some("session-1".to_string()),
     };
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::TranscriptText {
-            text: "first chunk".to_string(),
-        },
-        source: Some(source.clone()),
-    }))
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Notice(NoticeEvent::Info("first chunk".to_string())),
+        Some(source.clone()),
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::TranscriptText {
-            text: "second chunk".to_string(),
-        },
-        source: Some(source),
-    }))
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Notice(NoticeEvent::Info("second chunk".to_string())),
+        Some(source),
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::TranscriptText {
-            text: "other chunk".to_string(),
-        },
-        source: Some(crate::ui_output::UiOutputSource {
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Notice(NoticeEvent::Info("other chunk".to_string())),
+        Some(AgentSource {
             agent: "hephaestus".to_string(),
             session_id: Some("session-2".to_string()),
         }),
-    }))
+    ))
     .await
     .unwrap();
 
@@ -614,63 +612,59 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
 
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::MessageChunk {
-                text: "Top-level assistant opening response.".to_string(),
-                raw: None,
-            },
-            source: None,
-        }))
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text(
+                    "Top-level assistant opening response.".to_string(),
+                )],
+            }),
+            None,
+        ))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::TranscriptText {
-                text: "sub-agent tool call".to_string(),
-            },
-            source: Some(UiOutputSource {
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Notice(NoticeEvent::Info("sub-agent tool call".to_string())),
+            Some(AgentSource {
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
             }),
-        }))
+        ))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::TranscriptText {
-                text: "sub-agent follow-up output".to_string(),
-            },
-            source: Some(UiOutputSource {
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Notice(NoticeEvent::Info("sub-agent follow-up output".to_string())),
+            Some(AgentSource {
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
             }),
-        }))
+        ))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::TranscriptText {
-                text: "other sub-agent output".to_string(),
-            },
-            source: Some(UiOutputSource {
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Notice(NoticeEvent::Info("other sub-agent output".to_string())),
+            Some(AgentSource {
                 agent: "hephaestus".to_string(),
                 session_id: Some("session-2".to_string()),
             }),
-        }))
+        ))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::MessageChunk {
-                text: "Top-level assistant closes response.".to_string(),
-                raw: None,
-            },
-            source: None,
-        }))
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text(
+                    "Top-level assistant closes response.".to_string(),
+                )],
+            }),
+            None,
+        ))
         .await
         .unwrap();
 
@@ -691,33 +685,33 @@ async fn structured_system_entries_do_not_insert_blank_lines_between_each_line()
 
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ToolCall {
-                tool_name: "argus_session_prompt".to_string(),
-                input_yaml: Some("message: hello\nsession_id: abc123".to_string()),
-                raw: None,
-            },
-            source: Some(UiOutputSource {
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: String::new(),
+                name: "argus_session_prompt".to_string(),
+                kind: ToolKind::Other,
+                title: None,
+                input: yaml_to_json("message: hello\nsession_id: abc123"),
+                locations: vec![],
+            }),
+            Some(AgentSource {
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
             }),
-        }))
+        ))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ThoughtChunk {
-                text: "thinking hard\nstep two".to_string(),
-                raw: Some(Box::new(acp::ContentChunk::new(
-                    "thinking hard\nstep two".into(),
-                ))),
-            },
-            source: Some(UiOutputSource {
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text("thinking hard\nstep two".to_string())],
+            }),
+            Some(AgentSource {
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
             }),
-        }))
+        ))
         .await
         .unwrap();
 
@@ -734,36 +728,37 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
     for chunk in ["thinking ", "before ", "tool"] {
-        tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ThoughtChunk {
-                text: chunk.to_string(),
-                raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
-            },
-            source: None,
-        }))
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text(chunk.to_string())],
+            }),
+            None,
+        ))
         .await
         .unwrap();
     }
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::ToolCall {
-            tool_name: "argus_session_prompt".to_string(),
-            input_yaml: Some("message: delegate".to_string()),
-            raw: None,
-        },
-        source: None,
-    }))
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: String::new(),
+            name: "argus_session_prompt".to_string(),
+            kind: ToolKind::Other,
+            title: None,
+            input: yaml_to_json("message: delegate"),
+            locations: vec![],
+        }),
+        None,
+    ))
     .await
     .unwrap();
 
     for chunk in ["thinking ", "after ", "tool"] {
-        tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ThoughtChunk {
-                text: chunk.to_string(),
-                raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
-            },
-            source: None,
-        }))
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text(chunk.to_string())],
+            }),
+            None,
+        ))
         .await
         .unwrap();
     }
@@ -806,42 +801,43 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    let source = Some(UiOutputSource {
+    let source = Some(AgentSource {
         agent: "argus".to_string(),
         session_id: Some("session-1".to_string()),
     });
 
     for chunk in ["thinking ", "before ", "tool"] {
-        tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ThoughtChunk {
-                text: chunk.to_string(),
-                raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
-            },
-            source: source.clone(),
-        }))
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text(chunk.to_string())],
+            }),
+            source.clone(),
+        ))
         .await
         .unwrap();
     }
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::ToolCall {
-            tool_name: "argus_session_prompt".to_string(),
-            input_yaml: Some("message: delegate".to_string()),
-            raw: None,
-        },
-        source: source.clone(),
-    }))
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: String::new(),
+            name: "argus_session_prompt".to_string(),
+            kind: ToolKind::Other,
+            title: None,
+            input: yaml_to_json("message: delegate"),
+            locations: vec![],
+        }),
+        source.clone(),
+    ))
     .await
     .unwrap();
 
     for chunk in ["thinking ", "after ", "tool"] {
-        tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ThoughtChunk {
-                text: chunk.to_string(),
-                raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
-            },
-            source: source.clone(),
-        }))
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text(chunk.to_string())],
+            }),
+            source.clone(),
+        ))
         .await
         .unwrap();
     }
@@ -889,13 +885,14 @@ async fn llm_multiline_text_renders_without_extra_blank_lines() {
 
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::MessageChunk {
-                text: "line one\nline two\nline three".to_string(),
-                raw: None,
-            },
-            source: None,
-        }))
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text(
+                    "line one\nline two\nline three".to_string(),
+                )],
+            }),
+            None,
+        ))
         .await
         .unwrap();
 
@@ -919,47 +916,48 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
     for chunk in ["thinking ", "before ", "tool"] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-                kind: UiOutputEventKind::ThoughtChunk {
-                    text: chunk.to_string(),
-                    raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
-                },
-                source: Some(UiOutputSource {
+            .handle_tui_event(TuiEvent::Agent(
+                AgentEvent::Model(ModelEvent::ThoughtChunk {
+                    blocks: vec![ContentBlock::Text(chunk.to_string())],
+                }),
+                Some(AgentSource {
                     agent: "argus".to_string(),
                     session_id: Some("session-1".to_string()),
                 }),
-            }))
+            ))
             .await
             .unwrap();
     }
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ToolCall {
-                tool_name: "argus_session_prompt".to_string(),
-                input_yaml: Some("message: delegate".to_string()),
-                raw: None,
-            },
-            source: Some(UiOutputSource {
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: String::new(),
+                name: "argus_session_prompt".to_string(),
+                kind: ToolKind::Other,
+                title: None,
+                input: yaml_to_json("message: delegate"),
+                locations: vec![],
+            }),
+            Some(AgentSource {
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
             }),
-        }))
+        ))
         .await
         .unwrap();
     for chunk in ["thinking ", "after ", "tool"] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-                kind: UiOutputEventKind::ThoughtChunk {
-                    text: chunk.to_string(),
-                    raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
-                },
-                source: Some(UiOutputSource {
+            .handle_tui_event(TuiEvent::Agent(
+                AgentEvent::Model(ModelEvent::ThoughtChunk {
+                    blocks: vec![ContentBlock::Text(chunk.to_string())],
+                }),
+                Some(AgentSource {
                     agent: "argus".to_string(),
                     session_id: Some("session-1".to_string()),
                 }),
-            }))
+            ))
             .await
             .unwrap();
     }
@@ -976,95 +974,102 @@ async fn structured_ui_output_variants_render_in_transcript() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::ToolCall {
-            tool_name: "argus_session_prompt".to_string(),
-            input_yaml: Some("message: hello\nsession_id: abc123".to_string()),
-            raw: None,
-        },
-        source: Some(UiOutputSource {
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: String::new(),
+            name: "argus_session_prompt".to_string(),
+            kind: ToolKind::Other,
+            title: None,
+            input: yaml_to_json("message: hello\nsession_id: abc123"),
+            locations: vec![],
+        }),
+        Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
         }),
-    }))
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::ThoughtChunk {
-            text: "thinking hard".to_string(),
-            raw: Some(Box::new(acp::ContentChunk::new("thinking hard".into()))),
-        },
-        source: Some(UiOutputSource {
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::ThoughtChunk {
+            blocks: vec![ContentBlock::Text("thinking hard".to_string())],
+        }),
+        Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
         }),
-    }))
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::ToolCallUpdate {
-            tool_call_id: Some("call-1".to_string()),
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Update {
+            id: "call-1".to_string(),
             title: Some("argus_session_prompt".to_string()),
-            status: Some("completed".to_string()),
-            raw: None,
-        },
-        source: Some(UiOutputSource {
+            status: Some(ToolStatus::Completed),
+            content: None,
+        }),
+        Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
         }),
-    }))
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::Plan {
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Plan {
             entries: vec![
-                crate::ui_output::UiOutputPlanEntry {
+                PlanEntry {
                     status: "in_progress".to_string(),
                     content: "Refactor ACP formatting".to_string(),
                 },
-                crate::ui_output::UiOutputPlanEntry {
+                PlanEntry {
                     status: "pending".to_string(),
                     content: "Update snapshots".to_string(),
                 },
             ],
         },
-        source: Some(UiOutputSource {
+        Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
         }),
-    }))
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::Usage {
-            input_tokens: 12,
-            output_tokens: 34,
-            cached_tokens: 5,
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Usage {
+            input: 12,
+            output: 34,
+            cached: 5,
             session_label: Some("> argus ▸ session-1".to_string()),
-        },
-        source: Some(UiOutputSource {
+        }),
+        Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
         }),
-    }))
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::ToolCall {
-            tool_name: "bash".to_string(),
-            input_yaml: Some("command: ls".to_string()),
-            raw: None,
-        },
-        source: None,
-    }))
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: String::new(),
+            name: "bash".to_string(),
+            kind: ToolKind::Other,
+            title: None,
+            input: yaml_to_json("command: ls"),
+            locations: vec![],
+        }),
+        None,
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::ToolResultText {
-            text: "\u{1b}[2mline one\nline two\u{1b}[0m\n".to_string(),
-        },
-        source: None,
-    }))
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Completed {
+            id: String::new(),
+            output: serde_json::Value::String("\u{1b}[2mline one\nline two\u{1b}[0m\n".to_string()),
+            content: vec![],
+        }),
+        None,
+    ))
     .await
     .unwrap();
 
@@ -1103,43 +1108,49 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::ToolCall {
-            tool_name: "pytheas_session_prompt".to_string(),
-            input_yaml: Some("message: Count files in /tmp".to_string()),
-            raw: None,
-        },
-        source: None,
-    }))
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: String::new(),
+            name: "pytheas_session_prompt".to_string(),
+            kind: ToolKind::Other,
+            title: None,
+            input: yaml_to_json("message: Count files in /tmp"),
+            locations: vec![],
+        }),
+        None,
+    ))
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::ToolCall {
-            tool_name: "bash".to_string(),
-            input_yaml: Some("command: ls -1 /tmp | wc -l".to_string()),
-            raw: None,
-        },
-        source: Some(UiOutputSource {
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: String::new(),
+            name: "bash".to_string(),
+            kind: ToolKind::Other,
+            title: None,
+            input: yaml_to_json("command: ls -1 /tmp | wc -l"),
+            locations: vec![],
+        }),
+        Some(AgentSource {
             agent: "pytheas".to_string(),
             session_id: Some("session-nested".to_string()),
         }),
-    }))
+    ))
     .await
     .unwrap();
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::Usage {
-            input_tokens: 10,
-            output_tokens: 20,
-            cached_tokens: 0,
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Usage {
+            input: 10,
+            output: 20,
+            cached: 0,
             session_label: Some("> pytheas ▸ session-nested".to_string()),
-        },
-        source: Some(UiOutputSource {
+        }),
+        Some(AgentSource {
             agent: "pytheas".to_string(),
             session_id: Some("session-nested".to_string()),
         }),
-    }))
+    ))
     .await
     .unwrap();
 
@@ -1174,31 +1185,31 @@ async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() 
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    let source = UiOutputSource {
+    let source = AgentSource {
         agent: "pytheas".to_string(),
         session_id: Some("session-1".to_string()),
     };
 
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::Usage {
-            input_tokens: 10,
-            output_tokens: 1,
-            cached_tokens: 0,
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Usage {
+            input: 10,
+            output: 1,
+            cached: 0,
             session_label: None,
-        },
-        source: Some(source.clone()),
-    }))
+        }),
+        Some(source.clone()),
+    ))
     .await
     .unwrap();
-    tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-        kind: UiOutputEventKind::Usage {
-            input_tokens: 20,
-            output_tokens: 2,
-            cached_tokens: 0,
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Usage {
+            input: 20,
+            output: 2,
+            cached: 0,
             session_label: None,
-        },
-        source: Some(source.clone()),
-    }))
+        }),
+        Some(source.clone()),
+    ))
     .await
     .unwrap();
 
@@ -1246,7 +1257,7 @@ async fn acp_message_chunks_coalesce_like_direct_llm_streaming() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    let source = UiOutputSource {
+    let source = AgentSource {
         agent: "aristarchus".to_string(),
         session_id: Some("session-1".to_string()),
     };
@@ -1257,13 +1268,12 @@ async fn acp_message_chunks_coalesce_like_direct_llm_streaming() {
         "information to ",
         "complete my review.",
     ] {
-        tui.handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::MessageChunk {
-                text: chunk.to_string(),
-                raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
-            },
-            source: Some(source.clone()),
-        }))
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text(chunk.to_string())],
+            }),
+            Some(source.clone()),
+        ))
         .await
         .unwrap();
     }
@@ -2919,7 +2929,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     harness.tui().persistent_manager = persistent;
     harness.tui().clear_transcript();
 
-    let sub_source = Some(UiOutputSource {
+    let sub_source = Some(AgentSource {
         agent: "researcher".to_string(),
         session_id: Some("research-session-1".to_string()),
     });
@@ -2928,13 +2938,12 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     for chunk in ["I'll look into ", "that for you. ", "Delegating now."] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-                kind: UiOutputEventKind::MessageChunk {
-                    text: chunk.to_string(),
-                    raw: None,
-                },
-                source: None,
-            }))
+            .handle_tui_event(TuiEvent::Agent(
+                AgentEvent::Model(ModelEvent::MessageChunk {
+                    blocks: vec![ContentBlock::Text(chunk.to_string())],
+                }),
+                None,
+            ))
             .await
             .unwrap();
     }
@@ -2942,14 +2951,17 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 2: Top-level delegation tool call ──────────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ToolCall {
-                tool_name: "researcher_session_prompt".to_string(),
-                input_yaml: Some("message: investigate the data".to_string()),
-                raw: None,
-            },
-            source: None,
-        }))
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: String::new(),
+                name: "researcher_session_prompt".to_string(),
+                kind: ToolKind::Other,
+                title: None,
+                input: yaml_to_json("message: investigate the data"),
+                locations: vec![],
+            }),
+            None,
+        ))
         .await
         .unwrap();
 
@@ -2957,13 +2969,12 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     for chunk in ["Let me ", "analyze ", "the situation ", "carefully."] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-                kind: UiOutputEventKind::ThoughtChunk {
-                    text: chunk.to_string(),
-                    raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
-                },
-                source: sub_source.clone(),
-            }))
+            .handle_tui_event(TuiEvent::Agent(
+                AgentEvent::Model(ModelEvent::ThoughtChunk {
+                    blocks: vec![ContentBlock::Text(chunk.to_string())],
+                }),
+                sub_source.clone(),
+            ))
             .await
             .unwrap();
     }
@@ -2971,26 +2982,32 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 4: Sub-agent makes two tool calls ──────────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ToolCall {
-                tool_name: "bash".to_string(),
-                input_yaml: Some("command: find /data -name '*.csv'".to_string()),
-                raw: None,
-            },
-            source: sub_source.clone(),
-        }))
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: String::new(),
+                name: "bash".to_string(),
+                kind: ToolKind::Other,
+                title: None,
+                input: yaml_to_json("command: find /data -name '*.csv'"),
+                locations: vec![],
+            }),
+            sub_source.clone(),
+        ))
         .await
         .unwrap();
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ToolCall {
-                tool_name: "read_file".to_string(),
-                input_yaml: Some("path: /data/results.csv".to_string()),
-                raw: None,
-            },
-            source: sub_source.clone(),
-        }))
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: String::new(),
+                name: "read_file".to_string(),
+                kind: ToolKind::Other,
+                title: None,
+                input: yaml_to_json("path: /data/results.csv"),
+                locations: vec![],
+            }),
+            sub_source.clone(),
+        ))
         .await
         .unwrap();
 
@@ -3004,13 +3021,12 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     for chunk in ["Now I see ", "the pattern ", "in the data."] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-                kind: UiOutputEventKind::ThoughtChunk {
-                    text: chunk.to_string(),
-                    raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
-                },
-                source: sub_source.clone(),
-            }))
+            .handle_tui_event(TuiEvent::Agent(
+                AgentEvent::Model(ModelEvent::ThoughtChunk {
+                    blocks: vec![ContentBlock::Text(chunk.to_string())],
+                }),
+                sub_source.clone(),
+            ))
             .await
             .unwrap();
     }
@@ -3018,14 +3034,17 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 6: Sub-agent makes one more tool call ──────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::ToolCall {
-                tool_name: "write_file".to_string(),
-                input_yaml: Some("path: /data/summary.md".to_string()),
-                raw: None,
-            },
-            source: sub_source.clone(),
-        }))
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: String::new(),
+                name: "write_file".to_string(),
+                kind: ToolKind::Other,
+                title: None,
+                input: yaml_to_json("path: /data/summary.md"),
+                locations: vec![],
+            }),
+            sub_source.clone(),
+        ))
         .await
         .unwrap();
 
@@ -3043,13 +3062,12 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     ] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-                kind: UiOutputEventKind::MessageChunk {
-                    text: chunk.to_string(),
-                    raw: Some(Box::new(acp::ContentChunk::new(chunk.to_string().into()))),
-                },
-                source: sub_source.clone(),
-            }))
+            .handle_tui_event(TuiEvent::Agent(
+                AgentEvent::Model(ModelEvent::MessageChunk {
+                    blocks: vec![ContentBlock::Text(chunk.to_string())],
+                }),
+                sub_source.clone(),
+            ))
             .await
             .unwrap();
     }
@@ -3057,15 +3075,15 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     // ── Phase 8: Sub-agent usage line ────────────────────────────────
     harness
         .tui()
-        .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-            kind: UiOutputEventKind::Usage {
-                input_tokens: 500,
-                output_tokens: 200,
-                cached_tokens: 100,
+        .handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::Usage {
+                input: 500,
+                output: 200,
+                cached: 100,
                 session_label: Some("> researcher ▸ research-session-1".to_string()),
-            },
-            source: sub_source.clone(),
-        }))
+            }),
+            sub_source.clone(),
+        ))
         .await
         .unwrap();
 
@@ -3078,13 +3096,12 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     ] {
         harness
             .tui()
-            .handle_tui_event(TuiEvent::UiOutput(UiOutputEvent {
-                kind: UiOutputEventKind::MessageChunk {
-                    text: chunk.to_string(),
-                    raw: None,
-                },
-                source: None,
-            }))
+            .handle_tui_event(TuiEvent::Agent(
+                AgentEvent::Model(ModelEvent::MessageChunk {
+                    blocks: vec![ContentBlock::Text(chunk.to_string())],
+                }),
+                None,
+            ))
             .await
             .unwrap();
     }
