@@ -1,18 +1,12 @@
 mod abort_signal;
 mod clipboard;
 mod command;
-mod html_to_md;
-mod loader;
-mod request;
 pub mod session_name;
 mod spinner;
 
 pub use self::abort_signal::*;
 pub use self::clipboard::set_text;
 pub use self::command::*;
-pub use self::html_to_md::*;
-pub use self::loader::*;
-pub use self::request::*;
 pub use self::spinner::*;
 pub use harnx_core::abort::{
     create_abort_signal, wait_abort_signal, AbortSignal, AbortSignalInner,
@@ -23,6 +17,8 @@ pub use harnx_core::path::{
     to_absolute_path,
 };
 pub use harnx_core::text::strip_think_tag;
+pub use harnx_fetch::loader::*;
+pub use harnx_fetch::request::*;
 
 use anyhow::Result;
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
@@ -80,6 +76,7 @@ where
 }
 
 /// Also inlined in `harnx_render::pretty_error` — keep in sync.
+#[allow(dead_code)]
 pub fn pretty_error(err: &anyhow::Error) -> String {
     let mut output = vec![];
     output.push(format!("Error: {err}"));
@@ -99,6 +96,7 @@ pub fn pretty_error(err: &anyhow::Error) -> String {
 }
 
 /// Also inlined in `harnx_render::indent_text` — keep in sync.
+#[allow(dead_code)]
 pub fn indent_text<T: ToString>(s: T, size: usize) -> String {
     let indent_str = " ".repeat(size);
     s.to_string()
@@ -109,6 +107,7 @@ pub fn indent_text<T: ToString>(s: T, size: usize) -> String {
 }
 
 /// Also inlined in `harnx_render::error_text` — keep in sync.
+#[allow(dead_code)]
 pub fn error_text(input: &str) -> String {
     color_text(input, nu_ansi_term::Color::Red)
 }
