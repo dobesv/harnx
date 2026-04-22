@@ -9,20 +9,20 @@ extern crate log;
 #[cfg(test)]
 mod test_regression_issue_68;
 
-use harnx_acp::NestedAcpEvent;
 use agent_client_protocol::{self as acp, Client as _};
+use harnx_acp::NestedAcpEvent;
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use uuid::Uuid;
 
-use harnx_runtime::client::{Client, SseEvent, SseHandler};
-use harnx_runtime::config::{GlobalConfig, Input};
-use harnx_runtime::tool::{ToolCall, ToolResult};
-use harnx_runtime::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
 #[cfg(test)]
 use harnx_core::event::PlanEntry as CorePlanEntry;
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, ToolKind, ToolStatus,
 };
+use harnx_runtime::client::{Client, SseEvent, SseHandler};
+use harnx_runtime::config::{GlobalConfig, Input};
+use harnx_runtime::tool::{ToolCall, ToolResult};
+use harnx_runtime::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
 
 use anyhow::bail;
 use serde_json::{json, Value};
@@ -837,12 +837,12 @@ async fn eval_mcp_async(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::Agent;
     use harnx_runtime::{
         client::{ClientConfig, ModelType, TestStateGuard},
         config::{Config, CREATE_TITLE_AGENT},
         test_utils::{MockClient, MockTurnBuilder},
     };
-    use agent_client_protocol::Agent;
     use std::{
         cell::RefCell,
         pin::Pin,
@@ -958,9 +958,12 @@ mod tests {
 
         let mut config = Config::default();
         config.clients = clients;
-        config.model =
-            harnx_runtime::client::retrieve_model(&config.clients, "openai:gpt-4o", ModelType::Chat)
-                .expect("load test model");
+        config.model = harnx_runtime::client::retrieve_model(
+            &config.clients,
+            "openai:gpt-4o",
+            ModelType::Chat,
+        )
+        .expect("load test model");
         config.save_session = Some(true);
 
         Arc::new(RwLock::new(config))
