@@ -11,7 +11,6 @@ mod render;
 mod serve;
 mod tool;
 mod tui;
-#[macro_use]
 mod utils;
 
 #[macro_use]

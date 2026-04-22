@@ -85,6 +85,7 @@ harnx-hooks = { path = "../harnx-hooks" }
 harnx-mcp = { path = "../harnx-mcp" }
 harnx-rag = { path = "../harnx-rag" }
 harnx-render = { path = "../harnx-render" }
+harnx-runtime = { path = "../harnx-runtime" }
 harnx-spinner = { path = "../harnx-spinner" }
 shellexpand = { workspace = true }
 schemars = { workspace = true }

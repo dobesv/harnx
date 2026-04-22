@@ -21,6 +21,7 @@ chrono = { workspace = true }
 crossterm = { workspace = true }
 dirs = { workspace = true }
 fancy-regex = { workspace = true }
+fuzzy-matcher = { workspace = true }
 futures-util = { workspace = true }
 globset = { workspace = true }
 harnx-acp = { workspace = true }
