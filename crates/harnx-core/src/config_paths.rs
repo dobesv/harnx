@@ -194,8 +194,10 @@ pub fn sessions_dir(agent_name: Option<&str>) -> PathBuf {
     }
 }
 
-/// Resolve a session file by name. Accepts `"sub/name"` to nest one level
-/// deep under the sessions dir; otherwise places the file directly.
+/// Resolve a session file by name. If `name` contains a `/`, splits on the
+/// first one: the prefix becomes a subdir under `sessions_dir(agent_name)` and
+/// the suffix becomes the `.yaml` filename. Otherwise the file sits directly
+/// in the sessions dir.
 pub fn session_file(agent_name: Option<&str>, name: &str) -> PathBuf {
     let dir = sessions_dir(agent_name);
     match name.split_once('/') {
@@ -205,7 +207,8 @@ pub fn session_file(agent_name: Option<&str>, name: &str) -> PathBuf {
 }
 
 /// Resolve a RAG manifest file by name. Agent-scoped when `agent_name` is
-/// `Some` (routes through `agent_rag_file`), else the top-level rags dir.
+/// `Some` (routes through `agent_rag_file`, which honors `<AGENT>_DATA_DIR`),
+/// else under the top-level `rags_dir()` (overridable via `HARNX_RAGS_DIR`).
 pub fn rag_file(agent_name: Option<&str>, name: &str) -> PathBuf {
     match agent_name {
         Some(agent) => agent_rag_file(agent, name),
@@ -316,25 +319,63 @@ mod tests {
 
     #[test]
     fn rag_file_with_agent_routes_through_agent_rag_file() {
-        let got = rag_file(Some("demo"), "index");
+        // Use a random-looking name to avoid <AGENT>_DATA_DIR env collisions
+        // (see agent_data_dir_falls_back_to_agents_subdir for the same trick).
+        let agent = "ztest_agent_for_rag_2e1d";
+        let got = rag_file(Some(agent), "index");
         let tail: Vec<_> = got
             .components()
             .rev()
             .take(3)
             .map(|c| c.as_os_str().to_str().unwrap_or("").to_string())
             .collect();
-        assert_eq!(tail, vec!["index.yaml", "demo", AGENTS_DIR_NAME]);
+        assert_eq!(
+            tail,
+            vec![
+                "index.yaml".to_string(),
+                agent.to_string(),
+                AGENTS_DIR_NAME.to_string()
+            ]
+        );
     }
 
     #[test]
     fn messages_file_with_agent_uses_agent_data_dir() {
-        let got = messages_file(Some("demo"));
+        let agent = "ztest_agent_for_msgs_b83c";
+        let got = messages_file(Some(agent));
         let tail: Vec<_> = got
             .components()
             .rev()
             .take(3)
             .map(|c| c.as_os_str().to_str().unwrap_or("").to_string())
             .collect();
-        assert_eq!(tail, vec![MESSAGES_FILE_NAME, "demo", AGENTS_DIR_NAME]);
+        assert_eq!(
+            tail,
+            vec![
+                MESSAGES_FILE_NAME.to_string(),
+                agent.to_string(),
+                AGENTS_DIR_NAME.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn session_file_with_agent_nests_under_agent_data_dir() {
+        let agent = "ztest_agent_for_session_9a4f";
+        let got = session_file(Some(agent), "my_session");
+        let tail: Vec<_> = got
+            .components()
+            .rev()
+            .take(3)
+            .map(|c| c.as_os_str().to_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                "my_session.yaml".to_string(),
+                SESSIONS_DIR_NAME.to_string(),
+                agent.to_string(),
+            ]
+        );
     }
 }
