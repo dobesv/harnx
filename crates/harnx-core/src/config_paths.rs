@@ -170,6 +170,49 @@ pub fn models_override_file() -> PathBuf {
     local_path("models-override.yaml")
 }
 
+/// Persisted "last messages" file. Agent-scoped when `agent_name` is `Some`,
+/// else the top-level `messages.md` (overridable via `HARNX_MESSAGES_FILE`).
+pub fn messages_file(agent_name: Option<&str>) -> PathBuf {
+    match agent_name {
+        None => match env::var(get_env_name("messages_file")) {
+            Ok(value) => PathBuf::from(value),
+            Err(_) => local_path(MESSAGES_FILE_NAME),
+        },
+        Some(agent) => agent_data_dir(agent).join(MESSAGES_FILE_NAME),
+    }
+}
+
+/// Sessions directory. Agent-scoped when `agent_name` is `Some`, else the
+/// top-level sessions dir (overridable via `HARNX_SESSIONS_DIR`).
+pub fn sessions_dir(agent_name: Option<&str>) -> PathBuf {
+    match agent_name {
+        None => match env::var(get_env_name("sessions_dir")) {
+            Ok(value) => PathBuf::from(value),
+            Err(_) => local_path(SESSIONS_DIR_NAME),
+        },
+        Some(agent) => agent_data_dir(agent).join(SESSIONS_DIR_NAME),
+    }
+}
+
+/// Resolve a session file by name. Accepts `"sub/name"` to nest one level
+/// deep under the sessions dir; otherwise places the file directly.
+pub fn session_file(agent_name: Option<&str>, name: &str) -> PathBuf {
+    let dir = sessions_dir(agent_name);
+    match name.split_once('/') {
+        Some((sub, leaf)) => dir.join(sub).join(format!("{leaf}.yaml")),
+        None => dir.join(format!("{name}.yaml")),
+    }
+}
+
+/// Resolve a RAG manifest file by name. Agent-scoped when `agent_name` is
+/// `Some` (routes through `agent_rag_file`), else the top-level rags dir.
+pub fn rag_file(agent_name: Option<&str>, name: &str) -> PathBuf {
+    match agent_name {
+        Some(agent) => agent_rag_file(agent, name),
+        None => rags_dir().join(format!("{name}.yaml")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +276,65 @@ mod tests {
             Some("models-override.yaml")
         );
         assert_eq!(got.parent().unwrap(), config_dir());
+    }
+
+    #[test]
+    fn session_file_without_agent_places_yaml_under_sessions_dir() {
+        let got = session_file(None, "my_session");
+        let tail: Vec<_> = got
+            .components()
+            .rev()
+            .take(2)
+            .map(|c| c.as_os_str().to_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(tail, vec!["my_session.yaml", SESSIONS_DIR_NAME]);
+    }
+
+    #[test]
+    fn session_file_with_slash_splits_into_subdir() {
+        let got = session_file(None, "group/leaf");
+        let tail: Vec<_> = got
+            .components()
+            .rev()
+            .take(3)
+            .map(|c| c.as_os_str().to_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(tail, vec!["leaf.yaml", "group", SESSIONS_DIR_NAME]);
+    }
+
+    #[test]
+    fn rag_file_without_agent_uses_top_level_rags_dir() {
+        let got = rag_file(None, "code");
+        let tail: Vec<_> = got
+            .components()
+            .rev()
+            .take(2)
+            .map(|c| c.as_os_str().to_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(tail, vec!["code.yaml", RAGS_DIR_NAME]);
+    }
+
+    #[test]
+    fn rag_file_with_agent_routes_through_agent_rag_file() {
+        let got = rag_file(Some("demo"), "index");
+        let tail: Vec<_> = got
+            .components()
+            .rev()
+            .take(3)
+            .map(|c| c.as_os_str().to_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(tail, vec!["index.yaml", "demo", AGENTS_DIR_NAME]);
+    }
+
+    #[test]
+    fn messages_file_with_agent_uses_agent_data_dir() {
+        let got = messages_file(Some("demo"));
+        let tail: Vec<_> = got
+            .components()
+            .rev()
+            .take(3)
+            .map(|c| c.as_os_str().to_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(tail, vec![MESSAGES_FILE_NAME, "demo", AGENTS_DIR_NAME]);
     }
 }
