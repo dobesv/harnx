@@ -5,7 +5,7 @@ pub mod cli_event_sink;
 pub mod hooks;
 pub mod render;
 pub mod serve;
-pub mod tui;
+pub use harnx_tui as tui;
 pub mod utils;
 
 pub mod test_utils;

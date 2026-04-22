@@ -1,5 +1,5 @@
 ---
-source: src/tui/tests.rs
+source: src/tests.rs
 expression: rendered
 ---
 .exit agent              Leave agent

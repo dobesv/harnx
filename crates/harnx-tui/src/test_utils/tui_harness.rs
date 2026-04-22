@@ -4,10 +4,10 @@
 //! without a real terminal. It uses [`ratatui::backend::TestBackend`] to capture
 //! rendered output.
 
-use crate::config::{Config, GlobalConfig};
-use crate::hooks::{AsyncHookManager, PersistentHookManager};
-use crate::test_utils::SyncHarness;
-use crate::tui::types::Tui;
+use crate::types::Tui;
+use harnx_hooks::{AsyncHookManager, PersistentHookManager};
+use harnx_runtime::config::{Config, GlobalConfig};
+use harnx_runtime::test_utils::SyncHarness;
 
 use parking_lot::RwLock;
 use ratatui::backend::TestBackend;

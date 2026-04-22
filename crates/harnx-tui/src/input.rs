@@ -1,14 +1,19 @@
-use super::*;
-use crate::tui::render_helpers::{render_status_line, render_usage_line};
-use crate::tui::types::{TranscriptItem, TuiEvent};
+use crate::render_helpers::{render_status_line, render_usage_line};
+use crate::strip_ansi;
+use crate::types::Tui;
+use crate::types::{TranscriptItem, TuiEvent};
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use harnx_core::event::{AgentEvent, AgentSource};
+use harnx_runtime::utils::pretty_yaml_block;
+use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
 
 const ATTACHMENT_PREVIEW_MAX_CHARS: usize = 800;
 const ATTACHMENT_PREVIEW_MAX_LINES: usize = 12;
 
 fn unique_attachment_display_name(
-    attachments: &[crate::tui::types::Attachment],
+    attachments: &[crate::types::Attachment],
     original_name: &str,
 ) -> String {
     if !attachments.iter().any(|a| a.display_name == original_name) {
@@ -138,7 +143,7 @@ impl Tui {
                         // Keep the text in input so user can see/edit it.
                         let pending_attachments = self.app.attachments.clone();
                         let pending_attachment_dir = self.app.attachment_dir.clone();
-                        let pending = crate::tui::types::PendingMessage {
+                        let pending = crate::types::PendingMessage {
                             text,
                             attachments: pending_attachments,
                             attachment_dir: pending_attachment_dir,
@@ -168,7 +173,7 @@ impl Tui {
                         self.render_submitted_attachments(&attachments_snapshot);
                         self.pin_transcript_to_bottom();
                         self.app.input = Self::new_input();
-                        let msg = crate::tui::types::PendingMessage {
+                        let msg = crate::types::PendingMessage {
                             text,
                             attachments: std::mem::take(&mut self.app.attachments),
                             attachment_dir: self.app.attachment_dir.take(),
@@ -216,7 +221,7 @@ impl Tui {
         if let Some(ref dir) = self.app.attachment_dir {
             Ok(dir.clone())
         } else {
-            let dir = crate::tui::types::create_attachment_dir()?;
+            let dir = crate::types::create_attachment_dir()?;
             self.app.attachment_dir = Some(dir.clone());
             Ok(dir)
         }
@@ -226,7 +231,7 @@ impl Tui {
     pub(super) fn cleanup_attachments(&mut self) {
         self.app.attachments.clear();
         if let Some(dir) = self.app.attachment_dir.take() {
-            crate::tui::types::cleanup_attachment_dir(&dir);
+            crate::types::cleanup_attachment_dir(&dir);
         }
     }
 
@@ -264,7 +269,7 @@ impl Tui {
                                 "Failed to copy attachment: {err}"
                             )));
                         } else {
-                            self.app.attachments.push(crate::tui::types::Attachment {
+                            self.app.attachments.push(crate::types::Attachment {
                                 path: dest,
                                 display_name,
                             });
@@ -354,13 +359,13 @@ impl Tui {
     async fn write_paste_to_attachment_dir(
         &mut self,
         text: &str,
-    ) -> std::io::Result<crate::tui::types::Attachment> {
+    ) -> std::io::Result<crate::types::Attachment> {
         let dir = self.ensure_attachment_dir().await?;
         self.app.paste_count += 1;
         let filename = format!("paste-{}.txt", self.app.paste_count);
         let path = dir.join(&filename);
         tokio::fs::write(&path, text).await?;
-        Ok(crate::tui::types::Attachment {
+        Ok(crate::types::Attachment {
             path,
             display_name: filename,
         })
@@ -423,7 +428,7 @@ impl Tui {
     #[cfg(test)]
     pub(crate) async fn submit_pending_message(
         &mut self,
-        pending: crate::tui::types::PendingMessage,
+        pending: crate::types::PendingMessage,
     ) -> Result<()> {
         self.submit_pending_message_inner(pending).await
     }
@@ -431,14 +436,14 @@ impl Tui {
     #[cfg(not(test))]
     async fn submit_pending_message(
         &mut self,
-        pending: crate::tui::types::PendingMessage,
+        pending: crate::types::PendingMessage,
     ) -> Result<()> {
         self.submit_pending_message_inner(pending).await
     }
 
     async fn submit_pending_message_inner(
         &mut self,
-        pending: crate::tui::types::PendingMessage,
+        pending: crate::types::PendingMessage,
     ) -> Result<()> {
         self.app.input = Self::new_input();
         self.app
@@ -464,7 +469,7 @@ impl Tui {
         *self.shared_pending_message.lock().await = None;
     }
 
-    fn render_submitted_attachments(&mut self, attachments: &[crate::tui::types::Attachment]) {
+    fn render_submitted_attachments(&mut self, attachments: &[crate::types::Attachment]) {
         if attachments.is_empty() {
             return;
         }
@@ -721,7 +726,7 @@ impl Tui {
             AgentEvent::Tool(ToolEvent::Started { name, input, .. }) => {
                 let input_yaml = match &input {
                     serde_json::Value::Null => None,
-                    _ => Some(crate::utils::pretty_yaml_block(&input)),
+                    _ => Some(pretty_yaml_block(&input)),
                 };
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
@@ -801,14 +806,11 @@ impl Tui {
         }
     }
 
-    pub(super) async fn start_prompt(
-        &mut self,
-        msg: crate::tui::types::PendingMessage,
-    ) -> Result<()> {
+    pub(super) async fn start_prompt(&mut self, msg: crate::types::PendingMessage) -> Result<()> {
         self.app.llm_busy = true;
 
         let event_tx = self.event_tx.clone();
-        let ctx = crate::tui::prompt::PromptTaskContext {
+        let ctx = crate::prompt::PromptTaskContext {
             config: self.config.clone(),
             abort_signal: self.abort_signal.clone(),
             async_manager: self.async_manager.clone(),
@@ -1007,7 +1009,7 @@ impl Tui {
         // If we're still typing the first word starting with '.', complete commands
         if parts.len() == 1 && cmd.starts_with('.') {
             let filter = cmd;
-            let commands: Vec<(String, Option<String>)> = crate::commands::COMMANDS
+            let commands: Vec<(String, Option<String>)> = harnx_runtime::commands::COMMANDS
                 .iter()
                 .filter(|c| c.name.starts_with(filter))
                 .map(|c| (format!("{} ", c.name), Some(c.description.to_string())))
@@ -1089,7 +1091,7 @@ impl Tui {
             let mut pending_async_context = self.pending_async_context.lock().await;
             let mut output = Vec::<u8>::new();
 
-            let result = crate::commands::run_command_with_output(
+            let result = harnx_runtime::commands::run_command_with_output(
                 &config,
                 abort_signal,
                 line,
@@ -1113,7 +1115,7 @@ impl Tui {
 
         match result {
             Ok(outcome) => {
-                if matches!(outcome, crate::commands::CommandOutcome::Exit) {
+                if matches!(outcome, harnx_runtime::commands::CommandOutcome::Exit) {
                     self.app.should_quit = true;
                 }
                 let llm_busy = self.app.llm_busy;

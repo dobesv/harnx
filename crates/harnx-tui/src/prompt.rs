@@ -1,6 +1,16 @@
-use super::*;
-use crate::config::Config;
-use crate::tui::types::TuiEvent;
+use crate::types::Tui;
+use crate::types::{PendingMessage, TuiEvent};
+use anyhow::Result;
+use harnx_hooks::{
+    dispatch_hooks_with_count_and_manager, drain_async_results, inject_pending_async_context,
+    AsyncHookManager, HookEvent, HookResultControl, PersistentHookManager,
+};
+use harnx_runtime::client::{call_chat_completions, CompletionTokenUsage};
+use harnx_runtime::config::{Config, GlobalConfig, Input};
+use harnx_runtime::tool::ToolResult;
+use harnx_runtime::utils::AbortSignal;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 
 pub(super) struct PromptTaskContext {
     pub(super) config: GlobalConfig,
@@ -8,30 +18,31 @@ pub(super) struct PromptTaskContext {
     pub(super) async_manager: Arc<Mutex<AsyncHookManager>>,
     pub(super) persistent_manager: Arc<Mutex<PersistentHookManager>>,
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
-    pub(super) shared_pending_message: Arc<Mutex<Option<crate::tui::types::PendingMessage>>>,
+    pub(super) shared_pending_message: Arc<Mutex<Option<PendingMessage>>>,
     pub(super) event_tx: mpsc::UnboundedSender<TuiEvent>,
 }
 
 impl Tui {
-    pub(super) async fn run_prompt_task(
-        msg: crate::tui::types::PendingMessage,
-        ctx: PromptTaskContext,
-    ) -> Result<()> {
+    pub(super) async fn run_prompt_task(msg: PendingMessage, ctx: PromptTaskContext) -> Result<()> {
         let attachment_dir = msg.attachment_dir.clone();
         let input_res = if msg.attachments.is_empty() {
-            Ok(crate::config::input::from_str(&ctx.config, &msg.text, None))
+            Ok(harnx_runtime::config::input::from_str(
+                &ctx.config,
+                &msg.text,
+                None,
+            ))
         } else {
             let paths: Vec<String> = msg
                 .attachments
                 .iter()
                 .map(|a| a.path.to_string_lossy().to_string())
                 .collect();
-            crate::config::input::from_files(&ctx.config, &msg.text, paths, None).await
+            harnx_runtime::config::input::from_files(&ctx.config, &msg.text, paths, None).await
         };
         if let Some(dir) = attachment_dir {
             let cleanup_dir = dir.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                crate::tui::types::cleanup_attachment_dir(&cleanup_dir);
+                crate::types::cleanup_attachment_dir(&cleanup_dir);
             })
             .await;
         }
@@ -45,7 +56,7 @@ impl Tui {
         mut resume_count: u32,
         mut with_embeddings: bool,
     ) -> Result<()> {
-        let mut pending_switch: Option<crate::tool::SwitchAgentData> = None;
+        let mut pending_switch: Option<harnx_runtime::tool::SwitchAgentData> = None;
         loop {
             if input.is_empty() {
                 break;
@@ -73,7 +84,7 @@ impl Tui {
             }
 
             if with_embeddings {
-                crate::config::input::use_embeddings(
+                harnx_runtime::config::input::use_embeddings(
                     &mut input,
                     &ctx.config,
                     ctx.abort_signal.clone(),
@@ -118,16 +129,16 @@ impl Tui {
                 }
             }
 
-            let llm_result = crate::client::retry::call_with_retry_and_fallback_custom(
+            let llm_result = harnx_runtime::client::retry::call_with_retry_and_fallback_custom(
                 &input,
                 &ctx.config,
                 ctx.abort_signal.clone(),
                 move |input: &Input,
-                      client: &dyn crate::client::Client,
-                      config: &crate::config::GlobalConfig,
+                      client: &dyn harnx_runtime::client::Client,
+                      config: &GlobalConfig,
                       abort_signal| {
                     Box::pin(async move {
-                        if crate::config::input::stream(input, config) {
+                        if harnx_runtime::config::input::stream(input, config) {
                             Self::call_chat_completions_streaming_tui(
                                 input,
                                 client,
@@ -244,7 +255,7 @@ impl Tui {
                         .additional_context
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-                    input = crate::config::input::from_str(&ctx.config, &context, None);
+                    input = harnx_runtime::config::input::from_str(&ctx.config, &context, None);
                     resume_count += 1;
                     with_embeddings = true;
                     continue;
@@ -269,7 +280,7 @@ impl Tui {
                 if ctx.abort_signal.aborted() {
                     break;
                 }
-                input = crate::config::input::from_str(&ctx.config, &context, None);
+                input = harnx_runtime::config::input::from_str(&ctx.config, &context, None);
                 resume_count += 1;
                 with_embeddings = true;
                 continue;
@@ -285,8 +296,8 @@ impl Tui {
 
     async fn call_chat_completions_streaming_tui(
         input: &Input,
-        client: &dyn crate::client::Client,
-        config: &crate::config::GlobalConfig,
+        client: &dyn harnx_runtime::client::Client,
+        config: &GlobalConfig,
         abort_signal: AbortSignal,
     ) -> Result<(
         String,
@@ -295,7 +306,7 @@ impl Tui {
         CompletionTokenUsage,
     )> {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut handler = crate::client::SseHandler::new(tx, abort_signal.clone());
+        let mut handler = harnx_runtime::client::SseHandler::new(tx, abort_signal.clone());
 
         // Drain the SseEvent channel in the background so unbounded_send
         // doesn't fill up. No translation to TuiEvent happens here —
@@ -313,11 +324,11 @@ impl Tui {
             let cfg = config.read();
             (cfg.dry_run, cfg.user_agent.clone())
         };
-        let call_ctx = crate::client::ClientCallContext {
+        let call_ctx = harnx_runtime::client::ClientCallContext {
             user_agent: user_agent.as_deref(),
             dry_run,
         };
-        let send_ret = crate::client::chat_completions_streaming_with_input(
+        let send_ret = harnx_runtime::client::chat_completions_streaming_with_input(
             client,
             input,
             config,
@@ -337,8 +348,8 @@ impl Tui {
             Ok(_) => Ok((
                 text,
                 thought,
-                crate::tool::eval_tool_calls(
-                    &crate::tool::build_tool_eval_context(config),
+                harnx_runtime::tool::eval_tool_calls(
+                    &harnx_runtime::tool::build_tool_eval_context(config),
                     tool_calls,
                     &abort_signal,
                 )?,
@@ -356,7 +367,7 @@ impl Tui {
 
     fn hook_dispatch_context(
         config: &GlobalConfig,
-    ) -> (crate::hooks::HooksConfig, String, std::path::PathBuf) {
+    ) -> (harnx_hooks::HooksConfig, String, std::path::PathBuf) {
         let config = config.read();
         (
             config.resolved_hooks(),

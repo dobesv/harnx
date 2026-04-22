@@ -1585,6 +1585,7 @@ dependencies = [
  "harnx-runtime",
  "harnx-serve",
  "harnx-spinner",
+ "harnx-tui",
  "hmac",
  "hnsw_rs",
  "html_to_markdown",
@@ -2053,13 +2054,16 @@ dependencies = [
  "ratatui_widget_scrolling",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.11.0",
  "shell-words",
  "tempfile",
+ "textwrap",
  "tokio",
  "tokio-stream",
  "tokio-test",
  "unicode-width",
+ "uuid",
 ]
 
 [[package]]

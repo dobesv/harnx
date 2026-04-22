@@ -1,12 +1,32 @@
-use super::*;
-use crate::tui::event_source::{CrosstermEventSource, EventSource};
-use crate::tui::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
-use crate::tui::types::{App, TranscriptItem, SPINNER_FRAMES, TICK_RATE};
+use crate::agent_event_sink::install_tui_agent_event_sink;
+use crate::event_source::{CrosstermEventSource, EventSource};
+use crate::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
+use crate::types::Tui;
+use crate::types::{App, PendingMessage, TranscriptItem, SPINNER_FRAMES, TICK_RATE};
+use anyhow::Result;
+#[cfg(test)]
+use crossterm::event::KeyEvent;
+use crossterm::event::{
+    EnableBracketedPaste, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen};
+use crossterm::ExecutableCommand;
+use harnx_hooks::{drain_async_results, AsyncHookManager, PersistentHookManager};
+use harnx_runtime::config::GlobalConfig;
+use harnx_runtime::utils::create_abort_signal;
+use ratatui::Terminal;
+#[cfg(test)]
+use ratatui_textarea::Input as TextInput;
+use std::io::{self, Write};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::{mpsc, Mutex};
 
 impl Tui {
     #[cfg(test)]
     pub(super) async fn queue_pending_message(&mut self, text: String) {
-        let pending = crate::tui::types::PendingMessage {
+        let pending = PendingMessage {
             text: text.clone(),
             attachments: vec![],
             attachment_dir: None,
@@ -86,13 +106,12 @@ impl Tui {
 
         // Show the welcome banner on startup, even when an agent/session status line is also present.
         entries.push(TranscriptItem::SystemText(format!(
-            "Welcome to {} {}  •  Type .help for commands, Tab to complete.",
-            env!("CARGO_CRATE_NAME"),
+            "Welcome to harnx {}  •  Type .help for commands, Tab to complete.",
             env!("CARGO_PKG_VERSION")
         )));
 
         // Show agent banner and conversation starters if an agent is active
-        if state.contains(crate::config::StateFlags::AGENT) {
+        if state.contains(harnx_runtime::config::StateFlags::AGENT) {
             if let Ok(banner) = cfg.agent_banner() {
                 if !banner.trim().is_empty() {
                     entries.push(TranscriptItem::AssistantText(banner));
@@ -241,7 +260,7 @@ impl Tui {
             "↩ Async resume: {context}"
         )));
         self.pin_transcript_to_bottom();
-        self.start_prompt(crate::tui::types::PendingMessage {
+        self.start_prompt(PendingMessage {
             text: context,
             attachments: vec![],
             attachment_dir: None,

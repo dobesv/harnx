@@ -1,13 +1,18 @@
-use super::*;
-use crate::client::{Client, ClientConfig, TestStateGuard};
-use crate::config::Config;
-use crate::test_utils::{MockClient, MockTurnBuilder, TuiTestHarness};
-use crate::tui::types::{TranscriptItem, TuiEvent};
+use crate::test_utils::TuiTestHarness;
+use crate::types::Tui;
+use crate::types::{TranscriptItem, TuiEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, PlanEntry, ToolEvent, ToolKind,
     ToolStatus,
 };
+use harnx_hooks::{AsyncHookManager, PersistentHookManager};
+use harnx_runtime::client::{Client, ClientConfig, TestStateGuard};
+use harnx_runtime::config::{Config, GlobalConfig};
+use harnx_runtime::test_utils::{MockClient, MockTurnBuilder};
 use parking_lot::RwLock;
+use ratatui::style::Modifier;
+use ratatui::text::Line;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -47,14 +52,15 @@ fn test_config_with_mock_client_and_agent(
         guard.model = model.clone();
 
         // Set up agent for realistic status line.
-        let mut agent = crate::config::Agent::new(crate::config::AgentConfig::from_prompt(""));
+        let mut agent =
+            harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
         agent.set_name(agent_name);
         agent.set_model(model.clone());
         guard.agent = Some(agent);
 
         // Set up session if session_name is provided.
         if let Some(name) = session_name {
-            guard.session = Some(crate::config::session::new(&guard, name));
+            guard.session = Some(harnx_runtime::config::session::new(&guard, name));
         }
     }
     config
@@ -167,14 +173,14 @@ async fn pending_message_is_auto_sent_after_finish() {
 
 #[tokio::test]
 async fn pending_dot_command_restores_attachments_before_running() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
     use std::path::PathBuf;
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
     tui.app.llm_busy = true;
-    tui.app.pending_message = Some(crate::tui::types::PendingMessage {
+    tui.app.pending_message = Some(crate::types::PendingMessage {
         text: ".info attachments".to_string(),
         attachments: vec![
             Attachment {
@@ -219,7 +225,7 @@ async fn pending_message_consumed_clears_pending_and_shows_in_transcript() {
 
     // Simulate the prompt task consuming the pending message during a tool round.
     tui.handle_tui_event(TuiEvent::PendingMessageConsumed(
-        crate::tui::types::PendingMessage {
+        crate::types::PendingMessage {
             text: "interject here".to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -253,7 +259,7 @@ async fn pending_message_not_double_submitted_after_consumed() {
 
     // Prompt task consumed it.
     tui.handle_tui_event(TuiEvent::PendingMessageConsumed(
-        crate::tui::types::PendingMessage {
+        crate::types::PendingMessage {
             text: "once only".to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -294,7 +300,7 @@ async fn pending_dot_command_not_consumed_mid_tool_loop() {
     tui.app.llm_busy = true;
 
     // Queue a dot-command as pending.
-    let pending = crate::tui::types::PendingMessage {
+    let pending = crate::types::PendingMessage {
         text: ".info model".to_string(),
         attachments: vec![],
         attachment_dir: None,
@@ -320,7 +326,7 @@ async fn pending_message_with_attachments_not_consumed_mid_tool_loop() {
     // Messages with attachments should NOT be consumed mid-tool-loop;
     // they must wait for LlmFinal where submit_pending_message_inner
     // handles them with full attachment processing.
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
     use std::path::PathBuf;
 
     let config = test_config();
@@ -328,7 +334,7 @@ async fn pending_message_with_attachments_not_consumed_mid_tool_loop() {
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
     tui.app.llm_busy = true;
 
-    let pending = crate::tui::types::PendingMessage {
+    let pending = crate::types::PendingMessage {
         text: "check this file".to_string(),
         attachments: vec![Attachment {
             path: PathBuf::from("/tmp/test.txt"),
@@ -1294,7 +1300,7 @@ async fn acp_message_chunks_coalesce_like_direct_llm_streaming() {
 
 #[tokio::test]
 async fn submitting_message_with_attachments_renders_attachment_list_and_preview() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
@@ -1304,7 +1310,7 @@ async fn submitting_message_with_attachments_renders_attachment_list_and_preview
     let file = dir.path().join("notes.txt");
     std::fs::write(&file, "first line\nsecond line\nthird line").unwrap();
 
-    tui.submit_pending_message(crate::tui::types::PendingMessage {
+    tui.submit_pending_message(crate::types::PendingMessage {
         text: "hello with files".to_string(),
         attachments: vec![Attachment {
             path: file,
@@ -1427,7 +1433,7 @@ async fn test_basic_message_and_streaming_response() {
         .push(TranscriptItem::UserText("Test message".to_string()));
     harness
         .tui()
-        .start_prompt(crate::tui::types::PendingMessage {
+        .start_prompt(crate::types::PendingMessage {
             text: "Test message".to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -1524,7 +1530,7 @@ async fn test_streaming_with_tool_calls() {
         .push(TranscriptItem::UserText("What is the answer?".to_string()));
     harness
         .tui()
-        .start_prompt(crate::tui::types::PendingMessage {
+        .start_prompt(crate::types::PendingMessage {
             text: "What is the answer?".to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -1613,7 +1619,7 @@ async fn test_sub_agent_delegation_tool_appears() {
         .push(TranscriptItem::UserText("Help me".to_string()));
     harness
         .tui()
-        .start_prompt(crate::tui::types::PendingMessage {
+        .start_prompt(crate::types::PendingMessage {
             text: "Help me".to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -1667,8 +1673,8 @@ async fn test_sub_agent_delegation_tool_appears() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_tool_result_switch_agent_parsing() {
-    use crate::acp::{AcpManager, AcpServerConfig};
-    use crate::tool::{eval_tool_calls, ToolCall};
+    use harnx_acp::{AcpManager, AcpServerConfig};
+    use harnx_runtime::tool::{eval_tool_calls, ToolCall};
 
     let _guard = TestStateGuard::new(None).await;
     let config = test_config();
@@ -1701,9 +1707,9 @@ async fn test_tool_result_switch_agent_parsing() {
     // allowed tools set.  Override the output manually to exercise the
     // switch_agent parsing path that runs in eval_tool_calls (line 126-141 of
     // tool.rs) on the result object.
-    let abort_signal = crate::utils::create_abort_signal();
+    let abort_signal = harnx_runtime::utils::create_abort_signal();
     let mut results = eval_tool_calls(
-        &crate::tool::build_tool_eval_context(&config),
+        &harnx_runtime::tool::build_tool_eval_context(&config),
         vec![call],
         &abort_signal,
     )
@@ -1720,7 +1726,7 @@ async fn test_tool_result_switch_agent_parsing() {
                 obj.get("agent").and_then(|v| v.as_str()),
                 obj.get("prompt").and_then(|v| v.as_str()),
             ) {
-                results[0].switch_agent = Some(crate::tool::SwitchAgentData {
+                results[0].switch_agent = Some(harnx_runtime::tool::SwitchAgentData {
                     agent: agent.to_string(),
                     prompt: prompt.to_string(),
                     session_id: obj
@@ -1769,7 +1775,7 @@ async fn test_screen_overflow_and_word_wrap() {
         .push(TranscriptItem::UserText(user_message.to_string()));
     harness
         .tui()
-        .start_prompt(crate::tui::types::PendingMessage {
+        .start_prompt(crate::types::PendingMessage {
             text: user_message.to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -1982,7 +1988,7 @@ async fn test_ctrl_c_cancels_streaming() {
         .push(TranscriptItem::UserText("Long request".to_string()));
     harness
         .tui()
-        .start_prompt(crate::tui::types::PendingMessage {
+        .start_prompt(crate::types::PendingMessage {
             text: "Long request".to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -2061,7 +2067,7 @@ async fn test_streaming_error_shows_in_transcript() {
     // The error should propagate through start_prompt
     let result = harness
         .tui()
-        .start_prompt(crate::tui::types::PendingMessage {
+        .start_prompt(crate::types::PendingMessage {
             text: "Error test".to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -2124,7 +2130,7 @@ async fn test_cancel_during_tool_execution() {
         .push(TranscriptItem::UserText("Search test".to_string()));
     harness
         .tui()
-        .start_prompt(crate::tui::types::PendingMessage {
+        .start_prompt(crate::types::PendingMessage {
             text: "Search test".to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -2346,7 +2352,7 @@ async fn detach_cleans_up_temp_dir() {
 
 #[tokio::test]
 async fn attachment_footer_shows_attached_files() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
     use std::path::PathBuf;
 
     let mut harness = TuiTestHarness::with_size(60, 12);
@@ -2433,7 +2439,7 @@ async fn attach_command_preserves_draft_text() {
 
 #[tokio::test]
 async fn direct_submit_with_attachments_renders_attachment_entries_in_transcript() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
     use std::path::PathBuf;
 
     let config = test_config();
@@ -2471,7 +2477,7 @@ async fn direct_submit_with_attachments_renders_attachment_entries_in_transcript
 
 #[tokio::test]
 async fn dot_command_with_attachments_renders_attachment_entries_in_transcript() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
     use std::path::PathBuf;
 
     let config = test_config();
@@ -2529,7 +2535,7 @@ async fn attach_nonexistent_file_shows_error() {
 
 #[tokio::test]
 async fn detach_clears_all_attachments() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
     use std::path::PathBuf;
 
     let config = test_config();
@@ -2555,7 +2561,7 @@ async fn detach_clears_all_attachments() {
 
 #[tokio::test]
 async fn detach_by_name_removes_specific_attachment() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
@@ -2597,7 +2603,7 @@ async fn detach_by_name_removes_specific_attachment() {
 
 #[tokio::test]
 async fn submit_drains_attachments() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
 
     let config = test_config_with_mock_client_and_agent(
         "test-agent",
@@ -2645,7 +2651,7 @@ async fn submit_drains_attachments() {
 
 #[tokio::test]
 async fn submit_attachments_only_with_empty_text() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
 
     let config = test_config_with_mock_client_and_agent(
         "test-agent",
@@ -2692,7 +2698,7 @@ async fn submit_attachments_only_with_empty_text() {
 
 #[tokio::test]
 async fn queued_message_keeps_attachments_visible_while_busy() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
     use std::path::PathBuf;
 
     let config = test_config();
@@ -2752,7 +2758,7 @@ async fn test_recovery_after_cancellation() {
         .push(TranscriptItem::UserText("First request".to_string()));
     harness
         .tui()
-        .start_prompt(crate::tui::types::PendingMessage {
+        .start_prompt(crate::types::PendingMessage {
             text: "First request".to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -2817,7 +2823,7 @@ async fn test_recovery_after_cancellation() {
         .push(TranscriptItem::UserText("Second request".to_string()));
     harness
         .tui()
-        .start_prompt(crate::tui::types::PendingMessage {
+        .start_prompt(crate::types::PendingMessage {
             text: "Second request".to_string(),
             attachments: vec![],
             attachment_dir: None,
@@ -2861,7 +2867,7 @@ async fn attach_completes_file_paths() {
 
 #[tokio::test]
 async fn detach_completes_attachment_names() {
-    use crate::tui::types::Attachment;
+    use crate::types::Attachment;
     use std::path::PathBuf;
 
     let config = test_config();

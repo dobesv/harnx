@@ -1,5 +1,5 @@
 ---
-source: src/tui/tests.rs
+source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
 Welcome to harnx 0.30.0  •  Type .help

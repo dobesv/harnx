@@ -5,7 +5,7 @@ mod cli_event_sink;
 mod hooks;
 mod render;
 mod serve;
-mod tui;
+use harnx_tui as tui;
 mod utils;
 
 #[macro_use]

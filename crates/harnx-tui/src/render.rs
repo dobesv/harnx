@@ -1,5 +1,11 @@
-use super::*;
-use crate::tui::types::{App, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES};
+use crate::types::Tui;
+use crate::types::{App, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES};
+use harnx_runtime::config::GlobalConfig;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::Frame;
 
 impl Tui {
     fn render_text_entry(
@@ -32,7 +38,7 @@ impl Tui {
         match entry {
             TranscriptItem::SourceHeading(source) => Self::render_text_entry(
                 "",
-                &crate::tui::render_helpers::source_heading(source),
+                &crate::render_helpers::source_heading(source),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),

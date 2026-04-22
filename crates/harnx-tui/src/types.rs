@@ -1,7 +1,7 @@
-use crate::config::GlobalConfig;
-use crate::hooks::{AsyncHookManager, PersistentHookManager};
-use crate::utils::AbortSignal;
 use harnx_core::event::{AgentSource, PlanEntry};
+use harnx_hooks::{AsyncHookManager, PersistentHookManager};
+use harnx_runtime::config::GlobalConfig;
+use harnx_runtime::utils::AbortSignal;
 
 use ratatui_textarea::TextArea;
 use std::path::PathBuf;
