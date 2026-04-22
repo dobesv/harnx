@@ -50,7 +50,7 @@ use std::{
 use syntect::highlighting::ThemeSet;
 use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
 
-pub const TEMP_RAG_NAME: &str = "temp";
+pub use harnx_rag::TEMP_RAG_NAME;
 pub const TEMP_SESSION_NAME: &str = "temp";
 
 /// Monokai Extended
