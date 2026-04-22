@@ -20,6 +20,7 @@ members = [
     "crates/harnx-serve",
     "crates/harnx-spinner",
     "crates/harnx-test-bins",
+    "crates/harnx-tui",
 ]
 
 [workspace.package]

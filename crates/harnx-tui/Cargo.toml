@@ -1,0 +1,49 @@
+[package]
+name = "harnx-tui"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+crossterm = { workspace = true }
+fancy-regex = { workspace = true }
+futures-util = { workspace = true }
+harnx-acp = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+harnx-hooks = { path = "../harnx-hooks" }
+harnx-mcp = { path = "../harnx-mcp" }
+harnx-render = { path = "../harnx-render" }
+harnx-runtime = { path = "../harnx-runtime" }
+indexmap = { workspace = true }
+log = { workspace = true }
+nu-ansi-term = { workspace = true }
+parking_lot = { workspace = true }
+ratatui = { workspace = true }
+ratatui-textarea = { workspace = true }
+ratatui_widget_scrolling = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shell-words = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+unicode-width = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+crossterm = { workspace = true, features = ["use-dev-tty"] }
+
+[dev-dependencies]
+insta = { version = "1", features = ["yaml"] }
+pretty_assertions = "1.4.0"
+rand = "0.10.0"
+tempfile = "3"
+tokio-test = "0.4"

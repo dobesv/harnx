@@ -2026,6 +2026,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-tui"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "crossterm",
+ "fancy-regex 0.17.0",
+ "futures-util",
+ "harnx-acp",
+ "harnx-core",
+ "harnx-hooks",
+ "harnx-mcp",
+ "harnx-render",
+ "harnx-runtime",
+ "indexmap",
+ "insta",
+ "log",
+ "nu-ansi-term",
+ "parking_lot",
+ "pretty_assertions",
+ "rand 0.10.1",
+ "ratatui",
+ "ratatui-textarea",
+ "ratatui_widget_scrolling",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "shell-words",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "unicode-width",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
