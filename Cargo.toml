@@ -6,6 +6,7 @@ members = [
     "crates/harnx-core",
     "crates/harnx-engine",
     "crates/harnx-acp",
+    "crates/harnx-fetch",
     "crates/harnx-hooks",
     "crates/harnx-mcp",
     "crates/harnx-mcp-bash",
