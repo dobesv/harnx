@@ -1,4 +1,4 @@
-use crate::hooks::{
+use crate::{
     executor::execute_command_hook, AsyncHookManager, CompiledMatcher, HookConfig, HookEvent,
     HookOutcome, HookPayload, HookResult, HookResultControl, PersistentHookManager,
 };
@@ -182,7 +182,7 @@ pub async fn dispatch_hooks_with_count_and_manager(
 #[cfg(test)]
 mod tests {
     use super::{dispatch_hooks, dispatch_hooks_with_count, dispatch_hooks_with_count_and_manager};
-    use crate::hooks::{AsyncHookManager, HookConfig, HookEvent, HookResultControl};
+    use crate::{AsyncHookManager, HookConfig, HookEvent, HookResultControl};
     use serde_json::json;
     use std::fs;
     #[cfg(unix)]
@@ -222,7 +222,7 @@ mod tests {
             .encode_utf16()
             .flat_map(|unit| unit.to_le_bytes())
             .collect();
-        crate::utils::base64_encode(utf16)
+        harnx_core::crypto::base64_encode(utf16)
     }
 
     #[cfg(unix)]

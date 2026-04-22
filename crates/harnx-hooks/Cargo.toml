@@ -9,8 +9,10 @@ repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+fancy-regex = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 inquire = { workspace = true }
+log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }

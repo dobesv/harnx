@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::hooks::{HookOutcome, HookPayload, HookResult, HookResultControl};
+use crate::{HookOutcome, HookPayload, HookResult, HookResultControl};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -243,7 +243,7 @@ fn continue_with_default() -> HookOutcome {
 #[cfg(test)]
 mod tests {
     use super::{PersistentHookManager, PersistentHookProcess};
-    use crate::hooks::{HookEvent, HookPayload, HookResultControl};
+    use crate::{HookEvent, HookPayload, HookResultControl};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -293,7 +293,7 @@ mod tests {
             .encode_utf16()
             .flat_map(|unit| unit.to_le_bytes())
             .collect();
-        crate::utils::base64_encode(utf16)
+        harnx_core::crypto::base64_encode(utf16)
     }
 
     #[cfg(unix)]

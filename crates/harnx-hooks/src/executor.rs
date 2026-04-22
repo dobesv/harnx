@@ -1,4 +1,4 @@
-use crate::hooks::{HookOutcome, HookPayload, HookResult, HookResultControl};
+use crate::{HookOutcome, HookPayload, HookResult, HookResultControl};
 
 use std::io::ErrorKind;
 use std::process::Stdio;
@@ -180,7 +180,7 @@ pub(crate) fn default_shell_arg() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{execute_command_hook, parse_success_output};
-    use crate::hooks::{HookEvent, HookPayload, HookResultControl};
+    use crate::{HookEvent, HookPayload, HookResultControl};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};

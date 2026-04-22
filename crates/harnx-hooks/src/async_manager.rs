@@ -1,5 +1,6 @@
-use crate::config::Input;
-use crate::hooks::{executor::execute_command_hook, HookPayload, HookResult};
+use harnx_core::input::Input;
+
+use crate::{executor::execute_command_hook, HookPayload, HookResult};
 
 use tokio::sync::mpsc;
 
@@ -108,7 +109,7 @@ pub fn inject_pending_async_context(input: &mut Input, pending_async_context: &m
 #[cfg(test)]
 mod tests {
     use super::AsyncHookManager;
-    use crate::hooks::{HookEvent, HookPayload};
+    use crate::{HookEvent, HookPayload};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};

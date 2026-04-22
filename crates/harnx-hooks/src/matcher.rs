@@ -1,4 +1,4 @@
-use crate::hooks::HookEvent;
+use crate::HookEvent;
 
 use anyhow::{Context, Result};
 
@@ -33,7 +33,7 @@ impl CompiledMatcher {
 #[cfg(test)]
 mod tests {
     use super::CompiledMatcher;
-    use crate::hooks::HookEvent;
+    use crate::HookEvent;
     use serde_json::json;
 
     #[test]

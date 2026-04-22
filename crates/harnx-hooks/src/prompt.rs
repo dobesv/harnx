@@ -1,4 +1,3 @@
-use crate::utils::IS_STDOUT_TERMINAL;
 use inquire::Confirm;
 use serde_json::Value;
 
@@ -6,7 +5,8 @@ use serde_json::Value;
 /// Returns `true` if the user approves, `false` if denied.
 /// In non-interactive mode (no terminal), automatically denies.
 pub fn confirm_tool_use(tool_name: &str, tool_input: &Value, reason: Option<&str>) -> bool {
-    if !*IS_STDOUT_TERMINAL {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
         return false;
     }
 

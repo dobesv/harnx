@@ -1576,6 +1576,7 @@ dependencies = [
  "harnx-client",
  "harnx-core",
  "harnx-engine",
+ "harnx-hooks",
  "harnx-mcp",
  "harnx-render",
  "hmac",
@@ -1725,6 +1726,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "harnx-hooks"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "fancy-regex 0.17.0",
+ "harnx-core",
+ "inquire",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
