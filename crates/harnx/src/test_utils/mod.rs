@@ -59,16 +59,16 @@
 
 pub mod interrupt;
 pub mod mock_acp;
-pub mod mock_client;
 pub mod mock_openai_server;
-pub mod sync;
 pub mod tmux_harness;
 pub mod tui_harness;
 
+pub use harnx_runtime::test_utils::{mock_client, sync};
+pub use harnx_runtime::test_utils::mock_client::*;
+pub use harnx_runtime::test_utils::sync::*;
+
 pub use interrupt::*;
 pub use mock_acp::*;
-pub use mock_client::*;
 pub use mock_openai_server::*;
-pub use sync::*;
 pub use tmux_harness::*;
 pub use tui_harness::*;

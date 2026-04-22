@@ -7,4 +7,5 @@
 //! Downstream front-end crates (`harnx-serve`, `harnx-acp-server`,
 //! `harnx-tui`) depend on this crate rather than on `harnx` directly.
 
+pub mod test_utils;
 pub mod utils;
