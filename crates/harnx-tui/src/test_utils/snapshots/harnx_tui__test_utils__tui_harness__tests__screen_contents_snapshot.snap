@@ -1,0 +1,13 @@
+---
+source: crates/harnx-tui/src/test_utils/tui_harness.rs
+description: Basic TUI render test
+expression: normalized
+---
+Welcome to harnx 0.30.0  •  Type .help
+for commands, Tab to complete.
+
+
+
+
+
+• Input
