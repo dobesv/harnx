@@ -2,14 +2,10 @@ mod acp;
 mod agent_event_sink;
 mod cli;
 mod cli_event_sink;
-mod client;
-mod commands;
-mod config;
 mod hooks;
 mod rag;
 mod render;
 mod serve;
-mod tool;
 mod tui;
 mod utils;
 
@@ -21,6 +17,7 @@ pub mod test_utils;
 
 pub use harnx_mcp as mcp;
 pub use harnx_mcp::safety as mcp_safety;
+pub use harnx_runtime::{client, commands, config, tool};
 
 use crate::cli::Cli;
 use crate::client::{list_models, retry::call_with_retry_and_fallback, ModelType};

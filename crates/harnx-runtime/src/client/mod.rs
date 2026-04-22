@@ -22,7 +22,6 @@ pub use message::{patch_messages, render_message_input};
 // first consults the test-client override. All call sites inside harnx
 // use `crate::client::init_client` and therefore pick up this wrapper.
 pub fn init_client(clients: &[ClientConfig], model: &Model) -> anyhow::Result<Box<dyn Client>> {
-    #[cfg(test)]
     if let Some(client) = take_test_client() {
         return Ok(Box::new(TestClient::new(client)));
     }
@@ -30,7 +29,6 @@ pub fn init_client(clients: &[ClientConfig], model: &Model) -> anyhow::Result<Bo
     harnx_client::init_client(clients, model)
 }
 
-#[cfg(test)]
 static TEST_CLIENT: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<dyn Client>>>> =
     std::sync::OnceLock::new();
 
@@ -38,18 +36,15 @@ static TEST_CLIENT: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::Arc<d
 /// AgentEvent sink). Tests that call `set_test_client`, install sinks,
 /// or create a `Tui` should acquire this lock for their entire duration.
 /// Prefer using [`TestStateGuard`] instead of acquiring this directly.
-#[cfg(test)]
 pub static TEST_CLIENT_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// RAII guard that holds [`TEST_CLIENT_LOCK`], installs a test client on
 /// creation, and clears both the client and AgentEvent sink on drop.
-#[cfg(test)]
 pub struct TestStateGuard<'a> {
     _lock: tokio::sync::MutexGuard<'a, ()>,
 }
 
-#[cfg(test)]
 impl TestStateGuard<'_> {
     /// Acquire the global test-state lock and install `client`.
     pub async fn new(client: Option<std::sync::Arc<dyn Client>>) -> TestStateGuard<'static> {
@@ -64,7 +59,6 @@ impl TestStateGuard<'_> {
     }
 }
 
-#[cfg(test)]
 impl Drop for TestStateGuard<'_> {
     fn drop(&mut self) {
         set_test_client_inner(None);
@@ -72,13 +66,11 @@ impl Drop for TestStateGuard<'_> {
     }
 }
 
-#[cfg(test)]
 fn set_test_client_inner(client: Option<std::sync::Arc<dyn Client>>) {
     let slot = TEST_CLIENT.get_or_init(|| std::sync::Mutex::new(None));
     *slot.lock().expect("test client mutex poisoned") = client;
 }
 
-#[cfg(test)]
 pub(crate) fn take_test_client() -> Option<std::sync::Arc<dyn Client>> {
     TEST_CLIENT
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -87,13 +79,11 @@ pub(crate) fn take_test_client() -> Option<std::sync::Arc<dyn Client>> {
         .clone()
 }
 
-#[cfg(test)]
 pub(crate) struct TestClient {
     inner: std::sync::Arc<dyn Client>,
     model: Model,
 }
 
-#[cfg(test)]
 impl TestClient {
     pub(crate) fn new(inner: std::sync::Arc<dyn Client>) -> Self {
         let model = inner.model().clone();
@@ -101,7 +91,6 @@ impl TestClient {
     }
 }
 
-#[cfg(test)]
 #[async_trait::async_trait]
 impl Client for TestClient {
     fn extra_config(&self) -> Option<&ExtraConfig> {

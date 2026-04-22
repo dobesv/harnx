@@ -18,7 +18,7 @@ use std::sync::Arc;
 use harnx_core::event::AgentEvent;
 use harnx_core::event::AgentEventSink;
 
-pub use harnx_core::sink::{emit_agent_event, has_agent_event_sink, install_agent_event_sink};
+pub use harnx_core::sink::{has_agent_event_sink, install_agent_event_sink};
 
 use crate::cli_event_sink::CliAgentEventSink;
 use crate::render::RenderOptions;

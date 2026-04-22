@@ -1,4 +1,4 @@
-pub(crate) mod agent;
+pub mod agent;
 pub mod input;
 pub mod session;
 
@@ -2298,7 +2298,7 @@ impl Config {
         }
     }
 
-    pub(crate) fn save_message(
+    pub fn save_message(
         &mut self,
         input: &Input,
         output: &str,
