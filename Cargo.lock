@@ -1660,6 +1660,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-acp-server"
+version = "0.30.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "futures-util",
+ "harnx-acp",
+ "harnx-core",
+ "harnx-runtime",
+ "log",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "harnx-client"
 version = "0.30.0"
 dependencies = [

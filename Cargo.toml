@@ -6,6 +6,7 @@ members = [
     "crates/harnx-core",
     "crates/harnx-engine",
     "crates/harnx-acp",
+    "crates/harnx-acp-server",
     "crates/harnx-fetch",
     "crates/harnx-hooks",
     "crates/harnx-mcp",
@@ -110,3 +111,4 @@ reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustl
 syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"], default-features = false }
 arboard = { version = "3.3.0", default-features = false }
 harnx-acp = { path = "crates/harnx-acp", version = "0.30.0" }
+harnx-acp-server = { path = "crates/harnx-acp-server", version = "0.30.0" }
