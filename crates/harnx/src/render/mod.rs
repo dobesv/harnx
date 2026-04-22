@@ -1,9 +1,6 @@
-mod markdown;
+//! Re-export shim. The real render code lives in the `harnx-render`
+//! crate — moved in Plan 42 (step 9, β+ progressive peel). Call sites
+//! like `crate::render::MarkdownRender` continue to resolve through
+//! this shim.
 
-pub use self::markdown::{MarkdownRender, RenderOptions};
-
-use crate::utils::{error_text, pretty_error};
-
-pub fn render_error(err: anyhow::Error) {
-    eprintln!("{}", error_text(&pretty_error(&err)));
-}
+pub use harnx_render::*;
