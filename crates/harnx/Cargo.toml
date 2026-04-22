@@ -84,6 +84,7 @@ harnx-fetch = { path = "../harnx-fetch" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-mcp = { path = "../harnx-mcp" }
 harnx-render = { path = "../harnx-render" }
+harnx-spinner = { path = "../harnx-spinner" }
 shellexpand = { workspace = true }
 schemars = { workspace = true }
 ratatui-textarea = { workspace = true }
