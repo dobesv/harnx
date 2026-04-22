@@ -15,6 +15,7 @@ members = [
     "crates/harnx-mcp-todo",
     "crates/harnx-rag",
     "crates/harnx-render",
+    "crates/harnx-runtime",
     "crates/harnx-spinner",
     "crates/harnx-test-bins",
 ]
