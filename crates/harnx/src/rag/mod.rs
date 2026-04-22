@@ -1,9 +1,10 @@
 use self::splitter::*;
 
 use crate::client::{
-    init_client, list_models, EmbeddingsData, EmbeddingsOutput, Model, ModelType, RerankData,
+    init_client, list_models, ClientConfig, EmbeddingsData, EmbeddingsOutput, Model, ModelType,
+    RerankData,
 };
-use crate::config::{ensure_parent_exists, GlobalConfig, TEMP_RAG_NAME};
+use crate::config::{ensure_parent_exists, TEMP_RAG_NAME};
 use crate::utils::{
     abortable_run_with_spinner, abortable_run_with_spinner_rx, expand_glob_paths, get_env_name,
     is_loader_protocol, is_url, load_file, load_protocol_path, load_recursive_url, load_url,
@@ -25,8 +26,40 @@ use serde_json::json;
 use std::{collections::HashMap, env, fmt::Debug, fs, hash::Hash, path::Path, time::Duration};
 use tokio::time::sleep;
 
+/// Per-call context for RAG operations that reach the LLM client
+/// layer (embeddings / reranking). Fields mirror `ClientCallContext`
+/// + are read fresh from the caller's live `Config` on each call so
+/// dynamic toggles (e.g. `.set dry_run true`) propagate immediately.
+pub struct RagCallContext<'a> {
+    pub user_agent: Option<&'a str>,
+    pub dry_run: bool,
+}
+
+/// Init-time context — the subset of `Config` fields `Rag` reads
+/// while building its initial state.
+pub struct RagInitContext<'a> {
+    pub clients: &'a [ClientConfig],
+    pub document_loaders: &'a HashMap<String, String>,
+    pub rag_embedding_model: Option<&'a str>,
+    pub rag_reranker_model: Option<String>,
+    pub rag_top_k: usize,
+    pub rag_chunk_size: Option<usize>,
+    pub rag_chunk_overlap: Option<usize>,
+    pub user_agent: Option<&'a str>,
+    pub dry_run: bool,
+}
+
+impl RagInitContext<'_> {
+    fn call_ctx(&self) -> RagCallContext<'_> {
+        RagCallContext {
+            user_agent: self.user_agent,
+            dry_run: self.dry_run,
+        }
+    }
+}
+
 pub struct Rag {
-    config: GlobalConfig,
+    clients: Vec<ClientConfig>,
     name: String,
     path: String,
     embedding_model: Model,
@@ -50,7 +83,7 @@ impl Debug for Rag {
 impl Clone for Rag {
     fn clone(&self) -> Self {
         Self {
-            config: self.config.clone(),
+            clients: self.clients.clone(),
             name: self.name.clone(),
             path: self.path.clone(),
             embedding_model: self.embedding_model.clone(),
@@ -64,7 +97,7 @@ impl Clone for Rag {
 
 impl Rag {
     pub async fn init(
-        config: &GlobalConfig,
+        init_ctx: &RagInitContext<'_>,
         name: &str,
         save_path: &Path,
         doc_paths: &[String],
@@ -74,28 +107,30 @@ impl Rag {
             bail!("Failed to init rag in non-interactive mode");
         }
         println!("⚙ Initializing RAG...");
-        let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(config)?;
-        let (reranker_model, top_k) = {
-            let config = config.read();
-            (config.rag_reranker_model.clone(), config.rag_top_k)
-        };
+        let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(
+            init_ctx.clients,
+            init_ctx.rag_embedding_model,
+            init_ctx.rag_chunk_size,
+            init_ctx.rag_chunk_overlap,
+        )?;
         let data = RagData::new(
             embedding_model.id(),
             chunk_size,
             chunk_overlap,
-            reranker_model,
-            top_k,
+            init_ctx.rag_reranker_model.clone(),
+            init_ctx.rag_top_k,
             embedding_model.max_batch_size(),
         );
-        let mut rag = Self::create(config, name, save_path, data)?;
+        let mut rag = Self::create(init_ctx.clients, name, save_path, data)?;
         let mut paths = doc_paths.to_vec();
         if paths.is_empty() {
             paths = add_documents()?;
         };
-        let loaders = config.read().document_loaders.clone();
+        let loaders = init_ctx.document_loaders.clone();
+        let call_ctx = init_ctx.call_ctx();
         let (spinner, spinner_rx) = Spinner::create("");
         abortable_run_with_spinner_rx(
-            rag.sync_documents(&paths, true, loaders, Some(spinner)),
+            rag.sync_documents(&paths, true, loaders, &call_ctx, Some(spinner)),
             spinner_rx,
             abort_signal,
         )
@@ -106,23 +141,25 @@ impl Rag {
         Ok(rag)
     }
 
-    pub fn load(config: &GlobalConfig, name: &str, path: &Path) -> Result<Self> {
+    pub fn load(clients: &[ClientConfig], name: &str, path: &Path) -> Result<Self> {
         let err = || format!("Failed to load rag '{name}' at '{}'", path.display());
         let content = fs::read_to_string(path).with_context(err)?;
         let data: RagData = serde_yaml::from_str(&content).with_context(err)?;
-        Self::create(config, name, path, data)
+        Self::create(clients, name, path, data)
     }
 
-    pub fn create(config: &GlobalConfig, name: &str, path: &Path, data: RagData) -> Result<Self> {
+    pub fn create(
+        clients: &[ClientConfig],
+        name: &str,
+        path: &Path,
+        data: RagData,
+    ) -> Result<Self> {
         let hnsw = data.build_hnsw();
         let bm25 = data.build_bm25();
-        let embedding_model = crate::client::retrieve_model(
-            &config.read().clients,
-            &data.embedding_model,
-            ModelType::Embedding,
-        )?;
+        let embedding_model =
+            crate::client::retrieve_model(clients, &data.embedding_model, ModelType::Embedding)?;
         let rag = Rag {
-            config: config.clone(),
+            clients: clients.to_vec(),
             name: name.to_string(),
             path: path.display().to_string(),
             data,
@@ -142,13 +179,14 @@ impl Rag {
         &mut self,
         document_paths: &[String],
         refresh: bool,
-        config: &GlobalConfig,
+        document_loaders: &HashMap<String, String>,
+        call_ctx: &RagCallContext<'_>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
-        let loaders = config.read().document_loaders.clone();
+        let loaders = document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         abortable_run_with_spinner_rx(
-            self.sync_documents(document_paths, refresh, loaders, Some(spinner)),
+            self.sync_documents(document_paths, refresh, loaders, call_ctx, Some(spinner)),
             spinner_rx,
             abort_signal,
         )
@@ -159,42 +197,36 @@ impl Rag {
         Ok(())
     }
 
-    pub fn create_config(config: &GlobalConfig) -> Result<(Model, usize, usize)> {
-        let (embedding_model_id, chunk_size, chunk_overlap) = {
-            let config = config.read();
-            (
-                config.rag_embedding_model.clone(),
-                config.rag_chunk_size,
-                config.rag_chunk_overlap,
-            )
-        };
-        let embedding_model_id = match embedding_model_id {
+    pub fn create_config(
+        clients: &[ClientConfig],
+        rag_embedding_model: Option<&str>,
+        rag_chunk_size: Option<usize>,
+        rag_chunk_overlap: Option<usize>,
+    ) -> Result<(Model, usize, usize)> {
+        let embedding_model_id = match rag_embedding_model {
             Some(value) => {
                 println!("Select embedding model: {value}");
-                value
+                value.to_string()
             }
             None => {
-                let models = list_models(&config.read().clients, ModelType::Embedding);
+                let models = list_models(clients, ModelType::Embedding);
                 if models.is_empty() {
                     bail!("No available embedding model");
                 }
                 select_embedding_model(&models)?
             }
         };
-        let embedding_model = crate::client::retrieve_model(
-            &config.read().clients,
-            &embedding_model_id,
-            ModelType::Embedding,
-        )?;
+        let embedding_model =
+            crate::client::retrieve_model(clients, &embedding_model_id, ModelType::Embedding)?;
 
-        let chunk_size = match chunk_size {
+        let chunk_size = match rag_chunk_size {
             Some(value) => {
                 println!("Set chunk size: {value}");
                 value
             }
             None => set_chunk_size(&embedding_model)?,
         };
-        let chunk_overlap = match chunk_overlap {
+        let chunk_overlap = match rag_chunk_overlap {
             Some(value) => {
                 println!("Set chunk overlay: {value}");
                 value
@@ -307,13 +339,14 @@ impl Rag {
 
     pub async fn search(
         &self,
+        call_ctx: &RagCallContext<'_>,
         text: &str,
         top_k: usize,
         rerank_model: Option<&str>,
         abort_signal: AbortSignal,
     ) -> Result<(String, Vec<DocumentId>)> {
         let ret = abortable_run_with_spinner(
-            self.hybird_search(text, top_k, rerank_model),
+            self.hybird_search(call_ctx, text, top_k, rerank_model),
             "Searching",
             abort_signal,
         )
@@ -328,6 +361,7 @@ impl Rag {
         paths: &[String],
         refresh: bool,
         loaders: HashMap<String, String>,
+        call_ctx: &RagCallContext<'_>,
         spinner: Option<Spinner>,
     ) -> Result<()> {
         if let Some(spinner) = &spinner {
@@ -499,7 +533,7 @@ impl Rag {
 
             let embeddings_data = EmbeddingsData::new(texts, false);
             embeddings = self
-                .create_embeddings(embeddings_data, spinner.clone())
+                .create_embeddings(embeddings_data, call_ctx, spinner.clone())
                 .await?;
         }
 
@@ -521,12 +555,13 @@ impl Rag {
 
     async fn hybird_search(
         &self,
+        call_ctx: &RagCallContext<'_>,
         query: &str,
         top_k: usize,
         rerank_model: Option<&str>,
     ) -> Result<Vec<(DocumentId, String)>> {
         let (vector_search_results, keyword_search_results) = tokio::join!(
-            self.vector_search(query, top_k, 0.0),
+            self.vector_search(call_ctx, query, top_k, 0.0),
             self.keyword_search(query, top_k, 0.0),
         );
 
@@ -542,12 +577,9 @@ impl Rag {
 
         let ids = match rerank_model {
             Some(model_id) => {
-                let model = crate::client::retrieve_model(
-                    &self.config.read().clients,
-                    model_id,
-                    ModelType::Reranker,
-                )?;
-                let client = init_client(&self.config.read().clients, &model)?;
+                let model =
+                    crate::client::retrieve_model(&self.clients, model_id, ModelType::Reranker)?;
+                let client = init_client(&self.clients, &model)?;
                 let ids: IndexSet<DocumentId> = [vector_search_ids, keyword_search_ids]
                     .concat()
                     .into_iter()
@@ -561,13 +593,9 @@ impl Rag {
                     }
                 }
                 let data = RerankData::new(query.to_string(), documents, top_k);
-                let (dry_run, user_agent) = {
-                    let cfg = self.config.read();
-                    (cfg.dry_run, cfg.user_agent.clone())
-                };
                 let ctx = crate::client::ClientCallContext {
-                    user_agent: user_agent.as_deref(),
-                    dry_run,
+                    user_agent: call_ctx.user_agent,
+                    dry_run: call_ctx.dry_run,
                 };
                 let list = client
                     .rerank(&data, &ctx)
@@ -603,6 +631,7 @@ impl Rag {
 
     async fn vector_search(
         &self,
+        call_ctx: &RagCallContext<'_>,
         query: &str,
         top_k: usize,
         min_score: f32,
@@ -614,7 +643,9 @@ impl Rag {
         );
         let texts = splitter.split_text(query);
         let embeddings_data = EmbeddingsData::new(texts, true);
-        let embeddings = self.create_embeddings(embeddings_data, None).await?;
+        let embeddings = self
+            .create_embeddings(embeddings_data, call_ctx, None)
+            .await?;
         let output = self
             .hnsw
             .parallel_search(&embeddings, top_k, 30)
@@ -659,16 +690,13 @@ impl Rag {
     async fn create_embeddings(
         &self,
         data: EmbeddingsData,
+        call_ctx: &RagCallContext<'_>,
         spinner: Option<Spinner>,
     ) -> Result<EmbeddingsOutput> {
-        let embedding_client = init_client(&self.config.read().clients, &self.embedding_model)?;
-        let (dry_run, user_agent) = {
-            let cfg = self.config.read();
-            (cfg.dry_run, cfg.user_agent.clone())
-        };
+        let embedding_client = init_client(&self.clients, &self.embedding_model)?;
         let ctx = crate::client::ClientCallContext {
-            user_agent: user_agent.as_deref(),
-            dry_run,
+            user_agent: call_ctx.user_agent,
+            dry_run: call_ctx.dry_run,
         };
         let EmbeddingsData { texts, query } = data;
         let batch_size = self
