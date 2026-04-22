@@ -12,6 +12,8 @@ pub use harnx_core::macros::{Macro, MacroVariable};
 pub use harnx_core::model::ModelsOverride;
 pub use harnx_core::working_mode::WorkingMode;
 
+use harnx_core::config_paths as paths;
+
 use crate::acp::{AcpManager, AcpServerConfig};
 use crate::client::{
     create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
@@ -53,17 +55,6 @@ pub const TEMP_SESSION_NAME: &str = "temp";
 /// Monokai Extended
 const DARK_THEME: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bin");
 const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.theme.bin");
-
-const CONFIG_FILE_NAME: &str = "config.yaml";
-const MACROS_DIR_NAME: &str = "macros";
-const ENV_FILE_NAME: &str = ".env";
-const MESSAGES_FILE_NAME: &str = "messages.md";
-const SESSIONS_DIR_NAME: &str = "sessions";
-const RAGS_DIR_NAME: &str = "rags";
-const AGENTS_DIR_NAME: &str = "agents";
-const CLIENTS_DIR_NAME: &str = "clients";
-const MCP_SERVERS_DIR_NAME: &str = "mcp_servers";
-const ACP_SERVERS_DIR_NAME: &str = "acp_servers";
 
 const SERVE_ADDR: &str = "127.0.0.1:8000";
 
@@ -521,126 +512,84 @@ impl Config {
     }
 
     pub fn config_dir() -> PathBuf {
-        if let Ok(v) = env::var(get_env_name("config_dir")) {
-            PathBuf::from(v)
-        } else if let Ok(v) = env::var("XDG_CONFIG_HOME") {
-            PathBuf::from(v).join(env!("CARGO_CRATE_NAME"))
-        } else {
-            let dir = dirs::config_dir().expect("No user's config directory");
-            dir.join(env!("CARGO_CRATE_NAME"))
-        }
+        paths::config_dir()
     }
 
     pub fn local_path(name: &str) -> PathBuf {
-        Self::config_dir().join(name)
+        paths::local_path(name)
     }
 
     pub fn config_file() -> PathBuf {
-        match env::var(get_env_name("config_file")) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::local_path(CONFIG_FILE_NAME),
-        }
+        paths::config_file()
     }
 
     pub fn macros_dir() -> PathBuf {
-        match env::var(get_env_name("macros_dir")) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::local_path(MACROS_DIR_NAME),
-        }
+        paths::macros_dir()
     }
 
+    #[allow(dead_code)]
     pub fn config_dir_path() -> PathBuf {
-        Self::config_file()
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(Self::config_dir)
+        paths::config_dir_path()
     }
 
     pub fn clients_dir() -> PathBuf {
-        Self::config_dir_path().join(CLIENTS_DIR_NAME)
+        paths::clients_dir()
     }
 
     pub fn mcp_servers_dir() -> PathBuf {
-        Self::config_dir_path().join(MCP_SERVERS_DIR_NAME)
+        paths::mcp_servers_dir()
     }
 
     pub fn acp_servers_dir() -> PathBuf {
-        Self::config_dir_path().join(ACP_SERVERS_DIR_NAME)
+        paths::acp_servers_dir()
     }
 
     pub fn macro_file(name: &str) -> PathBuf {
-        Self::macros_dir().join(format!("{name}.yaml"))
+        paths::macro_file(name)
     }
 
     pub fn env_file() -> PathBuf {
-        match env::var(get_env_name("env_file")) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::local_path(ENV_FILE_NAME),
-        }
+        paths::env_file()
     }
 
     pub fn messages_file(&self) -> PathBuf {
-        match &self.agent {
-            None => match env::var(get_env_name("messages_file")) {
-                Ok(value) => PathBuf::from(value),
-                Err(_) => Self::local_path(MESSAGES_FILE_NAME),
-            },
-            Some(agent) => Self::agent_data_dir(agent.name()).join(MESSAGES_FILE_NAME),
-        }
+        paths::messages_file(self.agent.as_ref().map(|a| a.name()))
     }
 
     pub fn sessions_dir(&self) -> PathBuf {
-        match &self.agent {
-            None => match env::var(get_env_name("sessions_dir")) {
-                Ok(value) => PathBuf::from(value),
-                Err(_) => Self::local_path(SESSIONS_DIR_NAME),
-            },
-            Some(agent) => Self::agent_data_dir(agent.name()).join(SESSIONS_DIR_NAME),
-        }
+        paths::sessions_dir(self.agent.as_ref().map(|a| a.name()))
     }
 
     pub fn rags_dir() -> PathBuf {
-        match env::var(get_env_name("rags_dir")) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::local_path(RAGS_DIR_NAME),
-        }
+        paths::rags_dir()
     }
 
     pub fn session_file(&self, name: &str) -> PathBuf {
-        match name.split_once("/") {
-            Some((dir, name)) => self.sessions_dir().join(dir).join(format!("{name}.yaml")),
-            None => self.sessions_dir().join(format!("{name}.yaml")),
-        }
+        paths::session_file(self.agent.as_ref().map(|a| a.name()), name)
     }
 
     pub fn rag_file(&self, name: &str) -> PathBuf {
-        match &self.agent {
-            Some(agent) => Self::agent_rag_file(agent.name(), name),
-            None => Self::rags_dir().join(format!("{name}.yaml")),
-        }
+        paths::rag_file(self.agent.as_ref().map(|a| a.name()), name)
     }
 
     pub fn agents_data_dir() -> PathBuf {
-        Self::local_path(AGENTS_DIR_NAME)
+        paths::agents_data_dir()
     }
 
     pub fn agent_data_dir(name: &str) -> PathBuf {
-        match env::var(format!("{}_DATA_DIR", normalize_env_name(name))) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => Self::agents_data_dir().join(name),
-        }
+        paths::agent_data_dir(name)
     }
 
     pub fn agent_rag_file(agent_name: &str, rag_name: &str) -> PathBuf {
-        Self::agent_data_dir(agent_name).join(format!("{rag_name}.yaml"))
+        paths::agent_rag_file(agent_name, rag_name)
     }
 
     pub fn agent_file(name: &str) -> PathBuf {
-        Self::agents_data_dir().join(format!("{name}.md"))
+        paths::agent_file(name)
     }
 
     pub fn models_override_file() -> PathBuf {
-        Self::local_path("models-override.yaml")
+        paths::models_override_file()
     }
 
     pub fn state(&self) -> StateFlags {
@@ -2245,7 +2194,7 @@ impl Config {
             }
         } else if cmd == ".agent" {
             if args.len() == 2 {
-                let dir = Self::agent_data_dir(args[0]).join(SESSIONS_DIR_NAME);
+                let dir = Self::agent_data_dir(args[0]).join(paths::SESSIONS_DIR_NAME);
                 values = list_file_names(dir, ".yaml")
                     .into_iter()
                     .map(|v| (v, None))
@@ -2556,11 +2505,11 @@ impl Config {
             Self::default()
         };
         let config_dir = config_path.parent().unwrap_or(config_path);
-        config.clients = Self::load_clients_from_dir(&config_dir.join(CLIENTS_DIR_NAME))?;
+        config.clients = Self::load_clients_from_dir(&config_dir.join(paths::CLIENTS_DIR_NAME))?;
         config.mcp_servers =
-            Self::load_mcp_servers_from_dir(&config_dir.join(MCP_SERVERS_DIR_NAME))?;
+            Self::load_mcp_servers_from_dir(&config_dir.join(paths::MCP_SERVERS_DIR_NAME))?;
         config.acp_servers =
-            Self::load_acp_servers_from_dir(&config_dir.join(ACP_SERVERS_DIR_NAME))?;
+            Self::load_acp_servers_from_dir(&config_dir.join(paths::ACP_SERVERS_DIR_NAME))?;
         Self::auto_register_agents(&mut config.acp_servers)?;
         Ok(config)
     }
@@ -2695,9 +2644,9 @@ impl Config {
 
         let config_dir = Self::config_dir();
         config.mcp_servers =
-            Self::load_mcp_servers_from_dir(&config_dir.join(MCP_SERVERS_DIR_NAME))?;
+            Self::load_mcp_servers_from_dir(&config_dir.join(paths::MCP_SERVERS_DIR_NAME))?;
         config.acp_servers =
-            Self::load_acp_servers_from_dir(&config_dir.join(ACP_SERVERS_DIR_NAME))?;
+            Self::load_acp_servers_from_dir(&config_dir.join(paths::ACP_SERVERS_DIR_NAME))?;
         Self::auto_register_agents(&mut config.acp_servers)?;
         Ok(config)
     }
@@ -3118,7 +3067,7 @@ async fn create_config_file(config_path: &Path) -> Result<()> {
     let clients_dir = config_path
         .parent()
         .unwrap_or(config_path)
-        .join(CLIENTS_DIR_NAME);
+        .join(paths::CLIENTS_DIR_NAME);
     tokio::fs::create_dir_all(&clients_dir)
         .await
         .with_context(|| format!("Failed to create '{}'", clients_dir.display()))?;
