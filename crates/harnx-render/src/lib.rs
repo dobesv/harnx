@@ -10,6 +10,25 @@ pub fn render_error(err: anyhow::Error) {
     eprintln!("{}", error_text(&pretty_error(&err)));
 }
 
+/// Built-in Monokai Extended theme bytes — bincode-legacy-encoded
+/// `syntect::highlighting::Theme`. Use [`load_builtin_theme`] to decode.
+const DARK_THEME_BYTES: &[u8] = include_bytes!("../assets/monokai-extended.theme.bin");
+const LIGHT_THEME_BYTES: &[u8] = include_bytes!("../assets/monokai-extended-light.theme.bin");
+
+/// Decode the built-in Monokai Extended theme (light or dark variant).
+/// Pairs with [`MarkdownRender`]'s `theme: Option<Theme>` field — callers
+/// that want the default harnx look-and-feel decode this once at startup
+/// and pass it into `RenderOptions`.
+pub fn load_builtin_theme(light: bool) -> anyhow::Result<syntect::highlighting::Theme> {
+    use anyhow::Context;
+    let (bytes, label) = if light {
+        (LIGHT_THEME_BYTES, "light")
+    } else {
+        (DARK_THEME_BYTES, "dark")
+    };
+    decode_bin(bytes).with_context(|| format!("Invalid builtin {label} theme"))
+}
+
 /// Inlined from `harnx::utils::decode_bin` — bincode-legacy decode for
 /// the bundled `syntaxes.bin` and any other embedded binary assets.
 /// Duplicated here to keep harnx-core free of the bincode dep.

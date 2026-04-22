@@ -51,10 +51,6 @@ use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
 pub use harnx_rag::TEMP_RAG_NAME;
 pub const TEMP_SESSION_NAME: &str = "temp";
 
-/// Monokai Extended
-const DARK_THEME: &[u8] = include_bytes!("../../../harnx/assets/monokai-extended.theme.bin");
-const LIGHT_THEME: &[u8] = include_bytes!("../../../harnx/assets/monokai-extended-light.theme.bin");
-
 const SERVE_ADDR: &str = "127.0.0.1:8000";
 
 const SYNC_MODELS_URL: &str =
@@ -2212,12 +2208,7 @@ impl Config {
                     .with_context(|| format!("Invalid theme at '{}'", theme_path.display()))?;
                 Some(theme)
             } else {
-                let theme = if self.light_theme() {
-                    decode_bin(LIGHT_THEME).context("Invalid builtin light theme")?
-                } else {
-                    decode_bin(DARK_THEME).context("Invalid builtin dark theme")?
-                };
-                Some(theme)
+                Some(harnx_render::load_builtin_theme(self.light_theme())?)
             }
         } else {
             None
