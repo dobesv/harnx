@@ -35,10 +35,13 @@ pub fn emit_agent_event(event: AgentEvent) -> bool {
 }
 
 pub fn emit_agent_event_with_source(event: AgentEvent, source: Option<AgentSource>) -> bool {
-    let guard = AGENT_EVENT_SINK
-        .lock()
-        .expect("AGENT_EVENT_SINK mutex poisoned");
-    match guard.as_ref() {
+    let sink = {
+        let guard = AGENT_EVENT_SINK
+            .lock()
+            .expect("AGENT_EVENT_SINK mutex poisoned");
+        guard.as_ref().cloned()
+    };
+    match sink {
         Some(sink) => {
             sink.emit(event, source);
             true
