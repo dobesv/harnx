@@ -16,8 +16,8 @@ use harnx_core::event::{
     AgentEvent, AgentEventSink, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, TurnEvent,
 };
 
-use crate::render::{MarkdownRender, RenderOptions};
-use crate::utils::{dimmed_text, spawn_spinner, warning_text, Spinner, IS_STDOUT_TERMINAL};
+use harnx_render::{MarkdownRender, RenderOptions};
+use harnx_runtime::utils::{dimmed_text, spawn_spinner, warning_text, Spinner, IS_STDOUT_TERMINAL};
 
 /// Stderr-bound sink for the non-interactive CLI. Thread-safe — interior
 /// state is held behind an `Arc<Mutex<CliSinkState>>` so multiple clones

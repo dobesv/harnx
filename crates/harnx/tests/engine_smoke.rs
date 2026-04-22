@@ -27,7 +27,7 @@ impl ProxySink {
         Self {
             inner: harnx::cli_event_sink::CliAgentEventSink::new(
                 false,
-                harnx::render::RenderOptions::default(),
+                harnx_render::RenderOptions::default(),
             ),
             recorded: Arc::new(Mutex::new(vec![])),
         }

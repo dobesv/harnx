@@ -2,11 +2,7 @@ mod acp;
 mod agent_event_sink;
 mod cli;
 mod cli_event_sink;
-mod hooks;
-mod render;
 mod serve;
-use harnx_tui as tui;
-mod utils;
 
 #[macro_use]
 extern crate log;
@@ -17,6 +13,7 @@ pub mod test_utils;
 pub use harnx_mcp as mcp;
 pub use harnx_mcp::safety as mcp_safety;
 pub use harnx_runtime::{client, commands, config, tool};
+pub use harnx_tui as tui;
 
 use crate::cli::Cli;
 use crate::client::{list_models, retry::call_with_retry_and_fallback, ModelType};
@@ -24,14 +21,14 @@ use crate::config::{
     ensure_parent_exists, list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
     WorkingMode, TEMP_SESSION_NAME,
 };
-use crate::hooks::{
+use crate::tui::Tui;
+use harnx_hooks::{
     dispatch_hooks_with_count_and_manager, dispatch_hooks_with_managers, drain_async_results,
     inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
     PersistentHookManager,
 };
-use crate::render::render_error;
-use crate::tui::Tui;
-use crate::utils::*;
+use harnx_render::render_error;
+use harnx_runtime::utils::*;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -376,7 +373,7 @@ async fn acp_server_main(config: GlobalConfig, agent_name: String) -> Result<()>
     Ok(())
 }
 
-fn hook_dispatch_context(config: &GlobalConfig) -> (crate::hooks::HooksConfig, String, PathBuf) {
+fn hook_dispatch_context(config: &GlobalConfig) -> (harnx_hooks::HooksConfig, String, PathBuf) {
     let config = config.read();
     (
         config.resolved_hooks(),

@@ -20,7 +20,7 @@ use std::sync::Arc;
 pub use harnx_core::sink::{has_agent_event_sink, install_agent_event_sink};
 
 use crate::cli_event_sink::CliAgentEventSink;
-use crate::render::RenderOptions;
+use harnx_render::RenderOptions;
 
 /// Install the stderr-backed `CliAgentEventSink`. Used by the CLI
 /// (`Cmd`) working mode at process startup. Takes a `highlight` flag
