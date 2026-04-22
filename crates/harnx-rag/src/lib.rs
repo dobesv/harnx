@@ -14,9 +14,11 @@ use harnx_client::{
 use harnx_core::abort::AbortSignal;
 use harnx_core::config_paths::get_env_name;
 use harnx_core::crypto::sha256;
+use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::path::{
     ensure_parent_exists, expand_glob_paths, resolve_home_dir, to_absolute_path,
 };
+use harnx_core::sink::emit_agent_event;
 use harnx_fetch::{
     is_loader_protocol, load_file, load_protocol_path, load_recursive_url, load_url,
     DocumentMetadata, LoadedDocument, DEFAULT_EXTENSION, EXTENSION_METADATA,
@@ -66,6 +68,20 @@ fn warning_text(input: &str) -> String {
         .fg(nu_ansi_term::Color::Yellow)
         .paint(input)
         .to_string()
+}
+
+fn emit_info(msg: String) {
+    let event = AgentEvent::Notice(NoticeEvent::Info(msg.clone()));
+    if !emit_agent_event(event) {
+        println!("{msg}");
+    }
+}
+
+fn emit_warning(msg: String) {
+    let event = AgentEvent::Notice(NoticeEvent::Warning(msg.clone()));
+    if !emit_agent_event(event) {
+        println!("{}", warning_text(&msg));
+    }
 }
 
 fn is_url(path: &str) -> bool {
@@ -152,7 +168,7 @@ impl Rag {
         if !is_stdout_terminal() {
             bail!("Failed to init rag in non-interactive mode");
         }
-        println!("⚙ Initializing RAG...");
+        emit_info("⚙ Initializing RAG...".to_string());
         let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(
             init_ctx.clients,
             init_ctx.rag_embedding_model,
@@ -182,7 +198,7 @@ impl Rag {
         )
         .await?;
         if rag.save()? {
-            println!("✓ Saved RAG to '{}'.", save_path.display());
+            emit_info(format!("✓ Saved RAG to '{}'.", save_path.display()));
         }
         Ok(rag)
     }
@@ -237,7 +253,7 @@ impl Rag {
         )
         .await?;
         if self.save()? {
-            println!("✓ Saved rag to '{}'.", self.path);
+            emit_info(format!("✓ Saved rag to '{}'.", self.path));
         }
         Ok(())
     }
@@ -250,7 +266,7 @@ impl Rag {
     ) -> Result<(Model, usize, usize)> {
         let embedding_model_id = match rag_embedding_model {
             Some(value) => {
-                println!("Select embedding model: {value}");
+                emit_info(format!("Select embedding model: {value}"));
                 value.to_string()
             }
             None => {
@@ -265,14 +281,14 @@ impl Rag {
 
         let chunk_size = match rag_chunk_size {
             Some(value) => {
-                println!("Set chunk size: {value}");
+                emit_info(format!("Set chunk size: {value}"));
                 value
             }
             None => set_chunk_size(&embedding_model)?,
         };
         let chunk_overlap = match rag_chunk_overlap {
             Some(value) => {
-                println!("Set chunk overlay: {value}");
+                emit_info(format!("Set chunk overlay: {value}"));
                 value
             }
             None => {
@@ -468,12 +484,12 @@ impl Rag {
         let mut index = 0;
         let total = recursive_urls.len() + urls.len() + protocol_paths.len() + local_paths.len();
         let handle_error = |error: anyhow::Error, has_error: &mut bool| {
-            println!("{}", warning_text(&format!("⚠️ {error}")));
+            emit_warning(format!("⚠️ {error}"));
             *has_error = true;
         };
         for start_url in recursive_urls {
             index += 1;
-            println!("Load {start_url}** [{index}/{total}]");
+            emit_info(format!("Load {start_url}** [{index}/{total}]"));
             match load_recursive_url(&loaders, &start_url).await {
                 Ok(v) => loaded_documents.extend(v),
                 Err(err) => handle_error(err, &mut has_error),
@@ -481,7 +497,7 @@ impl Rag {
         }
         for url in urls {
             index += 1;
-            println!("Load {url} [{index}/{total}]");
+            emit_info(format!("Load {url} [{index}/{total}]"));
             match load_url(&loaders, &url).await {
                 Ok(v) => loaded_documents.push(v),
                 Err(err) => handle_error(err, &mut has_error),
@@ -489,7 +505,7 @@ impl Rag {
         }
         for protocol_path in protocol_paths {
             index += 1;
-            println!("Load {protocol_path} [{index}/{total}]");
+            emit_info(format!("Load {protocol_path} [{index}/{total}]"));
             match load_protocol_path(&loaders, &protocol_path) {
                 Ok(v) => loaded_documents.extend(v),
                 Err(err) => handle_error(err, &mut has_error),
@@ -497,7 +513,7 @@ impl Rag {
         }
         for local_path in local_paths {
             index += 1;
-            println!("Load {local_path} [{index}/{total}]");
+            emit_info(format!("Load {local_path} [{index}/{total}]"));
             match load_file(&loaders, &local_path).await {
                 Ok(v) => loaded_documents.push(v),
                 Err(err) => handle_error(err, &mut has_error),

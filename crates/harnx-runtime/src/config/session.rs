@@ -312,7 +312,7 @@ pub fn exit(session: &mut Session, session_dir: &Path, is_tui: bool) -> Result<(
         // Nothing new to persist, but print the path if the log file exists.
         if is_tui {
             if let Some(path) = &session.path {
-                println!("✓ Session saved at '{path}'.");
+                crate::utils::emit_info(format!("✓ Session saved at '{path}'."));
             }
         }
         return Ok(());
@@ -419,7 +419,10 @@ pub fn save(
     })?;
 
     if is_tui {
-        println!("✓ Saved the session to '{}'.", session_path.display());
+        crate::utils::emit_info(format!(
+            "✓ Saved the session to '{}'.",
+            session_path.display()
+        ));
     }
 
     if session.name() != session_name {

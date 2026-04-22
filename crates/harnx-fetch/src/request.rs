@@ -1,7 +1,30 @@
 use crate::command::{run_loader_command, temp_file};
 use crate::utils::{error_text, html_to_md, pretty_error, warning_text};
 use harnx_core::crypto::base64_encode;
+use harnx_core::event::{AgentEvent, NoticeEvent};
 use harnx_core::path::get_patch_extension;
+use harnx_core::sink::emit_agent_event;
+
+fn emit_info(msg: String) {
+    let event = AgentEvent::Notice(NoticeEvent::Info(msg.clone()));
+    if !emit_agent_event(event) {
+        println!("{msg}");
+    }
+}
+
+fn emit_warning(msg: String) {
+    let event = AgentEvent::Notice(NoticeEvent::Warning(msg.clone()));
+    if !emit_agent_event(event) {
+        println!("{}", warning_text(&msg));
+    }
+}
+
+fn emit_error(msg: String) {
+    let event = AgentEvent::Notice(NoticeEvent::Error(msg.clone()));
+    if !emit_agent_event(event) {
+        println!("{}", error_text(&msg));
+    }
+}
 
 use anyhow::{anyhow, bail, Context, Result};
 use fancy_regex::Regex;
@@ -149,7 +172,7 @@ pub async fn fetch_with_loaders(
                     save_file.write_all(&chunk).await?;
                 }
                 let contents = if size == 0 {
-                    println!("{}", warning_text(&format!("No content at '{path}'")));
+                    emit_warning(format!("No content at '{path}'"));
                     String::new()
                 } else {
                     run_loader_command(&save_path, &extension, loader_command)?
@@ -218,11 +241,11 @@ pub async fn crawl_website(start_url: &str, options: CrawlOptions) -> Result<Vec
     let mut paths = vec![start_url.path().to_string()];
     let normalized_start_url = normalize_start_url(&start_url);
     if !options.no_log {
-        println!(
+        emit_info(format!(
             "Start crawling url={start_url} exclude={} extract={}",
             options.exclude.join(","),
             options.extract.as_deref().unwrap_or_default()
-        );
+        ));
     }
 
     if let Ok(true) = GITHUB_REPO_RE.is_match(start_url.as_str()) {
@@ -271,7 +294,7 @@ pub async fn crawl_website(start_url: &str, options: CrawlOptions) -> Result<Vec
             match res {
                 Ok((path, text, links)) => {
                     if !options.no_log {
-                        println!("Crawled {path}");
+                        emit_info(format!("Crawled {path}"));
                     }
                     if !text.is_empty() {
                         result_pages.push(Page { path, text });
@@ -286,7 +309,7 @@ pub async fn crawl_website(start_url: &str, options: CrawlOptions) -> Result<Vec
                     if BREAK_ON_ERROR {
                         return Err(err);
                     } else if !options.no_log {
-                        println!("{}", error_text(&pretty_error(&err)));
+                        emit_error(pretty_error(&err));
                     }
                 }
             }

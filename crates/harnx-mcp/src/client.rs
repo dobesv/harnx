@@ -719,12 +719,18 @@ impl McpManager {
                 let client = client.clone();
                 async move {
                     if let Err(err) = client.connect().await {
-                        eprintln!(
-                            "Warning: MCP server '{}' failed to connect: {}. Use '.mcp connect {}' to retry.",
+                        let msg = format!(
+                            "MCP server '{}' failed to connect: {}. Use '.mcp connect {}' to retry.",
                             client.name(),
                             err,
                             client.name(),
                         );
+                        let event = harnx_core::event::AgentEvent::Notice(
+                            harnx_core::event::NoticeEvent::Warning(msg.clone()),
+                        );
+                        if !harnx_core::sink::emit_agent_event(event) {
+                            eprintln!("Warning: {msg}");
+                        }
                         log::warn!(
                             "MCP server '{}' connection failed: {}",
                             client.name(),

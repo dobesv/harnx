@@ -1032,7 +1032,7 @@ impl Config {
             edit_file(&editor, &agent_path)
         })?;
         if self.working_mode.is_tui() {
-            println!("✓ Saved the agent to '{}'.", agent_path.display());
+            crate::utils::emit_info(format!("✓ Saved the agent to '{}'.", agent_path.display()));
         }
         Ok(())
     }
@@ -1077,7 +1077,10 @@ impl Config {
             })?;
             agent.set_name(&agent_name);
             if self.working_mode.is_tui() {
-                println!("✓ Saved the agent to '{}'.", agent_path.display());
+                crate::utils::emit_info(format!(
+                    "✓ Saved the agent to '{}'.",
+                    agent_path.display()
+                ));
             }
         }
 
@@ -1352,7 +1355,10 @@ impl Config {
         } else {
             nu_ansi_term::Color::DarkGray
         };
-        print!("\n📢 {}\n", color.italic().paint("Compacting the session."),);
+        crate::utils::emit_info(format!(
+            "📢 {}",
+            color.italic().paint("Compacting the session.")
+        ));
         tokio::spawn(async move {
             if let Err(err) = Config::compact_session(&config).await {
                 warn!("Failed to compact the session: {err}");
@@ -1441,7 +1447,10 @@ impl Config {
         } else {
             nu_ansi_term::Color::DarkGray
         };
-        print!("\n📢 {}\n", color.italic().paint("Autonaming the session."),);
+        crate::utils::emit_info(format!(
+            "📢 {}",
+            color.italic().paint("Autonaming the session.")
+        ));
         tokio::spawn(async move {
             if let Err(err) = Config::autoname_session(&config).await {
                 warn!("Failed to autonaming the session: {err}");

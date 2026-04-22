@@ -8,6 +8,26 @@ pub use harnx_core::abort::{
     create_abort_signal, wait_abort_signal, AbortSignal, AbortSignalInner,
 };
 pub use harnx_core::crypto::{base64_encode, sha256};
+
+/// Emit a user-facing Info notice through the process-wide `AgentEventSink`,
+/// falling back to stdout if no sink is installed (e.g. unit tests).
+pub fn emit_info(msg: String) {
+    let event =
+        harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(msg.clone()));
+    if !harnx_core::sink::emit_agent_event(event) {
+        println!("{msg}");
+    }
+}
+
+/// Emit a user-facing Warning notice, falling back to stderr if no sink is
+/// installed.
+pub fn emit_warning(msg: String) {
+    let event =
+        harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Warning(msg.clone()));
+    if !harnx_core::sink::emit_agent_event(event) {
+        eprintln!("{}", warning_text(&msg));
+    }
+}
 pub use harnx_core::path::{
     expand_glob_paths, get_patch_extension, list_file_names, resolve_home_dir, safe_join_path,
     to_absolute_path,

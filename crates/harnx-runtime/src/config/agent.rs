@@ -336,7 +336,7 @@ pub fn init_agent_variables(
                 }
                 if *IS_STDOUT_TERMINAL {
                     if !printed {
-                        println!("⚙ Init agent variables...");
+                        crate::utils::emit_info("⚙ Init agent variables...".to_string());
                         printed = true;
                     }
                     let value = Text::new(&format!(
