@@ -29,6 +29,7 @@ pub struct HarnxAgent {
 
 #[derive(Clone)]
 struct HarnxSession {
+    #[allow(dead_code)]
     id: String,
     abort_signal: AbortSignal,
     /// Fires when the session receives an ACP `session/cancel` notification.

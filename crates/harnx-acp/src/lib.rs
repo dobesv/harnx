@@ -11,4 +11,6 @@ pub mod manager;
 pub use client::AcpClient;
 pub use config::AcpServerConfig;
 pub use event::NestedAcpEvent;
-pub use manager::AcpManager;
+pub use manager::{
+    forward_acp_chunks, session_prompt_with_abort, session_prompt_with_abort_for_test, AcpManager,
+};

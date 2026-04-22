@@ -253,7 +253,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn session_prompt_with_abort<Fut>(
+pub async fn session_prompt_with_abort<Fut>(
     client: &AcpClient,
     session_id: String,
     message: String,
@@ -284,7 +284,7 @@ where
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn session_prompt_with_abort_for_test<
+pub async fn session_prompt_with_abort_for_test<
     PromptFn,
     PromptFut,
     CancelFn,
@@ -358,7 +358,7 @@ fn optional_string<'a>(
 /// the sub-agent source, then restores the spinner.
 /// `_allow_fallback_print` is kept in the signature for call-site
 /// compatibility but is no longer used — sinks own display.
-pub(crate) async fn forward_acp_chunks(
+pub async fn forward_acp_chunks(
     mut chunk_rx: UnboundedReceiver<NestedAcpEvent>,
     spinner: Option<Spinner>,
     spinner_msg: String,
