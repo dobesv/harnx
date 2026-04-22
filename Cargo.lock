@@ -1647,9 +1647,13 @@ dependencies = [
  "async-trait",
  "futures-util",
  "harnx-core",
+ "harnx-spinner",
+ "indexmap",
  "log",
+ "parking_lot",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
 ]
 

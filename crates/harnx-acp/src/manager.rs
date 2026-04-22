@@ -1,14 +1,10 @@
-#![allow(dead_code)]
-
-mod server;
-
-use crate::tool::{JsonSchema, ToolDeclaration};
-use crate::utils::{spawn_spinner, Spinner, IS_STDOUT_TERMINAL};
+use crate::{AcpClient, AcpServerConfig, NestedAcpEvent};
+use harnx_core::abort::{wait_abort_signal, AbortSignal};
+use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider};
+use harnx_spinner::{spawn_spinner, Spinner};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use harnx_core::abort::{wait_abort_signal, AbortSignal};
-use harnx_core::tool::{ToolError, ToolProvider};
 use indexmap::IndexMap;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
@@ -18,6 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
+
+fn is_stdout_terminal() -> bool {
+    use std::io::IsTerminal;
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::io::stdout().is_terminal())
+}
 
 pub struct AcpManager {
     clients: Arc<RwLock<HashMap<String, Arc<AcpClient>>>>,
@@ -349,10 +351,6 @@ fn optional_string<'a>(
     }
 }
 
-pub use harnx_acp::{AcpClient, AcpServerConfig, NestedAcpEvent};
-#[allow(unused_imports)]
-pub use server::HarnxAgent;
-
 /// Forwards ACP chunk notifications to the unified AgentEvent sink
 /// (and thus to whichever sink is installed — CliAgentEventSink for
 /// CLI, TuiAgentEventSink for TUI, NullSink for tests). Each incoming
@@ -400,8 +398,8 @@ impl ToolProvider for AcpManager {
         arguments: Value,
         abort: &AbortSignal,
     ) -> Result<Value, ToolError> {
-        let has_sink = crate::agent_event_sink::has_agent_event_sink();
-        let is_terminal = *IS_STDOUT_TERMINAL && !has_sink;
+        let has_sink = harnx_core::sink::has_agent_event_sink();
+        let is_terminal = is_stdout_terminal() && !has_sink;
 
         // Give the parent tool-call event a chance to be consumed by
         // the UI before nested ACP output from the delegated session
@@ -463,9 +461,6 @@ impl ToolProvider for AcpManager {
         })
     }
 }
-
-#[cfg(test)]
-mod test_regression_issue_68;
 
 #[cfg(test)]
 mod tests {
@@ -702,7 +697,7 @@ enabled: false
             events: Mutex::new(Vec::new()),
         });
         harnx_core::sink::clear_agent_event_sink();
-        crate::agent_event_sink::install_agent_event_sink(sink.clone());
+        harnx_core::sink::install_agent_event_sink(sink.clone());
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
