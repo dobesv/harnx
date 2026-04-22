@@ -53,8 +53,7 @@ pub fn pretty_yaml_block(value: &serde_json::Value) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
-#[allow(unused_imports)]
-pub use harnx_core::config_paths::{get_env_name, normalize_env_name};
+pub use harnx_core::config_paths::get_env_name;
 
 pub fn parse_bool(value: &str) -> Option<bool> {
     match value {
