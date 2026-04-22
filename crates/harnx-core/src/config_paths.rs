@@ -4,6 +4,9 @@
 //! resolution and the file/dir name constants. See also `harnx-core::path`
 //! for generic path algorithms (safe_join_path, expand_glob_paths).
 
+use std::env;
+use std::path::PathBuf;
+
 /// Primary config file in the config dir (overridable via `HARNX_CONFIG_FILE`).
 pub const CONFIG_FILE_NAME: &str = "config.yaml";
 
@@ -53,9 +56,6 @@ pub fn get_env_name(key: &str) -> String {
 pub fn normalize_env_name(value: &str) -> String {
     value.replace('-', "_").to_ascii_uppercase()
 }
-
-use std::env;
-use std::path::PathBuf;
 
 /// Root config directory. Resolution order:
 /// 1. `HARNX_CONFIG_DIR` env var (literal path).
@@ -224,7 +224,14 @@ mod tests {
 
     #[test]
     fn models_override_file_is_under_config_dir() {
+        // Assert both the file name AND the parent — tighter than
+        // `ends_with("models-override.yaml")` alone would be, which
+        // would pass for a bare relative `"models-override.yaml"`.
         let got = models_override_file();
-        assert!(got.ends_with("models-override.yaml"));
+        assert_eq!(
+            got.file_name().and_then(|s| s.to_str()),
+            Some("models-override.yaml")
+        );
+        assert_eq!(got.parent().unwrap(), config_dir());
     }
 }
