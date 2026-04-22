@@ -1,0 +1,27 @@
+[package]
+name = "harnx-rag"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "RAG (retrieval-augmented generation) engine for harnx"
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bm25 = { workspace = true }
+harnx-client = { path = "../harnx-client" }
+harnx-core = { path = "../harnx-core" }
+harnx-fetch = { path = "../harnx-fetch" }
+harnx-spinner = { path = "../harnx-spinner" }
+hnsw_rs = { workspace = true }
+indexmap = { workspace = true }
+inquire = { workspace = true }
+nu-ansi-term = { workspace = true }
+parking_lot = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = ["sync", "fs"] }
+uuid = { workspace = true }
