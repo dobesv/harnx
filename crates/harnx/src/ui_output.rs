@@ -15,6 +15,11 @@ pub struct UiOutputSource {
 
 #[derive(Clone, Debug)]
 pub enum UiOutputEventKind {
+    // Scheduled for deletion in Plan 38 Task 5. No production constructor
+    // remains after Task 3 (the TuiAgentEventSink no longer translates
+    // AgentEvent::Tool(Completed) into this variant); tests still
+    // construct it via ui_output_to_agent_event and event_fallback_text.
+    #[allow(dead_code)]
     ToolResultText {
         text: String,
     },
@@ -106,7 +111,15 @@ pub fn has_ui_output_sink() -> bool {
     guard.is_some()
 }
 
+// Scheduled for deletion in Plan 38 Task 5. After Task 3, the
+// TuiAgentEventSink no longer calls this helper — production
+// emitters have moved to the AgentEvent sink. Legacy harnx code
+// (e.g. CLI install_cli_ui_output_sink, acp/client.rs
+// forward_display_chunk) still invokes it, but not from this crate's
+// lib build of main.rs — hence the lint. Remove along with
+// install_ui_output_sender in Task 5.
 #[cfg(not(test))]
+#[allow(dead_code)]
 pub fn emit_ui_output_event(event: UiOutputEvent) -> bool {
     match UI_OUTPUT_SENDER.get() {
         Some(sender) => sender.send(event).is_ok(),
@@ -115,6 +128,7 @@ pub fn emit_ui_output_event(event: UiOutputEvent) -> bool {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub fn emit_ui_output_event(event: UiOutputEvent) -> bool {
     let guard = UI_OUTPUT_SENDER
         .lock()

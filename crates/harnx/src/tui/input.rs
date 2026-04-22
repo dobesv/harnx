@@ -392,6 +392,9 @@ impl Tui {
             TuiEvent::UiOutput(event) => {
                 self.render_ui_output_event(event).await;
             }
+            TuiEvent::Agent(event, source) => {
+                self.render_agent_event(event, source).await;
+            }
             TuiEvent::ToolRoundComplete => {
                 // Intermediate tool round — prompt loop continues, don't clear llm_busy.
                 // Flush any pending thought so follow-up thought after tool results
@@ -573,16 +576,27 @@ impl Tui {
                     vec![TranscriptItem::SystemText(clean)]
                 }
             }
-            AgentEvent::Tool(ToolEvent::Completed { output, .. }) => {
-                // Tests and legacy emitters pre-format the ToolResultText as
-                // a string before wrapping it in AgentEvent::Tool::Completed
-                // (see ui_output_to_agent_event which maps ToolResultText to
-                // Value::String). For structured outputs we fall back to
-                // pretty YAML to preserve readability.
-                let text = output
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| crate::ui_output::pretty_yaml_block(&output));
+            AgentEvent::Tool(ToolEvent::Completed {
+                output, content, ..
+            }) => {
+                // Pre-Task-3, the TuiAgentEventSink pre-formatted Tool::Completed
+                // into UiOutputEventKind::ToolResultText via render_tool_result_text
+                // (truncation, matching the legacy default_emit_tool_result).
+                // Now that the sink forwards AgentEvent directly, the formatting
+                // lives here. Strip ANSI from a string-valued output BEFORE
+                // truncation so pre-dimmed test inputs that drive through
+                // ui_output_to_agent_event (which wraps the already-dimmed text
+                // in Value::String) get their ESC-introduced sequences removed
+                // cleanly — otherwise `truncate_output`'s `sanitize_output_text`
+                // strips the ESC char but leaves literal `[2m`/`[0m` markers.
+                // `render_tool_result_text` no longer wraps in ANSI dim: the TUI
+                // renderer applies `Modifier::DIM` via
+                // `TranscriptItem::ToolResultText`.
+                let raw = match &output {
+                    serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
+                    _ => output.clone(),
+                };
+                let text = crate::agent_event_sink::render_tool_result_text(&raw, &content);
                 let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
                 if clean.is_empty() {
                     vec![]

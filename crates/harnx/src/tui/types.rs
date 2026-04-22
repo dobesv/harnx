@@ -116,6 +116,10 @@ pub(crate) enum TranscriptItem {
 
 pub(crate) enum TuiEvent {
     UiOutput(UiOutputEvent),
+    Agent(
+        harnx_core::event::AgentEvent,
+        Option<harnx_core::event::AgentSource>,
+    ),
     /// Intermediate tool round completed; the prompt loop continues.
     ToolRoundComplete,
     /// The prompt task consumed the pending message during a tool round.
