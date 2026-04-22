@@ -20,7 +20,7 @@ pub use super::CompletionTokenUsage;
 fn emit_retry_warning(msg: &str) {
     use harnx_core::event::{AgentEvent, NoticeEvent};
     let event = AgentEvent::Notice(NoticeEvent::Warning(msg.to_string()));
-    if !crate::agent_event_sink::emit_agent_event(event) {
+    if !harnx_core::sink::emit_agent_event(event) {
         eprintln!("{}", warning_text(&format!("⚠ {msg}")));
     }
 }

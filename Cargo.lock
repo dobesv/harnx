@@ -1902,10 +1902,12 @@ dependencies = [
  "async-trait",
  "base64",
  "bincode 2.0.1",
+ "bitflags 2.11.1",
  "bytes",
  "chrono",
  "crossterm",
  "dirs",
+ "duct",
  "fancy-regex 0.17.0",
  "futures-util",
  "fuzzy-matcher",
@@ -1948,6 +1950,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "uuid",
+ "which",
 ]
 
 [[package]]

@@ -1,9 +1,6 @@
-use crate::{
-    config::GlobalConfig,
-    hooks::HookEvent,
-    mcp_safety::{truncate_output, TruncateOpts},
-    utils::*,
-};
+use crate::{config::GlobalConfig, utils::*};
+use harnx_hooks::HookEvent;
+use harnx_mcp::safety::{truncate_output, TruncateOpts};
 
 use serde_json::Value;
 use std::collections::HashSet;
@@ -63,7 +60,7 @@ pub fn build_tool_eval_context(config: &GlobalConfig) -> ToolEvalContext {
         let session_id = session_id.clone();
         let cwd = cwd.clone();
         Box::pin(async move {
-            crate::hooks::dispatch::dispatch_hooks(&event, &hooks_entries, &session_id, &cwd).await
+            harnx_hooks::dispatch::dispatch_hooks(&event, &hooks_entries, &session_id, &cwd).await
         })
     });
 
@@ -92,7 +89,7 @@ fn default_emit_tool_call(call: &ToolCall, json_data: &Value) {
         input: json_data.clone(),
         locations: Vec::new(),
     });
-    if !crate::agent_event_sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
+    if !harnx_core::sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
         // No sink installed (test context) — keep a visible fallback so
         // the batch doesn't go dark.
         let input_yaml = match json_data {
@@ -114,7 +111,7 @@ fn default_emit_tool_result(call: &ToolCall, result: &Value) {
         output: result.clone(),
         content: Vec::new(),
     });
-    if !crate::agent_event_sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
+    if !harnx_core::sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
         // No sink installed — fall back to the old format-and-print path.
         let mut opts = TruncateOpts::default();
         let marker = " [...] ";
@@ -136,7 +133,7 @@ fn default_emit_tool_result(call: &ToolCall, result: &Value) {
 }
 
 fn default_confirm_tool_use(tool_name: &str, arguments: &Value, reason: Option<&str>) -> bool {
-    crate::hooks::prompt::confirm_tool_use(tool_name, arguments, reason)
+    harnx_hooks::prompt::confirm_tool_use(tool_name, arguments, reason)
 }
 
 #[cfg(test)]

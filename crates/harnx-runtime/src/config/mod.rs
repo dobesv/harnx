@@ -16,16 +16,16 @@ pub use harnx_core::working_mode::WorkingMode;
 use harnx_core::config_data::ConfigData;
 use harnx_core::config_paths as paths;
 
-use crate::acp::{AcpManager, AcpServerConfig};
+use harnx_acp::{AcpManager, AcpServerConfig};
 use crate::client::{
     create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
     Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
 };
 use crate::commands::{run_command, split_args_text};
-use crate::hooks::{AsyncHookManager, HooksConfig};
-use crate::mcp::{McpManager, McpServerConfig};
-use crate::rag::Rag;
-use crate::render::{MarkdownRender, RenderOptions};
+use harnx_hooks::{AsyncHookManager, HooksConfig};
+use harnx_mcp::{McpManager, McpServerConfig};
+use harnx_rag::Rag;
+use harnx_render::{MarkdownRender, RenderOptions};
 use crate::tool::{ToolDeclaration, ToolResult, Tools};
 use crate::utils::*;
 
@@ -52,8 +52,8 @@ pub use harnx_rag::TEMP_RAG_NAME;
 pub const TEMP_SESSION_NAME: &str = "temp";
 
 /// Monokai Extended
-const DARK_THEME: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bin");
-const LIGHT_THEME: &[u8] = include_bytes!("../../assets/monokai-extended-light.theme.bin");
+const DARK_THEME: &[u8] = include_bytes!("../../../harnx/assets/monokai-extended.theme.bin");
+const LIGHT_THEME: &[u8] = include_bytes!("../../../harnx/assets/monokai-extended-light.theme.bin");
 
 const SERVE_ADDR: &str = "127.0.0.1:8000";
 
@@ -1511,7 +1511,7 @@ impl Config {
                         cfg.dry_run,
                     )
                 };
-                let init_ctx = crate::rag::RagInitContext {
+                let init_ctx = harnx_rag::RagInitContext {
                     clients: &clients_owned,
                     document_loaders: &loaders_owned,
                     rag_embedding_model: rag_embedding_model_owned.as_deref(),
@@ -1554,7 +1554,7 @@ impl Config {
                             cfg.dry_run,
                         )
                     };
-                    let init_ctx = crate::rag::RagInitContext {
+                    let init_ctx = harnx_rag::RagInitContext {
                         clients: &clients_owned,
                         document_loaders: &loaders_owned,
                         rag_embedding_model: rag_embedding_model_owned.as_deref(),
@@ -1624,7 +1624,7 @@ impl Config {
                 cfg.dry_run,
             )
         };
-        let call_ctx = crate::rag::RagCallContext {
+        let call_ctx = harnx_rag::RagCallContext {
             user_agent: user_agent_owned.as_deref(),
             dry_run,
         };
@@ -1654,7 +1654,7 @@ impl Config {
                 cfg.dry_run,
             )
         };
-        let call_ctx = crate::rag::RagCallContext {
+        let call_ctx = harnx_rag::RagCallContext {
             user_agent: user_agent_owned.as_deref(),
             dry_run,
         };
@@ -1705,7 +1705,7 @@ impl Config {
                 let cfg = config.read();
                 (cfg.user_agent.clone(), cfg.dry_run)
             };
-            let call_ctx = crate::rag::RagCallContext {
+            let call_ctx = harnx_rag::RagCallContext {
                 user_agent: user_agent_owned.as_deref(),
                 dry_run,
             };
@@ -2959,7 +2959,7 @@ pub async fn macro_execute(
     config.write().macro_flag = true;
     let mut async_manager = AsyncHookManager::new();
     let persistent_manager = std::sync::Arc::new(tokio::sync::Mutex::new(
-        crate::hooks::PersistentHookManager::new(),
+        harnx_hooks::PersistentHookManager::new(),
     ));
     let mut pending_async_context = None;
     for step in &macro_value.steps {

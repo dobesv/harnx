@@ -6,7 +6,7 @@ pub use harnx_core::session::{AutoName, Session, SessionLogEntry};
 use crate::client::{
     render_message_input, CompletionTokenUsage, Message, MessageContent, MessageRole,
 };
-use crate::render::MarkdownRender;
+use harnx_render::MarkdownRender;
 
 use anyhow::{Context, Result};
 use fancy_regex::Regex;
@@ -1080,7 +1080,7 @@ mod tests {
 
     #[test]
     fn render_shows_model_fallbacks() {
-        use crate::render::{MarkdownRender, RenderOptions};
+        use harnx_render::{MarkdownRender, RenderOptions};
 
         let mut session = test_session();
         session.set_model_fallbacks(vec![

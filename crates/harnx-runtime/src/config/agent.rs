@@ -285,7 +285,7 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
                     cfg.dry_run,
                 )
             };
-            let init_ctx = crate::rag::RagInitContext {
+            let init_ctx = harnx_rag::RagInitContext {
                 clients: &clients_owned,
                 document_loaders: &loaders_owned,
                 rag_embedding_model: rag_embedding_model_owned.as_deref(),

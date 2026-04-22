@@ -2,12 +2,12 @@ use std::io::Write;
 
 use crate::client::retry::call_with_retry_and_fallback;
 use crate::config::{macro_execute, AgentVariables, Config, GlobalConfig, Input, LastMessage};
-use crate::hooks::{
+use harnx_hooks::{
     dispatch_hooks_with_count_and_manager, dispatch_hooks_with_managers, drain_async_results,
     inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
     PersistentHookManager,
 };
-use crate::render::render_error;
+use harnx_render::render_error;
 use crate::utils::{abortable_run_with_spinner, dimmed_text, set_text, AbortSignal};
 
 use anyhow::{anyhow, bail, Context, Result};
