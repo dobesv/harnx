@@ -52,7 +52,7 @@ jobs:
     - name: Check for pending snapshot updates
       if: failure()
       run: |
-        if ls crates/harnx/src/tui/snapshots/*.snap.new 2>/dev/null; then
+        if ls crates/harnx-tui/src/snapshots/*.snap.new 2>/dev/null; then
           echo "::error::Snapshot updates pending. Run 'cargo insta review' locally to review and accept changes."
           exit 1
         fi
