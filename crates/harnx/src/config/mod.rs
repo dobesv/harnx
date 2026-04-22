@@ -39,9 +39,7 @@ use simplelog::LevelFilter;
 use std::collections::{HashMap, HashSet};
 use std::{
     env,
-    fs::{
-        read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions,
-    },
+    fs::{read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     process,
@@ -3061,7 +3059,6 @@ pub(crate) async fn ensure_parent_exists_async(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-
 
 fn read_env_value<T>(key: &str) -> Option<Option<T>>
 where

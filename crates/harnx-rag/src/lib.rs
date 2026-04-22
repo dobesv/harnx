@@ -14,7 +14,9 @@ use harnx_client::{
 use harnx_core::abort::AbortSignal;
 use harnx_core::config_paths::get_env_name;
 use harnx_core::crypto::sha256;
-use harnx_core::path::{ensure_parent_exists, expand_glob_paths, resolve_home_dir, to_absolute_path};
+use harnx_core::path::{
+    ensure_parent_exists, expand_glob_paths, resolve_home_dir, to_absolute_path,
+};
 use harnx_fetch::{
     is_loader_protocol, load_file, load_protocol_path, load_recursive_url, load_url,
     DocumentMetadata, LoadedDocument, DEFAULT_EXTENSION, EXTENSION_METADATA,
@@ -22,11 +24,11 @@ use harnx_fetch::{
 use harnx_spinner::{abortable_run_with_spinner, abortable_run_with_spinner_rx, Spinner};
 
 use anyhow::{anyhow, bail, Context, Result};
-use log::debug;
 use bm25::{Language, SearchEngine, SearchEngineBuilder};
 use hnsw_rs::prelude::*;
 use indexmap::{IndexMap, IndexSet};
 use inquire::{required, validator::Validation, Confirm, Select, Text};
+use log::debug;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -200,8 +202,7 @@ impl Rag {
     ) -> Result<Self> {
         let hnsw = data.build_hnsw();
         let bm25 = data.build_bm25();
-        let embedding_model =
-            retrieve_model(clients, &data.embedding_model, ModelType::Embedding)?;
+        let embedding_model = retrieve_model(clients, &data.embedding_model, ModelType::Embedding)?;
         let rag = Rag {
             clients: clients.to_vec(),
             name: name.to_string(),
@@ -260,8 +261,7 @@ impl Rag {
                 select_embedding_model(&models)?
             }
         };
-        let embedding_model =
-            retrieve_model(clients, &embedding_model_id, ModelType::Embedding)?;
+        let embedding_model = retrieve_model(clients, &embedding_model_id, ModelType::Embedding)?;
 
         let chunk_size = match rag_chunk_size {
             Some(value) => {
@@ -621,8 +621,7 @@ impl Rag {
 
         let ids = match rerank_model {
             Some(model_id) => {
-                let model =
-                    retrieve_model(&self.clients, model_id, ModelType::Reranker)?;
+                let model = retrieve_model(&self.clients, model_id, ModelType::Reranker)?;
                 let client = init_client(&self.clients, &model)?;
                 let ids: IndexSet<DocumentId> = [vector_search_ids, keyword_search_ids]
                     .concat()

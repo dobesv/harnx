@@ -1579,7 +1579,9 @@ dependencies = [
  "harnx-fetch",
  "harnx-hooks",
  "harnx-mcp",
+ "harnx-rag",
  "harnx-render",
+ "harnx-spinner",
  "hmac",
  "hnsw_rs",
  "html_to_markdown",
@@ -1846,6 +1848,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-rag"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bm25",
+ "harnx-client",
+ "harnx-core",
+ "harnx-fetch",
+ "harnx-spinner",
+ "hnsw_rs",
+ "indexmap",
+ "inquire",
+ "log",
+ "nu-ansi-term",
+ "parking_lot",
+ "pretty_assertions",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "harnx-render"
 version = "0.30.0"
 dependencies = [
@@ -1857,6 +1885,16 @@ dependencies = [
  "serde",
  "syntect",
  "textwrap",
+]
+
+[[package]]
+name = "harnx-spinner"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "harnx-core",
+ "tokio",
 ]
 
 [[package]]

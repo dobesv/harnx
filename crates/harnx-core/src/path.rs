@@ -213,9 +213,9 @@ pub fn ensure_parent_exists(path: &Path) -> anyhow::Result<()> {
     if path.exists() {
         return Ok(());
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Failed to write to '{}', No parent path", path.display()))?;
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("Failed to write to '{}', No parent path", path.display())
+    })?;
     if !parent.exists() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
