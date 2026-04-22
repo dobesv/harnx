@@ -1582,6 +1582,7 @@ dependencies = [
  "harnx-rag",
  "harnx-render",
  "harnx-runtime",
+ "harnx-serve",
  "harnx-spinner",
  "hmac",
  "hnsw_rs",
@@ -1951,6 +1952,32 @@ dependencies = [
  "unicode-width",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "harnx-serve"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "harnx-core",
+ "harnx-rag",
+ "harnx-runtime",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-graceful",
+ "tokio-stream",
+ "uuid",
 ]
 
 [[package]]

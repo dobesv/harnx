@@ -3,7 +3,6 @@ mod agent_event_sink;
 mod cli;
 mod cli_event_sink;
 mod hooks;
-mod rag;
 mod render;
 mod serve;
 mod tui;
