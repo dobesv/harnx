@@ -53,14 +53,8 @@ pub fn pretty_yaml_block(value: &serde_json::Value) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
-pub fn get_env_name(key: &str) -> String {
-    format!("{}_{key}", env!("CARGO_CRATE_NAME"),).to_ascii_uppercase()
-}
-
-#[allow(dead_code)]
-pub fn normalize_env_name(value: &str) -> String {
-    value.replace('-', "_").to_ascii_uppercase()
-}
+#[allow(unused_imports)]
+pub use harnx_core::config_paths::{get_env_name, normalize_env_name};
 
 pub fn parse_bool(value: &str) -> Option<bool> {
     match value {
