@@ -48,7 +48,7 @@ impl Engine {
         let ctx_for_task = Arc::clone(&ctx);
         tokio::spawn(async move {
             let emit = |event: AgentEvent| {
-                ctx_for_task.sink.emit(event.clone());
+                ctx_for_task.sink.emit(event.clone(), None);
                 let _ = tx.send(event);
             };
 

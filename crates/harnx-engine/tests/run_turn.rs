@@ -24,7 +24,7 @@ impl RecordingSink {
 }
 
 impl AgentEventSink for RecordingSink {
-    fn emit(&self, event: AgentEvent) {
+    fn emit(&self, event: AgentEvent, _source: Option<harnx_core::event::AgentSource>) {
         self.events.lock().expect("sink mutex").push(event);
     }
 }

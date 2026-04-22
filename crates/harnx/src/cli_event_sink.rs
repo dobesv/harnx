@@ -177,7 +177,13 @@ impl CliSinkState {
 }
 
 impl AgentEventSink for CliAgentEventSink {
-    fn emit(&self, event: AgentEvent) {
+    fn emit(&self, event: AgentEvent, _source: Option<harnx_core::event::AgentSource>) {
+        // Source-aware CLI rendering (e.g., "> {agent}" prefix for sub-agent
+        // output) is a future enhancement. For now, CLI output treats
+        // sub-agent events identically to main-agent events, matching the
+        // pre-migration baseline where sub-agent chunks on CLI were mostly
+        // invisible.
+        let _ = _source;
         let mut state = match self.state.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -352,44 +358,68 @@ mod tests {
     async fn emit_handles_each_top_level_variant_without_panic() {
         let sink = CliAgentEventSink::new(false, RenderOptions::default());
 
-        sink.emit(AgentEvent::Turn(TurnEvent::Started));
-        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
-            outcome: Default::default(),
-        }));
-        sink.emit(AgentEvent::Notice(NoticeEvent::Info("info".into())));
-        sink.emit(AgentEvent::Notice(NoticeEvent::Warning("warn".into())));
-        sink.emit(AgentEvent::Notice(NoticeEvent::Error("err".into())));
-        sink.emit(AgentEvent::Model(ModelEvent::MessageChunk {
-            blocks: vec![ContentBlock::Text("hello".into())],
-        }));
-        sink.emit(AgentEvent::Model(ModelEvent::Final {
-            output: "done".into(),
-            usage: Default::default(),
-        }));
-        sink.emit(AgentEvent::Model(ModelEvent::Error("boom".into())));
+        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
+        sink.emit(
+            AgentEvent::Turn(TurnEvent::Ended {
+                outcome: Default::default(),
+            }),
+            None,
+        );
+        sink.emit(AgentEvent::Notice(NoticeEvent::Info("info".into())), None);
+        sink.emit(
+            AgentEvent::Notice(NoticeEvent::Warning("warn".into())),
+            None,
+        );
+        sink.emit(AgentEvent::Notice(NoticeEvent::Error("err".into())), None);
+        sink.emit(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("hello".into())],
+            }),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Model(ModelEvent::Final {
+                output: "done".into(),
+                usage: Default::default(),
+            }),
+            None,
+        );
+        sink.emit(AgentEvent::Model(ModelEvent::Error("boom".into())), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn status_event_starts_spinner_without_panic() {
         let sink = CliAgentEventSink::new(false, RenderOptions::default());
-        sink.emit(AgentEvent::Status(StatusLine {
-            text: "[test-model] generating".into(),
-        }));
-        sink.emit(AgentEvent::Turn(TurnEvent::Started));
-        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
-            outcome: Default::default(),
-        }));
+        sink.emit(
+            AgentEvent::Status(StatusLine {
+                text: "[test-model] generating".into(),
+            }),
+            None,
+        );
+        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
+        sink.emit(
+            AgentEvent::Turn(TurnEvent::Ended {
+                outcome: Default::default(),
+            }),
+            None,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn status_event_updates_existing_spinner() {
         let sink = CliAgentEventSink::new(false, RenderOptions::default());
-        sink.emit(AgentEvent::Turn(TurnEvent::Started));
-        sink.emit(AgentEvent::Status(StatusLine {
-            text: "[rich-label] generating".into(),
-        }));
-        sink.emit(AgentEvent::Turn(TurnEvent::Ended {
-            outcome: Default::default(),
-        }));
+        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
+        sink.emit(
+            AgentEvent::Status(StatusLine {
+                text: "[rich-label] generating".into(),
+            }),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Turn(TurnEvent::Ended {
+                outcome: Default::default(),
+            }),
+            None,
+        );
     }
 }

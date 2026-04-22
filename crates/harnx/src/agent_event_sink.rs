@@ -47,7 +47,12 @@ pub fn install_cli_agent_event_sink(highlight: bool, render_options: RenderOptio
 pub struct TuiAgentEventSink;
 
 impl AgentEventSink for TuiAgentEventSink {
-    fn emit(&self, event: AgentEvent) {
+    fn emit(&self, event: AgentEvent, _source: Option<harnx_core::event::AgentSource>) {
+        // Task 2 will wire source → UiOutputSource conversion. For now,
+        // pass-through behavior preserved: all emitted UiOutputEvent values
+        // have source: None. This keeps Task 1 scope to trait-signature
+        // propagation only.
+        let _ = _source;
         use harnx_core::event::{ModelEvent, NoticeEvent, ToolEvent};
         match event {
             AgentEvent::Notice(notice) => {

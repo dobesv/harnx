@@ -13,7 +13,7 @@ use std::sync::Mutex;
 #[cfg(not(test))]
 use std::sync::OnceLock;
 
-use crate::event::{AgentEvent, AgentEventSink};
+use crate::event::{AgentEvent, AgentEventSink, AgentSource};
 
 #[cfg(test)]
 static AGENT_EVENT_SINK: Mutex<Option<Arc<dyn AgentEventSink>>> = Mutex::new(None);
@@ -49,9 +49,14 @@ pub fn has_agent_event_sink() -> bool {
 
 #[cfg(not(test))]
 pub fn emit_agent_event(event: AgentEvent) -> bool {
+    emit_agent_event_with_source(event, None)
+}
+
+#[cfg(not(test))]
+pub fn emit_agent_event_with_source(event: AgentEvent, source: Option<AgentSource>) -> bool {
     match AGENT_EVENT_SINK.get() {
         Some(sink) => {
-            sink.emit(event);
+            sink.emit(event, source);
             true
         }
         None => false,
@@ -60,12 +65,17 @@ pub fn emit_agent_event(event: AgentEvent) -> bool {
 
 #[cfg(test)]
 pub fn emit_agent_event(event: AgentEvent) -> bool {
+    emit_agent_event_with_source(event, None)
+}
+
+#[cfg(test)]
+pub fn emit_agent_event_with_source(event: AgentEvent, source: Option<AgentSource>) -> bool {
     let guard = AGENT_EVENT_SINK
         .lock()
         .expect("AGENT_EVENT_SINK mutex poisoned");
     match guard.as_ref() {
         Some(sink) => {
-            sink.emit(event);
+            sink.emit(event, source);
             true
         }
         None => false,
@@ -99,7 +109,7 @@ mod tests {
     }
 
     impl AgentEventSink for CollectingSink {
-        fn emit(&self, event: AgentEvent) {
+        fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
             self.events.lock().unwrap().push(event);
         }
     }
@@ -122,6 +132,44 @@ mod tests {
             AgentEvent::Notice(NoticeEvent::Warning(msg)) => assert_eq!(msg, "whoa"),
             other => panic!("unexpected event: {other:?}"),
         }
+        drop(events);
+        clear_agent_event_sink();
+    }
+
+    #[derive(Default)]
+    struct SourceRecordingSink {
+        events: Mutex<Vec<(AgentEvent, Option<AgentSource>)>>,
+    }
+
+    impl AgentEventSink for SourceRecordingSink {
+        fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+            self.events.lock().unwrap().push((event, source));
+        }
+    }
+
+    #[test]
+    fn emit_with_source_preserves_source() {
+        use crate::event::AgentSource;
+        clear_agent_event_sink();
+        let sink = Arc::new(SourceRecordingSink::default());
+        install_agent_event_sink(sink.clone());
+
+        emit_agent_event(AgentEvent::Notice(NoticeEvent::Info("no-source".into())));
+        emit_agent_event_with_source(
+            AgentEvent::Notice(NoticeEvent::Info("with-source".into())),
+            Some(AgentSource {
+                agent: "argus".into(),
+                session_id: Some("s1".into()),
+            }),
+        );
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].1.is_none());
+        let (_, s1) = &events[1];
+        let source = s1.as_ref().expect("second event carries source");
+        assert_eq!(source.agent, "argus");
+        assert_eq!(source.session_id.as_deref(), Some("s1"));
         drop(events);
         clear_agent_event_sink();
     }

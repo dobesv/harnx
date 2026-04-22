@@ -188,6 +188,12 @@ pub struct StatusLine {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentSource {
+    pub agent: String,
+    pub session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanEntry {
     pub status: String,
@@ -215,7 +221,7 @@ pub struct AgentHandoff {
 /// and installed on the `SessionCtx`. The trait is object-safe so the
 /// sink can be held as `Arc<dyn AgentEventSink>`.
 pub trait AgentEventSink: Send + Sync {
-    fn emit(&self, event: AgentEvent);
+    fn emit(&self, event: AgentEvent, source: Option<AgentSource>);
 }
 
 /// A no-op sink useful for tests or code paths that run before a real sink
@@ -224,7 +230,7 @@ pub trait AgentEventSink: Send + Sync {
 pub struct NullSink;
 
 impl AgentEventSink for NullSink {
-    fn emit(&self, _event: AgentEvent) {}
+    fn emit(&self, _event: AgentEvent, _source: Option<AgentSource>) {}
 }
 
 #[cfg(test)]
@@ -242,7 +248,7 @@ mod tests {
     #[test]
     fn null_sink_accepts_events() {
         let sink: Box<dyn AgentEventSink> = Box::new(NullSink);
-        sink.emit(AgentEvent::Turn(TurnEvent::Started));
+        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
     }
 
     #[test]
@@ -266,5 +272,28 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn agent_source_round_trips_through_serde() {
+        let source = AgentSource {
+            agent: "argus".to_string(),
+            session_id: Some("session-1".to_string()),
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        let decoded: AgentSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.agent, "argus");
+        assert_eq!(decoded.session_id.as_deref(), Some("session-1"));
+    }
+
+    #[test]
+    fn null_sink_accepts_source() {
+        let sink: Box<dyn AgentEventSink> = Box::new(NullSink);
+        let source = AgentSource {
+            agent: "argus".to_string(),
+            session_id: None,
+        };
+        sink.emit(AgentEvent::Turn(TurnEvent::Started), Some(source));
+        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
     }
 }
