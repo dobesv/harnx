@@ -7,6 +7,7 @@ pub mod abort;
 pub mod agent_config;
 pub mod api_types;
 pub mod cli;
+pub mod config_paths;
 pub mod context;
 pub mod crypto;
 pub mod error;
