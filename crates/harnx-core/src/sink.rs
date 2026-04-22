@@ -3,30 +3,19 @@
 //! sink (TUI, CLI, or none) render it. Lives in harnx-core so both
 //! harnx and harnx-engine can reach it without cycles.
 //!
-//! Mirrors the production/test dual-storage pattern used elsewhere:
-//! `OnceLock` in production for fast idempotent install; `Mutex` in
-//! tests so installers can overwrite each other between test cases.
+//! Uses a `Mutex<Option<...>>` so installers can overwrite each other
+//! (needed for cross-crate `#[cfg(test)]` callers: harnx's tests must
+//! be able to install/clear sinks even though harnx-core is compiled
+//! as a non-test dep). The uncontended-lock cost per emit is
+//! negligible compared to rendering.
 
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::Mutex;
-#[cfg(not(test))]
-use std::sync::OnceLock;
 
 use crate::event::{AgentEvent, AgentEventSink, AgentSource};
 
-#[cfg(test)]
 static AGENT_EVENT_SINK: Mutex<Option<Arc<dyn AgentEventSink>>> = Mutex::new(None);
 
-#[cfg(not(test))]
-static AGENT_EVENT_SINK: OnceLock<Arc<dyn AgentEventSink>> = OnceLock::new();
-
-#[cfg(not(test))]
-pub fn install_agent_event_sink(sink: Arc<dyn AgentEventSink>) {
-    let _ = AGENT_EVENT_SINK.set(sink);
-}
-
-#[cfg(test)]
 pub fn install_agent_event_sink(sink: Arc<dyn AgentEventSink>) {
     let mut guard = AGENT_EVENT_SINK
         .lock()
@@ -34,12 +23,6 @@ pub fn install_agent_event_sink(sink: Arc<dyn AgentEventSink>) {
     *guard = Some(sink);
 }
 
-#[cfg(not(test))]
-pub fn has_agent_event_sink() -> bool {
-    AGENT_EVENT_SINK.get().is_some()
-}
-
-#[cfg(test)]
 pub fn has_agent_event_sink() -> bool {
     let guard = AGENT_EVENT_SINK
         .lock()
@@ -47,28 +30,10 @@ pub fn has_agent_event_sink() -> bool {
     guard.is_some()
 }
 
-#[cfg(not(test))]
 pub fn emit_agent_event(event: AgentEvent) -> bool {
     emit_agent_event_with_source(event, None)
 }
 
-#[cfg(not(test))]
-pub fn emit_agent_event_with_source(event: AgentEvent, source: Option<AgentSource>) -> bool {
-    match AGENT_EVENT_SINK.get() {
-        Some(sink) => {
-            sink.emit(event, source);
-            true
-        }
-        None => false,
-    }
-}
-
-#[cfg(test)]
-pub fn emit_agent_event(event: AgentEvent) -> bool {
-    emit_agent_event_with_source(event, None)
-}
-
-#[cfg(test)]
 pub fn emit_agent_event_with_source(event: AgentEvent, source: Option<AgentSource>) -> bool {
     let guard = AGENT_EVENT_SINK
         .lock()
@@ -82,7 +47,9 @@ pub fn emit_agent_event_with_source(event: AgentEvent, source: Option<AgentSourc
     }
 }
 
-#[cfg(test)]
+/// Clear the installed sink. Intended for test use — both harnx-core's
+/// own `#[cfg(test)]` tests and harnx's cross-crate tests call this
+/// between cases to prevent sink leakage.
 pub fn clear_agent_event_sink() {
     let mut guard = AGENT_EVENT_SINK
         .lock()

@@ -197,9 +197,6 @@ fn concat_text_blocks(blocks: &[harnx_core::event::ContentBlock]) -> String {
 ///   `in-progress` kebab form. ACP protocol uses snake_case, but the
 ///   `UiOutputEventKind::ToolCallUpdate.status: Option<String>` is
 ///   unvalidated at construction, so the parser is permissive.
-// TODO(plan-36-task-4): remove `allow(dead_code)` once `forward_acp_chunks`
-// calls this translator.
-#[allow(dead_code)]
 pub fn ui_output_to_agent_event(event: UiOutputEvent) -> AgentEvent {
     use harnx_core::event::{
         ContentBlock, ModelEvent, NoticeEvent, PlanEntry, ToolEvent, ToolKind,
@@ -271,7 +268,6 @@ pub fn ui_output_to_agent_event(event: UiOutputEvent) -> AgentEvent {
     }
 }
 
-#[allow(dead_code)]
 fn yaml_to_json_value(yaml: Option<&str>) -> serde_json::Value {
     match yaml {
         None | Some("") => serde_json::Value::Null,
@@ -280,7 +276,6 @@ fn yaml_to_json_value(yaml: Option<&str>) -> serde_json::Value {
     }
 }
 
-#[allow(dead_code)]
 fn parse_tool_status(status: &str) -> Option<harnx_core::event::ToolStatus> {
     use harnx_core::event::ToolStatus;
     match status {

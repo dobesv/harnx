@@ -5,10 +5,7 @@ mod config;
 mod server;
 
 use crate::tool::{JsonSchema, ToolDeclaration};
-use crate::tui::render_helpers::event_fallback_text;
-use crate::ui_output::{
-    emit_ui_output_event, has_ui_output_sink, UiOutputEvent, UiOutputEventKind,
-};
+use crate::ui_output::{has_ui_output_sink, UiOutputEvent};
 use crate::utils::{spawn_spinner, Spinner, IS_STDOUT_TERMINAL};
 
 use anyhow::{anyhow, Result};
@@ -20,11 +17,13 @@ use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
+
+#[cfg(test)]
+use crate::ui_output::UiOutputEventKind;
 
 #[derive(Clone, Debug)]
 pub enum NestedAcpEvent {
@@ -367,43 +366,38 @@ pub use config::AcpServerConfig;
 #[allow(unused_imports)]
 pub use server::HarnxAgent;
 
-/// Forwards ACP chunk notifications to stdout with spinner management.
-///
-/// Each incoming chunk temporarily clears the spinner, prints the chunk,
-/// then restores the spinner.  This gives the user live visibility into
-/// sub-agent (and sub-sub-agent) tool calls, thoughts, and plan updates.
+/// Forwards ACP chunk notifications to the unified AgentEvent sink
+/// (and thus to whichever sink is installed — CliAgentEventSink for
+/// CLI, TuiAgentEventSink for TUI, NullSink for tests). Each incoming
+/// chunk temporarily pauses the spinner, emits an AgentEvent preserving
+/// the sub-agent source, then restores the spinner.
+/// `_allow_fallback_print` is kept in the signature for call-site
+/// compatibility but is no longer used — sinks own display.
 pub(crate) async fn forward_acp_chunks(
     mut chunk_rx: UnboundedReceiver<NestedAcpEvent>,
     spinner: Option<Spinner>,
     spinner_msg: String,
-    allow_fallback_print: bool,
+    _allow_fallback_print: bool,
 ) {
+    use crate::agent_event_sink::ui_output_to_agent_event;
+    use harnx_core::event::{AgentEvent, AgentSource, NoticeEvent};
+    use harnx_core::sink::emit_agent_event_with_source;
+
     while let Some(chunk) = chunk_rx.recv().await {
-        // Pause the spinner (clear display but keep task alive) before
-        // printing so output is clean, then resume it afterwards.
         if let Some(ref s) = spinner {
             s.pause();
         }
-        match chunk {
-            NestedAcpEvent::Ui(event) => {
-                let fallback = event_fallback_text(&event.kind, event.source.as_ref());
-                if !emit_ui_output_event(event) && allow_fallback_print {
-                    print!("{fallback}");
-                    let _ = std::io::stdout().flush();
-                }
+        let (event, source) = match chunk {
+            NestedAcpEvent::Ui(ui_event) => {
+                let source = ui_event.source.clone().map(|s| AgentSource {
+                    agent: s.agent,
+                    session_id: s.session_id,
+                });
+                (ui_output_to_agent_event(ui_event), source)
             }
-            NestedAcpEvent::Text(text) => {
-                let event = UiOutputEvent {
-                    kind: UiOutputEventKind::TranscriptText { text: text.clone() },
-                    source: None,
-                };
-                if !emit_ui_output_event(event) && allow_fallback_print {
-                    print!("{text}");
-                    let _ = std::io::stdout().flush();
-                }
-            }
-        }
-        // Re-enable the spinner after printing.
+            NestedAcpEvent::Text(text) => (AgentEvent::Notice(NoticeEvent::Info(text)), None),
+        };
+        emit_agent_event_with_source(event, source);
         if let Some(ref s) = spinner {
             let _ = s.set_message(spinner_msg.clone());
         }
@@ -708,46 +702,67 @@ enabled: false
         assert!(err.to_string().contains("session_id"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forward_acp_chunks_preserves_structured_nested_events() {
-        use crate::ui_output::{clear_ui_output_sender, install_ui_output_sender};
-        use tokio::sync::mpsc::unbounded_channel;
+        use crate::ui_output::UiOutputSource;
+        use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, NoticeEvent, ToolEvent};
+        use std::sync::Mutex;
 
-        let (ui_tx, mut ui_rx) = unbounded_channel();
-        install_ui_output_sender(ui_tx);
+        struct CollectingSink {
+            events: Mutex<Vec<(AgentEvent, Option<AgentSource>)>>,
+        }
+        impl AgentEventSink for CollectingSink {
+            fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+                self.events.lock().unwrap().push((event, source));
+            }
+        }
 
-        let (tx, rx) = unbounded_channel();
-        let forward = tokio::spawn(forward_acp_chunks(rx, None, "working".to_string(), false));
+        let sink = std::sync::Arc::new(CollectingSink {
+            events: Mutex::new(Vec::new()),
+        });
+        harnx_core::sink::clear_agent_event_sink();
+        crate::agent_event_sink::install_agent_event_sink(sink.clone());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         tx.send(NestedAcpEvent::Ui(UiOutputEvent {
             kind: UiOutputEventKind::ToolCall {
-                tool_name: "argus_session_prompt".to_string(),
-                input_yaml: Some("message: hi".to_string()),
+                tool_name: "read_file".to_string(),
+                input_yaml: Some("path: /tmp/x.txt".to_string()),
                 raw: None,
             },
-            source: Some(crate::ui_output::UiOutputSource {
+            source: Some(UiOutputSource {
                 agent: "argus".to_string(),
-                session_id: Some("sess-1".to_string()),
+                session_id: Some("sub-session-1".to_string()),
             }),
         }))
         .unwrap();
+        tx.send(NestedAcpEvent::Text("plain text notification".to_string()))
+            .unwrap();
         drop(tx);
 
-        forward.await.unwrap();
+        forward_acp_chunks(rx, None, "test".to_string(), false).await;
 
-        let event = ui_rx.recv().await.expect("forwarded UI event");
-        match event.kind {
-            UiOutputEventKind::ToolCall {
-                tool_name,
-                input_yaml,
-                ..
-            } => {
-                assert_eq!(tool_name, "argus_session_prompt");
-                assert_eq!(input_yaml.as_deref(), Some("message: hi"));
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+
+        match &events[0] {
+            (AgentEvent::Tool(ToolEvent::Started { name, input, .. }), Some(src)) => {
+                assert_eq!(name, "read_file");
+                assert_eq!(input["path"], "/tmp/x.txt");
+                assert_eq!(src.agent, "argus");
+                assert_eq!(src.session_id.as_deref(), Some("sub-session-1"));
             }
-            other => panic!("unexpected event kind: {other:?}"),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        match &events[1] {
+            (AgentEvent::Notice(NoticeEvent::Info(text)), None) => {
+                assert_eq!(text, "plain text notification");
+            }
+            other => panic!("unexpected second event: {other:?}"),
         }
 
-        clear_ui_output_sender();
+        drop(events);
+        harnx_core::sink::clear_agent_event_sink();
     }
 }
