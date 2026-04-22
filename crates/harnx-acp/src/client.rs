@@ -1,4 +1,4 @@
-use super::{AcpServerConfig, NestedAcpEvent};
+use crate::{AcpServerConfig, NestedAcpEvent};
 
 use agent_client_protocol::{self as acp, Agent as _};
 use anyhow::{anyhow, Context, Result};
@@ -1005,7 +1005,7 @@ fn session_info_update_event(
         return None;
     }
 
-    let session_label = Some(crate::tui::render_helpers::source_heading(&source));
+    let session_label = Some(source_heading(&source));
 
     Some(AgentEvent::Model(ModelEvent::Usage {
         input: input_tokens,
@@ -1025,6 +1025,18 @@ fn parse_tool_status_str(status: &str) -> Option<ToolStatus> {
         "completed" | "Completed" => Some(ToolStatus::Completed),
         "failed" | "Failed" => Some(ToolStatus::Failed),
         _ => None,
+    }
+}
+
+/// Format an `AgentSource` as a single-line session heading, matching the
+/// rendering used by the harnx TUI. Kept inline here so this crate has no
+/// reverse dependency on harnx rendering helpers.
+fn source_heading(source: &AgentSource) -> String {
+    match &source.session_id {
+        Some(session_id) if !session_id.is_empty() => {
+            format!("> {} ▸ {}", source.agent, session_id)
+        }
+        _ => format!("> {}", source.agent),
     }
 }
 

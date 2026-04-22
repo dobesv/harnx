@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-mod client;
 mod server;
 
 use crate::tool::{JsonSchema, ToolDeclaration};
@@ -350,8 +349,7 @@ fn optional_string<'a>(
     }
 }
 
-pub use client::AcpClient;
-pub use harnx_acp::{AcpServerConfig, NestedAcpEvent};
+pub use harnx_acp::{AcpClient, AcpServerConfig, NestedAcpEvent};
 #[allow(unused_imports)]
 pub use server::HarnxAgent;
 

@@ -1637,8 +1637,15 @@ dependencies = [
 name = "harnx-acp"
 version = "0.30.0"
 dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "futures-util",
  "harnx-core",
+ "log",
  "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

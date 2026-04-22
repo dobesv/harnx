@@ -9,8 +9,10 @@
 //! and the full ACP server implementation (`HarnxAgent` — depends on the
 //! harnx config, LLM pipeline, tool registry) stay in the `harnx` crate.
 
+mod client;
 mod config;
 mod event;
 
+pub use client::AcpClient;
 pub use config::AcpServerConfig;
 pub use event::NestedAcpEvent;

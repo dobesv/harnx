@@ -8,7 +8,15 @@ description = "ACP (Agent Client Protocol) client + shared types for harnx"
 repository.workspace = true
 
 [dependencies]
+agent-client-protocol = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
+log = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
