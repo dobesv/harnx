@@ -173,6 +173,107 @@ fn concat_text_blocks(blocks: &[harnx_core::event::ContentBlock]) -> String {
     out
 }
 
+/// Translate a legacy `UiOutputEvent` into its `AgentEvent` counterpart.
+/// Used by `forward_acp_chunks` to route ACP sub-agent output through
+/// the unified AgentEvent sink. Imperfect mappings (YAML-encoded
+/// ToolCall.input, string-encoded ToolStatus) are best-effort —
+/// invalid inputs fall back to sensible defaults (null JSON, None
+/// status).
+// TODO(plan-36-task-4): remove `allow(dead_code)` once `forward_acp_chunks`
+// calls this translator.
+#[allow(dead_code)]
+pub fn ui_output_to_agent_event(event: UiOutputEvent) -> AgentEvent {
+    use harnx_core::event::{
+        ContentBlock, ModelEvent, NoticeEvent, PlanEntry, ToolEvent, ToolKind,
+    };
+    match event.kind {
+        UiOutputEventKind::MessageChunk { text, .. } => {
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text(text)],
+            })
+        }
+        UiOutputEventKind::ThoughtChunk { text, .. } => {
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text(text)],
+            })
+        }
+        UiOutputEventKind::TranscriptText { text } => AgentEvent::Notice(NoticeEvent::Info(text)),
+        UiOutputEventKind::ToolResultText { text } => AgentEvent::Tool(ToolEvent::Completed {
+            id: String::new(),
+            output: serde_json::Value::String(text),
+            content: vec![],
+        }),
+        UiOutputEventKind::ToolCall {
+            tool_name,
+            input_yaml,
+            ..
+        } => AgentEvent::Tool(ToolEvent::Started {
+            id: String::new(),
+            name: tool_name,
+            kind: ToolKind::Other,
+            title: None,
+            input: yaml_to_json_value(input_yaml.as_deref()),
+            locations: vec![],
+        }),
+        UiOutputEventKind::ToolCallUpdate {
+            tool_call_id,
+            title,
+            status,
+            ..
+        } => AgentEvent::Tool(ToolEvent::Update {
+            id: tool_call_id.unwrap_or_default(),
+            title,
+            status: status.as_deref().and_then(parse_tool_status),
+            content: None,
+        }),
+        UiOutputEventKind::LlmFinal { output, usage } => {
+            AgentEvent::Model(ModelEvent::Final { output, usage })
+        }
+        UiOutputEventKind::LlmError(text) => AgentEvent::Model(ModelEvent::Error(text)),
+        UiOutputEventKind::Plan { entries } => AgentEvent::Plan {
+            entries: entries
+                .into_iter()
+                .map(|e| PlanEntry {
+                    status: e.status,
+                    content: e.content,
+                })
+                .collect(),
+        },
+        UiOutputEventKind::Usage {
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            session_label,
+        } => AgentEvent::Model(ModelEvent::Usage {
+            input: input_tokens,
+            output: output_tokens,
+            cached: cached_tokens,
+            session_label,
+        }),
+    }
+}
+
+#[allow(dead_code)]
+fn yaml_to_json_value(yaml: Option<&str>) -> serde_json::Value {
+    match yaml {
+        None | Some("") => serde_json::Value::Null,
+        Some(s) => serde_yaml::from_str::<serde_json::Value>(s)
+            .unwrap_or(serde_json::Value::String(s.to_string())),
+    }
+}
+
+#[allow(dead_code)]
+fn parse_tool_status(status: &str) -> Option<harnx_core::event::ToolStatus> {
+    use harnx_core::event::ToolStatus;
+    match status {
+        "pending" | "Pending" => Some(ToolStatus::Pending),
+        "in_progress" | "InProgress" | "in-progress" => Some(ToolStatus::InProgress),
+        "completed" | "Completed" => Some(ToolStatus::Completed),
+        "failed" | "Failed" => Some(ToolStatus::Failed),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +343,130 @@ mod tests {
         assert_eq!(source.agent, "hephaestus");
         assert!(source.session_id.is_none());
         crate::ui_output::clear_ui_output_sender();
+    }
+
+    #[test]
+    fn translate_message_chunk_to_agent_event() {
+        use harnx_core::event::{ContentBlock, ModelEvent};
+        let ui = UiOutputEvent {
+            kind: UiOutputEventKind::MessageChunk {
+                text: "hello".into(),
+                raw: None,
+            },
+            source: None,
+        };
+        match ui_output_to_agent_event(ui) {
+            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0] {
+                    ContentBlock::Text(t) => assert_eq!(t, "hello"),
+                    other => panic!("unexpected block: {other:?}"),
+                }
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_transcript_text_to_notice_info() {
+        let ui = UiOutputEvent {
+            kind: UiOutputEventKind::TranscriptText {
+                text: "note".into(),
+            },
+            source: None,
+        };
+        match ui_output_to_agent_event(ui) {
+            AgentEvent::Notice(NoticeEvent::Info(msg)) => assert_eq!(msg, "note"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_tool_call_yaml_to_json() {
+        use harnx_core::event::{ToolEvent, ToolKind};
+        let ui = UiOutputEvent {
+            kind: UiOutputEventKind::ToolCall {
+                tool_name: "read_file".into(),
+                input_yaml: Some("path: /tmp/x.txt\nfollow: true".into()),
+                raw: None,
+            },
+            source: None,
+        };
+        match ui_output_to_agent_event(ui) {
+            AgentEvent::Tool(ToolEvent::Started {
+                name, kind, input, ..
+            }) => {
+                assert_eq!(name, "read_file");
+                assert!(matches!(kind, ToolKind::Other));
+                assert_eq!(input["path"], "/tmp/x.txt");
+                assert_eq!(input["follow"], true);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_tool_call_update_maps_status() {
+        use harnx_core::event::{ToolEvent, ToolStatus};
+        let ui = UiOutputEvent {
+            kind: UiOutputEventKind::ToolCallUpdate {
+                tool_call_id: Some("call-42".into()),
+                title: Some("reading file".into()),
+                status: Some("in_progress".into()),
+                raw: None,
+            },
+            source: None,
+        };
+        match ui_output_to_agent_event(ui) {
+            AgentEvent::Tool(ToolEvent::Update {
+                id, title, status, ..
+            }) => {
+                assert_eq!(id, "call-42");
+                assert_eq!(title.as_deref(), Some("reading file"));
+                assert!(matches!(status, Some(ToolStatus::InProgress)));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_unknown_tool_status_yields_none() {
+        use harnx_core::event::ToolEvent;
+        let ui = UiOutputEvent {
+            kind: UiOutputEventKind::ToolCallUpdate {
+                tool_call_id: None,
+                title: None,
+                status: Some("mystery".into()),
+                raw: None,
+            },
+            source: None,
+        };
+        match ui_output_to_agent_event(ui) {
+            AgentEvent::Tool(ToolEvent::Update { status, .. }) => {
+                assert!(status.is_none());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_plan_entries() {
+        let ui = UiOutputEvent {
+            kind: UiOutputEventKind::Plan {
+                entries: vec![crate::ui_output::UiOutputPlanEntry {
+                    status: "done".into(),
+                    content: "first step".into(),
+                }],
+            },
+            source: None,
+        };
+        match ui_output_to_agent_event(ui) {
+            AgentEvent::Plan { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].status, "done");
+                assert_eq!(entries[0].content, "first step");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }
