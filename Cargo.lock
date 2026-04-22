@@ -1577,6 +1577,7 @@ dependencies = [
  "harnx-core",
  "harnx-engine",
  "harnx-mcp",
+ "harnx-render",
  "hmac",
  "hnsw_rs",
  "html_to_markdown",
@@ -1804,6 +1805,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "harnx-render"
+version = "0.30.0"
+dependencies = [
+ "ansi_colours",
+ "anyhow",
+ "bincode 2.0.1",
+ "crossterm",
+ "nu-ansi-term",
+ "serde",
+ "syntect",
+ "textwrap",
 ]
 
 [[package]]

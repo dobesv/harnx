@@ -1,4 +1,4 @@
-use crate::utils::decode_bin;
+use crate::decode_bin;
 
 use ansi_colours::AsRGB;
 use anyhow::{anyhow, Context, Result};
@@ -11,7 +11,7 @@ use syntect::parsing::SyntaxSet;
 use syntect::{easy::HighlightLines, parsing::SyntaxReference};
 
 /// Comes from <https://github.com/sharkdp/bat/raw/5e77ca37e89c873e4490b42ff556370dc5c6ba4f/assets/syntaxes.bin>
-const SYNTAXES: &[u8] = include_bytes!("../../assets/syntaxes.bin");
+const SYNTAXES: &[u8] = include_bytes!("../assets/syntaxes.bin");
 
 static LANG_MAPS: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
     let mut m = HashMap::new();
@@ -206,7 +206,7 @@ pub struct RenderOptions {
 }
 
 impl RenderOptions {
-    pub(crate) fn new(
+    pub fn new(
         theme: Option<Theme>,
         wrap: Option<String>,
         wrap_code: bool,

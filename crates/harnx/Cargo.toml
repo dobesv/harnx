@@ -81,6 +81,7 @@ harnx-client = { path = "../harnx-client" }
 harnx-core = { path = "../harnx-core" }
 harnx-engine = { path = "../harnx-engine" }
 harnx-mcp = { path = "../harnx-mcp" }
+harnx-render = { path = "../harnx-render" }
 shellexpand = { workspace = true }
 schemars = { workspace = true }
 ratatui-textarea = { workspace = true }
