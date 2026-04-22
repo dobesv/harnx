@@ -9,7 +9,9 @@ repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+base64 = { workspace = true }
 bm25 = { workspace = true }
+log = { workspace = true }
 harnx-client = { path = "../harnx-client" }
 harnx-core = { path = "../harnx-core" }
 harnx-fetch = { path = "../harnx-fetch" }
@@ -25,3 +27,6 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs"] }
 uuid = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1.4.0"

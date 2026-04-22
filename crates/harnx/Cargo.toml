@@ -83,6 +83,7 @@ harnx-engine = { path = "../harnx-engine" }
 harnx-fetch = { path = "../harnx-fetch" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-mcp = { path = "../harnx-mcp" }
+harnx-rag = { path = "../harnx-rag" }
 harnx-render = { path = "../harnx-render" }
 harnx-spinner = { path = "../harnx-spinner" }
 shellexpand = { workspace = true }
