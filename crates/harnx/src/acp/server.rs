@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::client::{Client, SseEvent, SseHandler};
 use crate::config::{GlobalConfig, Input};
 use crate::tool::{ToolCall, ToolResult};
-use crate::ui_output::{emit_ui_output_event, UiOutputEvent, UiOutputEventKind, UiOutputSource};
+use crate::ui_output::{UiOutputEvent, UiOutputEventKind, UiOutputSource};
 use crate::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
 
 use anyhow::bail;
@@ -409,11 +409,11 @@ impl acp::Agent for HarnxAgent {
                 });
 
                 // Notify the parent about each tool call so it appears in the
-                // parent transcript.  The `emit_ui_output_event` inside
-                // `eval_mcp_async` only works when a UI sink is installed
-                // (i.e. in the TUI process).  In ACP-server mode there is no
-                // UI sink, so we send the notification directly over the ACP
-                // connection.
+                // parent transcript.  The `emit_agent_event_with_source` inside
+                // `eval_mcp_async` only works when an AgentEvent sink is
+                // installed (i.e. in the TUI process).  In ACP-server mode
+                // there is no sink, so we send the notification directly over
+                // the ACP connection.
                 let conn = self.connection.borrow().clone();
                 if let Some(conn) = conn {
                     for call in &tool_calls {
@@ -763,14 +763,25 @@ async fn eval_mcp_async(
         None => bail!("No tool provider configured for '{}'", call.name),
     };
 
-    emit_ui_output_event(UiOutputEvent {
-        kind: UiOutputEventKind::ToolCall {
-            tool_name: call.name.clone(),
-            input_yaml: None,
-            raw: None,
-        },
-        source,
-    });
+    {
+        use crate::agent_event_sink::ui_output_to_agent_event;
+        use harnx_core::event::AgentSource;
+        use harnx_core::sink::emit_agent_event_with_source;
+
+        let agent_source = source.clone().map(|s| AgentSource {
+            agent: s.agent,
+            session_id: s.session_id,
+        });
+        let event = ui_output_to_agent_event(UiOutputEvent {
+            kind: UiOutputEventKind::ToolCall {
+                tool_name: call.name.clone(),
+                input_yaml: None,
+                raw: None,
+            },
+            source: source.clone(),
+        });
+        emit_agent_event_with_source(event, agent_source);
+    }
 
     tokio::select! {
         result = manager.call_tool(&call.name, json_data) => result,
