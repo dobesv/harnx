@@ -47,13 +47,12 @@ pub fn install_cli_agent_event_sink(highlight: bool, render_options: RenderOptio
 pub struct TuiAgentEventSink;
 
 impl AgentEventSink for TuiAgentEventSink {
-    fn emit(&self, event: AgentEvent, _source: Option<harnx_core::event::AgentSource>) {
-        // Task 2 will wire source → UiOutputSource conversion. For now,
-        // pass-through behavior preserved: all emitted UiOutputEvent values
-        // have source: None. This keeps Task 1 scope to trait-signature
-        // propagation only.
-        let _ = _source;
+    fn emit(&self, event: AgentEvent, source: Option<harnx_core::event::AgentSource>) {
         use harnx_core::event::{ModelEvent, NoticeEvent, ToolEvent};
+        let ui_source = source.map(|s| crate::ui_output::UiOutputSource {
+            agent: s.agent,
+            session_id: s.session_id,
+        });
         match event {
             AgentEvent::Notice(notice) => {
                 let text = match notice {
@@ -63,7 +62,7 @@ impl AgentEventSink for TuiAgentEventSink {
                 };
                 let ui_event = UiOutputEvent {
                     kind: UiOutputEventKind::TranscriptText { text },
-                    source: None,
+                    source: ui_source,
                 };
                 emit_ui_output_event(ui_event);
             }
@@ -77,7 +76,7 @@ impl AgentEventSink for TuiAgentEventSink {
                         },
                         raw: None,
                     },
-                    source: None,
+                    source: ui_source,
                 };
                 emit_ui_output_event(ui_event);
             }
@@ -87,7 +86,7 @@ impl AgentEventSink for TuiAgentEventSink {
                 let text = render_tool_result_text(&output, &content);
                 let ui_event = UiOutputEvent {
                     kind: UiOutputEventKind::ToolResultText { text },
-                    source: None,
+                    source: ui_source,
                 };
                 emit_ui_output_event(ui_event);
             }
@@ -96,7 +95,7 @@ impl AgentEventSink for TuiAgentEventSink {
                 if !text.is_empty() {
                     let ui_event = UiOutputEvent {
                         kind: UiOutputEventKind::MessageChunk { text, raw: None },
-                        source: None,
+                        source: ui_source,
                     };
                     emit_ui_output_event(ui_event);
                 }
@@ -106,7 +105,7 @@ impl AgentEventSink for TuiAgentEventSink {
                 if !text.is_empty() {
                     let ui_event = UiOutputEvent {
                         kind: UiOutputEventKind::ThoughtChunk { text, raw: None },
-                        source: None,
+                        source: ui_source,
                     };
                     emit_ui_output_event(ui_event);
                 }
@@ -172,4 +171,76 @@ fn concat_text_blocks(blocks: &[harnx_core::event::ContentBlock]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::event::{AgentSource, ContentBlock, ModelEvent, NoticeEvent, ToolEvent};
+
+    fn install_collector() -> tokio::sync::mpsc::UnboundedReceiver<UiOutputEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::ui_output::install_ui_output_sender(tx);
+        rx
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_propagates_through_message_chunk() {
+        let mut rx = install_collector();
+        let sink = TuiAgentEventSink;
+        sink.emit(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("hello".into())],
+            }),
+            Some(AgentSource {
+                agent: "argus".into(),
+                session_id: Some("session-1".into()),
+            }),
+        );
+        let ev = rx.try_recv().expect("ui output event");
+        match &ev.kind {
+            UiOutputEventKind::MessageChunk { text, .. } => assert_eq!(text, "hello"),
+            other => panic!("unexpected kind: {other:?}"),
+        }
+        let source = ev.source.expect("source preserved");
+        assert_eq!(source.agent, "argus");
+        assert_eq!(source.session_id.as_deref(), Some("session-1"));
+        crate::ui_output::clear_ui_output_sender();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn none_source_yields_none_source() {
+        let mut rx = install_collector();
+        let sink = TuiAgentEventSink;
+        sink.emit(AgentEvent::Notice(NoticeEvent::Info("hi".into())), None);
+        let ev = rx.try_recv().expect("ui output event");
+        assert!(ev.source.is_none());
+        crate::ui_output::clear_ui_output_sender();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_propagates_through_tool_completed() {
+        let mut rx = install_collector();
+        let sink = TuiAgentEventSink;
+        sink.emit(
+            AgentEvent::Tool(ToolEvent::Completed {
+                id: String::new(),
+                output: serde_json::Value::String("ok".into()),
+                content: vec![],
+            }),
+            Some(AgentSource {
+                agent: "hephaestus".into(),
+                session_id: None,
+            }),
+        );
+        let ev = rx.try_recv().expect("ui output event");
+        match &ev.kind {
+            UiOutputEventKind::ToolResultText { .. } => {}
+            other => panic!("unexpected kind: {other:?}"),
+        }
+        let source = ev.source.expect("source preserved");
+        assert_eq!(source.agent, "hephaestus");
+        assert!(source.session_id.is_none());
+        crate::ui_output::clear_ui_output_sender();
+    }
 }
