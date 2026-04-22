@@ -10,6 +10,7 @@ pub use harnx_core::last_message::LastMessage;
 #[allow(unused_imports)]
 pub use harnx_core::macros::{Macro, MacroVariable};
 pub use harnx_core::model::ModelsOverride;
+pub use harnx_core::path::ensure_parent_exists;
 pub use harnx_core::working_mode::WorkingMode;
 
 use harnx_core::config_data::ConfigData;
@@ -39,7 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::{
     env,
     fs::{
-        create_dir_all, read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions,
+        read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions,
     },
     io::Write,
     path::{Path, PathBuf},
@@ -3061,23 +3062,6 @@ pub(crate) async fn ensure_parent_exists_async(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn ensure_parent_exists(path: &Path) -> Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("Failed to write to '{}', No parent path", path.display()))?;
-    if !parent.exists() {
-        create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to write to '{}', Cannot create parent directory",
-                path.display()
-            )
-        })?;
-    }
-    Ok(())
-}
 
 fn read_env_value<T>(key: &str) -> Option<Option<T>>
 where

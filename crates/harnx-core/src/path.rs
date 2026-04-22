@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use indexmap::IndexSet;
 use path_absolutize::Absolutize;
 
@@ -203,6 +203,28 @@ fn is_valid_extension(suffixes: Option<&Vec<String>>, path: &Path) -> bool {
         }
     }
     true
+}
+
+/// Ensure the parent directory of `path` exists, creating it if
+/// necessary. Returns `Ok(())` if the path itself already exists.
+/// Moved from `harnx::config` in Plan 45 T1 to enable the harnx-rag
+/// extraction.
+pub fn ensure_parent_exists(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Failed to write to '{}', No parent path", path.display()))?;
+    if !parent.exists() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to write to '{}', Cannot create parent directory",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
