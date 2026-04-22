@@ -28,7 +28,7 @@ use tokio::time::sleep;
 
 /// Per-call context for RAG operations that reach the LLM client
 /// layer (embeddings / reranking). Fields mirror `ClientCallContext`
-/// + are read fresh from the caller's live `Config` on each call so
+/// and are read fresh from the caller's live `Config` on each call so
 /// dynamic toggles (e.g. `.set dry_run true`) propagate immediately.
 pub struct RagCallContext<'a> {
     pub user_agent: Option<&'a str>,

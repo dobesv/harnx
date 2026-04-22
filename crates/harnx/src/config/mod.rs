@@ -1488,7 +1488,42 @@ impl Config {
                         format!("Failed to cleanup previous '{TEMP_RAG_NAME}' rag")
                     })?;
                 }
-                Rag::init(config, TEMP_RAG_NAME, &rag_path, &[], abort_signal).await?
+                let (
+                    clients_owned,
+                    loaders_owned,
+                    rag_embedding_model_owned,
+                    rag_reranker_model,
+                    rag_top_k,
+                    rag_chunk_size,
+                    rag_chunk_overlap,
+                    user_agent_owned,
+                    dry_run,
+                ) = {
+                    let cfg = config.read();
+                    (
+                        cfg.clients.clone(),
+                        cfg.document_loaders.clone(),
+                        cfg.rag_embedding_model.clone(),
+                        cfg.rag_reranker_model.clone(),
+                        cfg.rag_top_k,
+                        cfg.rag_chunk_size,
+                        cfg.rag_chunk_overlap,
+                        cfg.user_agent.clone(),
+                        cfg.dry_run,
+                    )
+                };
+                let init_ctx = crate::rag::RagInitContext {
+                    clients: &clients_owned,
+                    document_loaders: &loaders_owned,
+                    rag_embedding_model: rag_embedding_model_owned.as_deref(),
+                    rag_reranker_model,
+                    rag_top_k,
+                    rag_chunk_size,
+                    rag_chunk_overlap,
+                    user_agent: user_agent_owned.as_deref(),
+                    dry_run,
+                };
+                Rag::init(&init_ctx, TEMP_RAG_NAME, &rag_path, &[], abort_signal).await?
             }
             Some(name) => {
                 let rag_path = config.read().rag_file(name);
@@ -1496,9 +1531,44 @@ impl Config {
                     if config.read().working_mode.is_cmd() {
                         bail!("Unknown RAG '{name}'")
                     }
-                    Rag::init(config, name, &rag_path, &[], abort_signal).await?
+                    let (
+                        clients_owned,
+                        loaders_owned,
+                        rag_embedding_model_owned,
+                        rag_reranker_model,
+                        rag_top_k,
+                        rag_chunk_size,
+                        rag_chunk_overlap,
+                        user_agent_owned,
+                        dry_run,
+                    ) = {
+                        let cfg = config.read();
+                        (
+                            cfg.clients.clone(),
+                            cfg.document_loaders.clone(),
+                            cfg.rag_embedding_model.clone(),
+                            cfg.rag_reranker_model.clone(),
+                            cfg.rag_top_k,
+                            cfg.rag_chunk_size,
+                            cfg.rag_chunk_overlap,
+                            cfg.user_agent.clone(),
+                            cfg.dry_run,
+                        )
+                    };
+                    let init_ctx = crate::rag::RagInitContext {
+                        clients: &clients_owned,
+                        document_loaders: &loaders_owned,
+                        rag_embedding_model: rag_embedding_model_owned.as_deref(),
+                        rag_reranker_model,
+                        rag_top_k,
+                        rag_chunk_size,
+                        rag_chunk_overlap,
+                        user_agent: user_agent_owned.as_deref(),
+                        dry_run,
+                    };
+                    Rag::init(&init_ctx, name, &rag_path, &[], abort_signal).await?
                 } else {
-                    Rag::load(config, name, &rag_path)?
+                    Rag::load(&config.read().clients, name, &rag_path)?
                 }
             }
         };
@@ -1547,8 +1617,26 @@ impl Config {
         if new_document_paths.is_empty() || new_document_paths == document_paths {
             bail!("No changes")
         }
-        rag.refresh_document_paths(&new_document_paths, false, config, abort_signal)
-            .await?;
+        let (document_loaders, user_agent_owned, dry_run) = {
+            let cfg = config.read();
+            (
+                cfg.document_loaders.clone(),
+                cfg.user_agent.clone(),
+                cfg.dry_run,
+            )
+        };
+        let call_ctx = crate::rag::RagCallContext {
+            user_agent: user_agent_owned.as_deref(),
+            dry_run,
+        };
+        rag.refresh_document_paths(
+            &new_document_paths,
+            false,
+            &document_loaders,
+            &call_ctx,
+            abort_signal,
+        )
+        .await?;
         config.write().rag = Some(Arc::new(rag));
         Ok(())
     }
@@ -1559,8 +1647,26 @@ impl Config {
             None => bail!("No RAG"),
         };
         let document_paths = rag.document_paths().to_vec();
-        rag.refresh_document_paths(&document_paths, true, config, abort_signal)
-            .await?;
+        let (document_loaders, user_agent_owned, dry_run) = {
+            let cfg = config.read();
+            (
+                cfg.document_loaders.clone(),
+                cfg.user_agent.clone(),
+                cfg.dry_run,
+            )
+        };
+        let call_ctx = crate::rag::RagCallContext {
+            user_agent: user_agent_owned.as_deref(),
+            dry_run,
+        };
+        rag.refresh_document_paths(
+            &document_paths,
+            true,
+            &document_loaders,
+            &call_ctx,
+            abort_signal,
+        )
+        .await?;
         config.write().rag = Some(Arc::new(rag));
         Ok(())
     }
@@ -1595,9 +1701,24 @@ impl Config {
         abort_signal: AbortSignal,
     ) -> Result<String> {
         let (reranker_model, top_k) = rag.get_config();
-        let (embeddings, ids) = rag
-            .search(text, top_k, reranker_model.as_deref(), abort_signal)
-            .await?;
+        let (embeddings, ids) = {
+            let (user_agent_owned, dry_run) = {
+                let cfg = config.read();
+                (cfg.user_agent.clone(), cfg.dry_run)
+            };
+            let call_ctx = crate::rag::RagCallContext {
+                user_agent: user_agent_owned.as_deref(),
+                dry_run,
+            };
+            rag.search(
+                &call_ctx,
+                text,
+                top_k,
+                reranker_model.as_deref(),
+                abort_signal,
+            )
+            .await?
+        };
         let text = config.read().rag_template(&embeddings, text);
         rag.set_last_sources(&ids);
         Ok(text)

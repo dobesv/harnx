@@ -238,7 +238,11 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
     resolve_file_backed_variables(agent.config.variables_mut(), &agent_dir)?;
 
     let rag = if rag_path.exists() {
-        Some(Arc::new(Rag::load(config, DEFAULT_AGENT_NAME, &rag_path)?))
+        Some(Arc::new(Rag::load(
+            &config.read().clients,
+            DEFAULT_AGENT_NAME,
+            &rag_path,
+        )?))
     } else if !agent.documents().is_empty() && !config.read().info_flag {
         let mut ans = false;
         if *IS_STDOUT_TERMINAL {
@@ -257,7 +261,42 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
                     document_paths.push(new_path.display().to_string())
                 }
             }
-            let rag = Rag::init(config, "rag", &rag_path, &document_paths, abort_signal).await?;
+            let (
+                clients_owned,
+                loaders_owned,
+                rag_embedding_model_owned,
+                rag_reranker_model,
+                rag_top_k,
+                rag_chunk_size,
+                rag_chunk_overlap,
+                user_agent_owned,
+                dry_run,
+            ) = {
+                let cfg = config.read();
+                (
+                    cfg.clients.clone(),
+                    cfg.document_loaders.clone(),
+                    cfg.rag_embedding_model.clone(),
+                    cfg.rag_reranker_model.clone(),
+                    cfg.rag_top_k,
+                    cfg.rag_chunk_size,
+                    cfg.rag_chunk_overlap,
+                    cfg.user_agent.clone(),
+                    cfg.dry_run,
+                )
+            };
+            let init_ctx = crate::rag::RagInitContext {
+                clients: &clients_owned,
+                document_loaders: &loaders_owned,
+                rag_embedding_model: rag_embedding_model_owned.as_deref(),
+                rag_reranker_model,
+                rag_top_k,
+                rag_chunk_size,
+                rag_chunk_overlap,
+                user_agent: user_agent_owned.as_deref(),
+                dry_run,
+            };
+            let rag = Rag::init(&init_ctx, "rag", &rag_path, &document_paths, abort_signal).await?;
             Some(Arc::new(rag))
         } else {
             None
