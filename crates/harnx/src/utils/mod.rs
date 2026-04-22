@@ -79,6 +79,7 @@ where
     list.into_iter().map(|(v, _)| v).collect()
 }
 
+/// Also inlined in `harnx_render::pretty_error` — keep in sync.
 pub fn pretty_error(err: &anyhow::Error) -> String {
     let mut output = vec![];
     output.push(format!("Error: {err}"));
@@ -97,6 +98,7 @@ pub fn pretty_error(err: &anyhow::Error) -> String {
     output.join("\n")
 }
 
+/// Also inlined in `harnx_render::indent_text` — keep in sync.
 pub fn indent_text<T: ToString>(s: T, size: usize) -> String {
     let indent_str = " ".repeat(size);
     s.to_string()
@@ -106,6 +108,7 @@ pub fn indent_text<T: ToString>(s: T, size: usize) -> String {
         .join("\n")
 }
 
+/// Also inlined in `harnx_render::error_text` — keep in sync.
 pub fn error_text(input: &str) -> String {
     color_text(input, nu_ansi_term::Color::Red)
 }
@@ -159,6 +162,7 @@ pub fn is_url(path: &str) -> bool {
     path.starts_with("http://") || path.starts_with("https://")
 }
 
+/// Also inlined in `harnx_render::decode_bin` — keep in sync.
 pub fn decode_bin<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T> {
     let (v, _) = bincode::serde::decode_from_slice(data, bincode::config::legacy())?;
     Ok(v)
