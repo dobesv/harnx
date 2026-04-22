@@ -2,7 +2,7 @@ use super::*;
 use crate::tui::render_helpers::{render_status_line, render_usage_line};
 use crate::tui::types::{TranscriptItem, TuiEvent};
 use crate::ui_output::{UiOutputEvent, UiOutputEventKind};
-use harnx_core::event::{AgentSource, PlanEntry};
+use harnx_core::event::{AgentEvent, AgentSource};
 use std::path::Path;
 
 const ATTACHMENT_PREVIEW_MAX_CHARS: usize = 800;
@@ -509,25 +509,34 @@ impl Tui {
     }
 
     async fn render_ui_output_event(&mut self, event: UiOutputEvent) {
-        let agent_source = event.source.as_ref().map(|s| AgentSource {
+        use crate::agent_event_sink::ui_output_to_agent_event;
+
+        let source = event.source.as_ref().map(|s| AgentSource {
             agent: s.agent.clone(),
             session_id: s.session_id.clone(),
         });
-        let is_thought = matches!(&event.kind, UiOutputEventKind::ThoughtChunk { .. });
-        let is_usage = matches!(&event.kind, UiOutputEventKind::Usage { .. });
+        let agent_event = ui_output_to_agent_event(event);
+        self.render_agent_event(agent_event, source).await;
+    }
+
+    async fn render_agent_event(&mut self, event: AgentEvent, source: Option<AgentSource>) {
+        use harnx_core::event::{ModelEvent, NoticeEvent, ToolEvent};
+
+        let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
+        let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
         // Tool calls (and plan updates) from sub-agents represent a turn-like
         // boundary in the sub-agent's output: text streamed *before* the tool
         // call belongs visually above it, text streamed *after* belongs
         // visually below.  Reset the streaming-assistant index here so a
         // subsequent MessageChunk starts a fresh AssistantText rather than
         // being appended to the text that preceded the tool call.  We
-        // deliberately do NOT reset for display-only events (TranscriptText,
-        // ToolResultText, Usage, ToolCallUpdate) so that LLM text chunks
-        // with trailing-newline completion still coalesce correctly across
-        // those events.
+        // deliberately do NOT reset for display-only events (Notice::Info,
+        // Tool::Completed, Model::Usage, Tool::Update) so that LLM text
+        // chunks with trailing-newline completion still coalesce correctly
+        // across those events.
         let is_turn_boundary = matches!(
-            &event.kind,
-            UiOutputEventKind::ToolCall { .. } | UiOutputEventKind::Plan { .. }
+            &event,
+            AgentEvent::Tool(ToolEvent::Started { .. }) | AgentEvent::Plan { .. }
         );
         if is_turn_boundary {
             self.app.streaming_assistant_idx = None;
@@ -535,10 +544,10 @@ impl Tui {
         if !is_thought {
             self.flush_pending_thought();
         }
-        self.render_ui_output_heading(agent_source.as_ref(), is_usage);
+        self.render_ui_output_heading(source.as_ref(), is_usage);
 
-        let rendered_entries = match event.kind {
-            UiOutputEventKind::TranscriptText { text } => {
+        let rendered_entries = match event {
+            AgentEvent::Notice(NoticeEvent::Info(text)) => {
                 let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
                 if clean.is_empty() {
                     vec![]
@@ -546,7 +555,34 @@ impl Tui {
                     vec![TranscriptItem::SystemText(clean)]
                 }
             }
-            UiOutputEventKind::ToolResultText { text } => {
+            AgentEvent::Notice(NoticeEvent::Warning(msg)) => {
+                let text = format!("⚠ {msg}");
+                let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
+                if clean.is_empty() {
+                    vec![]
+                } else {
+                    vec![TranscriptItem::SystemText(clean)]
+                }
+            }
+            AgentEvent::Notice(NoticeEvent::Error(msg)) => {
+                let text = format!("error: {msg}");
+                let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
+                if clean.is_empty() {
+                    vec![]
+                } else {
+                    vec![TranscriptItem::SystemText(clean)]
+                }
+            }
+            AgentEvent::Tool(ToolEvent::Completed { output, .. }) => {
+                // Tests and legacy emitters pre-format the ToolResultText as
+                // a string before wrapping it in AgentEvent::Tool::Completed
+                // (see ui_output_to_agent_event which maps ToolResultText to
+                // Value::String). For structured outputs we fall back to
+                // pretty YAML to preserve readability.
+                let text = output
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| crate::ui_output::pretty_yaml_block(&output));
                 let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
                 if clean.is_empty() {
                     vec![]
@@ -557,7 +593,8 @@ impl Tui {
                         .collect()
                 }
             }
-            UiOutputEventKind::MessageChunk { text, .. } => {
+            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
+                let text = concat_text_blocks(&blocks);
                 if text.is_empty() {
                     vec![]
                 } else {
@@ -566,10 +603,11 @@ impl Tui {
                     vec![]
                 }
             }
-            UiOutputEventKind::LlmFinal { output, usage } => {
+            AgentEvent::Model(ModelEvent::Final { output, usage }) => {
                 self.flush_pending_thought();
                 self.app.llm_busy = false;
                 self.app.last_ui_output_source = None;
+                let usage_str = format_usage(&usage);
                 if !output.is_empty() {
                     if let Some(idx) = self.app.streaming_assistant_idx {
                         match self.app.transcript.get_mut(idx) {
@@ -597,10 +635,10 @@ impl Tui {
                     self.pin_transcript_to_bottom();
                 }
                 self.app.streaming_assistant_idx = None;
-                if !usage.is_empty() {
+                if !usage_str.is_empty() {
                     self.app
                         .transcript
-                        .push(TranscriptItem::SystemText(format!("Usage: {usage}")));
+                        .push(TranscriptItem::SystemText(format!("Usage: {usage_str}")));
                     self.pin_transcript_to_bottom();
                 }
                 self.refresh_input_chrome();
@@ -615,7 +653,7 @@ impl Tui {
                 }
                 vec![]
             }
-            UiOutputEventKind::LlmError(err) => {
+            AgentEvent::Model(ModelEvent::Error(err)) => {
                 self.flush_pending_thought();
                 self.app.llm_busy = false;
                 self.app.streaming_assistant_idx = None;
@@ -634,14 +672,8 @@ impl Tui {
                 }
                 vec![]
             }
-            UiOutputEventKind::ThoughtChunk { text, raw } => {
-                let text = crate::tui::render_helpers::event_fallback_text(
-                    &UiOutputEventKind::ThoughtChunk {
-                        text: text.clone(),
-                        raw: raw.clone(),
-                    },
-                    agent_source.as_ref(),
-                );
+            AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
+                let text = concat_text_blocks(&blocks);
                 let clean = strip_ansi(&text)
                     .trim_start_matches("<think>")
                     .trim_end_matches("</think>")
@@ -649,46 +681,38 @@ impl Tui {
                 if clean.trim().is_empty() {
                     vec![]
                 } else {
-                    if self.app.pending_thought_source != agent_source {
+                    if self.app.pending_thought_source != source {
                         self.flush_pending_thought();
-                        self.app.pending_thought_source = agent_source.clone();
+                        self.app.pending_thought_source = source.clone();
                     }
                     self.app.pending_thought_text.push_str(&clean);
                     vec![]
                 }
             }
-
-            UiOutputEventKind::ToolCallUpdate { title, status, .. } => {
-                if let Some(text) = render_status_line(title.as_deref(), status.as_deref()) {
+            AgentEvent::Tool(ToolEvent::Update { title, status, .. }) => {
+                let status_str = status.map(|s| format!("{s:?}").to_lowercase());
+                if let Some(text) = render_status_line(title.as_deref(), status_str.as_deref()) {
                     vec![TranscriptItem::StatusLine(text)]
                 } else {
                     vec![]
                 }
             }
-            UiOutputEventKind::Plan { entries } => vec![TranscriptItem::Plan(
-                entries
-                    .into_iter()
-                    .map(|e| PlanEntry {
-                        status: e.status,
-                        content: e.content,
-                    })
-                    .collect(),
-            )],
-            UiOutputEventKind::Usage {
-                input_tokens,
-                output_tokens,
-                cached_tokens,
+            AgentEvent::Plan { entries } => vec![TranscriptItem::Plan(entries)],
+            AgentEvent::Model(ModelEvent::Usage {
+                input,
+                output,
+                cached,
                 session_label,
-            } => {
+            }) => {
                 let line = render_usage_line(
-                    input_tokens,
-                    output_tokens,
-                    cached_tokens,
+                    input,
+                    output,
+                    cached,
                     session_label.as_deref(),
-                    agent_source.as_ref(),
+                    source.as_ref(),
                 );
                 if let Some(line) = line {
-                    if self.update_existing_usage_line(agent_source.as_ref(), &line) {
+                    if self.update_existing_usage_line(source.as_ref(), &line) {
                         vec![]
                     } else {
                         vec![TranscriptItem::UsageLine(line)]
@@ -697,23 +721,26 @@ impl Tui {
                     vec![]
                 }
             }
-            UiOutputEventKind::ToolCall {
-                tool_name,
-                input_yaml,
-                ..
-            } => {
+            AgentEvent::Tool(ToolEvent::Started { name, input, .. }) => {
+                let input_yaml = match &input {
+                    serde_json::Value::Null => None,
+                    _ => Some(crate::ui_output::pretty_yaml_block(&input)),
+                };
                 vec![TranscriptItem::ToolCall {
-                    tool_name,
+                    tool_name: name,
                     input_yaml,
                 }]
             }
+            // Not rendered by the TUI: Turn, Session, Status, Tool::Progress,
+            // Tool::Failed.
+            _ => vec![],
         };
 
         if !rendered_entries.is_empty() {
             let start_idx = self.app.transcript.len();
             self.app.transcript.extend(rendered_entries);
             if is_usage {
-                self.app.last_usage_source = agent_source.clone();
+                self.app.last_usage_source = source.clone();
                 self.app.last_usage_transcript_idx = Some(start_idx);
             } else {
                 self.clear_usage_tracking();
@@ -1107,5 +1134,34 @@ impl Tui {
             }
         }
         Ok(())
+    }
+}
+
+/// Concatenate `ContentBlock::Text(..)` fragments into a single String.
+/// Non-Text blocks (Image, ResourceLink, Opaque) are skipped — the TUI
+/// transcript currently only renders text.
+fn concat_text_blocks(blocks: &[harnx_core::event::ContentBlock]) -> String {
+    use harnx_core::event::ContentBlock;
+    let mut out = String::new();
+    for block in blocks {
+        if let ContentBlock::Text(t) = block {
+            out.push_str(t);
+        }
+    }
+    out
+}
+
+/// Reproduce the textual representation of `CompletionTokenUsage` that the
+/// legacy `UiOutputEventKind::LlmFinal { usage: CompletionTokenUsage }` path
+/// produced. Pre-migration the TUI tested `!usage.is_empty()` (input==0 &&
+/// output==0) and then formatted via `format!("Usage: {usage}")` using the
+/// Display impl. Mirror that contract: return empty when `is_empty()`, else
+/// the Display output. Callers then test `!usage_str.is_empty()` to decide
+/// whether to emit a `Usage:` transcript line.
+fn format_usage(usage: &harnx_core::api_types::CompletionTokenUsage) -> String {
+    if usage.is_empty() {
+        String::new()
+    } else {
+        format!("{usage}")
     }
 }
