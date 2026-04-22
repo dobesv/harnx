@@ -1572,6 +1572,7 @@ dependencies = [
  "fuzzy-matcher",
  "glob",
  "globset",
+ "harnx-acp",
  "harnx-client",
  "harnx-core",
  "harnx-engine",
@@ -1630,6 +1631,14 @@ dependencies = [
  "urlencoding",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "harnx-acp"
+version = "0.30.0"
+dependencies = [
+ "harnx-core",
+ "serde",
 ]
 
 [[package]]

@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 mod client;
-mod config;
 mod server;
 
 use crate::tool::{JsonSchema, ToolDeclaration};
@@ -20,15 +19,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
-
-#[derive(Clone, Debug)]
-pub enum NestedAcpEvent {
-    Text(String),
-    Agent(
-        harnx_core::event::AgentEvent,
-        Option<harnx_core::event::AgentSource>,
-    ),
-}
 
 pub struct AcpManager {
     clients: Arc<RwLock<HashMap<String, Arc<AcpClient>>>>,
@@ -361,7 +351,7 @@ fn optional_string<'a>(
 }
 
 pub use client::AcpClient;
-pub use config::AcpServerConfig;
+pub use harnx_acp::{AcpServerConfig, NestedAcpEvent};
 #[allow(unused_imports)]
 pub use server::HarnxAgent;
 

@@ -5,6 +5,7 @@ members = [
     "crates/harnx-client",
     "crates/harnx-core",
     "crates/harnx-engine",
+    "crates/harnx-acp",
     "crates/harnx-mcp",
     "crates/harnx-mcp-bash",
     "crates/harnx-mcp-fs",
@@ -101,3 +102,4 @@ jiff = { version = "0.2.23", features = ["serde"] }
 reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
 syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"], default-features = false }
 arboard = { version = "3.3.0", default-features = false }
+harnx-acp = { path = "crates/harnx-acp", version = "0.30.0" }
