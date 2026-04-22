@@ -153,7 +153,10 @@ mod tests {
 
     fn make_config() -> GlobalConfig {
         let config = Config {
-            stream: false,
+            data: harnx_core::config_data::ConfigData {
+                stream: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
         Arc::new(RwLock::new(config))

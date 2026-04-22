@@ -12,6 +12,7 @@ pub use harnx_core::macros::{Macro, MacroVariable};
 pub use harnx_core::model::ModelsOverride;
 pub use harnx_core::working_mode::WorkingMode;
 
+use harnx_core::config_data::ConfigData;
 use harnx_core::config_paths as paths;
 
 use crate::acp::{AcpManager, AcpServerConfig};
@@ -32,7 +33,6 @@ use globset::GlobBuilder;
 use indexmap::IndexMap;
 use inquire::{list_option::ListOption, validator::Validation, Confirm, MultiSelect, Select, Text};
 use parking_lot::RwLock;
-use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use simplelog::LevelFilter;
 use std::collections::{HashMap, HashSet};
@@ -86,19 +86,6 @@ __INPUT__
 static EDITOR: OnceLock<Option<String>> = OnceLock::new();
 
 use harnx_core::agent_config::{normalize_toolset_value, split_tool_selectors, ToolsetValue};
-
-fn deserialize_toolsets<'de, D>(
-    deserializer: D,
-) -> std::result::Result<IndexMap<String, Vec<String>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let values = IndexMap::<String, ToolsetValue>::deserialize(deserializer)?;
-    Ok(values
-        .into_iter()
-        .map(|(key, value)| (key, normalize_toolset_value(value)))
-        .collect())
-}
 
 fn parse_toolsets_json(value: &str) -> serde_json::Result<IndexMap<String, Vec<String>>> {
     let values = serde_json::from_str::<IndexMap<String, ToolsetValue>>(value)?;
@@ -158,147 +145,56 @@ fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
         .collect()
 }
 
-#[derive(Deserialize)]
-#[serde(default)]
 pub struct Config {
-    #[serde(rename(serialize = "model", deserialize = "model"))]
-    #[serde(default)]
-    pub model_id: String,
-    pub temperature: Option<f64>,
-    pub top_p: Option<f64>,
+    pub data: ConfigData,
 
-    pub dry_run: bool,
-    pub stream: bool,
-    pub save: bool,
-    pub keybindings: String,
-    pub editor: Option<String>,
-    pub wrap: Option<String>,
-    pub wrap_code: bool,
-
-    pub tool_use: bool,
-    #[serde(default)]
-    #[serde(alias = "mapping_tools")]
-    #[serde(deserialize_with = "deserialize_toolsets")]
-    pub toolsets: IndexMap<String, Vec<String>>,
-    #[serde(
-        default,
-        deserialize_with = "harnx_core::agent_config::deserialize_use_tools"
-    )]
-    pub use_tools: Option<Vec<String>>,
-
-    #[serde(alias = "repl_default_session")]
-    pub tui_default_session: Option<String>,
-    pub cmd_default_session: Option<String>,
-    pub agent_default_session: Option<String>,
-
-    pub save_session: Option<bool>,
-    pub compress_threshold: usize,
-
-    pub rag_embedding_model: Option<String>,
-    pub rag_reranker_model: Option<String>,
-    pub rag_top_k: usize,
-    pub rag_chunk_size: Option<usize>,
-    pub rag_chunk_overlap: Option<usize>,
-    pub rag_template: Option<String>,
-
-    #[serde(default)]
-    pub document_loaders: HashMap<String, String>,
-
-    pub highlight: bool,
-    pub theme: Option<String>,
-
-    pub serve_addr: Option<String>,
-    pub user_agent: Option<String>,
-    pub save_shell_history: bool,
-    pub sync_models_url: Option<String>,
-
-    #[serde(skip)]
+    // Server-config vectors (types live in dependent crates — stay here,
+    // not in ConfigData, to avoid reverse deps from harnx-core).
     pub clients: Vec<ClientConfig>,
-
-    #[serde(skip)]
     pub mcp_servers: Vec<McpServerConfig>,
-
-    #[serde(skip)]
     pub acp_servers: Vec<AcpServerConfig>,
 
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<HooksConfig>,
-
-    #[serde(skip)]
+    // Runtime state — unchanged from pre-A2:
     pub model_cooldowns: std::sync::Arc<parking_lot::Mutex<crate::client::retry::ModelCooldownMap>>,
-    #[serde(skip)]
     pub macro_flag: bool,
-    #[serde(skip)]
     pub info_flag: bool,
-    #[serde(skip)]
     pub agent_variables: Option<AgentVariables>,
-    #[serde(skip)]
     pub mcp_root: Vec<String>,
 
-    #[serde(skip)]
     pub model: Model,
-    #[serde(skip)]
     pub tools: Tools,
-    #[serde(skip)]
     pub mcp_manager: Option<Arc<McpManager>>,
-    #[serde(skip)]
     pub acp_manager: Option<Arc<AcpManager>>,
-    #[serde(skip)]
     pub working_mode: WorkingMode,
-    #[serde(skip)]
     pub last_message: Option<LastMessage>,
 
-    #[serde(skip)]
     pub session: Option<Session>,
-    #[serde(skip)]
     pub rag: Option<Arc<Rag>>,
-    #[serde(skip)]
     pub agent: Option<Agent>,
-    #[serde(skip)]
     pub tui_before_editor: Option<Box<dyn FnMut() + Send + Sync>>,
-    #[serde(skip)]
     pub tui_after_editor: Option<Box<dyn FnMut() + Send + Sync>>,
+}
+
+impl std::ops::Deref for Config {
+    type Target = ConfigData;
+    fn deref(&self) -> &ConfigData {
+        &self.data
+    }
+}
+
+impl std::ops::DerefMut for Config {
+    fn deref_mut(&mut self) -> &mut ConfigData {
+        &mut self.data
+    }
 }
 
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
-            .field("model_id", &self.model_id)
-            .field("temperature", &self.temperature)
-            .field("top_p", &self.top_p)
-            .field("dry_run", &self.dry_run)
-            .field("stream", &self.stream)
-            .field("save", &self.save)
-            .field("keybindings", &self.keybindings)
-            .field("editor", &self.editor)
-            .field("wrap", &self.wrap)
-            .field("wrap_code", &self.wrap_code)
-            .field("tool_use", &self.tool_use)
-            .field("toolsets", &self.toolsets)
-            .field("use_tools", &self.use_tools)
-            .field("tui_default_session", &self.tui_default_session)
-            .field("cmd_default_session", &self.cmd_default_session)
-            .field("agent_default_session", &self.agent_default_session)
-            .field("save_session", &self.save_session)
-            .field("compress_threshold", &self.compress_threshold)
-            .field("rag_embedding_model", &self.rag_embedding_model)
-            .field("rag_reranker_model", &self.rag_reranker_model)
-            .field("rag_top_k", &self.rag_top_k)
-            .field("rag_chunk_size", &self.rag_chunk_size)
-            .field("rag_chunk_overlap", &self.rag_chunk_overlap)
-            .field("rag_template", &self.rag_template)
-            .field("document_loaders", &self.document_loaders)
-            .field("highlight", &self.highlight)
-            .field("theme", &self.theme)
-            .field("serve_addr", &self.serve_addr)
-            .field("user_agent", &self.user_agent)
-            .field("save_shell_history", &self.save_shell_history)
-            .field("sync_models_url", &self.sync_models_url)
+            .field("data", &self.data)
             .field("clients", &self.clients)
             .field("mcp_servers", &self.mcp_servers)
             .field("acp_servers", &self.acp_servers)
-            .field("hooks", &self.hooks)
             .field("macro_flag", &self.macro_flag)
             .field("info_flag", &self.info_flag)
             .field("agent_variables", &self.agent_variables)
@@ -319,41 +215,10 @@ impl std::fmt::Debug for Config {
 impl Clone for Config {
     fn clone(&self) -> Self {
         Self {
-            model_id: self.model_id.clone(),
-            temperature: self.temperature,
-            top_p: self.top_p,
-            dry_run: self.dry_run,
-            stream: self.stream,
-            save: self.save,
-            keybindings: self.keybindings.clone(),
-            editor: self.editor.clone(),
-            wrap: self.wrap.clone(),
-            wrap_code: self.wrap_code,
-            tool_use: self.tool_use,
-            toolsets: self.toolsets.clone(),
-            use_tools: self.use_tools.clone(),
-            tui_default_session: self.tui_default_session.clone(),
-            cmd_default_session: self.cmd_default_session.clone(),
-            agent_default_session: self.agent_default_session.clone(),
-            save_session: self.save_session,
-            compress_threshold: self.compress_threshold,
-            rag_embedding_model: self.rag_embedding_model.clone(),
-            rag_reranker_model: self.rag_reranker_model.clone(),
-            rag_top_k: self.rag_top_k,
-            rag_chunk_size: self.rag_chunk_size,
-            rag_chunk_overlap: self.rag_chunk_overlap,
-            rag_template: self.rag_template.clone(),
-            document_loaders: self.document_loaders.clone(),
-            highlight: self.highlight,
-            theme: self.theme.clone(),
-            serve_addr: self.serve_addr.clone(),
-            user_agent: self.user_agent.clone(),
-            save_shell_history: self.save_shell_history,
-            sync_models_url: self.sync_models_url.clone(),
+            data: self.data.clone(),
             clients: self.clients.clone(),
             mcp_servers: self.mcp_servers.clone(),
             acp_servers: self.acp_servers.clone(),
-            hooks: self.hooks.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
             info_flag: self.info_flag,
@@ -377,51 +242,11 @@ impl Clone for Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model_id: Default::default(),
-            temperature: None,
-            top_p: None,
-
-            dry_run: false,
-            stream: true,
-            save: false,
-            keybindings: "emacs".into(),
-            editor: None,
-            wrap: None,
-            wrap_code: false,
-
-            tool_use: true,
-            toolsets: Default::default(),
-            use_tools: None,
-
-            tui_default_session: None,
-            cmd_default_session: None,
-            agent_default_session: None,
-
-            save_session: Some(true),
-            compress_threshold: 180000,
-
-            rag_embedding_model: None,
-            rag_reranker_model: None,
-            rag_top_k: 5,
-            rag_chunk_size: None,
-            rag_chunk_overlap: None,
-            rag_template: None,
-
-            document_loaders: Default::default(),
-
-            highlight: true,
-            theme: None,
-
-            serve_addr: None,
-            user_agent: None,
-            save_shell_history: true,
-            sync_models_url: None,
+            data: ConfigData::default(),
 
             clients: vec![],
             mcp_servers: vec![],
             acp_servers: vec![],
-
-            hooks: None,
 
             model_cooldowns: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
             macro_flag: false,
@@ -2491,13 +2316,17 @@ impl Config {
 
     fn load_from_file(config_path: &Path) -> Result<Self> {
         let err = || format!("Failed to load config at '{}'", config_path.display());
-        let mut config: Self = if config_path.exists() {
+        let data: ConfigData = if config_path.exists() {
             let content = read_to_string(config_path).with_context(err)?;
             serde_yaml::from_str(&content)
                 .map_err(|err| anyhow!(err.to_string()))
                 .with_context(err)?
         } else {
-            Self::default()
+            ConfigData::default()
+        };
+        let mut config = Self {
+            data,
+            ..Self::default()
         };
         let config_dir = config_path.parent().unwrap_or(config_path);
         config.clients = Self::load_clients_from_dir(&config_dir.join(paths::CLIENTS_DIR_NAME))?;
@@ -2624,16 +2453,18 @@ impl Config {
         } else {
             json!({ "type": provider })
         };
-        let config_value = json!({
+        let data_value = json!({
             "model": model_id.to_string(),
             "save": false,
-            "clients": vec![client.clone()],
         });
-        let mut config: Self = serde_json::from_value(config_value)
-            .with_context(|| "Failed to load config from env")?;
+        let data: ConfigData =
+            serde_json::from_value(data_value).with_context(|| "Failed to load config from env")?;
 
-        // Config::clients is #[serde(skip)], so it's empty after from_value.
-        // We must populate it manually.
+        let mut config = Self {
+            data,
+            ..Self::default()
+        };
+
         config.clients =
             vec![serde_json::from_value(client).context("Failed to parse client config")?];
 
@@ -3301,8 +3132,11 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = Config {
-            stream: false,
-            save_session: Some(true),
+            data: ConfigData {
+                stream: false,
+                save_session: Some(true),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut session = self::session::new(&config, "test-intermediate");
@@ -3362,7 +3196,10 @@ mod tests {
     /// message in it, suitable for compaction tests.
     fn make_config_with_session() -> GlobalConfig {
         let mut config = Config {
-            stream: false,
+            data: ConfigData {
+                stream: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut session = self::session::new(&config, "test-session");
@@ -3442,7 +3279,10 @@ mod tests {
         ));
 
         let mut config = Config {
-            stream: false,
+            data: ConfigData {
+                stream: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
         // Point Config::agent_file() at the temp dir via HARNX_CONFIG_DIR.
