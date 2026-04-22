@@ -80,6 +80,7 @@ harnx-acp = { workspace = true }
 harnx-client = { path = "../harnx-client" }
 harnx-core = { path = "../harnx-core" }
 harnx-engine = { path = "../harnx-engine" }
+harnx-fetch = { path = "../harnx-fetch" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-mcp = { path = "../harnx-mcp" }
 harnx-render = { path = "../harnx-render" }

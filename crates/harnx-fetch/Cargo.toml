@@ -12,9 +12,11 @@ anyhow = { workspace = true }
 fancy-regex = { workspace = true }
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
+html_to_markdown = { workspace = true }
 http = { workspace = true }
 indexmap = { workspace = true }
 log = { workspace = true }
+nu-ansi-term = { workspace = true }
 reqwest = { workspace = true }
 scraper = { workspace = true }
 serde = { workspace = true }

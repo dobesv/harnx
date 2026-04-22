@@ -1576,6 +1576,7 @@ dependencies = [
  "harnx-client",
  "harnx-core",
  "harnx-engine",
+ "harnx-fetch",
  "harnx-hooks",
  "harnx-mcp",
  "harnx-render",
@@ -1726,6 +1727,28 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "harnx-fetch"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "fancy-regex 0.17.0",
+ "futures-util",
+ "harnx-core",
+ "html_to_markdown",
+ "http 1.4.0",
+ "indexmap",
+ "log",
+ "nu-ansi-term",
+ "reqwest",
+ "scraper",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
