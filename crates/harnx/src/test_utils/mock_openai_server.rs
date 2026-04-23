@@ -57,15 +57,15 @@ pub struct MockOpenAiToolCall {
 struct ServerState {
     script: MockOpenAiScript,
     turn_index: AtomicUsize,
-    request_log: Mutex<Vec<Value>>,
+    request_log: Arc<Mutex<Vec<Value>>>,
 }
 
 impl ServerState {
-    fn new(script: MockOpenAiScript) -> Self {
+    fn new(script: MockOpenAiScript, request_log: Arc<Mutex<Vec<Value>>>) -> Self {
         Self {
             script,
             turn_index: AtomicUsize::new(0),
-            request_log: Mutex::new(Vec::new()),
+            request_log,
         }
     }
 
@@ -92,6 +92,7 @@ pub struct MockOpenAiServer {
     port: u16,
     shutdown: Option<TcpStream>,
     accept_thread: Option<JoinHandle<()>>,
+    request_log: Arc<Mutex<Vec<Value>>>,
 }
 
 impl MockOpenAiServer {
@@ -116,7 +117,8 @@ impl MockOpenAiServer {
             .accept()
             .context("failed to accept shutdown channel")?;
 
-        let state = Arc::new(ServerState::new(script));
+        let request_log = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(ServerState::new(script, Arc::clone(&request_log)));
         let accept_thread =
             thread::spawn(move || run_accept_loop(listener, shutdown_server, state));
 
@@ -124,11 +126,16 @@ impl MockOpenAiServer {
             port,
             shutdown: Some(shutdown),
             accept_thread: Some(accept_thread),
+            request_log,
         })
     }
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    pub fn get_request_log(&self) -> Vec<Value> {
+        self.request_log.lock().unwrap().clone()
     }
 }
 

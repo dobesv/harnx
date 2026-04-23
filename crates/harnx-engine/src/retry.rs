@@ -14,7 +14,7 @@ use harnx_core::error::LlmError;
 use harnx_core::input::Input;
 use harnx_core::model::ModelType;
 use harnx_core::retry_config::{ModelCooldownMap, RetryConfig};
-use harnx_core::tool::ToolResult;
+use harnx_core::tool::ToolCall;
 use parking_lot::Mutex;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,12 +28,7 @@ pub const DEFAULT_COOLDOWN_SECS: u64 = 60;
 pub type CallFuture<'a> = Pin<
     Box<
         dyn std::future::Future<
-                Output = Result<(
-                    String,
-                    Option<String>,
-                    Vec<ToolResult>,
-                    CompletionTokenUsage,
-                )>,
+                Output = Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>,
             > + Send
             + 'a,
     >,
@@ -149,12 +144,7 @@ pub async fn call_with_retry_and_fallback_custom<F>(
     ctx: &TurnContext,
     abort_signal: AbortSignal,
     call_fn: F,
-) -> Result<(
-    String,
-    Option<String>,
-    Vec<ToolResult>,
-    CompletionTokenUsage,
-)>
+) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>
 where
     F: for<'a> Fn(&'a Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
 {
@@ -187,7 +177,6 @@ where
     for (idx, model_id) in model_ids.iter().enumerate() {
         // Skip models on cooldown
         if ctx.model_cooldowns.lock().is_on_cooldown(model_id) {
-            ctx.warn(&format!("Skipping model '{}' (on cooldown)", model_id));
             continue;
         }
 
@@ -277,12 +266,7 @@ pub async fn try_model_with_retries_custom<F>(
     retry_config: &RetryConfig,
     abort_signal: AbortSignal,
     call_fn: &F,
-) -> Result<(
-    String,
-    Option<String>,
-    Vec<ToolResult>,
-    CompletionTokenUsage,
-)>
+) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>
 where
     F: for<'a> Fn(&'a Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
 {

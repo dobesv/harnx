@@ -1,6 +1,6 @@
 use super::{call_chat_completions, call_chat_completions_streaming, Client};
 use crate::config::{GlobalConfig, Input};
-use crate::tool::ToolResult;
+use crate::tool::ToolCall;
 use crate::utils::{warning_text, AbortSignal};
 
 use anyhow::Result;
@@ -55,12 +55,7 @@ pub async fn call_with_retry_and_fallback(
     input: &Input,
     config: &GlobalConfig,
     abort_signal: AbortSignal,
-) -> Result<(
-    String,
-    Option<String>,
-    Vec<ToolResult>,
-    CompletionTokenUsage,
-)> {
+) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)> {
     call_with_retry_and_fallback_custom(input, config, abort_signal, |input, client, cfg, abort| {
         Box::pin(default_call_fn(input, client, cfg, abort))
     })
@@ -82,12 +77,7 @@ pub async fn call_with_retry_and_fallback_custom<F>(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
     call_fn: F,
-) -> Result<(
-    String,
-    Option<String>,
-    Vec<ToolResult>,
-    CompletionTokenUsage,
-)>
+) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>
 where
     F: for<'a> Fn(&'a Input, &'a dyn Client, &'a GlobalConfig, AbortSignal) -> CallFuture<'a>
         + Send
@@ -124,12 +114,7 @@ async fn default_call_fn(
     client: &dyn Client,
     config: &GlobalConfig,
     abort_signal: AbortSignal,
-) -> Result<(
-    String,
-    Option<String>,
-    Vec<ToolResult>,
-    CompletionTokenUsage,
-)> {
+) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)> {
     if crate::config::input::stream(input, config) {
         call_chat_completions_streaming(input, client, config, abort_signal).await
     } else {
@@ -177,12 +162,7 @@ mod tests {
         config: &GlobalConfig,
         retry_config: &RetryConfig,
         abort_signal: AbortSignal,
-    ) -> Result<(
-        String,
-        Option<String>,
-        Vec<ToolResult>,
-        CompletionTokenUsage,
-    )> {
+    ) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)> {
         let turn_ctx = build_turn_context(config);
         let config_for_closure: GlobalConfig = config.clone();
         harnx_engine::retry::try_model_with_retries_custom(

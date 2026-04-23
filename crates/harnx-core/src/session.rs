@@ -9,11 +9,12 @@ use crate::agent_config::{AgentConfig, AgentVariables, TEMP_AGENT_NAME};
 use crate::api_types::CompletionTokenUsage;
 use crate::message::{Message, MessageContent, MessageRole};
 use crate::model::Model;
+use crate::tool::{SwitchAgentData, ToolCall};
 
 use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -54,12 +55,43 @@ pub enum SessionLogEntry {
         role: MessageRole,
         content: MessageContent,
     },
+    /// Assistant turn that issued tool calls. The text/thought are the
+    /// LLM's prose preceding the calls. This entry is written
+    /// immediately after the LLM returns, before any tool executes, so
+    /// that the transcript shows what was requested even if the process
+    /// is interrupted mid-execution. It MUST be followed by a matching
+    /// `ToolResults` entry; an orphan trailing `ToolCalls` is repaired
+    /// on load by synthesizing lost-response errors.
+    #[serde(rename = "tool_calls")]
+    ToolCalls {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought: Option<String>,
+        calls: Vec<ToolCall>,
+    },
+    /// Results for the immediately preceding `ToolCalls` entry.
+    #[serde(rename = "tool_results")]
+    ToolResults { results: Vec<ToolOutput> },
     #[serde(rename = "data_urls")]
     DataUrls { urls: HashMap<String, String> },
     #[serde(rename = "compress")]
     Compress { prompt: String },
     #[serde(rename = "clear")]
     Clear,
+}
+
+/// A single tool-call result as persisted in the session log. Matches
+/// the corresponding `ToolCall` in the preceding `ToolCalls` entry by
+/// `id` (or by position when `id` is absent).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+    pub output: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_agent: Option<SwitchAgentData>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

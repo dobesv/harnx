@@ -209,44 +209,6 @@ impl ToolCall {
     }
 }
 
-pub const TRIGGER_AGENT_TOOL_NAME: &str = "trigger_agent";
-
-/// Builds the deprecated `trigger_agent` tool declaration for
-/// backward-compatible agent handoff. Prefer per-agent `*_session_handoff`
-/// tools for interactive delegation; this declaration is kept for older
-/// configs that still reference it by name.
-pub fn trigger_agent_tool_declaration() -> ToolDeclaration {
-    let mut properties = IndexMap::new();
-    properties.insert(
-        "agent".to_string(),
-        JsonSchema {
-            type_value: Some("string".to_string()),
-            description: Some("The name of the agent to transfer the session to.".to_string()),
-            ..Default::default()
-        },
-    );
-    properties.insert(
-        "prompt".to_string(),
-        JsonSchema {
-            type_value: Some("string".to_string()),
-            description: Some("The new prompt to start the new agent with.".to_string()),
-            ..Default::default()
-        },
-    );
-    ToolDeclaration {
-        name: TRIGGER_AGENT_TOOL_NAME.to_string(),
-        description: "Deprecated compatibility tool. Prefer per-agent *_session_handoff tools for interactive delegation."
-            .to_string(),
-        parameters: JsonSchema {
-            type_value: Some("object".to_string()),
-            properties: Some(properties),
-            required: Some(vec!["agent".to_string(), "prompt".to_string()]),
-            ..Default::default()
-        },
-        mcp_tool_name: None,
-    }
-}
-
 /// Extracts user-visible text from an MCP `CallToolResult` value.
 ///
 /// The result value has the shape:
