@@ -89,6 +89,7 @@ impl Tui {
                 history: vec![],
                 history_index: None,
                 history_draft: String::new(),
+                history_preview: false,
                 attachments: vec![],
                 attachment_dir: None,
                 paste_count: 0,

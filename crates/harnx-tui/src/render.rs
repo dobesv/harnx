@@ -489,20 +489,27 @@ impl Tui {
         _llm_busy: bool,
         pending_message: bool,
     ) {
-        let input_style = if pending_message {
-            Style::default().fg(Color::Yellow)
+        let (input_style, cursor_style) = if pending_message {
+            (
+                Style::default().fg(Color::Yellow),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            )
+        } else if app.history_preview {
+            (
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::REVERSED),
+            )
         } else {
-            Style::default().fg(Color::Reset)
+            (
+                Style::default().fg(Color::Reset),
+                Style::default().add_modifier(Modifier::REVERSED),
+            )
         };
         app.input.set_style(input_style);
-
-        let cursor_style = if pending_message {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            Style::default().add_modifier(Modifier::REVERSED)
-        };
         app.input.set_cursor_style(cursor_style);
     }
 }

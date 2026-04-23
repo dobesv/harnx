@@ -63,6 +63,7 @@ pub(super) struct App {
     pub(super) history: Vec<String>,
     pub(super) history_index: Option<usize>,
     pub(super) history_draft: String,
+    pub(super) history_preview: bool,
     pub(super) attachments: Vec<Attachment>,
     /// Temp directory holding copies of all current attachments. Created on
     /// first attach, removed recursively on submit or full detach.

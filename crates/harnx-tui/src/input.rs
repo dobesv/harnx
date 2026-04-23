@@ -92,18 +92,10 @@ impl Tui {
                 self.abort_signal.reset();
             }
             (KeyCode::Up, KeyModifiers::NONE) => {
-                if self.app.completions.is_empty() {
-                    self.history_prev();
-                } else {
-                    self.app.scroll_state.scroll_up();
-                }
+                self.handle_up_key(key);
             }
             (KeyCode::Down, KeyModifiers::NONE) => {
-                if self.app.completions.is_empty() {
-                    self.history_next();
-                } else {
-                    self.app.scroll_state.scroll_down();
-                }
+                self.handle_down_key(key);
             }
             (KeyCode::PageUp, KeyModifiers::NONE) => {
                 for _ in 0..10 {
@@ -198,6 +190,12 @@ impl Tui {
                 });
             }
             _ => {
+                // Exit history preview on any editing key — keep current content as new draft
+                if self.app.history_preview {
+                    self.app.history_index = None;
+                    self.app.history_preview = false;
+                    self.refresh_input_chrome();
+                }
                 // Any other key input clears pending message (converts back to draft)
                 if let Some(pending) = self.app.pending_message.take() {
                     self.app.attachments = pending.attachments;
@@ -331,6 +329,12 @@ impl Tui {
         if let Some(pending) = self.app.pending_message.take() {
             self.app.attachments = pending.attachments;
             self.app.attachment_dir = pending.attachment_dir;
+            self.refresh_input_chrome();
+        }
+        // Exit history preview on paste — keep current content as new draft
+        if self.app.history_preview {
+            self.app.history_index = None;
+            self.app.history_preview = false;
             self.refresh_input_chrome();
         }
         if !self.app.completions.is_empty() {
@@ -843,6 +847,42 @@ impl Tui {
         }
         self.app.history_index = None;
         self.app.history_draft = String::new();
+        self.app.history_preview = false;
+    }
+
+    fn input_is_blank(&self) -> bool {
+        self.app.input.lines().join("\n").is_empty()
+    }
+
+    fn handle_up_key(&mut self, key: KeyEvent) {
+        if !self.app.completions.is_empty() {
+            self.app.scroll_state.scroll_up();
+        } else if self.app.history_preview || self.input_is_blank() {
+            let before = self.app.history_index;
+            self.history_prev();
+            let moved = self.app.history_index.is_some()
+                && (self.app.history_index != before || self.app.history_preview);
+            if moved {
+                self.app.history_preview = true;
+                self.refresh_input_chrome();
+            }
+        } else {
+            self.app.input.input(TextInput::from(key));
+        }
+    }
+
+    fn handle_down_key(&mut self, key: KeyEvent) {
+        if !self.app.completions.is_empty() {
+            self.app.scroll_state.scroll_down();
+        } else if self.app.history_preview {
+            self.history_next();
+            if self.app.history_index.is_none() {
+                self.app.history_preview = false;
+            }
+            self.refresh_input_chrome();
+        } else {
+            self.app.input.input(TextInput::from(key));
+        }
     }
 
     fn history_prev(&mut self) {
