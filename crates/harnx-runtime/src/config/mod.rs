@@ -1145,7 +1145,9 @@ impl Config {
                         .with_default(false)
                         .prompt()?;
                         if ans {
-                            crate::config::session::add_message(session, input, output, None, &[])?;
+                            crate::config::session::add_assistant_text(
+                                session, input, output, None,
+                            )?;
                         }
                     }
                 }
@@ -2292,6 +2294,55 @@ impl Config {
         Ok(())
     }
 
+    /// Record token usage without saving any new message — the
+    /// round's transcript entries are being written separately by the
+    /// split [`save_session_tool_calls`] / [`save_session_tool_results`]
+    /// pair.  Callers use this to keep `completion_usage` current on
+    /// the session while driving the two-phase save directly.
+    pub fn record_completion_usage(&mut self, usage: &crate::client::CompletionTokenUsage) {
+        if let Some(session) = &mut self.session {
+            session.add_completion_usage(usage);
+        }
+    }
+
+    /// Record an assistant tool-call request BEFORE the tools execute.
+    /// Writes a `ToolCalls` entry to the session log and pushes a
+    /// pending Tool message in-memory.  Must be paired with a
+    /// [`save_session_tool_results`] call once outputs are available.
+    ///
+    /// Errors if no session is active or persistence fails.
+    pub fn save_session_tool_calls(
+        &mut self,
+        input: &Input,
+        output: &str,
+        thought: Option<&str>,
+        calls: &[crate::tool::ToolCall],
+    ) -> Result<()> {
+        let mut input = input.clone();
+        input.clear_patch();
+        let sessions_dir = self.sessions_dir();
+        if !input.with_session() {
+            return Ok(());
+        }
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        session.set_sessions_dir(sessions_dir);
+        crate::config::session::add_tool_calls(session, &input, output, thought, calls)
+    }
+
+    /// Finalize the tool round opened by [`save_session_tool_calls`].
+    /// Writes a `ToolResults` entry to the session log and fills in
+    /// the pending outputs on the last in-memory message.
+    pub fn save_session_tool_results(&mut self, results: &[ToolResult]) -> Result<()> {
+        let sessions_dir = self.sessions_dir();
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        session.set_sessions_dir(sessions_dir);
+        crate::config::session::add_tool_results(session, results)
+    }
+
     fn discontinuous_last_message(&mut self) {
         if let Some(last_message) = self.last_message.as_mut() {
             last_message.continuous = false;
@@ -2311,13 +2362,22 @@ impl Config {
         if input.with_session() {
             if let Some(session) = self.session.as_mut() {
                 session.set_sessions_dir(sessions_dir);
-                crate::config::session::add_message(
-                    session,
-                    &input,
-                    output,
-                    thought,
-                    tool_results,
-                )?;
+                if tool_results.is_empty() {
+                    crate::config::session::add_assistant_text(session, &input, output, thought)?;
+                } else {
+                    // Split the combined save into its two natural
+                    // events: the assistant's tool-call request, then
+                    // the tool results.  Callers on the split flow
+                    // drive these directly via
+                    // `save_assistant_tool_calls` /
+                    // `save_tool_results`; this path exists for
+                    // legacy all-at-once callers until they migrate.
+                    let calls: Vec<_> = tool_results.iter().map(|r| r.call.clone()).collect();
+                    crate::config::session::add_tool_calls(
+                        session, &input, output, thought, &calls,
+                    )?;
+                    crate::config::session::add_tool_results(session, tool_results)?;
+                }
                 return Ok(());
             }
         }
@@ -2744,18 +2804,18 @@ impl Config {
                     declarations.extend(manager.get_all_tools_blocking());
                 }
             }
-            if self.acp_manager.is_some() {
-                if let Some(manager) = &self.acp_manager {
-                    declarations.extend(manager.get_all_tools_blocking());
-                }
-                declarations.extend(handoff_tool_declarations_for_agents());
+            if let Some(manager) = &self.acp_manager {
+                declarations.extend(manager.get_all_tools_blocking());
             }
+            // Only generate handoff tool declarations when the agent's use_tools
+            // actually requests a *_session_handoff tool. Generating them
+            // unconditionally would inject extra tool declarations into agents
+            // that don't need them, changing LLM request payloads (#303).
             if split_tool_selectors(use_tools).into_iter().any(|v| {
                 let v = v.trim();
-                v == crate::tool::TRIGGER_AGENT_TOOL_NAME
-                    || matches_tool_glob(v, crate::tool::TRIGGER_AGENT_TOOL_NAME)
+                v.ends_with("_session_handoff") || v == "*"
             }) {
-                declarations.push(crate::tool::trigger_agent_tool_declaration());
+                declarations.extend(handoff_tool_declarations_for_agents());
             }
         }
 

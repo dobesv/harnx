@@ -367,7 +367,7 @@ async fn start_directive_inner(
         HookResultControl::Ask { .. } => {} // Ask is not applicable for UserPromptSubmit
         HookResultControl::Continue => {}
     }
-    let (output, thought, tool_results, usage) =
+    let (output, thought, tool_calls, usage) =
         match call_with_retry_and_fallback(&input, config, abort_signal.clone()).await {
             Ok(result) => result,
             Err(err) => {
@@ -394,13 +394,26 @@ async fn start_directive_inner(
                 return Err(err);
             }
         };
-    config.write().after_chat_completion(
-        &input,
-        &output,
-        thought.as_deref(),
-        &tool_results,
-        &usage,
-    )?;
+
+    // Tool rounds use `execute_tool_round` to persist the request,
+    // run the tools, and persist the results as two separate log
+    // entries.  Plain-text rounds save once via after_chat_completion.
+    let tool_results: Vec<harnx_runtime::tool::ToolResult> = if tool_calls.is_empty() {
+        config
+            .write()
+            .after_chat_completion(&input, &output, thought.as_deref(), &[], &usage)?;
+        Vec::new()
+    } else {
+        config.write().record_completion_usage(&usage);
+        harnx_runtime::tool::execute_tool_round(
+            config,
+            &input,
+            &output,
+            thought.as_deref(),
+            tool_calls,
+            &abort_signal,
+        )?
+    };
     if tool_results.is_empty() {
         let config_read = config.read();
         let status = config_read.render_status_line(true);

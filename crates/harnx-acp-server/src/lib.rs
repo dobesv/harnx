@@ -381,59 +381,95 @@ impl acp::Agent for HarnxAgent {
                 }
             };
 
+            if tool_calls.is_empty() {
+                // Pure text response.  Persist and end the turn.
+                let config = self.config.clone();
+                let input_for_save = input.clone();
+                let output_for_save = output.clone();
+                let thought_for_save = thought.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut config = config.write();
+                    config.save_message(
+                        &input_for_save,
+                        &output_for_save,
+                        thought_for_save.as_deref(),
+                        &[],
+                    )
+                })
+                .await
+                .map_err(|e| acp::Error::new(-32603, format!("Failed to join save task: {e}")))?
+                .map_err(|e| acp::Error::new(-32603, format!("Failed to save message: {e}")))?;
+
+                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+            }
+
+            // The LLM issued tool calls.  Persist the request NOW —
+            // before executing anything — so the transcript shows
+            // what was requested even if the process is interrupted
+            // or a tool error aborts the round.  The in-memory
+            // session gets a pending Tool message which we finalize
+            // with matching add_tool_results() once we have outputs.
             let config = self.config.clone();
             let input_for_save = input.clone();
             let output_for_save = output.clone();
             let thought_for_save = thought.clone();
+            let calls_for_save = tool_calls.clone();
             tokio::task::spawn_blocking(move || {
                 let mut config = config.write();
-                config.save_message(
-                    &input_for_save,
-                    &output_for_save,
-                    thought_for_save.as_deref(),
-                    &[],
-                )
+                let sessions_dir = config.sessions_dir();
+                if let Some(session) = config.session.as_mut() {
+                    session.set_sessions_dir(sessions_dir);
+                    harnx_runtime::config::session::add_tool_calls(
+                        session,
+                        &input_for_save,
+                        &output_for_save,
+                        thought_for_save.as_deref(),
+                        &calls_for_save,
+                    )
+                } else {
+                    Ok(())
+                }
             })
             .await
             .map_err(|e| acp::Error::new(-32603, format!("Failed to join save task: {e}")))?
-            .map_err(|e| acp::Error::new(-32603, format!("Failed to save message: {e}")))?;
-
-            if tool_calls.is_empty() {
-                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
-            }
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to save tool calls: {e}")))?;
 
             round += 1;
-            let tool_results = if round > MAX_TOOL_CALL_ROUNDS {
-                // If the LLM keeps trying to call tools even though we told them they hit the limit, abort
+            // (results, optional reason to end the turn after persisting them)
+            let (tool_results, end_turn): (Vec<ToolResult>, Option<acp::StopReason>) = if round
+                > MAX_TOOL_CALL_ROUNDS
+            {
+                // If the LLM keeps trying to call tools even
+                // though we told them they hit the limit, abort.
+                // We leave the earlier ToolCalls log entry orphaned
+                // and rely on the reload-time repair pass to fix
+                // it; this path terminates the turn.
                 if round > MAX_TOOL_CALL_ROUNDS + MAX_POST_TOOL_LIMIT_ROUNDS {
                     return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
                 }
-
-                tool_calls
-                    .into_iter()
-                    .map(|call| {
-                        ToolResult::new(
-                            call,
-                            json!({
-                                "error": "maximum tool call rounds exceeded",
-                                "action": "Provide your final answer to the user now. Summarize what you accomplished and any remaining work.",
-                                "guidance": "Explain that this session hit the tool call limit. If more tool use is needed, ask the user to continue in a new session or narrow the request."
-                            }),
-                        )
-                    })
-                    .collect()
+                let limit_results = tool_calls
+                        .iter()
+                        .cloned()
+                        .map(|call| {
+                            ToolResult::new(
+                                call,
+                                json!({
+                                    "error": "maximum tool call rounds exceeded",
+                                    "action": "Provide your final answer to the user now. Summarize what you accomplished and any remaining work.",
+                                    "guidance": "Explain that this session hit the tool call limit. If more tool use is needed, ask the user to continue in a new session or narrow the request."
+                                }),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                (limit_results, None)
             } else {
                 let source = Some(AgentSource {
                     agent: self.agent_name.clone(),
                     session_id: Some(session_key.clone()),
                 });
 
-                // Notify the parent about each tool call so it appears in the
-                // parent transcript.  The `emit_agent_event_with_source` inside
-                // `eval_mcp_async` only works when an AgentEvent sink is
-                // installed (i.e. in the TUI process).  In ACP-server mode
-                // there is no sink, so we send the notification directly over
-                // the ACP connection.
+                // Notify the parent about each tool call so it
+                // appears in the parent transcript.
                 let conn = self.connection.borrow().clone();
                 if let Some(conn) = conn {
                     for call in &tool_calls {
@@ -483,7 +519,7 @@ impl acp::Agent for HarnxAgent {
 
                     let eval_fut = eval_tool_calls_async(
                         &self.config,
-                        tool_calls,
+                        tool_calls.clone(),
                         &abort_signal,
                         source.clone(),
                     );
@@ -503,7 +539,12 @@ impl acp::Agent for HarnxAgent {
                     result
                 } else {
                     tokio::select! {
-                        r = eval_tool_calls_async(&self.config, tool_calls, &abort_signal, source) => r,
+                        r = eval_tool_calls_async(
+                            &self.config,
+                            tool_calls.clone(),
+                            &abort_signal,
+                            source,
+                        ) => r,
                         _ = cancel_notify.notified() => {
                             abort_signal.set_ctrlc();
                             return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
@@ -512,46 +553,54 @@ impl acp::Agent for HarnxAgent {
                 };
 
                 match result {
-                    Ok(results) => results,
+                    Ok(results) => (results, None),
                     Err(e) => {
-                        self.send_text_chunk(&session_key, &format!("\n[Tool error: {e:#}]"))
-                            .await?;
-                        return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                        // Tool execution failed. Synthesize error
+                        // outputs so the transcript stays
+                        // well-formed (matches the pending
+                        // ToolCalls entry we already wrote), send
+                        // the error text to the user, and end
+                        // the turn.
+                        let err_text = format!("\n[Tool error: {e:#}]");
+                        self.send_text_chunk(&session_key, &err_text).await?;
+                        let fallback = tool_calls
+                            .iter()
+                            .cloned()
+                            .map(|call| {
+                                ToolResult::new(
+                                    call,
+                                    json!({"error": format!("tool execution failed: {e:#}")}),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        (fallback, Some(acp::StopReason::EndTurn))
                     }
                 }
             };
 
-            // Persist tool results to the session so the is_continuation
-            // detection in add_message works on the next round and duplicate
-            // User messages are avoided (#293).
-            if !tool_results.is_empty() {
-                let config = self.config.clone();
-                let output_for_save = output.clone();
-                let thought_for_save = thought.clone();
-                let tool_results_for_save = tool_results.clone();
-                tokio::task::spawn_blocking(move || {
-                    let mut config = config.write();
-                    let sessions_dir = config.sessions_dir();
-                    if let Some(session) = config.session.as_mut() {
-                        session.set_sessions_dir(sessions_dir);
-                        let tool_calls_content = harnx_runtime::client::MessageContent::ToolCalls(
-                            harnx_runtime::client::MessageContentToolCalls::new(
-                                tool_results_for_save,
-                                output_for_save,
-                                thought_for_save,
-                            ),
-                        );
-                        let tool_msg = harnx_runtime::client::Message::new(
-                            harnx_runtime::client::MessageRole::Tool,
-                            tool_calls_content,
-                        );
-                        harnx_runtime::config::session::append_tool_round(session, &tool_msg);
-                    }
-                })
-                .await
-                .map_err(|e| {
-                    acp::Error::new(-32603, format!("Failed to persist tool results: {e}"))
-                })?;
+            // Persist the tool outputs, pairing with the ToolCalls
+            // entry we wrote before execution.
+            let config = self.config.clone();
+            let tool_results_for_save = tool_results.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut config = config.write();
+                let sessions_dir = config.sessions_dir();
+                if let Some(session) = config.session.as_mut() {
+                    session.set_sessions_dir(sessions_dir);
+                    harnx_runtime::config::session::add_tool_results(
+                        session,
+                        &tool_results_for_save,
+                    )
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to join save task: {e}")))?
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to save tool results: {e}")))?;
+
+            if let Some(reason) = end_turn {
+                return Ok(acp::PromptResponse::new(reason));
             }
 
             input = input.merge_tool_results(output, thought, tool_results);

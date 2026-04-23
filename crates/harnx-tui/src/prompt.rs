@@ -7,7 +7,6 @@ use harnx_hooks::{
 };
 use harnx_runtime::client::{call_chat_completions, CompletionTokenUsage};
 use harnx_runtime::config::{Config, GlobalConfig, Input};
-use harnx_runtime::tool::ToolResult;
 use harnx_runtime::utils::AbortSignal;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -78,6 +77,10 @@ impl Tui {
                 if ctx.config.read().session.is_some() {
                     ctx.config.write().empty_session()?;
                 }
+                // Rebuild input from only handoff prompt so parent tool calls,
+                // tool results, and session history do not leak into the new
+                // agent's first request (#303).
+                input = harnx_runtime::config::input::from_str(&ctx.config, &switch.prompt, None);
                 // Reset so the new agent starts fresh, matching the CMD
                 // path which passes 0 when recursing after a handoff.
                 resume_count = 0;
@@ -155,7 +158,7 @@ impl Tui {
             )
             .await;
 
-            let (output, thought, tool_results, usage) = match llm_result {
+            let (output, thought, tool_calls, usage) = match llm_result {
                 Ok(result) => result,
                 Err(err) => {
                     // Persist the user message to the session log even on
@@ -171,13 +174,30 @@ impl Tui {
                 }
             };
 
-            ctx.config.write().after_chat_completion(
-                &input,
-                &output,
-                thought.as_deref(),
-                &tool_results,
-                &usage,
-            )?;
+            // Tool rounds use `execute_tool_round` to persist the
+            // request, run the tools, and persist the results as two
+            // separate log entries.  Plain-text rounds save once via
+            // after_chat_completion.
+            let tool_results: Vec<harnx_runtime::tool::ToolResult> = if tool_calls.is_empty() {
+                ctx.config.write().after_chat_completion(
+                    &input,
+                    &output,
+                    thought.as_deref(),
+                    &[],
+                    &usage,
+                )?;
+                Vec::new()
+            } else {
+                ctx.config.write().record_completion_usage(&usage);
+                harnx_runtime::tool::execute_tool_round(
+                    &ctx.config,
+                    &input,
+                    &output,
+                    thought.as_deref(),
+                    tool_calls,
+                    &ctx.abort_signal,
+                )?
+            };
 
             let stop_outcome = if tool_results.is_empty() {
                 let event = HookEvent::Stop {
@@ -302,7 +322,7 @@ impl Tui {
     ) -> Result<(
         String,
         Option<String>,
-        Vec<ToolResult>,
+        Vec<harnx_core::tool::ToolCall>,
         CompletionTokenUsage,
     )> {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -345,16 +365,7 @@ impl Tui {
         }
 
         match send_ret {
-            Ok(_) => Ok((
-                text,
-                thought,
-                harnx_runtime::tool::eval_tool_calls(
-                    &harnx_runtime::tool::build_tool_eval_context(config),
-                    tool_calls,
-                    &abort_signal,
-                )?,
-                usage,
-            )),
+            Ok(_) => Ok((text, thought, tool_calls, usage)),
             Err(err) => {
                 if text.is_empty() {
                     Err(err)

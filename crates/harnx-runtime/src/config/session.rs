@@ -52,6 +52,13 @@ pub fn load(config: &Config, name: &str, path: &Path) -> Result<Session> {
 fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Result<Session> {
     let mut session = Session::default();
 
+    // Pending ToolCalls entry awaiting a matching ToolResults entry.
+    // On any other entry (or EOF) while pending, we repair by
+    // synthesizing lost-response errors for each pending call — this
+    // only matters for the tail of the log (crash mid tool round);
+    // mid-log corruption would be an invariant violation.
+    let mut pending: Option<PendingToolCalls> = None;
+
     for document in serde_yaml::Deserializer::from_str(content) {
         let entry = SessionLogEntry::deserialize(document)
             .with_context(|| format!("Invalid log entry in session {name}"))?;
@@ -82,11 +89,145 @@ fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Res
                 session.compaction_agent = compaction_agent;
             }
             SessionLogEntry::Message { role, content } => {
+                if let Some(pending) = pending.take() {
+                    session
+                        .messages
+                        .push(repair_orphan_tool_calls(pending, name)?);
+                }
+                if role == MessageRole::Tool {
+                    bail!(
+                        "Invalid log entry in session {name}: Tool-role Message entries are \
+                         no longer supported; use tool_calls/tool_results entries"
+                    );
+                }
                 session.messages.push(Message::new(role, content));
+            }
+            SessionLogEntry::ToolCalls {
+                text,
+                thought,
+                calls,
+            } => {
+                if let Some(pending) = pending.take() {
+                    session
+                        .messages
+                        .push(repair_orphan_tool_calls(pending, name)?);
+                }
+                pending = Some(PendingToolCalls {
+                    text,
+                    thought,
+                    calls,
+                });
+            }
+            SessionLogEntry::ToolResults { results } => {
+                let Some(PendingToolCalls {
+                    text,
+                    thought,
+                    calls,
+                }) = pending.take()
+                else {
+                    bail!(
+                        "Invalid log entry in session {name}: tool_results without a \
+                         preceding tool_calls entry"
+                    );
+                };
+                session
+                    .messages
+                    .push(assemble_tool_message(text, thought, calls, results));
             }
             SessionLogEntry::DataUrls { urls } => {
                 session.data_urls.extend(urls);
             }
+            SessionLogEntry::Compress { prompt } => {
+                if let Some(pending) = pending.take() {
+                    session
+                        .messages
+                        .push(repair_orphan_tool_calls(pending, name)?);
+                }
+                session.compressed_messages.append(&mut session.messages);
+                session.messages.push(Message::new(
+                    MessageRole::System,
+                    MessageContent::Text(prompt),
+                ));
+            }
+            SessionLogEntry::Clear => {
+                pending = None;
+                session.messages.clear();
+                session.compressed_messages.clear();
+                session.data_urls.clear();
+            }
+        }
+    }
+
+    // EOF with an orphan ToolCalls: the process was interrupted
+    // between dispatching tools and persisting their results. Repair
+    // so we can still replay a valid alternating user/assistant
+    // sequence to the model.
+    if let Some(pending) = pending.take() {
+        session
+            .messages
+            .push(repair_orphan_tool_calls(pending, name)?);
+    }
+
+    session.model =
+        crate::client::retrieve_model(&config.clients, &session.model_id, ModelType::Chat)?;
+    apply_name_and_path(&mut session, name, path, config);
+    session.update_tokens();
+    Ok(session)
+}
+
+struct PendingToolCalls {
+    text: String,
+    thought: Option<String>,
+    calls: Vec<crate::tool::ToolCall>,
+}
+
+/// Test-only log parser — runs the full load pipeline (including the
+/// orphan-ToolCalls repair pass) but skips the model-catalog lookup
+/// that `super::load` performs, so it works against the minimal
+/// `Config::default` used in unit tests.
+#[cfg(test)]
+fn load_from_log_for_test(content: &str) -> Session {
+    let mut session = Session::default();
+    let mut pending: Option<PendingToolCalls> = None;
+    for document in serde_yaml::Deserializer::from_str(content) {
+        let entry = SessionLogEntry::deserialize(document).expect("valid log entry");
+        match entry {
+            SessionLogEntry::Header { .. } => {}
+            SessionLogEntry::Message { role, content } => {
+                if let Some(pending) = pending.take() {
+                    session
+                        .messages
+                        .push(repair_orphan_tool_calls(pending, "test").unwrap());
+                }
+                assert_ne!(role, MessageRole::Tool, "legacy Tool Message unsupported");
+                session.messages.push(Message::new(role, content));
+            }
+            SessionLogEntry::ToolCalls {
+                text,
+                thought,
+                calls,
+            } => {
+                if let Some(pending) = pending.take() {
+                    session
+                        .messages
+                        .push(repair_orphan_tool_calls(pending, "test").unwrap());
+                }
+                pending = Some(PendingToolCalls {
+                    text,
+                    thought,
+                    calls,
+                });
+            }
+            SessionLogEntry::ToolResults { results } => {
+                let pending = pending.take().expect("tool_results must follow tool_calls");
+                session.messages.push(assemble_tool_message(
+                    pending.text,
+                    pending.thought,
+                    pending.calls,
+                    results,
+                ));
+            }
+            SessionLogEntry::DataUrls { urls } => session.data_urls.extend(urls),
             SessionLogEntry::Compress { prompt } => {
                 session.compressed_messages.append(&mut session.messages);
                 session.messages.push(Message::new(
@@ -95,18 +236,97 @@ fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Res
                 ));
             }
             SessionLogEntry::Clear => {
+                pending = None;
                 session.messages.clear();
                 session.compressed_messages.clear();
                 session.data_urls.clear();
             }
         }
     }
+    if let Some(pending) = pending.take() {
+        session
+            .messages
+            .push(repair_orphan_tool_calls(pending, "test").unwrap());
+    }
+    session
+}
 
-    session.model =
-        crate::client::retrieve_model(&config.clients, &session.model_id, ModelType::Chat)?;
-    apply_name_and_path(&mut session, name, path, config);
-    session.update_tokens();
-    Ok(session)
+fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Message> {
+    let PendingToolCalls {
+        text,
+        thought,
+        calls,
+    } = pending;
+    let lost = harnx_core::session::ToolOutput {
+        id: None,
+        name: String::new(),
+        output: serde_json::json!({
+            "error": "tool response lost (session was interrupted before results were persisted)"
+        }),
+        switch_agent: None,
+    };
+    // Fabricate one lost-response per call, matched by id/position.
+    let results: Vec<_> = calls
+        .iter()
+        .map(|c| harnx_core::session::ToolOutput {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            ..lost.clone()
+        })
+        .collect();
+    Ok(assemble_tool_message(text, thought, calls, results))
+}
+
+fn assemble_tool_message(
+    text: String,
+    thought: Option<String>,
+    calls: Vec<crate::tool::ToolCall>,
+    results: Vec<harnx_core::session::ToolOutput>,
+) -> Message {
+    use crate::client::MessageContentToolCalls;
+    use crate::tool::ToolResult;
+
+    // Match each call to its result by id (falling back to position).
+    let mut by_id: std::collections::HashMap<String, harnx_core::session::ToolOutput> = results
+        .iter()
+        .filter_map(|r| r.id.clone().map(|id| (id, r.clone())))
+        .collect();
+    let mut positional = results.into_iter().filter(|r| r.id.is_none());
+
+    let tool_results: Vec<ToolResult> = calls
+        .into_iter()
+        .map(|call| {
+            let output = match call
+                .id
+                .as_ref()
+                .and_then(|id| by_id.remove(id))
+                .or_else(|| positional.next())
+            {
+                Some(out) => ToolResult {
+                    call,
+                    output: out.output,
+                    switch_agent: out.switch_agent,
+                },
+                None => ToolResult::new(
+                    call,
+                    serde_json::json!({
+                        "error": "tool response lost (session was interrupted before results were persisted)"
+                    }),
+                ),
+            };
+            output
+        })
+        .collect();
+
+    Message::new(
+        MessageRole::Tool,
+        MessageContent::ToolCalls(MessageContentToolCalls {
+            tool_results,
+            text,
+            thought,
+            sequence: false,
+        }),
+    )
 }
 
 fn apply_name_and_path(session: &mut Session, name: &str, path: &Path, config: &Config) {
@@ -438,23 +658,6 @@ pub fn to_agent(session: &Session) -> Agent {
     Agent::new(session.to_agent_config())
 }
 
-/// Append a pre-built Tool message to the session log.
-/// Used by the ACP server to persist tool results separately from
-/// the main `add_message` flow.
-pub fn append_tool_round(session: &mut Session, tool_msg: &Message) {
-    if !append_event(
-        session,
-        &SessionLogEntry::Message {
-            role: tool_msg.role,
-            content: tool_msg.content.clone(),
-        },
-    ) {
-        session.dirty = true;
-    }
-    session.messages.push(tool_msg.clone());
-    session.update_tokens();
-}
-
 pub fn compress(session: &mut Session, mut prompt: String) {
     if let Some(system_prompt) = session.messages.first().and_then(|v| {
         if MessageRole::System == v.role {
@@ -478,12 +681,15 @@ pub fn compress(session: &mut Session, mut prompt: String) {
     }
 }
 
-pub fn add_message(
+/// Record an assistant turn that produced plain text (no tool calls).
+/// Handles the first-turn agent setup, optional user-message push, and
+/// continue/regenerate edit modes.  Exactly one `Message(Assistant,
+/// Text)` log entry is appended.
+pub fn add_assistant_text(
     session: &mut Session,
     input: &Input,
     output: &str,
     thought: Option<&str>,
-    tool_results: &[crate::tool::ToolResult],
 ) -> Result<()> {
     if input.continue_output().is_some() {
         if let Some(message) = session.messages.last_mut() {
@@ -491,9 +697,6 @@ pub fn add_message(
                 *text = format!("{text}{output}");
             }
         }
-        // Continue/regenerate are edits to the last message; mark dirty
-        // so the full-save fallback can persist them. We don't append
-        // because they modify an existing entry.
         session.dirty = true;
     } else if input.regenerate() {
         if let Some(message) = session.messages.last_mut() {
@@ -503,85 +706,7 @@ pub fn add_message(
         }
         session.dirty = true;
     } else {
-        let mut all_appended = true;
-        // Detect continuation rounds: if the last saved message is a Tool
-        // message, we're continuing after tool execution and should NOT add
-        // a duplicate user message.
-        let is_continuation = session
-            .messages
-            .last()
-            .is_some_and(|m| m.role == MessageRole::Tool);
-        if session.messages.is_empty() {
-            if session.name == TEMP_SESSION_NAME && session.save_session != Some(false) {
-                let raw_input = input.raw();
-                let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
-                session.autoname = Some(AutoName::new_from_chat_history(chat_history));
-            }
-            let agent_messages = input.agent().build_messages(input);
-            for msg in &agent_messages {
-                all_appended &= append_event(
-                    session,
-                    &SessionLogEntry::Message {
-                        role: msg.role,
-                        content: msg.content.clone(),
-                    },
-                );
-            }
-            session.messages.extend(agent_messages);
-        } else if !is_continuation {
-            let user_msg = Message::new(MessageRole::User, input.message_content());
-            all_appended &= append_event(
-                session,
-                &SessionLogEntry::Message {
-                    role: user_msg.role,
-                    content: user_msg.content.clone(),
-                },
-            );
-            session.messages.push(user_msg);
-        }
-        let new_data_urls = input.data_urls();
-        if !new_data_urls.is_empty() {
-            all_appended &= append_event(
-                session,
-                &SessionLogEntry::DataUrls {
-                    urls: new_data_urls.clone(),
-                },
-            );
-        }
-        session.data_urls.extend(new_data_urls);
-        // Only process input.tool_calls() when this is NOT a
-        // continuation round.  On continuation rounds the tool results
-        // were already persisted incrementally via the `tool_results`
-        // parameter in the previous round, so replaying them from the
-        // merged input would create duplicates.
-        if !is_continuation {
-            if let Some(tool_calls) = input.tool_calls().clone() {
-                let tool_msg =
-                    Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls));
-                all_appended &= append_event(
-                    session,
-                    &SessionLogEntry::Message {
-                        role: tool_msg.role,
-                        content: tool_msg.content.clone(),
-                    },
-                );
-                session.messages.push(tool_msg);
-            }
-        }
-        if let Some(injected) = input.injected_user_text() {
-            let injected_msg = Message::new(
-                MessageRole::User,
-                MessageContent::Text(injected.to_string()),
-            );
-            all_appended &= append_event(
-                session,
-                &SessionLogEntry::Message {
-                    role: injected_msg.role,
-                    content: injected_msg.content.clone(),
-                },
-            );
-            session.messages.push(injected_msg);
-        }
+        let mut all_appended = begin_turn(session, input, output);
         let content = match thought {
             Some(v) => MessageContent::Text(format!("<think>\n{v}\n</think>\n{output}")),
             _ => MessageContent::Text(output.to_string()),
@@ -595,30 +720,191 @@ pub fn add_message(
             },
         );
         session.messages.push(assistant_msg);
-        // Append tool results from this round (incremental persistence).
-        if !tool_results.is_empty() {
-            let tool_calls_content =
-                MessageContent::ToolCalls(crate::client::MessageContentToolCalls::new(
-                    tool_results.to_vec(),
-                    output.to_string(),
-                    thought.map(str::to_string),
-                ));
-            let tool_msg = Message::new(MessageRole::Tool, tool_calls_content);
-            all_appended &= append_event(
-                session,
-                &SessionLogEntry::Message {
-                    role: tool_msg.role,
-                    content: tool_msg.content.clone(),
-                },
-            );
-            session.messages.push(tool_msg);
-        }
-        // Only clear dirty if all events were appended; otherwise the
-        // full-save fallback in exit() will persist the data.
         session.dirty = !all_appended;
     }
     session.update_tokens();
     Ok(())
+}
+
+/// Record that the LLM issued tool calls.  Called BEFORE the tools
+/// actually execute, so the transcript captures what was requested
+/// even if the process is interrupted mid-round.  Writes a
+/// `ToolCalls` log entry and pushes a pending in-memory `Tool`
+/// message whose outputs are filled in by a matching
+/// [`add_tool_results`] call.
+pub fn add_tool_calls(
+    session: &mut Session,
+    input: &Input,
+    output: &str,
+    thought: Option<&str>,
+    calls: &[crate::tool::ToolCall],
+) -> Result<()> {
+    let mut all_appended = begin_turn(session, input, output);
+    all_appended &= append_event(
+        session,
+        &SessionLogEntry::ToolCalls {
+            text: output.to_string(),
+            thought: thought.map(str::to_string),
+            calls: calls.to_vec(),
+        },
+    );
+    // Push a pending Tool message.  Outputs are filled in by
+    // add_tool_results; synthetic error placeholders mean that if the
+    // pending message ever leaks (e.g. a mid-round abort without a
+    // matching add_tool_results call), the next LLM replay sees
+    // well-formed content instead of nulls.
+    let pending_results: Vec<crate::tool::ToolResult> = calls
+        .iter()
+        .cloned()
+        .map(|call| {
+            crate::tool::ToolResult::new(
+                call,
+                serde_json::json!({
+                    "error": "tool response pending (results not yet persisted)"
+                }),
+            )
+        })
+        .collect();
+    let content = MessageContent::ToolCalls(crate::client::MessageContentToolCalls::new(
+        pending_results,
+        output.to_string(),
+        thought.map(str::to_string),
+    ));
+    session
+        .messages
+        .push(Message::new(MessageRole::Tool, content));
+    session.dirty = !all_appended;
+    session.update_tokens();
+    Ok(())
+}
+
+/// Finalize the tool round opened by [`add_tool_calls`] by filling in
+/// the in-memory outputs and writing a `ToolResults` log entry.
+/// Matches each result to its call by id (or by position when the id
+/// is absent).
+pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResult]) -> Result<()> {
+    let Some(last) = session.messages.last_mut() else {
+        anyhow::bail!("add_tool_results called on empty session");
+    };
+    let MessageContent::ToolCalls(ref mut pending) = last.content else {
+        anyhow::bail!(
+            "add_tool_results called but the last session message is not a pending tool-call turn"
+        );
+    };
+    if last.role != MessageRole::Tool {
+        anyhow::bail!("add_tool_results called but the last session message is not role=Tool");
+    }
+
+    // Match results to the pending calls by id (fallback: position).
+    let mut by_id: std::collections::HashMap<String, crate::tool::ToolResult> = results
+        .iter()
+        .filter_map(|r| r.call.id.clone().map(|id| (id, r.clone())))
+        .collect();
+    let mut positional = results.iter().filter(|r| r.call.id.is_none()).cloned();
+    for slot in pending.tool_results.iter_mut() {
+        let replacement = slot
+            .call
+            .id
+            .as_ref()
+            .and_then(|id| by_id.remove(id))
+            .or_else(|| positional.next());
+        if let Some(replacement) = replacement {
+            slot.output = replacement.output;
+            slot.switch_agent = replacement.switch_agent;
+        }
+    }
+
+    let log_results: Vec<harnx_core::session::ToolOutput> = pending
+        .tool_results
+        .iter()
+        .map(|r| harnx_core::session::ToolOutput {
+            id: r.call.id.clone(),
+            name: r.call.name.clone(),
+            output: r.output.clone(),
+            switch_agent: r.switch_agent.clone(),
+        })
+        .collect();
+
+    let appended = append_event(
+        session,
+        &SessionLogEntry::ToolResults {
+            results: log_results,
+        },
+    );
+    if !appended {
+        session.dirty = true;
+    }
+    session.update_tokens();
+    Ok(())
+}
+
+/// Shared round-opening setup used by both `add_assistant_text` and
+/// `add_tool_calls`: first-turn agent-message injection, user-message
+/// push (skipped on continuation rounds), data-URL persistence, and
+/// any queued injected-user-text.  Returns `true` iff every log
+/// append succeeded.
+fn begin_turn(session: &mut Session, input: &Input, output: &str) -> bool {
+    let mut all_appended = true;
+    // Detect continuation rounds: if the last saved message is a Tool
+    // message, we're continuing after tool execution and should NOT
+    // add a duplicate user message.
+    let is_continuation = session
+        .messages
+        .last()
+        .is_some_and(|m| m.role == MessageRole::Tool);
+    if session.messages.is_empty() {
+        if session.name == TEMP_SESSION_NAME && session.save_session != Some(false) {
+            let raw_input = input.raw();
+            let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
+            session.autoname = Some(AutoName::new_from_chat_history(chat_history));
+        }
+        let agent_messages = input.agent().build_messages(input);
+        for msg in &agent_messages {
+            all_appended &= append_event(
+                session,
+                &SessionLogEntry::Message {
+                    role: msg.role,
+                    content: msg.content.clone(),
+                },
+            );
+        }
+        session.messages.extend(agent_messages);
+    } else if !is_continuation {
+        let user_msg = Message::new(MessageRole::User, input.message_content());
+        all_appended &= append_event(
+            session,
+            &SessionLogEntry::Message {
+                role: user_msg.role,
+                content: user_msg.content.clone(),
+            },
+        );
+        session.messages.push(user_msg);
+    }
+    let new_data_urls = input.data_urls();
+    if !new_data_urls.is_empty() {
+        all_appended &= append_event(
+            session,
+            &SessionLogEntry::DataUrls {
+                urls: new_data_urls.clone(),
+            },
+        );
+    }
+    session.data_urls.extend(new_data_urls);
+    if let Some(injected) = input.injected_user_text() {
+        let injected_msg = Message::new(
+            MessageRole::User,
+            MessageContent::Text(injected.to_string()),
+        );
+        all_appended &= append_event(
+            session,
+            &SessionLogEntry::Message {
+                role: injected_msg.role,
+                content: injected_msg.content.clone(),
+            },
+        );
+        session.messages.push(injected_msg);
+    }
+    all_appended
 }
 
 pub fn clear_messages(session: &mut Session) {
@@ -726,8 +1012,13 @@ mod tests {
         assert!(output.contains("- google:gemini"));
     }
 
+    /// The tool round splits into two independent log entries: a
+    /// `tool_calls` event written immediately after the LLM returns,
+    /// and a matching `tool_results` event after execution. In memory
+    /// they collapse into a single `Message(Tool, ToolCalls)` carrying
+    /// the outputs.
     #[test]
-    fn add_message_with_tool_results_saves_incrementally() {
+    fn add_tool_calls_and_results_saves_two_entries() {
         use crate::tool::{ToolCall, ToolResult};
         use serde_json::json;
         use tempfile::TempDir;
@@ -738,65 +1029,60 @@ mod tests {
 
         let config = Config::default();
         let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+        let input = crate::config::input::from_str(&global_config, "hello", Some(agent.clone()));
 
-        // Round 1: user input + assistant output with tool calls
-        let input = crate::config::input::from_str(
-            &std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
-            "hello",
-            Some(agent.clone()),
-        );
-        let tool_results = vec![ToolResult::new(
-            ToolCall {
-                name: "test_tool".to_string(),
-                arguments: json!({"arg": "val"}),
-                id: Some("call_1".to_string()),
-                thought_signature: None,
-            },
-            json!({"result": "ok"}),
-        )];
-        super::add_message(
+        let call = ToolCall {
+            name: "test_tool".to_string(),
+            arguments: json!({"arg": "val"}),
+            id: Some("call_1".to_string()),
+            thought_signature: None,
+        };
+
+        super::add_tool_calls(
             &mut session,
             &input,
             "I'll call a tool",
             None,
-            &tool_results,
+            std::slice::from_ref(&call),
         )
         .unwrap();
+        // Before results arrive, the in-memory last message is a
+        // pending Tool message with placeholder error outputs.
+        assert_eq!(session.messages.last().unwrap().role, MessageRole::Tool);
 
-        // Session should have: system/user msgs, assistant, tool
-        assert!(
-            session.messages.len() >= 3,
-            "expected at least 3 messages (agent setup + assistant + tool), got {}",
-            session.messages.len()
-        );
-        // Last message should be Tool role
-        assert_eq!(
-            session.messages.last().unwrap().role,
-            MessageRole::Tool,
-            "last message after tool round should be Tool role"
-        );
+        let results = vec![ToolResult::new(call, json!({"result": "ok"}))];
+        super::add_tool_results(&mut session, &results).unwrap();
 
-        // The session file should exist and contain the intermediate state
-        assert!(session.path.is_some(), "session file should be created");
+        // Check the in-memory outputs got filled in.
+        let last = session.messages.last().unwrap();
+        assert_eq!(last.role, MessageRole::Tool);
+        let MessageContent::ToolCalls(tc) = &last.content else {
+            panic!("expected ToolCalls content");
+        };
+        assert_eq!(tc.tool_results.len(), 1);
+        assert_eq!(tc.tool_results[0].output, json!({"result": "ok"}));
+
+        // On disk: separate ToolCalls and ToolResults events.
         let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
         assert!(
-            content.contains("I'll call a tool"),
-            "session file should contain assistant output from intermediate round"
+            content.contains("type: tool_calls"),
+            "file should contain a tool_calls entry"
+        );
+        assert!(
+            content.contains("type: tool_results"),
+            "file should contain a tool_results entry"
         );
         assert!(
             content.contains("test_tool"),
-            "session file should contain tool call info"
+            "file should contain the tool name"
         );
 
-        // Round 2: continuation (no new user msg), final assistant output
-        let input2 = crate::config::input::from_str(
-            &std::sync::Arc::new(parking_lot::RwLock::new(config)),
-            "hello",
-            Some(agent),
-        );
-        super::add_message(&mut session, &input2, "Here is the result", None, &[]).unwrap();
+        // Now a second round with a plain text reply — continuation
+        // detection should skip the duplicate user message.
+        let input2 = crate::config::input::from_str(&global_config, "hello", Some(agent));
+        super::add_assistant_text(&mut session, &input2, "final answer", None).unwrap();
 
-        // Should NOT have a duplicate user message
         let user_count = session
             .messages
             .iter()
@@ -804,26 +1090,21 @@ mod tests {
             .count();
         assert_eq!(
             user_count, 1,
-            "should have exactly 1 user message, not duplicates from continuation"
-        );
-
-        // Should have the final assistant message
-        assert_eq!(
-            session.messages.last().unwrap().role,
-            MessageRole::Assistant
+            "continuation detection should prevent duplicate user messages"
         );
         assert_eq!(
             session.messages.last().unwrap().content.to_text(),
-            "Here is the result"
+            "final answer"
         );
     }
 
-    /// Verify that when the continuation round's input carries merged
-    /// tool_calls (from merge_tool_results), they don't create duplicate
-    /// Tool messages — the tool results were already saved in round 1.
+    /// Verify that a session file with an orphan `tool_calls` entry
+    /// (process crashed mid-round) is repaired on load by
+    /// synthesizing lost-response error outputs for every pending
+    /// call.
     #[test]
-    fn continuation_with_merged_tool_calls_does_not_duplicate_tool_messages() {
-        use crate::tool::{ToolCall, ToolResult};
+    fn load_repairs_orphan_tool_calls_at_eof() {
+        use crate::tool::ToolCall;
         use serde_json::json;
         use tempfile::TempDir;
 
@@ -833,70 +1114,45 @@ mod tests {
 
         let config = Config::default();
         let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+        let input = crate::config::input::from_str(&global_config, "hello", Some(agent));
 
-        let tool_results = vec![ToolResult::new(
-            ToolCall {
-                name: "my_tool".to_string(),
-                arguments: json!({"x": 1}),
-                id: Some("call_1".to_string()),
-                thought_signature: None,
-            },
-            json!("tool output"),
-        )];
+        let call = ToolCall {
+            name: "my_tool".to_string(),
+            arguments: json!({"x": 1}),
+            id: Some("c1".to_string()),
+            thought_signature: None,
+        };
+        super::add_tool_calls(&mut session, &input, "calling tool", None, &[call]).unwrap();
+        // Deliberately do NOT call add_tool_results — simulates a
+        // crash mid-round.
 
-        // Round 1: save with tool_results — creates assistant + tool messages.
-        let input1 = crate::config::input::from_str(&global_config, "hello", Some(agent.clone()));
-        super::add_message(&mut session, &input1, "calling tool", None, &tool_results).unwrap();
-
-        let tool_count_after_round1 = session
-            .messages
-            .iter()
-            .filter(|m| m.role == MessageRole::Tool)
-            .count();
-        assert_eq!(
-            tool_count_after_round1, 1,
-            "round 1 should produce exactly 1 Tool message"
-        );
-
-        // Round 2: simulate what happens in the real prompt loop —
-        // merge_tool_results puts the tool data onto the input's tool_calls,
-        // then add_message is called with empty tool_results for the final
-        // round.
-        let input2 = crate::config::input::from_str(&global_config, "hello", Some(agent));
-        let merged_input =
-            input2.merge_tool_results("calling tool".to_string(), None, tool_results);
-        assert!(
-            merged_input.tool_calls().is_some(),
-            "merged input should have tool_calls set"
-        );
-        super::add_message(&mut session, &merged_input, "final answer", None, &[]).unwrap();
-
-        let tool_count_after_round2 = session
-            .messages
-            .iter()
-            .filter(|m| m.role == MessageRole::Tool)
-            .count();
-        assert_eq!(
-            tool_count_after_round2, 1,
-            "round 2 should NOT add another Tool message — tool results were already saved in round 1; got {} Tool messages",
-            tool_count_after_round2
-        );
-
-        // Verify on-disk content doesn't have duplicates either.
+        // Parse the log directly (same path as super::load, minus
+        // model resolution which needs a fully-configured catalog).
         let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        let tool_entry_count = content.matches("my_tool").count();
-        // The tool name appears once in the tool results entry.
+        let reloaded = super::load_from_log_for_test(&content);
+
+        let last = reloaded
+            .messages
+            .last()
+            .expect("session should have messages");
+        assert_eq!(last.role, MessageRole::Tool);
+        let MessageContent::ToolCalls(tc) = &last.content else {
+            panic!("expected ToolCalls content");
+        };
+        assert_eq!(tc.tool_results.len(), 1);
+        let output_str = tc.tool_results[0].output.to_string();
         assert!(
-            tool_entry_count <= 2,
-            "session file should not have excessive duplicates of tool data; found {tool_entry_count} occurrences of 'my_tool'"
+            output_str.contains("tool response lost"),
+            "expected synthesized lost-response error, got: {output_str}"
         );
     }
 
-    /// Verify that session file round-trips correctly after incremental
-    /// saving: load the saved file and check messages match.
+    /// Round-trip: write a full session (plain-text + tool round) and
+    /// reload it through `load_from_log`.  Verify the in-memory
+    /// messages are reconstructed correctly.
     #[test]
-    fn incremental_session_round_trips_through_load() {
+    fn session_round_trips_through_load() {
         use crate::tool::{ToolCall, ToolResult};
         use serde_json::json;
         use tempfile::TempDir;
@@ -909,175 +1165,53 @@ mod tests {
         let agent = config.extract_agent();
         let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
 
-        let tool_results = vec![ToolResult::new(
-            ToolCall {
-                name: "search".to_string(),
-                arguments: json!({"query": "test"}),
-                id: Some("c1".to_string()),
-                thought_signature: None,
-            },
+        let call = ToolCall {
+            name: "search".to_string(),
+            arguments: json!({"query": "test"}),
+            id: Some("c1".to_string()),
+            thought_signature: None,
+        };
+        let results = vec![ToolResult::new(
+            call.clone(),
             json!({"results": ["a", "b"]}),
         )];
 
-        // Round 1: intermediate save with tool results
         let input1 =
             crate::config::input::from_str(&global_config, "find test", Some(agent.clone()));
-        super::add_message(&mut session, &input1, "searching...", None, &tool_results).unwrap();
+        super::add_tool_calls(&mut session, &input1, "searching...", None, &[call]).unwrap();
+        super::add_tool_results(&mut session, &results).unwrap();
 
-        // Round 2: final answer
         let input2 = crate::config::input::from_str(&global_config, "find test", Some(agent));
-        super::add_message(&mut session, &input2, "found results", None, &[]).unwrap();
+        super::add_assistant_text(&mut session, &input2, "found results", None).unwrap();
 
-        // Verify the saved session file contains all expected content
-        // in correct order (header, messages from both rounds).
+        // Parse the log directly (same path as super::load, minus
+        // model resolution which needs a fully-configured catalog).
         let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        let reloaded = super::load_from_log_for_test(&content);
 
-        // Must have the header
-        assert!(
-            content.starts_with("type: header"),
-            "file should start with header"
-        );
-
-        // Must contain the user input, both assistant outputs, and tool data
-        assert!(
-            content.contains("find test"),
-            "file should contain user input"
-        );
-        assert!(
-            content.contains("searching..."),
-            "file should contain round 1 assistant output"
-        );
-        assert!(
-            content.contains("found results"),
-            "file should contain round 2 assistant output"
-        );
-        assert!(
-            content.contains("search"),
-            "file should contain tool call name"
-        );
-
-        // Count the YAML document separators to ensure the right number
-        // of entries were written (header + N messages).
-        let doc_count = content.matches("\n---\n").count() + 1; // +1 for first doc
-        assert!(
-            doc_count >= 4,
-            "file should have at least 4 YAML documents (header + user + assistant + tool + assistant); got {doc_count}"
-        );
-
-        // Exercise the deserializer to catch parser/serde regressions.
-        // We parse the YAML log entries directly (same path `Session::load`
-        // uses internally via `SessionLogEntry::deserialize`) rather than
-        // calling `Session::load`, because that also performs model
-        // resolution which depends on the global model catalog and is not
-        // available in this test's minimal `Config::default`.
-        use serde::Deserialize;
-        let mut parsed_messages: Vec<Message> = Vec::new();
-        for document in serde_yaml::Deserializer::from_str(&content) {
-            let entry =
-                SessionLogEntry::deserialize(document).expect("log entry should round-trip");
-            if let SessionLogEntry::Message { role, content } = entry {
-                parsed_messages.push(Message::new(role, content));
-            }
-        }
         assert_eq!(
-            parsed_messages.len(),
+            reloaded.messages.len(),
             session.messages.len(),
-            "reloaded messages should match the original count"
+            "reloaded message count should match"
         );
         assert_eq!(
-            parsed_messages.last().unwrap().content.to_text(),
+            reloaded.messages.last().unwrap().content.to_text(),
             "found results",
             "final reloaded message should preserve the last assistant output"
         );
-    }
-
-    /// Simulates the ACP server flow: save_message with &[] for the
-    /// assistant output, then append_tool_round separately, then
-    /// save_message again for the next round.  The session should have
-    /// no duplicate messages and continuation detection should work.
-    #[test]
-    fn append_tool_round_enables_continuation_detection() {
-        use crate::client::MessageContentToolCalls;
-        use crate::tool::{ToolCall, ToolResult};
-        use serde_json::json;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let mut session = test_session();
-        session.set_sessions_dir(tmp.path().to_path_buf());
-
-        let config = Config::default();
-        let agent = config.extract_agent();
-        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config));
-
-        // Round 1: save assistant output (as ACP server does with &[])
-        let input1 = crate::config::input::from_str(&global_config, "hello", Some(agent.clone()));
-        super::add_message(&mut session, &input1, "calling tool", None, &[]).unwrap();
-        assert_eq!(
-            session.messages.last().unwrap().role,
-            MessageRole::Assistant,
-            "after add_message with no tool_results, last msg should be Assistant"
-        );
-
-        // ACP server then appends tool results via append_tool_round
-        let tool_results = vec![ToolResult::new(
-            ToolCall {
-                name: "acp_tool".to_string(),
-                arguments: json!({"q": "test"}),
-                id: Some("tc1".to_string()),
-                thought_signature: None,
-            },
-            json!("tool output"),
-        )];
-        let tool_msg = Message::new(
-            MessageRole::Tool,
-            crate::client::MessageContent::ToolCalls(MessageContentToolCalls::new(
-                tool_results,
-                "calling tool".to_string(),
-                None,
-            )),
-        );
-        super::append_tool_round(&mut session, &tool_msg);
-        assert_eq!(
-            session.messages.last().unwrap().role,
-            MessageRole::Tool,
-            "after append_tool_round, last msg should be Tool"
-        );
-
-        // Round 2: save final answer — should detect continuation and
-        // NOT add a duplicate user message.
-        let input2 = crate::config::input::from_str(&global_config, "hello", Some(agent));
-        super::add_message(&mut session, &input2, "final answer", None, &[]).unwrap();
-
-        let user_count = session
+        // The Tool message should have its outputs intact.
+        let tool_msg = reloaded
             .messages
             .iter()
-            .filter(|m| m.role == MessageRole::User)
-            .count();
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("session should contain a Tool message");
+        let MessageContent::ToolCalls(tc) = &tool_msg.content else {
+            panic!("expected ToolCalls content on the Tool message");
+        };
         assert_eq!(
-            user_count, 1,
-            "should have exactly 1 user message (from round 1), not duplicates from continuation"
-        );
-
-        let tool_count = session
-            .messages
-            .iter()
-            .filter(|m| m.role == MessageRole::Tool)
-            .count();
-        assert_eq!(
-            tool_count, 1,
-            "should have exactly 1 tool message (from append_tool_round)"
-        );
-
-        // Verify the file contains the expected content
-        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
-        assert!(
-            content.contains("acp_tool"),
-            "file should contain the tool call name"
-        );
-        assert!(
-            content.contains("final answer"),
-            "file should contain the final assistant output"
+            tc.tool_results[0].output,
+            json!({"results": ["a", "b"]}),
+            "reloaded tool output should match what we wrote"
         );
     }
 

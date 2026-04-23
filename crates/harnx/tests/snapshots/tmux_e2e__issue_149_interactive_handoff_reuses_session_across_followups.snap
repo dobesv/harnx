@@ -1,6 +1,6 @@
 ---
-source: tests/tmux_e2e.rs
-assertion_line: 564
+source: crates/harnx/tests/tmux_e2e.rs
+assertion_line: 550
 expression: normalized
 ---
 Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
@@ -18,7 +18,7 @@ I took over this session and counted 7 files in /tmp.
 
 > what was the earlier /tmp answer, and are you still in that same handed-off session?
 
-I remember the earlier /tmp answer: 7 files, and this is follow-up #2 in the same handed-off session.
+Follow-up answered in the same handed-off session.
 
 
 
@@ -35,4 +35,4 @@ I remember the earlier /tmp answer: 7 files, and this is follow-up #2 in the sam
 
 
 
-• 🤖 handoff-sub-agent ▸ handoff-session-1   Context: 74(0%)
+• 🤖 handoff-sub-agent ▸ handoff-session-1   Context: 99(0%)

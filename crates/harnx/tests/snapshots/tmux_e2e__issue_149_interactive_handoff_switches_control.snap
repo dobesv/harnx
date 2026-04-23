@@ -1,6 +1,6 @@
 ---
 source: tests/tmux_e2e.rs
-assertion_line: 492
+assertion_line: 438
 expression: normalized
 ---
 Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
@@ -35,4 +35,4 @@ I took over this session and counted 7 files in /tmp.
 
 
 
-• 🤖 handoff-sub-agent ▸ handoff-session-1
+• 🤖 handoff-sub-agent ▸ handoff-session-1   Context: 56(0%)

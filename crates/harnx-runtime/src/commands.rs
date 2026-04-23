@@ -775,7 +775,7 @@ async fn ask_inner(
             env::current_dir().unwrap_or_default(),
         )
     };
-    let (output, thought, tool_results, usage) =
+    let (output, thought, tool_calls, usage) =
         match call_with_retry_and_fallback(&input, config, abort_signal.clone()).await {
             Ok(result) => result,
             Err(err) => {
@@ -802,13 +802,26 @@ async fn ask_inner(
                 return Err(err);
             }
         };
-    config.write().after_chat_completion(
-        &input,
-        &output,
-        thought.as_deref(),
-        &tool_results,
-        &usage,
-    )?;
+
+    // Plain-text rounds save once via after_chat_completion; tool
+    // rounds use `execute_tool_round` to persist the request, run the
+    // tools, and persist the results as two separate log entries.
+    let tool_results = if tool_calls.is_empty() {
+        config
+            .write()
+            .after_chat_completion(&input, &output, thought.as_deref(), &[], &usage)?;
+        Vec::new()
+    } else {
+        config.write().record_completion_usage(&usage);
+        crate::tool::execute_tool_round(
+            config,
+            &input,
+            &output,
+            thought.as_deref(),
+            tool_calls,
+            &abort_signal,
+        )?
+    };
     if tool_results.is_empty() {
         let config_read = config.read();
         let macro_flag = config_read.macro_flag;
@@ -878,7 +891,6 @@ async fn ask_inner(
     if !tool_results.is_empty() {
         let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
         if let Some(switch_agent) = switch_agent {
-            let merged_input = input.merge_tool_results(output, thought, tool_results.clone());
             config.write().exit_agent()?;
             crate::config::Config::use_agent(
                 config,
@@ -893,10 +905,11 @@ async fn ask_inner(
             if config.read().session.is_some() {
                 config.write().empty_session()?;
             }
+            let fresh_input = crate::config::input::from_str(config, &switch_agent.prompt, None);
             return Box::pin(ask_inner(
                 config,
                 abort_signal,
-                merged_input,
+                fresh_input,
                 true,
                 async_manager,
                 persistent_manager,

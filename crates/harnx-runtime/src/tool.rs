@@ -1,4 +1,8 @@
-use crate::{config::GlobalConfig, utils::*};
+use crate::{
+    config::{GlobalConfig, Input},
+    utils::*,
+};
+use anyhow::Result;
 use harnx_hooks::HookEvent;
 use harnx_mcp::safety::{truncate_output, TruncateOpts};
 
@@ -8,12 +12,61 @@ use std::sync::Arc;
 
 use harnx_core::tool::ToolProvider;
 pub use harnx_core::tool::{
-    extract_user_display_text, trigger_agent_tool_declaration, JsonSchema, SwitchAgentData,
-    ToolCall, ToolDeclaration, ToolResult, Tools, TRIGGER_AGENT_TOOL_NAME,
+    extract_user_display_text, JsonSchema, SwitchAgentData, ToolCall, ToolDeclaration, ToolResult,
+    Tools,
 };
 pub use harnx_engine::tool::{
     eval_tool_calls, ConfirmToolUseFn, DispatchHookFn, ToolCallEmitFn, ToolEvalContext,
 };
+
+/// Persist a tool round and execute its calls.  Writes the
+/// `ToolCalls` session-log entry BEFORE running tools (so the
+/// transcript captures the request even on crash/interrupt), runs
+/// `eval_tool_calls`, then writes the matching `ToolResults` entry.
+///
+/// On eval failure, synthesizes one error-output `ToolResult` per
+/// call, writes those to keep the log well-formed, and returns the
+/// original error.  Skips both writes entirely when `dry_run` is set.
+pub fn execute_tool_round(
+    config: &GlobalConfig,
+    input: &Input,
+    output: &str,
+    thought: Option<&str>,
+    tool_calls: Vec<ToolCall>,
+    abort_signal: &AbortSignal,
+) -> Result<Vec<ToolResult>> {
+    let dry_run = config.read().dry_run;
+    if !dry_run {
+        config
+            .write()
+            .save_session_tool_calls(input, output, thought, &tool_calls)?;
+    }
+    let eval_ctx = build_tool_eval_context(config);
+    let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal) {
+        Ok(results) => results,
+        Err(err) => {
+            let fallback: Vec<ToolResult> = tool_calls
+                .into_iter()
+                .map(|call| {
+                    ToolResult::new(
+                        call,
+                        serde_json::json!({
+                            "error": format!("tool execution failed: {err:#}")
+                        }),
+                    )
+                })
+                .collect();
+            if !dry_run {
+                let _ = config.write().save_session_tool_results(&fallback);
+            }
+            return Err(err);
+        }
+    };
+    if !dry_run {
+        config.write().save_session_tool_results(&results)?;
+    }
+    Ok(results)
+}
 
 /// Build a `ToolEvalContext` from the harnx `GlobalConfig`. Replaces the
 /// old inherent `ToolEvalContext::from_config` method — the struct lives
@@ -168,37 +221,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("No tool provider configured"));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_eval_tool_calls_partial_error_handling() {
-        let _guard = crate::client::TestStateGuard::new(None).await;
-        let config = Arc::new(RwLock::new(Config::default()));
-        // ACP handoff tools should be handled via the ACP manager and unknown tools still error.
-        let call1 = ToolCall::new(
-            TRIGGER_AGENT_TOOL_NAME.to_string(),
-            json!({"agent": "test", "prompt": "test"}),
-            Some("1".to_string()),
-            None,
-        );
-        let call2 = ToolCall::new(
-            "unknown_tool".to_string(),
-            json!({}),
-            Some("2".to_string()),
-            None,
-        );
-        let calls = vec![call1, call2];
-
-        let abort_signal = create_abort_signal();
-        let result =
-            eval_tool_calls(&build_tool_eval_context(&config), calls, &abort_signal).unwrap();
-        assert_eq!(result.len(), 2);
-
-        assert_eq!(result[0].call.name, TRIGGER_AGENT_TOOL_NAME);
-        assert_eq!(result[0].output["action"], "switch_agent");
-
-        assert_eq!(result[1].call.name, "unknown_tool");
-        assert_eq!(result[1].output["is_error"], true);
     }
 
     #[test]

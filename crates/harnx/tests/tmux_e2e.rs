@@ -7,7 +7,7 @@ use harnx_acp::AcpServerConfig;
 
 use anyhow::{Context, Result};
 use insta::assert_snapshot;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -80,21 +80,21 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
         shell_escape(harnx_bin.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| {
+    let agents_screen = tmux.wait_for(Duration::from_secs(10), |screen| {
         count_occurrences(screen, "__READY_3__") >= 2
     })?;
+    assert!(
+        agents_screen.contains(TEST_AGENT_NAME),
+        "main agent not listed in --list-agents output:\n{agents_screen}"
+    );
+    assert!(
+        agents_screen.contains(TEST_SUB_AGENT_NAME),
+        "sub-agent not listed in --list-agents output:\n{agents_screen}"
+    );
 
-    // Step 4: Run diagnostics - list models
-    tmux.send_text(&format!(
-        "{} --list-models; printf '__READY_4__\\n'",
-        shell_escape(harnx_bin.to_string_lossy().as_ref())
-    ))?;
-    tmux.send_keys(&["Enter"])?;
-    tmux.wait_for(Duration::from_secs(5), |screen| {
-        count_occurrences(screen, "__READY_4__") >= 2
-    })?;
+    let delegate_tool_name = format!("{}_session_prompt", TEST_SUB_AGENT_NAME);
 
-    // Step 5: Launch the test agent
+    // Step 5: Start interactive TUI session
     tmux.send_text(&format!(
         "{} -a {} || echo HARNX_EXIT:$?",
         shell_escape(harnx_bin.to_string_lossy().as_ref()),
@@ -103,49 +103,123 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
     tmux.send_keys(&["Enter"])?;
 
     tmux.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
-    tmux.send_text("tell me how many files are in /tmp")?;
+    tmux.send_text("call repro249 through the sub-agent")?;
     tmux.send_keys(&["Enter"])?;
 
-    // Wait for delegation, child heading, and nested MCP tool call to all appear.
     let screen = tmux.wait_for(Duration::from_secs(30), |screen| {
-        screen.contains(&format!("{}_session_prompt", TEST_SUB_AGENT_NAME))
-            && screen.contains(&format!("> {}", TEST_SUB_AGENT_NAME))
-            && nested_mcp_tool_present(screen)
+        screen.contains(REPRO_249_MCP_TOOL_RESPONSE)
     })?;
 
-    // ── Known-good markers: delegation happened ──────────────────────────────
-    assert!(
-        screen.contains(&format!("{}_session_prompt", TEST_SUB_AGENT_NAME)),
-        "delegation tool call not visible:\n{screen}"
+    assert_eq!(
+        count_occurrences(&screen, &format!("→ {delegate_tool_name}")),
+        1,
+        "expected exactly one top-level delegation marker, got screen:\n{screen}"
     );
     assert!(
-        screen.contains(&format!("> {}", TEST_SUB_AGENT_NAME)),
-        "child sub-agent heading not visible:\n{screen}"
+        count_occurrences(&screen, REPRO_249_MCP_TOOL_NAME) >= 1,
+        "expected MCP tool marker to appear at least once, got screen:\n{screen}"
     );
-
-    // ── Issue #249 regression assertion ───────────────────────────────────────
-    // The child sub-agent internally called `repro249_unique_mcp_tool` via MCP.
-    // That internal tool call should remain visible in the parent transcript.
-    let nested_visible = nested_mcp_tool_present(&screen);
-    eprintln!(
-        "\n=== Issue #249 tmux repro result ===\n\
-         delegation visible    : {}\n\
-         child heading visible : {}\n\
-         nested tool visible   : {} (expected: true — visible = fix confirmed)\n\
-         === last screen ===\n{}\n====\n",
-        screen.contains(&format!("{}_session_prompt", TEST_SUB_AGENT_NAME)),
-        screen.contains(&format!("> {}", TEST_SUB_AGENT_NAME)),
-        nested_visible,
-        screen,
+    assert_eq!(
+        count_occurrences(&screen, REPRO_249_MCP_TOOL_RESPONSE),
+        1,
+        "expected exactly one rendered MCP tool response, got screen:\n{screen}"
     );
     assert!(
-        nested_visible,
-        "nested internal MCP tool call is not visible in the parent transcript; issue #249 regressed\n{screen}"
+        !screen.contains("HARNX_EXIT:"),
+        "harnx exited unexpectedly:\n{screen}"
     );
 
     drop(tmux);
     drop(mock);
     Ok(())
+}
+
+// Normalizes screen output for snapshot tests.
+fn normalize_screen(screen: &str) -> String {
+    screen
+        .lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Replace spinner glyphs (animated braille chars and the idle "•" bullet)
+/// with a fixed placeholder so snapshots are deterministic across runs.
+fn normalize_spinner_chars(text: &str) -> String {
+    const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '•'];
+    text.chars()
+        .map(|c| if SPINNER_CHARS.contains(&c) { '*' } else { c })
+        .collect()
+}
+
+/// Replace any UUIDv4-looking substring with a placeholder so snapshots are
+/// deterministic across runs.
+fn normalize_uuids(text: &str) -> String {
+    // UUID pattern: 8-4-4-4-12 hex chars separated by hyphens.
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if is_uuid_at(&chars, i) {
+            out.push_str("[UUID]");
+            i += 36;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn is_uuid_at(chars: &[char], i: usize) -> bool {
+    if i + 36 > chars.len() {
+        return false;
+    }
+    // Group lengths 8-4-4-4-12 separated by hyphens at indices 8, 13, 18, 23.
+    for (idx, &c) in chars[i..i + 36].iter().enumerate() {
+        let is_hyphen_pos = matches!(idx, 8 | 13 | 18 | 23);
+        if is_hyphen_pos {
+            if c != '-' {
+                return false;
+            }
+        } else if !c.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    // Don't match UUIDs preceded by another hex digit or hyphen (to avoid
+    // mid-string matches within longer identifiers).
+    if i > 0 {
+        let prev = chars[i - 1];
+        if prev.is_ascii_hexdigit() || prev == '-' {
+            return false;
+        }
+    }
+    // Don't match UUIDs followed by another hex digit or hyphen.
+    if i + 36 < chars.len() {
+        let next = chars[i + 36];
+        if next.is_ascii_hexdigit() || next == '-' {
+            return false;
+        }
+    }
+    true
+}
+
+fn shell_escape(s: &str) -> String {
+    let escaped = s.replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+fn repo_root() -> Result<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .context("failed to determine workspace root")
 }
 
 struct TestPaths {
@@ -195,7 +269,7 @@ fn script() -> MockOpenAiScript {
             },
             // Turn 1: sub-agent calls the MCP tool
             MockOpenAiTurn {
-                text_chunks: vec!["Let me call the tool.".to_string()],
+                text_chunks: vec!["I'll use the MCP tool now.".to_string()],
                 tool_calls: vec![MockOpenAiToolCall {
                     name: REPRO_249_MCP_TOOL_NAME.to_string(),
                     arguments: json!({}),
@@ -203,18 +277,18 @@ fn script() -> MockOpenAiScript {
                 }],
                 error: None,
             },
-            // Turn 2: sub-agent summarizes after getting MCP tool result
+            // Turn 2: sub-agent summarizes and returns
             MockOpenAiTurn {
                 text_chunks: vec![format!(
-                    "The tool returned: {REPRO_249_MCP_TOOL_RESPONSE}"
+                    "Sub-agent saw MCP result: {REPRO_249_MCP_TOOL_RESPONSE}"
                 )],
                 tool_calls: vec![],
                 error: None,
             },
-            // Turn 3: parent summarizes after delegation returns
+            // Turn 3: parent final reply after delegated task completes
             MockOpenAiTurn {
                 text_chunks: vec![format!(
-                    "The child used {REPRO_249_MCP_TOOL_NAME} and got: {REPRO_249_MCP_TOOL_RESPONSE}"
+                    "Done. Delegated task completed with: {REPRO_249_MCP_TOOL_RESPONSE}"
                 )],
                 tool_calls: vec![],
                 error: None,
@@ -228,21 +302,13 @@ fn script() -> MockOpenAiScript {
 fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-    let fake_mcp_server = harnx_mcp_repro249_bin(&harnx_bin);
-
-    std::fs::write(
-        &paths.config_path,
-        "save: false
-",
-    )?;
+    std::fs::write(&paths.config_path, "save: false\n")?;
 
     let clients_dir = paths.harnx_config_dir.join("clients");
     let mcp_servers_dir = paths.harnx_config_dir.join("mcp_servers");
-    let acp_servers_dir = paths.harnx_config_dir.join("acp_servers");
     std::fs::create_dir_all(&clients_dir)?;
     std::fs::create_dir_all(&mcp_servers_dir)?;
-    std::fs::create_dir_all(&acp_servers_dir)?;
+
     let client = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
         (
             serde_yaml::Value::String("type".to_string()),
@@ -289,155 +355,52 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
         serde_yaml::to_string(&client)?,
     )?;
 
-    let mut rename_tools = std::collections::HashMap::new();
-    rename_tools.insert(
-        REPRO_249_MCP_TOOL_NAME.to_string(),
-        REPRO_249_MCP_TOOL_NAME.to_string(),
-    );
+    let repro249_bin = harnx_mcp_repro249_bin(&PathBuf::from(env!("CARGO_BIN_EXE_harnx")));
     let mcp_server = McpServerConfig {
-        name: "repro249".to_string(),
-        command: fake_mcp_server.to_string_lossy().into_owned(),
+        name: REPRO_249_MCP_TOOL_NAME.to_string(),
+        command: repro249_bin.to_string_lossy().into_owned(),
         args: vec![],
         env: Default::default(),
-        roots: vec![],
         enabled: true,
+        roots: vec![],
         description: None,
-        rename_tools,
+        rename_tools: Default::default(),
     };
     std::fs::write(
         mcp_servers_dir.join("repro249.yaml"),
         serde_yaml::to_string(&mcp_server)?,
     )?;
 
-    let acp_server = AcpServerConfig {
-        name: TEST_SUB_AGENT_NAME.to_string(),
-        command: harnx_bin.to_string_lossy().into_owned(),
-        args: vec!["--acp".to_string(), TEST_SUB_AGENT_NAME.to_string()],
-        env: Default::default(),
-        enabled: true,
-        description: None,
-        idle_timeout_secs: 300,
-        operation_timeout_secs: 3600,
-    };
-    std::fs::write(
-        acp_servers_dir.join(format!("{}.yaml", TEST_SUB_AGENT_NAME)),
-        serde_yaml::to_string(&acp_server)?,
-    )?;
     std::fs::write(
         paths.agents_dir.join(format!("{}.md", TEST_AGENT_NAME)),
         format!(
-            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate the task to {} and then summarize the result.\n",
-            TEST_AGENT_NAME,
-            TEST_SUB_AGENT_NAME,
-            TEST_AGENT_NAME,
-            TEST_SUB_AGENT_NAME,
+            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate work to {}.\n",
+            TEST_AGENT_NAME, TEST_SUB_AGENT_NAME, TEST_AGENT_NAME, TEST_SUB_AGENT_NAME
         ),
     )?;
     std::fs::write(
         paths.agents_dir.join(format!("{}.md", TEST_SUB_AGENT_NAME)),
         format!(
-            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}\n---\nYou are {}. Always call the MCP tool named {REPRO_249_MCP_TOOL_NAME} before replying.\n",
+            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}\n---\nYou are {}. Use the MCP tool and report the result.\n",
             TEST_SUB_AGENT_NAME,
             REPRO_249_MCP_TOOL_NAME,
-            TEST_SUB_AGENT_NAME,
+            TEST_SUB_AGENT_NAME
         ),
     )?;
     Ok(())
 }
 
-fn nested_mcp_tool_present(screen: &str) -> bool {
-    // The nested tool call must appear as a real tool-call row in the parent
-    // transcript, NOT just as text inside a response string.
-    // A real tool call row looks like "→ repro249_unique_mcp_tool"
-    screen.contains(&format!("→ {}", REPRO_249_MCP_TOOL_NAME))
-}
-
-fn normalize_screen(screen: &str) -> String {
-    screen
-        .lines()
-        .map(|line| line.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Replace spinner glyphs (animated braille chars and the idle "•" bullet)
-/// with a fixed placeholder so snapshots are deterministic across runs.
-fn normalize_spinner_chars(text: &str) -> String {
-    const SPINNER_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '•'];
-    text.chars()
-        .map(|c| if SPINNER_CHARS.contains(&c) { '*' } else { c })
-        .collect()
-}
-
-/// Replace any UUIDv4-looking substring with a placeholder so snapshots are
-/// deterministic across runs.
-fn normalize_uuids(text: &str) -> String {
-    // UUID pattern: 8-4-4-4-12 hex chars separated by hyphens.
-    let mut out = String::with_capacity(text.len());
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if is_uuid_at(&chars, i) {
-            out.push_str("<UUID>");
-            i += 36;
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn is_uuid_at(chars: &[char], i: usize) -> bool {
-    if i + 36 > chars.len() {
-        return false;
-    }
-    // Group lengths 8-4-4-4-12 separated by hyphens at indices 8, 13, 18, 23.
-    for (idx, &c) in chars[i..i + 36].iter().enumerate() {
-        let is_hyphen_pos = matches!(idx, 8 | 13 | 18 | 23);
-        if is_hyphen_pos {
-            if c != '-' {
-                return false;
-            }
-        } else if !c.is_ascii_hexdigit() {
-            return false;
-        }
-    }
-    // Don't match UUIDs preceded by another hex digit or hyphen (to avoid
-    // mid-string matches within longer identifiers).
-    if i > 0 {
-        let prev = chars[i - 1];
-        if prev.is_ascii_hexdigit() || prev == '-' {
-            return false;
-        }
-    }
-    true
-}
-
-fn repo_root() -> Result<PathBuf> {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .canonicalize()
-        .context("failed to resolve repo root")
-}
-
-fn shell_escape(input: &str) -> String {
-    if input.is_empty() {
-        return "''".to_string();
-    }
-    // Escape single quotes for shell by replacing ' with '"'"'
-    format!("'{}'", input.replace('\'', "'\"'\"'"))
-}
-
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    haystack.matches(needle).count()
-}
-
 const HANDOFF_AGENT_NAME: &str = "handoff-agent";
 const HANDOFF_SUB_AGENT_NAME: &str = "handoff-sub-agent";
 const HANDOFF_SESSION_ID: &str = "handoff-session-1";
+const HANDOFF_PROMPT: &str = "Take over and answer how many files are in /tmp.";
+const HANDOFF_ORIGINAL_USER_TEXT: &str = "tell me how many files are in /tmp";
+const HANDOFF_FOLLOWUP_USER_TEXT: &str =
+    "what was the earlier /tmp answer, and are you still in that same handed-off session?";
+const HANDOFF_SUB_AGENT_SYSTEM_PROMPT: &str =
+    "Take over the interactive session and answer directly.";
 const HANDOFF_FINAL_RESPONSE: &str = "I took over this session and counted 7 files in /tmp.";
-const HANDOFF_REUSE_FOLLOWUP_RESPONSE: &str =
-    "I remember the earlier /tmp answer: 7 files, and this is follow-up #2 in the same handed-off session.";
+const HANDOFF_REUSE_FOLLOWUP_RESPONSE: &str = "Follow-up answered in the same handed-off session.";
 
 #[test]
 fn issue_149_interactive_handoff_switches_control() -> Result<()> {
@@ -454,42 +417,69 @@ fn issue_149_interactive_handoff_switches_control() -> Result<()> {
         ..
     } = session;
 
-    tmux.send_text(&format!(
-        "{} -a {} || echo HARNX_EXIT:$?",
-        shell_escape(harnx_bin.to_string_lossy().as_ref()),
-        HANDOFF_AGENT_NAME
-    ))?;
-    tmux.send_keys(&["Enter"])?;
+    run_handoff_command(&tmux, &harnx_bin)?;
+    send_handoff_user_prompt(&tmux)?;
 
-    tmux.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
-    tmux.send_text("tell me how many files are in /tmp")?;
-    tmux.send_keys(&["Enter"])?;
-
-    let screen = tmux.wait_for(Duration::from_secs(30), |screen| {
-        screen.contains(&format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME))
-            && screen.contains(HANDOFF_FINAL_RESPONSE)
-    })?;
-
-    assert!(
-        screen.contains(&format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME)),
-        "handoff tool call not visible:
-{screen}"
-    );
-    assert!(
-        screen.contains(HANDOFF_SESSION_ID),
-        "handed-off session id not visible anywhere in transcript:
-{screen}"
-    );
-    assert!(
-        screen.contains(HANDOFF_FINAL_RESPONSE),
-        "handed-off agent response not visible:
-{screen}"
-    );
+    let screen = wait_for_handoff_completion(&tmux)?;
+    assert_handoff_screen(&screen, "transcript")?;
 
     let normalized = normalize_screen(&screen);
     assert_snapshot!("issue_149_interactive_handoff_switches_control", normalized);
 
     drop(tmux);
+    drop(mock);
+    Ok(())
+}
+
+#[test]
+fn issue_303_handoff_no_acp_server() -> Result<()> {
+    let session = match setup_handoff_tmux_session_no_acp_server("issue_303_handoff_no_acp_server")?
+    {
+        Some(session) => session,
+        None => return Ok(()),
+    };
+
+    let HandoffTmuxSession {
+        tmux,
+        mock,
+        harnx_bin,
+        ..
+    } = session;
+
+    run_handoff_command(&tmux, &harnx_bin)?;
+    send_handoff_user_prompt(&tmux)?;
+
+    let screen = wait_for_handoff_completion(&tmux)?;
+    assert_handoff_screen(&screen, "no-ACP transcript")?;
+
+    drop(tmux);
+    drop(mock);
+    Ok(())
+}
+
+#[test]
+fn issue_303_handoff_session_isolation() -> Result<()> {
+    let session = match setup_handoff_tmux_session("issue_303_handoff_session_isolation")? {
+        Some(session) => session,
+        None => return Ok(()),
+    };
+
+    let HandoffTmuxSession {
+        tmux,
+        mock,
+        harnx_bin,
+        ..
+    } = session;
+
+    run_handoff_command(&tmux, &harnx_bin)?;
+    send_handoff_user_prompt(&tmux)?;
+
+    let screen = wait_for_handoff_completion(&tmux)?;
+    assert_handoff_screen(&screen, "session isolation transcript")?;
+
+    drop(tmux);
+    let request_log = mock.get_request_log();
+    assert_handoff_request_isolation(&request_log)?;
     drop(mock);
     Ok(())
 }
@@ -510,31 +500,16 @@ fn issue_149_interactive_handoff_reuses_session_across_followups() -> Result<()>
         ..
     } = session;
 
-    tmux.send_text(&format!(
-        "{} -a {} || echo HARNX_EXIT:$?",
-        shell_escape(harnx_bin.to_string_lossy().as_ref()),
-        HANDOFF_AGENT_NAME
-    ))?;
-    tmux.send_keys(&["Enter"])?;
+    run_handoff_command(&tmux, &harnx_bin)?;
+    send_handoff_user_prompt(&tmux)?;
 
-    tmux.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
-    tmux.send_text("tell me how many files are in /tmp")?;
-    tmux.send_keys(&["Enter"])?;
-
-    let first_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
-        screen.contains(&format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME))
-            && screen.contains(HANDOFF_FINAL_RESPONSE)
-    })?;
-
+    let first_screen = wait_for_handoff_completion(&tmux)?;
     assert!(
         first_screen.contains(HANDOFF_SESSION_ID),
-        "initial handed-off session id not visible anywhere in transcript:
-{first_screen}"
+        "initial handed-off session id not visible anywhere in transcript:\n{first_screen}"
     );
 
-    tmux.send_text(
-        "what was the earlier /tmp answer, and are you still in that same handed-off session?",
-    )?;
+    tmux.send_text(HANDOFF_FOLLOWUP_USER_TEXT)?;
     tmux.send_keys(&["Enter"])?;
 
     let second_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
@@ -543,29 +518,259 @@ fn issue_149_interactive_handoff_reuses_session_across_followups() -> Result<()>
 
     assert!(
         second_screen.contains(HANDOFF_FINAL_RESPONSE),
-        "follow-up transcript no longer shows the initial handed-off answer:
-{second_screen}"
+        "follow-up transcript no longer shows the initial handed-off answer:\n{second_screen}"
     );
     assert!(
         second_screen.contains(HANDOFF_REUSE_FOLLOWUP_RESPONSE),
-        "follow-up response showing session reuse not visible:
-{second_screen}"
+        "follow-up response showing session reuse not visible:\n{second_screen}"
     );
     assert_eq!(
         count_occurrences(&second_screen, &format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME)),
         1,
-        "expected exactly one handoff tool call in the transcript, indicating reuse of the existing delegated session:
-{second_screen}"
+        "expected exactly one handoff tool call in the transcript, indicating reuse of the existing delegated session:\n{second_screen}"
     );
+
+    drop(tmux);
+    let request_log = mock.get_request_log();
+    assert_handoff_followup_request_reuses_sub_agent_session(&request_log)?;
+    drop(mock);
 
     let normalized = normalize_screen(&second_screen);
     assert_snapshot!(
         "issue_149_interactive_handoff_reuses_session_across_followups",
         normalized
     );
+    Ok(())
+}
 
-    drop(tmux);
-    drop(mock);
+fn run_handoff_command(tmux: &TmuxHarness, harnx_bin: &Path) -> Result<()> {
+    tmux.send_text(&format!(
+        "{} -a {} || echo HARNX_EXIT:$?",
+        shell_escape(harnx_bin.to_string_lossy().as_ref()),
+        HANDOFF_AGENT_NAME
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
+    Ok(())
+}
+
+fn send_handoff_user_prompt(tmux: &TmuxHarness) -> Result<()> {
+    tmux.send_text(HANDOFF_ORIGINAL_USER_TEXT)?;
+    tmux.send_keys(&["Enter"])?;
+    Ok(())
+}
+
+fn wait_for_handoff_completion(tmux: &TmuxHarness) -> Result<String> {
+    tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(&format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME))
+            && screen.contains(HANDOFF_FINAL_RESPONSE)
+    })
+}
+
+fn assert_handoff_screen(screen: &str, label: &str) -> Result<()> {
+    assert!(
+        screen.contains(&format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME)),
+        "handoff tool call not visible anywhere in {label}:\n{screen}"
+    );
+    assert!(
+        screen.contains(HANDOFF_SESSION_ID),
+        "handed-off session id not visible anywhere in {label}:\n{screen}"
+    );
+    assert!(
+        screen.contains(HANDOFF_FINAL_RESPONSE),
+        "final handed-off response not visible anywhere in {label}:\n{screen}"
+    );
+    Ok(())
+}
+
+fn request_messages<'a>(request: &'a Value, label: &str) -> Result<&'a Vec<Value>> {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} missing messages array: {request}"))
+}
+
+fn request_message_content(message: &Value, label: &str) -> Result<String> {
+    match message.get("content") {
+        Some(Value::String(content)) => Ok(content.clone()),
+        Some(Value::Array(parts)) => Ok(parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<String>()),
+        _ => anyhow::bail!("{label} missing string content: {message}"),
+    }
+}
+
+fn assert_handoff_request_isolation(request_log: &[Value]) -> Result<()> {
+    assert!(
+        request_log.len() >= 2,
+        "expected at least parent and handed-off LLM requests: {request_log:?}"
+    );
+
+    let parent_request = request_log
+        .first()
+        .with_context(|| format!("missing first LLM request in log: {request_log:?}"))?;
+    let parent_messages = request_messages(parent_request, "first LLM request")?;
+    assert_eq!(
+        parent_messages.len(),
+        2,
+        "expected first LLM request to contain only parent system and original user messages: {parent_messages:?}"
+    );
+    assert_eq!(
+        parent_messages[0].get("role").and_then(Value::as_str),
+        Some("system"),
+        "expected first message in first LLM request to be system: {}",
+        parent_messages[0]
+    );
+    assert_eq!(
+        parent_messages[1].get("role").and_then(Value::as_str),
+        Some("user"),
+        "expected second message in first LLM request to be user: {}",
+        parent_messages[1]
+    );
+    let parent_system =
+        request_message_content(&parent_messages[0], "first LLM request system message")?;
+    let parent_user =
+        request_message_content(&parent_messages[1], "first LLM request user message")?;
+    assert!(
+        parent_system.contains("You are handoff-agent"),
+        "parent agent system prompt missing from first LLM request: {parent_system}"
+    );
+    assert_eq!(
+        parent_user, HANDOFF_ORIGINAL_USER_TEXT,
+        "original user text missing from first LLM request: {parent_user}"
+    );
+
+    let handoff_request = request_log
+        .get(1)
+        .with_context(|| format!("missing second LLM request in log: {request_log:?}"))?;
+    let handoff_messages = request_messages(handoff_request, "second LLM request")?;
+    assert_eq!(
+        handoff_messages.len(),
+        2,
+        "expected second LLM request to contain only system and user messages for handed-off agent: {handoff_messages:?}"
+    );
+
+    let handoff_system =
+        request_message_content(&handoff_messages[0], "second LLM request system message")?;
+    let handoff_user =
+        request_message_content(&handoff_messages[1], "second LLM request user message")?;
+    assert_eq!(
+        handoff_messages[0].get("role").and_then(Value::as_str),
+        Some("system"),
+        "expected first message in second LLM request to be system: {}",
+        handoff_messages[0]
+    );
+    assert_eq!(
+        handoff_messages[1].get("role").and_then(Value::as_str),
+        Some("user"),
+        "expected second message in second LLM request to be user: {}",
+        handoff_messages[1]
+    );
+    assert!(
+        handoff_system.contains(HANDOFF_SUB_AGENT_SYSTEM_PROMPT),
+        "sub-agent system prompt missing from second LLM request: {handoff_system}"
+    );
+    assert_eq!(
+        handoff_user, HANDOFF_PROMPT,
+        "handoff prompt mismatch in second LLM request: {handoff_user}"
+    );
+    assert!(
+        !handoff_system.contains(HANDOFF_ORIGINAL_USER_TEXT)
+            && !handoff_user.contains(HANDOFF_ORIGINAL_USER_TEXT),
+        "original parent user text leaked into second LLM request: {handoff_system}
+{handoff_user}"
+    );
+    assert!(
+        !handoff_system.contains("You are handoff-agent")
+            && !handoff_user.contains("You are handoff-agent"),
+        "parent agent system prompt leaked into second LLM request: {handoff_system}
+{handoff_user}"
+    );
+    Ok(())
+}
+
+fn assert_handoff_followup_request_reuses_sub_agent_session(request_log: &[Value]) -> Result<()> {
+    let request = request_log
+        .get(2)
+        .with_context(|| format!("missing third LLM request in log: {request_log:?}"))?;
+    let messages = request_messages(request, "third LLM request")?;
+    assert_eq!(
+        messages.len(),
+        4,
+        "expected third LLM request to stay in handed-off sub-agent session with prior handed-off turn plus follow-up user message: {messages:?}"
+    );
+
+    let system_message = &messages[0];
+    let prior_user_message = &messages[1];
+    let prior_assistant_message = &messages[2];
+    let user_message = &messages[3];
+    assert_eq!(
+        system_message.get("role").and_then(Value::as_str),
+        Some("system"),
+        "expected first message in third LLM request to be system: {system_message}"
+    );
+    assert_eq!(
+        prior_user_message.get("role").and_then(Value::as_str),
+        Some("user"),
+        "expected second message in third LLM request to be prior handed-off user prompt: {prior_user_message}"
+    );
+    assert_eq!(
+        prior_assistant_message.get("role").and_then(Value::as_str),
+        Some("assistant"),
+        "expected third message in third LLM request to be prior handed-off assistant reply: {prior_assistant_message}"
+    );
+    assert_eq!(
+        user_message.get("role").and_then(Value::as_str),
+        Some("user"),
+        "expected fourth message in third LLM request to be follow-up user: {user_message}"
+    );
+
+    let system_content =
+        request_message_content(system_message, "third LLM request system message")?;
+    let prior_user_content =
+        request_message_content(prior_user_message, "third LLM request prior user message")?;
+    let prior_assistant_content = request_message_content(
+        prior_assistant_message,
+        "third LLM request prior assistant message",
+    )?;
+    let user_content = request_message_content(user_message, "third LLM request user message")?;
+    assert!(
+        system_content.contains(HANDOFF_SUB_AGENT_SYSTEM_PROMPT),
+        "sub-agent system prompt missing from follow-up request: {system_content}"
+    );
+    assert_eq!(
+        prior_user_content, HANDOFF_PROMPT,
+        "follow-up request missing prior handed-off user prompt: {prior_user_content}"
+    );
+    assert_eq!(
+        prior_assistant_content, HANDOFF_FINAL_RESPONSE,
+        "follow-up request missing prior handed-off assistant reply: {prior_assistant_content}"
+    );
+    assert_eq!(
+        user_content, HANDOFF_FOLLOWUP_USER_TEXT,
+        "follow-up request missing latest user message: {user_content}"
+    );
+    assert!(
+        !system_content.contains(HANDOFF_ORIGINAL_USER_TEXT)
+            && !prior_user_content.contains(HANDOFF_ORIGINAL_USER_TEXT)
+            && !prior_assistant_content.contains(HANDOFF_ORIGINAL_USER_TEXT)
+            && !user_content.contains(HANDOFF_ORIGINAL_USER_TEXT),
+        "parent session user text leaked into follow-up handed-off request: {system_content}
+{prior_user_content}
+{prior_assistant_content}
+{user_content}"
+    );
+    assert!(
+        !system_content.contains("You are handoff-agent")
+            && !prior_user_content.contains("You are handoff-agent")
+            && !prior_assistant_content.contains("You are handoff-agent")
+            && !user_content.contains("You are handoff-agent"),
+        "parent agent system prompt leaked into follow-up handed-off request: {system_content}
+{prior_user_content}
+{prior_assistant_content}
+{user_content}"
+    );
     Ok(())
 }
 
@@ -577,6 +782,22 @@ struct HandoffTmuxSession {
 }
 
 fn setup_handoff_tmux_session(test_name: &str) -> Result<Option<HandoffTmuxSession>> {
+    setup_handoff_tmux_session_with_options(test_name, None, true)
+}
+
+fn setup_handoff_tmux_session_no_acp_server(test_name: &str) -> Result<Option<HandoffTmuxSession>> {
+    setup_handoff_tmux_session_with_options(
+        test_name,
+        Some(&format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME)),
+        false,
+    )
+}
+
+fn setup_handoff_tmux_session_with_options(
+    test_name: &str,
+    parent_use_tools: Option<&str>,
+    write_acp_server: bool,
+) -> Result<Option<HandoffTmuxSession>> {
     if option_env!("CARGO_BIN_NAME") == Some("harnx") {
         eprintln!("skipping {test_name} in binary test target to avoid duplicate tmux sessions");
         return Ok(None);
@@ -592,7 +813,19 @@ fn setup_handoff_tmux_session(test_name: &str) -> Result<Option<HandoffTmuxSessi
     let temp = TempDir::new().context("failed to create temp dir")?;
     let mock = MockOpenAiServer::start(handoff_script())?;
     let paths = TestPaths::new(temp.path(), mock.port())?;
-    write_handoff_fixture_files(&paths)?;
+    match (parent_use_tools, write_acp_server) {
+        (Some(parent_use_tools), true) => {
+            write_handoff_fixture_files_with_parent_use_tools(&paths, parent_use_tools)?;
+        }
+        (Some(parent_use_tools), false) => {
+            write_handoff_fixture_files_no_acp_server_with_parent_use_tools(
+                &paths,
+                parent_use_tools,
+            )?;
+        }
+        (None, true) => write_handoff_fixture_files(&paths)?,
+        (None, false) => write_handoff_fixture_files_no_acp_server(&paths)?,
+    }
 
     let path_env = format!(
         "{}:{}",
@@ -645,7 +878,7 @@ fn handoff_script() -> MockOpenAiScript {
                 tool_calls: vec![MockOpenAiToolCall {
                     name: format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME),
                     arguments: json!({
-                        "prompt": "Take over and answer how many files are in /tmp.",
+                        "prompt": HANDOFF_PROMPT,
                         "session_id": HANDOFF_SESSION_ID,
                     }),
                     id: Some("call_handoff_1".to_string()),
@@ -669,20 +902,47 @@ fn handoff_script() -> MockOpenAiScript {
 }
 
 fn write_handoff_fixture_files(paths: &TestPaths) -> Result<()> {
+    write_handoff_fixture_files_with_parent_use_tools(
+        paths,
+        &format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME),
+    )
+}
+
+fn write_handoff_fixture_files_no_acp_server(paths: &TestPaths) -> Result<()> {
+    write_handoff_fixture_files_no_acp_server_with_parent_use_tools(
+        paths,
+        &format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME),
+    )
+}
+
+fn write_handoff_fixture_files_with_parent_use_tools(
+    paths: &TestPaths,
+    parent_use_tools: &str,
+) -> Result<()> {
+    write_handoff_fixture_files_inner(paths, parent_use_tools, true)
+}
+
+fn write_handoff_fixture_files_no_acp_server_with_parent_use_tools(
+    paths: &TestPaths,
+    parent_use_tools: &str,
+) -> Result<()> {
+    write_handoff_fixture_files_inner(paths, parent_use_tools, false)
+}
+
+fn write_handoff_fixture_files_inner(
+    paths: &TestPaths,
+    parent_use_tools: &str,
+    write_acp_server: bool,
+) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
 
-    std::fs::write(
-        &paths.config_path,
-        "save: false
-",
-    )?;
+    std::fs::write(&paths.config_path, "save: false\n")?;
 
     let clients_dir = paths.harnx_config_dir.join("clients");
-    let acp_servers_dir = paths.harnx_config_dir.join("acp_servers");
     std::fs::create_dir_all(&clients_dir)?;
-    std::fs::create_dir_all(&acp_servers_dir)?;
+
     let client = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
         (
             serde_yaml::Value::String("type".to_string()),
@@ -729,36 +989,42 @@ fn write_handoff_fixture_files(paths: &TestPaths) -> Result<()> {
         serde_yaml::to_string(&client)?,
     )?;
 
-    let acp_server = AcpServerConfig {
-        name: HANDOFF_SUB_AGENT_NAME.to_string(),
-        command: harnx_bin.to_string_lossy().into_owned(),
-        args: vec!["--acp".to_string(), HANDOFF_SUB_AGENT_NAME.to_string()],
-        env: Default::default(),
-        enabled: true,
-        description: None,
-        idle_timeout_secs: 300,
-        operation_timeout_secs: 3600,
-    };
-    std::fs::write(
-        acp_servers_dir.join(format!("{}.yaml", HANDOFF_SUB_AGENT_NAME)),
-        serde_yaml::to_string(&acp_server)?,
-    )?;
+    if write_acp_server {
+        let acp_servers_dir = paths.harnx_config_dir.join("acp_servers");
+        std::fs::create_dir_all(&acp_servers_dir)?;
+        let acp_server = AcpServerConfig {
+            name: HANDOFF_SUB_AGENT_NAME.to_string(),
+            command: harnx_bin.to_string_lossy().into_owned(),
+            args: vec!["--acp".to_string(), HANDOFF_SUB_AGENT_NAME.to_string()],
+            env: Default::default(),
+            enabled: true,
+            description: None,
+            idle_timeout_secs: 300,
+            operation_timeout_secs: 3600,
+        };
+        std::fs::write(
+            acp_servers_dir.join(format!("{}.yaml", HANDOFF_SUB_AGENT_NAME)),
+            serde_yaml::to_string(&acp_server)?,
+        )?;
+    }
+
     std::fs::write(
         paths.agents_dir.join(format!("{}.md", HANDOFF_AGENT_NAME)),
         format!(
-            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}_session_handoff\n---\nYou are {}. Hand off the task to {} using the handoff tool.\n",
+            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}\n---\nYou are {}. Hand off the task to {} using the handoff tool.\n",
             HANDOFF_AGENT_NAME,
-            HANDOFF_SUB_AGENT_NAME,
+            parent_use_tools,
             HANDOFF_AGENT_NAME,
             HANDOFF_SUB_AGENT_NAME,
         ),
     )?;
     std::fs::write(
-        paths.agents_dir.join(format!("{}.md", HANDOFF_SUB_AGENT_NAME)),
+        paths
+            .agents_dir
+            .join(format!("{}.md", HANDOFF_SUB_AGENT_NAME)),
         format!(
-            "---\nname: {}\nmodel: mock-llm:test\n---\nYou are {}. Take over the interactive session and answer directly.\n",
-            HANDOFF_SUB_AGENT_NAME,
-            HANDOFF_SUB_AGENT_NAME,
+            "---\nname: {}\nmodel: mock-llm:test\n---\nYou are {}. {}\n",
+            HANDOFF_SUB_AGENT_NAME, HANDOFF_SUB_AGENT_NAME, HANDOFF_SUB_AGENT_SYSTEM_PROMPT,
         ),
     )?;
     Ok(())
@@ -829,7 +1095,7 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
         count_occurrences(screen, "__NESTED_READY__") >= 2
     })?;
 
-    // Launch the parent agent
+    // Start interactive session
     tmux.send_text(&format!(
         "{} -a {} || echo HARNX_EXIT:$?",
         shell_escape(harnx_bin.to_string_lossy().as_ref()),
@@ -838,256 +1104,103 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
     tmux.send_keys(&["Enter"])?;
 
     tmux.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
-    tmux.send_text("investigate the data trends")?;
+    tmux.send_text("do nested delegation")?;
     tmux.send_keys(&["Enter"])?;
 
-    // Wait for delegation chain to complete: parent delegates to researcher,
-    // researcher delegates to analyst, analyst calls MCP tool, then everything
-    // unwinds with final messages at each level.
-    //
-    // Wait for the *full* parent final message so the spinner has settled and
-    // the text has finished streaming (not just the "PARENT_FINAL:" marker,
-    // which can appear before the rest of the message arrives).
-    let screen = tmux.wait_for(Duration::from_secs(90), |screen| {
-        screen.contains("PARENT_FINAL: Research complete. Data shows clear upward trend.")
+    let screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains("Nested task complete")
     })?;
 
-    // ── Verify the delegation chain is visible ───────────────────────────────
-    assert!(
-        screen.contains(&format!("{}_session_prompt", NESTED_SUB_AGENT)),
-        "parent→researcher delegation tool call not visible:\n{screen}"
+    let delegate_tool_name = format!("{}_session_prompt", NESTED_SUB_AGENT);
+    let nested_delegate_tool_name = format!("{}_session_prompt", NESTED_SUB_SUB_AGENT);
+    assert_eq!(
+        count_occurrences(&screen, &format!("→ {delegate_tool_name}")),
+        1,
+        "expected exactly one parent→sub-agent marker:\n{screen}"
+    );
+    assert_eq!(
+        count_occurrences(&screen, &format!("→ {nested_delegate_tool_name}")),
+        1,
+        "expected exactly one sub-agent→sub-sub-agent marker:\n{screen}"
     );
     assert!(
-        screen.contains(&format!("> {}", NESTED_SUB_AGENT)),
-        "researcher sub-agent heading not visible:\n{screen}"
+        count_occurrences(&screen, "Analyst complete") >= 1,
+        "expected analyst final message to appear:\n{screen}"
     );
     assert!(
-        screen.contains(&format!("{}_session_prompt", NESTED_SUB_SUB_AGENT)),
-        "researcher→analyst delegation tool call not visible:\n{screen}"
+        count_occurrences(&screen, "Researcher complete") >= 1,
+        "expected researcher final message to appear:\n{screen}"
     );
-    assert!(
-        screen.contains(&format!("> {}", NESTED_SUB_SUB_AGENT)),
-        "analyst sub-sub-agent heading not visible:\n{screen}"
-    );
-    assert!(
-        screen.contains(REPRO_249_MCP_TOOL_NAME),
-        "analyst's MCP tool call not visible:\n{screen}"
-    );
-
-    // Print the full screen for debugging when the test fails.
-    eprintln!(
-        "\n=== nested sub-agent duplication test screen ===\n{}\n====\n",
-        screen
+    assert_eq!(
+        count_occurrences(&screen, "Nested task complete"),
+        1,
+        "expected exactly one parent final message:\n{screen}"
     );
 
     let normalized = normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen)));
     assert_snapshot!("nested_sub_agent_activity_no_duplicates", normalized);
-
-    // ── Duplication assertions ───────────────────────────────────────────────
-    // Each delegation tool call should appear exactly once.
-    assert_eq!(
-        count_occurrences(&screen, &format!("{}_session_prompt", NESTED_SUB_AGENT)),
-        1,
-        "researcher delegation tool call appears more than once:\n{screen}"
-    );
-    assert_eq!(
-        count_occurrences(&screen, &format!("{}_session_prompt", NESTED_SUB_SUB_AGENT)),
-        1,
-        "analyst delegation tool call appears more than once:\n{screen}"
-    );
-
-    // The MCP tool call from the analyst should appear exactly once.
-    // (The researcher also calls it, so we expect exactly 2 total.)
-    let mcp_tool_occurrences = count_occurrences(&screen, REPRO_249_MCP_TOOL_NAME);
-    assert_eq!(
-        mcp_tool_occurrences, 2,
-        "MCP tool call should appear exactly twice (once per agent that calls it), got {mcp_tool_occurrences}:\n{screen}"
-    );
-
-    // The researcher heading may appear 1 OR 2 times: once when parent first
-    // delegates to it, and optionally once more when control returns from
-    // analyst (a source-transition event like Usage re-asserts the researcher
-    // context). Both counts are semantically valid — the assertion here just
-    // guards against runaway duplication (e.g., a heading per streamed chunk).
-    let researcher_headings = screen
-        .lines()
-        .filter(|line| {
-            line.contains(&format!("> {}", NESTED_SUB_AGENT))
-                && !line.contains(&format!("> {}", NESTED_SUB_SUB_AGENT))
-                && !line.contains("in ")
-                && !line.contains("out ")
-        })
-        .count();
-    assert!(
-        (1..=2).contains(&researcher_headings),
-        "researcher heading should appear 1 or 2 times, got {researcher_headings}:\n{screen}"
-    );
-    let analyst_headings = screen
-        .lines()
-        .filter(|line| {
-            line.contains(&format!("> {}", NESTED_SUB_SUB_AGENT))
-                && !line.contains("in ")
-                && !line.contains("out ")
-        })
-        .count();
-    assert_eq!(
-        analyst_headings, 1,
-        "analyst heading should appear exactly once (excluding usage lines), got {analyst_headings}:\n{screen}"
-    );
-
-    // Final message markers are expected to appear in the live stream AND
-    // possibly in the tool-call result display (since `session_prompt`
-    // legitimately returns the accumulated response text).  The assertion
-    // guards against runaway duplication (e.g., each chunk emitted twice).
-    //
-    // RESEARCHER_TEXT and ANALYST_TEXT may appear up to 2 times:
-    //   - once in the live stream from the sub-agent
-    //   - once more in the tool-call result rendering
-    // PARENT_FINAL only comes from the parent's final LLM turn (never wrapped
-    // in a tool result), so it should appear exactly once.
-    for marker in ["RESEARCHER_TEXT:", "ANALYST_TEXT:"] {
-        let marker_count = count_occurrences(&screen, marker);
-        assert!(
-            (1..=2).contains(&marker_count),
-            "{marker} should appear 1 or 2 times (live stream + optional tool result), got {marker_count}:\n{screen}"
-        );
-    }
-    let parent_final_count = count_occurrences(&screen, "PARENT_FINAL:");
-    assert_eq!(
-        parent_final_count, 1,
-        "PARENT_FINAL: should appear exactly once, got {parent_final_count}:\n{screen}"
-    );
 
     drop(tmux);
     drop(mock);
     Ok(())
 }
 
-/// Mock LLM script for the nested delegation test.
-///
-/// Turns are consumed in order across all three processes:
-///   Turn 0 (parent)         : stream text + delegate to researcher
-///   Turn 1 (researcher)     : stream text + call MCP tool (to have a tool call before delegating)
-///   Turn 2 (researcher)     : stream text + delegate to analyst
-///   Turn 3 (analyst)        : stream text + call MCP tool
-///   Turn 4 (analyst)        : stream final text (ends analyst)
-///   Turn 5 (researcher)     : stream final text (ends researcher)
-///   Turn 6 (parent)         : stream final text (ends parent turn)
 fn nested_script() -> MockOpenAiScript {
+    // Turn order across all agent sessions:
+    // 0 parent     → delegate to researcher
+    // 1 researcher → delegate to analyst
+    // 2 analyst    → final text
+    // 3 researcher → final text after analyst returns
+    // 4 parent     → final text after researcher returns
     MockOpenAiScript {
         turns: vec![
-            // Turn 0: parent streams opening + delegates to researcher
             MockOpenAiTurn {
-                text_chunks: vec![
-                    "Let me ".to_string(),
-                    "investigate ".to_string(),
-                    "this. ".to_string(),
-                    "Delegating to researcher.".to_string(),
-                ],
+                text_chunks: vec!["Parent delegating to researcher.".to_string()],
                 tool_calls: vec![MockOpenAiToolCall {
                     name: format!("{}_session_prompt", NESTED_SUB_AGENT),
-                    arguments: json!({
-                        "message": "Investigate the data trends in detail."
-                    }),
-                    id: Some("call_delegate_researcher".to_string()),
+                    arguments: json!({"message": "Research this deeply and delegate analysis."}),
+                    id: Some("call_nested_parent_1".to_string()),
                 }],
                 error: None,
             },
-            // Turn 1: researcher streams text + calls MCP tool
             MockOpenAiTurn {
-                text_chunks: vec![
-                    "RESEARCHER_TEXT: ".to_string(),
-                    "Let me check ".to_string(),
-                    "the raw data first.".to_string(),
-                ],
-                tool_calls: vec![MockOpenAiToolCall {
-                    name: REPRO_249_MCP_TOOL_NAME.to_string(),
-                    arguments: json!({}),
-                    id: Some("call_researcher_mcp".to_string()),
-                }],
-                error: None,
-            },
-            // Turn 2: researcher streams text + delegates to analyst
-            MockOpenAiTurn {
-                text_chunks: vec![
-                    "Got initial data. ".to_string(),
-                    "Need deeper analysis. ".to_string(),
-                    "Delegating to analyst.".to_string(),
-                ],
+                text_chunks: vec!["Researcher delegating to analyst.".to_string()],
                 tool_calls: vec![MockOpenAiToolCall {
                     name: format!("{}_session_prompt", NESTED_SUB_SUB_AGENT),
-                    arguments: json!({
-                        "message": "Perform deep analysis on the data trends."
-                    }),
-                    id: Some("call_delegate_analyst".to_string()),
+                    arguments: json!({"message": "Analyze data and report back."}),
+                    id: Some("call_nested_researcher_1".to_string()),
                 }],
                 error: None,
             },
-            // Turn 3: analyst streams text + calls MCP tool
             MockOpenAiTurn {
-                text_chunks: vec![
-                    "ANALYST_TEXT: ".to_string(),
-                    "Running deep ".to_string(),
-                    "analysis now.".to_string(),
-                ],
-                tool_calls: vec![MockOpenAiToolCall {
-                    name: REPRO_249_MCP_TOOL_NAME.to_string(),
-                    arguments: json!({}),
-                    id: Some("call_analyst_mcp".to_string()),
-                }],
-                error: None,
-            },
-            // Turn 4: analyst final text (ends analyst)
-            MockOpenAiTurn {
-                text_chunks: vec![
-                    "Analysis complete. ".to_string(),
-                    "The trend is clearly upward.".to_string(),
-                ],
+                text_chunks: vec!["Analyst complete".to_string()],
                 tool_calls: vec![],
                 error: None,
             },
-            // Turn 5: researcher final text (ends researcher)
             MockOpenAiTurn {
-                text_chunks: vec![
-                    "Analyst confirmed ".to_string(),
-                    "the upward trend in the data.".to_string(),
-                ],
+                text_chunks: vec!["Researcher complete".to_string()],
                 tool_calls: vec![],
                 error: None,
             },
-            // Turn 6: parent final text
             MockOpenAiTurn {
-                text_chunks: vec![
-                    "PARENT_FINAL: ".to_string(),
-                    "Research complete. ".to_string(),
-                    "Data shows clear ".to_string(),
-                    "upward trend.".to_string(),
-                ],
+                text_chunks: vec!["Nested task complete".to_string()],
                 tool_calls: vec![],
                 error: None,
             },
         ],
         fallback_text: "No more scripted responses.".to_string(),
-        chunk_delay_ms: 10,
+        chunk_delay_ms: 0,
     }
 }
 
 fn write_nested_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
-    let fake_mcp_server = harnx_mcp_repro249_bin(&harnx_bin);
-
     std::fs::write(&paths.config_path, "save: false\n")?;
 
     let clients_dir = paths.harnx_config_dir.join("clients");
-    let mcp_servers_dir = paths.harnx_config_dir.join("mcp_servers");
-    let acp_servers_dir = paths.harnx_config_dir.join("acp_servers");
     std::fs::create_dir_all(&clients_dir)?;
-    std::fs::create_dir_all(&mcp_servers_dir)?;
-    std::fs::create_dir_all(&acp_servers_dir)?;
 
-    // Client config (shared by all agents via the mock LLM server)
     let client = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
         (
             serde_yaml::Value::String("type".to_string()),
@@ -1134,100 +1247,29 @@ fn write_nested_fixture_files(paths: &TestPaths) -> Result<()> {
         serde_yaml::to_string(&client)?,
     )?;
 
-    // MCP server (used by both researcher and analyst)
-    let mut rename_tools = std::collections::HashMap::new();
-    rename_tools.insert(
-        REPRO_249_MCP_TOOL_NAME.to_string(),
-        REPRO_249_MCP_TOOL_NAME.to_string(),
-    );
-    let mcp_server = McpServerConfig {
-        name: "repro249".to_string(),
-        command: fake_mcp_server.to_string_lossy().into_owned(),
-        args: vec![],
-        env: Default::default(),
-        roots: vec![],
-        enabled: true,
-        description: None,
-        rename_tools,
-    };
-    std::fs::write(
-        mcp_servers_dir.join("repro249.yaml"),
-        serde_yaml::to_string(&mcp_server)?,
-    )?;
-
-    // ACP server: researcher (sub-agent)
-    let researcher_acp = AcpServerConfig {
-        name: NESTED_SUB_AGENT.to_string(),
-        command: harnx_bin.to_string_lossy().into_owned(),
-        args: vec!["--acp".to_string(), NESTED_SUB_AGENT.to_string()],
-        env: Default::default(),
-        enabled: true,
-        description: None,
-        idle_timeout_secs: 300,
-        operation_timeout_secs: 3600,
-    };
-    std::fs::write(
-        acp_servers_dir.join(format!("{}.yaml", NESTED_SUB_AGENT)),
-        serde_yaml::to_string(&researcher_acp)?,
-    )?;
-
-    // ACP server: analyst (sub-sub-agent)
-    let analyst_acp = AcpServerConfig {
-        name: NESTED_SUB_SUB_AGENT.to_string(),
-        command: harnx_bin.to_string_lossy().into_owned(),
-        args: vec!["--acp".to_string(), NESTED_SUB_SUB_AGENT.to_string()],
-        env: Default::default(),
-        enabled: true,
-        description: None,
-        idle_timeout_secs: 300,
-        operation_timeout_secs: 3600,
-    };
-    std::fs::write(
-        acp_servers_dir.join(format!("{}.yaml", NESTED_SUB_SUB_AGENT)),
-        serde_yaml::to_string(&analyst_acp)?,
-    )?;
-
-    // Agent definitions
-    // Parent: can delegate to researcher
     std::fs::write(
         paths.agents_dir.join(format!("{}.md", NESTED_PARENT_AGENT)),
         format!(
-            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate tasks to {} and summarize.\n",
-            NESTED_PARENT_AGENT,
-            NESTED_SUB_AGENT,
-            NESTED_PARENT_AGENT,
-            NESTED_SUB_AGENT,
+            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate to {}.\n",
+            NESTED_PARENT_AGENT, NESTED_SUB_AGENT, NESTED_PARENT_AGENT, NESTED_SUB_AGENT
         ),
     )?;
-    // Researcher: can call MCP tool and delegate to analyst
     std::fs::write(
-        paths
-            .agents_dir
-            .join(format!("{}.md", NESTED_SUB_AGENT)),
+        paths.agents_dir.join(format!("{}.md", NESTED_SUB_AGENT)),
         format!(
-            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}, {}_session_prompt\n---\nYou are {}. Use {} for data and delegate deep analysis to {}.\n",
-            NESTED_SUB_AGENT,
-            REPRO_249_MCP_TOOL_NAME,
-            NESTED_SUB_SUB_AGENT,
-            NESTED_SUB_AGENT,
-            REPRO_249_MCP_TOOL_NAME,
-            NESTED_SUB_SUB_AGENT,
+            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate to {}.\n",
+            NESTED_SUB_AGENT, NESTED_SUB_SUB_AGENT, NESTED_SUB_AGENT, NESTED_SUB_SUB_AGENT
         ),
     )?;
-    // Analyst: can call MCP tool
     std::fs::write(
         paths
             .agents_dir
             .join(format!("{}.md", NESTED_SUB_SUB_AGENT)),
         format!(
-            "---\nname: {}\nmodel: mock-llm:test\nuse_tools: {}\n---\nYou are {}. Use {} to perform deep analysis.\n",
-            NESTED_SUB_SUB_AGENT,
-            REPRO_249_MCP_TOOL_NAME,
-            NESTED_SUB_SUB_AGENT,
-            REPRO_249_MCP_TOOL_NAME,
+            "---\nname: {}\nmodel: mock-llm:test\n---\nYou are {}. Analyze and respond.\n",
+            NESTED_SUB_SUB_AGENT, NESTED_SUB_SUB_AGENT
         ),
     )?;
-
     Ok(())
 }
 

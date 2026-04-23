@@ -9,9 +9,7 @@
 use anyhow::{anyhow, bail, Result};
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
-use harnx_core::tool::{
-    SwitchAgentData, ToolCall, ToolError, ToolProvider, ToolResult, TRIGGER_AGENT_TOOL_NAME,
-};
+use harnx_core::tool::{SwitchAgentData, ToolCall, ToolError, ToolProvider, ToolResult};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::future::Future;
@@ -227,23 +225,6 @@ fn eval_tool_call_mcp(
 
     // Emit tool call info to TUI or terminal
     (ctx.emit_tool_call_fn)(call, &json_data);
-
-    if call.name == TRIGGER_AGENT_TOOL_NAME {
-        let agent = json_data["agent"].as_str().ok_or_else(|| {
-            ToolError::Recoverable(anyhow!("Missing 'agent' argument for trigger_agent"))
-        })?;
-        let prompt = json_data["prompt"].as_str().ok_or_else(|| {
-            ToolError::Recoverable(anyhow!("Missing 'prompt' argument for trigger_agent"))
-        })?;
-
-        return Ok(json!({
-            "status": "success",
-            "message": format!("Transferring session to agent '{}'...", agent),
-            "action": "switch_agent",
-            "agent": agent,
-            "prompt": prompt
-        }));
-    }
 
     let allowed_tool_names = &ctx.allowed_tool_names;
 

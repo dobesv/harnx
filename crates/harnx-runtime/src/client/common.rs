@@ -13,7 +13,7 @@ use super::*;
 
 use crate::{
     config::{Config, GlobalConfig, Input},
-    tool::{eval_tool_calls, ToolResult},
+    tool::ToolCall,
     utils::*,
 };
 
@@ -107,12 +107,7 @@ pub async fn call_chat_completions(
     client: &dyn Client,
     config: &GlobalConfig,
     abort_signal: AbortSignal,
-) -> Result<(
-    String,
-    Option<String>,
-    Vec<ToolResult>,
-    CompletionTokenUsage,
-)> {
+) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)> {
     let spinner_message = spinner_label(config);
     // Snapshot the config values we need into owned storage so the ctx
     // reference can live across the .await without holding the RwLock.
@@ -166,12 +161,7 @@ pub async fn call_chat_completions(
                     config.read().print_markdown(&text)?;
                 }
             }
-            let tool_results = eval_tool_calls(
-                &crate::tool::build_tool_eval_context(config),
-                tool_calls,
-                &abort_signal,
-            )?;
-            Ok((text, thought, tool_results, usage))
+            Ok((text, thought, tool_calls, usage))
         }
         Err(err) => Err(err),
     }
@@ -182,12 +172,7 @@ pub async fn call_chat_completions_streaming(
     client: &dyn Client,
     config: &GlobalConfig,
     abort_signal: AbortSignal,
-) -> Result<(
-    String,
-    Option<String>,
-    Vec<ToolResult>,
-    CompletionTokenUsage,
-)> {
+) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)> {
     let (dry_run, user_agent) = {
         let cfg = config.read();
         (cfg.dry_run, cfg.user_agent.clone())
@@ -257,18 +242,8 @@ pub async fn call_chat_completions_streaming(
     }
 
     let (text, thought, tool_calls, usage, _aborted) = engine_ret?;
-
-    let tool_results = if tool_calls.is_empty() {
-        vec![]
-    } else {
-        eval_tool_calls(
-            &crate::tool::build_tool_eval_context(config),
-            tool_calls,
-            &abort_signal,
-        )?
-    };
-
-    Ok((text, thought, tool_results, usage))
+    let _ = abort_signal;
+    Ok((text, thought, tool_calls, usage))
 }
 
 pub async fn create_config(
