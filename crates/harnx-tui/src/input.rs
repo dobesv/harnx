@@ -83,13 +83,14 @@ impl Tui {
                 self.app.should_quit = true;
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                // Abort current operation; reset signal so next submit works (fix #3)
+                // Abort current operation; the signal is reset before the next submit (see below).
                 self.abort_signal.set_ctrlc();
                 self.app.transcript.push(TranscriptItem::SystemText(
                     "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
                 ));
                 self.app.llm_busy = false;
-                self.abort_signal.reset();
+                self.app.pending_message = None;
+                *self.shared_pending_message.lock().await = None;
             }
             (KeyCode::Up, KeyModifiers::NONE) => {
                 self.handle_up_key(key);

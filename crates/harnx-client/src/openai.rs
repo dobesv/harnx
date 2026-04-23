@@ -243,6 +243,9 @@ pub async fn openai_chat_completions_streaming(
 ) -> Result<()> {
     let mut state = OpenAiStreamState::default();
     let handle = |message: SseMmessage| -> Result<bool> {
+        if handler.aborted() {
+            return Ok(true);
+        }
         if message.data == "[DONE]" {
             openai_emit_pending_tool_call(&mut state, handler)?;
             return Ok(true);

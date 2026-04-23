@@ -53,6 +53,7 @@ use reqwest::Client as ReqwestClient;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone)]
 pub enum MockResponseEvent {
@@ -60,13 +61,22 @@ pub enum MockResponseEvent {
     Text(String),
     /// A tool call to include in the response.
     ToolCall(ToolCall),
+    /// Block streaming until test releases gate.
+    Gate {
+        reached: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     /// Return an error during streaming (for testing error scenarios).
     /// Uses `Arc<Error>` since `anyhow::Error` is not `Clone`.
     Error(Arc<anyhow::Error>),
 }
 
 impl MockResponseEvent {
-    fn apply(&self, handler: &mut SseHandler, output: &mut ChatCompletionsOutput) -> Result<()> {
+    async fn apply(
+        &self,
+        handler: &mut SseHandler,
+        output: &mut ChatCompletionsOutput,
+    ) -> Result<()> {
         match self {
             Self::Text(text) => {
                 handler.text(text)?;
@@ -75,6 +85,10 @@ impl MockResponseEvent {
             Self::ToolCall(tool_call) => {
                 handler.tool_call(tool_call.clone())?;
                 output.tool_calls.push(tool_call.clone());
+            }
+            Self::Gate { reached, release } => {
+                reached.notify_one();
+                release.notified().await;
             }
             Self::Error(err) => {
                 // Try to downcast to a concrete error type that implements Clone.
@@ -136,6 +150,7 @@ impl MockTurn {
             match event {
                 MockResponseEvent::Text(text) => output.text.push_str(text),
                 MockResponseEvent::ToolCall(tool_call) => output.tool_calls.push(tool_call.clone()),
+                MockResponseEvent::Gate { .. } => {}
                 MockResponseEvent::Error(err) => {
                     if let Some(llm_err) = err.downcast_ref::<crate::client::LlmError>() {
                         return Err(crate::client::LlmError {
@@ -212,6 +227,14 @@ impl MockTurnBuilder {
                 Some(id.into()),
                 None,
             )));
+        self
+    }
+
+    /// Add blocking gate to pause streaming until test releases it.
+    pub fn add_gate(mut self, reached: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.turn
+            .events
+            .push(MockResponseEvent::Gate { reached, release });
         self
     }
 
@@ -335,7 +358,13 @@ impl Client for MockClient {
         let turn = self.next_turn(data)?;
         let mut result = Ok(());
         for event in turn.events() {
-            if let Err(e) = event.apply(handler, &mut ChatCompletionsOutput::default()) {
+            if handler.abort().aborted() {
+                break;
+            }
+            if let Err(e) = event
+                .apply(handler, &mut ChatCompletionsOutput::default())
+                .await
+            {
                 result = Err(e);
                 break;
             }

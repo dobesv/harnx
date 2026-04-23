@@ -316,6 +316,9 @@ async fn chat_completions_streaming(
     let mut buffer = BytesMut::new();
     let mut decoder = MessageFrameDecoder::new();
     while let Some(chunk) = stream.next().await {
+        if handler.aborted() {
+            break;
+        }
         let chunk = chunk?;
         buffer.extend_from_slice(&chunk);
         while let DecodedFrame::Complete(message) = decoder.decode_frame(&mut buffer)? {
