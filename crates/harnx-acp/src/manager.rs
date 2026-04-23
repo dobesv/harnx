@@ -356,13 +356,10 @@ fn optional_string<'a>(
 /// CLI, TuiAgentEventSink for TUI, NullSink for tests). Each incoming
 /// chunk temporarily pauses the spinner, emits an AgentEvent preserving
 /// the sub-agent source, then restores the spinner.
-/// `_allow_fallback_print` is kept in the signature for call-site
-/// compatibility but is no longer used — sinks own display.
 pub async fn forward_acp_chunks(
     mut chunk_rx: UnboundedReceiver<NestedAcpEvent>,
     spinner: Option<Spinner>,
     spinner_msg: String,
-    _allow_fallback_print: bool,
 ) {
     use harnx_core::event::{AgentEvent, NoticeEvent};
     use harnx_core::sink::emit_agent_event_with_source;
@@ -420,12 +417,7 @@ impl ToolProvider for AcpManager {
         // Forward chunks either to TUI output sink or stdout.
         let spinner_clone = spinner.clone();
         let spinner_msg = format!("  {} working…", tool_name);
-        let forward_handle = tokio::spawn(forward_acp_chunks(
-            chunk_rx,
-            spinner_clone,
-            spinner_msg,
-            is_terminal,
-        ));
+        let forward_handle = tokio::spawn(forward_acp_chunks(chunk_rx, spinner_clone, spinner_msg));
 
         // Race the sub-agent call against our abort_signal so Ctrl-C
         // interrupts nested ACP delegations the same way it interrupts
@@ -720,7 +712,7 @@ enabled: false
             .unwrap();
         drop(tx);
 
-        forward_acp_chunks(rx, None, "test".to_string(), false).await;
+        forward_acp_chunks(rx, None, "test".to_string()).await;
 
         let events = sink.events.lock().unwrap();
         assert_eq!(events.len(), 2);
