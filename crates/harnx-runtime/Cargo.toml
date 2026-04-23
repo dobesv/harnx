@@ -53,6 +53,7 @@ serde_yaml = { workspace = true }
 shell-words = { workspace = true }
 shellexpand = { workspace = true }
 simplelog = { workspace = true }
+time = { workspace = true }
 syntect = { workspace = true }
 sys-locale = { workspace = true }
 terminal-colorsaurus = { workspace = true }

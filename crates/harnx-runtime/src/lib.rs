@@ -10,6 +10,7 @@
 #[macro_use]
 extern crate log;
 
+pub mod bootstrap;
 pub mod client;
 pub mod commands;
 pub mod config;

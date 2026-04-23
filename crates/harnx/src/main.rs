@@ -18,8 +18,8 @@ pub use harnx_tui as tui;
 use crate::cli::Cli;
 use crate::client::{list_models, retry::call_with_retry_and_fallback, ModelType};
 use crate::config::{
-    ensure_parent_exists, list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
-    WorkingMode, TEMP_SESSION_NAME,
+    list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input, WorkingMode,
+    TEMP_SESSION_NAME,
 };
 use crate::tui::Tui;
 use harnx_hooks::{
@@ -33,7 +33,6 @@ use harnx_runtime::utils::*;
 use anyhow::{bail, Result};
 use clap::Parser;
 use parking_lot::RwLock;
-use simplelog::{format_description, ConfigBuilder, LevelFilter, SimpleLogger, WriteLogger};
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 #[tokio::main]
@@ -602,35 +601,4 @@ async fn create_input(
     Ok(input)
 }
 
-fn setup_logger(is_serve: bool) -> Result<()> {
-    let (log_level, log_path) = Config::log_config(is_serve)?;
-    if log_level == LevelFilter::Off {
-        return Ok(());
-    }
-    let crate_name = env!("CARGO_CRATE_NAME");
-    let log_filter = match std::env::var(get_env_name("log_filter")) {
-        Ok(v) => v,
-        Err(_) => match is_serve {
-            true => format!("{crate_name}::serve"),
-            false => crate_name.into(),
-        },
-    };
-    let config = ConfigBuilder::new()
-        .add_filter_allow(log_filter)
-        .set_time_format_custom(format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-        ))
-        .set_thread_level(LevelFilter::Off)
-        .build();
-    match log_path {
-        None => {
-            SimpleLogger::init(log_level, config)?;
-        }
-        Some(log_path) => {
-            ensure_parent_exists(&log_path)?;
-            let log_file = std::fs::File::create(log_path)?;
-            WriteLogger::init(log_level, config, log_file)?;
-        }
-    }
-    Ok(())
-}
+use harnx_runtime::bootstrap::setup_logger;
