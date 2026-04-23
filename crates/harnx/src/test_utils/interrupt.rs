@@ -3,10 +3,10 @@
 //! This module is compiled only under `cfg(test)` via `src/test_utils/mod.rs`.
 //! It intentionally does not expose anything outside the crate.
 
-use crate::acp::AcpServerConfig;
 use crate::test_utils::mock_openai_server::{MockOpenAiScript, MockOpenAiTurn};
 use crate::test_utils::tmux_harness::TmuxHarness;
 use anyhow::{Context, Result};
+use harnx_acp::AcpServerConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -375,7 +375,7 @@ pub async fn spawn_acp_client(
     paths: &ConfigPaths,
     harnx_bin: &Path,
     agent: &str,
-) -> Result<crate::acp::AcpClient> {
+) -> Result<harnx_acp::AcpClient> {
     let mut env = HashMap::new();
     env.insert(
         "HARNX_CONFIG_DIR".to_string(),
@@ -391,7 +391,7 @@ pub async fn spawn_acp_client(
         idle_timeout_secs: 300,
         operation_timeout_secs: 60,
     };
-    let client = crate::acp::AcpClient::new(config);
+    let client = harnx_acp::AcpClient::new(config);
     client
         .connect()
         .await

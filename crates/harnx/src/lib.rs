@@ -1,4 +1,3 @@
-pub mod acp;
 pub mod agent_event_sink;
 pub mod cli;
 pub mod cli_event_sink;

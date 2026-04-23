@@ -1,9 +1,9 @@
-use harnx::acp::AcpServerConfig;
 use harnx::mcp::McpServerConfig;
 use harnx::test_utils::{
     harnx_mcp_repro249_bin, MockOpenAiError, MockOpenAiScript, MockOpenAiServer,
     MockOpenAiToolCall, MockOpenAiTurn, TmuxHarness,
 };
+use harnx_acp::AcpServerConfig;
 
 use anyhow::{Context, Result};
 use insta::assert_snapshot;

@@ -1,4 +1,3 @@
-mod acp;
 mod agent_event_sink;
 mod cli;
 mod cli_event_sink;
