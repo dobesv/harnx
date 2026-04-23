@@ -6,4 +6,5 @@
 // (interrupt.rs), but not by the harnx binary itself — hence the allow.
 #[allow(unused_imports)]
 pub use harnx_acp::{AcpClient, AcpManager, AcpServerConfig};
+#[allow(unused_imports)]
 pub use harnx_acp_server::HarnxAgent;

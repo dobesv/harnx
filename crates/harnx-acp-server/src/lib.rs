@@ -6,6 +6,10 @@
 #[macro_use]
 extern crate log;
 
+mod server_main;
+
+pub use server_main::run;
+
 #[cfg(test)]
 mod test_regression_issue_68;
 
