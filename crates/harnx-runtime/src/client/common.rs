@@ -202,7 +202,7 @@ pub async fn call_chat_completions_streaming(
     if dry_run {
         let content = crate::config::input::echo_messages(input, config);
         if !content.is_empty() {
-            println!("{content}");
+            crate::utils::emit_info(content.clone());
         }
         return Ok((content, None, vec![], CompletionTokenUsage::default()));
     }
@@ -394,7 +394,7 @@ async fn set_client_models_config(client_config: &mut Value, client: &str) -> Re
                     .prompt()?;
             }
             Err(err) => {
-                eprintln!("✗ Fetch models failed: {err}");
+                crate::utils::emit_warning(format!("✗ Fetch models failed: {err}"));
             }
         }
     }

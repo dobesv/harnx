@@ -363,10 +363,10 @@ pub async fn run_command_with_output(
                 Some(("disconnect", name)) => {
                     let name = name.map(|n| n.trim()).unwrap_or("");
                     if name.is_empty() {
-                        println!("Usage: .mcp disconnect <server>");
+                        crate::utils::emit_info("Usage: .mcp disconnect <server>".to_string());
                     } else {
                         Config::mcp_disconnect_server(config, name).await?;
-                        println!("Disconnected from MCP server '{}'", name);
+                        crate::utils::emit_info(format!("Disconnected from MCP server '{name}'"));
                     }
                 }
                 Some(("tools", name)) => {
@@ -483,7 +483,7 @@ Commands:
                     )
                     .await?;
                 }
-                None => println!(
+                None => crate::utils::emit_info(
                     r#"Usage: .file <file|dir|url|cmd|loader:resource|%%>... [-- <text>...]
 
 .file /tmp/file.txt
@@ -493,6 +493,7 @@ Commands:
 .file `git diff` -- Generate git commit message
 .file jina:https://example.com
 .file %% -- translate last reply to english"#
+                        .to_string(),
                 ),
             },
             ".continue" => {
@@ -809,10 +810,8 @@ async fn ask_inner(
         &usage,
     )?;
     if tool_results.is_empty() {
-        if !config.read().macro_flag {
-            eprintln!();
-        }
         let config_read = config.read();
+        let macro_flag = config_read.macro_flag;
         let status = config_read.render_status_line(true);
         let session_usage = config_read
             .session
@@ -831,6 +830,7 @@ async fn ask_inner(
                 }
             })
             .unwrap_or_default();
+        drop(config_read);
         let mut line_parts = vec![];
         if !status.is_empty() {
             line_parts.push(status);
@@ -842,9 +842,9 @@ async fn ask_inner(
             line_parts.push(format!("  {}", context_stats));
         }
         if !line_parts.is_empty() {
-            eprintln!("{}", dimmed_text(&line_parts.join("")));
+            let prefix = if macro_flag { "" } else { "\n" };
+            crate::utils::emit_info(format!("{prefix}{}", dimmed_text(&line_parts.join(""))));
         }
-        drop(config_read);
     }
     let stop_outcome = if tool_results.is_empty() {
         let event = HookEvent::Stop {

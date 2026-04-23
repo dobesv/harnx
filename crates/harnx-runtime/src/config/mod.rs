@@ -468,14 +468,13 @@ impl Config {
             let editor = this.editor()?;
             edit_file(&editor, &config_path)
         })?;
-        println!(
-            "NOTE: Remember to restart {} if there are changes made.\nConfig files:\n  {}\n  {}/\n  {}/\n  {}/",
-            env!("CARGO_CRATE_NAME"),
+        crate::utils::emit_info(format!(
+            "NOTE: Remember to restart harnx if there are changes made.\nConfig files:\n  {}\n  {}/\n  {}/\n  {}/",
             config_path.display(),
             Self::clients_dir().display(),
             Self::mcp_servers_dir().display(),
             Self::acp_servers_dir().display(),
-        );
+        ));
         Ok(())
     }
 
@@ -772,7 +771,7 @@ impl Config {
                 }
             }
         }
-        println!("✓ Successfully deleted {kind}.");
+        crate::utils::emit_info(format!("✓ Successfully deleted {kind}."));
         Ok(())
     }
 
@@ -2160,7 +2159,7 @@ impl Config {
         let content = abortable_run_with_spinner(fetch(url), "Fetching models.yaml", abort_signal)
             .await
             .with_context(|| format!("Failed to fetch '{url}'"))?;
-        println!("✓ Fetched '{url}'");
+        crate::utils::emit_info(format!("✓ Fetched '{url}'"));
         let list = serde_yaml::from_str::<Vec<ProviderModels>>(&content)
             .with_context(|| "Failed to parse models.yaml")?;
         let models_override = ModelsOverride {
@@ -2174,7 +2173,7 @@ impl Config {
         ensure_parent_exists(&model_override_path)?;
         std::fs::write(&model_override_path, models_override_data)
             .with_context(|| format!("Failed to write to '{}'", model_override_path.display()))?;
-        println!("✓ Updated '{}'", model_override_path.display());
+        crate::utils::emit_info(format!("✓ Updated '{}'", model_override_path.display()));
         Ok(())
     }
 
@@ -2257,13 +2256,14 @@ impl Config {
     }
 
     pub fn print_markdown(&self, text: &str) -> Result<()> {
-        if *IS_STDOUT_TERMINAL {
+        let rendered = if *IS_STDOUT_TERMINAL {
             let render_options = self.render_options()?;
             let mut markdown_render = MarkdownRender::init(render_options)?;
-            println!("{}", markdown_render.render(text));
+            markdown_render.render(text)
         } else {
-            println!("{text}");
-        }
+            text.to_string()
+        };
+        crate::utils::emit_info(rendered);
         Ok(())
     }
 
@@ -2964,7 +2964,7 @@ pub async fn macro_execute(
     let mut pending_async_context = None;
     for step in &macro_value.steps {
         let command = Macro::interpolate_command(step, &variables);
-        println!(">> {}", multiline_text(&command));
+        crate::utils::emit_info(format!(">> {}", multiline_text(&command)));
         run_command(
             &config,
             abort_signal.clone(),
@@ -3036,8 +3036,14 @@ async fn create_config_file(config_path: &Path) -> Result<()> {
         tokio::fs::set_permissions(&client_path, perms).await?;
     }
 
-    println!("✓ Saved the config file to '{}'.", config_path.display());
-    println!("✓ Saved the client config to '{}'.", client_path.display());
+    crate::utils::emit_info(format!(
+        "✓ Saved the config file to '{}'.",
+        config_path.display()
+    ));
+    crate::utils::emit_info(format!(
+        "✓ Saved the client config to '{}'.",
+        client_path.display()
+    ));
 
     Ok(())
 }
