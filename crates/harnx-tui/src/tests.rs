@@ -3157,3 +3157,223 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
 
     harness.drain_and_settle().await.unwrap();
 }
+
+// ── History preview mode tests (issue #281) ──────────────────────────────────
+
+/// Create a `Tui` pre-seeded with history entries for history-preview tests.
+/// Entries are given newest-first: index 0 will be the most-recent entry.
+fn make_tui_with_history(entries: &[&str]) -> (crate::types::Tui, GlobalConfig) {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    for entry in entries.iter().rev() {
+        tui.app.history.insert(0, entry.to_string());
+    }
+    (tui, config)
+}
+
+/// Blank input + Up → enters preview mode, shows most-recent history entry.
+#[tokio::test]
+async fn history_up_on_blank_enters_preview() {
+    let (mut tui, _config) = make_tui_with_history(&["first message", "second message"]);
+
+    tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.history_preview, "should be in preview mode");
+    assert_eq!(tui.app.history_index, Some(0));
+    assert_eq!(
+        tui.app.input.lines().join("\n"),
+        "first message",
+        "input should show most-recent history entry"
+    );
+}
+
+/// Blank input + Up with empty history → no preview mode, no-op.
+#[tokio::test]
+async fn history_up_on_blank_empty_history_no_preview() {
+    let (mut tui, _config) = make_tui_with_history(&[]);
+
+    tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        !tui.app.history_preview,
+        "should NOT enter preview with empty history"
+    );
+    assert_eq!(tui.app.history_index, None);
+    assert_eq!(tui.app.input.lines().join("\n"), "");
+}
+
+/// Up twice navigates to the older entry (index 1).
+#[tokio::test]
+async fn history_up_up_navigates_older() {
+    let (mut tui, _config) = make_tui_with_history(&["first message", "second message"]);
+
+    tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.history_preview, "should still be in preview mode");
+    assert_eq!(tui.app.history_index, Some(1));
+    assert_eq!(
+        tui.app.input.lines().join("\n"),
+        "second message",
+        "input should show older history entry"
+    );
+}
+
+/// Up then Down → preview exits, draft restored.
+#[tokio::test]
+async fn history_down_returns_to_draft() {
+    let (mut tui, _config) = make_tui_with_history(&["first message"]);
+
+    // Start with blank input and press Up to enter preview mode.
+    // history_prev() saves the current input ("") into history_draft.
+    tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(tui.app.history_preview, "should be in preview after Up");
+    assert_eq!(tui.app.input.lines().join("\n"), "first message");
+
+    // Simulate that the user had typed a draft before navigating — overwrite
+    // history_draft directly so Down will restore it.
+    tui.app.history_draft = "my draft".to_string();
+
+    // Down returns to draft
+    tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(!tui.app.history_preview, "preview should be exited");
+    assert_eq!(tui.app.history_index, None);
+    assert_eq!(
+        tui.app.input.lines().join("\n"),
+        "my draft",
+        "draft should be restored"
+    );
+}
+
+/// While in preview, pressing a char exits preview and appends char to input.
+#[tokio::test]
+async fn history_typing_exits_preview() {
+    let (mut tui, _config) = make_tui_with_history(&["hello"]);
+
+    // Enter preview
+    tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(tui.app.history_preview);
+
+    // Type a character
+    tui.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(!tui.app.history_preview, "preview should be exited");
+    assert_eq!(tui.app.history_index, None);
+    // Content preserved + char appended
+    let content = tui.app.input.lines().join("\n");
+    assert!(
+        content.contains("hello"),
+        "history content should be preserved: {content}"
+    );
+    assert!(
+        content.contains('!'),
+        "typed char should be appended: {content}"
+    );
+}
+
+/// Non-blank input + Up (not in preview) → cursor moves up in textarea, no history change.
+#[tokio::test]
+async fn history_up_not_blank_moves_cursor() {
+    let (mut tui, _config) = make_tui_with_history(&["old message"]);
+
+    // Set multi-line draft (cursor ends at bottom)
+    tui.set_input_text("hello\nworld");
+
+    tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        !tui.app.history_preview,
+        "should NOT enter preview with non-blank input"
+    );
+    assert_eq!(
+        tui.app.history_index, None,
+        "history index should not change"
+    );
+    // Input text unchanged
+    assert_eq!(tui.app.input.lines().join("\n"), "hello\nworld");
+}
+
+/// Non-blank input + Down (not in preview) → cursor moves down, no history change.
+#[tokio::test]
+async fn history_down_not_preview_moves_cursor() {
+    let (mut tui, _config) = make_tui_with_history(&["old message"]);
+
+    // Set multi-line draft
+    tui.set_input_text("hello\nworld");
+
+    tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(!tui.app.history_preview, "should NOT enter preview");
+    assert_eq!(
+        tui.app.history_index, None,
+        "history index should not change"
+    );
+    assert_eq!(tui.app.input.lines().join("\n"), "hello\nworld");
+}
+
+/// While in preview, paste exits preview.
+#[tokio::test]
+async fn history_paste_exits_preview() {
+    let (mut tui, _config) = make_tui_with_history(&["hello"]);
+
+    // Enter preview
+    tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(tui.app.history_preview);
+
+    // Paste inline text
+    tui.handle_paste("pasted".to_string()).await;
+
+    assert!(
+        !tui.app.history_preview,
+        "preview should be exited after paste"
+    );
+    assert_eq!(tui.app.history_index, None);
+}
+
+/// Preview mode produces a distinct cursor style from normal mode.
+#[tokio::test]
+async fn history_preview_cursor_style() {
+    let (mut tui, config) = make_tui_with_history(&[]);
+
+    // Normal mode style
+    tui.app.history_preview = false;
+    Tui::refresh_input_chrome_from_state(&config, &mut tui.app, false, false);
+    let normal_style = tui.app.input.cursor_style();
+
+    // Preview mode style
+    tui.app.history_preview = true;
+    Tui::refresh_input_chrome_from_state(&config, &mut tui.app, false, false);
+    let preview_style = tui.app.input.cursor_style();
+
+    assert_ne!(
+        normal_style, preview_style,
+        "cursor style should differ between normal and preview mode"
+    );
+    assert!(
+        preview_style.add_modifier.contains(Modifier::REVERSED),
+        "preview cursor should still have REVERSED modifier for visibility"
+    );
+}

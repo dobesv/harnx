@@ -64,19 +64,14 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 Run the full verification pipeline before committing:
 
 ```sh
-cargo fmt --all && cargo build --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo nextest run --workspace
-```
-
-**Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
-
-During development you can run the individual commands:
-
-```sh
 cargo build --workspace                                       # Compile the project
 cargo fmt --all                                               # Auto-format code (run without --check to fix)
 cargo clippy --workspace --all-targets -- -D warnings         # Lint — treat warnings as errors
 cargo nextest run --workspace --stress-count=5                # Run all tests, repeat several times to catch flaky tests
+cs delta $(git merge-base HEAD origin/main)                   # Run CodeScene code quality analysis on current branch changes                                          
 ```
+
+**Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
 
 ## Commit Conventions
 
