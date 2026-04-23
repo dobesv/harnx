@@ -4,7 +4,7 @@ set -e
 # @meta dotenv
 # @env DRY_RUN Dry run mode
 
-# @cmd Install all harnx binaries (harnx, harnx-serve, harnx-acp-server) from the local workspace
+# @cmd Install all harnx binaries (harnx, harnx-serve, harnx-acp-server, harnx-mcp-*) from the local workspace
 # Release profile by default. Pass --debug for a faster build with slower runtime.
 # @flag --debug Install debug build instead of the default release build
 # @flag --force Overwrite an existing installed binary of the same name
@@ -17,7 +17,7 @@ install() {
     [[ -n "$argc_locked" ]] && args+=(--locked)
     pkgs=("${argc_pkgs[@]}")
     if [[ ${#pkgs[@]} -eq 0 ]]; then
-        pkgs=(harnx harnx-serve harnx-acp-server)
+        pkgs=(harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-fs harnx-mcp-time harnx-mcp-todo)
     fi
     for pkg in "${pkgs[@]}"; do
         echo "==> Installing $pkg"
