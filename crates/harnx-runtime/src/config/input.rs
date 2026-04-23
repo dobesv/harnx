@@ -171,7 +171,7 @@ pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Messag
     let mut messages = if let Some(session) = session_of(input, &config.read().session) {
         crate::config::session::build_messages(session, input)
     } else {
-        crate::config::agent::build_messages(input.agent(), input)
+        input.agent().build_messages(input)
     };
     if let Some(tool_calls) = &input.tool_calls {
         messages.push(Message::new(
@@ -192,7 +192,7 @@ pub fn echo_messages(input: &Input, config: &GlobalConfig) -> String {
     if let Some(session) = session_of(input, &config.read().session) {
         crate::config::session::echo_messages(session, input)
     } else {
-        crate::config::agent::echo_messages(input.agent(), input)
+        input.agent().echo_messages(input)
     }
 }
 

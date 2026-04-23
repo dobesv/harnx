@@ -1,6 +1,5 @@
 use super::*;
 
-use crate::client::{Message, MessageContent, MessageRole};
 use anyhow::{anyhow, Context, Result};
 use inquire::{validator::Validation, Text};
 use std::{
@@ -14,70 +13,6 @@ pub use harnx_core::agent_config::{AgentConfig, AgentVariable, AgentVariables, T
 pub const CREATE_TITLE_AGENT: &str = harnx_core::agent_config::CREATE_TITLE_AGENT_NAME;
 
 const DEFAULT_AGENT_NAME: &str = "rag";
-
-/// Build the messages for a one-shot LLM call using `config`'s prompt/tools
-/// and the user-side `input`. Free function (harnx-side) rather than a method
-/// on `AgentConfig` so `AgentConfig` can stay in `harnx-core` without knowing
-/// about the harnx-side `Input` type.
-pub fn build_messages(config: &AgentConfig, input: &Input) -> Vec<Message> {
-    let prompt = config.interpolated_instructions();
-    let tools_text = config.tools_text();
-    let content = input.message_content();
-    let mut messages = if prompt.is_empty() {
-        let mut messages = vec![];
-        if let Some(tools_text) = &tools_text {
-            messages.push(Message::new(
-                MessageRole::System,
-                MessageContent::Text(tools_text.clone()),
-            ));
-        }
-        messages.push(Message::new(MessageRole::User, content));
-        messages
-    } else {
-        let mut messages = vec![];
-        let system_text = match (&tools_text, prompt.is_empty()) {
-            (Some(tools), false) => format!("{prompt}\n\n{tools}"),
-            (Some(tools), true) => tools.clone(),
-            (None, false) => prompt.to_string(),
-            (None, true) => String::new(),
-        };
-        if !system_text.is_empty() {
-            messages.push(Message::new(
-                MessageRole::System,
-                MessageContent::Text(system_text),
-            ));
-        }
-        messages.push(Message::new(MessageRole::User, content));
-        messages
-    };
-    if let Some(text) = input.continue_output() {
-        messages.push(Message::new(
-            MessageRole::Assistant,
-            MessageContent::Text(text.into()),
-        ));
-    }
-    messages
-}
-
-/// Render the prompt + tools-summary + input markdown for the echo-mode
-/// (`.echo`) command. Free-function companion of `build_messages`.
-pub fn echo_messages(config: &AgentConfig, input: &Input) -> String {
-    let prompt = config.interpolated_instructions();
-    let tools_text = config.tools_text();
-    let input_markdown = input.render();
-
-    if prompt.is_empty() {
-        if let Some(tools) = &tools_text {
-            format!("{tools}\n\n{input_markdown}")
-        } else {
-            input_markdown
-        }
-    } else if let Some(tools) = &tools_text {
-        format!("{prompt}\n\n{tools}\n\n{input_markdown}")
-    } else {
-        format!("{}\n\n{}", prompt, input_markdown)
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct Agent {
@@ -678,7 +613,7 @@ mod tests {
         ));
         let input = crate::config::input::from_str(&config, "Real input", Some(agent));
 
-        let messages = super::agent::build_messages(input.agent(), &input);
+        let messages = input.agent().build_messages(&input);
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, MessageRole::System);

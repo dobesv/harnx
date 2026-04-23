@@ -517,7 +517,7 @@ pub fn add_message(
                 let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
                 session.autoname = Some(AutoName::new_from_chat_history(chat_history));
             }
-            let agent_messages = crate::config::agent::build_messages(input.agent(), input);
+            let agent_messages = input.agent().build_messages(input);
             for msg in &agent_messages {
                 all_appended &= append_event(
                     session,
@@ -655,7 +655,7 @@ pub fn build_messages(session: &Session, input: &Input) -> Vec<Message> {
     let mut need_add_msg = true;
     let len = messages.len();
     if len == 0 {
-        messages = crate::config::agent::build_messages(input.agent(), input);
+        messages = input.agent().build_messages(input);
         need_add_msg = false;
     } else if len == 1 && session.compressed_messages.len() >= 2 {
         if let Some(index) = session

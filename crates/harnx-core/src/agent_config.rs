@@ -423,6 +423,72 @@ impl AgentConfig {
             .join("\n");
         Some(tools)
     }
+
+    /// Build the messages for a one-shot LLM call using this agent's prompt +
+    /// tools and the user-side `input`. Assembles a System message (prompt +
+    /// tool summary, if any) followed by a User message with the input's
+    /// content, optionally appending an Assistant continuation message if
+    /// `input.continue_output()` is set.
+    pub fn build_messages(&self, input: &crate::input::Input) -> Vec<crate::message::Message> {
+        use crate::message::{Message, MessageContent, MessageRole};
+        let prompt = self.interpolated_instructions();
+        let tools_text = self.tools_text();
+        let content = input.message_content();
+        let mut messages = if prompt.is_empty() {
+            let mut messages = vec![];
+            if let Some(tools_text) = &tools_text {
+                messages.push(Message::new(
+                    MessageRole::System,
+                    MessageContent::Text(tools_text.clone()),
+                ));
+            }
+            messages.push(Message::new(MessageRole::User, content));
+            messages
+        } else {
+            let mut messages = vec![];
+            let system_text = match (&tools_text, prompt.is_empty()) {
+                (Some(tools), false) => format!("{prompt}\n\n{tools}"),
+                (Some(tools), true) => tools.clone(),
+                (None, false) => prompt.to_string(),
+                (None, true) => String::new(),
+            };
+            if !system_text.is_empty() {
+                messages.push(Message::new(
+                    MessageRole::System,
+                    MessageContent::Text(system_text),
+                ));
+            }
+            messages.push(Message::new(MessageRole::User, content));
+            messages
+        };
+        if let Some(text) = input.continue_output() {
+            messages.push(Message::new(
+                MessageRole::Assistant,
+                MessageContent::Text(text.into()),
+            ));
+        }
+        messages
+    }
+
+    /// Render the prompt + tools-summary + input markdown for the echo-mode
+    /// (`.echo`) command. Companion of `build_messages`.
+    pub fn echo_messages(&self, input: &crate::input::Input) -> String {
+        let prompt = self.interpolated_instructions();
+        let tools_text = self.tools_text();
+        let input_markdown = input.render();
+
+        if prompt.is_empty() {
+            if let Some(tools) = &tools_text {
+                format!("{tools}\n\n{input_markdown}")
+            } else {
+                input_markdown
+            }
+        } else if let Some(tools) = &tools_text {
+            format!("{prompt}\n\n{tools}\n\n{input_markdown}")
+        } else {
+            format!("{}\n\n{}", prompt, input_markdown)
+        }
+    }
 }
 
 // --- AgentFrontMatter (serialized shape of an agent.md front-matter block) ---
