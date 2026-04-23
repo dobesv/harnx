@@ -84,6 +84,17 @@ impl Tui {
                 // Reset so the new agent starts fresh, matching the CMD
                 // path which passes 0 when recursing after a handoff.
                 resume_count = 0;
+                // Emit a source heading event so the TUI renders the
+                // "> agent ▸ session" header for the newly switched agent,
+                // matching the behavior of session_prompt delegation.
+                let source = harnx_core::event::AgentSource {
+                    agent: switch.agent.clone(),
+                    session_id: switch.session_id.clone(),
+                };
+                let _ = ctx.event_tx.send(TuiEvent::Agent(
+                    harnx_core::event::AgentEvent::Turn(harnx_core::event::TurnEvent::Started),
+                    Some(source),
+                ));
             }
 
             if with_embeddings {
