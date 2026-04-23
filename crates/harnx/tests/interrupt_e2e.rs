@@ -248,7 +248,12 @@ fn interrupt_oneshot_during_sub_agent() -> Result<()> {
     let mut child = spawn_oneshot(&paths, &harnx_bin, "delegate")?;
 
     // Allow parent LLM + ACP handshake + child startup + child streaming.
-    std::thread::sleep(Duration::from_millis(2500));
+    // macOS CI runners are noticeably slower at process spawn / ACP handshake
+    // than Linux; a 2500 ms budget was occasionally undershooting there,
+    // causing the parent to exit normally before we SIGINT'd it. 4000 ms gives
+    // a comfortable margin without making the happy-path test meaningfully
+    // longer (we only wait the full budget if the spawn is slow).
+    std::thread::sleep(Duration::from_millis(4000));
 
     send_sigint(&child)?;
 
