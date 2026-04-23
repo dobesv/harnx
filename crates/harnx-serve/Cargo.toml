@@ -10,13 +10,19 @@ repository.workspace = true
 categories.workspace = true
 keywords.workspace = true
 
+[[bin]]
+name = "harnx-serve"
+path = "src/bin/harnx-serve.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+clap = { workspace = true }
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-rag = { path = "../harnx-rag" }
+harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
 http = { workspace = true }
 http-body-util = { workspace = true }
