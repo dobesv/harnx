@@ -223,7 +223,11 @@ impl AgentEventSink for CliAgentEventSink {
                 eprintln!("{}", dimmed_text(&format!("handoff → {agent}")));
             }
             AgentEvent::Notice(NoticeEvent::Info(msg)) => {
-                eprintln!("{msg}");
+                // Info notices go to stdout — they're user-facing output
+                // (save confirmations, dry-run echo, progress messages) that
+                // shell scripts may pipe/capture. Warnings + Errors keep
+                // their stderr routing below.
+                println!("{msg}");
             }
             AgentEvent::Notice(NoticeEvent::Warning(msg)) => {
                 eprintln!("{}", warning_text(&msg));
@@ -348,11 +352,12 @@ mod tests {
     use super::*;
     use harnx_core::event::{ContentBlock, StatusLine};
 
-    // The sink writes to stderr, which is hard to capture in a unit test
-    // without subprocess machinery. We verify here only that `emit` doesn't
-    // panic for a representative sample of event variants — the behavioral
-    // verification (events arrive in the right order) lives in the
-    // integration test at `tests/engine_smoke.rs`.
+    // The sink writes to stdout (Info notices, streaming chunks) and stderr
+    // (Warning/Error notices, status lines), which is hard to capture in a
+    // unit test without subprocess machinery. We verify here only that
+    // `emit` doesn't panic for a representative sample of event variants —
+    // the behavioral verification (events arrive in the right order) lives
+    // in the integration test at `tests/engine_smoke.rs`.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn emit_handles_each_top_level_variant_without_panic() {
