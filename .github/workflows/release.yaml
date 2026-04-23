@@ -103,9 +103,11 @@ jobs:
       
     - name: Build
       shell: bash
-      run: $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }}
+      run: |
+        $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
+          -p harnx -p harnx-serve -p harnx-acp-server
 
-    - name: Build Archive
+    - name: Build Archives
       shell: bash
       id: package
       env:
@@ -114,35 +116,42 @@ jobs:
       run: |
         set -euxo pipefail
 
-        bin=${GITHUB_REPOSITORY##*/}
         dist_dir=`pwd`/dist
-        name=$bin-$version-$target
-        executable=target/$target/release/$bin
-
-        if [[ "$RUNNER_OS" == "Windows" ]]; then
-          executable=$executable.exe
-        fi
-
         mkdir $dist_dir
-        cp $executable $dist_dir
-        cd $dist_dir
 
-        if [[ "$RUNNER_OS" == "Windows" ]]; then
-            archive=$dist_dir/$name.zip
-            7z a $archive *
-            echo "archive=dist/$name.zip" >> $GITHUB_OUTPUT
-        else
-            archive=$dist_dir/$name.tar.gz
-            tar -czf $archive *
-            echo "archive=dist/$name.tar.gz" >> $GITHUB_OUTPUT
-        fi
+        archives=()
+        for bin in harnx harnx-serve harnx-acp-server; do
+          name=$bin-$version-$target
+          executable=target/$target/release/$bin
 
-    - name: Publish Archive
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            executable=$executable.exe
+          fi
+
+          staging=$dist_dir/$bin-stage
+          mkdir $staging
+          cp $executable $staging/
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+              archive=$dist_dir/$name.zip
+              (cd $staging && 7z a $archive *)
+              archives+=("dist/$name.zip")
+          else
+              archive=$dist_dir/$name.tar.gz
+              (cd $staging && tar -czf $archive *)
+              archives+=("dist/$name.tar.gz")
+          fi
+        done
+
+        # Emit as a newline-separated list for softprops/action-gh-release.
+        printf 'archives<<EOF\n%s\nEOF\n' "$(IFS=$'\n'; echo "${archives[*]}")" >> $GITHUB_OUTPUT
+
+    - name: Publish Archives
       uses: softprops/action-gh-release@v2
       if: ${{ startsWith(github.ref, 'refs/tags/') }}
       with:
         draft: false
-        files: ${{ steps.package.outputs.archive }}
+        files: ${{ steps.package.outputs.archives }}
         prerelease: ${{ steps.check-tag.outputs.rc == 'true' }}
 
   publish-crate:

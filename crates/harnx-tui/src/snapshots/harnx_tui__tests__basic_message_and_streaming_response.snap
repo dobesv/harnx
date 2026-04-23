@@ -1,0 +1,26 @@
+---
+source: src/tests.rs
+expression: rendered
+---
+> Test message
+
+Hello from the mock client!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• 🤖  test-agent

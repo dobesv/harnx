@@ -1,0 +1,20 @@
+---
+source: crates/harnx-tui/src/tests.rs
+expression: rendered
+---
+Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
+> argus ▸ session-1
+<think>thinking before tool</think>
+→ argus_session_prompt
+   message: delegate
+<think>thinking after tool</think>
+
+
+
+
+
+
+
+
+
+• 🤖  coordinator ▸ coalescing-test

@@ -1572,6 +1572,20 @@ dependencies = [
  "fuzzy-matcher",
  "glob",
  "globset",
+ "harnx-acp",
+ "harnx-acp-server",
+ "harnx-client",
+ "harnx-core",
+ "harnx-engine",
+ "harnx-fetch",
+ "harnx-hooks",
+ "harnx-mcp",
+ "harnx-rag",
+ "harnx-render",
+ "harnx-runtime",
+ "harnx-serve",
+ "harnx-spinner",
+ "harnx-tui",
  "hmac",
  "hnsw_rs",
  "html_to_markdown",
@@ -1626,6 +1640,435 @@ dependencies = [
  "urlencoding",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "harnx-acp"
+version = "0.30.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "futures-util",
+ "harnx-core",
+ "harnx-spinner",
+ "indexmap",
+ "log",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
+name = "harnx-acp-server"
+version = "0.30.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "clap",
+ "futures-util",
+ "harnx-acp",
+ "harnx-core",
+ "harnx-render",
+ "harnx-runtime",
+ "log",
+ "parking_lot",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "harnx-client"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-smithy-eventstream",
+ "base64",
+ "bytes",
+ "chrono",
+ "dirs",
+ "fancy-regex 0.17.0",
+ "futures-util",
+ "harnx-core",
+ "hmac",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "indexmap",
+ "json-patch",
+ "log",
+ "parking_lot",
+ "path-absolutize",
+ "rand 0.10.1",
+ "reqwest",
+ "reqwest-eventsource",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.11.0",
+ "shell-words",
+ "tokio",
+ "tokio-stream",
+ "urlencoding",
+]
+
+[[package]]
+name = "harnx-core"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "async-trait",
+ "base64",
+ "chrono",
+ "clap",
+ "dirs",
+ "fancy-regex 0.17.0",
+ "hmac",
+ "indexmap",
+ "os_info",
+ "path-absolutize",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.11.0",
+ "sys-locale",
+ "tokio",
+ "unicode-segmentation",
+ "unicode-width",
+ "urlencoding",
+]
+
+[[package]]
+name = "harnx-engine"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "harnx-client",
+ "harnx-core",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
+name = "harnx-fetch"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "fancy-regex 0.17.0",
+ "futures-util",
+ "harnx-core",
+ "html_to_markdown",
+ "http 1.4.0",
+ "indexmap",
+ "log",
+ "nu-ansi-term",
+ "reqwest",
+ "scraper",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "harnx-hooks"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "fancy-regex 0.17.0",
+ "harnx-core",
+ "inquire",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "harnx-mcp"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dirs",
+ "futures-util",
+ "harnx-core",
+ "indexmap",
+ "log",
+ "parking_lot",
+ "process-wrap",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "harnx-mcp-bash"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "fancy-regex 0.17.0",
+ "harnx-mcp",
+ "libc",
+ "process-wrap",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "harnx-mcp-fs"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "fancy-regex 0.17.0",
+ "glob",
+ "harnx-mcp",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "harnx-mcp-time"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "iana-time-zone",
+ "jiff",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "harnx-mcp-todo"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "harnx-rag"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bm25",
+ "harnx-client",
+ "harnx-core",
+ "harnx-fetch",
+ "harnx-spinner",
+ "hnsw_rs",
+ "indexmap",
+ "inquire",
+ "log",
+ "nu-ansi-term",
+ "parking_lot",
+ "pretty_assertions",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "harnx-render"
+version = "0.30.0"
+dependencies = [
+ "ansi_colours",
+ "anyhow",
+ "bincode 2.0.1",
+ "crossterm",
+ "nu-ansi-term",
+ "serde",
+ "syntect",
+ "textwrap",
+]
+
+[[package]]
+name = "harnx-runtime"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-recursion",
+ "async-trait",
+ "base64",
+ "bincode 2.0.1",
+ "bitflags 2.11.1",
+ "bytes",
+ "chrono",
+ "crossterm",
+ "dirs",
+ "duct",
+ "fancy-regex 0.17.0",
+ "futures-util",
+ "fuzzy-matcher",
+ "globset",
+ "harnx-acp",
+ "harnx-client",
+ "harnx-core",
+ "harnx-engine",
+ "harnx-fetch",
+ "harnx-hooks",
+ "harnx-mcp",
+ "harnx-rag",
+ "harnx-render",
+ "harnx-spinner",
+ "http 1.4.0",
+ "indexmap",
+ "inquire",
+ "is-terminal",
+ "log",
+ "nu-ansi-term",
+ "os_info",
+ "parking_lot",
+ "path-absolutize",
+ "pretty_assertions",
+ "reqwest",
+ "reqwest-eventsource",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "shell-words",
+ "shellexpand",
+ "simplelog",
+ "syntect",
+ "sys-locale",
+ "tempfile",
+ "terminal-colorsaurus",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "unicode-segmentation",
+ "unicode-width",
+ "uuid",
+ "which",
+]
+
+[[package]]
+name = "harnx-serve"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "clap",
+ "futures-util",
+ "harnx-core",
+ "harnx-rag",
+ "harnx-render",
+ "harnx-runtime",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-graceful",
+ "tokio-stream",
+ "uuid",
+]
+
+[[package]]
+name = "harnx-spinner"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "harnx-core",
+ "tokio",
+]
+
+[[package]]
+name = "harnx-test-bins"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "ratatui",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
+name = "harnx-tui"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "crossterm",
+ "fancy-regex 0.17.0",
+ "futures-util",
+ "harnx-acp",
+ "harnx-core",
+ "harnx-hooks",
+ "harnx-mcp",
+ "harnx-render",
+ "harnx-runtime",
+ "indexmap",
+ "insta",
+ "log",
+ "nu-ansi-term",
+ "parking_lot",
+ "pretty_assertions",
+ "rand 0.10.1",
+ "ratatui",
+ "ratatui-textarea",
+ "ratatui_widget_scrolling",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.11.0",
+ "shell-words",
+ "tempfile",
+ "textwrap",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "unicode-width",
+ "uuid",
 ]
 
 [[package]]

@@ -1,17 +1,44 @@
-[package]
-name = "harnx"
-version = "0.30.0"
+[workspace]
+resolver = "2"
+members = [
+    "crates/harnx",
+    "crates/harnx-client",
+    "crates/harnx-core",
+    "crates/harnx-engine",
+    "crates/harnx-acp",
+    "crates/harnx-acp-server",
+    "crates/harnx-fetch",
+    "crates/harnx-hooks",
+    "crates/harnx-mcp",
+    "crates/harnx-mcp-bash",
+    "crates/harnx-mcp-fs",
+    "crates/harnx-mcp-time",
+    "crates/harnx-mcp-todo",
+    "crates/harnx-rag",
+    "crates/harnx-render",
+    "crates/harnx-runtime",
+    "crates/harnx-serve",
+    "crates/harnx-spinner",
+    "crates/harnx-test-bins",
+    "crates/harnx-tui",
+]
+
+[workspace.package]
 edition = "2021"
 authors = ["sigoden <sigoden@gmail.com>"]
 description = "All-in-one LLM CLI Tool"
-default-run = "harnx"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/dobesv/harnx"
 repository = "https://github.com/dobesv/harnx"
 categories = ["command-line-utilities"]
 keywords = ["chatgpt", "llm", "cli", "ai", "tui"]
 
-[dependencies]
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
+
+[workspace.dependencies]
 anyhow = "1.0.69"
 bytes = "1.4.0"
 clap = { version = "4.4.8", features = ["derive"] }
@@ -81,77 +108,8 @@ schemars = "1.0"
 ratatui-textarea = "0.9.0"
 ratatui_widget_scrolling = "0.1.0"
 jiff = { version = "0.2.23", features = ["serde"] }
-
-[dependencies.reqwest]
-version = "0.13.0"
-features = ["json", "multipart", "socks", "rustls", "stream"]
-default-features = false
-
-[dependencies.syntect]
-version = "5.0.0"
-default-features = false
-features = ["parsing", "regex-onig", "plist-load"]
-
-[target.'cfg(target_os = "macos")'.dependencies]
-crossterm = { version = "0.29", features = ["use-dev-tty"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-arboard = { version = "3.3.0", default-features = false, features = ["wayland-data-control"] }
-
-[target.'cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))'.dependencies]
+reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
+syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"], default-features = false }
 arboard = { version = "3.3.0", default-features = false }
-
-[dev-dependencies]
-insta = { version = "1", features = ["yaml"] }
-pretty_assertions = "1.4.0"
-rand = "0.10.0"
-tokio-test = "0.4"
-tempfile = "3"
-
-[[bin]]
-name = "harnx-mcp-todo"
-path = "src/bin/harnx-mcp-todo/main.rs"
-
-[[bin]]
-name = "harnx-mcp-bash"
-path = "src/bin/harnx-mcp-bash/main.rs"
-
-[[bin]]
-name = "harnx-mcp-fs"
-path = "src/bin/harnx-mcp-fs/main.rs"
-
-[[bin]]
-name = "harnx-mcp-time"
-path = "src/bin/harnx-mcp-time/main.rs"
-
-[[bin]]
-name = "harnx-acp-test"
-path = "src/bin/harnx-acp-test/main.rs"
-
-[[bin]]
-name = "harnx-mock-llm"
-path = "src/bin/harnx-mock-llm/main.rs"
-
-[[bin]]
-name = "harnx-mcp-repro249"
-path = "src/bin/harnx-mcp-repro249/main.rs"
-
-[[bin]]
-name = "harnx-test-ratatui"
-path = "src/bin/harnx-test-ratatui.rs"
-install = false
-
-[profile.release]
-lto = true
-strip = true
-opt-level = "z"
-
-# Recommended: use cargo-nextest for reliable test execution
-# Install: cargo install cargo-nextest
-# Run: cargo nextest run --lib
-#
-# With standard cargo test, use --test-threads=1:
-# cargo test --lib -- --test-threads=1
-#
-# The TUI tests use shared global state (UI_OUTPUT_SENDER) that cannot
-# be fully isolated between parallel test runs.
+harnx-acp = { path = "crates/harnx-acp", version = "0.30.0" }
+harnx-acp-server = { path = "crates/harnx-acp-server", version = "0.30.0" }

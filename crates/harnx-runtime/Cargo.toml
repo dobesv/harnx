@@ -1,0 +1,76 @@
+[package]
+name = "harnx-runtime"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-recursion = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bincode = { workspace = true }
+bitflags = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+crossterm = { workspace = true }
+dirs = { workspace = true }
+duct = { workspace = true }
+fancy-regex = { workspace = true }
+fuzzy-matcher = { workspace = true }
+futures-util = { workspace = true }
+globset = { workspace = true }
+harnx-acp = { workspace = true }
+harnx-client = { path = "../harnx-client" }
+harnx-core = { path = "../harnx-core" }
+harnx-engine = { path = "../harnx-engine" }
+harnx-fetch = { path = "../harnx-fetch" }
+harnx-hooks = { path = "../harnx-hooks" }
+harnx-mcp = { path = "../harnx-mcp" }
+harnx-rag = { path = "../harnx-rag" }
+harnx-render = { path = "../harnx-render" }
+harnx-spinner = { path = "../harnx-spinner" }
+http = { workspace = true }
+indexmap = { workspace = true }
+inquire = { workspace = true }
+is-terminal = { workspace = true }
+log = { workspace = true }
+nu-ansi-term = { workspace = true }
+os_info = { workspace = true }
+parking_lot = { workspace = true }
+path-absolutize = { workspace = true }
+reqwest = { workspace = true }
+reqwest-eventsource = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+shell-words = { workspace = true }
+shellexpand = { workspace = true }
+simplelog = { workspace = true }
+time = { workspace = true }
+syntect = { workspace = true }
+sys-locale = { workspace = true }
+terminal-colorsaurus = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
+uuid = { workspace = true }
+which = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { workspace = true, features = ["wayland-data-control"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))'.dependencies]
+arboard = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = "1.4.0"
+tempfile = "3"
+tokio-test = "0.4"

@@ -46,13 +46,23 @@ jobs:
       with:
         tool: cargo-nextest
 
+    # harnx's integration tests (tests/interrupt_e2e.rs, tests/tmux_e2e.rs)
+    # spawn sibling bins (harnx-mcp-time, harnx-mcp-repro249) via a
+    # sibling-path lookup in src/test_utils/interrupt.rs. Those bins live in
+    # separate workspace crates that harnx doesn't depend on, so
+    # `cargo nextest run --all` alone won't build them. Build the whole
+    # workspace (bins + tests) first so every bin is present before tests
+    # start.
+    - name: Build workspace
+      run: cargo build --workspace --all-targets
+
     - name: Test
       run: cargo nextest run --all
 
     - name: Check for pending snapshot updates
       if: failure()
       run: |
-        if ls src/tui/snapshots/*.snap.new 2>/dev/null; then
+        if ls crates/harnx-tui/src/snapshots/*.snap.new 2>/dev/null; then
           echo "::error::Snapshot updates pending. Run 'cargo insta review' locally to review and accept changes."
           exit 1
         fi

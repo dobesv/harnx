@@ -1,0 +1,12 @@
+---
+source: src/tests.rs
+expression: rendered
+---
+wrap them cleanly across lines without
+clipping or splitting words awkwardly.
+Each sentence keeps going long enough to
+force vertical overflow in the
+transcript area and prove scrolling
+still leaves wrapped content visible.
+
+• Input

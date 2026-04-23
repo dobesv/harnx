@@ -1,0 +1,116 @@
+[package]
+name = "harnx"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+default-run = "harnx"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+dirs = { workspace = true }
+futures-util = { workspace = true }
+inquire = { workspace = true }
+is-terminal = { workspace = true }
+ratatui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tokio-graceful = { workspace = true }
+tokio-stream = { workspace = true }
+crossterm = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+iana-time-zone = { workspace = true }
+bincode = { workspace = true }
+parking_lot = { workspace = true }
+fancy-regex = { workspace = true }
+base64 = { workspace = true }
+nu-ansi-term = { workspace = true }
+async-trait = { workspace = true }
+textwrap = { workspace = true }
+ansi_colours = { workspace = true }
+reqwest-eventsource = { workspace = true }
+simplelog = { workspace = true }
+log = { workspace = true }
+shell-words = { workspace = true }
+sha2 = { workspace = true }
+unicode-width = { workspace = true }
+async-recursion = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+time = { workspace = true }
+indexmap = { workspace = true }
+hmac = { workspace = true }
+aws-smithy-eventstream = { workspace = true }
+urlencoding = { workspace = true }
+unicode-segmentation = { workspace = true }
+json-patch = { workspace = true }
+bitflags = { workspace = true }
+path-absolutize = { workspace = true }
+hnsw_rs = { workspace = true }
+rayon = { workspace = true }
+uuid = { workspace = true }
+scraper = { workspace = true }
+sys-locale = { workspace = true }
+html_to_markdown = { workspace = true }
+os_info = { workspace = true }
+bm25 = { workspace = true }
+which = { workspace = true }
+fuzzy-matcher = { workspace = true }
+terminal-colorsaurus = { workspace = true }
+duct = { workspace = true }
+rmcp = { workspace = true }
+process-wrap = { workspace = true }
+libc = { workspace = true }
+agent-client-protocol = { workspace = true }
+glob = { workspace = true }
+globset = { workspace = true }
+harnx-acp = { workspace = true }
+harnx-acp-server = { workspace = true }
+harnx-client = { path = "../harnx-client" }
+harnx-core = { path = "../harnx-core" }
+harnx-engine = { path = "../harnx-engine" }
+harnx-fetch = { path = "../harnx-fetch" }
+harnx-hooks = { path = "../harnx-hooks" }
+harnx-mcp = { path = "../harnx-mcp" }
+harnx-rag = { path = "../harnx-rag" }
+harnx-render = { path = "../harnx-render" }
+harnx-runtime = { path = "../harnx-runtime" }
+harnx-serve = { path = "../harnx-serve" }
+harnx-spinner = { path = "../harnx-spinner" }
+harnx-tui = { path = "../harnx-tui" }
+shellexpand = { workspace = true }
+schemars = { workspace = true }
+ratatui-textarea = { workspace = true }
+ratatui_widget_scrolling = { workspace = true }
+jiff = { workspace = true }
+reqwest = { workspace = true }
+syntect = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+crossterm = { workspace = true, features = ["use-dev-tty"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { workspace = true, features = ["wayland-data-control"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))'.dependencies]
+arboard = { workspace = true }
+
+[dev-dependencies]
+insta = { version = "1", features = ["yaml"] }
+pretty_assertions = "1.4.0"
+rand = "0.10.0"
+tokio-test = "0.4"
+tempfile = "3"
+

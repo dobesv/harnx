@@ -1,0 +1,26 @@
+[package]
+name = "harnx-fetch"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Web-fetch + document-loading infrastructure for harnx (crawl_website, load_file, load_url, run_loader_command)"
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+fancy-regex = { workspace = true }
+futures-util = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+html_to_markdown = { workspace = true }
+http = { workspace = true }
+indexmap = { workspace = true }
+log = { workspace = true }
+nu-ansi-term = { workspace = true }
+reqwest = { workspace = true }
+scraper = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+shell-words = { workspace = true }
+tokio = { workspace = true, features = ["sync", "fs"] }
+uuid = { workspace = true }

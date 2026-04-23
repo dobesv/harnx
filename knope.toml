@@ -1,6 +1,14 @@
 [[packages]]
 name = "harnx"
-version_file = "Cargo.toml"
+# All three shippable bins keep their literal `version = "0.30.0"` in sync
+# with each other. knope bumps them together as a single package unit so
+# the release artifacts (harnx-$ver, harnx-serve-$ver, harnx-acp-server-$ver)
+# always match.
+versioned_files = [
+    "crates/harnx/Cargo.toml",
+    "crates/harnx-serve/Cargo.toml",
+    "crates/harnx-acp-server/Cargo.toml",
+]
 changelog = "CHANGELOG.md"
 tag_prefix = "v"
 

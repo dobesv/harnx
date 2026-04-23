@@ -1,0 +1,20 @@
+---
+source: crates/harnx-tui/src/tests.rs
+expression: rendered
+---
+Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
+Top-level assistant opening response.
+
+> argus ▸ session-1
+sub-agent tool call
+sub-agent follow-up output
+> hephaestus ▸ session-2
+other sub-agent output
+Top-level assistant closes response.
+
+
+
+
+
+
+• 🤖  main-agent ▸ main-session

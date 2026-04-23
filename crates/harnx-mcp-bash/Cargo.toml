@@ -1,0 +1,24 @@
+[package]
+name = "harnx-mcp-bash"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server that exposes bash/subprocess execution with safety guards"
+
+[dependencies]
+anyhow = { workspace = true }
+fancy-regex = { workspace = true }
+harnx-mcp = { path = "../harnx-mcp" }
+libc = { workspace = true }
+process-wrap = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+uuid = { workspace = true }
+
+[[bin]]
+name = "harnx-mcp-bash"
+path = "src/main.rs"
