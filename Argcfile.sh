@@ -4,6 +4,27 @@ set -e
 # @meta dotenv
 # @env DRY_RUN Dry run mode
 
+# @cmd Install all harnx binaries (harnx, harnx-serve, harnx-acp-server) from the local workspace
+# Release profile by default. Pass --debug for a faster build with slower runtime.
+# @flag --debug Install debug build instead of the default release build
+# @flag --force Overwrite an existing installed binary of the same name
+# @flag --locked Use the committed Cargo.lock (recommended for reproducible installs)
+# @arg pkgs*[harnx|harnx-serve|harnx-acp-server] Restrict the install to one or more bins (default: all three)
+install() {
+    args=()
+    [[ -n "$argc_debug" ]] && args+=(--debug)
+    [[ -n "$argc_force" ]] && args+=(--force)
+    [[ -n "$argc_locked" ]] && args+=(--locked)
+    pkgs=("${argc_pkgs[@]}")
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        pkgs=(harnx harnx-serve harnx-acp-server)
+    fi
+    for pkg in "${pkgs[@]}"; do
+        echo "==> Installing $pkg"
+        cargo install "${args[@]}" --path "crates/$pkg"
+    done
+}
+
 # @cmd Test configuration initialization
 # @env HARNX_CONFIG_DIR=tmp/test-init-config
 # @arg args~

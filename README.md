@@ -8,15 +8,59 @@ usable with other harnesses.
 
 ## Install
 
-### Install from Git
+Harnx ships as three binaries, each installable independently:
 
-- **Rust Developers:** `cargo install --git https://github.com/dobesv/harnx harnx`
-- **From Source:** `cargo install --path .`
+| Binary | What it does | Release size |
+|---|---|---|
+| `harnx` | Full CLI — TUI + Cmd + HTTP (`--serve`) + ACP (`--acp=<agent>`) | ~18 MB |
+| `harnx-serve` | HTTP-only server, no TUI deps | ~10 MB |
+| `harnx-acp-server` | ACP-only headless agent over stdio, no TUI deps | ~11 MB |
+
+Install whichever you need. Most users want just `harnx`; headless server
+deployments can skip the TUI deps by picking `harnx-serve` or
+`harnx-acp-server` directly.
+
+### Install from Git (Rust developers)
+
+```sh
+cargo install --git https://github.com/dobesv/harnx harnx
+cargo install --git https://github.com/dobesv/harnx harnx-serve
+cargo install --git https://github.com/dobesv/harnx harnx-acp-server
+```
+
+The package name after `--git <url>` picks which workspace member to install.
+Add `--tag v0.30.0` to pin a specific release, or `--branch monorepo` to
+track an in-progress branch.
+
+### Install from a local checkout
+
+Clone the repo, then:
+
+```sh
+# Install all three at once via the project's argc task runner:
+argc install
+
+# ...or pick one:
+argc install harnx
+argc install harnx-serve
+argc install harnx-acp-server
+
+# Raw cargo also works:
+cargo install --path crates/harnx
+cargo install --path crates/harnx-serve
+cargo install --path crates/harnx-acp-server
+```
+
+The `argc install` helper accepts `--debug` (build unoptimized for faster
+compile), `--force` (overwrite existing bins), and `--locked` (use the
+committed `Cargo.lock` for a reproducible install).
 
 ### Pre-built Binaries
 
-Download pre-built binaries for macOS, Linux, and Windows from [GitHub Releases](https://github.com/dobesv/harnx/releases), extract 
-them, and add the binaries to your `$PATH`.
+Download pre-built archives for macOS, Linux, and Windows from
+[GitHub Releases](https://github.com/dobesv/harnx/releases). Each release
+publishes a separate archive per binary per target (e.g.
+`harnx-0.30.0-x86_64-unknown-linux-musl.tar.gz`). Extract and add to `$PATH`.
 
 ## Features
 
