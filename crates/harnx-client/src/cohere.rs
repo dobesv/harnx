@@ -110,69 +110,98 @@ async fn chat_completions(
     extract_chat_completions(&data)
 }
 
+/// Mutable accumulator state for the Cohere streaming parser. Extracted
+/// so per-event handling is testable in isolation.
+#[derive(Default)]
+struct CohereStreamState {
+    function_name: String,
+    function_arguments: String,
+    function_id: String,
+}
+
+fn cohere_handle_tool_call_start(state: &mut CohereStreamState, data: &Value) {
+    let (Some(function), Some(id)) = (
+        data["delta"]["message"]["tool_calls"]["function"].as_object(),
+        data["delta"]["message"]["tool_calls"]["id"].as_str(),
+    ) else {
+        return;
+    };
+    if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+        state.function_name = name.to_string();
+    }
+    state.function_id = id.to_string();
+}
+
+fn cohere_handle_tool_call_end(
+    state: &mut CohereStreamState,
+    handler: &mut SseHandler,
+) -> Result<()> {
+    if !state.function_name.is_empty() {
+        let arguments: Value = state.function_arguments.parse().with_context(|| {
+            format!(
+                "Tool call '{}' have non-JSON arguments '{}'",
+                state.function_name, state.function_arguments
+            )
+        })?;
+        handler.tool_call(ToolCall::new(
+            state.function_name.clone(),
+            arguments,
+            Some(state.function_id.clone()),
+            None,
+        ))?;
+    }
+    state.function_name.clear();
+    state.function_arguments.clear();
+    state.function_id.clear();
+    Ok(())
+}
+
+fn cohere_handle_stream_event(
+    state: &mut CohereStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    let Some(typ) = data["type"].as_str() else {
+        return Ok(());
+    };
+    match typ {
+        "content-delta" => {
+            if let Some(text) = data["delta"]["message"]["content"]["text"].as_str() {
+                handler.text(text)?;
+            }
+        }
+        "tool-plan-delta" => {
+            if let Some(text) = data["delta"]["message"]["tool_plan"].as_str() {
+                handler.text(text)?;
+            }
+        }
+        "tool-call-start" => cohere_handle_tool_call_start(state, data),
+        "tool-call-delta" => {
+            if let Some(text) =
+                data["delta"]["message"]["tool_calls"]["function"]["arguments"].as_str()
+            {
+                state.function_arguments.push_str(text);
+            }
+        }
+        "tool-call-end" => cohere_handle_tool_call_end(state, handler)?,
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
+    let mut state = CohereStreamState::default();
     let handle = |message: SseMmessage| -> Result<bool> {
         if message.data == "[DONE]" {
             return Ok(true);
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
-        if let Some(typ) = data["type"].as_str() {
-            match typ {
-                "content-delta" => {
-                    if let Some(text) = data["delta"]["message"]["content"]["text"].as_str() {
-                        handler.text(text)?;
-                    }
-                }
-                "tool-plan-delta" => {
-                    if let Some(text) = data["delta"]["message"]["tool_plan"].as_str() {
-                        handler.text(text)?;
-                    }
-                }
-                "tool-call-start" => {
-                    if let (Some(function), Some(id)) = (
-                        data["delta"]["message"]["tool_calls"]["function"].as_object(),
-                        data["delta"]["message"]["tool_calls"]["id"].as_str(),
-                    ) {
-                        if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                            function_name = name.to_string();
-                        }
-                        function_id = id.to_string();
-                    }
-                }
-                "tool-call-delta" => {
-                    if let Some(text) =
-                        data["delta"]["message"]["tool_calls"]["function"]["arguments"].as_str()
-                    {
-                        function_arguments.push_str(text);
-                    }
-                }
-                "tool-call-end" => {
-                    if !function_name.is_empty() {
-                        let arguments: Value = function_arguments.parse().with_context(|| {
-                            format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                        })?;
-                        handler.tool_call(ToolCall::new(
-                            function_name.clone(),
-                            arguments,
-                            Some(function_id.clone()),
-                            None,
-                        ))?;
-                    }
-                    function_name.clear();
-                    function_arguments.clear();
-                    function_id.clear();
-                }
-                _ => {}
-            }
-        }
+        cohere_handle_stream_event(&mut state, handler, &data)?;
         Ok(false)
     };
 
@@ -246,4 +275,67 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         cached_tokens: None,
     };
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::abort::create_abort_signal;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    /// Regression guard: two sequential tool-call blocks in one Cohere
+    /// streaming response must emit each exactly once.
+    #[test]
+    fn two_tool_calls_in_one_response_do_not_double_emit() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = CohereStreamState::default();
+
+        let events = [
+            json!({
+                "type": "tool-call-start",
+                "delta": {"message": {"tool_calls": {
+                    "id": "call_A",
+                    "function": {"name": "Bash"}
+                }}}
+            }),
+            json!({
+                "type": "tool-call-delta",
+                "delta": {"message": {"tool_calls": {
+                    "function": {"arguments": "{\"cmd\": \"pwd\"}"}
+                }}}
+            }),
+            json!({"type": "tool-call-end"}),
+            json!({
+                "type": "tool-call-start",
+                "delta": {"message": {"tool_calls": {
+                    "id": "call_B",
+                    "function": {"name": "Bash"}
+                }}}
+            }),
+            json!({
+                "type": "tool-call-delta",
+                "delta": {"message": {"tool_calls": {
+                    "function": {"arguments": "{\"cmd\": \"ls\"}"}
+                }}}
+            }),
+            json!({"type": "tool-call-end"}),
+        ];
+
+        for event in &events {
+            cohere_handle_stream_event(&mut state, &mut handler, event)
+                .expect("stream event should process");
+        }
+
+        let ids: Vec<Option<&str>> = handler
+            .tool_calls()
+            .iter()
+            .map(|c| c.id.as_deref())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("call_A"), Some("call_B")],
+            "each tool-call block must be emitted exactly once"
+        );
+    }
 }

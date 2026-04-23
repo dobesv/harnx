@@ -86,115 +86,170 @@ pub async fn openai_chat_completions(
     openai_extract_chat_completions(&data)
 }
 
+/// Mutable accumulator state for the OpenAI streaming parser. Extracted
+/// so per-event handling is testable in isolation.
+#[derive(Default)]
+struct OpenAiStreamState {
+    call_id: String,
+    function_name: String,
+    function_arguments: String,
+    function_id: String,
+    reasoning_state: i32,
+}
+
+fn openai_emit_pending_tool_call(
+    state: &mut OpenAiStreamState,
+    handler: &mut SseHandler,
+) -> Result<()> {
+    if state.function_name.is_empty() {
+        return Ok(());
+    }
+    if state.function_arguments.is_empty() {
+        state.function_arguments = String::from("{}");
+    }
+    let arguments: Value = state.function_arguments.parse().with_context(|| {
+        format!(
+            "Tool call '{}' have non-JSON arguments '{}'",
+            state.function_name, state.function_arguments
+        )
+    })?;
+    handler.tool_call(ToolCall::new(
+        state.function_name.clone(),
+        arguments,
+        normalize_function_id(&state.function_id),
+        None,
+    ))?;
+    state.function_name.clear();
+    state.function_arguments.clear();
+    state.function_id.clear();
+    Ok(())
+}
+
+/// Transition the reasoning-block bracket state. Emits `<think>\n` when
+/// opening and `\n</think>\n\n` when closing; no-op when already in the
+/// target state.
+fn openai_transition_reasoning(
+    state: &mut OpenAiStreamState,
+    handler: &mut SseHandler,
+    open: bool,
+) -> Result<()> {
+    let target: i32 = if open { 1 } else { 0 };
+    if state.reasoning_state == target {
+        return Ok(());
+    }
+    let bracket = if open { "<think>\n" } else { "\n</think>\n\n" };
+    handler.text(bracket)?;
+    state.reasoning_state = target;
+    Ok(())
+}
+
+fn openai_handle_text_delta(
+    state: &mut OpenAiStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    let delta = &data["choices"][0]["delta"];
+    if let Some(text) = delta["content"].as_str().filter(|v| !v.is_empty()) {
+        openai_transition_reasoning(state, handler, false)?;
+        handler.text(text)?;
+    } else if let Some(text) = delta["reasoning_content"]
+        .as_str()
+        .or_else(|| delta["reasoning"].as_str())
+        .filter(|v| !v.is_empty())
+    {
+        openai_transition_reasoning(state, handler, true)?;
+        handler.text(text)?;
+    }
+    Ok(())
+}
+
+fn openai_accumulate_tool_call_delta(
+    state: &mut OpenAiStreamState,
+    function: &serde_json::Map<String, Value>,
+    id: Option<&str>,
+) {
+    if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+        if name.starts_with(&state.function_name) {
+            state.function_name = name.to_string();
+        } else {
+            state.function_name.push_str(name);
+        }
+    }
+    if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
+        state.function_arguments.push_str(arguments);
+    }
+    if let Some(id) = id {
+        state.function_id = id.to_string();
+    }
+}
+
+fn openai_handle_tool_call_delta(
+    state: &mut OpenAiStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    let delta = &data["choices"][0]["delta"];
+    let (Some(function), index, id) = (
+        delta["tool_calls"][0]["function"].as_object(),
+        delta["tool_calls"][0]["index"].as_u64(),
+        delta["tool_calls"][0]["id"]
+            .as_str()
+            .filter(|v| !v.is_empty()),
+    ) else {
+        return Ok(());
+    };
+    openai_transition_reasoning(state, handler, false)?;
+    let maybe_call_id = format!("{}/{}", id.unwrap_or_default(), index.unwrap_or_default());
+    if maybe_call_id != state.call_id && maybe_call_id.len() >= state.call_id.len() {
+        openai_emit_pending_tool_call(state, handler)?;
+        state.call_id = maybe_call_id;
+    }
+    openai_accumulate_tool_call_delta(state, function, id);
+    Ok(())
+}
+
+fn openai_handle_final_usage(handler: &mut SseHandler, data: &Value) {
+    // Only capture usage from the final usage-only chunk (where choices is empty/absent).
+    // Some providers send partial usage in intermediate chunks which would give wrong values.
+    let Some(usage) = data.get("usage") else {
+        return;
+    };
+    let choices_empty = data["choices"].as_array().is_none_or(|c| c.is_empty());
+    if !choices_empty {
+        return;
+    }
+    handler.set_usage(
+        usage["prompt_tokens"].as_u64(),
+        usage["completion_tokens"].as_u64(),
+        usage["prompt_tokens_details"]["cached_tokens"].as_u64(),
+    );
+}
+
+fn openai_handle_stream_event(
+    state: &mut OpenAiStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    openai_handle_text_delta(state, handler, data)?;
+    openai_handle_tool_call_delta(state, handler, data)?;
+    openai_handle_final_usage(handler, data);
+    Ok(())
+}
+
 pub async fn openai_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut call_id = String::new();
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let mut reasoning_state = 0;
+    let mut state = OpenAiStreamState::default();
     let handle = |message: SseMmessage| -> Result<bool> {
         if message.data == "[DONE]" {
-            if !function_name.is_empty() {
-                if function_arguments.is_empty() {
-                    function_arguments = String::from("{}");
-                }
-                let arguments: Value = function_arguments.parse().with_context(|| {
-                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                })?;
-                handler.tool_call(ToolCall::new(
-                    function_name.clone(),
-                    arguments,
-                    normalize_function_id(&function_id),
-                    None,
-                ))?;
-            }
+            openai_emit_pending_tool_call(&mut state, handler)?;
             return Ok(true);
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
-        if let Some(text) = data["choices"][0]["delta"]["content"]
-            .as_str()
-            .filter(|v| !v.is_empty())
-        {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-            }
-            handler.text(text)?;
-        } else if let Some(text) = data["choices"][0]["delta"]["reasoning_content"]
-            .as_str()
-            .or_else(|| data["choices"][0]["delta"]["reasoning"].as_str())
-            .filter(|v| !v.is_empty())
-        {
-            if reasoning_state == 0 {
-                handler.text("<think>\n")?;
-                reasoning_state = 1;
-            }
-            handler.text(text)?;
-        }
-        if let (Some(function), index, id) = (
-            data["choices"][0]["delta"]["tool_calls"][0]["function"].as_object(),
-            data["choices"][0]["delta"]["tool_calls"][0]["index"].as_u64(),
-            data["choices"][0]["delta"]["tool_calls"][0]["id"]
-                .as_str()
-                .filter(|v| !v.is_empty()),
-        ) {
-            if reasoning_state == 1 {
-                handler.text("\n</think>\n\n")?;
-                reasoning_state = 0;
-            }
-            let maybe_call_id = format!("{}/{}", id.unwrap_or_default(), index.unwrap_or_default());
-            if maybe_call_id != call_id && maybe_call_id.len() >= call_id.len() {
-                if !function_name.is_empty() {
-                    if function_arguments.is_empty() {
-                        function_arguments = String::from("{}");
-                    }
-                    let arguments: Value = function_arguments.parse().with_context(|| {
-                        format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                    })?;
-                    handler.tool_call(ToolCall::new(
-                        function_name.clone(),
-                        arguments,
-                        normalize_function_id(&function_id),
-                        None,
-                    ))?;                }
-                function_name.clear();
-                function_arguments.clear();
-                function_id.clear();
-                call_id = maybe_call_id;
-            }
-            if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
-                if name.starts_with(&function_name) {
-                    function_name = name.to_string();
-                } else {
-                    function_name.push_str(name);
-                }
-            }
-            if let Some(arguments) = function.get("arguments").and_then(|v| v.as_str()) {
-                function_arguments.push_str(arguments);
-            }
-            if let Some(id) = id {
-                function_id = id.to_string();
-            }
-        }
-        // Only capture usage from the final usage-only chunk (where choices is empty/absent).
-        // Some providers send partial usage in intermediate chunks which would give wrong values.
-        if let Some(usage) = data.get("usage") {
-            let choices_empty = data["choices"]
-                .as_array()
-                .is_none_or(|c| c.is_empty());
-            if choices_empty {
-                handler.set_usage(
-                    usage["prompt_tokens"].as_u64(),
-                    usage["completion_tokens"].as_u64(),
-                    usage["prompt_tokens_details"]["cached_tokens"].as_u64(),
-                );
-            }
-        }
+        openai_handle_stream_event(&mut state, handler, &data)?;
         Ok(false)
     };
 
@@ -413,5 +468,72 @@ fn normalize_function_id(value: &str) -> Option<String> {
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::abort::create_abort_signal;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    /// Regression guard: two tool_calls in one OpenAI streaming response
+    /// must emit each call exactly once. OpenAI splits calls by a
+    /// `{id}/{index}` transition marker plus a final `[DONE]` flush;
+    /// the test covers both the transition emit and the final flush.
+    #[test]
+    fn two_tool_calls_in_one_response_do_not_double_emit() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = OpenAiStreamState::default();
+
+        let chunks = [
+            json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_A",
+                    "function": {"name": "Bash", "arguments": "{\"cmd"}
+                }]}}]
+            }),
+            json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_A",
+                    "function": {"name": "", "arguments": "\": \"pwd\"}"}
+                }]}}]
+            }),
+            json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 1,
+                    "id": "call_B",
+                    "function": {"name": "Bash", "arguments": "{\"cmd"}
+                }]}}]
+            }),
+            json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 1,
+                    "id": "call_B",
+                    "function": {"name": "", "arguments": "\": \"ls\"}"}
+                }]}}]
+            }),
+        ];
+
+        for chunk in &chunks {
+            openai_handle_stream_event(&mut state, &mut handler, chunk)
+                .expect("stream event should process");
+        }
+        // [DONE] flushes the still-pending final tool call.
+        openai_emit_pending_tool_call(&mut state, &mut handler).expect("finalize should succeed");
+
+        let ids: Vec<Option<&str>> = handler
+            .tool_calls()
+            .iter()
+            .map(|c| c.id.as_deref())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("call_A"), Some("call_B")],
+            "each tool_call must be emitted exactly once"
+        );
     }
 }
