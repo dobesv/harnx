@@ -178,6 +178,125 @@ async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutp
     extract_chat_completions(&data)
 }
 
+/// Mutable accumulator state for the Bedrock streaming parser.
+/// Extracted so per-event handling is testable in isolation.
+#[derive(Default)]
+struct BedrockStreamState {
+    function_name: String,
+    function_arguments: String,
+    function_id: String,
+    reasoning_state: i32,
+}
+
+fn bedrock_emit_pending_tool_call(
+    state: &mut BedrockStreamState,
+    handler: &mut SseHandler,
+) -> Result<()> {
+    if state.function_name.is_empty() {
+        return Ok(());
+    }
+    if state.function_arguments.is_empty() {
+        state.function_arguments = String::from("{}");
+    }
+    let arguments: Value = state.function_arguments.parse().with_context(|| {
+        format!(
+            "Tool call '{}' have non-JSON arguments '{}'",
+            state.function_name, state.function_arguments
+        )
+    })?;
+    handler.tool_call(ToolCall::new(
+        state.function_name.clone(),
+        arguments,
+        Some(state.function_id.clone()),
+        None,
+    ))?;
+    state.function_name.clear();
+    state.function_arguments.clear();
+    state.function_id.clear();
+    Ok(())
+}
+
+fn bedrock_handle_content_block_start(
+    state: &mut BedrockStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    let Some(tool_use) = data["start"]["toolUse"].as_object() else {
+        return Ok(());
+    };
+    let (Some(id), Some(name)) = (
+        json_str_from_map(tool_use, "toolUseId"),
+        json_str_from_map(tool_use, "name"),
+    ) else {
+        return Ok(());
+    };
+    // Fallback emit for servers that skip contentBlockStop.
+    bedrock_emit_pending_tool_call(state, handler)?;
+    // Defensive clear preserved from the original code, in case args
+    // were accumulated without a preceding function_name.
+    state.function_arguments.clear();
+    state.function_name = name.into();
+    state.function_id = id.into();
+    Ok(())
+}
+
+fn bedrock_handle_content_block_delta(
+    state: &mut BedrockStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    if let Some(text) = data["delta"]["text"].as_str() {
+        handler.text(text)?;
+    } else if let Some(text) = data["delta"]["reasoningContent"]["text"].as_str() {
+        if state.reasoning_state == 0 {
+            handler.text("<think>\n")?;
+            state.reasoning_state = 1;
+        }
+        handler.text(text)?;
+    } else if let Some(input) = data["delta"]["toolUse"]["input"].as_str() {
+        state.function_arguments.push_str(input);
+    }
+    Ok(())
+}
+
+fn bedrock_handle_content_block_stop(
+    state: &mut BedrockStreamState,
+    handler: &mut SseHandler,
+) -> Result<()> {
+    if state.reasoning_state == 1 {
+        handler.text("\n</think>\n\n")?;
+        state.reasoning_state = 0;
+    }
+    // Emit if a toolUse block is pending, and reset accumulators so the
+    // fallback emit path in contentBlockStart doesn't re-fire this same
+    // call when the next toolUse block begins. Same bug that affected
+    // the Claude streaming parser (both follow Anthropic's content-block
+    // protocol).
+    bedrock_emit_pending_tool_call(state, handler)
+}
+
+fn bedrock_handle_stream_event(
+    state: &mut BedrockStreamState,
+    handler: &mut SseHandler,
+    smithy_type: &str,
+    data: &Value,
+) -> Result<()> {
+    match smithy_type {
+        "contentBlockStart" => bedrock_handle_content_block_start(state, handler, data)?,
+        "contentBlockDelta" => bedrock_handle_content_block_delta(state, handler, data)?,
+        "contentBlockStop" => bedrock_handle_content_block_stop(state, handler)?,
+        "metadata" => {
+            handler.set_usage(
+                data["usage"]["inputTokens"].as_u64(),
+                data["usage"]["outputTokens"].as_u64(),
+                data["usage"]["cacheReadInputTokens"].as_u64(),
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
@@ -191,10 +310,7 @@ async fn chat_completions_streaming(
         bail!("Invalid response data: {data}");
     }
 
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let mut reasoning_state = 0;
+    let mut state = BedrockStreamState::default();
 
     let mut stream = res.bytes_stream();
     let mut buffer = BytesMut::new();
@@ -210,78 +326,7 @@ async fn chat_completions_streaming(
                 ("event", _) => {
                     let data: Value = serde_json::from_slice(message.payload())?;
                     debug!("stream-data: {smithy_type} {data}");
-                    match smithy_type {
-                        "contentBlockStart" => {
-                            if let Some(tool_use) = data["start"]["toolUse"].as_object() {
-                                if let (Some(id), Some(name)) = (
-                                    json_str_from_map(tool_use, "toolUseId"),
-                                    json_str_from_map(tool_use, "name"),
-                                ) {
-                                    if !function_name.is_empty() {
-                                        if function_arguments.is_empty() {
-                                            function_arguments = String::from("{}");
-                                        }
-                                        let arguments: Value =
-                                        function_arguments.parse().with_context(|| {
-                                            format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                                        })?;
-                                        handler.tool_call(ToolCall::new(
-                                            function_name.clone(),
-                                            arguments,
-                                            Some(function_id.clone()),
-                                            None,
-                                        ))?;
-                                    }
-                                    function_arguments.clear();
-                                    function_name = name.into();
-                                    function_id = id.into();
-                                }
-                            }
-                        }
-                        "contentBlockDelta" => {
-                            if let Some(text) = data["delta"]["text"].as_str() {
-                                handler.text(text)?;
-                            } else if let Some(text) =
-                                data["delta"]["reasoningContent"]["text"].as_str()
-                            {
-                                if reasoning_state == 0 {
-                                    handler.text("<think>\n")?;
-                                    reasoning_state = 1;
-                                }
-                                handler.text(text)?;
-                            } else if let Some(input) = data["delta"]["toolUse"]["input"].as_str() {
-                                function_arguments.push_str(input);
-                            }
-                        }
-                        "contentBlockStop" => {
-                            if reasoning_state == 1 {
-                                handler.text("\n</think>\n\n")?;
-                                reasoning_state = 0;
-                            }
-                            if !function_name.is_empty() {
-                                if function_arguments.is_empty() {
-                                    function_arguments = String::from("{}");
-                                }
-                                let arguments: Value = function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                                })?;
-                                handler.tool_call(ToolCall::new(
-                                    function_name.clone(),
-                                    arguments,
-                                    Some(function_id.clone()),
-                                    None,
-                                ))?;
-                            }
-                        }
-                        "metadata" => {
-                            handler.set_usage(
-                                data["usage"]["inputTokens"].as_u64(),
-                                data["usage"]["outputTokens"].as_u64(),
-                                data["usage"]["cacheReadInputTokens"].as_u64(),
-                            );
-                        }
-                        _ => {}
-                    }
+                    bedrock_handle_stream_event(&mut state, handler, smithy_type, &data)?;
                 }
                 ("exception", _) => {
                     let payload = base64_decode(message.payload())?;
@@ -642,4 +687,60 @@ fn gen_signing_key(key: &str, date_stamp: &str, region: &str, service: &str) -> 
     let k_region = hmac_sha256(&k_date, region);
     let k_service = hmac_sha256(&k_region, service);
     hmac_sha256(&k_service, "aws4_request")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::abort::create_abort_signal;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    /// Regression test: two toolUse blocks in one Bedrock streaming
+    /// response must not cause the first one to be emitted twice.
+    /// Mirrors the Claude parser fix — contentBlockStop now resets
+    /// accumulator state so contentBlockStart's fallback-emit path
+    /// doesn't re-fire the previous call.
+    #[test]
+    fn two_tool_uses_in_one_response_do_not_double_emit() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = BedrockStreamState::default();
+
+        let events: Vec<(&str, Value)> = vec![
+            (
+                "contentBlockStart",
+                json!({"start": {"toolUse": {"toolUseId": "toolu_A", "name": "Bash"}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"toolUse": {"input": "{\"command\": \"pwd\"}"}}}),
+            ),
+            ("contentBlockStop", json!({})),
+            (
+                "contentBlockStart",
+                json!({"start": {"toolUse": {"toolUseId": "toolu_B", "name": "Bash"}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"toolUse": {"input": "{\"command\": \"ls\"}"}}}),
+            ),
+            ("contentBlockStop", json!({})),
+        ];
+
+        for (smithy_type, data) in &events {
+            bedrock_handle_stream_event(&mut state, &mut handler, smithy_type, data)
+                .expect("stream event should process");
+        }
+
+        let ids: Vec<Option<&str>> = handler
+            .tool_calls()
+            .iter()
+            .map(|c| c.id.as_deref())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("toolu_A"), Some("toolu_B")],
+            "each toolUse block should be emitted exactly once"
+        );
+    }
 }

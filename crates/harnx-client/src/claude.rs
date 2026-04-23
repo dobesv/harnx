@@ -65,99 +65,162 @@ pub async fn claude_chat_completions(
     claude_extract_chat_completions(&data)
 }
 
+/// Mutable state threaded through the Claude streaming parser. Extracted
+/// from the `sse_stream` closure so the per-event logic is testable in
+/// isolation.
+#[derive(Default)]
+struct ClaudeStreamState {
+    function_name: String,
+    function_arguments: String,
+    function_id: String,
+    reasoning_state: i32,
+}
+
+fn claude_emit_pending_tool_call(
+    state: &mut ClaudeStreamState,
+    handler: &mut SseHandler,
+    empty_args_as_object: bool,
+) -> Result<()> {
+    if state.function_name.is_empty() {
+        return Ok(());
+    }
+    let arguments: Value = if empty_args_as_object && state.function_arguments.is_empty() {
+        json!({})
+    } else {
+        state.function_arguments.parse().with_context(|| {
+            format!(
+                "Tool call '{}' have non-JSON arguments '{}'",
+                state.function_name, state.function_arguments
+            )
+        })?
+    };
+    handler.tool_call(ToolCall::new(
+        state.function_name.clone(),
+        arguments,
+        Some(state.function_id.clone()),
+        None,
+    ))?;
+    state.function_name.clear();
+    state.function_arguments.clear();
+    state.function_id.clear();
+    Ok(())
+}
+
+/// Transition the reasoning-block bracket state. Emits `<think>\n` when
+/// opening and `\n</think>\n\n` when closing; no-op when already in the
+/// target state.
+fn claude_transition_reasoning(
+    state: &mut ClaudeStreamState,
+    handler: &mut SseHandler,
+    open: bool,
+) -> Result<()> {
+    let target: i32 = if open { 1 } else { 0 };
+    if state.reasoning_state == target {
+        return Ok(());
+    }
+    let bracket = if open { "<think>\n" } else { "\n</think>\n\n" };
+    handler.text(bracket)?;
+    state.reasoning_state = target;
+    Ok(())
+}
+
+fn claude_handle_content_block_start(
+    state: &mut ClaudeStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    let (Some("tool_use"), Some(name), Some(id)) = (
+        data["content_block"]["type"].as_str(),
+        data["content_block"]["name"].as_str(),
+        data["content_block"]["id"].as_str(),
+    ) else {
+        return Ok(());
+    };
+    // Fallback emit: the previous tool_use block never received a
+    // content_block_stop (some providers / proxy paths skip it).
+    // Normally content_block_stop clears the accumulators, so this
+    // path is dormant.
+    claude_emit_pending_tool_call(state, handler, false)?;
+    state.function_name = name.into();
+    state.function_arguments.clear();
+    state.function_id = id.into();
+    Ok(())
+}
+
+fn claude_handle_content_block_delta(
+    state: &mut ClaudeStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    let delta = &data["delta"];
+    if let Some(text) = delta["text"].as_str() {
+        handler.text(text)?;
+    } else if let Some(text) = delta["thinking"].as_str() {
+        claude_transition_reasoning(state, handler, true)?;
+        handler.text(text)?;
+    } else if let Some(partial_json) = delta["partial_json"]
+        .as_str()
+        .filter(|_| !state.function_name.is_empty())
+    {
+        state.function_arguments.push_str(partial_json);
+    }
+    Ok(())
+}
+
+fn claude_handle_content_block_stop(
+    state: &mut ClaudeStreamState,
+    handler: &mut SseHandler,
+) -> Result<()> {
+    claude_transition_reasoning(state, handler, false)?;
+    // Emit if a tool_use block is pending, and reset accumulators so
+    // the fallback emit path in content_block_start doesn't re-fire
+    // this same call when the next tool_use block begins.
+    claude_emit_pending_tool_call(state, handler, true)
+}
+
+fn claude_handle_stream_event(
+    state: &mut ClaudeStreamState,
+    handler: &mut SseHandler,
+    data: &Value,
+) -> Result<()> {
+    let Some(typ) = data["type"].as_str() else {
+        return Ok(());
+    };
+    match typ {
+        "message_start" => {
+            handler.set_usage(
+                data["message"]["usage"]["input_tokens"].as_u64(),
+                None,
+                data["message"]["usage"]["cache_read_input_tokens"].as_u64(),
+            );
+        }
+        "message_delta" => {
+            // message_delta usage fields are cumulative and override
+            // earlier values from message_start when present
+            handler.set_usage(
+                data["usage"]["input_tokens"].as_u64(),
+                data["usage"]["output_tokens"].as_u64(),
+                data["usage"]["cache_read_input_tokens"].as_u64(),
+            );
+        }
+        "content_block_start" => claude_handle_content_block_start(state, handler, data)?,
+        "content_block_delta" => claude_handle_content_block_delta(state, handler, data)?,
+        "content_block_stop" => claude_handle_content_block_stop(state, handler)?,
+        _ => {}
+    }
+    Ok(())
+}
+
 pub async fn claude_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
     _model: &Model,
 ) -> Result<()> {
-    let mut function_name = String::new();
-    let mut function_arguments = String::new();
-    let mut function_id = String::new();
-    let mut reasoning_state = 0;
+    let mut state = ClaudeStreamState::default();
     let handle = |message: SseMmessage| -> Result<bool> {
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
-        if let Some(typ) = data["type"].as_str() {
-            match typ {
-                "message_start" => {
-                    handler.set_usage(
-                        data["message"]["usage"]["input_tokens"].as_u64(),
-                        None,
-                        data["message"]["usage"]["cache_read_input_tokens"].as_u64(),
-                    );
-                }
-                "message_delta" => {
-                    // message_delta usage fields are cumulative and override
-                    // earlier values from message_start when present
-                    handler.set_usage(
-                        data["usage"]["input_tokens"].as_u64(),
-                        data["usage"]["output_tokens"].as_u64(),
-                        data["usage"]["cache_read_input_tokens"].as_u64(),
-                    );
-                }
-                "content_block_start" => {
-                    if let (Some("tool_use"), Some(name), Some(id)) = (
-                        data["content_block"]["type"].as_str(),
-                        data["content_block"]["name"].as_str(),
-                        data["content_block"]["id"].as_str(),
-                    ) {
-                        if !function_name.is_empty() {
-                            let arguments: Value =
-                                function_arguments.parse().with_context(|| {
-                                    format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                                })?;
-                            handler.tool_call(ToolCall::new(
-                                function_name.clone(),
-                                arguments,
-                                Some(function_id.clone()),
-                                None,
-                            ))?;
-                        }
-                        function_name = name.into();
-                        function_arguments.clear();
-                        function_id = id.into();
-                    }
-                }
-                "content_block_delta" => {
-                    if let Some(text) = data["delta"]["text"].as_str() {
-                        handler.text(text)?;
-                    } else if let Some(text) = data["delta"]["thinking"].as_str() {
-                        if reasoning_state == 0 {
-                            handler.text("<think>\n")?;
-                            reasoning_state = 1;
-                        }
-                        handler.text(text)?;
-                    } else if let (true, Some(partial_json)) = (
-                        !function_name.is_empty(),
-                        data["delta"]["partial_json"].as_str(),
-                    ) {
-                        function_arguments.push_str(partial_json);
-                    }
-                }
-                "content_block_stop" => {
-                    if reasoning_state == 1 {
-                        handler.text("\n</think>\n\n")?;
-                        reasoning_state = 0;
-                    }
-                    if !function_name.is_empty() {
-                        let arguments: Value = if function_arguments.is_empty() {
-                            json!({})
-                        } else {
-                            function_arguments.parse().with_context(|| {
-                                format!("Tool call '{function_name}' have non-JSON arguments '{function_arguments}'")
-                            })?
-                        };
-                        handler.tool_call(ToolCall::new(
-                            function_name.clone(),
-                            arguments,
-                            Some(function_id.clone()),
-                            None,
-                        ))?;
-                    }
-                }
-                _ => {}
-            }
-        }
+        claude_handle_stream_event(&mut state, handler, &data)?;
         Ok(false)
     };
 
@@ -387,6 +450,61 @@ system_prompt_prefix:
         assert_eq!(
             config.system_prompt_prefix,
             Some(vec!["identity".to_string(), "extra".to_string()])
+        );
+    }
+
+    /// Regression test for a Claude streaming parser bug where two
+    /// tool_use blocks in the same response caused the first one to be
+    /// emitted twice. Root cause: `content_block_stop` emitted the
+    /// tool_call but left `function_name` populated, so the next
+    /// `content_block_start` saw non-empty state and re-emitted the
+    /// same call via its "missed stop event" fallback path.
+    #[test]
+    fn two_tool_uses_in_one_response_do_not_double_emit() {
+        use harnx_core::abort::create_abort_signal;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = ClaudeStreamState::default();
+
+        let events = [
+            json!({
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "Bash", "id": "toolu_A"}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "delta": {"partial_json": "{\"command\": \"pwd\"}"}
+            }),
+            json!({"type": "content_block_stop"}),
+            // Before the fix, this content_block_start re-emitted id=A
+            // because function_name was still populated.
+            json!({
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "Bash", "id": "toolu_B"}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "delta": {"partial_json": "{\"command\": \"ls\"}"}
+            }),
+            json!({"type": "content_block_stop"}),
+        ];
+
+        for event in &events {
+            claude_handle_stream_event(&mut state, &mut handler, event)
+                .expect("stream event should process");
+        }
+
+        let ids: Vec<Option<&str>> = handler
+            .tool_calls()
+            .iter()
+            .map(|c| c.id.as_deref())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![Some("toolu_A"), Some("toolu_B")],
+            "each tool_use block should be emitted exactly once"
         );
     }
 

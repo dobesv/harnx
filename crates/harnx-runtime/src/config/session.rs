@@ -739,13 +739,20 @@ pub fn add_tool_calls(
     thought: Option<&str>,
     calls: &[crate::tool::ToolCall],
 ) -> Result<()> {
+    // Dedup matches what `eval_tool_calls` does before execution. Keeping
+    // the two in sync means pending slots, the tool_calls log entry, and
+    // the eventual tool_results all describe the same set of calls —
+    // otherwise duplicate-id calls from the LLM leave orphan pending
+    // slots that persist as "tool response pending" placeholders in the
+    // log (issue: multiple results with the same id sent to the LLM).
+    let calls = crate::tool::ToolCall::dedup(calls.to_vec());
     let mut all_appended = begin_turn(session, input, output);
     all_appended &= append_event(
         session,
         &SessionLogEntry::ToolCalls {
             text: output.to_string(),
             thought: thought.map(str::to_string),
-            calls: calls.to_vec(),
+            calls: calls.clone(),
         },
     );
     // Push a pending Tool message.  Outputs are filled in by
@@ -754,8 +761,7 @@ pub fn add_tool_calls(
     // matching add_tool_results call), the next LLM replay sees
     // well-formed content instead of nulls.
     let pending_results: Vec<crate::tool::ToolResult> = calls
-        .iter()
-        .cloned()
+        .into_iter()
         .map(|call| {
             crate::tool::ToolResult::new(
                 call,
@@ -1095,6 +1101,98 @@ mod tests {
         assert_eq!(
             session.messages.last().unwrap().content.to_text(),
             "final answer"
+        );
+    }
+
+    /// Regression test: when the LLM emits multiple tool calls with
+    /// the same id (rare but observed, e.g. around agent handoffs),
+    /// `eval_tool_calls` dedupes before execution. `add_tool_calls`
+    /// must dedup identically so the pending slots / log entries match
+    /// the eventual results — otherwise the unmatched pending slot
+    /// persists as a "tool response pending" placeholder and the LLM
+    /// sees two results with the same tool_use_id on the next turn.
+    #[test]
+    fn add_tool_calls_dedupes_duplicate_ids() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+        let input = crate::config::input::from_str(&global_config, "run bash", Some(agent));
+
+        // Two calls share an id (LLM bug); one has a unique id.
+        let dup_1 = ToolCall {
+            name: "Bash".to_string(),
+            arguments: json!({"command": "pwd"}),
+            id: Some("toolu_dup".to_string()),
+            thought_signature: None,
+        };
+        let dup_2 = ToolCall {
+            name: "Bash".to_string(),
+            arguments: json!({"command": "ls"}),
+            id: Some("toolu_dup".to_string()),
+            thought_signature: None,
+        };
+        let unique = ToolCall {
+            name: "Bash".to_string(),
+            arguments: json!({"command": "echo hi"}),
+            id: Some("toolu_unique".to_string()),
+            thought_signature: None,
+        };
+
+        super::add_tool_calls(
+            &mut session,
+            &input,
+            "calling tools",
+            None,
+            &[dup_1, dup_2.clone(), unique.clone()],
+        )
+        .unwrap();
+
+        // Simulate eval_tool_calls's dedup: it keeps the LAST call for
+        // each duplicate id, so the executor runs dup_2 and unique.
+        let results = vec![
+            ToolResult::new(dup_2, json!({"stdout": "ls-output"})),
+            ToolResult::new(unique, json!({"stdout": "hi"})),
+        ];
+        super::add_tool_results(&mut session, &results).unwrap();
+
+        // In-memory state should have exactly 2 slots — no orphan pending.
+        let last = session.messages.last().unwrap();
+        let MessageContent::ToolCalls(tc) = &last.content else {
+            panic!("expected ToolCalls content");
+        };
+        assert_eq!(
+            tc.tool_results.len(),
+            2,
+            "pending slots should be deduped to match eval_tool_calls"
+        );
+        for slot in &tc.tool_results {
+            let output_str = slot.output.to_string();
+            assert!(
+                !output_str.contains("tool response pending"),
+                "no slot should retain the pending placeholder, got: {output_str}"
+            );
+        }
+
+        // The on-disk log must not contain the pending-placeholder string.
+        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(
+            !content.contains("tool response pending"),
+            "log should never persist pending-placeholder outputs, got:\n{content}"
+        );
+
+        // And the tool_results entry should contain two unique ids, not three.
+        let dup_id_occurrences = content.matches("toolu_dup").count();
+        assert_eq!(
+            dup_id_occurrences, 2,
+            "toolu_dup should appear once in tool_calls and once in tool_results (not more)"
         );
     }
 

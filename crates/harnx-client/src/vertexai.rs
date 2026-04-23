@@ -183,6 +183,56 @@ pub async fn gemini_chat_completions(
     gemini_extract_chat_completions_text(&data)
 }
 
+fn gemini_handle_part(handler: &mut SseHandler, part: &Value, index: usize) -> Result<()> {
+    if let Some(text) = part["text"].as_str() {
+        if index > 0 {
+            handler.text("\n\n")?;
+        }
+        handler.text(text)?;
+    } else if let Some(thought) = part["thought"].as_str() {
+        handler.thought(thought)?;
+    } else if let (Some(name), Some(args)) = (
+        part["functionCall"]["name"].as_str(),
+        part["functionCall"]["args"].as_object(),
+    ) {
+        let thought_signature = part["thoughtSignature"]
+            .as_str()
+            .or_else(|| part["thought_signature"].as_str())
+            .map(|v| v.to_string());
+        handler.tool_call(ToolCall::new(
+            name.to_string(),
+            json!(args),
+            None,
+            thought_signature,
+        ))?;
+    }
+    Ok(())
+}
+
+/// Process one parsed chunk from a Gemini streaming response. Extracted
+/// so per-chunk handling is testable in isolation. Unlike Claude/Bedrock
+/// /OpenAI, Gemini has no accumulator state — each chunk carries complete
+/// parts — so no state struct is needed.
+fn gemini_handle_stream_chunk(handler: &mut SseHandler, data: &Value) -> Result<()> {
+    if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
+        for (i, part) in parts.iter().enumerate() {
+            gemini_handle_part(handler, part, i)?;
+        }
+    } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
+        .as_str()
+        .or_else(|| data["candidates"][0]["finishReason"].as_str())
+    {
+        bail!("Blocked due to safety")
+    }
+    handler.set_usage(
+        data["usageMetadata"]["promptTokenCount"].as_u64(),
+        data["usageMetadata"]["candidatesTokenCount"].as_u64(),
+        data["usageMetadata"]["cachedContentTokenCount"].as_u64(),
+    );
+
+    Ok(())
+}
+
 pub async fn gemini_chat_completions_streaming(
     builder: RequestBuilder,
     handler: &mut SseHandler,
@@ -198,44 +248,7 @@ pub async fn gemini_chat_completions_streaming(
         let handle = |value: &str| -> Result<()> {
             let data: Value = serde_json::from_str(value)?;
             debug!("stream-data: {data}");
-            if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
-                for (i, part) in parts.iter().enumerate() {
-                    if let Some(text) = part["text"].as_str() {
-                        if i > 0 {
-                            handler.text("\n\n")?;
-                        }
-                        handler.text(text)?;
-                    } else if let Some(thought) = part["thought"].as_str() {
-                        handler.thought(thought)?;
-                    } else if let (Some(name), Some(args)) = (
-                        part["functionCall"]["name"].as_str(),
-                        part["functionCall"]["args"].as_object(),
-                    ) {
-                        let thought_signature = part["thoughtSignature"]
-                            .as_str()
-                            .or_else(|| part["thought_signature"].as_str())
-                            .map(|v| v.to_string());
-                        handler.tool_call(ToolCall::new(
-                            name.to_string(),
-                            json!(args),
-                            None,
-                            thought_signature,
-                        ))?;
-                    }
-                }
-            } else if let Some("SAFETY") = data["promptFeedback"]["blockReason"]
-                .as_str()
-                .or_else(|| data["candidates"][0]["finishReason"].as_str())
-            {
-                bail!("Blocked due to safety")
-            }
-            handler.set_usage(
-                data["usageMetadata"]["promptTokenCount"].as_u64(),
-                data["usageMetadata"]["candidatesTokenCount"].as_u64(),
-                data["usageMetadata"]["cachedContentTokenCount"].as_u64(),
-            );
-
-            Ok(())
+            gemini_handle_stream_chunk(handler, &data)
         };
         json_stream(res.bytes_stream(), handle).await?;
     }
@@ -586,5 +599,73 @@ fn strip_model_version(name: &str) -> &str {
     match name.split_once('@') {
         Some((v, _)) => v,
         None => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_core::abort::create_abort_signal;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    /// Regression guard: two functionCalls in one Gemini streaming
+    /// response (arriving as two separate chunks) must emit each
+    /// exactly once. Unlike Claude/Bedrock, Gemini chunks are
+    /// self-contained so there's no accumulator to leak between
+    /// calls — this test locks that invariant in.
+    #[test]
+    fn two_function_calls_in_one_response_do_not_double_emit() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+
+        let chunks = [
+            json!({
+                "candidates": [{"content": {"parts": [{
+                    "functionCall": {"name": "Bash", "args": {"cmd": "pwd"}}
+                }]}}]
+            }),
+            json!({
+                "candidates": [{"content": {"parts": [{
+                    "functionCall": {"name": "Bash", "args": {"cmd": "ls"}}
+                }]}}]
+            }),
+        ];
+
+        for chunk in &chunks {
+            gemini_handle_stream_chunk(&mut handler, chunk)
+                .expect("stream chunk should process");
+        }
+
+        let calls = handler.tool_calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "each functionCall chunk must be emitted exactly once"
+        );
+        assert_eq!(calls[0].arguments, json!({"cmd": "pwd"}));
+        assert_eq!(calls[1].arguments, json!({"cmd": "ls"}));
+    }
+
+    /// Regression guard: two functionCalls delivered in the SAME chunk
+    /// (Gemini sometimes batches parts) must still emit as two distinct
+    /// calls.
+    #[test]
+    fn two_function_calls_in_one_chunk_do_not_double_emit() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+
+        let chunk = json!({
+            "candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "Bash", "args": {"cmd": "pwd"}}},
+                {"functionCall": {"name": "Bash", "args": {"cmd": "ls"}}}
+            ]}}]
+        });
+
+        gemini_handle_stream_chunk(&mut handler, &chunk).expect("stream chunk should process");
+
+        let calls = handler.tool_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments, json!({"cmd": "pwd"}));
+        assert_eq!(calls[1].arguments, json!({"cmd": "ls"}));
     }
 }

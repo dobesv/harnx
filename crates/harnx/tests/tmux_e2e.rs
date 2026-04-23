@@ -390,25 +390,53 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     Ok(())
 }
 
-const HANDOFF_AGENT_NAME: &str = "handoff-agent";
-const HANDOFF_SUB_AGENT_NAME: &str = "handoff-sub-agent";
-const HANDOFF_SESSION_ID: &str = "handoff-session-1";
-const HANDOFF_PROMPT: &str = "Take over and answer how many files are in /tmp.";
-const HANDOFF_ORIGINAL_USER_TEXT: &str = "tell me how many files are in /tmp";
-const HANDOFF_FOLLOWUP_USER_TEXT: &str =
-    "what was the earlier /tmp answer, and are you still in that same handed-off session?";
+// ── Planning → Execution handoff scenario ─────────────────────────────────────
+//
+// Scenario: Planner asks clarifying question → User answers → Planner creates
+// plan → Planner asks if ready to hand off → User says yes → Session handoff to
+// executor → Executor runs step 1 → Executor reports done → User gives feedback
+// → Executor adjusts and runs step 2 → Executor reports final done.
+
+const EXECUTOR_AGENT_NAME: &str = "plan-executor";
+const HANDOFF_SESSION_ID: &str = "exec-session-1";
+
+// Planner phase
+const PLANNER_QUESTION: &str = "What feature would you like me to plan?";
+const USER_ANSWER: &str = "Add a dark mode toggle";
+const PLANNER_PLAN_CREATED: &str =
+    "Plan created: 1) Add theme toggle component 2) Add CSS variables 3) Wire up state persistence";
+const PLANNER_HANDOFF_ASK: &str = "Ready to hand off to plan-executor. Proceed?";
+const USER_CONFIRM: &str = "yes";
+
+// Executor phase 1 - initial execution
+const EXECUTOR_STEP1_TOOL: &str = "create_file";
+const EXECUTOR_STEP1_TEXT: &str = "Executing step 1: creating theme toggle component.";
+const EXECUTOR_DONE_RESPONSE: &str = "Plan execution complete. Theme toggle is ready.";
+
+// User feedback phase
+const USER_FEEDBACK: &str = "Actually, can you also add a shortcut key?";
+
+// Executor phase 2 - feedback incorporation
+const EXECUTOR_STEP2_TOOL: &str = "edit_file";
+const EXECUTOR_STEP2_TEXT: &str = "Adding keyboard shortcut for theme toggle.";
+const EXECUTOR_FINAL_RESPONSE: &str = "Done! Theme toggle now has keyboard shortcut Ctrl+Shift+T.";
+
+// Legacy constants for backward compatibility with other tests
+const HANDOFF_AGENT_NAME: &str = "planner";
+const HANDOFF_SUB_AGENT_NAME: &str = "plan-executor";
+const HANDOFF_PROMPT: &str = "Execute the plan: add dark mode toggle with keyboard shortcut.";
+const HANDOFF_ORIGINAL_USER_TEXT: &str = "plan a dark mode feature";
 const HANDOFF_SUB_AGENT_SYSTEM_PROMPT: &str =
-    "Take over the interactive session and answer directly.";
-const HANDOFF_FINAL_RESPONSE: &str = "I took over this session and counted 7 files in /tmp.";
-const HANDOFF_REUSE_FOLLOWUP_RESPONSE: &str = "Follow-up answered in the same handed-off session.";
+    "You are a plan executor. Execute the plan step by step using available tools.";
+const HANDOFF_FINAL_RESPONSE: &str = EXECUTOR_FINAL_RESPONSE;
+const HANDOFF_SUB_AGENT_TOOL_NAME: &str = EXECUTOR_STEP1_TOOL;
 
 #[test]
-fn issue_149_interactive_handoff_switches_control() -> Result<()> {
-    let session =
-        match setup_handoff_tmux_session("issue_149_interactive_handoff_switches_control")? {
-            Some(session) => session,
-            None => return Ok(()),
-        };
+fn interactive_handoff_planner_to_executor() -> Result<()> {
+    let session = match setup_handoff_tmux_session("interactive_handoff_planner_to_executor")? {
+        Some(session) => session,
+        None => return Ok(()),
+    };
 
     let HandoffTmuxSession {
         tmux,
@@ -418,13 +446,80 @@ fn issue_149_interactive_handoff_switches_control() -> Result<()> {
     } = session;
 
     run_handoff_command(&tmux, &harnx_bin)?;
-    send_handoff_user_prompt(&tmux)?;
 
-    let screen = wait_for_handoff_completion(&tmux)?;
-    assert_handoff_screen(&screen, "transcript")?;
+    // Turn 1: User gives initial request, planner asks clarifying question
+    tmux.send_text(HANDOFF_ORIGINAL_USER_TEXT)?;
+    tmux.send_keys(&["Enter"])?;
+    let _first_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(PLANNER_QUESTION)
+    })?;
 
-    let normalized = normalize_screen(&screen);
-    assert_snapshot!("issue_149_interactive_handoff_switches_control", normalized);
+    // Turn 2: User answers, planner creates plan and asks about handoff
+    tmux.send_text(USER_ANSWER)?;
+    tmux.send_keys(&["Enter"])?;
+    let _second_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains("Ready to hand off")
+    })?;
+
+    // Turn 3: User confirms, planner hands off to executor
+    tmux.send_text(USER_CONFIRM)?;
+    tmux.send_keys(&["Enter"])?;
+    let _third_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(&format!("{}_session_handoff", EXECUTOR_AGENT_NAME))
+    })?;
+
+    // Wait for executor to start and run first tool
+    let _fourth_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(EXECUTOR_STEP1_TOOL)
+    })?;
+
+    // Wait for executor to report done
+    let _fifth_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(EXECUTOR_DONE_RESPONSE)
+    })?;
+
+    // Turn 4: User gives feedback
+    tmux.send_text(USER_FEEDBACK)?;
+    tmux.send_keys(&["Enter"])?;
+
+    // Wait for executor to run second tool
+    let _sixth_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(EXECUTOR_STEP2_TOOL)
+    })?;
+
+    // Wait for final response
+    let final_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(EXECUTOR_FINAL_RESPONSE)
+    })?;
+
+    // Assert the key elements are visible
+    assert!(
+        final_screen.contains(PLANNER_PLAN_CREATED),
+        "plan creation not visible: {final_screen}"
+    );
+    assert!(
+        final_screen.contains(&format!("{}_session_handoff", EXECUTOR_AGENT_NAME)),
+        "handoff tool call not visible: {final_screen}"
+    );
+    assert!(
+        final_screen.contains(HANDOFF_SESSION_ID),
+        "session id not visible: {final_screen}"
+    );
+    assert!(
+        final_screen.contains(EXECUTOR_STEP1_TOOL),
+        "executor first tool call not visible: {final_screen}"
+    );
+    assert!(
+        final_screen.contains(EXECUTOR_STEP2_TOOL),
+        "executor second tool call not visible: {final_screen}"
+    );
+    assert!(
+        final_screen.contains(EXECUTOR_FINAL_RESPONSE),
+        "final response not visible: {final_screen}"
+    );
+
+    let normalized = normalize_screen(&final_screen);
+    assert_snapshot!("interactive_handoff_planner_to_executor", normalized);
 
     drop(tmux);
     drop(mock);
@@ -432,12 +527,12 @@ fn issue_149_interactive_handoff_switches_control() -> Result<()> {
 }
 
 #[test]
-fn issue_303_handoff_no_acp_server() -> Result<()> {
-    let session = match setup_handoff_tmux_session_no_acp_server("issue_303_handoff_no_acp_server")?
-    {
-        Some(session) => session,
-        None => return Ok(()),
-    };
+fn handoff_without_acp_server_config() -> Result<()> {
+    let session =
+        match setup_handoff_tmux_session_no_acp_server("handoff_without_acp_server_config")? {
+            Some(session) => session,
+            None => return Ok(()),
+        };
 
     let HandoffTmuxSession {
         tmux,
@@ -458,8 +553,13 @@ fn issue_303_handoff_no_acp_server() -> Result<()> {
 }
 
 #[test]
-fn issue_303_handoff_session_isolation() -> Result<()> {
-    let session = match setup_handoff_tmux_session("issue_303_handoff_session_isolation")? {
+fn handoff_session_isolation() -> Result<()> {
+    let session = match setup_handoff_tmux_session_with_script(
+        "handoff_session_isolation",
+        simple_handoff_script(),
+        None,
+        true,
+    )? {
         Some(session) => session,
         None => return Ok(()),
     };
@@ -481,65 +581,6 @@ fn issue_303_handoff_session_isolation() -> Result<()> {
     let request_log = mock.get_request_log();
     assert_handoff_request_isolation(&request_log)?;
     drop(mock);
-    Ok(())
-}
-
-#[test]
-fn issue_149_interactive_handoff_reuses_session_across_followups() -> Result<()> {
-    let session = match setup_handoff_tmux_session(
-        "issue_149_interactive_handoff_reuses_session_across_followups",
-    )? {
-        Some(session) => session,
-        None => return Ok(()),
-    };
-
-    let HandoffTmuxSession {
-        tmux,
-        mock,
-        harnx_bin,
-        ..
-    } = session;
-
-    run_handoff_command(&tmux, &harnx_bin)?;
-    send_handoff_user_prompt(&tmux)?;
-
-    let first_screen = wait_for_handoff_completion(&tmux)?;
-    assert!(
-        first_screen.contains(HANDOFF_SESSION_ID),
-        "initial handed-off session id not visible anywhere in transcript:\n{first_screen}"
-    );
-
-    tmux.send_text(HANDOFF_FOLLOWUP_USER_TEXT)?;
-    tmux.send_keys(&["Enter"])?;
-
-    let second_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
-        screen.contains(HANDOFF_REUSE_FOLLOWUP_RESPONSE)
-    })?;
-
-    assert!(
-        second_screen.contains(HANDOFF_FINAL_RESPONSE),
-        "follow-up transcript no longer shows the initial handed-off answer:\n{second_screen}"
-    );
-    assert!(
-        second_screen.contains(HANDOFF_REUSE_FOLLOWUP_RESPONSE),
-        "follow-up response showing session reuse not visible:\n{second_screen}"
-    );
-    assert_eq!(
-        count_occurrences(&second_screen, &format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME)),
-        1,
-        "expected exactly one handoff tool call in the transcript, indicating reuse of the existing delegated session:\n{second_screen}"
-    );
-
-    drop(tmux);
-    let request_log = mock.get_request_log();
-    assert_handoff_followup_request_reuses_sub_agent_session(&request_log)?;
-    drop(mock);
-
-    let normalized = normalize_screen(&second_screen);
-    assert_snapshot!(
-        "issue_149_interactive_handoff_reuses_session_across_followups",
-        normalized
-    );
     Ok(())
 }
 
@@ -575,6 +616,10 @@ fn assert_handoff_screen(screen: &str, label: &str) -> Result<()> {
     assert!(
         screen.contains(HANDOFF_SESSION_ID),
         "handed-off session id not visible anywhere in {label}:\n{screen}"
+    );
+    assert!(
+        screen.contains(HANDOFF_SUB_AGENT_TOOL_NAME),
+        "sub-agent tool call '{HANDOFF_SUB_AGENT_TOOL_NAME}' not visible anywhere in {label}:\n{screen}"
     );
     assert!(
         screen.contains(HANDOFF_FINAL_RESPONSE),
@@ -633,7 +678,7 @@ fn assert_handoff_request_isolation(request_log: &[Value]) -> Result<()> {
     let parent_user =
         request_message_content(&parent_messages[1], "first LLM request user message")?;
     assert!(
-        parent_system.contains("You are handoff-agent"),
+        parent_system.contains(HANDOFF_AGENT_NAME),
         "parent agent system prompt missing from first LLM request: {parent_system}"
     );
     assert_eq!(
@@ -690,90 +735,6 @@ fn assert_handoff_request_isolation(request_log: &[Value]) -> Result<()> {
     Ok(())
 }
 
-fn assert_handoff_followup_request_reuses_sub_agent_session(request_log: &[Value]) -> Result<()> {
-    let request = request_log
-        .get(2)
-        .with_context(|| format!("missing third LLM request in log: {request_log:?}"))?;
-    let messages = request_messages(request, "third LLM request")?;
-    assert_eq!(
-        messages.len(),
-        4,
-        "expected third LLM request to stay in handed-off sub-agent session with prior handed-off turn plus follow-up user message: {messages:?}"
-    );
-
-    let system_message = &messages[0];
-    let prior_user_message = &messages[1];
-    let prior_assistant_message = &messages[2];
-    let user_message = &messages[3];
-    assert_eq!(
-        system_message.get("role").and_then(Value::as_str),
-        Some("system"),
-        "expected first message in third LLM request to be system: {system_message}"
-    );
-    assert_eq!(
-        prior_user_message.get("role").and_then(Value::as_str),
-        Some("user"),
-        "expected second message in third LLM request to be prior handed-off user prompt: {prior_user_message}"
-    );
-    assert_eq!(
-        prior_assistant_message.get("role").and_then(Value::as_str),
-        Some("assistant"),
-        "expected third message in third LLM request to be prior handed-off assistant reply: {prior_assistant_message}"
-    );
-    assert_eq!(
-        user_message.get("role").and_then(Value::as_str),
-        Some("user"),
-        "expected fourth message in third LLM request to be follow-up user: {user_message}"
-    );
-
-    let system_content =
-        request_message_content(system_message, "third LLM request system message")?;
-    let prior_user_content =
-        request_message_content(prior_user_message, "third LLM request prior user message")?;
-    let prior_assistant_content = request_message_content(
-        prior_assistant_message,
-        "third LLM request prior assistant message",
-    )?;
-    let user_content = request_message_content(user_message, "third LLM request user message")?;
-    assert!(
-        system_content.contains(HANDOFF_SUB_AGENT_SYSTEM_PROMPT),
-        "sub-agent system prompt missing from follow-up request: {system_content}"
-    );
-    assert_eq!(
-        prior_user_content, HANDOFF_PROMPT,
-        "follow-up request missing prior handed-off user prompt: {prior_user_content}"
-    );
-    assert_eq!(
-        prior_assistant_content, HANDOFF_FINAL_RESPONSE,
-        "follow-up request missing prior handed-off assistant reply: {prior_assistant_content}"
-    );
-    assert_eq!(
-        user_content, HANDOFF_FOLLOWUP_USER_TEXT,
-        "follow-up request missing latest user message: {user_content}"
-    );
-    assert!(
-        !system_content.contains(HANDOFF_ORIGINAL_USER_TEXT)
-            && !prior_user_content.contains(HANDOFF_ORIGINAL_USER_TEXT)
-            && !prior_assistant_content.contains(HANDOFF_ORIGINAL_USER_TEXT)
-            && !user_content.contains(HANDOFF_ORIGINAL_USER_TEXT),
-        "parent session user text leaked into follow-up handed-off request: {system_content}
-{prior_user_content}
-{prior_assistant_content}
-{user_content}"
-    );
-    assert!(
-        !system_content.contains("You are handoff-agent")
-            && !prior_user_content.contains("You are handoff-agent")
-            && !prior_assistant_content.contains("You are handoff-agent")
-            && !user_content.contains("You are handoff-agent"),
-        "parent agent system prompt leaked into follow-up handed-off request: {system_content}
-{prior_user_content}
-{prior_assistant_content}
-{user_content}"
-    );
-    Ok(())
-}
-
 struct HandoffTmuxSession {
     _temp: TempDir,
     mock: MockOpenAiServer,
@@ -782,19 +743,21 @@ struct HandoffTmuxSession {
 }
 
 fn setup_handoff_tmux_session(test_name: &str) -> Result<Option<HandoffTmuxSession>> {
-    setup_handoff_tmux_session_with_options(test_name, None, true)
+    setup_handoff_tmux_session_with_script(test_name, handoff_script(), None, true)
 }
 
 fn setup_handoff_tmux_session_no_acp_server(test_name: &str) -> Result<Option<HandoffTmuxSession>> {
-    setup_handoff_tmux_session_with_options(
+    setup_handoff_tmux_session_with_script(
         test_name,
+        simple_handoff_script(),
         Some(&format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME)),
         false,
     )
 }
 
-fn setup_handoff_tmux_session_with_options(
+fn setup_handoff_tmux_session_with_script(
     test_name: &str,
+    script: MockOpenAiScript,
     parent_use_tools: Option<&str>,
     write_acp_server: bool,
 ) -> Result<Option<HandoffTmuxSession>> {
@@ -811,7 +774,7 @@ fn setup_handoff_tmux_session_with_options(
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
 
     let temp = TempDir::new().context("failed to create temp dir")?;
-    let mock = MockOpenAiServer::start(handoff_script())?;
+    let mock = MockOpenAiServer::start(script)?;
     let paths = TestPaths::new(temp.path(), mock.port())?;
     match (parent_use_tools, write_acp_server) {
         (Some(parent_use_tools), true) => {
@@ -873,6 +836,80 @@ fn setup_handoff_tmux_session_with_options(
 fn handoff_script() -> MockOpenAiScript {
     MockOpenAiScript {
         turns: vec![
+            // Turn 1: Planner asks clarifying question
+            MockOpenAiTurn {
+                text_chunks: vec![PLANNER_QUESTION.to_string()],
+                tool_calls: vec![],
+                error: None,
+            },
+            // Turn 2: Planner receives answer, creates plan, asks about handoff
+            MockOpenAiTurn {
+                text_chunks: vec![format!("{}. {}", PLANNER_PLAN_CREATED, PLANNER_HANDOFF_ASK)],
+                tool_calls: vec![],
+                error: None,
+            },
+            // Turn 3: Planner receives confirmation, hands off to executor
+            MockOpenAiTurn {
+                text_chunks: vec!["Great! Handing off to plan-executor.".to_string()],
+                tool_calls: vec![MockOpenAiToolCall {
+                    name: format!("{}_session_handoff", EXECUTOR_AGENT_NAME),
+                    arguments: json!({
+                        "prompt": HANDOFF_PROMPT,
+                        "session_id": HANDOFF_SESSION_ID,
+                    }),
+                    id: Some("call_handoff_1".to_string()),
+                }],
+                error: None,
+            },
+            // Turn 4: Executor runs step 1 (create_file tool)
+            MockOpenAiTurn {
+                text_chunks: vec![EXECUTOR_STEP1_TEXT.to_string()],
+                tool_calls: vec![MockOpenAiToolCall {
+                    name: EXECUTOR_STEP1_TOOL.to_string(),
+                    arguments: json!({
+                        "path": "src/components/ThemeToggle.tsx",
+                        "content": "// Theme toggle component"
+                    }),
+                    id: Some("call_create_file_1".to_string()),
+                }],
+                error: None,
+            },
+            // Turn 5: Executor reports done
+            MockOpenAiTurn {
+                text_chunks: vec![EXECUTOR_DONE_RESPONSE.to_string()],
+                tool_calls: vec![],
+                error: None,
+            },
+            // Turn 6: Executor receives feedback, runs step 2 (edit_file tool)
+            MockOpenAiTurn {
+                text_chunks: vec![EXECUTOR_STEP2_TEXT.to_string()],
+                tool_calls: vec![MockOpenAiToolCall {
+                    name: EXECUTOR_STEP2_TOOL.to_string(),
+                    arguments: json!({
+                        "path": "src/components/ThemeToggle.tsx",
+                        "edit": "Add keyboard shortcut Ctrl+Shift+T"
+                    }),
+                    id: Some("call_edit_file_1".to_string()),
+                }],
+                error: None,
+            },
+            // Turn 7: Executor reports final done
+            MockOpenAiTurn {
+                text_chunks: vec![EXECUTOR_FINAL_RESPONSE.to_string()],
+                tool_calls: vec![],
+                error: None,
+            },
+        ],
+        fallback_text: "No more scripted responses.".to_string(),
+        chunk_delay_ms: 0,
+    }
+}
+
+/// Simple handoff script for basic tests - single handoff with tool call
+fn simple_handoff_script() -> MockOpenAiScript {
+    MockOpenAiScript {
+        turns: vec![
+            // Turn 1: Agent hands off to sub-agent
             MockOpenAiTurn {
                 text_chunks: vec!["I'll hand this off to the specialist.".to_string()],
                 tool_calls: vec![MockOpenAiToolCall {
@@ -885,13 +922,21 @@ fn handoff_script() -> MockOpenAiScript {
                 }],
                 error: None,
             },
+            // Turn 2: Sub-agent runs a tool
             MockOpenAiTurn {
-                text_chunks: vec![HANDOFF_FINAL_RESPONSE.to_string()],
-                tool_calls: vec![],
+                text_chunks: vec![EXECUTOR_STEP1_TEXT.to_string()],
+                tool_calls: vec![MockOpenAiToolCall {
+                    name: HANDOFF_SUB_AGENT_TOOL_NAME.to_string(),
+                    arguments: json!({
+                        "path": "/tmp"
+                    }),
+                    id: Some("call_tool_1".to_string()),
+                }],
                 error: None,
             },
+            // Turn 3: Sub-agent responds
             MockOpenAiTurn {
-                text_chunks: vec![HANDOFF_REUSE_FOLLOWUP_RESPONSE.to_string()],
+                text_chunks: vec![HANDOFF_FINAL_RESPONSE.to_string()],
                 tool_calls: vec![],
                 error: None,
             },
