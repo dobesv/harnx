@@ -403,7 +403,8 @@ const HANDOFF_SESSION_ID: &str = "exec-session-1";
 // Planner phase
 const PLANNER_QUESTION: &str = "What feature would you like me to plan?";
 const USER_ANSWER: &str = "Add a dark mode toggle";
-const PLANNER_PLAN_CREATED: &str = "Plan created: 1) Add theme toggle component 2) Add CSS variables 3) Wire up state persistence";
+const PLANNER_PLAN_CREATED: &str =
+    "Plan created: 1) Add theme toggle component 2) Add CSS variables 3) Wire up state persistence";
 const PLANNER_HANDOFF_ASK: &str = "Ready to hand off to plan-executor. Proceed?";
 const USER_CONFIRM: &str = "yes";
 
@@ -432,11 +433,10 @@ const HANDOFF_SUB_AGENT_TOOL_NAME: &str = EXECUTOR_STEP1_TOOL;
 
 #[test]
 fn interactive_handoff_planner_to_executor() -> Result<()> {
-    let session =
-        match setup_handoff_tmux_session("interactive_handoff_planner_to_executor")? {
-            Some(session) => session,
-            None => return Ok(()),
-        };
+    let session = match setup_handoff_tmux_session("interactive_handoff_planner_to_executor")? {
+        Some(session) => session,
+        None => return Ok(()),
+    };
 
     let HandoffTmuxSession {
         tmux,
@@ -450,54 +450,47 @@ fn interactive_handoff_planner_to_executor() -> Result<()> {
     // Turn 1: User gives initial request, planner asks clarifying question
     tmux.send_text(HANDOFF_ORIGINAL_USER_TEXT)?;
     tmux.send_keys(&["Enter"])?;
-    let _first_screen = tmux.wait_for(
-        Duration::from_secs(30),
-        |screen| screen.contains(PLANNER_QUESTION),
-    )?;
+    let _first_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(PLANNER_QUESTION)
+    })?;
 
     // Turn 2: User answers, planner creates plan and asks about handoff
     tmux.send_text(USER_ANSWER)?;
     tmux.send_keys(&["Enter"])?;
-    let _second_screen = tmux.wait_for(
-        Duration::from_secs(30),
-        |screen| screen.contains("Ready to hand off"),
-    )?;
+    let _second_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains("Ready to hand off")
+    })?;
 
     // Turn 3: User confirms, planner hands off to executor
     tmux.send_text(USER_CONFIRM)?;
     tmux.send_keys(&["Enter"])?;
-    let _third_screen =
-        tmux.wait_for(Duration::from_secs(30), |screen| {
-            screen.contains(&format!("{}_session_handoff", EXECUTOR_AGENT_NAME))
-        })?;
+    let _third_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(&format!("{}_session_handoff", EXECUTOR_AGENT_NAME))
+    })?;
 
     // Wait for executor to start and run first tool
-    let _fourth_screen = tmux.wait_for(
-        Duration::from_secs(30),
-        |screen| screen.contains(EXECUTOR_STEP1_TOOL),
-    )?;
+    let _fourth_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(EXECUTOR_STEP1_TOOL)
+    })?;
 
     // Wait for executor to report done
-    let _fifth_screen =
-        tmux.wait_for(Duration::from_secs(30), |screen| {
-            screen.contains(EXECUTOR_DONE_RESPONSE)
-        })?;
+    let _fifth_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(EXECUTOR_DONE_RESPONSE)
+    })?;
 
     // Turn 4: User gives feedback
     tmux.send_text(USER_FEEDBACK)?;
     tmux.send_keys(&["Enter"])?;
 
     // Wait for executor to run second tool
-    let _sixth_screen = tmux.wait_for(
-        Duration::from_secs(30),
-        |screen| screen.contains(EXECUTOR_STEP2_TOOL),
-    )?;
+    let _sixth_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(EXECUTOR_STEP2_TOOL)
+    })?;
 
     // Wait for final response
-    let final_screen = tmux.wait_for(
-        Duration::from_secs(30),
-        |screen| screen.contains(EXECUTOR_FINAL_RESPONSE),
-    )?;
+    let final_screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains(EXECUTOR_FINAL_RESPONSE)
+    })?;
 
     // Assert the key elements are visible
     assert!(
@@ -535,11 +528,11 @@ fn interactive_handoff_planner_to_executor() -> Result<()> {
 
 #[test]
 fn handoff_without_acp_server_config() -> Result<()> {
-    let session = match setup_handoff_tmux_session_no_acp_server("handoff_without_acp_server_config")?
-    {
-        Some(session) => session,
-        None => return Ok(()),
-    };
+    let session =
+        match setup_handoff_tmux_session_no_acp_server("handoff_without_acp_server_config")? {
+            Some(session) => session,
+            None => return Ok(()),
+        };
 
     let HandoffTmuxSession {
         tmux,
@@ -742,7 +735,6 @@ fn assert_handoff_request_isolation(request_log: &[Value]) -> Result<()> {
     Ok(())
 }
 
-
 struct HandoffTmuxSession {
     _temp: TempDir,
     mock: MockOpenAiServer,
@@ -852,10 +844,7 @@ fn handoff_script() -> MockOpenAiScript {
             },
             // Turn 2: Planner receives answer, creates plan, asks about handoff
             MockOpenAiTurn {
-                text_chunks: vec![format!(
-                    "{}. {}",
-                    PLANNER_PLAN_CREATED, PLANNER_HANDOFF_ASK
-                )],
+                text_chunks: vec![format!("{}. {}", PLANNER_PLAN_CREATED, PLANNER_HANDOFF_ASK)],
                 tool_calls: vec![],
                 error: None,
             },
