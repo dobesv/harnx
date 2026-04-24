@@ -218,6 +218,9 @@ pub async fn claude_chat_completions_streaming(
 ) -> Result<()> {
     let mut state = ClaudeStreamState::default();
     let handle = |message: SseMmessage| -> Result<bool> {
+        if handler.aborted() {
+            return Ok(true);
+        }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
         claude_handle_stream_event(&mut state, handler, &data)?;

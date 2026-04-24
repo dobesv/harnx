@@ -196,6 +196,9 @@ async fn chat_completions_streaming(
 ) -> Result<()> {
     let mut state = CohereStreamState::default();
     let handle = |message: SseMmessage| -> Result<bool> {
+        if handler.aborted() {
+            return Ok(true);
+        }
         if message.data == "[DONE]" {
             return Ok(true);
         }

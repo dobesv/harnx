@@ -40,6 +40,9 @@ impl SseHandler {
         if text.is_empty() {
             return Ok(());
         }
+        if self.abort_signal.aborted() {
+            return Ok(());
+        }
         let prefix = if !self.thought_buffer.is_empty() && !self.thought_closed {
             self.thought_closed = true;
             "\n</think>\n\n"
@@ -73,6 +76,9 @@ impl SseHandler {
 
     pub fn thought(&mut self, thought: &str) -> Result<()> {
         if thought.is_empty() {
+            return Ok(());
+        }
+        if self.abort_signal.aborted() {
             return Ok(());
         }
         let prefix = if self.thought_buffer.is_empty() {
@@ -124,6 +130,9 @@ impl SseHandler {
 
     pub fn tool_call(&mut self, call: ToolCall) -> Result<()> {
         // debug!("HandleCall: {:?}", call);
+        if self.abort_signal.aborted() {
+            return Ok(());
+        }
         if !self.thought_buffer.is_empty() && !self.thought_closed {
             self.thought_closed = true;
             let _ = self
@@ -138,6 +147,10 @@ impl SseHandler {
         self.abort_signal.clone()
     }
 
+    pub fn aborted(&self) -> bool {
+        self.abort_signal.aborted()
+    }
+
     pub fn tool_calls(&self) -> &[ToolCall] {
         &self.tool_calls
     }
@@ -148,6 +161,9 @@ impl SseHandler {
         output_tokens: Option<u64>,
         cached_tokens: Option<u64>,
     ) {
+        if self.abort_signal.aborted() {
+            return;
+        }
         if input_tokens.is_some() {
             self.input_tokens = input_tokens;
         }
@@ -239,7 +255,7 @@ where
 pub async fn json_stream<S, F, E>(mut stream: S, mut handle: F) -> Result<()>
 where
     S: Stream<Item = Result<bytes::Bytes, E>> + Unpin,
-    F: FnMut(&str) -> Result<()>,
+    F: FnMut(&str) -> Result<bool>,
     E: std::error::Error,
 {
     let mut parser = JsonStreamParser::default();
@@ -250,7 +266,9 @@ where
         unparsed_bytes.extend(chunk_bytes);
         match std::str::from_utf8(&unparsed_bytes) {
             Ok(text) => {
-                parser.process(text, &mut handle)?;
+                if parser.process(text, &mut handle)? {
+                    break;
+                }
                 unparsed_bytes.clear();
             }
             Err(_) => {
@@ -277,9 +295,9 @@ struct JsonStreamParser {
 }
 
 impl JsonStreamParser {
-    fn process<F>(&mut self, text: &str, handle: &mut F) -> Result<()>
+    fn process<F>(&mut self, text: &str, handle: &mut F) -> Result<bool>
     where
-        F: FnMut(&str) -> Result<()>,
+        F: FnMut(&str) -> Result<bool>,
     {
         self.buffer.extend(text.chars());
 
@@ -315,7 +333,10 @@ impl JsonStreamParser {
                     if self.balances.is_empty() {
                         if let Some(start) = self.start.take() {
                             let value: String = self.buffer[start..=i].iter().collect();
-                            handle(&value)?;
+                            if handle(&value)? {
+                                self.cursor = self.buffer.len();
+                                return Ok(true);
+                            }
                         }
                     }
                 }
@@ -326,7 +347,7 @@ impl JsonStreamParser {
             }
         }
         self.cursor = self.buffer.len();
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -359,7 +380,7 @@ mod tests {
             let mut output = vec![];
             let ret = json_stream(stream, |data| {
                 output.push(data.to_string());
-                Ok(())
+                Ok(false)
             })
             .await;
             assert!(ret.is_ok());

@@ -245,10 +245,14 @@ pub async fn gemini_chat_completions_streaming(
         let data: Value = res.json().await?;
         catch_error(&data, status.as_u16(), retry_after)?;
     } else {
-        let handle = |value: &str| -> Result<()> {
+        let handle = |value: &str| -> Result<bool> {
+            if handler.aborted() {
+                return Ok(true);
+            }
             let data: Value = serde_json::from_str(value)?;
             debug!("stream-data: {data}");
-            gemini_handle_stream_chunk(handler, &data)
+            gemini_handle_stream_chunk(handler, &data)?;
+            Ok(false)
         };
         json_stream(res.bytes_stream(), handle).await?;
     }

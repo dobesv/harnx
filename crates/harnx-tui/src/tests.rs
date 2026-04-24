@@ -15,7 +15,7 @@ use ratatui::style::Modifier;
 use ratatui::text::Line;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 fn yaml_to_json(yaml: &str) -> serde_json::Value {
     serde_yaml::from_str::<serde_json::Value>(yaml)
@@ -3376,4 +3376,101 @@ async fn history_preview_cursor_style() {
         preview_style.add_modifier.contains(Modifier::REVERSED),
         "preview cursor should still have REVERSED modifier for visibility"
     );
+}
+
+/// Regression test for #292: Ctrl-C during in-flight streaming must actually
+/// abort background task, not only update UI state.
+///
+/// FAILS before fix (abort_signal.reset() in Ctrl-C handler clears signal before
+/// background task can observe it).
+/// PASSES after fix (reset() removed from Ctrl-C handler).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ctrl_c_interrupts_in_flight_streaming() {
+    let config =
+        test_config_with_mock_client_and_agent("test-agent", Some("ctrl-c-in-flight-session"));
+    let gate_reached = Arc::new(Notify::new());
+    let gate_release = Arc::new(Notify::new());
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_text_chunk("before-gate")
+                    .add_gate(gate_reached.clone(), gate_release.clone())
+                    .add_text_chunk("after-gate — should not appear")
+                    .build(),
+            )
+            .build(),
+    );
+
+    let _guard = TestStateGuard::new(Some(mock_client)).await;
+
+    let mut harness = TuiTestHarness::with_config(config.clone());
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::UserText("Long request".to_string()));
+    harness
+        .tui()
+        .start_prompt(crate::types::PendingMessage {
+            text: "Long request".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), gate_reached.notified())
+        .await
+        .expect("mock stream should reach gate before Ctrl+C");
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    gate_release.notify_one();
+
+    if harness
+        .wait_until_screen_contains("aborted", Duration::from_secs(5))
+        .await
+        .is_err()
+    {
+        harness
+            .wait_until_screen_contains("Ctrl+C", Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while harness.tui().app.llm_busy {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for llm_busy to clear"
+        );
+        while let Ok(event) = harness.tui().event_rx.try_recv() {
+            harness.tui().handle_tui_event(event).await.unwrap();
+        }
+        harness.render();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let screen = harness.screen_contents();
+    assert!(
+        !screen.contains("after-gate — should not appear"),
+        "stream should be interrupted before gate release chunk appears: {screen}"
+    );
+    assert!(
+        screen.contains("aborted") || screen.contains("Ctrl+C"),
+        "screen should show abort message, got: {screen}"
+    );
+    assert!(
+        !harness.tui().app.llm_busy,
+        "Ctrl+C should clear llm_busy for in-flight streaming"
+    );
+
+    harness.drain_and_settle().await.unwrap();
 }
