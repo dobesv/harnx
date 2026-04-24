@@ -7,7 +7,8 @@ mod markdown;
 pub use self::markdown::{MarkdownRender, RenderOptions};
 
 pub fn render_error(err: anyhow::Error) {
-    eprintln!("{}", error_text(&pretty_error(&err)));
+    let body = pretty_error_string(&err);
+    eprintln!("{}", error_text(&format!("Error: {body}")));
 }
 
 /// Built-in Monokai Extended theme bytes — bincode-legacy-encoded
@@ -63,12 +64,15 @@ fn no_color() -> bool {
     })
 }
 
-/// Inlined from `harnx::utils::pretty_error`. Formats an
-/// `anyhow::Error` with its cause chain in the same layout the
-/// original harnx helper used.
-fn pretty_error(err: &anyhow::Error) -> String {
+/// Format an `anyhow::Error` cause chain as a plain-text string.
+///
+/// Produces a multi-line string with the top-level message on the first line
+/// and a `Caused by:` block for any nested causes.  The output does **not**
+/// include an `"Error: "` prefix — the TUI renderer (`render.rs`) adds its own
+/// `"error: "` label, and [`render_error`] prepends `"Error: "` for the CLI path.
+pub fn pretty_error_string(err: &anyhow::Error) -> String {
     let mut output = vec![];
-    output.push(format!("Error: {err}"));
+    output.push(format!("{err}"));
     let causes: Vec<_> = err.chain().skip(1).collect();
     let causes_len = causes.len();
     if causes_len > 0 {
@@ -84,7 +88,7 @@ fn pretty_error(err: &anyhow::Error) -> String {
     output.join("\n")
 }
 
-/// Helper for `pretty_error`. Also inlined from `harnx::utils::indent_text`.
+/// Helper for [`pretty_error_string`]. Inlined from `harnx::utils::indent_text`.
 fn indent_text<T: ToString>(s: T, size: usize) -> String {
     let indent_str = " ".repeat(size);
     s.to_string()
@@ -92,4 +96,44 @@ fn indent_text<T: ToString>(s: T, size: usize) -> String {
         .map(|line| format!("{indent_str}{line}"))
         .collect::<Vec<String>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pretty_error_string;
+
+    #[test]
+    fn no_causes() {
+        let err = anyhow::anyhow!("something went wrong");
+        assert_eq!(pretty_error_string(&err), "something went wrong");
+    }
+
+    #[test]
+    fn single_cause() {
+        let err = anyhow::anyhow!("root cause").context("outer context");
+        let s = pretty_error_string(&err);
+        assert_eq!(s, "outer context\n\nCaused by:\n    root cause");
+    }
+
+    #[test]
+    fn multiple_causes() {
+        let err = anyhow::anyhow!("innermost")
+            .context("middle")
+            .context("outermost");
+        let s = pretty_error_string(&err);
+        assert_eq!(
+            s,
+            "outermost\n\nCaused by:\n    0: middle\n    1: innermost"
+        );
+    }
+
+    #[test]
+    fn render_error_prepends_error_prefix() {
+        // Verify the string shape render_error would produce (without ANSI/color).
+        let err = anyhow::anyhow!("root cause").context("outer");
+        let body = pretty_error_string(&err);
+        let cli_output = format!("Error: {body}");
+        assert!(cli_output.starts_with("Error: outer"));
+        assert!(cli_output.contains("Caused by:"));
+    }
 }

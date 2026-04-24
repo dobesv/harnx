@@ -5,6 +5,7 @@ use crate::types::{TranscriptItem, TuiEvent};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use harnx_core::event::{AgentEvent, AgentSource};
+use harnx_render::pretty_error_string;
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
@@ -654,7 +655,7 @@ impl Tui {
                     if let Err(err) = self.submit_pending_message(pending).await {
                         self.app
                             .transcript
-                            .push(TranscriptItem::ErrorText(err.to_string()));
+                            .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
                         self.pin_transcript_to_bottom();
                     }
                 }
@@ -673,7 +674,7 @@ impl Tui {
                     if let Err(err) = self.submit_pending_message(pending).await {
                         self.app
                             .transcript
-                            .push(TranscriptItem::ErrorText(err.to_string()));
+                            .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
                         self.pin_transcript_to_bottom();
                     }
                 }
@@ -830,7 +831,7 @@ impl Tui {
             if let Err(err) = result {
                 use harnx_core::event::{AgentEvent, ModelEvent};
                 let _ = event_tx.send(TuiEvent::Agent(
-                    AgentEvent::Model(ModelEvent::Error(err.to_string())),
+                    AgentEvent::Model(ModelEvent::Error(pretty_error_string(&err))),
                     None,
                 ));
             }
@@ -1171,7 +1172,7 @@ impl Tui {
             Err(err) => {
                 self.app
                     .transcript
-                    .push(TranscriptItem::ErrorText(err.to_string()));
+                    .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
             }
         }
         Ok(())

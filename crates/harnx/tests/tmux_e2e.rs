@@ -1152,9 +1152,11 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
     tmux.send_text("do nested delegation")?;
     tmux.send_keys(&["Enter"])?;
 
-    let screen = tmux.wait_for(Duration::from_secs(30), |screen| {
-        screen.contains("Nested task complete")
-    })?;
+    let screen = tmux.wait_for_stable(
+        Duration::from_secs(30),
+        Duration::from_millis(300),
+        |screen| screen.contains("Nested task complete"),
+    )?;
 
     let delegate_tool_name = format!("{}_session_prompt", NESTED_SUB_AGENT);
     let nested_delegate_tool_name = format!("{}_session_prompt", NESTED_SUB_SUB_AGENT);

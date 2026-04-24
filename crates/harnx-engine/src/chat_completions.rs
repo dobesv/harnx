@@ -12,6 +12,7 @@ use harnx_core::event::{AgentEvent, ModelEvent};
 use harnx_core::sink::emit_agent_event;
 use harnx_core::text::{extract_code_block, strip_think_tag};
 use harnx_core::tool::ToolCall;
+use harnx_render::pretty_error_string;
 
 /// Non-streaming LLM call. Builds the `reqwest::Client`, invokes
 /// `Client::chat_completions_inner`, and wraps the error with a useful
@@ -130,7 +131,9 @@ pub async fn run_chat_completion(
             Ok((text, thought, tool_calls, usage))
         }
         Err(err) => {
-            emit_agent_event(AgentEvent::Model(ModelEvent::Error(err.to_string())));
+            emit_agent_event(AgentEvent::Model(ModelEvent::Error(pretty_error_string(
+                &err,
+            ))));
             Err(err)
         }
     }
@@ -187,7 +190,9 @@ pub async fn run_chat_completion_streaming(
             Ok((text, thought, tool_calls, usage, false))
         }
         Err(err) => {
-            emit_agent_event(AgentEvent::Model(ModelEvent::Error(err.to_string())));
+            emit_agent_event(AgentEvent::Model(ModelEvent::Error(pretty_error_string(
+                &err,
+            ))));
             if text.is_empty() {
                 Err(err)
             } else {

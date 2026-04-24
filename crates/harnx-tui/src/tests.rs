@@ -2094,6 +2094,89 @@ async fn test_streaming_error_shows_in_transcript() {
     harness.drain_and_settle().await.unwrap();
 }
 
+/// Test that a chained error shows the full cause chain in the TUI transcript.
+///
+/// This test verifies that when a `ModelEvent::Error` carrying a `pretty_error_string`-
+/// formatted chain arrives at the TUI, the full text (including "Caused by:") is
+/// stored in `TranscriptItem::ErrorText` and rendered on screen.
+///
+/// We inject the event directly into the TUI's event channel rather than going
+/// through `start_prompt` / the LLM retry pipeline — that avoids backoff delays
+/// and keeps the test focused on the TUI's own error-display behaviour.
+#[tokio::test]
+async fn test_streaming_error_shows_full_cause_chain_in_transcript() {
+    use harnx_render::pretty_error_string;
+
+    // Build the chained error and format it the same way the engine does.
+    let chained_error = anyhow::anyhow!("root cause detail").context("outer error message");
+    let formatted = pretty_error_string(&chained_error);
+
+    // Verify the formatted string has the expected structure before injecting.
+    assert!(
+        formatted.contains("outer error message"),
+        "pretty_error_string should contain outer message, got: {formatted}"
+    );
+    assert!(
+        formatted.contains("Caused by:"),
+        "pretty_error_string should contain 'Caused by:', got: {formatted}"
+    );
+    assert!(
+        formatted.contains("root cause detail"),
+        "pretty_error_string should contain root cause, got: {formatted}"
+    );
+
+    let config =
+        test_config_with_mock_client_and_agent("test-agent", Some("error-chain-display-session"));
+    let mut harness = TuiTestHarness::with_config(config.clone());
+    harness.tui().clear_transcript();
+
+    // Inject the already-formatted error directly into the TUI event channel,
+    // bypassing the LLM call / retry pipeline entirely.
+    harness
+        .tui()
+        .event_tx
+        .send(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::Error(formatted.clone())),
+            None,
+        ))
+        .unwrap();
+
+    // Drain the single queued event into the transcript.
+    harness.drain_and_settle().await.unwrap();
+
+    // The transcript must have an ErrorText entry containing the full chain.
+    let error_text = harness
+        .tui()
+        .app
+        .transcript
+        .iter()
+        .find_map(|entry| match entry {
+            TranscriptItem::ErrorText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("Transcript should contain an ErrorText entry after ModelEvent::Error");
+
+    assert!(
+        error_text.contains("outer error message"),
+        "ErrorText should contain outer error message, got: {error_text}"
+    );
+    assert!(
+        error_text.contains("Caused by:"),
+        "ErrorText should contain 'Caused by:', got: {error_text}"
+    );
+    assert!(
+        error_text.contains("root cause detail"),
+        "ErrorText should contain root cause detail, got: {error_text}"
+    );
+
+    // Also verify the rendered screen shows "error:" prefix.
+    harness.render();
+    assert!(
+        harness.screen_contents().contains("error:"),
+        "Rendered screen should show 'error:' prefix for ErrorText"
+    );
+}
+
 /// Test cancellation during tool call execution.
 /// When user presses Ctrl+C while a tool is executing, the tool should be aborted.
 #[tokio::test(flavor = "multi_thread")]
