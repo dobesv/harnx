@@ -468,6 +468,39 @@ mod tests {
             .block_on(future)
     }
 
+    /// Mutex that serialises tests which install a global `AgentEventSink`.
+    /// The sink is process-global; concurrent tests would see each other's events.
+    /// Uses `tokio::sync::Mutex` so the guard can be held across `.await` points.
+    static SINK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn assert_error_event(
+        event: &(
+            harnx_core::event::AgentEvent,
+            Option<harnx_core::event::AgentSource>,
+        ),
+        expected_fragments: &[&str],
+        expected_agent: &str,
+        expected_session_id: Option<&str>,
+    ) {
+        use harnx_core::event::{AgentEvent, AgentSource, ModelEvent};
+        match event {
+            (
+                AgentEvent::Model(ModelEvent::Error(msg)),
+                Some(AgentSource { agent, session_id }),
+            ) => {
+                for fragment in expected_fragments {
+                    assert!(
+                        msg.contains(fragment),
+                        "error message missing {fragment:?}, got: {msg}"
+                    );
+                }
+                assert_eq!(agent, expected_agent);
+                assert_eq!(session_id.as_deref(), expected_session_id);
+            }
+            other => panic!("expected ModelEvent::Error with source, got: {other:?}"),
+        }
+    }
+
     fn test_config(name: &str) -> AcpServerConfig {
         AcpServerConfig {
             name: name.to_string(),
@@ -676,6 +709,8 @@ enabled: false
         };
         use std::sync::Mutex;
 
+        let _guard = SINK_LOCK.lock().await;
+
         struct CollectingSink {
             events: Mutex<Vec<(AgentEvent, Option<AgentSource>)>>,
         }
@@ -732,6 +767,63 @@ enabled: false
             }
             other => panic!("unexpected second event: {other:?}"),
         }
+
+        drop(events);
+        harnx_core::sink::clear_agent_event_sink();
+    }
+
+    /// Test that error events from sub-agents pass through the forwarding layer intact.
+    /// When a sub-agent emits a ModelEvent::Error with a formatted cause chain,
+    /// the ACP forwarding layer should preserve the full error string without stripping
+    /// or mangling the "Caused by:" sections.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_acp_chunks_preserves_error_event_content() {
+        use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, ModelEvent};
+        use std::sync::Mutex;
+
+        let _guard = SINK_LOCK.lock().await;
+
+        struct CollectingSink {
+            events: Mutex<Vec<(AgentEvent, Option<AgentSource>)>>,
+        }
+        impl AgentEventSink for CollectingSink {
+            fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+                self.events.lock().unwrap().push((event, source));
+            }
+        }
+
+        let sink = std::sync::Arc::new(CollectingSink {
+            events: Mutex::new(Vec::new()),
+        });
+        harnx_core::sink::clear_agent_event_sink();
+        harnx_core::sink::install_agent_event_sink(sink.clone());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Simulate a sub-agent emitting an error with a formatted cause chain
+        let formatted_error = "outer error message\n\nCaused by:\n    root cause detail";
+        let source = AgentSource {
+            agent: "pytheas".to_string(),
+            session_id: Some("sub-session-error".to_string()),
+        };
+
+        tx.send(NestedAcpEvent::Agent(
+            AgentEvent::Model(ModelEvent::Error(formatted_error.to_string())),
+            Some(source.clone()),
+        ))
+        .unwrap();
+        drop(tx);
+
+        forward_acp_chunks(rx, None, "test".to_string()).await;
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "Should have exactly one event");
+        assert_error_event(
+            &events[0],
+            &["outer error message", "Caused by:", "root cause detail"],
+            "pytheas",
+            Some("sub-session-error"),
+        );
 
         drop(events);
         harnx_core::sink::clear_agent_event_sink();

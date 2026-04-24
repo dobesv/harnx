@@ -55,6 +55,66 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+/// Rebuild an `anyhow::Error` chain from an `Arc<anyhow::Error>`.
+///
+/// Since `anyhow::Error` is not `Clone`, the mock stores errors in `Arc`. When
+/// the mock needs to *return* the error (which consumes it), it reconstructs
+/// the full chain by collecting each cause's display string and re-wrapping
+/// them from innermost to outermost. This preserves `Caused by:` output.
+///
+/// `LlmError` is a special case: it is reconstructed as the concrete type so
+/// that retry logic can downcast it even after the chain is rebuilt. Any outer
+/// context messages that wrapped the `LlmError` in the original chain are
+/// re-applied on top of the reconstructed error, preserving the full chain for
+/// `pretty_error_string`.
+fn rebuild_anyhow_chain(err: &Arc<anyhow::Error>) -> anyhow::Error {
+    // Collect chain entries (outermost first) as display strings, and note the
+    // index of the LlmError entry so we can reconstruct it as a concrete type
+    // (required for retry logic to downcast it) while still re-wrapping any
+    // outer context messages that sat above it in the original chain.
+    let chain: Vec<&dyn std::error::Error> = err.chain().collect();
+
+    // Find the LlmError position in the chain.
+    let llm_pos = chain
+        .iter()
+        .position(|e| e.downcast_ref::<crate::client::LlmError>().is_some());
+
+    if let Some(pos) = llm_pos {
+        let llm_err = chain[pos]
+            .downcast_ref::<crate::client::LlmError>()
+            .unwrap();
+
+        // Reconstruct the concrete LlmError as the innermost anyhow error so
+        // that retry logic can still downcast it.
+        let mut rebuilt: anyhow::Error = crate::client::LlmError {
+            status: llm_err.status,
+            message: llm_err.message.clone(),
+            retry_after: llm_err.retry_after,
+        }
+        .into();
+
+        // Re-apply outer context messages (those above LlmError in the chain)
+        // from innermost-outer to outermost so the final chain matches the
+        // original: outermost_ctx → ... → LlmError.
+        for outer in chain[..pos].iter().rev() {
+            rebuilt = rebuilt.context(outer.to_string());
+        }
+        return rebuilt;
+    }
+
+    // Generic case: no LlmError found — collect display strings and rebuild
+    // from innermost to outermost so the resulting error has the same chain.
+    let messages: Vec<String> = chain.iter().map(|e| e.to_string()).collect();
+    if messages.is_empty() {
+        return anyhow::anyhow!("{}", err);
+    }
+    let mut rebuilt = anyhow::anyhow!("{}", messages[messages.len() - 1]);
+    for msg in messages[..messages.len() - 1].iter().rev() {
+        rebuilt = rebuilt.context(msg.clone());
+    }
+    rebuilt
+}
+
 #[derive(Debug, Clone)]
 pub enum MockResponseEvent {
     /// A text chunk to stream to the client.
@@ -91,24 +151,7 @@ impl MockResponseEvent {
                 release.notified().await;
             }
             Self::Error(err) => {
-                // Try to downcast to a concrete error type that implements Clone.
-                // For LlmError (the most common test case), reconstruct it to preserve
-                // the error type through the anyhow chain.
-                // Walk the error chain to find LlmError (it may be
-                // wrapped by .with_context() or other anyhow layers).
-                for cause in err.chain() {
-                    if let Some(llm_err) = cause.downcast_ref::<crate::client::LlmError>() {
-                        return Err(crate::client::LlmError {
-                            status: llm_err.status,
-                            message: llm_err.message.clone(),
-                            retry_after: llm_err.retry_after,
-                        }
-                        .into());
-                    }
-                }
-                // Fallback: create a new error from the display string
-                let msg = err.to_string();
-                return Err(anyhow::anyhow!("{}", msg));
+                return Err(rebuild_anyhow_chain(err));
             }
         }
         Ok(())
@@ -152,15 +195,7 @@ impl MockTurn {
                 MockResponseEvent::ToolCall(tool_call) => output.tool_calls.push(tool_call.clone()),
                 MockResponseEvent::Gate { .. } => {}
                 MockResponseEvent::Error(err) => {
-                    if let Some(llm_err) = err.downcast_ref::<crate::client::LlmError>() {
-                        return Err(crate::client::LlmError {
-                            status: llm_err.status,
-                            message: llm_err.message.clone(),
-                            retry_after: llm_err.retry_after,
-                        }
-                        .into());
-                    }
-                    return Err(anyhow::anyhow!("{}", err));
+                    return Err(rebuild_anyhow_chain(err));
                 }
             }
         }

@@ -1755,6 +1755,7 @@ dependencies = [
  "futures-util",
  "harnx-client",
  "harnx-core",
+ "harnx-render",
  "parking_lot",
  "serde_json",
  "tokio",

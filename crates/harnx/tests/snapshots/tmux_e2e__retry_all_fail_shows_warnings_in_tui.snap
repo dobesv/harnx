@@ -1,6 +1,5 @@
 ---
-source: tests/tmux_e2e.rs
-assertion_line: 1427
+source: crates/harnx/tests/tmux_e2e.rs
 expression: normalized
 ---
 Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
@@ -18,8 +17,8 @@ mock-llm:primary)), cooldown 60s. Trying next fallback.
 mock-llm:fallback)), cooldown 60s. Trying next fallback.
 error: Failed to call chat-completions api (client: mock-llm, model: mock-llm:fallback)
 
-
-
+Caused by:
+    Internal Server Error (type: server_error) (status: 500)
 
 
 
