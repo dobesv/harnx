@@ -223,6 +223,29 @@ impl Tui {
                 (height, paragraph)
             });
 
+        // Clamp position to the freshly-updated last_max_position.
+        //
+        // `scroll_down()` and `scroll_up()` operate against the *previous*
+        // render's `last_max_position`.  When content grows between frames
+        // (e.g. a streaming LLM response makes a transcript item taller),
+        // the old ceiling is too small: `scroll_down` hits it prematurely and
+        // sets `follow = true` at the wrong value.  On the next render the
+        // real max is updated, but by then `position` is stuck above the
+        // actual maximum.  Every subsequent `scroll_up` tick then burns off
+        // the excess before any visual movement occurs — the "dead zone".
+        //
+        // Clamping here, immediately after the real max is known, prevents
+        // position from ever drifting above `last_max_position`.  This costs
+        // nothing (it is a simple saturating compare) and eliminates the
+        // dead zone completely.
+        if !self.app.scroll_state.follow {
+            self.app.scroll_state.position = self
+                .app
+                .scroll_state
+                .position
+                .min(self.app.scroll_state.last_max_position);
+        }
+
         self.app.last_known_input_width = chunks[1].width.saturating_sub(2).max(1);
 
         let title = self.build_input_title();

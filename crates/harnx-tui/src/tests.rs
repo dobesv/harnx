@@ -3829,3 +3829,112 @@ async fn ctrl_c_resubmit_does_not_consume_a_second_mock_turn_while_task_a_is_in_
     }
     harness.drain_and_settle().await.unwrap();
 }
+
+/// Regression test for GitHub issue #264 — "Have to scroll up a lot sometimes before content moves down"
+///
+/// Two bugs are covered:
+///
+/// 1. **Tall-item rendering**: when a transcript entry is taller than the viewport and
+///    the viewport is pinned to the bottom, `copy_partial_bottom_widget_to_frame` must
+///    show the *bottom* portion of the item (skipping the hidden top lines), not the top.
+///
+/// 2. **Stale-max dead-zone**: after `scroll_down` prematurely sets `follow=true` against
+///    a stale `last_max_position`, subsequent `scroll_up` calls should become immediately
+///    effective once the render corrects `last_max_position`.  The position-clamp in
+///    `render.rs` ensures `position` never exceeds `last_max_position` so no dead zone
+///    accumulates.
+#[tokio::test]
+async fn test_tall_item_scroll_shows_correct_portion_and_no_dead_zone() {
+    // Use a narrow viewport (40 cols wide, 10 rows tall) so the transcript area is tiny
+    // (10 - 3 = 7 rows for the transcript, 3 rows for the input).
+    let mut harness = TuiTestHarness::with_size(40, 10);
+
+    // Build a single transcript item that is much taller than the 7-row transcript area.
+    // 20 distinct lines so we can check which portion is visible.
+    let lines: Vec<String> = (1..=20).map(|i| format!("line-{i:02}")).collect();
+    let tall_text = lines.join("\n");
+
+    harness.tui().clear_transcript();
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText(tall_text.clone()));
+    // Pin to bottom (follow=true) — the default on new content
+    harness.tui().pin_transcript_to_bottom();
+
+    // First render: the scroll widget learns the real item height, position snaps to max.
+    harness.render();
+    let bottom_view = normalize_screen(&harness.screen_contents());
+
+    // Bug 1: at the bottom, we must see the *last* lines of the tall item, not the first.
+    assert!(
+        bottom_view.contains("line-20"),
+        "bottom view should show the last line of the tall item, got:\n{bottom_view}"
+    );
+    assert!(
+        !bottom_view.contains("line-01"),
+        "bottom view must NOT show the first line when pinned to bottom, got:\n{bottom_view}"
+    );
+
+    // Scroll up 7 positions (more than one viewport's worth) so line-20 is no longer visible.
+    for _ in 0..7 {
+        harness.tui().app.scroll_state.scroll_up();
+    }
+    harness.render();
+    let scrolled_view = normalize_screen(&harness.screen_contents());
+
+    // After scrolling up 7 positions (position went from 13 → 6, scroll_offset = 13-6 = 7),
+    // the item shows lines [8..14].  line-20 must not be visible.
+    assert!(
+        !scrolled_view.contains("line-20"),
+        "after scrolling up 7 positions, line-20 should no longer be visible; got:\n{scrolled_view}"
+    );
+    // And we should now see lines near the top of that window.
+    assert!(
+        scrolled_view.contains("line-08")
+            || scrolled_view.contains("line-09")
+            || scrolled_view.contains("line-10"),
+        "after scrolling up 7 positions, should see lines near line-08..10; got:\n{scrolled_view}"
+    );
+
+    // Bug 2: simulate the stale-max dead-zone.
+    //
+    // Reset position to 0 so scroll_down can climb from a known low value.
+    // Then set last_max_position to a stale (too-small) value, simulating a
+    // height-cache miss.  scroll_down should hit the stale ceiling, set
+    // follow=true, and stop — even though the real max is much higher.
+    harness.tui().app.scroll_state.position = 0;
+    harness.tui().app.scroll_state.follow = false;
+    let real_max = harness.tui().app.scroll_state.last_max_position;
+    harness.tui().app.scroll_state.last_max_position = 2; // stale, too small
+
+    // scroll_down will increment position up to the stale max of 2, then set follow=true.
+    for _ in 0..6 {
+        harness.tui().app.scroll_state.scroll_down();
+    }
+    assert!(
+        harness.tui().app.scroll_state.follow,
+        "scroll_down should have set follow=true at the stale max"
+    );
+    assert_eq!(
+        harness.tui().app.scroll_state.position,
+        2,
+        "position should have clamped at the stale last_max_position=2"
+    );
+
+    // Now render with position deliberately set above the real max, simulating
+    // the scenario where last_max_position was stale and position drifted too high.
+    // The position-clamp in render.rs must bring it back to last_max_position.
+    harness.tui().app.scroll_state.last_max_position = real_max;
+    harness.tui().app.scroll_state.follow = false;
+    harness.tui().app.scroll_state.position = real_max + 5; // intentionally above real max
+    harness.render();
+
+    let pos_after_clamp = harness.tui().app.scroll_state.position;
+    let max_after_render = harness.tui().app.scroll_state.last_max_position;
+    assert!(
+        pos_after_clamp <= max_after_render,
+        "position ({pos_after_clamp}) must be clamped to last_max_position ({max_after_render}) after render"
+    );
+}

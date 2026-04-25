@@ -3967,8 +3967,6 @@ dependencies = [
 [[package]]
 name = "ratatui_widget_scrolling"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "374d43a10a1475fd6b81bb15d7f12899242da7d293e32c386c429807b69be720"
 dependencies = [
  "ratatui-core",
  "ratatui-widgets",
