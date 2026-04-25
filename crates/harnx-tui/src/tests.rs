@@ -3938,3 +3938,80 @@ async fn test_tall_item_scroll_shows_correct_portion_and_no_dead_zone() {
         "position ({pos_after_clamp}) must be clamped to last_max_position ({max_after_render}) after render"
     );
 }
+
+/// Regression test: when an item is taller than the viewport and the user
+/// scrolls up, the visible window through that item must move *backwards*
+/// through the buffer (toward earlier lines), not forwards.
+///
+/// Symptom (from the user video): scrolling up makes the visible content
+/// "go in the wrong direction".  Concretely, when the scroll position is
+/// such that the first line of the chunk should be at the top of the
+/// viewport, the buggy code instead shows the *last* lines of the chunk
+/// (i.e. the same content that's visible when pinned to the bottom).
+///
+/// Math (V = transcript viewport height = 10, H = item height = 20):
+///
+/// | scroll_up count | scroll_offset | expected first/last visible buffer lines |
+/// |-----------------|---------------|------------------------------------------|
+/// |               0 | 0             | line-11 .. line-20                       |
+/// |               1 | 1             | line-10 .. line-19                       |
+/// |               5 | 5             | line-06 .. line-15                       |
+/// |              10 | 10            | line-01 .. line-10                       |
+#[tokio::test]
+async fn test_tall_item_scroll_window_moves_in_correct_direction() {
+    // size 40x13 → transcript area is 13 - 3 (input) = 10 rows.
+    let mut harness = TuiTestHarness::with_size(40, 13);
+
+    let lines: Vec<String> = (1..=20).map(|i| format!("line-{i:02}")).collect();
+    let tall_text = lines.join("\n");
+
+    harness.tui().clear_transcript();
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText(tall_text));
+    harness.tui().pin_transcript_to_bottom();
+
+    // Helper: assert the visible portion of the transcript shows exactly
+    // line-{first}..line-{last} (inclusive, zero-padded), and no others.
+    let assert_window = |harness: &mut TuiTestHarness, first: usize, last: usize, label: &str| {
+        let view = normalize_screen(&harness.screen_contents());
+        for n in 1..=20usize {
+            let needle = format!("line-{n:02}");
+            let in_window = n >= first && n <= last;
+            let present = view.contains(&needle);
+            assert_eq!(
+                    present, in_window,
+                    "{label}: expected {needle} present={in_window}, got present={present}\nview:\n{view}"
+                );
+        }
+    };
+
+    // 1. Pinned to bottom — should show the last 10 lines (line-11..line-20).
+    harness.render();
+    assert_window(&mut harness, 11, 20, "initial bottom view");
+
+    // 2. Scroll up by 1.  The window should slide backwards by 1 line:
+    //    line-10..line-19.  The buggy code instead shows line-02..line-11
+    //    (window jumps backwards by H-V-1 = 9 lines and slides forward).
+    harness.tui().app.scroll_state.scroll_up();
+    harness.render();
+    assert_window(&mut harness, 10, 19, "after scroll_up x1");
+
+    // 3. Scroll up by 4 more (total 5).
+    for _ in 0..4 {
+        harness.tui().app.scroll_state.scroll_up();
+    }
+    harness.render();
+    assert_window(&mut harness, 6, 15, "after scroll_up x5");
+
+    // 4. Scroll up by 5 more (total 10 = max).  We should now be at the
+    //    very top of the item: line-01..line-10.  The buggy code instead
+    //    shows line-11..line-20 (identical to the pinned-to-bottom view!).
+    for _ in 0..5 {
+        harness.tui().app.scroll_state.scroll_up();
+    }
+    harness.render();
+    assert_window(&mut harness, 1, 10, "after scroll_up x10 (top of item)");
+}
