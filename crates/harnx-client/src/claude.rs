@@ -74,6 +74,10 @@ struct ClaudeStreamState {
     function_arguments: String,
     function_id: String,
     reasoning_state: i32,
+    /// Accumulated signature from `signature_delta` events for the current
+    /// thinking block.  Passed to each tool call emitted in the same turn so
+    /// the serialiser can echo it back verbatim on the next request.
+    thinking_signature: String,
 }
 
 fn claude_emit_pending_tool_call(
@@ -94,11 +98,16 @@ fn claude_emit_pending_tool_call(
             )
         })?
     };
+    let thought_signature = if state.thinking_signature.is_empty() {
+        None
+    } else {
+        Some(state.thinking_signature.clone())
+    };
     handler.tool_call(ToolCall::new(
         state.function_name.clone(),
         arguments,
         Some(state.function_id.clone()),
-        None,
+        thought_signature,
     ))?;
     state.function_name.clear();
     state.function_arguments.clear();
@@ -158,6 +167,10 @@ fn claude_handle_content_block_delta(
     } else if let Some(text) = delta["thinking"].as_str() {
         claude_transition_reasoning(state, handler, true)?;
         handler.text(text)?;
+    } else if let Some(sig) = delta["signature"].as_str() {
+        // signature_delta: accumulate the thinking-block signature so it can
+        // be echoed back verbatim on the next API request (issue #328).
+        state.thinking_signature.push_str(sig);
     } else if let Some(partial_json) = delta["partial_json"]
         .as_str()
         .filter(|_| !state.function_name.is_empty())
@@ -295,10 +308,26 @@ pub fn claude_build_chat_completions_body(
                     })]
                 }
                 MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
+                    tool_results, text, thought, ..
                 }) => {
                     let mut assistant_parts = vec![];
                     let mut user_parts = vec![];
+                    if let Some(thought_text) = thought {
+                        // Echo the thinking block verbatim so the API knows
+                        // this assistant turn included extended thinking.
+                        // The signature is stored on each tool call in the turn
+                        // (issue #328: omitting this caused the model to treat
+                        // its own tool calls as coming from a "previous session").
+                        let signature = tool_results
+                            .first()
+                            .and_then(|r| r.call.thought_signature.as_deref())
+                            .unwrap_or("");
+                        assistant_parts.push(json!({
+                            "type": "thinking",
+                            "thinking": thought_text,
+                            "signature": signature,
+                        }));
+                    }
                     if !text.is_empty() {
                         assistant_parts.push(json!({
                             "type": "text",
@@ -380,7 +409,8 @@ pub fn claude_build_chat_completions_body(
 
 pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let mut text = String::new();
-    let mut reasoning = None;
+    let mut reasoning: Option<String> = None;
+    let mut reasoning_signature: Option<String> = None;
     let mut tool_calls = vec![];
     if let Some(list) = data["content"].as_array() {
         for item in list {
@@ -388,6 +418,9 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
                 Some("thinking") => {
                     if let Some(v) = item["thinking"].as_str() {
                         reasoning = Some(v.to_string());
+                    }
+                    if let Some(s) = item["signature"].as_str() {
+                        reasoning_signature = Some(s.to_string());
                     }
                 }
                 Some("text") => {
@@ -408,7 +441,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
                             name.to_string(),
                             input.clone(),
                             Some(id.to_string()),
-                            None,
+                            None, // signature attached below
                         ));
                     }
                 }
@@ -416,18 +449,36 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
             }
         }
     }
-    if let Some(reasoning) = reasoning {
-        text = format!("<think>\n{reasoning}\n</think>\n\n{text}")
+
+    // Attach the thinking signature to every tool call in this turn.
+    // The API requires it echoed back verbatim alongside the thinking block.
+    if let Some(sig) = &reasoning_signature {
+        for call in &mut tool_calls {
+            call.thought_signature = Some(sig.clone());
+        }
     }
 
-    if text.is_empty() && tool_calls.is_empty() {
-        bail!("Invalid response data: {data}");
+    // When there are tool calls, carry the thought on its dedicated field so
+    // the serialiser can echo back the thinking block on the next request.
+    // When there are no tool calls, fold it into text for display (existing
+    // behaviour for plain-text reasoning responses).
+    if !tool_calls.is_empty() {
+        if text.is_empty() && reasoning.is_none() {
+            bail!("Invalid response data: {data}");
+        }
+    } else {
+        if let Some(r) = &reasoning {
+            text = format!("<think>\n{r}\n</think>\n\n{text}");
+        }
+        if text.is_empty() {
+            bail!("Invalid response data: {data}");
+        }
     }
 
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
-        thought: None,
+        thought: reasoning,
         id: data["id"].as_str().map(|v| v.to_string()),
         input_tokens: data["usage"]["input_tokens"].as_u64(),
         output_tokens: data["usage"]["output_tokens"].as_u64(),
@@ -508,6 +559,119 @@ system_prompt_prefix:
             ids,
             vec![Some("toolu_A"), Some("toolu_B")],
             "each tool_use block should be emitted exactly once"
+        );
+    }
+
+    /// Regression test for issue #328. When a `ToolCalls` message carries a
+    /// `thought` (extended thinking block), the serialiser must include a
+    /// `{"type":"thinking","thinking":...,"signature":...}` content block as
+    /// the first item in the assistant turn.  Without it the Anthropic API has
+    /// no record of the model's prior reasoning and the model interprets the
+    /// tool results as coming from a "previous session".
+    #[test]
+    fn claude_body_includes_thinking_block_when_thought_present() {
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::tool::{ToolCall, ToolResult};
+
+        let call = ToolCall::new(
+            "Bash".to_string(),
+            json!({"command": "ls"}),
+            Some("toolu_X".to_string()),
+            None,
+        );
+        let tool_result = ToolResult::new(call, json!({"output": "file.txt"}));
+        let tool_calls_msg = Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![tool_result],
+                String::new(),
+                Some("I reasoned carefully".to_string()),
+            )),
+        );
+
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Do something".to_string()),
+            ),
+            tool_calls_msg,
+        ];
+
+        let mut model = Model::new("claude", "claude-3-5-sonnet");
+        model.set_max_tokens(Some(4096), true);
+
+        let data = ChatCompletionsData {
+            messages,
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+        };
+
+        let body = claude_build_chat_completions_body(data, &model).unwrap();
+        let msgs = body["messages"].as_array().expect("messages array");
+
+        // Find the assistant turn — it follows the user message in the array.
+        let assistant_msg = msgs
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("serialised messages must contain an assistant turn (issue #328: ToolCalls arm must emit one)");
+
+        let content = assistant_msg["content"].as_array()
+            .expect("assistant content should be an array");
+
+        // The thinking block must be present and come before any tool_use block.
+        let thinking_idx = content.iter().position(|b| b["type"] == "thinking")
+            .expect("assistant content must contain a thinking block (issue #328: thought is dropped)");
+        let tool_use_idx = content.iter().position(|b| b["type"] == "tool_use")
+            .expect("assistant content must contain a tool_use block");
+
+        assert!(
+            thinking_idx < tool_use_idx,
+            "thinking block must precede tool_use block"
+        );
+        assert_eq!(
+            content[thinking_idx]["thinking"], "I reasoned carefully",
+            "thinking block must carry the thought text verbatim"
+        );
+    }
+
+    /// Regression test for issue #328 (parser side).  `claude_extract_chat_completions`
+    /// must store the thinking block's text in `ChatCompletionsOutput.thought` and
+    /// its `signature` in `ToolCall.thought_signature` so the serialiser can echo
+    /// them back on the next turn.
+    #[test]
+    fn claude_extract_preserves_thought_and_signature() {
+        let response = json!({
+            "id": "msg_test",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "Let me think...",
+                    "signature": "sig_abc123"
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_X",
+                    "name": "Bash",
+                    "input": {"command": "ls"}
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 20}
+        });
+
+        let output = claude_extract_chat_completions(&response)
+            .expect("extraction should succeed");
+
+        assert_eq!(
+            output.thought,
+            Some("Let me think...".to_string()),
+            "thought must be stored in ChatCompletionsOutput.thought (issue #328: currently always None)"
+        );
+        assert_eq!(
+            output.tool_calls[0].thought_signature,
+            Some("sig_abc123".to_string()),
+            "thinking signature must be stored in ToolCall.thought_signature (issue #328: currently always None)"
         );
     }
 
