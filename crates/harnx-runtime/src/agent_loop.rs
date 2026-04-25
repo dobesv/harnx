@@ -25,8 +25,8 @@ use harnx_hooks::{
 };
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use crate::client::CompletionTokenUsage;
 use crate::client::retry::call_with_retry_and_fallback;
+use crate::client::CompletionTokenUsage;
 use crate::tool::ToolCall;
 use crate::utils::AbortSignal;
 
@@ -174,7 +174,9 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
             )
         };
 
-        let max_resume = ctx.max_resume.unwrap_or_else(|| hooks.max_resume.unwrap_or(5));
+        let max_resume = ctx
+            .max_resume
+            .unwrap_or_else(|| hooks.max_resume.unwrap_or(5));
 
         // Dispatch UserPromptSubmit hook (was previously TUI-only; now unified).
         {
@@ -263,6 +265,13 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
                 abort_signal,
             )?
         };
+
+        // `injected_user_text` is a one-shot field — it was written to the
+        // session by `begin_turn` (inside `add_assistant_text` /
+        // `add_tool_calls`) just above. Clear it now so it isn't re-emitted
+        // on every subsequent loop iteration; on_tool_round may set a fresh
+        // injection from the next pending user message below.
+        input.injected_user_text = None;
 
         // Emit status/usage line for text-only turns. CLI-only: fires when
         // no on_text_response callback is set. TUI and ACP handle their own
@@ -438,4 +447,118 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
     Config::maybe_autoname_session(config.clone());
     Config::maybe_compact_session(config.clone());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::MessageRole;
+    use crate::utils::create_abort_signal;
+    use harnx_hooks::{AsyncHookManager, PersistentHookManager};
+    use parking_lot::RwLock;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    /// Regression test for the user-message-replay bug: a user message typed
+    /// during a running tool round (delivered via `on_tool_round` setting
+    /// `Input::injected_user_text`) must not be re-emitted on every
+    /// subsequent loop iteration. Before the fix, `injected_user_text`
+    /// stayed set across rounds, so `begin_turn` appended the same user
+    /// message N times — once per following round — and the LLM saw N
+    /// duplicate copies. The fix clears the field after each round.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn injected_user_text_is_not_replayed_across_rounds() {
+        let _guard = crate::client::TestStateGuard::new(None).await;
+
+        let tmp = TempDir::new().unwrap();
+
+        // Build a Config with an attached session pointed at a temp dir.
+        let mut config = Config::default();
+        let mut session = crate::config::session::new(&config, "replay_test");
+        session.set_sessions_dir(tmp.path().to_path_buf());
+        config.session = Some(session);
+        let global_config = Arc::new(RwLock::new(config));
+
+        // Mock LLM: round 1 → tool call, round 2 → tool call, round 3 → text-only.
+        // No real tool provider is registered, so eval_tool_calls returns
+        // is_error results. That's fine — the loop still proceeds round by
+        // round, which is what the test needs.
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {
+            let cc = cc.clone();
+            Box::pin(async move {
+                let n = cc.fetch_add(1, Ordering::SeqCst);
+                let result = if n < 2 {
+                    (
+                        format!("calling tool {n}"),
+                        None,
+                        vec![ToolCall::new(
+                            "noop".to_string(),
+                            json!({}),
+                            Some(format!("call_{n}")),
+                            None,
+                        )],
+                        CompletionTokenUsage::default(),
+                    )
+                } else {
+                    (
+                        "all done".to_string(),
+                        None,
+                        vec![],
+                        CompletionTokenUsage::default(),
+                    )
+                };
+                Ok(result)
+            })
+        });
+
+        // Simulate the TUI's pending-message injection: set
+        // `injected_user_text` exactly once, after the first tool round.
+        let inj_count = Arc::new(AtomicUsize::new(0));
+        let inj = inj_count.clone();
+        let on_tool_round: OnToolRoundFn = Arc::new(move |merged_input, _results| {
+            let inj = inj.clone();
+            Box::pin(async move {
+                if inj.fetch_add(1, Ordering::SeqCst) == 0 {
+                    merged_input.set_injected_user_text("queued message".to_string());
+                }
+            })
+        });
+
+        let ctx = AgentLoopContext {
+            config: global_config.clone(),
+            abort_signal: create_abort_signal(),
+            async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::new())),
+            persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new())),
+            call_fn: Some(call_fn),
+            on_tool_round: Some(on_tool_round),
+            on_text_response: None,
+            initial_with_embeddings: false,
+            initial_resume_count: 0,
+            max_resume: Some(0),
+            pending_async_context: None,
+        };
+
+        let input = crate::config::input::from_str(&global_config, "do work", None);
+        run_agent_loop(&ctx, input).await.unwrap();
+
+        // The injection happened once; the bug would have made it appear in
+        // session.messages once per round after the injection (here: 2x —
+        // round 2 and round 3). With the fix it appears exactly once.
+        let cfg = global_config.read();
+        let session = cfg.session.as_ref().expect("session attached above");
+        let count = session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User && m.content.to_text() == "queued message")
+            .count();
+        assert_eq!(
+            count, 1,
+            "injected_user_text must be appended once per injection, not \
+             replayed on every subsequent loop iteration. Got {count} copies \
+             in session.messages."
+        );
+    }
 }

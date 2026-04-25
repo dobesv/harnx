@@ -246,9 +246,7 @@ impl acp::Agent for HarnxAgent {
                 tokio::task::spawn_local(async move {
                     let notification = acp::SessionNotification::new(
                         acp::SessionId::new(sid),
-                        acp::SessionUpdate::AgentMessageChunk(
-                            acp::ContentChunk::new(text.into()),
-                        ),
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(text.into())),
                     );
                     let _ = conn.session_notification(notification).await;
                 });

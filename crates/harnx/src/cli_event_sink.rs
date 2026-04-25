@@ -30,7 +30,9 @@ pub struct CliAgentEventSink {
 
 fn source_heading(source: &AgentSource) -> String {
     match &source.session_id {
-        Some(session_id) if !session_id.is_empty() => format!("> {} ▸ {}", source.agent, session_id),
+        Some(session_id) if !session_id.is_empty() => {
+            format!("> {} ▸ {}", source.agent, session_id)
+        }
         _ => format!("> {}", source.agent),
     }
 }
@@ -200,7 +202,10 @@ impl AgentEventSink for CliAgentEventSink {
         if show_heading {
             if let Some(source) = source.as_ref() {
                 if let Err(err) = state.cleanup() {
-                    eprintln!("{}", warning_text(&format!("cli-sink cleanup failed: {err}")));
+                    eprintln!(
+                        "{}",
+                        warning_text(&format!("cli-sink cleanup failed: {err}"))
+                    );
                 }
                 println!("{}", source_heading(source));
             }
