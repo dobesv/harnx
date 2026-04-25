@@ -389,6 +389,106 @@ mod tests {
         );
     }
 
+    /// Shared retry config for retry-after tests: 3 attempts, small budget
+    /// (20ms + 40ms = 60ms total) so tests run fast.
+    fn retry_after_test_config() -> RetryConfig {
+        RetryConfig {
+            attempts: 3,
+            initial_delay_ms: 20,
+            max_delay_ms: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_short_waits_server_hint_instead_of_backoff() {
+        // retry_after (5ms) < remaining budget (60ms) — should retry and succeed.
+        let rate_limit_err: anyhow::Error = LlmError {
+            status: 429,
+            message: "Rate limited".to_string(),
+            retry_after: Some(Duration::from_millis(5)),
+        }
+        .into();
+        let mock = Arc::new(
+            MockClient::builder()
+                .error_on_stream(rate_limit_err)
+                .add_turn(MockTurnBuilder::new().add_text_chunk("ok").build())
+                .build(),
+        );
+        let _guard = TestStateGuard::new(Some(mock)).await;
+
+        let config = make_config();
+        let input = make_input(&config);
+        let abort = create_abort_signal();
+        let client = crate::config::input::create_client(&input, &config).unwrap();
+
+        let result = try_model_with_retries(
+            &input,
+            client.as_ref(),
+            &config,
+            &retry_after_test_config(),
+            abort,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "Expected success after retrying with server retry-after hint: {:?}",
+            result.err()
+        );
+        let (output, _, _, _) = result.unwrap();
+        assert_eq!(output, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_long_exits_early_without_extra_attempts() {
+        // retry_after (10s) > remaining budget (60ms) — should bail after 1 attempt.
+        let rate_limit_err: anyhow::Error = LlmError {
+            status: 429,
+            message: "Rate limited".to_string(),
+            retry_after: Some(Duration::from_millis(10_000)),
+        }
+        .into();
+        let mock = Arc::new(
+            MockClient::builder()
+                .error_on_stream(rate_limit_err)
+                .add_turn(
+                    MockTurnBuilder::new()
+                        .add_text_chunk("should not reach")
+                        .build(),
+                )
+                .build(),
+        );
+        let _guard = TestStateGuard::new(Some(mock.clone())).await;
+
+        let config = make_config();
+        let input = make_input(&config);
+        let abort = create_abort_signal();
+        let client = crate::config::input::create_client(&input, &config).unwrap();
+
+        let result = try_model_with_retries(
+            &input,
+            client.as_ref(),
+            &config,
+            &retry_after_test_config(),
+            abort,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "Expected error when retry-after exceeds budget"
+        );
+
+        let err = result.unwrap_err();
+        let llm_err = find_llm_error(&err).expect("Expected LlmError");
+        assert_eq!(llm_err.status, 429);
+
+        // Only 1 call should have been made — no spurious retries before the bail.
+        assert_eq!(
+            mock.conversation_history().conversation_history.len(),
+            1,
+            "Expected exactly 1 attempt before bailing on long retry-after"
+        );
+    }
+
     #[tokio::test]
     async fn test_invalid_fallback_model_reports_warning_and_skips() {
         // Primary model fails with a retryable error; the only fallback is an
