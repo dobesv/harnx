@@ -256,6 +256,96 @@ fn resolve_client(ctx: &TurnContext, model_id: &str) -> Result<Box<dyn Client>> 
     ctx.init_client(&model)
 }
 
+/// What the retry loop should do after an attempt fails.
+enum AttemptOutcome {
+    /// Sleep for the given duration then retry, logging the given message.
+    Sleep(Duration, String),
+    /// Return the error immediately (auth / non-retryable).
+    BailImmediately,
+    /// Store the error and exit the retry loop (e.g. retry-after exceeds budget).
+    ExitLoop,
+}
+
+/// Classify a failed attempt and decide what to do next.
+///
+/// Returns the outcome (including the delay and warning message for `Sleep`)
+/// so `try_model_with_retries_custom` stays a thin, low-complexity loop.
+fn handle_attempt_error(
+    err: &anyhow::Error,
+    retry_config: &RetryConfig,
+    attempt: u32,
+    attempts: u32,
+) -> AttemptOutcome {
+    if let Some(llm_err) = find_llm_error(err) {
+        if llm_err.is_auth_error() || !llm_err.is_retryable() {
+            return AttemptOutcome::BailImmediately;
+        }
+        if attempt + 1 >= attempts {
+            return AttemptOutcome::ExitLoop;
+        }
+        match retry_delay_for_llm_error(llm_err, retry_config, attempt, attempts) {
+            None => AttemptOutcome::ExitLoop,
+            Some(delay) => {
+                let hint = if llm_err.retry_after.is_some() {
+                    " (server retry-after)"
+                } else {
+                    ""
+                };
+                let msg = format!(
+                    "Retryable error (status {}, {}), attempt {}/{}. Retrying in {}ms{hint}...",
+                    llm_err.status,
+                    llm_err.message,
+                    attempt + 1,
+                    attempts,
+                    delay.as_millis()
+                );
+                AttemptOutcome::Sleep(delay, msg)
+            }
+        }
+    } else {
+        // Non-LlmError (network timeout, DNS, etc): treat as retryable.
+        if attempt + 1 < attempts {
+            let delay = compute_backoff_delay(retry_config, attempt);
+            let msg = format!(
+                "Network error, attempt {}/{}. Retrying in {}ms: {}",
+                attempt + 1,
+                attempts,
+                delay.as_millis(),
+                err
+            );
+            AttemptOutcome::Sleep(delay, msg)
+        } else {
+            AttemptOutcome::ExitLoop
+        }
+    }
+}
+
+/// Determine how long to wait before the next retry attempt, given an LLM error.
+///
+/// Returns `Some(delay)` if the loop should sleep then retry, or `None` if the
+/// server's `retry_after` hint exceeds the remaining backoff budget and the loop
+/// should bail immediately.
+fn retry_delay_for_llm_error(
+    llm_err: &LlmError,
+    retry_config: &RetryConfig,
+    attempt: u32,
+    attempts: u32,
+) -> Option<Duration> {
+    if let Some(retry_after) = llm_err.retry_after {
+        let remaining_budget: Duration = (attempt + 1..attempts)
+            .map(|a| compute_backoff_delay(retry_config, a))
+            .sum();
+        if retry_after > remaining_budget {
+            // Server wants us to wait longer than we'd spend retrying — bail.
+            return None;
+        }
+        // Honour the server hint instead of the backoff schedule.
+        Some(retry_after)
+    } else {
+        Some(compute_backoff_delay(retry_config, attempt))
+    }
+}
+
 /// Inner retry loop for a single model. Public for test-support use in
 /// harnx — harnx retains a thin test wrapper that builds a `TurnContext`
 /// from its `GlobalConfig` and calls this function.
@@ -275,60 +365,25 @@ where
     let attempts = retry_config.attempts.max(1);
 
     for attempt in 0..attempts {
-        let result = call_fn(input, client, abort_signal.clone()).await;
-
-        match result {
+        match call_fn(input, client, abort_signal.clone()).await {
             Ok(result) => return Ok(result),
-            Err(err) => {
-                // Check if this is a retryable error
-                if let Some(llm_err) = find_llm_error(&err) {
-                    if llm_err.is_auth_error() {
-                        // Auth errors: don't retry, let caller set infinite cooldown
-                        return Err(err);
-                    }
-                    if !llm_err.is_retryable() {
-                        // Non-retryable (400, 404, etc): fail immediately
-                        return Err(err);
-                    }
-                    // Retryable error
-                    if attempt + 1 < attempts {
-                        let delay = compute_backoff_delay(retry_config, attempt);
-                        ctx.warn(&format!(
-                            "Retryable error (status {}, {}), attempt {}/{}. Retrying in {}ms...",
-                            llm_err.status,
-                            llm_err.message,
-                            attempt + 1,
-                            attempts,
-                            delay.as_millis()
-                        ));
-                        tokio::select! {
-                            () = tokio::time::sleep(delay) => {}
-                            () = wait_abort_signal(&abort_signal) => {
-                                return Err(err);
-                            }
-                        }
-                    }
-                } else {
-                    // Non-LlmError (network timeout, DNS, etc): treat as retryable
-                    if attempt + 1 < attempts {
-                        let delay = compute_backoff_delay(retry_config, attempt);
-                        ctx.warn(&format!(
-                            "Network error, attempt {}/{}. Retrying in {}ms: {}",
-                            attempt + 1,
-                            attempts,
-                            delay.as_millis(),
-                            err
-                        ));
-                        tokio::select! {
-                            () = tokio::time::sleep(delay) => {}
-                            () = wait_abort_signal(&abort_signal) => {
-                                return Err(err);
-                            }
-                        }
-                    }
+            Err(err) => match handle_attempt_error(&err, retry_config, attempt, attempts) {
+                AttemptOutcome::BailImmediately => return Err(err),
+                AttemptOutcome::ExitLoop => {
+                    last_error = Some(err);
+                    break;
                 }
-                last_error = Some(err);
-            }
+                AttemptOutcome::Sleep(delay, msg) => {
+                    ctx.warn(&msg);
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = wait_abort_signal(&abort_signal) => {
+                            return Err(err);
+                        }
+                    }
+                    last_error = Some(err);
+                }
+            },
         }
     }
 
