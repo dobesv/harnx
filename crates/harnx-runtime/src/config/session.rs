@@ -655,7 +655,11 @@ pub fn save(
 }
 
 pub fn to_agent(session: &Session) -> Agent {
-    Agent::new(session.to_agent_config())
+    Agent::new(
+        session
+            .to_agent_config()
+            .expect("session agent config should always be valid"),
+    )
 }
 
 pub fn compress(session: &mut Session, mut prompt: String) {
@@ -991,7 +995,7 @@ mod tests {
         let agent = Agent::new(AgentConfig::from_markdown(
             "test",
             "---\nmodel: openai:gpt-4o\nmodel_fallbacks:\n  - anthropic:claude\n  - google:gemini\n---\nYou are a test agent.",
-        ));
+        ).unwrap());
         let mut session = test_session();
 
         session.set_agent(&agent);

@@ -36,7 +36,7 @@ pub const CREATE_TITLE_AGENT_NAME: &str = "%create-title%";
 pub type AgentVariables = IndexMap<String, String>;
 
 static RE_METADATA: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?s)-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?s)\A-{3,}\s*(.*?)\s*-{3,}\s*(.*)").unwrap());
 
 // --- Toolset-value serde helpers ---------------------------------------------
 //
@@ -153,7 +153,7 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
-    pub fn from_markdown(name: &str, content: &str) -> Self {
+    pub fn from_markdown(name: &str, content: &str) -> Result<Self> {
         let mut metadata = "";
         let mut prompt = content.trim();
         if let Ok(Some(caps)) = RE_METADATA.captures(content) {
@@ -167,9 +167,10 @@ impl AgentConfig {
         let frontmatter = if metadata.is_empty() {
             AgentFrontMatter::default()
         } else {
-            serde_yaml::from_str::<AgentFrontMatter>(metadata).unwrap_or_default()
+            serde_yaml::from_str::<AgentFrontMatter>(metadata)
+                .map_err(|e| anyhow::anyhow!("Invalid front-matter in agent '{}': {}", name, e))?
         };
-        Self {
+        Ok(Self {
             name: name.to_string(),
             model_id: frontmatter.model_id,
             model_fallbacks: frontmatter.model_fallbacks,
@@ -188,13 +189,17 @@ impl AgentConfig {
             compaction_agent: frontmatter.compaction_agent,
             prompt,
             ..Default::default()
-        }
+        })
     }
 
     pub fn from_prompt(prompt: &str) -> Self {
-        let mut agent = Self::from_markdown(TEMP_AGENT_NAME, prompt);
-        agent.name = TEMP_AGENT_NAME.to_string();
-        agent
+        let mut prompt = prompt.to_string();
+        interpolate_variables(&mut prompt);
+        Self {
+            name: TEMP_AGENT_NAME.to_string(),
+            prompt,
+            ..Default::default()
+        }
     }
 
     /// Markdown body for the built-in `%create-title%` agent, or `None`
@@ -585,6 +590,48 @@ fn serialize_frontmatter(frontmatter: &AgentFrontMatter) -> Result<String> {
 }
 
 // --- AgentVariable -----------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_frontmatter_only_at_start_of_file() {
+        // A `--- ... ---` block that is NOT at the very start of the file must
+        // be treated as plain prompt text, not parsed as front-matter.
+        let content = "Some preamble text.\n---\nmodel: openai:gpt-4o\n---\nMore text.";
+        let agent = AgentConfig::from_markdown("test", content).unwrap();
+        // No model should have been parsed from the mid-file block.
+        assert!(agent.model_id().is_none());
+        // The entire content (trimmed) should appear as the prompt.
+        let instructions = agent.interpolated_instructions();
+        assert!(
+            instructions.contains("Some preamble text."),
+            "expected preamble in prompt, got: {instructions:?}"
+        );
+        assert!(
+            instructions.contains("model: openai:gpt-4o"),
+            "expected mid-file --- block to be part of prompt, got: {instructions:?}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_frontmatter_returns_error() {
+        // A file whose leading front-matter contains invalid YAML must return
+        // Err rather than silently producing a default config.
+        let content = "---\nmodel: [unclosed bracket\n---\nYou are an agent.";
+        let result = AgentConfig::from_markdown("bad-agent", content);
+        assert!(
+            result.is_err(),
+            "expected Err for malformed YAML front-matter, got Ok"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("Invalid front-matter"),
+            "expected error message to mention 'Invalid front-matter', got: {msg:?}"
+        );
+    }
+}
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AgentVariable {

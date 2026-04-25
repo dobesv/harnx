@@ -3440,7 +3440,7 @@ mod tests {
         let mut main_agent = Agent::new(AgentConfig::from_markdown(
             "main",
             "---\nmodel: gemini:gemini-3.1-flash-lite-preview\ncompaction_agent: my-compactor\n---\nYou are the main agent.",
-        ));
+        ).unwrap());
         main_agent.set_model(crate::client::Model::new(
             "gemini",
             "gemini-3.1-flash-lite-preview",
