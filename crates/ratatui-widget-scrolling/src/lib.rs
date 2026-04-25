@@ -14,6 +14,19 @@ pub type FullItems = Option<(std::ops::Range<IndexInHeightLog>, Rect)>;
 /// `lines_above_viewport` is the number of lines of this item that are
 /// scrolled above the top of the viewport.  The renderer must skip that
 /// many lines before copying content into the frame.
+/// `(item_index, screen_area, lines_above_viewport)`
+///
+/// `lines_above_viewport` is the number of lines of this item that have been
+/// scrolled past the *top* edge of the viewport (not the bottom).  The
+/// renderer must skip exactly that many lines from the start of the item
+/// buffer before copying content into the frame.
+///
+/// For a tall item that is anchored at the bottom of the viewport (the most
+/// recent transcript entry), this is `max(0, item_height - scroll_offset -
+/// viewport_height)` — the portion of the item that overflows above the
+/// visible area.  When the item does not overflow above the viewport
+/// (i.e. it fits between the bottom of the viewport and somewhere inside it),
+/// this is `0`.
 pub type PartialBottomItem = Option<(IndexInHeightLog, Rect, usize)>;
 
 pub struct ScrollState {
@@ -420,10 +433,19 @@ pub fn get_areas_to_render_from_scroll_position(
                 remaining_item_bottom_height_after_scrolling
             };
 
-        // Store the return value.
-        // The third field is `scroll_offset`: the number of lines of this item
-        // that are scrolled above the top of the viewport.  The renderer must
-        // skip exactly that many lines before copying content to the frame.
+        // Lines of this item that are above the *top* of the viewport — the
+        // portion that overflows upward beyond what the viewport can show.
+        // Equals `(height - scroll_offset) - viewport_height` when the item
+        // overflows the top of the viewport, otherwise `0`.
+        //
+        // The renderer skips this many lines from the start of the item's
+        // buffer before copying.  Passing `scroll_offset` here (which counts
+        // lines below the viewport, not above) makes the visible window
+        // through a tall item slide in the wrong direction as the user
+        // scrolls — the bug fixed here.
+        let lines_above_viewport =
+            remaining_item_bottom_height_after_scrolling.saturating_sub(viewable_space);
+
         area_for_partial_draw_bottom = Some((
             index,
             Rect {
@@ -435,7 +457,7 @@ pub fn get_areas_to_render_from_scroll_position(
                 height: partial_item_bottom_height.try_into().unwrap_or(u16::MAX),
                 ..area
             },
-            scroll_offset,
+            lines_above_viewport,
         ));
     }
 
@@ -932,5 +954,43 @@ mod tests {
                 width: 5,
             }
         );
+    }
+
+    /// `lines_above_viewport` (the third tuple field of `PartialBottomItem`)
+    /// must equal the number of item lines scrolled past the *top* of the
+    /// viewport, not the number scrolled past the bottom.  These two values
+    /// only coincide at one specific scroll position; everywhere else,
+    /// passing the wrong one makes the visible window through a tall item
+    /// slide in the wrong direction.
+    ///
+    /// For a single item with H = 20 in a viewport with V = 10:
+    ///
+    /// | scroll_offset (S) | expected lines_above = max(0, H - S - V) |
+    /// |-------------------|------------------------------------------|
+    /// |                 1 |                                        9 |
+    /// |                 5 |                                        5 |
+    /// |                10 |                                        0 |
+    /// |                15 |                                        0 (item no longer overflows top) |
+    #[test]
+    fn partial_bottom_lines_above_is_overflow_above_not_offset_below() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            height: 10,
+            width: 5,
+        };
+        let height_log = [20];
+
+        for (scroll_offset, expected_lines_above) in [(1, 9), (5, 5), (10, 0), (15, 0)] {
+            let (_, _, partial_bottom) =
+                get_areas_to_render_from_scroll_position(area, scroll_offset, &height_log);
+            let (_, _, lines_above) = partial_bottom.unwrap_or_else(|| {
+                panic!("expected partial_bottom for scroll_offset={scroll_offset}")
+            });
+            assert_eq!(
+                lines_above, expected_lines_above,
+                "scroll_offset={scroll_offset}: lines_above must be max(0, H-S-V), not S"
+            );
+        }
     }
 }
