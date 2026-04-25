@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 pub(super) const MIN_INPUT_HEIGHT: u16 = 3;
 pub(super) const MAX_INPUT_HEIGHT: u16 = 8;
@@ -16,12 +17,24 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 
 pub struct Tui {
     pub(super) config: GlobalConfig,
+    /// Tui-level abort signal used for Ctrl-D quitting and dot-command
+    /// interruption. Each running prompt task gets its OWN abort signal
+    /// (see `current_prompt_abort` below) so that resetting the Tui-level
+    /// signal on a new submission can never un-abort an old prompt task.
     pub(super) abort_signal: AbortSignal,
     pub(super) async_manager: Arc<Mutex<AsyncHookManager>>,
     pub(super) persistent_manager: Arc<Mutex<PersistentHookManager>>,
     pub(super) pending_async_context: Arc<Mutex<Option<String>>>,
     /// Shared state so the prompt task can consume a pending message mid-tool-loop.
     pub(super) shared_pending_message: Arc<Mutex<Option<PendingMessage>>>,
+    /// Per-task abort signal for the currently running (or most recently
+    /// started) prompt task. Ctrl+C signals this; `start_prompt` consults
+    /// it to abort an in-flight task before spawning a new one.
+    pub(super) current_prompt_abort: Option<AbortSignal>,
+    /// JoinHandle for the currently running (or most recently started)
+    /// prompt task. `start_prompt` awaits/aborts this before spawning a
+    /// new task — guaranteeing one prompt task at a time.
+    pub(super) current_prompt_handle: Option<JoinHandle<()>>,
     #[allow(private_interfaces)]
     pub(crate) app: App,
     pub(crate) event_tx: mpsc::UnboundedSender<TuiEvent>,

@@ -27,7 +27,7 @@ pub use harnx_engine::tool::{
 /// On eval failure, synthesizes one error-output `ToolResult` per
 /// call, writes those to keep the log well-formed, and returns the
 /// original error.  Skips both writes entirely when `dry_run` is set.
-pub fn execute_tool_round(
+pub async fn execute_tool_round(
     config: &GlobalConfig,
     input: &Input,
     output: &str,
@@ -41,8 +41,9 @@ pub fn execute_tool_round(
             .write()
             .save_session_tool_calls(input, output, thought, &tool_calls)?;
     }
-    let eval_ctx = build_tool_eval_context(config);
-    let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal) {
+    let agent_use_tools = input.agent().use_tools().map(|v| v.join(","));
+    let eval_ctx = build_tool_eval_context(config, agent_use_tools.as_deref());
+    let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal).await {
         Ok(results) => results,
         Err(err) => {
             let fallback: Vec<ToolResult> = tool_calls
@@ -75,11 +76,20 @@ pub fn execute_tool_round(
 /// the provider list (ACP first, MCP second), builds the dispatch hook
 /// closure over captured `hooks.entries`, `session_id`, and `cwd`, and
 /// wires in harnx-side default UI/prompt callbacks.
-pub fn build_tool_eval_context(config: &GlobalConfig) -> ToolEvalContext {
+///
+/// `agent_use_tools` is the active agent's `use_tools` whitelist. The
+/// CLI/TUI flow stores the agent on the Config (via `use_agent`), so
+/// `Config::extract_agent()` would yield the right value, but the ACP
+/// server holds the agent only on the per-prompt `Input` (because each
+/// `prompt` call may target a different agent on the same Config).
+/// Passing the use_tools list explicitly keeps both paths correct.
+pub fn build_tool_eval_context(
+    config: &GlobalConfig,
+    agent_use_tools: Option<&str>,
+) -> ToolEvalContext {
     let guard = config.read();
-    let use_tools = guard.extract_agent().use_tools().map(|v| v.join(","));
     let allowed_tool_names: HashSet<String> = guard
-        .tool_declarations_for_use_tools(use_tools.as_deref())
+        .tool_declarations_for_use_tools(agent_use_tools)
         .into_iter()
         .map(|decl| decl.name)
         .collect();
@@ -211,8 +221,13 @@ mod tests {
         let calls = vec![call];
 
         let abort_signal = create_abort_signal();
-        let result =
-            eval_tool_calls(&build_tool_eval_context(&config), calls, &abort_signal).unwrap();
+        let result = eval_tool_calls(
+            &build_tool_eval_context(&config, None),
+            calls,
+            &abort_signal,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].call.name, "unknown_tool");
         assert!(result[0].output.is_object());

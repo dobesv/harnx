@@ -1,11 +1,9 @@
 use std::io::Write;
 
-use crate::client::retry::call_with_retry_and_fallback;
 use crate::config::{macro_execute, AgentVariables, Config, GlobalConfig, Input, LastMessage};
 use crate::utils::{abortable_run_with_spinner, dimmed_text, set_text, AbortSignal};
 use harnx_hooks::{
-    dispatch_hooks_with_count_and_manager, dispatch_hooks_with_managers, drain_async_results,
-    inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
+    dispatch_hooks_with_managers, AsyncHookManager, HookEvent, HookResultControl,
     PersistentHookManager,
 };
 use harnx_render::render_error;
@@ -13,7 +11,7 @@ use harnx_render::render_error;
 use anyhow::{anyhow, bail, Context, Result};
 use fancy_regex::Regex;
 use std::env;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 /// Outcome of running a dot-command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,7 +708,6 @@ Commands:
 }
 
 #[allow(clippy::too_many_arguments)]
-#[async_recursion::async_recursion]
 async fn ask(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
@@ -736,11 +733,10 @@ async fn ask(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[async_recursion::async_recursion]
 async fn ask_inner(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
-    mut input: Input,
+    input: Input,
     with_embeddings: bool,
     async_manager: &mut AsyncHookManager,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
@@ -748,246 +744,35 @@ async fn ask_inner(
     resume_count: u32,
     max_resume: u32,
 ) -> Result<()> {
-    if input.is_empty() {
-        return Ok(());
-    }
-    if with_embeddings {
-        crate::config::input::use_embeddings(&mut input, config, abort_signal.clone()).await?;
-    }
-    while config.read().is_compacting_session() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    // Wrap the &mut managers into Arc<Mutex> for the unified loop.
+    // This is safe because ask_inner is called once per user turn (not concurrently).
+    let am = std::mem::take(async_manager);
+    let am_arc = Arc::new(tokio::sync::Mutex::new(am));
+    let pending = std::mem::take(pending_async_context);
+    let pending_arc = Arc::new(tokio::sync::Mutex::new(pending));
 
-    drain_async_results(async_manager, pending_async_context);
-    inject_pending_async_context(&mut input, pending_async_context);
-
-    config.write().before_chat_completion(&input)?;
-    let (hooks, session_id, cwd) = {
-        let config = config.read();
-        (
-            config.resolved_hooks(),
-            config
-                .session
-                .as_ref()
-                .map(|session| session.name())
-                .unwrap_or("default")
-                .to_string(),
-            env::current_dir().unwrap_or_default(),
-        )
+    let ctx = crate::agent_loop::AgentLoopContext {
+        config: config.clone(),
+        abort_signal: abort_signal.clone(),
+        async_manager: am_arc.clone(),
+        persistent_manager: persistent_manager.clone(),
+        call_fn: None,
+        on_tool_round: None,
+        on_text_response: None,
+        initial_with_embeddings: with_embeddings,
+        initial_resume_count: resume_count,
+        max_resume: Some(max_resume),
+        pending_async_context: Some(pending_arc.clone()),
     };
-    let (output, thought, tool_calls, usage) =
-        match call_with_retry_and_fallback(&input, config, abort_signal.clone()).await {
-            Ok(result) => result,
-            Err(err) => {
-                let event = HookEvent::StopFailure {
-                    error: err.to_string(),
-                    error_type: "api_error".to_string(),
-                };
-                let _ = dispatch_hooks_with_managers(
-                    &event,
-                    &hooks.entries,
-                    &session_id,
-                    &cwd,
-                    Some(async_manager),
-                    Some(persistent_manager),
-                )
-                .await;
-                let _ = config.write().after_chat_completion(
-                    &input,
-                    "",
-                    None,
-                    &[],
-                    &Default::default(),
-                );
-                return Err(err);
-            }
-        };
 
-    // Plain-text rounds save once via after_chat_completion; tool
-    // rounds use `execute_tool_round` to persist the request, run the
-    // tools, and persist the results as two separate log entries.
-    let tool_results = if tool_calls.is_empty() {
-        config
-            .write()
-            .after_chat_completion(&input, &output, thought.as_deref(), &[], &usage)?;
-        Vec::new()
-    } else {
-        config.write().record_completion_usage(&usage);
-        crate::tool::execute_tool_round(
-            config,
-            &input,
-            &output,
-            thought.as_deref(),
-            tool_calls,
-            &abort_signal,
-        )?
-    };
-    if tool_results.is_empty() {
-        let config_read = config.read();
-        let macro_flag = config_read.macro_flag;
-        let status = config_read.render_status_line(true);
-        let session_usage = config_read
-            .session
-            .as_ref()
-            .map(|s| s.completion_usage().clone());
-        let display_usage = session_usage.as_ref().unwrap_or(&usage);
-        let context_stats = config_read
-            .session
-            .as_ref()
-            .map(|s| {
-                let (tokens, percent) = s.tokens_usage();
-                if percent > 0.0 {
-                    format!("💬 {}({:.0}%)", tokens, percent)
-                } else {
-                    format!("💬 {}", tokens)
-                }
-            })
-            .unwrap_or_default();
-        drop(config_read);
-        let mut line_parts = vec![];
-        if !status.is_empty() {
-            line_parts.push(status);
-        }
-        if !display_usage.is_empty() {
-            line_parts.push(format!("   {}", display_usage));
-        }
-        if !context_stats.is_empty() {
-            line_parts.push(format!("  {}", context_stats));
-        }
-        if !line_parts.is_empty() {
-            let prefix = if macro_flag { "" } else { "\n" };
-            crate::utils::emit_info(format!("{prefix}{}", dimmed_text(&line_parts.join(""))));
-        }
-    }
-    let stop_outcome = if tool_results.is_empty() {
-        let event = HookEvent::Stop {
-            stop_hook_active: true,
-            last_assistant_message: Some(output.clone()),
-        };
-        let stop_outcome = dispatch_hooks_with_count_and_manager(
-            &event,
-            &hooks.entries,
-            &session_id,
-            &cwd,
-            resume_count,
-            Some(async_manager),
-            Some(persistent_manager),
-        )
-        .await;
-        if let Some(additional_context) = stop_outcome
-            .result
-            .additional_context
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        {
-            debug!(
-                "Captured Stop hook additional context for later auto-continue: {additional_context}"
-            );
-        }
-        Some(stop_outcome)
-    } else {
-        None
-    };
-    if !tool_results.is_empty() {
-        let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
-        if let Some(switch_agent) = switch_agent {
-            config.write().exit_agent()?;
-            crate::config::Config::use_agent(
-                config,
-                &switch_agent.agent,
-                switch_agent.session_id.as_deref(),
-                abort_signal.clone(),
-            )
-            .await?;
-            // Always empty the session on handoff so the new agent starts
-            // fresh — the prior agent's system prompt and messages should
-            // not bleed into the new agent's session (#291).
-            if config.read().session.is_some() {
-                config.write().empty_session()?;
-            }
-            let fresh_input = crate::config::input::from_str(config, &switch_agent.prompt, None);
-            return Box::pin(ask_inner(
-                config,
-                abort_signal,
-                fresh_input,
-                true,
-                async_manager,
-                persistent_manager,
-                pending_async_context,
-                0,
-                max_resume,
-            ))
-            .await;
-        }
+    let result = crate::agent_loop::run_agent_loop(&ctx, input).await;
 
-        ask_inner(
-            config,
-            abort_signal,
-            input.merge_tool_results(output, thought, tool_results),
-            false,
-            async_manager,
-            persistent_manager,
-            pending_async_context,
-            resume_count,
-            max_resume,
-        )
-        .await
-    } else {
-        if let Some(stop_outcome) = stop_outcome {
-            if stop_outcome.result.resume.unwrap_or(false) && resume_count < max_resume {
-                if abort_signal.aborted() {
-                    return Ok(());
-                }
+    let mut guard = am_arc.lock().await;
+    *async_manager = std::mem::take(&mut *guard);
+    let mut pending_guard = pending_arc.lock().await;
+    *pending_async_context = std::mem::take(&mut *pending_guard);
 
-                let context = stop_outcome
-                    .result
-                    .additional_context
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-                let new_input = crate::config::input::from_str(config, &context, None);
-                return ask_inner(
-                    config,
-                    abort_signal,
-                    new_input,
-                    true,
-                    async_manager,
-                    persistent_manager,
-                    pending_async_context,
-                    resume_count + 1,
-                    max_resume,
-                )
-                .await;
-            }
-        }
-
-        if drain_async_results(async_manager, pending_async_context) && resume_count < max_resume {
-            if abort_signal.aborted() {
-                return Ok(());
-            }
-
-            let context = pending_async_context
-                .take()
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-            let new_input = crate::config::input::from_str(config, &context, None);
-            return ask_inner(
-                config,
-                abort_signal,
-                new_input,
-                true,
-                async_manager,
-                persistent_manager,
-                pending_async_context,
-                resume_count + 1,
-                max_resume,
-            )
-            .await;
-        }
-
-        Config::maybe_autoname_session(config.clone());
-        Config::maybe_compact_session(config.clone());
-        Ok(())
-    }
+    result
 }
 
 fn unknown_command() -> Result<()> {

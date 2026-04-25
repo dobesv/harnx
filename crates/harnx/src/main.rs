@@ -412,7 +412,8 @@ async fn start_directive_inner(
             thought.as_deref(),
             tool_calls,
             &abort_signal,
-        )?
+        )
+        .await?
     };
     if tool_results.is_empty() {
         let config_read = config.read();

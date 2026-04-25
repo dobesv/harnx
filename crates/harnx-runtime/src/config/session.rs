@@ -1337,4 +1337,115 @@ mod tests {
             "render output should contain comma-separated fallback values: {output}"
         );
     }
+
+    /// `begin_turn` writes `input.injected_user_text` to the session log on
+    /// every call where the field is set — it does not clear the field. The
+    /// agent loop is responsible for resetting `injected_user_text` between
+    /// iterations; if it forgets, the same user message is appended on every
+    /// tool round and the LLM sees N copies of one user message.
+    #[test]
+    fn injected_user_text_appended_once_per_begin_turn_call() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+
+        let mut input =
+            crate::config::input::from_str(&global_config, "do work", Some(agent.clone()));
+        input.set_injected_user_text("queued message".to_string());
+
+        let call_a = ToolCall {
+            name: "tool_a".to_string(),
+            arguments: json!({}),
+            id: Some("a1".to_string()),
+            thought_signature: None,
+        };
+        super::add_tool_calls(
+            &mut session,
+            &input,
+            "round 1",
+            None,
+            std::slice::from_ref(&call_a),
+        )
+        .unwrap();
+        super::add_tool_results(
+            &mut session,
+            &[ToolResult::new(call_a, json!({"ok": true}))],
+        )
+        .unwrap();
+
+        // Without the agent_loop clearing `injected_user_text` between rounds,
+        // the SAME `input` reused for round 2 reapplies the injection.
+        let call_b = ToolCall {
+            name: "tool_b".to_string(),
+            arguments: json!({}),
+            id: Some("b1".to_string()),
+            thought_signature: None,
+        };
+        super::add_tool_calls(
+            &mut session,
+            &input,
+            "round 2",
+            None,
+            std::slice::from_ref(&call_b),
+        )
+        .unwrap();
+        super::add_tool_results(
+            &mut session,
+            &[ToolResult::new(call_b, json!({"ok": true}))],
+        )
+        .unwrap();
+
+        let injected_count = session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User && m.content.to_text() == "queued message")
+            .count();
+        assert_eq!(
+            injected_count, 2,
+            "begin_turn appends injected_user_text every call when the field stays set; \
+             callers (the agent loop) must clear it between rounds to avoid duplicates"
+        );
+
+        // Mirror of the agent_loop fix: clearing the field between rounds
+        // restores the desired one-copy-per-injection behavior.
+        let mut input_cleared = input.clone();
+        input_cleared.injected_user_text = None;
+        let call_c = ToolCall {
+            name: "tool_c".to_string(),
+            arguments: json!({}),
+            id: Some("c1".to_string()),
+            thought_signature: None,
+        };
+        super::add_tool_calls(
+            &mut session,
+            &input_cleared,
+            "round 3",
+            None,
+            std::slice::from_ref(&call_c),
+        )
+        .unwrap();
+        super::add_tool_results(
+            &mut session,
+            &[ToolResult::new(call_c, json!({"ok": true}))],
+        )
+        .unwrap();
+
+        let injected_count_after_clear = session
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User && m.content.to_text() == "queued message")
+            .count();
+        assert_eq!(
+            injected_count_after_clear, 2,
+            "after clearing injected_user_text, no further duplicates are appended"
+        );
+    }
 }

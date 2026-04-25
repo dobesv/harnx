@@ -68,6 +68,8 @@ impl Tui {
             persistent_manager,
             pending_async_context: Arc::new(Mutex::new(None)),
             shared_pending_message: Arc::new(Mutex::new(None)),
+            current_prompt_abort: None,
+            current_prompt_handle: None,
             app: App {
                 transcript: initial_transcript,
                 input: Self::new_input(),
