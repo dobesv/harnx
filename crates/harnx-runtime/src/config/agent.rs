@@ -102,6 +102,21 @@ fn resolve_file_backed_variables(variables: &mut [AgentVariable], agent_dir: &Pa
     Ok(())
 }
 
+/// Load file-backed variable defaults onto the agent's variables.
+///
+/// For each variable with a `path:` field, reads the file and stores its
+/// content as the variable's `default`.  This is the subset of init that
+/// must run before `init_agent_session_variables` so that user-provided
+/// `agent_variables` can still override file defaults.
+pub fn resolve_file_defaults(agent: &mut Agent) -> Result<()> {
+    let agent_file_path = Config::agent_file(agent.name());
+    let agent_dir = agent_file_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(Config::agents_data_dir);
+    resolve_file_backed_variables(agent.config.variables_mut(), &agent_dir)
+}
+
 /// Resolve file-backed variable defaults and populate `shared_variables`.
 ///
 /// This performs the synchronous subset of `init()` that loads variable
@@ -111,13 +126,7 @@ fn resolve_file_backed_variables(variables: &mut [AgentVariable], agent_dir: &Pa
 /// model and this method for variables when you need a lightweight agent
 /// suitable for non-interactive use (e.g. compaction).
 pub fn resolve_variables(agent: &mut Agent) -> Result<()> {
-    let agent_file_path = Config::agent_file(agent.name());
-    let agent_dir = agent_file_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(Config::agents_data_dir);
-
-    resolve_file_backed_variables(agent.config.variables_mut(), &agent_dir)?;
+    resolve_file_defaults(agent)?;
 
     let new_variables = init_agent_variables(
         agent.config.defined_variables(),
