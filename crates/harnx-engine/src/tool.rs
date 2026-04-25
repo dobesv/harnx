@@ -15,24 +15,6 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::runtime::{Handle, RuntimeFlavor};
-
-/// Run an async future to completion in the current runtime context.
-///
-/// On multi-thread runtimes, uses `block_in_place` so other tasks can
-/// continue running on the thread pool while we block. On
-/// `current_thread` runtimes (e.g. the ACP server), `block_in_place`
-/// panics, so we fall back to a plain `Handle::current().block_on`.
-/// The latter is safe here because tool evaluation runs in a dedicated
-/// spawn (either `tokio::spawn` for CLI/TUI or `spawn_local` for ACP)
-/// and hook dispatch does not itself need to yield to other tasks.
-fn block_on_async<F: Future>(f: F) -> F::Output {
-    let handle = Handle::current();
-    match handle.runtime_flavor() {
-        RuntimeFlavor::CurrentThread => handle.block_on(f),
-        _ => tokio::task::block_in_place(|| handle.block_on(f)),
-    }
-}
 
 /// Callback invoked with a `&ToolCall` and the parsed arguments JSON.
 /// Used for both "tool is about to dispatch" and "tool returned a
@@ -86,7 +68,7 @@ pub struct ToolEvalContext {
     pub dispatch_hook_fn: Arc<DispatchHookFn>,
 }
 
-pub fn eval_tool_calls(
+pub async fn eval_tool_calls(
     ctx: &ToolEvalContext,
     mut calls: Vec<ToolCall>,
     abort_signal: &AbortSignal,
@@ -110,17 +92,15 @@ pub fn eval_tool_calls(
             tool_input: tool_input.clone(),
             tool_use_id: tool_use_id.clone(),
         };
-        let pre_outcome = block_on_async(async {
-            tokio::select! {
-                outcome = (ctx.dispatch_hook_fn)(pre_event) => outcome,
-                _ = wait_abort_signal(abort_signal) => HookOutcome {
-                    control: HookResultControl::Block {
-                        reason: "cancelled by user".to_string(),
-                    },
-                    result: HookResult::default(),
+        let pre_outcome = tokio::select! {
+            outcome = (ctx.dispatch_hook_fn)(pre_event) => outcome,
+            _ = wait_abort_signal(abort_signal) => HookOutcome {
+                control: HookResultControl::Block {
+                    reason: "cancelled by user".to_string(),
                 },
-            }
-        });
+                result: HookResult::default(),
+            },
+        };
         if abort_signal.aborted() {
             bail!("interrupted during pre-tool hook");
         }
@@ -145,7 +125,7 @@ pub fn eval_tool_calls(
             bail!("tool execution aborted by user");
         }
 
-        let eval_result = eval_tool_call_mcp(&call, ctx, abort_signal);
+        let eval_result = eval_tool_call_mcp(&call, ctx, abort_signal).await;
         match eval_result {
             Ok(mut result) => {
                 let post_event = HookEvent::PostToolUse {
@@ -154,7 +134,7 @@ pub fn eval_tool_calls(
                     tool_response: result.clone(),
                     tool_use_id: tool_use_id.clone(),
                 };
-                let _ = block_on_async((ctx.dispatch_hook_fn)(post_event));
+                let _ = (ctx.dispatch_hook_fn)(post_event).await;
 
                 // Emit tool result to TUI or terminal
                 (ctx.emit_tool_result_fn)(&call, &result);
@@ -192,7 +172,7 @@ pub fn eval_tool_calls(
                     tool_use_id: tool_use_id.clone(),
                     error: error_display.clone(),
                 };
-                let _ = block_on_async((ctx.dispatch_hook_fn)(fail_event));
+                let _ = (ctx.dispatch_hook_fn)(fail_event).await;
 
                 is_all_null = false;
                 let error_result = json!({
@@ -210,7 +190,7 @@ pub fn eval_tool_calls(
     Ok(output)
 }
 
-fn eval_tool_call_mcp(
+async fn eval_tool_call_mcp(
     call: &ToolCall,
     ctx: &ToolEvalContext,
     abort_signal: &AbortSignal,
@@ -274,7 +254,7 @@ fn eval_tool_call_mcp(
         }
         let tool_name = call.name.clone();
         let args = json_data.clone();
-        let result = block_on_async(provider.call_tool(&tool_name, args, abort_signal))?;
+        let result = provider.call_tool(&tool_name, args, abort_signal).await?;
         return Ok(result);
     }
 

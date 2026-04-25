@@ -263,7 +263,8 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
                 thought.as_deref(),
                 tool_calls,
                 abort_signal,
-            )?
+            )
+            .await?
         };
 
         // `injected_user_text` is a one-shot field — it was written to the
@@ -381,6 +382,23 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
                 input = crate::config::input::from_str(config, &switch.prompt, None);
                 resume_count = 0;
                 with_embeddings = true;
+                // Emit a sourced Turn::Started so every front-end's sink
+                // sees the agent change. The TUI's `render_ui_output_heading`
+                // inserts a `> {agent} ▸ {session}` heading on source
+                // changes; the CLI sink prints the same heading; the ACP
+                // sink forwards it to `session_notification`. Without
+                // this emit the unified loop silently switches agents
+                // and the sub-agent's chunks render under the parent's
+                // heading (the planner→executor e2e snapshot regression
+                // and #312/#249 follow-up tests).
+                let source = harnx_core::event::AgentSource {
+                    agent: switch.agent.clone(),
+                    session_id: switch.session_id.clone(),
+                };
+                harnx_core::sink::emit_agent_event_with_source(
+                    harnx_core::event::AgentEvent::Turn(harnx_core::event::TurnEvent::Started),
+                    Some(source),
+                );
                 continue;
             }
 

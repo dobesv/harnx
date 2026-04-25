@@ -14,52 +14,78 @@ pub use server_main::run;
 mod test_regression_issue_68;
 
 use agent_client_protocol::{self as acp, Client as AcpClientTrait};
-use harnx_acp::NestedAcpEvent;
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use uuid::Uuid;
 
-use harnx_core::event::{AgentEvent, AgentSource, ModelEvent};
+use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, ToolEvent};
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::utils::{AbortSignal, AbortSignalInner};
 
+/// Update payloads forwarded from the per-prompt `AcpChunkSink` to the
+/// local `fwd_task`. Each variant carries the original `AgentSource` so
+/// the forwarded `SessionNotification` can attach `meta` describing
+/// which agent (parent vs. some sub-agent) actually produced the event;
+/// the parent's `AcpNotificationClient::resolve_notification_source`
+/// reads that meta to render the right `> agent ▸ session` heading.
+enum AcpForward {
+    /// Text chunk for `SessionUpdate::AgentMessageChunk`.
+    Text(String, Option<AgentSource>),
+    /// Sub-agent tool invocation for `SessionUpdate::ToolCall`.
+    ToolCall {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        source: Option<AgentSource>,
+    },
+}
+
 /// An `AgentEventSink` installed during each ACP prompt turn.
-/// Forwards `MessageChunk` events from the unified run_agent_loop through a
-/// channel to a spawned local task that calls `session_notification`.
-/// Using a channel avoids the `!Send` / `!Sync` problem of holding `Rc`.
+/// Forwards events from the unified `run_agent_loop` through a channel
+/// to a spawned local task that calls `session_notification`. The
+/// channel is required because the ACP `connection` is `Rc<...>` (`!Send`)
+/// and can't be captured in the sink itself.
 struct AcpChunkSink {
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<AcpForward>,
 }
 
 impl harnx_core::event::AgentEventSink for AcpChunkSink {
     fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
-        if let Some(source) = source.as_ref() {
-            let _ = self.tx.send(source_heading(source));
+        // Source headings are NOT injected into the chunk stream here.
+        // Sending `> agent ▸ session` as an `AgentMessageChunk` would
+        // pollute the parent's accumulated `response_text` (which forms
+        // the next agent's input, see `AcpNotificationClient::session_
+        // notification`). The parent's UI reconstructs source from the
+        // chunk's `meta` (set by `spawn_notify_text` /
+        // `spawn_notify_tool_call`) and renders the heading itself.
+        match event {
+            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
+                let text: String = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        harnx_core::event::ContentBlock::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !text.is_empty() {
+                    let _ = self.tx.send(AcpForward::Text(text, source));
+                }
+            }
+            AgentEvent::Model(ModelEvent::Final { output, .. }) if !output.is_empty() => {
+                let _ = self.tx.send(AcpForward::Text(output, source));
+            }
+            AgentEvent::Tool(ToolEvent::Started {
+                id, name, input, ..
+            }) => {
+                let _ = self.tx.send(AcpForward::ToolCall {
+                    id,
+                    name,
+                    input,
+                    source,
+                });
+            }
+            _ => {}
         }
-
-        let text = match &event {
-            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    harnx_core::event::ContentBlock::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<String>(),
-            AgentEvent::Model(ModelEvent::Final { output, .. }) => output.clone(),
-            _ => return,
-        };
-        if !text.is_empty() {
-            let _ = self.tx.send(text);
-        }
-    }
-}
-
-fn source_heading(source: &AgentSource) -> String {
-    match &source.session_id {
-        Some(session_id) if !session_id.is_empty() => {
-            format!("> {} ▸ {}", source.agent, session_id)
-        }
-        _ => format!("> {}", source.agent),
     }
 }
 
@@ -209,34 +235,56 @@ impl acp::Agent for HarnxAgent {
         let mut input = harnx_runtime::config::input::from_str(&self.config, &prompt_text, None);
         harnx_runtime::config::input::set_agent(&mut input, &self.config, agent.into_config());
 
-        // Install an AgentEventSink for streaming chunks (MessageChunk events).
-        // For non-streaming turns, on_text_response sends full text below.
-        // Nested ACP activity must also be subscribed + forwarded.
-        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let text_tx = chunk_tx.clone();
+        // Install an AgentEventSink for streaming chunks (MessageChunk events)
+        // and tool calls (ToolEvent::Started). Nested ACP activity from
+        // sub-agent delegations also flows through this sink because
+        // `AcpManager::call_tool` registers a forwarder that re-emits each
+        // nested chunk via `emit_agent_event_with_source` — the global sink
+        // is the single point that converts all events to ACP notifications.
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<AcpForward>();
         let sink: Arc<dyn harnx_core::event::AgentEventSink> =
             Arc::new(AcpChunkSink { tx: chunk_tx });
         harnx_core::sink::install_agent_event_sink(sink);
 
-        let acp_manager = self.config.read().acp_manager.clone();
-        let (mut nested_rx, nested_sub_id) = if let Some(ref mgr) = acp_manager {
-            let (rx, id) = mgr.subscribe_chunks().await;
-            (Some(rx), Some(id))
-        } else {
-            (None, None)
-        };
-
-        // Spawn local task to drain both local loop chunks and nested ACP chunks.
+        // Spawn local task to drain chunk_rx → session_notification.
         let connection_for_fwd = self.connection.borrow().clone();
         let session_key_for_fwd = session_key.clone();
-        // Helper: fire a session_notification without blocking the LocalSet
+        // Helpers: fire a session_notification without blocking the LocalSet
         // thread. Each notification is spawned as its own local task so
         // run_agent_loop / execute_tool_round are never starved waiting for
         // the parent to acknowledge a notification write.
-        fn spawn_notify(
+        // Build the `meta` payload that `AcpNotificationClient::resolve_
+        // notification_source` reads to determine `AgentSource`. Without
+        // these fields the parent infers source from the connection's
+        // agent_name, which (a) loses sub-agent identity when this
+        // server is forwarding a nested chunk and (b) prevents
+        // `render_ui_output_heading` from emitting `> agent ▸ session`.
+        // `agent_from_meta_value` / `session_from_meta_value` in
+        // `harnx-acp::client` read `agent` and `session` keys (no
+        // namespace prefix). Match those exactly so the parent recovers
+        // sub-agent identity.
+        fn meta_from_source(
+            source: &AgentSource,
+        ) -> Option<serde_json::Map<String, serde_json::Value>> {
+            let mut map = serde_json::Map::new();
+            map.insert(
+                "agent".to_string(),
+                serde_json::Value::String(source.agent.clone()),
+            );
+            if let Some(session_id) = &source.session_id {
+                map.insert(
+                    "session".to_string(),
+                    serde_json::Value::String(session_id.clone()),
+                );
+            }
+            Some(map)
+        }
+
+        fn spawn_notify_text(
             conn: &Option<Rc<acp::AgentSideConnection>>,
             session_key: &str,
             text: String,
+            source: Option<AgentSource>,
         ) {
             if text.is_empty() {
                 return;
@@ -244,82 +292,78 @@ impl acp::Agent for HarnxAgent {
             if let Some(conn) = conn.clone() {
                 let sid = session_key.to_string();
                 tokio::task::spawn_local(async move {
+                    let mut chunk = acp::ContentChunk::new(text.into());
+                    if let Some(source) = source.as_ref() {
+                        if let Some(meta) = meta_from_source(source) {
+                            chunk = chunk.meta(meta);
+                        }
+                    }
                     let notification = acp::SessionNotification::new(
                         acp::SessionId::new(sid),
-                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(text.into())),
+                        acp::SessionUpdate::AgentMessageChunk(chunk),
                     );
                     let _ = conn.session_notification(notification).await;
                 });
             }
         }
 
-        let fwd_task = tokio::task::spawn_local(async move {
-            // Phase 1: drain both chunk_rx and nested_rx concurrently.
-            // Each notification is fire-and-forget (spawn_local) so this loop
-            // never blocks waiting for the parent to ACK a write. This keeps
-            // run_agent_loop / execute_tool_round schedulable on the same
-            // LocalSet thread.
-            'outer: loop {
-                let Some(ref mut nrx) = nested_rx else {
-                    break 'outer;
-                };
-                tokio::select! {
-                    maybe_text = chunk_rx.recv() => match maybe_text {
-                        Some(text) => {
-                            spawn_notify(&connection_for_fwd, &session_key_for_fwd, text);
-                        }
-                        None => break 'outer,
-                    },
-                    maybe_nested = nrx.recv() => match maybe_nested {
-                        Some(NestedAcpEvent::Text(text)) => {
-                            spawn_notify(&connection_for_fwd, &session_key_for_fwd, text);
-                        }
-                        Some(NestedAcpEvent::Agent(event, source)) => {
-                            if let Some(source) = source.as_ref() {
-                                spawn_notify(&connection_for_fwd, &session_key_for_fwd, source_heading(source));
-                            }
-                            let text = match event {
-                                AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => blocks
-                                    .into_iter()
-                                    .filter_map(|b| match b {
-                                        harnx_core::event::ContentBlock::Text(t) => Some(t),
-                                        _ => None,
-                                    })
-                                    .collect::<String>(),
-                                AgentEvent::Model(ModelEvent::Final { output, .. }) => output,
-                                AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(text)) => text,
-                                AgentEvent::Model(ModelEvent::Error(text)) => text,
-                                _ => String::new(),
-                            };
-                            spawn_notify(&connection_for_fwd, &session_key_for_fwd, text);
-                        }
-                        None => {
-                            nested_rx = None;
-                            break 'outer;
+        fn spawn_notify_tool_call(
+            conn: &Option<Rc<acp::AgentSideConnection>>,
+            session_key: &str,
+            id: String,
+            name: String,
+            input: serde_json::Value,
+            source: Option<AgentSource>,
+        ) {
+            if let Some(conn) = conn.clone() {
+                let sid = session_key.to_string();
+                tokio::task::spawn_local(async move {
+                    let tool_call_id = if id.is_empty() { name.clone() } else { id };
+                    let mut tc = acp::ToolCall::new(tool_call_id, name).raw_input(input);
+                    if let Some(source) = source.as_ref() {
+                        if let Some(meta) = meta_from_source(source) {
+                            tc = tc.meta(meta);
                         }
                     }
-                }
+                    let notification = acp::SessionNotification::new(
+                        acp::SessionId::new(sid),
+                        acp::SessionUpdate::ToolCall(tc),
+                    );
+                    let _ = conn.session_notification(notification).await;
+                });
             }
-            // Phase 2: drain remaining chunk_rx items.
-            while let Some(text) = chunk_rx.recv().await {
-                spawn_notify(&connection_for_fwd, &session_key_for_fwd, text);
+        }
+
+        fn spawn_notify_forward(
+            conn: &Option<Rc<acp::AgentSideConnection>>,
+            session_key: &str,
+            update: AcpForward,
+        ) {
+            match update {
+                AcpForward::Text(text, source) => {
+                    spawn_notify_text(conn, session_key, text, source)
+                }
+                AcpForward::ToolCall {
+                    id,
+                    name,
+                    input,
+                    source,
+                } => spawn_notify_tool_call(conn, session_key, id, name, input, source),
+            }
+        }
+
+        let fwd_task = tokio::task::spawn_local(async move {
+            while let Some(update) = chunk_rx.recv().await {
+                spawn_notify_forward(&connection_for_fwd, &session_key_for_fwd, update);
             }
         });
 
-        // on_text_response: called by run_agent_loop with the actual output text
-        // when the turn ends with a plain-text response (no tool calls). Routes
-        // through the same channel as streaming chunks so the fwd_task sends it
-        // to the ACP client. This keeps the closure Send (no Rc captured).
-        // text_tx was cloned from chunk_tx above
-        let on_text_response: harnx_runtime::OnTextResponseFn =
-            Arc::new(move |output: String, _usage| {
-                let tx = text_tx.clone();
-                Box::pin(async move {
-                    if !output.is_empty() {
-                        let _ = tx.send(output);
-                    }
-                })
-            });
+        // We deliberately do NOT register an `on_text_response` here:
+        // streaming `MessageChunk` events already flow through the
+        // `AcpChunkSink` / `chunk_rx` / `fwd_task` chain, which
+        // session_notification each chunk to the parent. Adding an
+        // `on_text_response` would re-emit the same final text and the
+        // parent's transcript would render the assistant's reply twice.
 
         let loop_ctx = harnx_runtime::AgentLoopContext {
             config: self.config.clone(),
@@ -328,7 +372,7 @@ impl acp::Agent for HarnxAgent {
             persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::default())),
             call_fn: None,
             on_tool_round: None,
-            on_text_response: Some(on_text_response),
+            on_text_response: None,
             initial_with_embeddings: true,
             initial_resume_count: 0,
             max_resume: None,
@@ -340,20 +384,14 @@ impl acp::Agent for HarnxAgent {
             _ = cancel_notify.notified() => {
                 abort_signal.set_ctrlc();
                 harnx_core::sink::clear_agent_event_sink();
-                if let (Some(mgr), Some(id)) = (acp_manager.as_ref(), nested_sub_id) {
-                    mgr.unsubscribe_chunks(id).await;
-                }
                 fwd_task.abort();
                 return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
             }
         };
 
         harnx_core::sink::clear_agent_event_sink();
-        if let (Some(mgr), Some(id)) = (acp_manager.as_ref(), nested_sub_id) {
-            mgr.unsubscribe_chunks(id).await;
-        }
-        // Drop loop_ctx to release text_tx (a clone of chunk_tx), so all
-        // senders into chunk_rx are dropped and fwd_task can exit cleanly.
+        // Drop loop_ctx so all senders into chunk_rx are dropped and
+        // fwd_task can exit cleanly.
         drop(loop_ctx);
         let _ = fwd_task.await;
 

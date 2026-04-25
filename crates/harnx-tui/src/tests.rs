@@ -1709,10 +1709,11 @@ async fn test_tool_result_switch_agent_parsing() {
     // tool.rs) on the result object.
     let abort_signal = harnx_runtime::utils::create_abort_signal();
     let mut results = eval_tool_calls(
-        &harnx_runtime::tool::build_tool_eval_context(&config),
+        &harnx_runtime::tool::build_tool_eval_context(&config, None),
         vec![call],
         &abort_signal,
     )
+    .await
     .unwrap();
     results[0].output = serde_json::json!({
         "action": "switch_agent",
@@ -3555,5 +3556,264 @@ async fn test_ctrl_c_interrupts_in_flight_streaming() {
         "Ctrl+C should clear llm_busy for in-flight streaming"
     );
 
+    harness.drain_and_settle().await.unwrap();
+}
+
+/// Regression test for Bug 2's mechanism: pressing Ctrl+C while a
+/// prompt task is running must not eagerly clear `llm_busy`. Before the
+/// fix, the Ctrl+C handler set `llm_busy = false` immediately, which
+/// caused the very next Enter to take the "spawn a fresh prompt" branch
+/// and run a second task alongside the first — corrupting session
+/// state. With the fix, `llm_busy` stays true until the running task
+/// actually emits Final/Error, and the user's new message queues into
+/// `pending_message` instead of racing the old task.
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_c_during_in_flight_task_does_not_clear_llm_busy_or_spawn_new_task() {
+    let config = test_config_with_mock_client_and_agent("test-agent", Some("ctrl-c-bug2-busy"));
+    let gate_reached = Arc::new(Notify::new());
+    let gate_release = Arc::new(Notify::new());
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_text_chunk("first")
+                    .add_gate(gate_reached.clone(), gate_release.clone())
+                    .build(),
+            )
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_text_chunk("second response done")
+                    .build(),
+            )
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
+
+    let mut harness = TuiTestHarness::with_config(config.clone());
+
+    // Start Task A and let it wedge on the gate.
+    harness
+        .tui()
+        .start_prompt(crate::types::PendingMessage {
+            text: "first message".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), gate_reached.notified())
+        .await
+        .expect("Task A should reach the gate");
+
+    let task_a_abort = harness
+        .tui()
+        .current_prompt_abort
+        .clone()
+        .expect("Task A should have a per-task abort signal");
+    let task_a_abort_handle_dbg = format!(
+        "{:?}",
+        harness
+            .tui()
+            .current_prompt_handle
+            .as_ref()
+            .expect("Task A should have a JoinHandle")
+            .abort_handle()
+    );
+
+    // Press Ctrl+C.
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    // Task A's per-task abort fired; llm_busy is NOT cleared (Task A is
+    // still in flight); the queued-message channel is cleared.
+    assert!(
+        task_a_abort.aborted_ctrlc(),
+        "Ctrl+C must set Task A's per-task abort signal"
+    );
+    assert!(
+        harness.tui().app.llm_busy,
+        "llm_busy must remain true while Task A is winding down — \
+         clearing it eagerly is what allowed Bug 2's concurrent tasks"
+    );
+    assert!(harness.tui().app.pending_message.is_none());
+
+    // User types a new message and presses Enter while Task A is still
+    // running. With llm_busy still true, this must queue (not spawn).
+    harness.tui().set_input_text("second message");
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // The new message must be QUEUED, not running. The same Task A
+    // handle / abort signal must still be present — no Task B was
+    // spawned alongside.
+    assert!(
+        harness.tui().app.pending_message.is_some(),
+        "the typed message must queue while Task A is still in flight"
+    );
+    let task_a_abort_after = harness
+        .tui()
+        .current_prompt_abort
+        .clone()
+        .expect("the per-task abort slot must still hold Task A's signal");
+    assert!(
+        std::sync::Arc::ptr_eq(&task_a_abort, &task_a_abort_after),
+        "the current_prompt_abort must still be Task A's — no second task \
+         was spawned. (Bug 2 produced a second concurrent task here.)"
+    );
+    assert!(
+        task_a_abort_after.aborted_ctrlc(),
+        "Task A's abort must remain set — per-task signals are immune to \
+         resets driven by a fresh submission"
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            harness
+                .tui()
+                .current_prompt_handle
+                .as_ref()
+                .expect("handle slot must still hold Task A")
+                .abort_handle()
+        ),
+        task_a_abort_handle_dbg,
+        "the JoinHandle slot must still hold Task A's handle"
+    );
+
+    // Release Task A so the test can clean up. After Final propagates,
+    // submit_pending_message_inner will spawn the queued Task B; both
+    // tasks must drain before the harness shuts down or the spawned
+    // tokio task can outlive its TestStateGuard.
+    gate_release.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        while let Ok(event) = harness.tui().event_rx.try_recv() {
+            harness.tui().handle_tui_event(event).await.unwrap();
+        }
+        if mock_client.remaining_turns() == 0 && !harness.tui().app.llm_busy {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for both prompts to drain"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    harness.drain_and_settle().await.unwrap();
+}
+
+/// Regression test for the second observable symptom of Bug 2: a
+/// Ctrl+C-then-resubmit must not consume a fresh mock turn while the
+/// old task is still in flight. Before the fix, the Enter handler
+/// observed `llm_busy=false` (cleared eagerly by Ctrl+C) and spawned
+/// Task B immediately — Task B then made its own LLM call, popping the
+/// next mock turn while Task A was still wedged on the gate. With the
+/// fix, `llm_busy` stays true, the message queues, and the next mock
+/// turn is consumed only after Task A completes.
+///
+/// FAILS before the fix: `mock_client.remaining_turns()` drops to 0
+/// because Task B was spawned alongside Task A.
+/// PASSES after the fix: `remaining_turns()` stays at 1 — Task B is
+/// queued, not running.
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_c_resubmit_does_not_consume_a_second_mock_turn_while_task_a_is_in_flight() {
+    let config = test_config_with_mock_client_and_agent("test-agent", Some("orphan-tool-bug2"));
+    let gate_reached = Arc::new(Notify::new());
+    let gate_release = Arc::new(Notify::new());
+    let mock_client = Arc::new(
+        MockClient::builder()
+            .global_config(config.clone())
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_tool_call("noop", serde_json::json!({}))
+                    .add_gate(gate_reached.clone(), gate_release.clone())
+                    .build(),
+            )
+            .add_turn(
+                MockTurnBuilder::new()
+                    .add_text_chunk("second response done")
+                    .build(),
+            )
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
+
+    let mut harness = TuiTestHarness::with_config(config.clone());
+
+    // Task A: mock returns a tool_call, then wedges on the gate so
+    // execute_tool_round can't write its tool_results yet.
+    harness
+        .tui()
+        .start_prompt(crate::types::PendingMessage {
+            text: "first message".to_string(),
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+        })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), gate_reached.notified())
+        .await
+        .expect("Task A should reach the gate before Ctrl+C");
+
+    // Sanity check: Task A's LLM call has popped turn 1; turn 2 still
+    // sits in the queue.
+    assert_eq!(
+        mock_client.remaining_turns(),
+        1,
+        "Task A should have popped its own turn but not Task B's"
+    );
+
+    // Ctrl+C, then resubmit — the exact race that spawned Task B
+    // alongside Task A in the reproducing session.
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    harness.tui().set_input_text("second message");
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // Give the runtime a moment to schedule any task that the buggy
+    // path WOULD have spawned. With the fix, no task was spawned —
+    // remaining_turns must still be 1.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        mock_client.remaining_turns(),
+        1,
+        "no second prompt task should be running while Task A is still \
+         in flight — Bug 2 spawned Task B here, which would pop turn 2"
+    );
+
+    // Release Task A so the test can clean up. After Final/Error
+    // propagates, the queued message becomes Task B and consumes
+    // turn 2.
+    gate_release.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        while let Ok(event) = harness.tui().event_rx.try_recv() {
+            harness.tui().handle_tui_event(event).await.unwrap();
+        }
+        if mock_client.remaining_turns() == 0 && !harness.tui().app.llm_busy {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for prompts to drain"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     harness.drain_and_settle().await.unwrap();
 }

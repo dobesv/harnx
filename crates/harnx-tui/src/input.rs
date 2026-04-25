@@ -13,6 +13,13 @@ use std::path::Path;
 const ATTACHMENT_PREVIEW_MAX_CHARS: usize = 800;
 const ATTACHMENT_PREVIEW_MAX_LINES: usize = 12;
 
+/// How long `start_prompt` waits for a prior prompt task to finish
+/// cooperatively (after signalling its abort) before force-cancelling it
+/// via `JoinHandle::abort`. Long enough for `bash_wait` and similar
+/// cooperative tools to observe the abort and return; short enough that
+/// the user does not feel a stall.
+const PROMPT_TASK_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn unique_attachment_display_name(
     attachments: &[crate::types::Attachment],
     original_name: &str,
@@ -84,14 +91,33 @@ impl Tui {
                 self.app.should_quit = true;
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                // Abort current operation; the signal is reset before the next submit (see below).
+                // Abort signal goes both to the Tui-level signal (used by
+                // dot-commands) and to the in-flight prompt task's own
+                // signal (if any). Per-task signals are why we no longer
+                // need to "reset" anything before the next submission —
+                // the running task can never be un-aborted.
                 self.abort_signal.set_ctrlc();
+                if let Some(prompt_abort) = &self.current_prompt_abort {
+                    prompt_abort.set_ctrlc();
+                }
                 self.app.transcript.push(TranscriptItem::SystemText(
                     "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
                 ));
-                self.app.llm_busy = false;
+                // Discard any queued message — Ctrl+C means "cancel
+                // everything", including the message you typed while the
+                // task was running.
                 self.app.pending_message = None;
                 *self.shared_pending_message.lock().await = None;
+                // `llm_busy` stays true while a prompt task is still
+                // winding down; the Final/Error event from that task is
+                // what flips it off. Flipping it eagerly here is what
+                // produced Bug 2 — the next Enter would race a fresh
+                // prompt task against the still-running old one. When no
+                // prompt task is in flight (idle Ctrl+C) we still clear
+                // the flag for parity with the prior UX.
+                if self.current_prompt_handle.is_none() {
+                    self.app.llm_busy = false;
+                }
             }
             (KeyCode::Up, KeyModifiers::NONE) => {
                 self.handle_up_key(key);
@@ -614,6 +640,19 @@ impl Tui {
             AgentEvent::Model(ModelEvent::Final { output, usage }) => {
                 self.flush_pending_thought();
                 self.app.llm_busy = false;
+                // The task that emitted Final has signalled it is exiting.
+                // Drop our reference to its abort signal — the next Ctrl+C
+                // should not target a task that's already gone. We keep
+                // the JoinHandle until the next `start_prompt` so the
+                // drain step has something to await on (already-completed
+                // handles resolve immediately).
+                self.current_prompt_abort = None;
+                // Defensive cleanup of the pending-message channel: the
+                // normal mid-tool-round consumption already clears it,
+                // but a text-only response path leaves it set, where it
+                // would otherwise leak into the NEXT prompt task and be
+                // re-injected as a duplicate user message.
+                *self.shared_pending_message.lock().await = None;
                 self.app.last_ui_output_source = None;
                 let usage_str = format_usage(&usage);
                 if !output.is_empty() {
@@ -664,6 +703,11 @@ impl Tui {
             AgentEvent::Model(ModelEvent::Error(err)) => {
                 self.flush_pending_thought();
                 self.app.llm_busy = false;
+                // Mirrors the Final cleanup: drop the per-task abort
+                // signal (task has exited) and clear the shared pending
+                // channel so its content can't leak into the next task.
+                self.current_prompt_abort = None;
+                *self.shared_pending_message.lock().await = None;
                 self.app.streaming_assistant_idx = None;
                 self.app.last_ui_output_source = None;
                 self.app.transcript.push(TranscriptItem::ErrorText(err));
@@ -813,12 +857,28 @@ impl Tui {
     }
 
     pub(super) async fn start_prompt(&mut self, msg: crate::types::PendingMessage) -> Result<()> {
+        // Drain any prior prompt task BEFORE spawning the new one. Two
+        // prompt tasks must never run concurrently against the same
+        // session — they would interleave save_session_tool_calls /
+        // save_session_tool_results writes and corrupt the in-memory
+        // pending Tool message (see Bug 2: orphan tool_calls in the
+        // session log around line 24785/24794 of the reproducing
+        // session).
+        self.drain_previous_prompt_task().await;
+
+        // Allocate a fresh abort signal for this task. Subsequent Ctrl+C
+        // will signal exactly this task; later submissions get their
+        // own fresh signal so that nothing in this branch can be
+        // un-aborted by a future `abort_signal.reset()`.
+        let new_abort = harnx_runtime::utils::create_abort_signal();
+        self.current_prompt_abort = Some(new_abort.clone());
+
         self.app.llm_busy = true;
 
         let event_tx = self.event_tx.clone();
         let ctx = crate::prompt::PromptTaskContext {
             config: self.config.clone(),
-            abort_signal: self.abort_signal.clone(),
+            abort_signal: new_abort,
             async_manager: self.async_manager.clone(),
             persistent_manager: self.persistent_manager.clone(),
             pending_async_context: self.pending_async_context.clone(),
@@ -826,7 +886,7 @@ impl Tui {
             event_tx: event_tx.clone(),
         };
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let result: Result<()> = Self::run_prompt_task(msg, ctx).await;
             if let Err(err) = result {
                 use harnx_core::event::{AgentEvent, ModelEvent};
@@ -836,8 +896,46 @@ impl Tui {
                 ));
             }
         });
+        self.current_prompt_handle = Some(handle);
 
         Ok(())
+    }
+
+    /// Wait for any prior prompt task to finish before spawning a new
+    /// one. Cooperative shutdown via the prior task's abort signal is
+    /// tried first with a short timeout; if the task does not exit
+    /// within `PROMPT_TASK_DRAIN_TIMEOUT`, force-cancel it via
+    /// `JoinHandle::abort`.
+    async fn drain_previous_prompt_task(&mut self) {
+        // Signal cooperative abort first (if a signal is around). This is
+        // a no-op if the prior task has already finished and we just
+        // never cleared the signal.
+        if let Some(abort) = self.current_prompt_abort.take() {
+            abort.set_ctrlc();
+        }
+
+        let Some(handle) = self.current_prompt_handle.take() else {
+            return;
+        };
+
+        // Already-completed handle resolves immediately; live handle is
+        // given up to PROMPT_TASK_DRAIN_TIMEOUT to wind down before we
+        // hard-cancel it.
+        let abort_handle = handle.abort_handle();
+        match tokio::time::timeout(PROMPT_TASK_DRAIN_TIMEOUT, handle).await {
+            Ok(Ok(())) => {} // task ended cleanly
+            Ok(Err(_)) => {
+                // Task panicked or was already cancelled; the unwound
+                // task can no longer touch session state, so we move on.
+            }
+            Err(_) => {
+                // Cooperative shutdown timed out — force the task to
+                // stop. The corresponding future is dropped at its next
+                // .await; until then it's wedged on something
+                // synchronous (block_in_place / a non-cooperative tool).
+                abort_handle.abort();
+            }
+        }
     }
 
     fn push_history(&mut self, text: String) {
