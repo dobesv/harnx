@@ -397,14 +397,14 @@ impl Session {
 }
 
 impl Session {
-    pub fn to_agent_config(&self) -> AgentConfig {
+    pub fn to_agent_config(&self) -> Result<AgentConfig> {
         let agent_name = self.agent_name.as_deref().unwrap_or(TEMP_AGENT_NAME);
         let prompt = if self.agent_prompt.is_empty() {
             self.agent_instructions.as_str()
         } else {
             self.agent_prompt.as_str()
         };
-        let mut config = AgentConfig::from_markdown(agent_name, prompt);
+        let mut config = AgentConfig::from_markdown(agent_name, prompt)?;
         config.set_model(self.model.clone());
         config.set_temperature(self.temperature);
         config.set_top_p(self.top_p);
@@ -412,7 +412,7 @@ impl Session {
         config.set_model_fallbacks(self.model_fallbacks.clone());
         config.set_compaction_agent(self.compaction_agent.clone());
         config.set_shared_variables(self.agent_variables.clone());
-        config
+        Ok(config)
     }
 
     pub fn model(&self) -> &Model {

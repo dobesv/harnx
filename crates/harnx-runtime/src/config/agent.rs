@@ -55,7 +55,7 @@ impl Agent {
 pub fn builtin(name: &str) -> Result<Agent> {
     let content = AgentConfig::builtin_markdown(name)
         .ok_or_else(|| anyhow::anyhow!("Unknown built-in agent `{name}`"))?;
-    Ok(Agent::new(AgentConfig::from_markdown(name, content)))
+    Ok(Agent::new(AgentConfig::from_markdown(name, content)?))
 }
 
 pub fn load(path: &Path) -> Result<Agent> {
@@ -65,7 +65,7 @@ pub fn load(path: &Path) -> Result<Agent> {
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow!("Invalid agent file name: '{}'", path.display()))?;
-    Ok(Agent::new(AgentConfig::from_markdown(name, &contents)))
+    Ok(Agent::new(AgentConfig::from_markdown(name, &contents)?))
 }
 
 /// Load file-backed defaults for variables that have a `path:` field.
@@ -430,7 +430,7 @@ mod tests {
     }
 
     fn make_agent_with_tools(prompt: &str, tools: Vec<crate::tool::ToolDeclaration>) -> Agent {
-        let mut agent = Agent::new(AgentConfig::from_markdown("test", prompt));
+        let mut agent = Agent::new(AgentConfig::from_markdown("test", prompt).unwrap());
         agent
             .config
             .set_tools(crate::tool::Tools::init_from_mcp(if tools.is_empty() {
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn test_agent_from_markdown_full() {
         let content = "---\nmodel: openai:gpt-4o\ntemperature: 0.7\ntop_p: 0.9\nuse_tools: fs,web_search\ndescription: A test agent\nversion: '1.0'\n---\nYou are a helpful test agent.";
-        let agent = AgentConfig::from_markdown("test-agent", content);
+        let agent = AgentConfig::from_markdown("test-agent", content).unwrap();
         assert_eq!(agent.name(), "test-agent");
         assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
         assert_eq!(agent.temperature(), Some(0.7));
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn test_agent_from_markdown_minimal() {
         let content = "Just instructions, no front-matter.";
-        let agent = AgentConfig::from_markdown("minimal", content);
+        let agent = AgentConfig::from_markdown("minimal", content).unwrap();
         assert_eq!(agent.name(), "minimal");
         assert!(agent.model_id().is_none());
         assert!(agent.temperature().is_none());
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn test_agent_from_markdown_empty_body() {
         let content = "---\nmodel: openai:gpt-4o\ntemperature: 0.5\n---\n";
-        let agent = AgentConfig::from_markdown("empty-body", content);
+        let agent = AgentConfig::from_markdown("empty-body", content).unwrap();
         assert_eq!(agent.name(), "empty-body");
         assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
         assert!(agent.interpolated_instructions().is_empty());
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn test_agent_from_markdown_with_use_tools() {
         let content = "---\nuse_tools: fs_*,bash_exec\n---\nHelp with files.";
-        let agent = AgentConfig::from_markdown("tools-agent", content);
+        let agent = AgentConfig::from_markdown("tools-agent", content).unwrap();
         assert_eq!(
             agent.use_tools(),
             Some(vec!["fs_*".to_string(), "bash_exec".to_string()])
@@ -526,14 +526,14 @@ mod tests {
     #[test]
     fn test_agent_compaction_agent_set() {
         let content = "---\ncompaction_agent: my-compactor\n---\nYou are a test agent.";
-        let agent = AgentConfig::from_markdown("test-agent", content);
+        let agent = AgentConfig::from_markdown("test-agent", content).unwrap();
         assert_eq!(agent.compaction_agent(), Some("my-compactor"));
     }
 
     #[test]
     fn test_agent_compaction_agent_unset() {
         let content = "---\nmodel: openai:gpt-4o\n---\nYou are a test agent.";
-        let agent = AgentConfig::from_markdown("test-agent", content);
+        let agent = AgentConfig::from_markdown("test-agent", content).unwrap();
         assert!(agent.compaction_agent().is_none());
     }
 
@@ -541,11 +541,11 @@ mod tests {
     fn test_agent_compaction_agent_roundtrip() {
         let content =
             "---\ncompaction_agent: my-compactor\nmodel: openai:gpt-4o\n---\nYou are a test agent.";
-        let agent = AgentConfig::from_markdown("test-agent", content);
+        let agent = AgentConfig::from_markdown("test-agent", content).unwrap();
 
         // Export and re-parse
         let exported = agent.export().unwrap();
-        let reparsed = AgentConfig::from_markdown("test-agent", &exported);
+        let reparsed = AgentConfig::from_markdown("test-agent", &exported).unwrap();
 
         assert_eq!(reparsed.compaction_agent(), Some("my-compactor"));
         assert_eq!(reparsed.model_id(), Some("openai:gpt-4o"));
