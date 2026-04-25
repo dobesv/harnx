@@ -13,27 +13,55 @@ pub use server_main::run;
 #[cfg(test)]
 mod test_regression_issue_68;
 
-use agent_client_protocol::{self as acp, Client as _};
+use agent_client_protocol::{self as acp, Client as AcpClientTrait};
 use harnx_acp::NestedAcpEvent;
+use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use uuid::Uuid;
 
-#[cfg(test)]
-use harnx_core::event::PlanEntry as CorePlanEntry;
-use harnx_core::event::{
-    AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, ToolKind, ToolStatus,
-};
-use harnx_runtime::client::{Client, SseEvent, SseHandler};
-use harnx_runtime::config::{GlobalConfig, Input};
-use harnx_runtime::tool::{ToolCall, ToolResult};
-use harnx_runtime::utils::{wait_abort_signal, AbortSignal, AbortSignalInner};
+use harnx_core::event::{AgentEvent, AgentSource, ModelEvent};
+use harnx_runtime::config::GlobalConfig;
+use harnx_runtime::utils::{AbortSignal, AbortSignalInner};
 
-use anyhow::bail;
-use serde_json::{json, Value};
-use tokio::sync::mpsc::unbounded_channel;
+/// An `AgentEventSink` installed during each ACP prompt turn.
+/// Forwards `MessageChunk` events from the unified run_agent_loop through a
+/// channel to a spawned local task that calls `session_notification`.
+/// Using a channel avoids the `!Send` / `!Sync` problem of holding `Rc`.
+struct AcpChunkSink {
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
 
-const MAX_TOOL_CALL_ROUNDS: u32 = 100;
-const MAX_POST_TOOL_LIMIT_ROUNDS: u32 = 1;
+impl harnx_core::event::AgentEventSink for AcpChunkSink {
+    fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+        if let Some(source) = source.as_ref() {
+            let _ = self.tx.send(source_heading(source));
+        }
+
+        let text = match &event {
+            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    harnx_core::event::ContentBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            AgentEvent::Model(ModelEvent::Final { output, .. }) => output.clone(),
+            _ => return,
+        };
+        if !text.is_empty() {
+            let _ = self.tx.send(text);
+        }
+    }
+}
+
+fn source_heading(source: &AgentSource) -> String {
+    match &source.session_id {
+        Some(session_id) if !session_id.is_empty() => {
+            format!("> {} ▸ {}", source.agent, session_id)
+        }
+        _ => format!("> {}", source.agent),
+    }
+}
 
 pub struct HarnxAgent {
     agent_name: String,
@@ -76,177 +104,6 @@ impl HarnxAgent {
 
     pub fn set_connection(&self, conn: Rc<acp::AgentSideConnection>) {
         self.connection.replace(Some(conn));
-    }
-
-    async fn send_text_chunk(&self, session_id: &str, text: &str) -> acp::Result<()> {
-        let connection = self.connection.borrow().clone();
-        if let Some(connection) = connection {
-            let notification = acp::SessionNotification::new(
-                acp::SessionId::new(session_id.to_string()),
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    text.to_string().into(),
-                )),
-            );
-            connection.session_notification(notification).await?;
-        }
-        Ok(())
-    }
-
-    async fn send_usage(
-        &self,
-        session_id: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cached_tokens: u64,
-    ) -> acp::Result<()> {
-        if input_tokens == 0 && output_tokens == 0 {
-            return Ok(());
-        }
-        let connection = self.connection.borrow().clone();
-        if let Some(connection) = connection {
-            // Include the harnx session name (human-readable) when available,
-            // falling back to the ACP session ID.
-            let session_name = self
-                .config
-                .read()
-                .session
-                .as_ref()
-                .map(|s| s.name().to_string())
-                .unwrap_or_default();
-            let mut meta = serde_json::Map::new();
-            meta.insert(
-                "harnx:usage".to_string(),
-                json!({
-                    "agent": self.agent_name,
-                    "session": session_name,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "cached_tokens": cached_tokens,
-                }),
-            );
-            let update = acp::SessionInfoUpdate::new().meta(meta);
-            let notification = acp::SessionNotification::new(
-                acp::SessionId::new(session_id.to_string()),
-                acp::SessionUpdate::SessionInfoUpdate(update),
-            );
-            connection.session_notification(notification).await?;
-        }
-        Ok(())
-    }
-
-    async fn execute_llm_streaming(
-        &self,
-        session_id: &str,
-        input: &Input,
-        client: &dyn Client,
-        abort_signal: &AbortSignal,
-    ) -> Result<(String, Option<String>, Vec<ToolCall>), acp::Error> {
-        let (tx, mut rx) = unbounded_channel();
-        let mut handler = SseHandler::new(tx, abort_signal.clone());
-
-        let connection = self.connection.borrow().clone();
-        let sid = session_id.to_string();
-
-        let (dry_run, user_agent) = {
-            let cfg = self.config.read();
-            (cfg.dry_run, cfg.user_agent.clone())
-        };
-        let ctx = harnx_runtime::client::ClientCallContext {
-            user_agent: user_agent.as_deref(),
-            dry_run,
-        };
-
-        let (send_ret, _) = tokio::join!(
-            harnx_runtime::client::chat_completions_streaming_with_input(
-                client,
-                input,
-                &self.config,
-                &mut handler,
-                &ctx
-            ),
-            async {
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        SseEvent::Text(chunk) => {
-                            if let Some(ref conn) = connection {
-                                let notification = acp::SessionNotification::new(
-                                    acp::SessionId::new(sid.clone()),
-                                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                                        chunk.into(),
-                                    )),
-                                );
-                                if let Err(e) = conn.session_notification(notification).await {
-                                    warn!("ACP streaming notification failed: {e}");
-                                }
-                            }
-                        }
-                        SseEvent::Done => break,
-                    }
-                }
-            }
-        );
-
-        send_ret.map_err(|e| acp::Error::new(-32603, e.to_string()))?;
-
-        let (text, thought, tool_calls, usage) = handler.take();
-
-        // Send token usage stats to the parent via SessionInfoUpdate._meta
-        let _ = self
-            .send_usage(
-                session_id,
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cached_tokens,
-            )
-            .await;
-
-        Ok((text, thought, tool_calls))
-    }
-
-    async fn execute_llm_non_streaming(
-        &self,
-        session_id: &str,
-        input: &Input,
-        client: &dyn Client,
-        abort_signal: &AbortSignal,
-    ) -> Result<(String, Option<String>, Vec<ToolCall>), acp::Error> {
-        let (dry_run, user_agent) = {
-            let cfg = self.config.read();
-            (cfg.dry_run, cfg.user_agent.clone())
-        };
-        let ctx = harnx_runtime::client::ClientCallContext {
-            user_agent: user_agent.as_deref(),
-            dry_run,
-        };
-
-        let output = tokio::select! {
-            result = harnx_runtime::client::chat_completions_with_input(client, input.clone(), &self.config, &ctx) => {
-                result.map_err(|e| acp::Error::new(-32603, e.to_string()))?
-            }
-            _ = wait_abort_signal(abort_signal) => {
-                return Ok((String::new(), None, vec![]));
-            }
-        };
-
-        if let Some(thought) = &output.thought {
-            self.send_text_chunk(session_id, &format!("<think>\n{}\n</think>\n", thought))
-                .await?;
-        }
-        if !output.text.is_empty() {
-            self.send_text_chunk(session_id, &output.text).await?;
-        }
-
-        // Send token usage stats to the parent via SessionInfoUpdate._meta
-        let _ = self
-            .send_usage(
-                session_id,
-                output.input_tokens.unwrap_or(0),
-                output.output_tokens.unwrap_or(0),
-                output.cached_tokens.unwrap_or(0),
-            )
-            .await;
-
-        Ok((output.text, output.thought, output.tool_calls))
     }
 }
 
@@ -329,18 +186,19 @@ impl acp::Agent for HarnxAgent {
                 }
                 config
                     .use_session(Some(&session_key))
-                    .map_err(|e| acp::Error::new(-32603, format!("Failed to load session: {e}")))?;
+                    .map_err(|e| acp::Error::new(-32603, format!("Failed to use session: {e}")))?;
             }
         }
 
+        // Load and resolve the agent (expands system prompt variables like
+        // {{__os__}}). In non-ACP flows this happens via
+        // init_agent_session_variables; in ACP mode we do it here since the
+        // agent is not stored on the config.
         let mut agent = self
             .config
             .read()
             .retrieve_agent(&self.agent_name)
             .map_err(|e| acp::Error::new(-32603, format!("Failed to retrieve agent: {e}")))?;
-        // Resolve agent variables so they are expanded in the system prompt.
-        // In non-ACP flows this happens via init_agent_session_variables; in
-        // ACP mode we do it here since the agent is not stored on the config.
         if let Err(e) = harnx_runtime::config::agent::resolve_variables(&mut agent) {
             warn!(
                 "Failed to resolve variables for agent '{}': {e}",
@@ -350,260 +208,163 @@ impl acp::Agent for HarnxAgent {
 
         let mut input = harnx_runtime::config::input::from_str(&self.config, &prompt_text, None);
         harnx_runtime::config::input::set_agent(&mut input, &self.config, agent.into_config());
-        let client = harnx_runtime::config::input::create_client(&input, &self.config)
-            .map_err(|e| acp::Error::new(-32603, format!("Failed to create client: {e}")))?;
 
-        let mut round = 0u32;
-        loop {
-            if abort_signal.aborted() {
-                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        // Install an AgentEventSink for streaming chunks (MessageChunk events).
+        // For non-streaming turns, on_text_response sends full text below.
+        // Nested ACP activity must also be subscribed + forwarded.
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let text_tx = chunk_tx.clone();
+        let sink: Arc<dyn harnx_core::event::AgentEventSink> =
+            Arc::new(AcpChunkSink { tx: chunk_tx });
+        harnx_core::sink::install_agent_event_sink(sink);
+
+        let acp_manager = self.config.read().acp_manager.clone();
+        let (mut nested_rx, nested_sub_id) = if let Some(ref mgr) = acp_manager {
+            let (rx, id) = mgr.subscribe_chunks().await;
+            (Some(rx), Some(id))
+        } else {
+            (None, None)
+        };
+
+        // Spawn local task to drain both local loop chunks and nested ACP chunks.
+        let connection_for_fwd = self.connection.borrow().clone();
+        let session_key_for_fwd = session_key.clone();
+        // Helper: fire a session_notification without blocking the LocalSet
+        // thread. Each notification is spawned as its own local task so
+        // run_agent_loop / execute_tool_round are never starved waiting for
+        // the parent to acknowledge a notification write.
+        fn spawn_notify(
+            conn: &Option<Rc<acp::AgentSideConnection>>,
+            session_key: &str,
+            text: String,
+        ) {
+            if text.is_empty() {
+                return;
             }
-
-            let exec_fut = async {
-                if harnx_runtime::config::input::stream(&input, &self.config) {
-                    self.execute_llm_streaming(&session_key, &input, client.as_ref(), &abort_signal)
-                        .await
-                } else {
-                    self.execute_llm_non_streaming(
-                        &session_key,
-                        &input,
-                        client.as_ref(),
-                        &abort_signal,
-                    )
-                    .await
-                }
-            };
-            let (output, thought, tool_calls) = tokio::select! {
-                result = exec_fut => result?,
-                _ = cancel_notify.notified() => {
-                    abort_signal.set_ctrlc();
-                    return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
-                }
-            };
-
-            if tool_calls.is_empty() {
-                // Pure text response.  Persist and end the turn.
-                let config = self.config.clone();
-                let input_for_save = input.clone();
-                let output_for_save = output.clone();
-                let thought_for_save = thought.clone();
-                tokio::task::spawn_blocking(move || {
-                    let mut config = config.write();
-                    config.save_message(
-                        &input_for_save,
-                        &output_for_save,
-                        thought_for_save.as_deref(),
-                        &[],
-                    )
-                })
-                .await
-                .map_err(|e| acp::Error::new(-32603, format!("Failed to join save task: {e}")))?
-                .map_err(|e| acp::Error::new(-32603, format!("Failed to save message: {e}")))?;
-
-                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
-            }
-
-            // The LLM issued tool calls.  Persist the request NOW —
-            // before executing anything — so the transcript shows
-            // what was requested even if the process is interrupted
-            // or a tool error aborts the round.  The in-memory
-            // session gets a pending Tool message which we finalize
-            // with matching add_tool_results() once we have outputs.
-            let config = self.config.clone();
-            let input_for_save = input.clone();
-            let output_for_save = output.clone();
-            let thought_for_save = thought.clone();
-            let calls_for_save = tool_calls.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut config = config.write();
-                let sessions_dir = config.sessions_dir();
-                if let Some(session) = config.session.as_mut() {
-                    session.set_sessions_dir(sessions_dir);
-                    harnx_runtime::config::session::add_tool_calls(
-                        session,
-                        &input_for_save,
-                        &output_for_save,
-                        thought_for_save.as_deref(),
-                        &calls_for_save,
-                    )
-                } else {
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(|e| acp::Error::new(-32603, format!("Failed to join save task: {e}")))?
-            .map_err(|e| acp::Error::new(-32603, format!("Failed to save tool calls: {e}")))?;
-
-            round += 1;
-            // (results, optional reason to end the turn after persisting them)
-            let (tool_results, end_turn): (Vec<ToolResult>, Option<acp::StopReason>) = if round
-                > MAX_TOOL_CALL_ROUNDS
-            {
-                // If the LLM keeps trying to call tools even
-                // though we told them they hit the limit, abort.
-                // We leave the earlier ToolCalls log entry orphaned
-                // and rely on the reload-time repair pass to fix
-                // it; this path terminates the turn.
-                if round > MAX_TOOL_CALL_ROUNDS + MAX_POST_TOOL_LIMIT_ROUNDS {
-                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
-                }
-                let limit_results = tool_calls
-                        .iter()
-                        .cloned()
-                        .map(|call| {
-                            ToolResult::new(
-                                call,
-                                json!({
-                                    "error": "maximum tool call rounds exceeded",
-                                    "action": "Provide your final answer to the user now. Summarize what you accomplished and any remaining work.",
-                                    "guidance": "Explain that this session hit the tool call limit. If more tool use is needed, ask the user to continue in a new session or narrow the request."
-                                }),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                (limit_results, None)
-            } else {
-                let source = Some(AgentSource {
-                    agent: self.agent_name.clone(),
-                    session_id: Some(session_key.clone()),
-                });
-
-                // Notify the parent about each tool call so it
-                // appears in the parent transcript.
-                let conn = self.connection.borrow().clone();
-                if let Some(conn) = conn {
-                    for call in &tool_calls {
-                        let tool_call_id = call.id.clone().unwrap_or_else(|| call.name.clone());
-                        let tc = acp::ToolCall::new(tool_call_id, call.name.clone())
-                            .raw_input(call.arguments.clone());
-                        let notification = acp::SessionNotification::new(
-                            acp::SessionId::new(session_key.clone()),
-                            acp::SessionUpdate::ToolCall(tc),
-                        );
-                        let _ = conn.session_notification(notification).await;
-                    }
-                }
-
-                let acp_manager = self.config.read().acp_manager.clone();
-                let result = if let Some(ref manager) = acp_manager {
-                    let (mut chunk_rx, subscription_id) = manager.subscribe_chunks().await;
-                    let connection = self.connection.borrow().clone();
-                    let sid = session_key.clone();
-
-                    let forward_task = tokio::task::spawn_local(async move {
-                        while let Some(chunk) = chunk_rx.recv().await {
-                            if let Some(ref conn) = connection {
-                                let update = match chunk {
-                                    NestedAcpEvent::Agent(event, source) => {
-                                        nested_agent_event_to_session_update(event, source)
-                                    }
-                                    NestedAcpEvent::Text(text) => {
-                                        Some(acp::SessionUpdate::AgentMessageChunk(
-                                            acp::ContentChunk::new(text.into()),
-                                        ))
-                                    }
-                                };
-
-                                if let Some(update) = update {
-                                    let notification = acp::SessionNotification::new(
-                                        acp::SessionId::new(sid.clone()),
-                                        update,
-                                    );
-                                    if let Err(e) = conn.session_notification(notification).await {
-                                        warn!("ACP nested streaming notification failed: {e}");
-                                    }
-                                }
-                            }
-                        }
-                    });
-
-                    let eval_fut = eval_tool_calls_async(
-                        &self.config,
-                        tool_calls.clone(),
-                        &abort_signal,
-                        source.clone(),
+            if let Some(conn) = conn.clone() {
+                let sid = session_key.to_string();
+                tokio::task::spawn_local(async move {
+                    let notification = acp::SessionNotification::new(
+                        acp::SessionId::new(sid),
+                        acp::SessionUpdate::AgentMessageChunk(
+                            acp::ContentChunk::new(text.into()),
+                        ),
                     );
-                    let result = tokio::select! {
-                        r = eval_fut => r,
-                        _ = cancel_notify.notified() => {
-                            abort_signal.set_ctrlc();
-                            manager.unsubscribe_chunks(subscription_id).await;
-                            let _ = forward_task.await;
-                            return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
-                        }
-                    };
-
-                    manager.unsubscribe_chunks(subscription_id).await;
-                    let _ = forward_task.await;
-
-                    result
-                } else {
-                    tokio::select! {
-                        r = eval_tool_calls_async(
-                            &self.config,
-                            tool_calls.clone(),
-                            &abort_signal,
-                            source,
-                        ) => r,
-                        _ = cancel_notify.notified() => {
-                            abort_signal.set_ctrlc();
-                            return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
-                        }
-                    }
-                };
-
-                match result {
-                    Ok(results) => (results, None),
-                    Err(e) => {
-                        // Tool execution failed. Synthesize error
-                        // outputs so the transcript stays
-                        // well-formed (matches the pending
-                        // ToolCalls entry we already wrote), send
-                        // the error text to the user, and end
-                        // the turn.
-                        let err_text = format!("\n[Tool error: {e:#}]");
-                        self.send_text_chunk(&session_key, &err_text).await?;
-                        let fallback = tool_calls
-                            .iter()
-                            .cloned()
-                            .map(|call| {
-                                ToolResult::new(
-                                    call,
-                                    json!({"error": format!("tool execution failed: {e:#}")}),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        (fallback, Some(acp::StopReason::EndTurn))
-                    }
-                }
-            };
-
-            // Persist the tool outputs, pairing with the ToolCalls
-            // entry we wrote before execution.
-            let config = self.config.clone();
-            let tool_results_for_save = tool_results.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut config = config.write();
-                let sessions_dir = config.sessions_dir();
-                if let Some(session) = config.session.as_mut() {
-                    session.set_sessions_dir(sessions_dir);
-                    harnx_runtime::config::session::add_tool_results(
-                        session,
-                        &tool_results_for_save,
-                    )
-                } else {
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(|e| acp::Error::new(-32603, format!("Failed to join save task: {e}")))?
-            .map_err(|e| acp::Error::new(-32603, format!("Failed to save tool results: {e}")))?;
-
-            if let Some(reason) = end_turn {
-                return Ok(acp::PromptResponse::new(reason));
+                    let _ = conn.session_notification(notification).await;
+                });
             }
+        }
 
-            input = input.merge_tool_results(output, thought, tool_results);
+        let fwd_task = tokio::task::spawn_local(async move {
+            // Phase 1: drain both chunk_rx and nested_rx concurrently.
+            // Each notification is fire-and-forget (spawn_local) so this loop
+            // never blocks waiting for the parent to ACK a write. This keeps
+            // run_agent_loop / execute_tool_round schedulable on the same
+            // LocalSet thread.
+            'outer: loop {
+                let Some(ref mut nrx) = nested_rx else {
+                    break 'outer;
+                };
+                tokio::select! {
+                    maybe_text = chunk_rx.recv() => match maybe_text {
+                        Some(text) => {
+                            spawn_notify(&connection_for_fwd, &session_key_for_fwd, text);
+                        }
+                        None => break 'outer,
+                    },
+                    maybe_nested = nrx.recv() => match maybe_nested {
+                        Some(NestedAcpEvent::Text(text)) => {
+                            spawn_notify(&connection_for_fwd, &session_key_for_fwd, text);
+                        }
+                        Some(NestedAcpEvent::Agent(event, source)) => {
+                            if let Some(source) = source.as_ref() {
+                                spawn_notify(&connection_for_fwd, &session_key_for_fwd, source_heading(source));
+                            }
+                            let text = match event {
+                                AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => blocks
+                                    .into_iter()
+                                    .filter_map(|b| match b {
+                                        harnx_core::event::ContentBlock::Text(t) => Some(t),
+                                        _ => None,
+                                    })
+                                    .collect::<String>(),
+                                AgentEvent::Model(ModelEvent::Final { output, .. }) => output,
+                                AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(text)) => text,
+                                AgentEvent::Model(ModelEvent::Error(text)) => text,
+                                _ => String::new(),
+                            };
+                            spawn_notify(&connection_for_fwd, &session_key_for_fwd, text);
+                        }
+                        None => {
+                            nested_rx = None;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            // Phase 2: drain remaining chunk_rx items.
+            while let Some(text) = chunk_rx.recv().await {
+                spawn_notify(&connection_for_fwd, &session_key_for_fwd, text);
+            }
+        });
+
+        // on_text_response: called by run_agent_loop with the actual output text
+        // when the turn ends with a plain-text response (no tool calls). Routes
+        // through the same channel as streaming chunks so the fwd_task sends it
+        // to the ACP client. This keeps the closure Send (no Rc captured).
+        // text_tx was cloned from chunk_tx above
+        let on_text_response: harnx_runtime::OnTextResponseFn =
+            Arc::new(move |output: String, _usage| {
+                let tx = text_tx.clone();
+                Box::pin(async move {
+                    if !output.is_empty() {
+                        let _ = tx.send(output);
+                    }
+                })
+            });
+
+        let loop_ctx = harnx_runtime::AgentLoopContext {
+            config: self.config.clone(),
+            abort_signal: abort_signal.clone(),
+            async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::default())),
+            persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::default())),
+            call_fn: None,
+            on_tool_round: None,
+            on_text_response: Some(on_text_response),
+            initial_with_embeddings: true,
+            initial_resume_count: 0,
+            max_resume: None,
+            pending_async_context: None,
+        };
+
+        let loop_result = tokio::select! {
+            r = harnx_runtime::run_agent_loop(&loop_ctx, input) => r,
+            _ = cancel_notify.notified() => {
+                abort_signal.set_ctrlc();
+                harnx_core::sink::clear_agent_event_sink();
+                if let (Some(mgr), Some(id)) = (acp_manager.as_ref(), nested_sub_id) {
+                    mgr.unsubscribe_chunks(id).await;
+                }
+                fwd_task.abort();
+                return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+            }
+        };
+
+        harnx_core::sink::clear_agent_event_sink();
+        if let (Some(mgr), Some(id)) = (acp_manager.as_ref(), nested_sub_id) {
+            mgr.unsubscribe_chunks(id).await;
+        }
+        // Drop loop_ctx to release text_tx (a clone of chunk_tx), so all
+        // senders into chunk_rx are dropped and fwd_task can exit cleanly.
+        drop(loop_ctx);
+        let _ = fwd_task.await;
+
+        match loop_result {
+            Ok(()) => Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
+            Err(_e) if abort_signal.aborted() => {
+                Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+            }
+            Err(e) => Err(acp::Error::new(-32603, format!("Agent loop error: {e:#}"))),
         }
     }
 
@@ -627,263 +388,6 @@ fn content_block_to_text(content: &acp::ContentBlock) -> String {
         acp::ContentBlock::Audio(_) => "<audio>".to_string(),
         acp::ContentBlock::Resource(_) => "<resource>".to_string(),
         _ => String::new(),
-    }
-}
-
-// Map an AgentEvent forwarded from a nested ACP session into an
-// equivalent `acp::SessionUpdate` so it can be re-emitted to the parent
-// ACP client. Returns `None` for events that do not cross the ACP
-// boundary (Tool::Completed, Model::Usage, etc.).
-fn nested_agent_event_to_session_update(
-    event: AgentEvent,
-    source: Option<AgentSource>,
-) -> Option<acp::SessionUpdate> {
-    let source_meta: Option<serde_json::Map<String, serde_json::Value>> =
-        source.as_ref().map(|source| {
-            serde_json::Map::from_iter([
-                ("agent".to_string(), json!(source.agent)),
-                ("session".to_string(), json!(source.session_id)),
-            ])
-        });
-
-    match event {
-        AgentEvent::Notice(NoticeEvent::Info(text)) => {
-            let mut chunk = acp::ContentChunk::new(text.into());
-            if let Some(meta) = source_meta.clone() {
-                chunk = chunk.meta(meta);
-            }
-            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
-        }
-        AgentEvent::Notice(NoticeEvent::Warning(msg)) => {
-            let mut chunk = acp::ContentChunk::new(format!("[warning] {msg}").into());
-            if let Some(meta) = source_meta.clone() {
-                chunk = chunk.meta(meta);
-            }
-            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
-        }
-        AgentEvent::Notice(NoticeEvent::Error(msg)) => {
-            let mut chunk = acp::ContentChunk::new(format!("[error] {msg}").into());
-            if let Some(meta) = source_meta.clone() {
-                chunk = chunk.meta(meta);
-            }
-            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
-        }
-        AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
-            let text = concat_text_blocks(&blocks);
-            let mut chunk = acp::ContentChunk::new(text.into());
-            if let Some(meta) = source_meta.clone() {
-                chunk = chunk.meta(meta);
-            }
-            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
-        }
-        AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
-            let text = concat_text_blocks(&blocks);
-            let mut chunk = acp::ContentChunk::new(text.into());
-            if let Some(meta) = source_meta.clone() {
-                chunk = chunk.meta(meta);
-            }
-            Some(acp::SessionUpdate::AgentThoughtChunk(chunk))
-        }
-        AgentEvent::Model(ModelEvent::Final { output, .. }) => {
-            if output.is_empty() {
-                return None;
-            }
-            let mut chunk = acp::ContentChunk::new(output.into());
-            if let Some(meta) = source_meta.clone() {
-                chunk = chunk.meta(meta);
-            }
-            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
-        }
-        AgentEvent::Model(ModelEvent::Error(err)) => {
-            let mut chunk = acp::ContentChunk::new(format!("[error] {err}").into());
-            if let Some(meta) = source_meta.clone() {
-                chunk = chunk.meta(meta);
-            }
-            Some(acp::SessionUpdate::AgentMessageChunk(chunk))
-        }
-        AgentEvent::Tool(ToolEvent::Started {
-            id, name, input, ..
-        }) => {
-            let stable_id = if id.is_empty() { name.clone() } else { id };
-            let input_yaml = match &input {
-                serde_json::Value::Null => String::new(),
-                _ => harnx_runtime::utils::pretty_yaml_block(&input),
-            };
-            let mut call = acp::ToolCall::new(stable_id, name).raw_input(input);
-            // `raw_input` is the structured form; tools may still want the
-            // formatted YAML body as the call content when `raw_input` is
-            // not present. We pass both paths through the raw_input field
-            // for round-trip fidelity, so the YAML block isn't separately
-            // attached here.
-            let _ = input_yaml;
-            if let Some(meta) = source_meta.clone() {
-                call = call.meta(meta);
-            }
-            Some(acp::SessionUpdate::ToolCall(call))
-        }
-        AgentEvent::Tool(ToolEvent::Update {
-            id, title, status, ..
-        }) => {
-            let mut fields = acp::ToolCallUpdateFields::new();
-            if let Some(title) = title {
-                fields = fields.title(title);
-            }
-            if let Some(status) = status {
-                let acp_status = match status {
-                    ToolStatus::Completed => acp::ToolCallStatus::Completed,
-                    ToolStatus::InProgress => acp::ToolCallStatus::InProgress,
-                    ToolStatus::Failed => acp::ToolCallStatus::Failed,
-                    ToolStatus::Pending => acp::ToolCallStatus::Pending,
-                };
-                fields = fields.status(acp_status);
-            }
-            let stable_tool_call_id = if id.is_empty() {
-                "status".to_string()
-            } else {
-                id
-            };
-            let mut update = acp::ToolCallUpdate::new(stable_tool_call_id, fields);
-            if let Some(meta) = source_meta.clone() {
-                update = update.meta(meta);
-            }
-            Some(acp::SessionUpdate::ToolCallUpdate(update))
-        }
-        AgentEvent::Plan { entries } => {
-            let mapped_entries = entries
-                .into_iter()
-                .map(|entry| {
-                    let status = match entry.status.as_str() {
-                        "completed" => acp::PlanEntryStatus::Completed,
-                        "in_progress" => acp::PlanEntryStatus::InProgress,
-                        _ => acp::PlanEntryStatus::Pending,
-                    };
-                    acp::PlanEntry::new(entry.content, acp::PlanEntryPriority::Medium, status)
-                })
-                .collect();
-            let mut plan = acp::Plan::new(mapped_entries);
-            if let Some(meta) = source_meta.clone() {
-                plan = plan.meta(meta);
-            }
-            Some(acp::SessionUpdate::Plan(plan))
-        }
-        // Model::Usage, Tool::Completed, Tool::Progress, Tool::Failed,
-        // Turn::*, Session::*, Status are not forwarded as
-        // SessionUpdates (usage crosses as SessionInfoUpdate separately).
-        _ => None,
-    }
-}
-
-/// Concatenate text content blocks into a single string. Non-Text blocks
-/// are skipped — the ACP session update path only carries text.
-fn concat_text_blocks(blocks: &[ContentBlock]) -> String {
-    let mut out = String::new();
-    for block in blocks {
-        if let ContentBlock::Text(t) = block {
-            out.push_str(t);
-        }
-    }
-    out
-}
-
-async fn eval_tool_calls_async(
-    config: &GlobalConfig,
-    mut calls: Vec<ToolCall>,
-    abort_signal: &AbortSignal,
-    source: Option<AgentSource>,
-) -> anyhow::Result<Vec<ToolResult>> {
-    let mut output = vec![];
-    if calls.is_empty() {
-        return Ok(output);
-    }
-    calls = ToolCall::dedup(calls);
-    if calls.is_empty() {
-        bail!("The request was aborted because an infinite loop of function calls was detected.")
-    }
-
-    let mut is_all_null = true;
-    for call in calls {
-        if abort_signal.aborted() {
-            bail!("Tool execution cancelled");
-        }
-        let result = eval_mcp_async(config, &call, abort_signal, source.clone()).await;
-        match result {
-            Ok(mut value) => {
-                if value.is_null() {
-                    value = json!("DONE");
-                } else {
-                    is_all_null = false;
-                }
-                output.push(ToolResult::new(call, value));
-            }
-            Err(err) => {
-                return Err(err);
-            }
-        }
-    }
-    if is_all_null {
-        output = vec![];
-    }
-    Ok(output)
-}
-
-async fn eval_mcp_async(
-    config: &GlobalConfig,
-    call: &ToolCall,
-    abort_signal: &AbortSignal,
-    source: Option<AgentSource>,
-) -> anyhow::Result<Value> {
-    let json_data = if call.arguments.is_null() {
-        Value::Null
-    } else if call.arguments.is_object() {
-        call.arguments.clone()
-    } else if let Some(arguments) = call.arguments.as_str() {
-        serde_json::from_str(arguments).map_err(|_| {
-            anyhow::anyhow!(
-                "The call '{}' has invalid arguments: {arguments}",
-                call.name
-            )
-        })?
-    } else {
-        bail!(
-            "The call '{}' has invalid arguments: {}",
-            call.name,
-            call.arguments
-        );
-    };
-
-    let acp_manager = config.read().acp_manager.clone();
-    if let Some(manager) = acp_manager {
-        if manager.find_client_for_tool(&call.name).is_some() {
-            return tokio::select! {
-                result = manager.call_tool(&call.name, json_data) => result,
-                _ = wait_abort_signal(abort_signal) => bail!("ACP tool call cancelled"),
-            };
-        }
-    }
-
-    let mcp_manager = config.read().mcp_manager.clone();
-    let manager = match mcp_manager {
-        Some(m) => m,
-        None => bail!("No tool provider configured for '{}'", call.name),
-    };
-
-    {
-        use harnx_core::sink::emit_agent_event_with_source;
-
-        let event = AgentEvent::Tool(ToolEvent::Started {
-            id: String::new(),
-            name: call.name.clone(),
-            kind: ToolKind::Other,
-            title: None,
-            input: serde_json::Value::Null,
-            locations: vec![],
-        });
-        emit_agent_event_with_source(event, source.clone());
-    }
-
-    tokio::select! {
-        result = manager.call_tool(&call.name, json_data) => result,
-        _ = wait_abort_signal(abort_signal) => bail!("MCP tool call cancelled"),
     }
 }
 
@@ -1153,63 +657,6 @@ mod tests {
             server_handle.abort();
             client_handle.abort();
         });
-    }
-
-    #[test]
-    fn nested_agent_event_maps_to_structured_session_updates() {
-        let nested_source = AgentSource {
-            agent: "argus".to_string(),
-            session_id: Some("nested-123".to_string()),
-        };
-        let tool_update = nested_agent_event_to_session_update(
-            AgentEvent::Tool(ToolEvent::Started {
-                id: "call-1".to_string(),
-                name: "argus_session_prompt".to_string(),
-                kind: ToolKind::Other,
-                title: None,
-                input: serde_json::json!({"message": "hello"}),
-                locations: vec![],
-            }),
-            Some(nested_source.clone()),
-        )
-        .expect("tool update");
-
-        match tool_update {
-            acp::SessionUpdate::ToolCall(call) => {
-                assert!(format!("{:?}", call).contains("argus_session_prompt"));
-                assert!(format!("{:?}", call).contains("hello"));
-                assert!(format!("{:?}", call).contains("argus"));
-                assert!(format!("{:?}", call).contains("nested-123"));
-            }
-            other => panic!("unexpected tool update: {other:?}"),
-        }
-
-        let thought_update = nested_agent_event_to_session_update(
-            AgentEvent::Model(ModelEvent::ThoughtChunk {
-                blocks: vec![ContentBlock::Text("thinking".to_string())],
-            }),
-            Some(nested_source.clone()),
-        )
-        .expect("thought update");
-        match thought_update {
-            acp::SessionUpdate::AgentThoughtChunk(chunk) => {
-                assert!(format!("{:?}", chunk).contains("argus"));
-                assert!(format!("{:?}", chunk).contains("nested-123"));
-            }
-            other => panic!("unexpected thought update: {other:?}"),
-        }
-
-        let plan_update = nested_agent_event_to_session_update(
-            AgentEvent::Plan {
-                entries: vec![CorePlanEntry {
-                    status: "in_progress".to_string(),
-                    content: "delegate to argus".to_string(),
-                }],
-            },
-            Some(nested_source),
-        )
-        .expect("plan update");
-        assert!(matches!(plan_update, acp::SessionUpdate::Plan(_)));
     }
 
     #[test]

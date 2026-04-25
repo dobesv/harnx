@@ -1,12 +1,9 @@
 use crate::types::Tui;
 use crate::types::{PendingMessage, TuiEvent};
 use anyhow::Result;
-use harnx_hooks::{
-    dispatch_hooks_with_count_and_manager, drain_async_results, inject_pending_async_context,
-    AsyncHookManager, HookEvent, HookResultControl, PersistentHookManager,
-};
-use harnx_runtime::client::{call_chat_completions, CompletionTokenUsage};
-use harnx_runtime::config::{Config, GlobalConfig, Input};
+use harnx_hooks::{AsyncHookManager, PersistentHookManager};
+use harnx_runtime::client::CompletionTokenUsage;
+use harnx_runtime::config::{GlobalConfig, Input};
 use harnx_runtime::utils::AbortSignal;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -51,278 +48,107 @@ impl Tui {
 
     async fn run_prompt_inner(
         ctx: PromptTaskContext,
-        mut input: Input,
-        mut resume_count: u32,
-        mut with_embeddings: bool,
+        input: Input,
+        _resume_count: u32,
+        _with_embeddings: bool,
     ) -> Result<()> {
-        let mut pending_switch: Option<harnx_runtime::tool::SwitchAgentData> = None;
-        loop {
-            if input.is_empty() {
-                break;
-            }
+        let _ = &ctx.pending_async_context;
 
-            // Apply a deferred agent switch from the previous tool round.
-            if let Some(switch) = pending_switch.take() {
-                ctx.config.write().exit_agent()?;
-                Config::use_agent(
-                    &ctx.config,
-                    &switch.agent,
-                    switch.session_id.as_deref(),
-                    ctx.abort_signal.clone(),
-                )
-                .await?;
-                // Always empty the session on handoff so the new agent starts
-                // fresh — the prior agent's system prompt and messages should
-                // not bleed into the new agent's session (#291).
-                if ctx.config.read().session.is_some() {
-                    ctx.config.write().empty_session()?;
-                }
-                // Rebuild input from only handoff prompt so parent tool calls,
-                // tool results, and session history do not leak into the new
-                // agent's first request (#303).
-                input = harnx_runtime::config::input::from_str(&ctx.config, &switch.prompt, None);
-                // Reset so the new agent starts fresh, matching the CMD
-                // path which passes 0 when recursing after a handoff.
-                resume_count = 0;
-                // Emit a source heading event so the TUI renders the
-                // "> agent ▸ session" header for the newly switched agent,
-                // matching the behavior of session_prompt delegation.
-                let source = harnx_core::event::AgentSource {
-                    agent: switch.agent.clone(),
-                    session_id: switch.session_id.clone(),
-                };
-                let _ = ctx.event_tx.send(TuiEvent::Agent(
-                    harnx_core::event::AgentEvent::Turn(harnx_core::event::TurnEvent::Started),
-                    Some(source),
-                ));
-            }
-
-            if with_embeddings {
-                harnx_runtime::config::input::use_embeddings(
-                    &mut input,
-                    &ctx.config,
-                    ctx.abort_signal.clone(),
-                )
-                .await?;
-            }
-
-            {
-                let mut async_guard = ctx.async_manager.lock().await;
-                let mut pending_guard = ctx.pending_async_context.lock().await;
-                drain_async_results(&mut async_guard, &mut pending_guard);
-                inject_pending_async_context(&mut input, &mut pending_guard);
-            }
-
-            ctx.config.write().before_chat_completion(&input)?;
-            let (hooks, session_id, cwd) = Self::hook_dispatch_context(&ctx.config);
-            let event = HookEvent::UserPromptSubmit {
-                prompt: input.text().to_string(),
-            };
-            {
-                let async_guard = ctx.async_manager.lock().await;
-                let outcome = dispatch_hooks_with_count_and_manager(
-                    &event,
-                    &hooks.entries,
-                    &session_id,
-                    &cwd,
-                    resume_count,
-                    Some(&async_guard),
-                    Some(&ctx.persistent_manager),
-                )
-                .await;
-                if matches!(outcome.control, HookResultControl::Block { .. }) {
-                    use harnx_core::event::{AgentEvent, ModelEvent};
-                    let _ = ctx.event_tx.send(TuiEvent::Agent(
-                        AgentEvent::Model(ModelEvent::Final {
-                            output: String::new(),
-                            usage: Default::default(),
-                        }),
-                        None,
-                    ));
-                    break;
-                }
-            }
-
-            let llm_result = harnx_runtime::client::retry::call_with_retry_and_fallback_custom(
-                &input,
-                &ctx.config,
-                ctx.abort_signal.clone(),
-                move |input: &Input,
-                      client: &dyn harnx_runtime::client::Client,
-                      config: &GlobalConfig,
-                      abort_signal| {
+        let call_fn: harnx_runtime::AgentCallFn = {
+            let config = ctx.config.clone();
+            Arc::new(
+                move |input: &harnx_runtime::config::Input,
+                      _config: &harnx_runtime::config::GlobalConfig,
+                      abort: harnx_runtime::utils::AbortSignal| {
+                    let input = input.clone();
+                    let config = config.clone();
                     Box::pin(async move {
-                        if harnx_runtime::config::input::stream(input, config) {
-                            Self::call_chat_completions_streaming_tui(
-                                input,
-                                client,
-                                config,
-                                abort_signal,
-                            )
-                            .await
-                        } else {
-                            call_chat_completions(input, true, false, client, config, abort_signal)
-                                .await
-                        }
+                        harnx_runtime::client::retry::call_with_retry_and_fallback_custom(
+                            &input,
+                            &config,
+                            abort,
+                            |inp, client, cfg, abort_signal| {
+                                Box::pin(async move {
+                                    if harnx_runtime::config::input::stream(inp, cfg) {
+                                        Tui::call_chat_completions_streaming_tui(
+                                            inp,
+                                            client,
+                                            cfg,
+                                            abort_signal,
+                                        )
+                                        .await
+                                    } else {
+                                        harnx_runtime::client::call_chat_completions(
+                                            inp,
+                                            true,
+                                            false,
+                                            client,
+                                            cfg,
+                                            abort_signal,
+                                        )
+                                        .await
+                                    }
+                                })
+                            },
+                        )
+                        .await
                     })
                 },
             )
-            .await;
+        };
 
-            let (output, thought, tool_calls, usage) = match llm_result {
-                Ok(result) => result,
-                Err(err) => {
-                    // Persist the user message to the session log even on
-                    // LLM failure so it is not lost.
-                    let _ = ctx.config.write().after_chat_completion(
-                        &input,
-                        "",
-                        None,
-                        &[],
-                        &Default::default(),
-                    );
-                    return Err(err);
-                }
-            };
-
-            // Tool rounds use `execute_tool_round` to persist the
-            // request, run the tools, and persist the results as two
-            // separate log entries.  Plain-text rounds save once via
-            // after_chat_completion.
-            let tool_results: Vec<harnx_runtime::tool::ToolResult> = if tool_calls.is_empty() {
-                ctx.config.write().after_chat_completion(
-                    &input,
-                    &output,
-                    thought.as_deref(),
-                    &[],
-                    &usage,
-                )?;
-                Vec::new()
-            } else {
-                ctx.config.write().record_completion_usage(&usage);
-                harnx_runtime::tool::execute_tool_round(
-                    &ctx.config,
-                    &input,
-                    &output,
-                    thought.as_deref(),
-                    tool_calls,
-                    &ctx.abort_signal,
-                )?
-            };
-
-            let stop_outcome = if tool_results.is_empty() {
-                let event = HookEvent::Stop {
-                    stop_hook_active: true,
-                    last_assistant_message: Some(output.clone()),
-                };
-                let async_guard = ctx.async_manager.lock().await;
-                Some(
-                    dispatch_hooks_with_count_and_manager(
-                        &event,
-                        &hooks.entries,
-                        &session_id,
-                        &cwd,
-                        resume_count,
-                        Some(&async_guard),
-                        Some(&ctx.persistent_manager),
-                    )
-                    .await,
-                )
-            } else {
-                None
-            };
-
-            if !tool_results.is_empty() {
-                let mut merged_input =
-                    input.merge_tool_results(output, thought, tool_results.clone());
-                let _ = ctx.event_tx.send(TuiEvent::ToolRoundComplete);
-                // Defer agent switch to the top of the next iteration so the
-                // TUI has a chance to render the tool-call row before the new
-                // agent's streaming output begins.
-                pending_switch = tool_results.iter().find_map(|v| v.switch_agent.clone());
-
-                // Check if the user queued a message while tools were running.
-                // If so, inject it as a trailing user message so the LLM sees
-                // it right after the tool results.
-                //
-                // Skip dot-commands and messages with attachments — those need
-                // the full submit_pending_message_inner() flow which runs on
-                // the TUI side after LlmFinal.
-                {
-                    let mut guard = ctx.shared_pending_message.lock().await;
+        let event_tx = ctx.event_tx.clone();
+        let shared_pending = ctx.shared_pending_message.clone();
+        let on_tool_round: harnx_runtime::OnToolRoundFn = Arc::new(
+            move |merged_input: &mut harnx_runtime::config::Input,
+                  _tool_results: &[harnx_runtime::tool::ToolResult]| {
+                let event_tx = event_tx.clone();
+                let shared_pending = shared_pending.clone();
+                Box::pin(async move {
+                    let _ = event_tx.send(TuiEvent::ToolRoundComplete);
+                    let mut guard = shared_pending.lock().await;
                     if let Some(pending) = guard.as_ref() {
                         let is_dot_command = pending.text.trim_start().starts_with('.');
                         let has_attachments = !pending.attachments.is_empty();
                         if !is_dot_command && !has_attachments {
                             let pending = guard.take().unwrap();
                             merged_input.set_injected_user_text(pending.text.clone());
-                            let _ = ctx.event_tx.send(TuiEvent::PendingMessageConsumed(pending));
+                            let _ = event_tx.send(TuiEvent::PendingMessageConsumed(pending));
                         }
                     }
-                }
+                })
+            },
+        );
 
-                input = merged_input;
-                with_embeddings = pending_switch.is_some();
-                continue;
-            } else {
-                use harnx_core::event::{AgentEvent, ModelEvent};
-                let _ = ctx.event_tx.send(TuiEvent::Agent(
-                    AgentEvent::Model(ModelEvent::Final {
-                        output: output.clone(),
-                        usage: usage.clone(),
-                    }),
-                    None,
-                ));
-            }
+        let event_tx = ctx.event_tx.clone();
+        let on_text_response: harnx_runtime::OnTextResponseFn = Arc::new(
+            move |output: String, usage: harnx_runtime::client::CompletionTokenUsage| {
+                let event_tx = event_tx.clone();
+                Box::pin(async move {
+                    use harnx_core::event::{AgentEvent, ModelEvent};
+                    let _ = event_tx.send(TuiEvent::Agent(
+                        AgentEvent::Model(ModelEvent::Final { output, usage }),
+                        None,
+                    ));
+                })
+            },
+        );
 
-            let max_resume = hooks.max_resume.unwrap_or(5);
-            if let Some(stop_outcome) = stop_outcome {
-                if stop_outcome.result.resume.unwrap_or(false) && resume_count < max_resume {
-                    if ctx.abort_signal.aborted() {
-                        break;
-                    }
-                    let context = stop_outcome
-                        .result
-                        .additional_context
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| "Continue working on pending tasks.".to_string());
-                    input = harnx_runtime::config::input::from_str(&ctx.config, &context, None);
-                    resume_count += 1;
-                    with_embeddings = true;
-                    continue;
-                }
-            }
+        let loop_ctx = harnx_runtime::AgentLoopContext {
+            config: ctx.config.clone(),
+            abort_signal: ctx.abort_signal.clone(),
+            async_manager: ctx.async_manager.clone(),
+            persistent_manager: ctx.persistent_manager.clone(),
+            call_fn: Some(call_fn),
+            on_tool_round: Some(on_tool_round),
+            on_text_response: Some(on_text_response),
+            initial_with_embeddings: true,
+            initial_resume_count: 0,
+            max_resume: None,
+            pending_async_context: None,
+        };
 
-            let async_resume_context = {
-                let mut async_guard = ctx.async_manager.lock().await;
-                let mut pending_guard = ctx.pending_async_context.lock().await;
-                if drain_async_results(&mut async_guard, &mut pending_guard)
-                    && resume_count < max_resume
-                {
-                    pending_guard
-                        .take()
-                        .filter(|value: &String| !value.is_empty())
-                        .or(Some("Continue working on pending tasks.".to_string()))
-                } else {
-                    None
-                }
-            };
-            if let Some(context) = async_resume_context {
-                if ctx.abort_signal.aborted() {
-                    break;
-                }
-                input = harnx_runtime::config::input::from_str(&ctx.config, &context, None);
-                resume_count += 1;
-                with_embeddings = true;
-                continue;
-            }
-
-            break;
-        }
-
-        Config::maybe_autoname_session(ctx.config.clone());
-        Config::maybe_compact_session(ctx.config.clone());
-        Ok(())
+        harnx_runtime::run_agent_loop(&loop_ctx, input).await
     }
 
     async fn call_chat_completions_streaming_tui(
@@ -385,21 +211,5 @@ impl Tui {
                 }
             }
         }
-    }
-
-    fn hook_dispatch_context(
-        config: &GlobalConfig,
-    ) -> (harnx_hooks::HooksConfig, String, std::path::PathBuf) {
-        let config = config.read();
-        (
-            config.resolved_hooks(),
-            config
-                .session
-                .as_ref()
-                .map(|session| session.name())
-                .unwrap_or("default")
-                .to_string(),
-            std::env::current_dir().unwrap_or_default(),
-        )
     }
 }

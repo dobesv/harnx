@@ -1672,6 +1672,7 @@ dependencies = [
  "futures-util",
  "harnx-acp",
  "harnx-core",
+ "harnx-hooks",
  "harnx-render",
  "harnx-runtime",
  "log",

@@ -22,6 +22,7 @@ clap = { workspace = true }
 futures-util = { workspace = true }
 harnx-acp = { workspace = true }
 harnx-core = { path = "../harnx-core" }
+harnx-hooks = { path = "../harnx-hooks" }
 harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
 log = { workspace = true }

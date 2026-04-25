@@ -10,6 +10,7 @@
 #[macro_use]
 extern crate log;
 
+pub mod agent_loop;
 pub mod bootstrap;
 pub mod client;
 pub mod commands;
@@ -17,3 +18,7 @@ pub mod config;
 pub mod test_utils;
 pub mod tool;
 pub mod utils;
+
+pub use agent_loop::{
+    run_agent_loop, AgentCallFn, AgentLoopContext, OnTextResponseFn, OnToolRoundFn,
+};

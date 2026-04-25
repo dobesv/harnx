@@ -13,7 +13,8 @@ use crossterm::{cursor, queue, style, terminal};
 use textwrap::core::display_width;
 
 use harnx_core::event::{
-    AgentEvent, AgentEventSink, ContentBlock, ModelEvent, NoticeEvent, ToolEvent, TurnEvent,
+    AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, ToolEvent,
+    TurnEvent,
 };
 
 use harnx_render::{MarkdownRender, RenderOptions};
@@ -25,6 +26,13 @@ use harnx_runtime::utils::{dimmed_text, spawn_spinner, warning_text, Spinner, IS
 #[derive(Clone)]
 pub struct CliAgentEventSink {
     state: Arc<Mutex<CliSinkState>>,
+}
+
+fn source_heading(source: &AgentSource) -> String {
+    match &source.session_id {
+        Some(session_id) if !session_id.is_empty() => format!("> {} ▸ {}", source.agent, session_id),
+        _ => format!("> {}", source.agent),
+    }
 }
 
 struct CliSinkState {
@@ -177,17 +185,26 @@ impl CliSinkState {
 }
 
 impl AgentEventSink for CliAgentEventSink {
-    fn emit(&self, event: AgentEvent, _source: Option<harnx_core::event::AgentSource>) {
-        // Source-aware CLI rendering (e.g., "> {agent}" prefix for sub-agent
-        // output) is a future enhancement. For now, CLI output treats
-        // sub-agent events identically to main-agent events, matching the
-        // pre-migration baseline where sub-agent chunks on CLI were mostly
-        // invisible.
-        let _ = _source;
+    fn emit(&self, event: AgentEvent, source: Option<harnx_core::event::AgentSource>) {
         let mut state = match self.state.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let show_heading = matches!(
+            event,
+            AgentEvent::Model(ModelEvent::MessageChunk { .. })
+                | AgentEvent::Model(ModelEvent::ThoughtChunk { .. })
+                | AgentEvent::Model(ModelEvent::Final { .. })
+                | AgentEvent::Model(ModelEvent::Error(_))
+        );
+        if show_heading {
+            if let Some(source) = source.as_ref() {
+                if let Err(err) = state.cleanup() {
+                    eprintln!("{}", warning_text(&format!("cli-sink cleanup failed: {err}")));
+                }
+                println!("{}", source_heading(source));
+            }
+        }
         match event {
             AgentEvent::Status(line) => match &state.spinner {
                 Some(spinner) => {
