@@ -167,6 +167,9 @@ impl acp::Agent for HarnxAgent {
                     .map_err(|e| acp::Error::new(-32603, format!("Failed to exit session: {e}")))?;
             }
             config
+                .use_agent_by_name(&self.agent_name)
+                .map_err(|e| acp::Error::new(-32603, format!("Failed to set agent: {e}")))?;
+            config
                 .use_session(Some(&session_id))
                 .map_err(|e| acp::Error::new(-32603, format!("Failed to create session: {e}")))?;
         }
@@ -210,6 +213,9 @@ impl acp::Agent for HarnxAgent {
                         acp::Error::new(-32603, format!("Failed to exit session: {e}"))
                     })?;
                 }
+                config
+                    .use_agent_by_name(&self.agent_name)
+                    .map_err(|e| acp::Error::new(-32603, format!("Failed to set agent: {e}")))?;
                 config
                     .use_session(Some(&session_key))
                     .map_err(|e| acp::Error::new(-32603, format!("Failed to use session: {e}")))?;
@@ -443,6 +449,7 @@ mod tests {
         sync::Arc,
         task::{Context as TaskContext, Poll},
     };
+    use tempfile::TempDir;
     use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, ReadBuf};
     use tokio::task::LocalSet;
     use tokio::time::{timeout, Duration};
@@ -562,6 +569,34 @@ mod tests {
         Arc::new(RwLock::new(config))
     }
 
+    fn write_test_agent(temp: &TempDir, agent_name: &str, prompt: &str) {
+        let agents_dir = temp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        let agent_content = format!("---\nmodel: openai:gpt-4o\n---\n{prompt}\n");
+        std::fs::write(agents_dir.join(format!("{agent_name}.md")), agent_content)
+            .expect("write test agent file");
+    }
+
+    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+
+    impl EnvGuard {
+        fn new(key: &'static str, value: &std::path::Path) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self(key, prev)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(v) = self.1.take() {
+                unsafe { std::env::set_var(self.0, v) };
+            } else {
+                unsafe { std::env::remove_var(self.0) };
+            }
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn setup_roundtrip(
         agent_name: &str,
@@ -607,8 +642,13 @@ mod tests {
 
     #[test]
     fn test_new_session_returns_unique_ids() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        write_test_agent(&temp, "test", "You are test agent.");
         let config = test_config();
+        let temp_path = temp.path().to_path_buf();
         run_local(async move {
+            let _guard = TestStateGuard::new(None).await;
+            let _env = EnvGuard::new("HARNX_CONFIG_DIR", &temp_path);
             let agent = HarnxAgent::new("test".to_string(), config);
             let cwd = std::env::current_dir().expect("current dir");
 
@@ -631,8 +671,13 @@ mod tests {
 
     #[test]
     fn test_cancel_marks_session() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        write_test_agent(&temp, "test", "You are test agent.");
         let config = test_config();
+        let temp_path = temp.path().to_path_buf();
         run_local(async move {
+            let _guard = TestStateGuard::new(None).await;
+            let _env = EnvGuard::new("HARNX_CONFIG_DIR", &temp_path);
             let agent = HarnxAgent::new("test".to_string(), config);
             let response = agent
                 .new_session(acp::NewSessionRequest::new(
@@ -697,7 +742,14 @@ mod tests {
 
     #[test]
     fn test_acp_server_new_session_and_prompt_roundtrip() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        write_test_agent(
+            &temp,
+            CREATE_TITLE_AGENT,
+            "You create concise titles for conversations.",
+        );
         let config = test_config();
+        let temp_path = temp.path().to_path_buf();
 
         run_local(async move {
             let _guard = TestStateGuard::new(Some(Arc::new(
@@ -710,6 +762,7 @@ mod tests {
                     .build(),
             )))
             .await;
+            let _env = EnvGuard::new("HARNX_CONFIG_DIR", &temp_path);
 
             let (client_conn, chunks, server_handle, client_handle) =
                 setup_roundtrip(CREATE_TITLE_AGENT, config.clone());
@@ -760,7 +813,10 @@ mod tests {
                 *chunks
             );
 
-            let session_path = config.read().session_file(&session.session_id.to_string());
+            let session_id = session.session_id.to_string();
+            let session_path =
+                harnx_core::config_paths::session_file(Some(CREATE_TITLE_AGENT), &session_id);
+            let top_level_path = harnx_core::config_paths::session_file(None, &session_id);
             assert!(
                 !session_path.display().to_string().contains("/sessions/_/"),
                 "session file should not be written under '_' temp directory: {}",
@@ -768,8 +824,13 @@ mod tests {
             );
             assert!(
                 session_path.exists(),
-                "ACP prompt should persist the session to disk at {}",
+                "ACP prompt should persist session to disk at {}",
                 session_path.display()
+            );
+            assert!(
+                !top_level_path.exists(),
+                "session must NOT be saved to top-level path {}, should be agent-scoped",
+                top_level_path.display()
             );
 
             // Verify session file actually contains conversation content.
@@ -794,35 +855,12 @@ mod tests {
     /// should contain the expanded OS name, not the raw `{{__os__}}` template.
     #[test]
     fn test_acp_prompt_expands_system_variables_in_session() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let agents_dir = temp.path().join("agents");
-        std::fs::create_dir_all(&agents_dir).unwrap();
-
-        // Write an agent whose prompt contains {{__os__}}.
-        let agent_content =
-            "---\nmodel: openai:gpt-4o\n---\nYou are running on {{__os__}}. Help the user.\n";
-        std::fs::write(agents_dir.join("vartest.md"), agent_content).unwrap();
-
-        // Point HARNX_CONFIG_DIR at the temp dir so retrieve_agent finds it.
-        // The env mutation must be serialized with other tests that touch
-        // HARNX_CONFIG_DIR — we do this by creating the guard *inside* the
-        // region where `TEST_CLIENT_LOCK` is held (via `TestStateGuard`).
-        struct EnvGuard(&'static str, Option<std::ffi::OsString>);
-        impl EnvGuard {
-            fn new(key: &'static str, val: &std::path::Path) -> Self {
-                let prev = std::env::var_os(key);
-                unsafe { std::env::set_var(key, val) };
-                Self(key, prev)
-            }
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(v) => unsafe { std::env::set_var(self.0, v) },
-                    None => unsafe { std::env::remove_var(self.0) },
-                }
-            }
-        }
+        let temp = tempfile::tempdir().expect("create temp dir");
+        write_test_agent(
+            &temp,
+            "vartest",
+            "You are running on {{__os__}}. Help the user.",
+        );
 
         let config = test_config();
         let temp_path = temp.path().to_path_buf();
@@ -878,11 +916,18 @@ mod tests {
 
             // The session file should contain the expanded OS name
             // (e.g. "linux", "macos") instead of the raw template.
-            let session_path = config.read().session_file(&session.session_id.to_string());
+            let session_id = session.session_id.to_string();
+            let session_path = harnx_core::config_paths::session_file(Some("vartest"), &session_id);
+            let top_level_path = harnx_core::config_paths::session_file(None, &session_id);
             assert!(
                 session_path.exists(),
                 "session file should exist at {}",
                 session_path.display()
+            );
+            assert!(
+                !top_level_path.exists(),
+                "session must NOT be saved to top-level path {}, should be agent-scoped",
+                top_level_path.display()
             );
             let content = std::fs::read_to_string(&session_path).expect("read session");
             assert!(
