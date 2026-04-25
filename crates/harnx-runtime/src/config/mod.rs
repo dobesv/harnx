@@ -985,7 +985,13 @@ impl Config {
     }
 
     pub fn use_agent_by_name(&mut self, name: &str) -> Result<()> {
-        let agent = self.retrieve_agent(name)?;
+        let mut agent = self.retrieve_agent(name)?;
+        // Mirror the async `use_agent` flow: `init()` resolves file-backed
+        // variable defaults (the `path:` field) before the agent becomes
+        // active.  Without this, a follow-up `use_session` would call
+        // `init_agent_session_variables`, find unresolved required variables,
+        // and bail with "agent variables are required".
+        self::agent::resolve_file_defaults(&mut agent)?;
         self.use_agent_obj(agent)
     }
 
@@ -3532,6 +3538,77 @@ mod tests {
         assert!(
             has_system,
             "compaction agent's system prompt must be in the messages; messages: {messages:?}"
+        );
+    }
+
+    /// Regression test for the ACP-server failure where `use_agent_by_name`
+    /// followed by `use_session` bailed with "agent variables are required"
+    /// for an agent whose variables use `path:` (file-backed defaults).  The
+    /// async `agent::init` resolves these defaults, but the synchronous
+    /// `retrieve_agent` does not — `use_agent_by_name` must do so itself,
+    /// otherwise `init_agent_session_variables` (called from `use_session`)
+    /// finds no defaults and bails in non-interactive contexts like ACP.
+    #[tokio::test]
+    async fn test_use_agent_by_name_resolves_file_backed_variable_defaults() {
+        use crate::client::TestStateGuard;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let agents_dir = temp.path().join("agents");
+        std::fs::create_dir_all(agents_dir.join("shared")).unwrap();
+        std::fs::write(
+            agents_dir.join("file-backed-vars.md"),
+            "---\nvariables:\n  - name: prompt_body\n    description: Shared prompt\n    path: shared/prompt.md\n---\n{{prompt_body}}\n",
+        )
+        .unwrap();
+        std::fs::write(agents_dir.join("shared/prompt.md"), "Loaded body").unwrap();
+
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn new(key: &'static str, value: &std::path::Path) -> Self {
+                let prev = std::env::var_os(key);
+                unsafe { std::env::set_var(key, value) };
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => unsafe { std::env::set_var(self.key, v) },
+                    None => unsafe { std::env::remove_var(self.key) },
+                }
+            }
+        }
+
+        // Hold the global test lock so concurrent tests can't race on the
+        // shared HARNX_CONFIG_DIR env var.
+        let _guard = TestStateGuard::new(None).await;
+        let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+
+        // Drive use_session in non-interactive mode so the inquire prompt
+        // that would otherwise hang in CI is suppressed.  The fix must still
+        // produce populated shared_variables under no_interaction.
+        let mut config = Config {
+            info_flag: true,
+            ..Default::default()
+        };
+        config
+            .use_agent_by_name("file-backed-vars")
+            .expect("use_agent_by_name must resolve path-backed variable defaults");
+        config
+            .use_session(Some("file-backed-vars-session"))
+            .expect("use_session must succeed once defaults are resolved");
+
+        let agent = config.agent.as_ref().expect("agent should be set");
+        assert_eq!(
+            agent
+                .shared_variables()
+                .get("prompt_body")
+                .map(String::as_str),
+            Some("Loaded body"),
+            "shared_variables should be populated from the file-backed default"
         );
     }
 }

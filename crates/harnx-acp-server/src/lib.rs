@@ -222,10 +222,10 @@ impl acp::Agent for HarnxAgent {
             }
         }
 
-        // Load and resolve the agent (expands system prompt variables like
-        // {{__os__}}). In non-ACP flows this happens via
-        // init_agent_session_variables; in ACP mode we do it here since the
-        // agent is not stored on the config.
+        // Build a fresh agent for the input.  The agent is also stored on
+        // the config (via `use_agent_by_name` above) which is what carries
+        // session/shared variables; this local copy is used to expand system
+        // prompt variables like {{__os__}} via `set_agent`.
         let mut agent = self
             .config
             .read()
