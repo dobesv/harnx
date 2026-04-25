@@ -21,6 +21,7 @@ members = [
     "crates/harnx-spinner",
     "crates/harnx-test-bins",
     "crates/harnx-tui",
+    "crates/ratatui-widget-scrolling",
 ]
 
 [workspace.package]
@@ -113,3 +114,6 @@ syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"
 arboard = { version = "3.3.0", default-features = false }
 harnx-acp = { path = "crates/harnx-acp", version = "0.30.0" }
 harnx-acp-server = { path = "crates/harnx-acp-server", version = "0.30.0" }
+
+[patch.crates-io]
+ratatui_widget_scrolling = { path = "crates/ratatui-widget-scrolling" }
