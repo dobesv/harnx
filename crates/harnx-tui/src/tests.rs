@@ -2005,20 +2005,32 @@ async fn test_ctrl_c_cancels_streaming() {
         .await
         .unwrap();
 
-    // Process all pending events
-    loop {
-        match harness.tui().event_rx.try_recv() {
-            Ok(event) => {
-                harness.tui().handle_tui_event(event).await.unwrap();
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-            Err(e) => panic!("Unexpected error receiving event: {e}"),
+    // Drain pending events until the prompt task has actually finished
+    // (`llm_busy=false`). `wait_until_mock_exhausted` only confirms the
+    // mock has popped its last turn — the streaming response can still
+    // be in flight, and the `Final` event that flips `llm_busy` may not
+    // be on the channel yet. Polling here closes that race so the
+    // post-Ctrl+C assertion is meaningful in stress runs.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while harness.tui().app.llm_busy {
+        while let Ok(event) = harness.tui().event_rx.try_recv() {
+            harness.tui().handle_tui_event(event).await.unwrap();
         }
+        if !harness.tui().app.llm_busy {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for prompt task to finish (llm_busy stuck)"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     harness.render();
 
-    // Now simulate Ctrl+C after streaming is done.
-    // Exercise the same cancellation path used in production key handling.
+    // Now simulate Ctrl+C on the idle TUI. With per-task abort signals
+    // and a conditional `llm_busy` clear (no in-flight task → flip to
+    // false), Ctrl+C must leave `llm_busy=false` and surface the abort
+    // notice in the transcript.
     harness
         .tui()
         .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
