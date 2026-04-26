@@ -29,3 +29,4 @@ tokio = { workspace = true, features = ["fs"] }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 urlencoding = { workspace = true }
+minijinja = { workspace = true }

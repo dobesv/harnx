@@ -493,7 +493,7 @@ mod tests {
 
         // Build a Config with an attached session pointed at a temp dir.
         let mut config = Config::default();
-        let mut session = crate::config::session::new(&config, "replay_test");
+        let mut session = crate::config::session::new(&config, "replay_test").unwrap();
         session.set_sessions_dir(tmp.path().to_path_buf());
         config.session = Some(session);
         let global_config = Arc::new(RwLock::new(config));
