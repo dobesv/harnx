@@ -50,6 +50,7 @@ struct AcpWorkerHandle {
     tx: mpsc::UnboundedSender<WorkerCommand>,
     join: thread::JoinHandle<()>,
     abort_tx: oneshot::Sender<()>,
+    dead_rx: oneshot::Receiver<()>,
 }
 
 enum WorkerCommand {
@@ -395,14 +396,27 @@ impl AcpClient {
 
     pub async fn connect(&self) -> Result<()> {
         *self.connection_failed.write().await = false;
-        if *self.connected.read().await {
-            return Ok(());
-        }
 
         let mut worker_guard = self.worker.lock().await;
-        if worker_guard.is_some() {
-            *self.connected.write().await = true;
-            return Ok(());
+        if let Some(w) = worker_guard.as_mut() {
+            if !matches!(
+                w.dead_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            ) {
+                // Worker is still alive (Err(Empty)) or already connected — trust it.
+                *self.connected.write().await = true;
+                return Ok(());
+            }
+            // Worker died (Err(Closed)) — clear stale state and fall through to re-spawn.
+            *worker_guard = None;
+            *self.connected.write().await = false;
+            *self.initialize_response.write().await = None;
+            self.sessions.write().await.clear();
+        } else if *self.connected.read().await {
+            // connected=true but no worker — shouldn't happen; reset fully and reconnect.
+            *self.connected.write().await = false;
+            *self.initialize_response.write().await = None;
+            self.sessions.write().await.clear();
         }
 
         let (worker, ready_rx) = spawn_worker(
@@ -422,11 +436,15 @@ impl AcpClient {
             }
             Ok(Ok(Err(err))) => {
                 *self.connection_failed.write().await = true;
+                *self.initialize_response.write().await = None;
+                self.sessions.write().await.clear();
                 abort_and_join_worker(worker).await;
                 Err(err)
             }
             Ok(Err(_)) => {
                 *self.connection_failed.write().await = true;
+                *self.initialize_response.write().await = None;
+                self.sessions.write().await.clear();
                 abort_and_join_worker(worker).await;
                 Err(anyhow!(
                     "ACP server '{}' stopped during initialization",
@@ -435,6 +453,8 @@ impl AcpClient {
             }
             Err(_) => {
                 *self.connection_failed.write().await = true;
+                *self.initialize_response.write().await = None;
+                self.sessions.write().await.clear();
                 abort_and_join_worker(worker).await;
                 Err(anyhow!(
                     "ACP server '{}' timed out during initialization",
@@ -584,10 +604,12 @@ impl AcpClient {
     }
 
     async fn ensure_connected(&self) -> Result<()> {
-        if !*self.connected.read().await {
-            self.connect().await?;
-        }
-        Ok(())
+        // Delegate entirely to connect(), which holds the worker mutex for its
+        // full body (liveness probe → state clear → spawn → store).  This
+        // means concurrent callers serialize naturally: the second caller enters
+        // connect() after the first has already stored a fresh worker handle,
+        // sees it alive, and returns Ok(()) without spawning a duplicate.
+        self.connect().await
     }
 
     async fn worker_sender(&self) -> Result<mpsc::UnboundedSender<WorkerCommand>> {
@@ -611,12 +633,14 @@ fn spawn_worker(
     let (tx, rx) = mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = oneshot::channel();
     let (abort_tx, abort_rx) = oneshot::channel();
+    let (dead_tx, dead_rx) = oneshot::channel::<()>();
     let thread_name = format!("acp-client-{name}");
     let config_name = config.name.clone();
 
     let join = thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
+            let _dead_tx = dead_tx;
             let runtime = match Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => runtime,
                 Err(err) => {
@@ -650,7 +674,15 @@ fn spawn_worker(
         })
         .with_context(|| format!("Failed to start ACP worker thread for '{}'", config_name))?;
 
-    Ok((AcpWorkerHandle { tx, join, abort_tx }, ready_rx))
+    Ok((
+        AcpWorkerHandle {
+            tx,
+            join,
+            abort_tx,
+            dead_rx,
+        },
+        ready_rx,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -878,7 +910,12 @@ async fn shutdown_child(child: &Rc<RefCell<Option<Child>>>) -> Result<()> {
 }
 
 async fn abort_and_join_worker(worker: AcpWorkerHandle) {
-    let AcpWorkerHandle { tx, join, abort_tx } = worker;
+    let AcpWorkerHandle {
+        tx,
+        join,
+        abort_tx,
+        dead_rx: _,
+    } = worker;
     let _ = abort_tx.send(());
     drop(tx);
     join_worker(join).await;
@@ -1143,6 +1180,79 @@ mod tests {
         assert_eq!(
             source.session_id.as_deref(),
             Some("608e48b6-c880-4168-b028-1bda3469be07")
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_death_triggers_reconnection_attempt() {
+        // Unit test: inject a stale (dead) worker handle directly into the
+        // client and verify that `ensure_connected()` detects the dead worker,
+        // resets state, and then attempts to reconnect (the reconnect will fail
+        // because the command doesn't exist, but the important thing is that
+        // `connected` is reset to false rather than being left stuck at true).
+
+        let config = AcpServerConfig {
+            name: "mock-dead".to_string(),
+            command: "__harnx_test_nonexistent_binary__".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            enabled: true,
+            description: None,
+            idle_timeout_secs: 5,
+            operation_timeout_secs: 30,
+        };
+        let client = AcpClient::new(config);
+
+        // Create a dead worker handle: drop dead_tx immediately so dead_rx
+        // will return Err(TryRecvError::Closed) on try_recv(), which is the
+        // death signal.  (Dropping without sending yields Closed, not Ok(()).)
+        let (tx, _rx) = mpsc::unbounded_channel::<WorkerCommand>();
+        let (abort_tx, _abort_rx) = oneshot::channel::<()>();
+        let (dead_tx, dead_rx) = oneshot::channel::<()>();
+        drop(dead_tx); // sender dropped → dead_rx fires immediately
+
+        // Build a fake join handle by spawning a thread that does nothing.
+        let join = thread::spawn(|| {});
+
+        let stale_handle = AcpWorkerHandle {
+            tx,
+            join,
+            abort_tx,
+            dead_rx,
+        };
+
+        // Plant the stale handle and set connected = true to simulate the
+        // post-crash stuck state.
+        *client.worker.lock().await = Some(stale_handle);
+        *client.connected.write().await = true;
+
+        // ensure_connected() must detect the dead worker and attempt to
+        // reconnect.  The reconnect fails (no such binary), so it returns Err.
+        let result = client.ensure_connected().await;
+
+        // The critical assertion: connected must be false, not stuck at true.
+        assert!(
+            !*client.connected.read().await,
+            "connected must be reset after dead worker detected"
+        );
+        // All connection state must be cleared, not just `connected`.
+        assert!(
+            client.sessions.read().await.is_empty(),
+            "sessions must be cleared after dead worker detected"
+        );
+        assert!(
+            client.initialize_response.read().await.is_none(),
+            "initialize_response must be cleared after dead worker detected"
+        );
+        // Worker handle must be gone too.
+        assert!(
+            client.worker.lock().await.is_none(),
+            "worker must be cleared after dead worker detected"
+        );
+        // The reconnect error proves a fresh spawn was attempted.
+        assert!(
+            result.is_err(),
+            "ensure_connected should return an error when the binary does not exist"
         );
     }
 
