@@ -673,16 +673,14 @@ mod tests {
         assert_eq!(calls[1].arguments, json!({"cmd": "ls"}));
     }
 
-    /// End-to-end thought + thoughtSignature roundtrip for Gemini/Vertex AI
-    /// (issue #347 cross-provider audit).
+    /// End-to-end thought + thoughtSignature round-trip for Gemini/Vertex AI.
     ///
     /// Gemini's protocol carries `thought: <text>` parts and a
-    /// `thoughtSignature` on functionCall parts. Like Claude, dropping these
-    /// on the round-trip leaves the model's tool calls orphaned on the next
-    /// turn. The streaming code currently routes `part["thought"]` to
-    /// `handler.thought()` and captures `thoughtSignature` on tool_call
-    /// emission; this test pins both behaviors AND verifies the serialiser
-    /// echoes them back.
+    /// `thoughtSignature` on functionCall parts. Dropping either on the
+    /// round-trip leaves the model's tool calls orphaned on the next turn.
+    /// The streaming code routes `part["thought"]` to `handler.thought()`
+    /// and captures `thoughtSignature` on tool_call emission; this test
+    /// pins both behaviours AND verifies the serialiser echoes them back.
     #[test]
     fn gemini_streaming_thought_roundtrips_into_next_request_body() {
         use harnx_core::api_types::ChatCompletionsData;

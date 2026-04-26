@@ -167,12 +167,11 @@ fn claude_handle_content_block_delta(
     } else if let Some(text) = delta["thinking"].as_str() {
         // Route thinking deltas to the dedicated thought buffer so the
         // serialiser can echo a `{"type":"thinking",...}` block on the next
-        // request (issue #347 / #328 streaming side). Routing to
-        // `handler.text()` instead would fold thinking into the text buffer
-        // wrapped in `<think>...</think>` and leave `thought` = None, which
-        // makes the next turn omit the thinking block entirely — the model
-        // then sees its own tool calls as orphaned and produces "previous
-        // session" hallucinations.
+        // request. Routing to `handler.text()` instead folds thinking into
+        // the text buffer wrapped in `<think>...</think>` and returns
+        // `thought = None`, which makes the next turn omit the thinking
+        // block entirely — the model then sees its own tool calls as
+        // orphaned and produces "previous session" hallucinations.
         handler.thought(text)?;
     } else if let Some(sig) = delta["signature"].as_str() {
         // signature_delta: accumulate the thinking-block signature so it can
@@ -705,25 +704,24 @@ system_prompt_prefix:
         );
     }
 
-    /// End-to-end roundtrip for issue #347 / #328 on the STREAMING path.
+    /// End-to-end thinking + signature round-trip on the STREAMING path.
     ///
-    /// The non-streaming roundtrip is already covered above
-    /// (`claude_extract_preserves_thought_and_signature` +
-    /// `claude_body_includes_thinking_block_when_thought_present`), but issue
-    /// #328's "previous session" symptom can also surface on the streaming path
-    /// when the thinking text is delivered as `content_block_delta` events with
-    /// a trailing `signature_delta`.
+    /// The non-streaming round-trip is covered by
+    /// `claude_extract_preserves_thought_and_signature` plus
+    /// `claude_body_includes_thinking_block_when_thought_present`. The
+    /// streaming path can regress the same "previous session" symptom
+    /// independently when thinking text is delivered as
+    /// `content_block_delta` events with a trailing `signature_delta`.
     ///
-    /// This test drives `claude_handle_stream_event` with a realistic event
-    /// sequence (thinking deltas → signature_delta → tool_use), takes the
-    /// `SseHandler` output the same way `run_chat_completion_streaming` does,
-    /// then feeds it back into `claude_build_chat_completions_body` to verify
-    /// the next request includes the thinking block + signature. If the
-    /// streaming side drops the thought (e.g. because thinking deltas were
-    /// routed to the text buffer instead of the thought buffer), the
-    /// serialiser produces an assistant turn with no thinking block and the
-    /// model sees its tool calls as orphaned — exactly the bug we keep
-    /// reopening.
+    /// This test drives `claude_handle_stream_event` with a realistic
+    /// event sequence (thinking deltas → signature_delta → tool_use),
+    /// takes the `SseHandler` output the same way
+    /// `run_chat_completion_streaming` does, then feeds it back into
+    /// `claude_build_chat_completions_body` to verify the next request
+    /// includes the thinking block + signature. If thinking deltas land
+    /// in the text buffer instead of the thought buffer the serialiser
+    /// emits an assistant turn with no thinking block and the model sees
+    /// its tool calls as orphaned.
     #[test]
     fn claude_streaming_thought_roundtrips_into_next_request_body() {
         use harnx_core::abort::create_abort_signal;
@@ -791,13 +789,14 @@ system_prompt_prefix:
 
         // The thinking content must end up on the dedicated `thought` field,
         // NOT folded into the text buffer with <think>...</think> wrappers.
-        // If it lands in `text`, the next turn's request body will have no
-        // thinking block to echo back (issue #328 streaming-side regression).
+        // If it lands in `text`, the next turn's request body has no thinking
+        // block to echo back and the model treats the tool results as
+        // orphaned.
         assert_eq!(
             thought.as_deref(),
             Some("Let me think about this."),
             "streaming thought must be captured in the dedicated thought field, \
-             not the text buffer (issue #347: streaming path regresses #328)"
+             not the text buffer"
         );
         assert!(
             !text.contains("<think>"),
@@ -810,7 +809,7 @@ system_prompt_prefix:
         assert_eq!(
             tool_calls[0].thought_signature.as_deref(),
             Some("sig_stream_xyz"),
-            "streaming signature must reach the tool_call (PR #330 streaming side)"
+            "streaming signature must reach the tool_call"
         );
 
         // Now simulate what the agent loop does: build a ToolCalls message
@@ -861,9 +860,9 @@ system_prompt_prefix:
             .find(|b| b["type"] == "thinking")
             .expect(
                 "next request body must include a thinking block for the \
-                 streamed assistant turn (issue #328/#347): otherwise the \
-                 model receives tool results with no record of its prior \
-                 reasoning and infers a session boundary",
+                 streamed assistant turn: otherwise the model receives tool \
+                 results with no record of its prior reasoning and infers a \
+                 session boundary",
             );
         assert_eq!(thinking_block["thinking"], "Let me think about this.");
         assert_eq!(
@@ -941,8 +940,7 @@ system_prompt_prefix:
                 call.thought_signature.as_deref(),
                 Some("sig_multi"),
                 "every streamed tool_use sibling of a thinking block must carry \
-                 its signature so the next request body is well-formed (issue #328 \
-                 multi-call generalization)"
+                 its signature so the next request body is well-formed"
             );
         }
     }
