@@ -292,20 +292,24 @@ impl acp::Client for AcpNotificationClient {
         };
 
         if let Some(event) = event {
-            let chunk_for_response = if is_agent_message {
-                message_text.clone()
-            } else {
-                None
-            };
-
-            self.forward_agent_event(event, resolved_source.clone())
-                .await;
-
-            if let Some(chunk) = chunk_for_response {
-                let mut sessions = self.sessions.write().await;
-                let state = sessions.entry(session_id).or_default();
-                state.response_text.push_str(&chunk);
+            // Append to response_text BEFORE forwarding the event.
+            //
+            // `forward_agent_event` acquires `self.chunk_forwarder.write()`
+            // which can yield, allowing the `WorkerCommand::Prompt` task to
+            // run and snapshot `response_text` via `state.response_text.clone()`
+            // before this notification's text has been appended.  Writing first
+            // ensures the text is visible to the prompt-completion task regardless
+            // of scheduling order.
+            if is_agent_message {
+                if let Some(ref chunk) = message_text {
+                    let mut sessions = self.sessions.write().await;
+                    let state = sessions.entry(session_id).or_default();
+                    state.response_text.push_str(chunk);
+                }
             }
+
+            self.forward_agent_event(event, resolved_source)
+                .await;
         }
 
         Ok(())
