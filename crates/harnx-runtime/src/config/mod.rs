@@ -992,13 +992,30 @@ impl Config {
         // `init_agent_session_variables`, find unresolved required variables,
         // and bail with "agent variables are required".
         self::agent::resolve_file_defaults(&mut agent)?;
+        // Populate shared_variables from the resolved defaults so that
+        // `session::new()` -> `set_agent()` -> `render_template()` can access
+        // user-defined variables immediately (before `init_agent_session_variables`
+        // runs). This mirrors the variable-initialization step in
+        // `init_agent_session_variables` for the no-session-yet case.
+        if !agent.defined_variables().is_empty() && agent.shared_variables().is_empty() {
+            let mut config_variables = AgentVariables::default();
+            if let Some(v) = &self.agent_variables {
+                config_variables.extend(v.clone());
+            }
+            let shared = self::agent::init_agent_variables(
+                agent.defined_variables(),
+                &config_variables,
+                self.info_flag,
+            )?;
+            agent.set_shared_variables(shared);
+        }
         self.use_agent_obj(agent)
     }
 
     pub fn use_agent_obj(&mut self, agent: Agent) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             session.guard_empty()?;
-            session.set_agent(&agent);
+            session.set_agent(&agent)?;
         } else {
             self.agent = Some(agent);
         }
@@ -1116,12 +1133,12 @@ impl Config {
                         format!("Failed to cleanup previous '{TEMP_SESSION_NAME}' session")
                     })?;
                 }
-                session = Some(self::session::new(self, TEMP_SESSION_NAME));
+                session = Some(self::session::new(self, TEMP_SESSION_NAME)?);
             }
             Some(name) => {
                 let session_path = self.session_file(name);
                 if !session_path.exists() {
-                    session = Some(self::session::new(self, name));
+                    session = Some(self::session::new(self, name)?);
                 } else {
                     session = Some(self::session::load(self, name, &session_path)?);
                 }
@@ -1262,7 +1279,11 @@ impl Config {
     pub fn empty_session(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             if let Some(agent) = self.agent.as_ref() {
-                session.sync_agent(agent);
+                session.sync_agent(agent)?;
+                // Persist the updated agent name/prompt/variables to disk
+                // before clearing messages, so the header reflects the
+                // current agent state if the session file is reloaded.
+                crate::config::session::append_event(session, &session.build_header_entry());
             }
             crate::config::session::clear_messages(session);
         } else {
@@ -2482,7 +2503,7 @@ impl Config {
                     shared_variables
                 };
             agent.set_session_variables(session_variables);
-            session.sync_agent(agent);
+            session.sync_agent(agent)?;
         } else {
             let variables = session.agent_variables();
             agent.set_session_variables(variables.clone());
@@ -3279,7 +3300,7 @@ mod tests {
     #[test]
     fn empty_session_clears_named_session_with_messages() {
         let mut config = Config::default();
-        let mut session = self::session::new(&config, "handoff-target");
+        let mut session = self::session::new(&config, "handoff-target").unwrap();
         session.push_message_for_test(MessageRole::System, "You are agent A.".to_string());
         session.push_message_for_test(MessageRole::User, "Hello from old session".to_string());
         session.push_message_for_test(MessageRole::Assistant, "Response from agent A".to_string());
@@ -3313,7 +3334,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut session = self::session::new(&config, "test-intermediate");
+        let mut session = self::session::new(&config, "test-intermediate").unwrap();
         session.set_sessions_dir(tmp.path().to_path_buf());
         config.session = Some(session);
 
@@ -3376,7 +3397,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut session = self::session::new(&config, "test-session");
+        let mut session = self::session::new(&config, "test-session").unwrap();
         session.push_message_for_test(
             MessageRole::User,
             "Tell me about the Rust ownership model.".to_string(),
@@ -3487,7 +3508,7 @@ mod tests {
 
         config.agent = Some(main_agent);
 
-        let mut session = self::session::new(&config, "test-session");
+        let mut session = self::session::new(&config, "test-session").unwrap();
         session.push_message_for_test(
             MessageRole::User,
             "Tell me about the Rust ownership model.".to_string(),

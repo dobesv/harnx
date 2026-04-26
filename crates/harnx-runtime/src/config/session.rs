@@ -18,16 +18,16 @@ use std::sync::LazyLock;
 
 static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
 
-pub fn new(config: &Config, name: &str) -> Session {
+pub fn new(config: &Config, name: &str) -> Result<Session> {
     let agent = config.extract_agent();
     let mut session = Session {
         name: name.to_string(),
         save_session: config.save_session,
         ..Default::default()
     };
-    session.set_agent(&agent);
+    session.set_agent(&agent)?;
     session.dirty = false;
-    session
+    Ok(session)
 }
 
 pub fn load(config: &Config, name: &str, path: &Path) -> Result<Session> {
@@ -41,8 +41,8 @@ pub fn load(config: &Config, name: &str, path: &Path) -> Result<Session> {
         load_from_log(config, name, path, &content)?
     } else {
         // Old format: create a fresh session so we don't crash.
-        let mut session = new(config, name);
-        apply_name_and_path(&mut session, name, path, config);
+        let mut session = new(config, name)?;
+        apply_name_and_path(&mut session, name, path, config)?;
         session
     };
 
@@ -170,7 +170,7 @@ fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Res
 
     session.model =
         crate::client::retrieve_model(&config.clients, &session.model_id, ModelType::Chat)?;
-    apply_name_and_path(&mut session, name, path, config);
+    apply_name_and_path(&mut session, name, path, config)?;
     session.update_tokens();
     Ok(session)
 }
@@ -329,7 +329,12 @@ fn assemble_tool_message(
     )
 }
 
-fn apply_name_and_path(session: &mut Session, name: &str, path: &Path, config: &Config) {
+fn apply_name_and_path(
+    session: &mut Session,
+    name: &str,
+    path: &Path,
+    config: &Config,
+) -> Result<()> {
     if let Some(autoname) = name.strip_prefix("_/") {
         session.name = TEMP_SESSION_NAME.to_string();
         session.path = Some(path.display().to_string());
@@ -344,7 +349,18 @@ fn apply_name_and_path(session: &mut Session, name: &str, path: &Path, config: &
     session.agent_prompt = session.agent_instructions.clone();
     if let Some(agent_name) = &session.agent_name {
         if let Ok(agent) = config.retrieve_agent(agent_name) {
-            session.agent_prompt = agent.interpolated_instructions();
+            // Only re-render the prompt when the session does not already have
+            // resolved agent data from the log.  If agent_variables is
+            // non-empty the session was restored from disk with its own
+            // variable values; re-rendering with the current agent definition
+            // would overwrite those resolved values.  Similarly, if
+            // agent_prompt differs from agent_instructions the session log
+            // already stored a rendered prompt — preserve it.
+            let prompt_is_unresolved = session.agent_variables().is_empty()
+                && session.agent_prompt == session.agent_instructions;
+            if prompt_is_unresolved {
+                session.agent_prompt = agent.interpolated_instructions()?;
+            }
             if session.use_tools.is_none() {
                 session.use_tools = agent.use_tools();
             }
@@ -356,6 +372,7 @@ fn apply_name_and_path(session: &mut Session, name: &str, path: &Path, config: &
             }
         }
     }
+    Ok(())
 }
 
 /// Initialize the session log file with a header entry.
@@ -710,7 +727,7 @@ pub fn add_assistant_text(
         }
         session.dirty = true;
     } else {
-        let mut all_appended = begin_turn(session, input, output);
+        let mut all_appended = begin_turn(session, input, output)?;
         let content = match thought {
             Some(v) => MessageContent::Text(format!("<think>\n{v}\n</think>\n{output}")),
             _ => MessageContent::Text(output.to_string()),
@@ -750,7 +767,7 @@ pub fn add_tool_calls(
     // slots that persist as "tool response pending" placeholders in the
     // log (issue: multiple results with the same id sent to the LLM).
     let calls = crate::tool::ToolCall::dedup(calls.to_vec());
-    let mut all_appended = begin_turn(session, input, output);
+    let mut all_appended = begin_turn(session, input, output)?;
     all_appended &= append_event(
         session,
         &SessionLogEntry::ToolCalls {
@@ -853,7 +870,7 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
 /// push (skipped on continuation rounds), data-URL persistence, and
 /// any queued injected-user-text.  Returns `true` iff every log
 /// append succeeded.
-fn begin_turn(session: &mut Session, input: &Input, output: &str) -> bool {
+fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool> {
     let mut all_appended = true;
     // Detect continuation rounds: if the last saved message is a Tool
     // message, we're continuing after tool execution and should NOT
@@ -868,7 +885,7 @@ fn begin_turn(session: &mut Session, input: &Input, output: &str) -> bool {
             let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
             session.autoname = Some(AutoName::new_from_chat_history(chat_history));
         }
-        let agent_messages = input.agent().build_messages(input);
+        let agent_messages = input.agent().build_messages(input)?;
         for msg in &agent_messages {
             all_appended &= append_event(
                 session,
@@ -914,7 +931,7 @@ fn begin_turn(session: &mut Session, input: &Input, output: &str) -> bool {
         );
         session.messages.push(injected_msg);
     }
-    all_appended
+    Ok(all_appended)
 }
 
 pub fn clear_messages(session: &mut Session) {
@@ -930,14 +947,14 @@ pub fn clear_messages(session: &mut Session) {
 }
 
 pub fn echo_messages(session: &Session, input: &Input) -> String {
-    let messages = build_messages(session, input);
+    let messages = build_messages(session, input).unwrap_or_default();
     serde_yaml::to_string(&messages).unwrap_or_else(|_| "Unable to echo message".into())
 }
 
-pub fn build_messages(session: &Session, input: &Input) -> Vec<Message> {
+pub fn build_messages(session: &Session, input: &Input) -> Result<Vec<Message>> {
     let mut messages = session.messages.clone();
     if input.continue_output().is_some() {
-        return messages;
+        return Ok(messages);
     } else if input.regenerate() {
         while let Some(last) = messages.last() {
             if !last.role.is_user() {
@@ -946,12 +963,12 @@ pub fn build_messages(session: &Session, input: &Input) -> Vec<Message> {
                 break;
             }
         }
-        return messages;
+        return Ok(messages);
     }
     let mut need_add_msg = true;
     let len = messages.len();
     if len == 0 {
-        messages = input.agent().build_messages(input);
+        messages = input.agent().build_messages(input)?;
         need_add_msg = false;
     } else if len == 1 && session.compressed_messages.len() >= 2 {
         if let Some(index) = session
@@ -969,7 +986,7 @@ pub fn build_messages(session: &Session, input: &Input) -> Vec<Message> {
         // On normal session turns the system prompt was stored on turn 1
         // by save_message(), so inject_system_prompt stays false.
         if input.inject_system_prompt() {
-            let system_text = input.agent().system_text();
+            let system_text = input.agent().system_text()?;
             if !system_text.is_empty() {
                 messages.insert(
                     0,
@@ -979,7 +996,7 @@ pub fn build_messages(session: &Session, input: &Input) -> Vec<Message> {
         }
         messages.push(Message::new(MessageRole::User, input.message_content()));
     }
-    messages
+    Ok(messages)
 }
 
 #[cfg(test)]
@@ -987,7 +1004,7 @@ mod tests {
     use super::*;
 
     fn test_session() -> Session {
-        new(&Config::default(), "test")
+        new(&Config::default(), "test").unwrap()
     }
 
     #[test]
@@ -998,7 +1015,7 @@ mod tests {
         ).unwrap());
         let mut session = test_session();
 
-        session.set_agent(&agent);
+        session.set_agent(&agent).unwrap();
         let round_tripped_agent = to_agent(&session);
 
         assert_eq!(
