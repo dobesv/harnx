@@ -185,7 +185,12 @@ struct BedrockStreamState {
     function_name: String,
     function_arguments: String,
     function_id: String,
-    reasoning_state: i32,
+    /// Accumulated signature from `reasoningContent.signature` deltas for
+    /// the current reasoning block. Passed to each toolUse emitted in the
+    /// same turn so the serialiser can echo it back verbatim on the next
+    /// request — Bedrock (and the underlying Anthropic API) rejects
+    /// reasoning round-trips whose signature is missing or modified.
+    thinking_signature: String,
 }
 
 fn bedrock_emit_pending_tool_call(
@@ -204,11 +209,16 @@ fn bedrock_emit_pending_tool_call(
             state.function_name, state.function_arguments
         )
     })?;
+    let thought_signature = if state.thinking_signature.is_empty() {
+        None
+    } else {
+        Some(state.thinking_signature.clone())
+    };
     handler.tool_call(ToolCall::new(
         state.function_name.clone(),
         arguments,
         Some(state.function_id.clone()),
-        None,
+        thought_signature,
     ))?;
     state.function_name.clear();
     state.function_arguments.clear();
@@ -248,11 +258,20 @@ fn bedrock_handle_content_block_delta(
     if let Some(text) = data["delta"]["text"].as_str() {
         handler.text(text)?;
     } else if let Some(text) = data["delta"]["reasoningContent"]["text"].as_str() {
-        if state.reasoning_state == 0 {
-            handler.text("<think>\n")?;
-            state.reasoning_state = 1;
-        }
-        handler.text(text)?;
+        // Route reasoning text to the dedicated thought buffer so the
+        // serialiser can echo a `reasoningContent` block on the next
+        // request. Routing to `handler.text()` instead folds reasoning
+        // into the text buffer wrapped in `<think>...</think>` and
+        // returns `thought = None`, which makes the next turn omit the
+        // reasoningContent block entirely — the model then sees its own
+        // tool calls as orphaned and produces "previous session"
+        // hallucinations.
+        handler.thought(text)?;
+    } else if let Some(sig) = data["delta"]["reasoningContent"]["signature"].as_str() {
+        // Bedrock Converse Stream delivers the reasoning-block signature
+        // via a `reasoningContent.signature` delta after the text deltas.
+        // Accumulate so it can be attached to every toolUse in the turn.
+        state.thinking_signature.push_str(sig);
     } else if let Some(input) = data["delta"]["toolUse"]["input"].as_str() {
         state.function_arguments.push_str(input);
     }
@@ -263,15 +282,16 @@ fn bedrock_handle_content_block_stop(
     state: &mut BedrockStreamState,
     handler: &mut SseHandler,
 ) -> Result<()> {
-    if state.reasoning_state == 1 {
-        handler.text("\n</think>\n\n")?;
-        state.reasoning_state = 0;
-    }
     // Emit if a toolUse block is pending, and reset accumulators so the
     // fallback emit path in contentBlockStart doesn't re-fire this same
     // call when the next toolUse block begins. Same bug that affected
     // the Claude streaming parser (both follow Anthropic's content-block
     // protocol).
+    //
+    // Reasoning-block close brackets are no longer emitted here — the
+    // SseHandler's `thought()` / `text()` / `tool_call()` / `done()`
+    // methods manage `<think>...</think>` display framing themselves now
+    // that reasoning text flows through `thought_buffer`.
     bedrock_emit_pending_tool_call(state, handler)
 }
 
@@ -431,10 +451,37 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                     })]
                 }
                 MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
+                    tool_results,
+                    text,
+                    thought,
+                    ..
                 }) => {
                     let mut assistant_parts = vec![];
                     let mut user_parts = vec![];
+                    if let Some(thought_text) = thought {
+                        // Echo the reasoningContent block verbatim so
+                        // Bedrock knows this assistant turn included
+                        // extended thinking. The signature is stored on
+                        // each tool call in the turn — omitting it
+                        // causes the model to treat its own tool calls
+                        // as coming from a "previous session" and
+                        // produce replay-confusion hallucinations.
+                        let signature = tool_results
+                            .first()
+                            .and_then(|r| r.call.thought_signature.as_deref())
+                            .unwrap_or("");
+                        let mut reasoning_text = json!({ "text": thought_text });
+                        if !signature.is_empty() {
+                            if let Some(obj) = reasoning_text.as_object_mut() {
+                                obj.insert("signature".to_string(), signature.into());
+                            }
+                        }
+                        assistant_parts.push(json!({
+                            "reasoningContent": {
+                                "reasoningText": reasoning_text,
+                            }
+                        }));
+                    }
                     if !text.is_empty() {
                         assistant_parts.push(json!({
                             "text": text,
@@ -526,7 +573,8 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
 
 fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     let mut text = String::new();
-    let mut reasoning = None;
+    let mut reasoning: Option<String> = None;
+    let mut reasoning_signature: Option<String> = None;
     let mut tool_calls = vec![];
     if let Some(array) = data["output"]["message"]["content"].as_array() {
         for item in array {
@@ -538,8 +586,11 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
             } else if let Some(reasoning_text) =
                 item["reasoningContent"]["reasoningText"].as_object()
             {
-                if let Some(text) = json_str_from_map(reasoning_text, "text") {
-                    reasoning = Some(text.to_string());
+                if let Some(t) = json_str_from_map(reasoning_text, "text") {
+                    reasoning = Some(t.to_string());
+                }
+                if let Some(s) = json_str_from_map(reasoning_text, "signature") {
+                    reasoning_signature = Some(s.to_string());
                 }
             } else if let Some(tool_use) = item["toolUse"].as_object() {
                 if let (Some(id), Some(name), Some(input)) = (
@@ -551,25 +602,43 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
                         name.to_string(),
                         input.clone(),
                         Some(id.to_string()),
-                        None,
+                        None, // signature attached below
                     ));
                 }
             }
         }
     }
 
-    if let Some(reasoning) = reasoning {
-        text = format!("<think>\n{reasoning}\n</think>\n\n{text}")
+    // Attach the reasoning signature to every tool call in this turn.
+    // Bedrock requires the signature echoed back verbatim alongside the
+    // reasoningContent block.
+    if let Some(sig) = &reasoning_signature {
+        for call in &mut tool_calls {
+            call.thought_signature = Some(sig.clone());
+        }
     }
 
-    if text.is_empty() && tool_calls.is_empty() {
-        bail!("Invalid response data: {data}");
+    // When there are tool calls, carry the thought on its dedicated field
+    // so the serialiser can echo back the reasoningContent block on the
+    // next request. When there are no tool calls, fold it into text for
+    // display (existing behaviour for plain-text reasoning responses).
+    if !tool_calls.is_empty() {
+        if text.is_empty() && reasoning.is_none() {
+            bail!("Invalid response data: {data}");
+        }
+    } else {
+        if let Some(r) = &reasoning {
+            text = format!("<think>\n{r}\n</think>\n\n{text}");
+        }
+        if text.is_empty() {
+            bail!("Invalid response data: {data}");
+        }
     }
 
     let output = ChatCompletionsOutput {
         text,
         tool_calls,
-        thought: None,
+        thought: reasoning,
         id: None,
         input_tokens: data["usage"]["inputTokens"].as_u64(),
         output_tokens: data["usage"]["outputTokens"].as_u64(),
@@ -744,6 +813,296 @@ mod tests {
             ids,
             vec![Some("toolu_A"), Some("toolu_B")],
             "each toolUse block should be emitted exactly once"
+        );
+    }
+
+    /// End-to-end reasoning round-trip on the Bedrock STREAMING path.
+    ///
+    /// When Bedrock Converse Stream delivers a reasoningContent block
+    /// (text deltas + trailing signature delta) followed by toolUse, the
+    /// streaming parser must:
+    ///   1. route reasoning text to `handler.thought()` (not
+    ///      `handler.text()`, which would fold reasoning into the text
+    ///      buffer wrapped in `<think>...</think>` and lose the thought),
+    ///   2. capture the `reasoningContent.signature` delta and attach it
+    ///      to every toolUse in the turn, and
+    ///   3. surface the thought via `SseHandler::take()` so the
+    ///      serialiser can echo a `reasoningContent` block on the next
+    ///      request.
+    ///
+    /// If any of those break, the next turn's request has no
+    /// reasoningContent block, the model sees its own tool calls as
+    /// orphaned, and it produces "previous session" hallucinations.
+    /// This test drives the full state machine and verifies the next
+    /// request body is well-formed.
+    #[test]
+    fn bedrock_streaming_thought_roundtrips_into_next_request_body() {
+        use harnx_core::api_types::ChatCompletionsData;
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::model::Model;
+        use harnx_core::tool::ToolResult;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = BedrockStreamState::default();
+
+        // Realistic Bedrock Converse Stream sequence: reasoning block
+        // (multi-chunk text + trailing signature delta) then a toolUse.
+        let events: Vec<(&str, Value)> = vec![
+            ("contentBlockStart", json!({"start": {}})),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"reasoningContent": {"text": "Let me think "}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"reasoningContent": {"text": "about this."}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"reasoningContent": {"signature": "sig_bedrock_xyz"}}}),
+            ),
+            ("contentBlockStop", json!({})),
+            (
+                "contentBlockStart",
+                json!({"start": {"toolUse": {"toolUseId": "toolu_S", "name": "Bash"}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"toolUse": {"input": "{\"command\":\"ls\"}"}}}),
+            ),
+            ("contentBlockStop", json!({})),
+        ];
+        for (smithy_type, data) in &events {
+            bedrock_handle_stream_event(&mut state, &mut handler, smithy_type, data)
+                .expect("stream event should process");
+        }
+
+        let (text, thought, tool_calls, _usage) = handler.take();
+
+        assert_eq!(
+            thought.as_deref(),
+            Some("Let me think about this."),
+            "Bedrock streaming reasoning text must reach the dedicated thought \
+             field, not the text buffer wrapped in <think>"
+        );
+        assert!(
+            !text.contains("<think>"),
+            "text buffer must not be polluted with <think> wrappers when \
+             tool calls are present. Got: {text:?}"
+        );
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].thought_signature.as_deref(),
+            Some("sig_bedrock_xyz"),
+            "Bedrock streaming reasoningContent.signature must reach \
+             ToolCall.thought_signature"
+        );
+
+        // Now simulate what the agent loop does: build a ToolCalls message
+        // from (text, thought, tool_calls), then build the next request body.
+        let tool_result = ToolResult::new(tool_calls.into_iter().next().unwrap(), json!("ok"));
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Run a command".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![tool_result],
+                    text,
+                    thought,
+                )),
+            ),
+        ];
+        let mut model = Model::new("bedrock", "us.anthropic.claude-sonnet-4-6");
+        model.set_max_tokens(Some(4096), true);
+        let body = build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: true,
+            },
+            &model,
+        )
+        .unwrap();
+
+        let assistant_msg = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("must have an assistant turn");
+        let content = assistant_msg["content"]
+            .as_array()
+            .expect("assistant content array");
+
+        // Find the reasoningContent block — it must exist and precede the
+        // toolUse so Bedrock can verify the reasoning matches the request.
+        let reasoning_idx = content
+            .iter()
+            .position(|b| b["reasoningContent"].is_object())
+            .expect(
+                "next request body must include a reasoningContent block for the \
+                 streamed assistant turn: otherwise the model receives tool \
+                 results with no record of its prior reasoning",
+            );
+        let tool_use_idx = content
+            .iter()
+            .position(|b| b["toolUse"].is_object())
+            .expect("must have a toolUse block");
+        assert!(
+            reasoning_idx < tool_use_idx,
+            "reasoningContent must precede toolUse"
+        );
+
+        let reasoning_text = &content[reasoning_idx]["reasoningContent"]["reasoningText"];
+        assert_eq!(reasoning_text["text"], "Let me think about this.");
+        assert_eq!(
+            reasoning_text["signature"], "sig_bedrock_xyz",
+            "reasoning signature must be echoed verbatim from the streamed \
+             reasoningContent.signature delta"
+        );
+    }
+
+    /// Multiple toolUse blocks in one streamed Bedrock turn must all carry
+    /// the same reasoning signature. Bedrock rejects requests where any
+    /// toolUse sibling of a reasoningContent block lacks the signature
+    /// when echoed back.
+    #[test]
+    fn bedrock_streaming_multiple_tool_calls_share_thought_signature() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = BedrockStreamState::default();
+
+        let events: Vec<(&str, Value)> = vec![
+            ("contentBlockStart", json!({"start": {}})),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"reasoningContent": {"text": "Plan two calls."}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"reasoningContent": {"signature": "sig_multi"}}}),
+            ),
+            ("contentBlockStop", json!({})),
+            (
+                "contentBlockStart",
+                json!({"start": {"toolUse": {"toolUseId": "toolu_A", "name": "Bash"}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"toolUse": {"input": "{\"command\":\"pwd\"}"}}}),
+            ),
+            ("contentBlockStop", json!({})),
+            (
+                "contentBlockStart",
+                json!({"start": {"toolUse": {"toolUseId": "toolu_B", "name": "Bash"}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"toolUse": {"input": "{\"command\":\"ls\"}"}}}),
+            ),
+            ("contentBlockStop", json!({})),
+        ];
+        for (smithy_type, data) in &events {
+            bedrock_handle_stream_event(&mut state, &mut handler, smithy_type, data)
+                .expect("stream event should process");
+        }
+
+        let (_text, thought, tool_calls, _usage) = handler.take();
+        assert_eq!(thought.as_deref(), Some("Plan two calls."));
+        assert_eq!(tool_calls.len(), 2);
+        for call in &tool_calls {
+            assert_eq!(
+                call.thought_signature.as_deref(),
+                Some("sig_multi"),
+                "every streamed toolUse sibling of a reasoningContent block \
+                 must carry its signature so the next request body is well-formed"
+            );
+        }
+    }
+
+    /// Non-streaming counterpart: `extract_chat_completions` must capture
+    /// the reasoningContent signature and attach it to every parsed
+    /// toolUse so a multi-call thinking turn echoes correctly.
+    #[test]
+    fn bedrock_extract_attaches_signature_to_every_tool_call() {
+        let response = json!({
+            "output": {"message": {"role": "assistant", "content": [
+                {
+                    "reasoningContent": {
+                        "reasoningText": {
+                            "text": "two calls",
+                            "signature": "sig_multi"
+                        }
+                    }
+                },
+                {"toolUse": {"toolUseId": "toolu_A", "name": "Bash", "input": {"command": "pwd"}}},
+                {"toolUse": {"toolUseId": "toolu_B", "name": "Bash", "input": {"command": "ls"}}}
+            ]}},
+            "usage": {"inputTokens": 1, "outputTokens": 1}
+        });
+
+        let output = extract_chat_completions(&response).unwrap();
+        assert_eq!(
+            output.thought.as_deref(),
+            Some("two calls"),
+            "thought must be stored in ChatCompletionsOutput.thought, not folded \
+             into text when tool calls are present"
+        );
+        assert_eq!(output.tool_calls.len(), 2);
+        for call in &output.tool_calls {
+            assert_eq!(
+                call.thought_signature.as_deref(),
+                Some("sig_multi"),
+                "every parsed toolUse sibling of a reasoningContent block must \
+                 carry its signature (non-streaming multi-call)"
+            );
+        }
+    }
+
+    /// Bedrock streaming text-only response with reasoning must populate
+    /// `thought` cleanly without polluting `text`. Pins the no-tool path
+    /// so a future refactor can't re-introduce `<think>` wrappers in text.
+    #[test]
+    fn bedrock_streaming_text_only_with_thinking_separates_buffers() {
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = BedrockStreamState::default();
+
+        let events: Vec<(&str, Value)> = vec![
+            ("contentBlockStart", json!({"start": {}})),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"reasoningContent": {"text": "Considering."}}}),
+            ),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"reasoningContent": {"signature": "sig_text"}}}),
+            ),
+            ("contentBlockStop", json!({})),
+            ("contentBlockStart", json!({"start": {}})),
+            (
+                "contentBlockDelta",
+                json!({"delta": {"text": "Final answer."}}),
+            ),
+            ("contentBlockStop", json!({})),
+        ];
+        for (smithy_type, data) in &events {
+            bedrock_handle_stream_event(&mut state, &mut handler, smithy_type, data)
+                .expect("stream event should process");
+        }
+
+        let (text, thought, tool_calls, _usage) = handler.take();
+        assert_eq!(text, "Final answer.", "text buffer carries only the prose");
+        assert_eq!(thought.as_deref(), Some("Considering."));
+        assert!(
+            tool_calls.is_empty(),
+            "no toolUse blocks were sent; tool_calls must stay empty"
         );
     }
 }
