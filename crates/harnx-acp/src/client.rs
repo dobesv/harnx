@@ -308,8 +308,7 @@ impl acp::Client for AcpNotificationClient {
                 }
             }
 
-            self.forward_agent_event(event, resolved_source)
-                .await;
+            self.forward_agent_event(event, resolved_source).await;
         }
 
         Ok(())
