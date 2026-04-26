@@ -147,7 +147,7 @@ jobs:
         printf 'archives<<EOF\n%s\nEOF\n' "$(IFS=$'\n'; echo "${archives[*]}")" >> $GITHUB_OUTPUT
 
     - name: Publish Archives
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       if: ${{ startsWith(github.ref, 'refs/tags/') }}
       with:
         draft: false
