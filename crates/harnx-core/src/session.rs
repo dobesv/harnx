@@ -283,6 +283,9 @@ impl Session {
     }
 
     pub fn set_agent(&mut self, agent: &AgentConfig) -> anyhow::Result<()> {
+        // Render the template first so a failure leaves session state unchanged.
+        let new_prompt = agent.interpolated_instructions()?;
+        let new_variables = agent.variables().clone();
         self.model_id = agent.model().id();
         self.temperature = agent.temperature();
         self.top_p = agent.top_p();
@@ -295,8 +298,8 @@ impl Session {
         } else {
             Some(agent.name().to_string())
         };
-        self.agent_prompt = agent.interpolated_instructions()?;
-        self.agent_variables = agent.variables().clone();
+        self.agent_prompt = new_prompt;
+        self.agent_variables = new_variables;
         self.agent_instructions = self.agent_prompt.clone();
         self.dirty = true;
         self.update_tokens();
@@ -304,13 +307,16 @@ impl Session {
     }
 
     pub fn sync_agent(&mut self, agent: &AgentConfig) -> anyhow::Result<()> {
+        // Render the template first so a failure leaves session state unchanged.
+        let new_prompt = agent.interpolated_instructions()?;
+        let new_variables = agent.variables().clone();
         self.agent_name = if agent.name().is_empty() {
             None
         } else {
             Some(agent.name().to_string())
         };
-        self.agent_prompt = agent.interpolated_instructions()?;
-        self.agent_variables = agent.variables().clone();
+        self.agent_prompt = new_prompt;
+        self.agent_variables = new_variables;
         self.agent_instructions = self.agent_prompt.clone();
         Ok(())
     }

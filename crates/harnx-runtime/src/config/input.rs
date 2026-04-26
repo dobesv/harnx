@@ -188,11 +188,11 @@ pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Messag
     Ok(messages)
 }
 
-pub fn echo_messages(input: &Input, config: &GlobalConfig) -> String {
+pub fn echo_messages(input: &Input, config: &GlobalConfig) -> anyhow::Result<String> {
     if let Some(session) = session_of(input, &config.read().session) {
-        crate::config::session::echo_messages(session, input)
+        Ok(crate::config::session::echo_messages(session, input))
     } else {
-        input.agent().echo_messages(input).unwrap_or_default()
+        input.agent().echo_messages(input)
     }
 }
 

@@ -72,7 +72,7 @@ pub fn detect_shell() -> Shell {
         }
     };
     let shell_arg = match name {
-        "powershel" => "-Command",
+        "powershell" => "-Command",
         "cmd" => "/C",
         _ => "-c",
     };
@@ -81,18 +81,18 @@ pub fn detect_shell() -> Shell {
 
 static SHELL_CMD: LazyLock<Option<String>> = LazyLock::new(|| {
     if cfg!(windows) {
-        if let Ok(comspec) = env::var("COMSPEC") {
-            Some(comspec)
-        } else {
-            if let Ok(program_files) = env::var("ProgramFiles") {
-                if Path::new(&format!(r"{}\PowerShell\7\pwsh.exe", program_files)).exists() {
-                    return Some("pwsh.exe".to_string());
-                } else {
-                    return Some("powershell.exe".to_string());
-                }
+        // Check for PowerShell before falling back to COMSPEC (which usually
+        // points to cmd.exe). Prefer pwsh (PowerShell 7+) over powershell.exe
+        // (Windows PowerShell 5.x), and only use COMSPEC if neither is found.
+        if let Ok(program_files) = env::var("ProgramFiles") {
+            if Path::new(&format!(r"{}\PowerShell\7\pwsh.exe", program_files)).exists() {
+                return Some("pwsh.exe".to_string());
             }
-            None
         }
+        if Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe").exists() {
+            return Some("powershell.exe".to_string());
+        }
+        env::var("COMSPEC").ok()
     } else {
         env::var("SHELL").ok()
     }

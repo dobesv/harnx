@@ -1280,6 +1280,10 @@ impl Config {
         if let Some(session) = self.session.as_mut() {
             if let Some(agent) = self.agent.as_ref() {
                 session.sync_agent(agent)?;
+                // Persist the updated agent name/prompt/variables to disk
+                // before clearing messages, so the header reflects the
+                // current agent state if the session file is reloaded.
+                crate::config::session::append_event(session, &session.build_header_entry());
             }
             crate::config::session::clear_messages(session);
         } else {

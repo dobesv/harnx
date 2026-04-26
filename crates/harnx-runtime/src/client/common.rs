@@ -37,7 +37,7 @@ pub async fn chat_completions_with_input(
     ctx: &ClientCallContext<'_>,
 ) -> Result<ChatCompletionsOutput> {
     if ctx.dry_run {
-        let content = crate::config::input::echo_messages(&input, config);
+        let content = crate::config::input::echo_messages(&input, config)?;
         return Ok(ChatCompletionsOutput::new(&content));
     }
     let data =
@@ -56,7 +56,7 @@ pub async fn chat_completions_streaming_with_input(
     ctx: &ClientCallContext<'_>,
 ) -> Result<()> {
     if ctx.dry_run {
-        let content = crate::config::input::echo_messages(input, config);
+        let content = crate::config::input::echo_messages(input, config)?;
         handler.text(&content)?;
         handler.done();
         return Ok(());
@@ -125,7 +125,7 @@ pub async fn call_chat_completions(
     // live LLM call. Match pre-plan behavior: print via print_markdown
     // when `print=true`.
     if dry_run {
-        let content = crate::config::input::echo_messages(input, config);
+        let content = crate::config::input::echo_messages(input, config)?;
         let usage = CompletionTokenUsage::default();
         if print && !content.is_empty() {
             config.read().print_markdown(&content)?;
@@ -185,7 +185,7 @@ pub async fn call_chat_completions_streaming(
     // Dry-run: just echo the prepared messages to stdout. The streaming
     // rendering path is unnecessary for a no-LLM echo.
     if dry_run {
-        let content = crate::config::input::echo_messages(input, config);
+        let content = crate::config::input::echo_messages(input, config)?;
         if !content.is_empty() {
             crate::utils::emit_info(content.clone());
         }

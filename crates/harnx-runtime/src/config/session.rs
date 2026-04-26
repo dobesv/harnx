@@ -349,7 +349,18 @@ fn apply_name_and_path(
     session.agent_prompt = session.agent_instructions.clone();
     if let Some(agent_name) = &session.agent_name {
         if let Ok(agent) = config.retrieve_agent(agent_name) {
-            session.agent_prompt = agent.interpolated_instructions()?;
+            // Only re-render the prompt when the session does not already have
+            // resolved agent data from the log.  If agent_variables is
+            // non-empty the session was restored from disk with its own
+            // variable values; re-rendering with the current agent definition
+            // would overwrite those resolved values.  Similarly, if
+            // agent_prompt differs from agent_instructions the session log
+            // already stored a rendered prompt — preserve it.
+            let prompt_is_unresolved = session.agent_variables().is_empty()
+                && session.agent_prompt == session.agent_instructions;
+            if prompt_is_unresolved {
+                session.agent_prompt = agent.interpolated_instructions()?;
+            }
             if session.use_tools.is_none() {
                 session.use_tools = agent.use_tools();
             }
