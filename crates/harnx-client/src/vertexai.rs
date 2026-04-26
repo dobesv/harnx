@@ -672,4 +672,110 @@ mod tests {
         assert_eq!(calls[0].arguments, json!({"cmd": "pwd"}));
         assert_eq!(calls[1].arguments, json!({"cmd": "ls"}));
     }
+
+    /// End-to-end thought + thoughtSignature round-trip for Gemini/Vertex AI.
+    ///
+    /// Gemini's protocol carries `thought: <text>` parts and a
+    /// `thoughtSignature` on functionCall parts. Dropping either on the
+    /// round-trip leaves the model's tool calls orphaned on the next turn.
+    /// The streaming code routes `part["thought"]` to `handler.thought()`
+    /// and captures `thoughtSignature` on tool_call emission; this test
+    /// pins both behaviours AND verifies the serialiser echoes them back.
+    #[test]
+    fn gemini_streaming_thought_roundtrips_into_next_request_body() {
+        use harnx_core::api_types::ChatCompletionsData;
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::model::Model;
+        use harnx_core::tool::ToolResult;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+
+        // Realistic Gemini chunk: a thought part, a text part, and a
+        // functionCall part with thoughtSignature, all in one candidate.
+        let chunk = json!({
+            "candidates": [{"content": {"parts": [
+                {"thought": "Plan the call."},
+                {"text": "Running ls."},
+                {
+                    "functionCall": {"name": "Bash", "args": {"cmd": "ls"}},
+                    "thoughtSignature": "sig_gemini_xyz"
+                }
+            ]}}]
+        });
+        gemini_handle_stream_chunk(&mut handler, &chunk).expect("stream chunk should process");
+
+        let (text, thought, tool_calls, _usage) = handler.take();
+        // Gemini prepends "\n\n" for non-first parts (gemini_handle_part).
+        assert!(
+            text.contains("Running ls."),
+            "text part flows to text buffer; got {text:?}"
+        );
+        assert_eq!(
+            thought.as_deref(),
+            Some("Plan the call."),
+            "thought part must reach the dedicated thought buffer (not text)"
+        );
+        assert!(
+            !text.contains("Plan the call."),
+            "thought must not leak into text buffer; got {text:?}"
+        );
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].thought_signature.as_deref(),
+            Some("sig_gemini_xyz"),
+            "thoughtSignature on functionCall must reach ToolCall.thought_signature"
+        );
+
+        // Now feed it back through the serialiser and confirm the next
+        // request body carries thought + thoughtSignature on the model turn.
+        let tool_result = ToolResult::new(tool_calls.into_iter().next().unwrap(), json!("ok"));
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Run a command".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![tool_result],
+                    text,
+                    thought,
+                )),
+            ),
+        ];
+        let mut model = Model::new("gemini", "gemini-2.5-pro");
+        model.set_max_tokens(Some(4096), true);
+        let body = gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: true,
+            },
+            &model,
+        )
+        .unwrap();
+
+        let contents = body["contents"].as_array().unwrap();
+        let model_turn = contents
+            .iter()
+            .find(|c| c["role"] == "model")
+            .expect("must have a model role turn after the user message");
+        let parts = model_turn["parts"].as_array().unwrap();
+        let thought_part = parts
+            .iter()
+            .find(|p| p["thought"].is_string())
+            .expect("model turn must include a thought part on the round-trip");
+        assert_eq!(thought_part["thought"], "Plan the call.");
+        let fcall_part = parts
+            .iter()
+            .find(|p| p["functionCall"].is_object())
+            .expect("model turn must include a functionCall part");
+        assert_eq!(
+            fcall_part["thoughtSignature"], "sig_gemini_xyz",
+            "thoughtSignature must be echoed verbatim alongside the functionCall"
+        );
+    }
 }
