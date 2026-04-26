@@ -2090,19 +2090,46 @@ async fn test_streaming_error_shows_in_transcript() {
 
     let _ = result; // start_prompt always returns Ok (spawns a task)
 
-    // Wait for the error to appear in the transcript
-    harness
-        .wait_until_screen_contains("error:", Duration::from_secs(5))
-        .await
-        .unwrap();
-
-    let has_error = harness
-        .tui()
-        .app
-        .transcript
-        .iter()
-        .any(|entry| matches!(entry, TranscriptItem::ErrorText(_)));
-    assert!(has_error, "Transcript should contain an error entry");
+    // Wait for the ErrorText entry to appear in the transcript.
+    //
+    // Polling the rendered screen for the substring "error:" is ambiguous:
+    // the retry loop emits a `NoticeEvent::Warning` along the lines of
+    // "Model '...' exhausted retries (error: <cause>) ..." which renders as
+    // `SystemText` and *also* contains "error:".  On a slow runner the
+    // warning event arrives before the spawned prompt task's
+    // `ModelEvent::Error` has been processed into `ErrorText`, so the screen
+    // check would succeed while the transcript still lacks the entry the
+    // test cares about — producing the exact flake observed in CI on
+    // macos-latest.  Polling the transcript directly removes the ambiguity.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        while let Ok(event) = harness.tui().event_rx.try_recv() {
+            harness.tui().handle_tui_event(event).await.unwrap();
+        }
+        let has_error = harness
+            .tui()
+            .app
+            .transcript
+            .iter()
+            .any(|entry| matches!(entry, TranscriptItem::ErrorText(_)));
+        if has_error {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let summary: Vec<String> = harness
+                .tui()
+                .app
+                .transcript
+                .iter()
+                .map(|e| format!("{e:?}"))
+                .collect();
+            panic!(
+                "Transcript did not gain an ErrorText entry within 5s; transcript was:\n{}",
+                summary.join("\n")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     harness.drain_and_settle().await.unwrap();
 }
