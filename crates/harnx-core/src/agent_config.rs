@@ -6,7 +6,7 @@
 use crate::hooks::HooksConfig;
 use crate::model::Model;
 use crate::retry_config::RetryConfig;
-use crate::system_vars::interpolate_variables;
+use crate::system_vars::render_template;
 use crate::tool::Tools;
 
 use anyhow::Result;
@@ -162,8 +162,7 @@ impl AgentConfig {
                 prompt = prompt_value.as_str().trim();
             }
         }
-        let mut prompt = prompt.to_string();
-        interpolate_variables(&mut prompt);
+        let prompt = prompt.to_string();
         let frontmatter = if metadata.is_empty() {
             AgentFrontMatter::default()
         } else {
@@ -193,8 +192,7 @@ impl AgentConfig {
     }
 
     pub fn from_prompt(prompt: &str) -> Self {
-        let mut prompt = prompt.to_string();
-        interpolate_variables(&mut prompt);
+        let prompt = prompt.to_string();
         Self {
             name: TEMP_AGENT_NAME.to_string(),
             prompt,
@@ -352,16 +350,9 @@ impl AgentConfig {
         &self.conversation_starters
     }
 
-    pub fn interpolated_instructions(&self) -> String {
-        let mut output = self
-            .instructions
-            .clone()
-            .unwrap_or_else(|| self.prompt.clone());
-        for (k, v) in self.variables() {
-            output = output.replace(&format!("{{{{{k}}}}}"), v)
-        }
-        interpolate_variables(&mut output);
-        output
+    pub fn interpolated_instructions(&self) -> anyhow::Result<String> {
+        let template = self.instructions.as_deref().unwrap_or(&self.prompt);
+        render_template(template, self)
     }
 
     pub fn agent_default_session(&self) -> Option<&str> {
@@ -398,15 +389,15 @@ impl AgentConfig {
     /// Compute the full system-message text (prompt + tools summary), matching
     /// the logic in `build_messages` but without producing a User message.
     /// Used by `Session::build_messages` when `inject_system_prompt` is true.
-    pub fn system_text(&self) -> String {
-        let prompt = self.interpolated_instructions();
+    pub fn system_text(&self) -> anyhow::Result<String> {
+        let prompt = self.interpolated_instructions()?;
         let tools_text = self.tools_text();
-        match (&tools_text, prompt.is_empty()) {
+        Ok(match (&tools_text, prompt.is_empty()) {
             (Some(tools), false) => format!("{prompt}\n\n{tools}"),
             (Some(tools), true) => tools.clone(),
             (None, false) => prompt,
             (None, true) => String::new(),
-        }
+        })
     }
 
     pub fn tools_text(&self) -> Option<String> {
@@ -434,9 +425,12 @@ impl AgentConfig {
     /// tool summary, if any) followed by a User message with the input's
     /// content, optionally appending an Assistant continuation message if
     /// `input.continue_output()` is set.
-    pub fn build_messages(&self, input: &crate::input::Input) -> Vec<crate::message::Message> {
+    pub fn build_messages(
+        &self,
+        input: &crate::input::Input,
+    ) -> anyhow::Result<Vec<crate::message::Message>> {
         use crate::message::{Message, MessageContent, MessageRole};
-        let prompt = self.interpolated_instructions();
+        let prompt = self.interpolated_instructions()?;
         let tools_text = self.tools_text();
         let content = input.message_content();
         let mut messages = if prompt.is_empty() {
@@ -472,26 +466,26 @@ impl AgentConfig {
                 MessageContent::Text(text.into()),
             ));
         }
-        messages
+        Ok(messages)
     }
 
     /// Render the prompt + tools-summary + input markdown for the echo-mode
     /// (`.echo`) command. Companion of `build_messages`.
-    pub fn echo_messages(&self, input: &crate::input::Input) -> String {
-        let prompt = self.interpolated_instructions();
+    pub fn echo_messages(&self, input: &crate::input::Input) -> anyhow::Result<String> {
+        let prompt = self.interpolated_instructions()?;
         let tools_text = self.tools_text();
         let input_markdown = input.render();
 
         if prompt.is_empty() {
             if let Some(tools) = &tools_text {
-                format!("{tools}\n\n{input_markdown}")
+                Ok(format!("{tools}\n\n{input_markdown}"))
             } else {
-                input_markdown
+                Ok(input_markdown)
             }
         } else if let Some(tools) = &tools_text {
-            format!("{prompt}\n\n{tools}\n\n{input_markdown}")
+            Ok(format!("{prompt}\n\n{tools}\n\n{input_markdown}"))
         } else {
-            format!("{}\n\n{}", prompt, input_markdown)
+            Ok(format!("{}\n\n{}", prompt, input_markdown))
         }
     }
 }
@@ -604,7 +598,7 @@ mod tests {
         // No model should have been parsed from the mid-file block.
         assert!(agent.model_id().is_none());
         // The entire content (trimmed) should appear as the prompt.
-        let instructions = agent.interpolated_instructions();
+        let instructions = agent.interpolated_instructions().unwrap();
         assert!(
             instructions.contains("Some preamble text."),
             "expected preamble in prompt, got: {instructions:?}"
@@ -629,6 +623,45 @@ mod tests {
         assert!(
             msg.contains("Invalid front-matter"),
             "expected error message to mention 'Invalid front-matter', got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_template_system_var_os() {
+        let agent = AgentConfig::from_prompt("You are on {{__os__}}");
+        let result = agent.interpolated_instructions().unwrap();
+        assert_eq!(result, format!("You are on {}", std::env::consts::OS));
+    }
+
+    #[test]
+    fn test_render_template_agent_name() {
+        let agent = AgentConfig::from_markdown("my-agent", "Your name is {{agent.name}}.").unwrap();
+        let result = agent.interpolated_instructions().unwrap();
+        assert_eq!(result, "Your name is my-agent.");
+    }
+
+    #[test]
+    fn test_render_template_user_variable() {
+        let mut agent = AgentConfig::from_prompt("Hello {{project_name}}");
+        let mut variables = AgentVariables::default();
+        variables.insert("project_name".to_string(), "harnx".to_string());
+        agent.set_shared_variables(variables);
+        let result = agent.interpolated_instructions().unwrap();
+        assert_eq!(result, "Hello harnx");
+    }
+
+    #[test]
+    fn test_render_template_undefined_var_returns_err() {
+        let agent = AgentConfig::from_prompt("Hello {{undefined_mysterious_var}}");
+        let result = agent.interpolated_instructions();
+        assert!(
+            result.is_err(),
+            "expected Err for undefined template var, got Ok"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("Template error"),
+            "expected error message to contain 'Template error', got: {msg:?}"
         );
     }
 }

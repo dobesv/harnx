@@ -464,6 +464,7 @@ mod tests {
         );
         assert!(agent
             .interpolated_instructions()
+            .unwrap()
             .contains("You are a helpful test agent"));
     }
 
@@ -475,7 +476,7 @@ mod tests {
         assert!(agent.model_id().is_none());
         assert!(agent.temperature().is_none());
         assert_eq!(
-            agent.interpolated_instructions(),
+            agent.interpolated_instructions().unwrap(),
             "Just instructions, no front-matter."
         );
     }
@@ -486,7 +487,7 @@ mod tests {
         let agent = AgentConfig::from_markdown("empty-body", content).unwrap();
         assert_eq!(agent.name(), "empty-body");
         assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
-        assert!(agent.interpolated_instructions().is_empty());
+        assert!(agent.interpolated_instructions().unwrap().is_empty());
     }
 
     #[test]
@@ -503,6 +504,7 @@ mod tests {
         assert_eq!(agent.name(), "%%");
         assert!(agent
             .interpolated_instructions()
+            .unwrap()
             .contains("You are a pirate"));
         assert!(agent.model_id().is_none());
         assert!(agent.temperature().is_none());
@@ -512,8 +514,11 @@ mod tests {
     fn test_agent_builtin_create_title() {
         let agent = super::builtin("%create-title%").unwrap();
         assert_eq!(agent.name(), "%create-title%");
-        assert!(!agent.interpolated_instructions().is_empty());
-        assert!(agent.interpolated_instructions().contains("concise"));
+        assert!(!agent.interpolated_instructions().unwrap().is_empty());
+        assert!(agent
+            .interpolated_instructions()
+            .unwrap()
+            .contains("concise"));
     }
 
     #[test]
@@ -622,7 +627,7 @@ mod tests {
         ));
         let input = crate::config::input::from_str(&config, "Real input", Some(agent));
 
-        let messages = input.agent().build_messages(&input);
+        let messages = input.agent().build_messages(&input).unwrap();
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, MessageRole::System);
