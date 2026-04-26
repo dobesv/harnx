@@ -114,7 +114,7 @@ syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"
 arboard = { version = "3.3.0", default-features = false }
 harnx-acp = { path = "crates/harnx-acp", version = "0.30.0" }
 harnx-acp-server = { path = "crates/harnx-acp-server", version = "0.30.0" }
-minijinja = { version = "2.19.0", default-features = false, features = ["builtins", "serde"] }
+minijinja = { version = "2.19.0", default-features = false, features = ["builtins", "debug", "serde"] }
 
 [patch.crates-io]
 ratatui_widget_scrolling = { path = "crates/ratatui-widget-scrolling" }
