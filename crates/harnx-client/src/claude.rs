@@ -165,8 +165,15 @@ fn claude_handle_content_block_delta(
     if let Some(text) = delta["text"].as_str() {
         handler.text(text)?;
     } else if let Some(text) = delta["thinking"].as_str() {
-        claude_transition_reasoning(state, handler, true)?;
-        handler.text(text)?;
+        // Route thinking deltas to the dedicated thought buffer so the
+        // serialiser can echo a `{"type":"thinking",...}` block on the next
+        // request (issue #347 / #328 streaming side). Routing to
+        // `handler.text()` instead would fold thinking into the text buffer
+        // wrapped in `<think>...</think>` and leave `thought` = None, which
+        // makes the next turn omit the thinking block entirely — the model
+        // then sees its own tool calls as orphaned and produces "previous
+        // session" hallucinations.
+        handler.thought(text)?;
     } else if let Some(sig) = delta["signature"].as_str() {
         // signature_delta: accumulate the thinking-block signature so it can
         // be echoed back verbatim on the next API request (issue #328).
@@ -695,6 +702,335 @@ system_prompt_prefix:
             output.tool_calls[0].thought_signature,
             Some("sig_abc123".to_string()),
             "thinking signature must be stored in ToolCall.thought_signature (issue #328: currently always None)"
+        );
+    }
+
+    /// End-to-end roundtrip for issue #347 / #328 on the STREAMING path.
+    ///
+    /// The non-streaming roundtrip is already covered above
+    /// (`claude_extract_preserves_thought_and_signature` +
+    /// `claude_body_includes_thinking_block_when_thought_present`), but issue
+    /// #328's "previous session" symptom can also surface on the streaming path
+    /// when the thinking text is delivered as `content_block_delta` events with
+    /// a trailing `signature_delta`.
+    ///
+    /// This test drives `claude_handle_stream_event` with a realistic event
+    /// sequence (thinking deltas → signature_delta → tool_use), takes the
+    /// `SseHandler` output the same way `run_chat_completion_streaming` does,
+    /// then feeds it back into `claude_build_chat_completions_body` to verify
+    /// the next request includes the thinking block + signature. If the
+    /// streaming side drops the thought (e.g. because thinking deltas were
+    /// routed to the text buffer instead of the thought buffer), the
+    /// serialiser produces an assistant turn with no thinking block and the
+    /// model sees its tool calls as orphaned — exactly the bug we keep
+    /// reopening.
+    #[test]
+    fn claude_streaming_thought_roundtrips_into_next_request_body() {
+        use harnx_core::abort::create_abort_signal;
+        use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+        use harnx_core::tool::ToolResult;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = ClaudeStreamState::default();
+
+        // Realistic Anthropic streaming sequence: thinking block (with
+        // multi-chunk text and a signature_delta), then a tool_use block.
+        let events = [
+            json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 100, "cache_read_input_tokens": 0}}
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Let me think "}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "about this."}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig_stream_xyz"}
+            }),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "tool_use", "name": "Bash", "id": "toolu_S"}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"command\":\"ls\"}"}
+            }),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"output_tokens": 42}
+            }),
+        ];
+
+        for event in &events {
+            claude_handle_stream_event(&mut state, &mut handler, event)
+                .expect("stream event should process");
+        }
+
+        // Drain the handler the same way run_chat_completion_streaming does.
+        let (text, thought, tool_calls, _usage) = handler.take();
+
+        // The thinking content must end up on the dedicated `thought` field,
+        // NOT folded into the text buffer with <think>...</think> wrappers.
+        // If it lands in `text`, the next turn's request body will have no
+        // thinking block to echo back (issue #328 streaming-side regression).
+        assert_eq!(
+            thought.as_deref(),
+            Some("Let me think about this."),
+            "streaming thought must be captured in the dedicated thought field, \
+             not the text buffer (issue #347: streaming path regresses #328)"
+        );
+        assert!(
+            !text.contains("<think>"),
+            "streaming text must not be polluted with <think> wrappers when \
+             tool calls are present — the wrapper is meant for plain-text \
+             reasoning responses; tool-call turns echo the raw thinking block. \
+             Got text: {text:?}"
+        );
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].thought_signature.as_deref(),
+            Some("sig_stream_xyz"),
+            "streaming signature must reach the tool_call (PR #330 streaming side)"
+        );
+
+        // Now simulate what the agent loop does: build a ToolCalls message
+        // from (text, thought, tool_calls), then build the next request body.
+        let tool_result = ToolResult::new(tool_calls.into_iter().next().unwrap(), json!("ok"));
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Run a command".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![tool_result],
+                    text,
+                    thought,
+                )),
+            ),
+        ];
+
+        let mut model = Model::new("claude", "claude-3-5-sonnet");
+        model.set_max_tokens(Some(4096), true);
+
+        let body = claude_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: true,
+            },
+            &model,
+        )
+        .unwrap();
+
+        let assistant_msg = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("must have an assistant turn");
+        let content = assistant_msg["content"]
+            .as_array()
+            .expect("assistant content array");
+
+        let thinking_block = content
+            .iter()
+            .find(|b| b["type"] == "thinking")
+            .expect(
+                "next request body must include a thinking block for the \
+                 streamed assistant turn (issue #328/#347): otherwise the \
+                 model receives tool results with no record of its prior \
+                 reasoning and infers a session boundary",
+            );
+        assert_eq!(thinking_block["thinking"], "Let me think about this.");
+        assert_eq!(
+            thinking_block["signature"], "sig_stream_xyz",
+            "thinking block signature must be echoed verbatim from the \
+             streamed signature_delta"
+        );
+    }
+
+    /// Multiple tool_use blocks in one streamed turn must all carry the same
+    /// thought signature. The Anthropic API rejects requests where any
+    /// tool_use sibling of a thinking block lacks its signature when echoed
+    /// back, and the signature is shared across all tool calls in the turn.
+    /// Without this, a 2-tool turn would round-trip with one valid call and
+    /// one orphan call on the next request.
+    #[test]
+    fn claude_streaming_multiple_tool_calls_share_thought_signature() {
+        use harnx_core::abort::create_abort_signal;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = ClaudeStreamState::default();
+
+        let events = [
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Plan two calls."}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig_multi"}
+            }),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "tool_use", "name": "Bash", "id": "toolu_A"}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"command\":\"pwd\"}"}
+            }),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {"type": "tool_use", "name": "Bash", "id": "toolu_B"}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"command\":\"ls\"}"}
+            }),
+            json!({"type": "content_block_stop", "index": 2}),
+        ];
+        for event in &events {
+            claude_handle_stream_event(&mut state, &mut handler, event)
+                .expect("stream event should process");
+        }
+
+        let (_text, thought, tool_calls, _usage) = handler.take();
+        assert_eq!(thought.as_deref(), Some("Plan two calls."));
+        assert_eq!(tool_calls.len(), 2);
+        for call in &tool_calls {
+            assert_eq!(
+                call.thought_signature.as_deref(),
+                Some("sig_multi"),
+                "every streamed tool_use sibling of a thinking block must carry \
+                 its signature so the next request body is well-formed (issue #328 \
+                 multi-call generalization)"
+            );
+        }
+    }
+
+    /// Mirror of `claude_streaming_multiple_tool_calls_share_thought_signature`
+    /// for the non-streaming path. `claude_extract_chat_completions` already
+    /// loops over all tool_calls and assigns the captured signature to each;
+    /// this test pins that behavior so a future refactor can't drop the loop
+    /// and silently break multi-call thinking turns.
+    #[test]
+    fn claude_extract_attaches_signature_to_every_tool_call() {
+        let response = json!({
+            "id": "msg_multi",
+            "content": [
+                {"type": "thinking", "thinking": "two calls", "signature": "sig_multi"},
+                {"type": "tool_use", "id": "toolu_A", "name": "Bash", "input": {"command": "pwd"}},
+                {"type": "tool_use", "id": "toolu_B", "name": "Bash", "input": {"command": "ls"}}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+
+        let output = claude_extract_chat_completions(&response).unwrap();
+        assert_eq!(output.tool_calls.len(), 2);
+        for call in &output.tool_calls {
+            assert_eq!(
+                call.thought_signature.as_deref(),
+                Some("sig_multi"),
+                "every parsed tool_use sibling of a thinking block must carry \
+                 its signature (non-streaming multi-call)"
+            );
+        }
+    }
+
+    /// Streaming text-only response with extended thinking must populate
+    /// `thought` cleanly without polluting `text`. This is the dual of the
+    /// thinking+tool_use roundtrip — it pins the behavior the streaming-side
+    /// fix relies on for the no-tool-calls path so a future refactor of
+    /// `handler.thought()` can't silently re-introduce `<think>` wrappers
+    /// into the text buffer.
+    #[test]
+    fn claude_streaming_text_only_with_thinking_separates_buffers() {
+        use harnx_core::abort::create_abort_signal;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = ClaudeStreamState::default();
+
+        let events = [
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Considering."}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "signature_delta", "signature": "sig_text"}
+            }),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "text", "text": ""}
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "Final answer."}
+            }),
+            json!({"type": "content_block_stop", "index": 1}),
+        ];
+        for event in &events {
+            claude_handle_stream_event(&mut state, &mut handler, event)
+                .expect("stream event should process");
+        }
+
+        let (text, thought, tool_calls, _usage) = handler.take();
+        assert_eq!(text, "Final answer.", "text buffer carries only the prose");
+        assert_eq!(thought.as_deref(), Some("Considering."));
+        assert!(
+            tool_calls.is_empty(),
+            "no tool_use blocks were sent; tool_calls must stay empty"
         );
     }
 
