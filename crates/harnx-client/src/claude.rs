@@ -191,6 +191,18 @@ fn claude_handle_content_block_stop(
     claude_emit_pending_tool_call(state, handler, true)
 }
 
+/// Add two optional u64 values. If both are None, returns None.
+/// If one is Some and the other None, returns the Some value.
+/// Uses saturating_add to avoid overflow panics in debug builds.
+fn add_opt_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+    }
+}
+
 fn claude_handle_stream_event(
     state: &mut ClaudeStreamState,
     handler: &mut SseHandler,
@@ -201,19 +213,27 @@ fn claude_handle_stream_event(
     };
     match typ {
         "message_start" => {
+            let usage = &data["message"]["usage"];
             handler.set_usage(
-                data["message"]["usage"]["input_tokens"].as_u64(),
+                add_opt_u64(
+                    usage["input_tokens"].as_u64(),
+                    usage["cache_creation_input_tokens"].as_u64(),
+                ),
                 None,
-                data["message"]["usage"]["cache_read_input_tokens"].as_u64(),
+                usage["cache_read_input_tokens"].as_u64(),
             );
         }
         "message_delta" => {
             // message_delta usage fields are cumulative and override
             // earlier values from message_start when present
+            let usage = &data["usage"];
             handler.set_usage(
-                data["usage"]["input_tokens"].as_u64(),
-                data["usage"]["output_tokens"].as_u64(),
-                data["usage"]["cache_read_input_tokens"].as_u64(),
+                add_opt_u64(
+                    usage["input_tokens"].as_u64(),
+                    usage["cache_creation_input_tokens"].as_u64(),
+                ),
+                usage["output_tokens"].as_u64(),
+                usage["cache_read_input_tokens"].as_u64(),
             );
         }
         "content_block_start" => claude_handle_content_block_start(state, handler, data)?,
@@ -480,7 +500,10 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         tool_calls,
         thought: reasoning,
         id: data["id"].as_str().map(|v| v.to_string()),
-        input_tokens: data["usage"]["input_tokens"].as_u64(),
+        input_tokens: add_opt_u64(
+            data["usage"]["input_tokens"].as_u64(),
+            data["usage"]["cache_creation_input_tokens"].as_u64(),
+        ),
         output_tokens: data["usage"]["output_tokens"].as_u64(),
         cached_tokens: data["usage"]["cache_read_input_tokens"].as_u64(),
     };
@@ -721,5 +744,103 @@ system_prompt_prefix:
         assert_eq!(system[1]["text"], "extra");
         assert_eq!(system[2]["type"], "text");
         assert_eq!(system[2]["text"], "Be helpful");
+    }
+
+    /// Regression test for issue #159.
+    /// `claude_extract_chat_completions` must add `cache_creation_input_tokens`
+    /// to `input_tokens` so the "In" count in the status bar reflects all tokens
+    /// consumed by the request, not just the residual non-cached portion.
+    #[test]
+    fn claude_extract_includes_cache_creation_in_input_tokens() {
+        let response = json!({
+            "id": "msg_test",
+            "content": [{"type": "text", "text": "Hello"}],
+            "usage": {
+                "input_tokens": 5,
+                "cache_creation_input_tokens": 1000,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 10
+            }
+        });
+
+        let output = claude_extract_chat_completions(&response)
+            .expect("extraction should succeed");
+
+        assert_eq!(
+            output.input_tokens,
+            Some(1005),
+            "input_tokens must include cache_creation_input_tokens (issue #159)"
+        );
+        assert_eq!(output.output_tokens, Some(10));
+        assert_eq!(output.cached_tokens, Some(0));
+    }
+
+    /// Regression test for issue #159 — non-zero cache_read alongside cache_creation.
+    #[test]
+    fn claude_extract_all_three_token_buckets() {
+        let response = json!({
+            "id": "msg_test",
+            "content": [{"type": "text", "text": "Hello"}],
+            "usage": {
+                "input_tokens": 5,
+                "cache_creation_input_tokens": 1000,
+                "cache_read_input_tokens": 500,
+                "output_tokens": 10
+            }
+        });
+
+        let output = claude_extract_chat_completions(&response)
+            .expect("extraction should succeed");
+
+        assert_eq!(output.input_tokens, Some(1005), "input + cache_creation");
+        assert_eq!(output.cached_tokens, Some(500), "cache_read preserved");
+        assert_eq!(output.output_tokens, Some(10));
+    }
+
+    /// Regression test for issue #159 — no cache_creation field present.
+    #[test]
+    fn claude_extract_input_tokens_without_cache_creation() {
+        let response = json!({
+            "id": "msg_test",
+            "content": [{"type": "text", "text": "Hello"}],
+            "usage": {
+                "input_tokens": 42,
+                "output_tokens": 7
+            }
+        });
+
+        let output = claude_extract_chat_completions(&response)
+            .expect("extraction should succeed");
+
+        assert_eq!(output.input_tokens, Some(42));
+    }
+
+    /// Regression test for issue #159 — only cache_creation, no input_tokens field.
+    #[test]
+    fn claude_extract_only_cache_creation_tokens() {
+        let response = json!({
+            "id": "msg_test",
+            "content": [{"type": "text", "text": "Hello"}],
+            "usage": {
+                "cache_creation_input_tokens": 2000,
+                "output_tokens": 5
+            }
+        });
+
+        let output = claude_extract_chat_completions(&response)
+            .expect("extraction should succeed");
+
+        assert_eq!(output.input_tokens, Some(2000), "cache_creation alone becomes input_tokens");
+    }
+
+    /// add_opt_u64 helper edge cases including saturating behaviour.
+    #[test]
+    fn add_opt_u64_edge_cases() {
+        assert_eq!(add_opt_u64(None, None), None);
+        assert_eq!(add_opt_u64(Some(5), None), Some(5));
+        assert_eq!(add_opt_u64(None, Some(10)), Some(10));
+        assert_eq!(add_opt_u64(Some(5), Some(10)), Some(15));
+        // saturating_add: overflow saturates to u64::MAX rather than panicking
+        assert_eq!(add_opt_u64(Some(u64::MAX), Some(1)), Some(u64::MAX));
     }
 }
