@@ -1819,13 +1819,16 @@ impl Config {
         });
         config.write().rag = agent.rag();
         config.write().agent = Some(agent);
+        // Populate shared_variables from resolved file-backed defaults and
+        // any --agent-variable overrides before any code path that renders
+        // the template. session::new() -> set_agent() runs the template
+        // immediately, so this must happen before use_session().
+        config.write().init_agent_shared_variables()?;
         if let Some(session) = session {
             // Exit any existing session (e.g. from tui_default_session) before
             // switching to the agent's session.
             config.write().exit_session()?;
             config.write().use_session(Some(&session))?;
-        } else {
-            config.write().init_agent_shared_variables()?;
         }
         Ok(())
     }

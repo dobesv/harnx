@@ -106,6 +106,7 @@ pub fn now() -> String {
 pub fn render_template(template: &str, agent: &AgentConfig) -> Result<String> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
+    env.set_debug(true);
 
     let agent_ctx = AgentContext {
         name: agent.name(),
@@ -152,6 +153,21 @@ pub fn render_template(template: &str, agent: &AgentConfig) -> Result<String> {
         ctx.insert(k.clone(), Value::from(v.clone()));
     }
 
-    env.render_str(template, ctx)
-        .map_err(|e| anyhow::anyhow!("Template error in agent '{}': {}", agent.name(), e))
+    env.render_str(template, ctx).map_err(|e| {
+        let expr = e
+            .range()
+            .and_then(|range| template.get(range))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        match expr {
+            Some(expr) => anyhow::anyhow!(
+                "Template error in agent '{}' at line {}: {} `{}`",
+                agent.name(),
+                e.line().unwrap_or(0),
+                e.kind(),
+                expr,
+            ),
+            None => anyhow::anyhow!("Template error in agent '{}': {}", agent.name(), e),
+        }
+    })
 }
