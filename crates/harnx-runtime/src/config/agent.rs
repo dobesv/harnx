@@ -435,6 +435,8 @@ mod tests {
             description: description.to_string(),
             parameters: Default::default(),
             mcp_tool_name: None,
+            call_template: None,
+            result_template: None,
         }
     }
 

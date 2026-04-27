@@ -5,13 +5,13 @@
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool,
+    Meta, PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
@@ -1066,53 +1066,93 @@ impl ServerHandler for TodoServer {
                     "List todos. Filter by status ('open', 'closed', 'all') and optionally by tag.",
                     Map::new(),
                 )
-                .with_input_schema::<TodoListParams>(),
+                .with_input_schema::<TodoListParams>()
+                .with_meta(Meta(json!({
+                    "call_template": "**list todos**",
+                    "result_template": "{{ result.content[0].text | default('') }}"
+                }).as_object().unwrap().clone())),
                 Tool::new(
                     "todo_get",
                     "Get a single todo by ID, including its full body.",
                     Map::new(),
                 )
-                .with_input_schema::<TodoGetParams>(),
+                .with_input_schema::<TodoGetParams>()
+                .with_meta(Meta(json!({
+                    "call_template": "**get todo** {{ args.id }}",
+                    "result_template": "{{ result.content[0].text | default('') }}"
+                }).as_object().unwrap().clone())),
                 Tool::new(
                     "todo_create",
                     "Create a new todo with title, optional tags, status, body, key, and dependencies.",
                     Map::new(),
                 )
-                .with_input_schema::<TodoCreateParams>(),
+                .with_input_schema::<TodoCreateParams>()
+                .with_meta(Meta(json!({
+                    "call_template": "**create todo** {{ args.title }}",
+                    "result_template": "{{ result.content[0].text | default('') }}"
+                }).as_object().unwrap().clone())),
                 Tool::new(
                     "todo_update",
                     "Update a todo's title, status, tags, key, dependencies, or body (replaces).",
                     Map::new(),
                 )
-                .with_input_schema::<TodoUpdateParams>(),
+                .with_input_schema::<TodoUpdateParams>()
+                .with_meta(Meta(json!({
+                    "call_template": "**update todo** {{ args.id }}",
+                    "result_template": "{{ result.content[0].text | default('') }}"
+                }).as_object().unwrap().clone())),
                 Tool::new(
                     "todo_append",
                     "Append text to a todo's body (adds, doesn't replace).",
                     Map::new(),
                 )
-                .with_input_schema::<TodoAppendParams>(),
+                .with_input_schema::<TodoAppendParams>()
+                .with_meta(Meta(json!({
+                    "call_template": "**append** to {{ args.id }}",
+                    "result_template": "{{ result.content[0].text | default('') }}"
+                }).as_object().unwrap().clone())),
                 Tool::new("todo_delete", "Delete a todo by ID.", Map::new())
-                    .with_input_schema::<TodoDeleteParams>(),
+                    .with_input_schema::<TodoDeleteParams>()
+                    .with_meta(Meta(json!({
+                        "call_template": "**delete todo** {{ args.id }}",
+                        "result_template": "{{ result.content[0].text | default('') }}"
+                    }).as_object().unwrap().clone())),
                 Tool::new("read_plan", "Read a plan's content by name.", Map::new())
-                    .with_input_schema::<PlanReadParams>(),
+                    .with_input_schema::<PlanReadParams>()
+                    .with_meta(Meta(json!({
+                        "call_template": "**read plan** {{ args.name }}",
+                        "result_template": "{{ result.content[0].text | default('') }}"
+                    }).as_object().unwrap().clone())),
                 Tool::new(
                     "write_plan",
                     "Write/update a plan's content by name. Optionally create todos along with the plan.",
                     Map::new(),
                 )
-                .with_input_schema::<PlanWriteParams>(),
+                .with_input_schema::<PlanWriteParams>()
+                .with_meta(Meta(json!({
+                    "call_template": "**write plan** {{ args.name }}",
+                    "result_template": "{{ result.content[0].text | default('') }}"
+                }).as_object().unwrap().clone())),
                 Tool::new(
                     "plan_add_note",
                     "Add a note to an existing plan.",
                     Map::new(),
                 )
-                .with_input_schema::<PlanAddNoteParams>(),
+                .with_input_schema::<PlanAddNoteParams>()
+                .with_meta(Meta(json!({
+                    "call_template": "**add note** to {{ args.name }}",
+                    "result_template": "{{ result.content[0].text | default('') }}"
+                }).as_object().unwrap().clone())),
                 Tool::new(
                     "plan_get_todo",
                     "Get a todo by its plan name and key within the plan.",
                     Map::new(),
                 )
-                .with_input_schema::<PlanGetTodoParams>(),
+                .with_input_schema::<PlanGetTodoParams>()
+                .with_meta(Meta(json!({
+                    "call_template": "**get todo** {{ args.plan }}/{{ args.key }}",
+                    "result_template": "{{ result.content[0].text | default('') }}"
+                }).as_object().unwrap().clone())),
             ],
             next_cursor: None,
         })

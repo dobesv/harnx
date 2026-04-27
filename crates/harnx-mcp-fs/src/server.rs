@@ -9,14 +9,14 @@ use harnx_mcp::safety::{
 use fancy_regex::Regex;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    Meta, PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::future::Future;
@@ -727,6 +727,18 @@ impl FsServer {
     }
 }
 
+fn make_tool_meta(call_template: &str) -> Meta {
+    Meta(
+        json!({
+            "call_template": call_template,
+            "result_template": "{{ result.content[0].text | default('') }}"
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    )
+}
+
 impl ServerHandler for FsServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -748,20 +760,26 @@ impl ServerHandler for FsServer {
         let tools = vec![
                 Tool::new("read", "Read a text file with line numbers, pagination, grep filtering, and smart truncation.", Map::new())
                     .with_input_schema::<ReadFileParams>()
-                    .annotate(read_only.clone()),
+                    .annotate(read_only.clone())
+                    .with_meta(make_tool_meta("**read** `{{ args.path }}`")),
                 Tool::new("write", "Write or create a file, replacing its contents.", Map::new())
-                    .with_input_schema::<WriteFileParams>(),
+                    .with_input_schema::<WriteFileParams>()
+                    .with_meta(make_tool_meta("**write** `{{ args.path }}` ({{ args.content | length }} chars)")),
                 Tool::new("edit", "Replace exact text within an existing file.", Map::new())
-                    .with_input_schema::<EditFileParams>(),
+                    .with_input_schema::<EditFileParams>()
+                    .with_meta(make_tool_meta("**edit** `{{ args.path }}`")),
                 Tool::new("ls", "List directory contents, optionally recursively.", Map::new())
                     .with_input_schema::<ListDirectoryParams>()
-                    .annotate(read_only.clone()),
+                    .annotate(read_only.clone())
+                    .with_meta(make_tool_meta("**ls** `{{ args.path }}`{% if args.recursive %} (recursive){% endif %}")),
                 Tool::new("grep", "Search file contents with regex and optional context lines.", Map::new())
                     .with_input_schema::<SearchFilesParams>()
-                    .annotate(read_only.clone()),
+                    .annotate(read_only.clone())
+                    .with_meta(make_tool_meta("**grep** `{{ args.pattern }}`")),
                 Tool::new("find", "Find files by glob pattern.", Map::new())
                     .with_input_schema::<FindFilesParams>()
-                    .annotate(read_only),
+                    .annotate(read_only)
+                    .with_meta(make_tool_meta("**find** `{{ args.pattern }}`")),
             ];
 
         Ok(ListToolsResult {

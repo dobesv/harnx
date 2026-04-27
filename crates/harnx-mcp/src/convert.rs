@@ -4,17 +4,27 @@ use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use serde_json::Value;
 
+/// Bundle of display templates for a tool.
+#[derive(Debug, Clone, Default)]
+pub struct ToolTemplates {
+    pub call_template: Option<String>,
+    pub result_template: Option<String>,
+}
+
 pub fn mcp_tool_to_declaration(
     display_name: &str,
     server_tool_name: &str,
     tool_description: &str,
     input_schema: &Value,
+    templates: ToolTemplates,
 ) -> Result<ToolDeclaration> {
     Ok(ToolDeclaration {
         name: display_name.to_string(),
         description: tool_description.to_string(),
         parameters: convert_json_schema(input_schema)?,
         mcp_tool_name: Some(server_tool_name.to_string()),
+        call_template: templates.call_template,
+        result_template: templates.result_template,
     })
 }
 
@@ -106,7 +116,7 @@ fn convert_json_schema(schema: &Value) -> Result<JsonSchema> {
 
 #[cfg(test)]
 mod tests {
-    use super::{convert_json_schema, mcp_tool_to_declaration};
+    use super::{convert_json_schema, mcp_tool_to_declaration, ToolTemplates};
     use serde_json::json;
 
     #[test]
@@ -213,6 +223,7 @@ mod tests {
             "read_file",
             "Read a file from disk",
             &schema,
+            ToolTemplates::default(),
         )
         .expect("convert tool");
 

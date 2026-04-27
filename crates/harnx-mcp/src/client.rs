@@ -1,5 +1,5 @@
-use crate::config::McpServerConfig;
-use crate::convert::mcp_tool_to_declaration;
+use crate::config::{McpServerConfig, ToolDisplayTemplates};
+use crate::convert::{mcp_tool_to_declaration, ToolTemplates};
 use crate::safety::path_to_file_uri;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::tool::{ToolDeclaration, ToolError, ToolProvider};
@@ -208,11 +208,41 @@ impl McpClient {
                 } else {
                     format!("{}_{}", self.name, server_tool_name)
                 };
+
+            // Extract _meta templates (server-provided)
+            let meta_call_tmpl = tool
+                .meta
+                .as_ref()
+                .and_then(|m| m.0.get("call_template"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let meta_result_tmpl = tool
+                .meta
+                .as_ref()
+                .and_then(|m| m.0.get("result_template"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            // Apply config override (higher precedence)
+            let cfg_templates: Option<&ToolDisplayTemplates> =
+                self.config.tool_templates.get(&server_tool_name);
+            let call_template = cfg_templates
+                .and_then(|t| t.call_template.clone())
+                .or(meta_call_tmpl);
+            let result_template = cfg_templates
+                .and_then(|t| t.result_template.clone())
+                .or(meta_result_tmpl);
+            let templates = ToolTemplates {
+                call_template,
+                result_template,
+            };
+
             mcp_tool_to_declaration(
                 &final_name,
                 &server_tool_name,
                 tool.description.as_deref().unwrap_or_default(),
                 &input_schema,
+                templates,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -460,6 +490,7 @@ mod tests {
             enabled: true,
             description: None,
             rename_tools: HashMap::new(),
+            tool_templates: HashMap::new(),
         }
     }
 
@@ -596,8 +627,22 @@ mod tests {
         let manager = McpManager::new();
         let client = Arc::new(McpClient::new(test_mcp_config("fs")));
         *client.tools.write() = vec![
-            mcp_tool_to_declaration("fs_read", "read", "Read", &json!({})).unwrap(),
-            mcp_tool_to_declaration("fs_write", "write", "Write", &json!({})).unwrap(),
+            mcp_tool_to_declaration(
+                "fs_read",
+                "read",
+                "Read",
+                &json!({}),
+                ToolTemplates::default(),
+            )
+            .unwrap(),
+            mcp_tool_to_declaration(
+                "fs_write",
+                "write",
+                "Write",
+                &json!({}),
+                ToolTemplates::default(),
+            )
+            .unwrap(),
         ];
         manager.clients.write().insert("fs".to_string(), client);
 
@@ -636,6 +681,7 @@ mod tests {
             "read",
             "Read mock file contents.",
             &json!({}),
+            ToolTemplates::default(),
         )
         .unwrap()];
         *client.service.write() = Some(client_service);
@@ -662,6 +708,68 @@ mod tests {
                 }),
             ))
         );
+    }
+
+    #[test]
+    fn test_template_merge_meta_only() {
+        use crate::config::ToolDisplayTemplates;
+
+        let meta_call = Some("meta call".to_string());
+        let meta_result = Some("meta result".to_string());
+        let cfg: Option<&ToolDisplayTemplates> = None;
+        let call_template = cfg.and_then(|t| t.call_template.clone()).or(meta_call);
+        let result_template = cfg.and_then(|t| t.result_template.clone()).or(meta_result);
+        assert_eq!(call_template, Some("meta call".to_string()));
+        assert_eq!(result_template, Some("meta result".to_string()));
+    }
+
+    #[test]
+    fn test_template_merge_config_only() {
+        use crate::config::ToolDisplayTemplates;
+
+        let cfg_entry = ToolDisplayTemplates {
+            call_template: Some("cfg call".to_string()),
+            result_template: Some("cfg result".to_string()),
+        };
+        let cfg = Some(&cfg_entry);
+        let call_template = cfg.and_then(|t| t.call_template.clone()).or(None);
+        let result_template = cfg.and_then(|t| t.result_template.clone()).or(None);
+        assert_eq!(call_template, Some("cfg call".to_string()));
+        assert_eq!(result_template, Some("cfg result".to_string()));
+    }
+
+    #[test]
+    fn test_template_merge_config_overrides_meta() {
+        use crate::config::ToolDisplayTemplates;
+
+        let meta_call = Some("meta call".to_string());
+        let meta_result = Some("meta result".to_string());
+        let cfg_entry = ToolDisplayTemplates {
+            call_template: Some("cfg call".to_string()),
+            result_template: Some("cfg result".to_string()),
+        };
+        let cfg = Some(&cfg_entry);
+        let call_template = cfg.and_then(|t| t.call_template.clone()).or(meta_call);
+        let result_template = cfg.and_then(|t| t.result_template.clone()).or(meta_result);
+        assert_eq!(call_template, Some("cfg call".to_string()));
+        assert_eq!(result_template, Some("cfg result".to_string()));
+    }
+
+    #[test]
+    fn test_template_merge_partial_override() {
+        use crate::config::ToolDisplayTemplates;
+
+        let meta_call = Some("meta call".to_string());
+        let meta_result = Some("meta result".to_string());
+        let cfg_entry = ToolDisplayTemplates {
+            call_template: Some("cfg call".to_string()),
+            result_template: None,
+        };
+        let cfg = Some(&cfg_entry);
+        let call_template = cfg.and_then(|t| t.call_template.clone()).or(meta_call);
+        let result_template = cfg.and_then(|t| t.result_template.clone()).or(meta_result);
+        assert_eq!(call_template, Some("cfg call".to_string()));
+        assert_eq!(result_template, Some("meta result".to_string()));
     }
 }
 
