@@ -16,6 +16,11 @@ use harnx_core::path::ensure_parent_exists;
 /// (HTTP serve, ACP) default to `harnx::serve` whereas CLI/TUI default to
 /// the top-level `harnx` filter so dot-command logs aren't suppressed.
 pub fn setup_logger(is_server: bool) -> Result<()> {
+    // LLM trace is independent of the simplelog filter — it must work even
+    // when log_level is Off, since it's the user's primary tool for debugging
+    // request/response correctness.
+    harnx_core::llm_trace::init_from_env();
+
     let (log_level, log_path) = Config::log_config(is_server)?;
     if log_level == LevelFilter::Off {
         return Ok(());

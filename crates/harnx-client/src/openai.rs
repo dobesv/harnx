@@ -83,6 +83,7 @@ pub async fn openai_chat_completions(
     }
 
     debug!("non-stream-data: {data}");
+    harnx_core::llm_trace::response("openai", &data);
     openai_extract_chat_completions(&data)
 }
 
@@ -252,6 +253,7 @@ pub async fn openai_chat_completions_streaming(
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
+        harnx_core::llm_trace::stream_event("openai", &data);
         openai_handle_stream_event(&mut state, handler, &data)?;
         Ok(false)
     };

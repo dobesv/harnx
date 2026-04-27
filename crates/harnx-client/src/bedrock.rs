@@ -175,6 +175,7 @@ async fn chat_completions(builder: RequestBuilder) -> Result<ChatCompletionsOutp
     }
 
     debug!("non-stream-data: {data}");
+    harnx_core::llm_trace::response("bedrock", &data);
     extract_chat_completions(&data)
 }
 
@@ -349,6 +350,12 @@ async fn chat_completions_streaming(
                 ("event", _) => {
                     let data: Value = serde_json::from_slice(message.payload())?;
                     debug!("stream-data: {smithy_type} {data}");
+                    if harnx_core::llm_trace::is_enabled() {
+                        harnx_core::llm_trace::stream_event(
+                            "bedrock",
+                            &serde_json::json!({"smithy_type": smithy_type, "event": data}),
+                        );
+                    }
                     bedrock_handle_stream_event(&mut state, handler, smithy_type, &data)?;
                 }
                 ("exception", _) => {
@@ -744,6 +751,7 @@ fn aws_fetch(
     headers.insert("authorization".into(), authorization_header);
 
     debug!("Request {endpoint} {body}");
+    harnx_core::llm_trace::request_raw(&endpoint, &body);
 
     let mut request_builder = client.request(method, endpoint).body(body);
 

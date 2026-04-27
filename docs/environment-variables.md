@@ -65,6 +65,14 @@ Harnx can load environment variables from a `.env` file located in the configura
 
 - **HARNX_LOG_LEVEL**: The log level (e.g., `debug`, `info`).
 - **HARNX_LOG_FILE**: The path to the log file.
+- **HARNX_LLM_TRACE**: Path to a file that receives one JSON line per LLM
+  HTTP request and per response chunk. Independent of `HARNX_LOG_LEVEL`.
+  Each line is `{ts, kind, ...}` where `kind` is `request`, `response`, or
+  `stream-event`. Use this to inspect exactly what the harness sent to the
+  model and what it received — for example, when the model claims tool
+  results were "replayed" or "cached" and you want to confirm whether the
+  message history the harness built is responsible. The file is appended,
+  not truncated, so set a fresh path per session.
 
 ## Generic Envs
 

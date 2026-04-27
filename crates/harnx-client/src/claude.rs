@@ -62,6 +62,7 @@ pub async fn claude_chat_completions(
         catch_error(&data, status.as_u16(), retry_after)?;
     }
     debug!("non-stream-data: {data}");
+    harnx_core::llm_trace::response("claude", &data);
     claude_extract_chat_completions(&data)
 }
 
@@ -262,6 +263,7 @@ pub async fn claude_chat_completions_streaming(
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
+        harnx_core::llm_trace::stream_event("claude", &data);
         claude_handle_stream_event(&mut state, handler, &data)?;
         Ok(false)
     };

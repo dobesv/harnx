@@ -422,6 +422,7 @@ impl RequestData {
     pub fn into_builder(self, client: &ReqwestClient) -> RequestBuilder {
         let RequestData { url, headers, body } = self;
         debug!("Request {url} {body}");
+        harnx_core::llm_trace::request(&url, &body);
 
         let mut builder = client.post(url);
         for (key, value) in headers {

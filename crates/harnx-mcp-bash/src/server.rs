@@ -28,7 +28,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -79,7 +79,8 @@ impl JsonSchema for ExecCommandParams {
 
 #[derive(Debug, Deserialize)]
 struct ReadExecLogParams {
-    path: String,
+    execution_id: String,
+    stream: String,
     #[serde(default)]
     offset: Option<usize>,
     #[serde(default)]
@@ -102,7 +103,8 @@ impl JsonSchema for ReadExecLogParams {
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        let path = generator.subschema_for::<String>();
+        let execution_id = generator.subschema_for::<String>();
+        let stream = generator.subschema_for::<String>();
         let offset = generator.subschema_for::<Option<usize>>();
         let limit = generator.subschema_for::<Option<usize>>();
         let tail = generator.subschema_for::<Option<usize>>();
@@ -112,7 +114,8 @@ impl JsonSchema for ReadExecLogParams {
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
         object_schema(
             vec![
-                ("path", path),
+                ("execution_id", execution_id),
+                ("stream", stream),
                 ("offset", offset),
                 ("limit", limit),
                 ("tail", tail),
@@ -121,7 +124,7 @@ impl JsonSchema for ReadExecLogParams {
                 ("tail_lines", tail_lines),
                 ("max_output_bytes", max_output_bytes),
             ],
-            &["path"],
+            &["execution_id", "stream"],
         )
     }
 }
@@ -150,11 +153,17 @@ impl JsonSchema for SpawnCommandParams {
 
 #[derive(Debug, Deserialize)]
 struct WaitParams {
-    pid: u32,
+    execution_id: String,
     #[serde(default)]
     timeout_secs: Option<u64>,
     #[serde(default)]
+    head_lines: Option<usize>,
+    #[serde(default)]
     tail_lines: Option<usize>,
+    #[serde(default)]
+    max_output_bytes: Option<usize>,
+    #[serde(default)]
+    grep: Option<String>,
 }
 
 impl JsonSchema for WaitParams {
@@ -163,23 +172,29 @@ impl JsonSchema for WaitParams {
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        let pid = generator.subschema_for::<u32>();
+        let execution_id = generator.subschema_for::<String>();
         let timeout_secs = generator.subschema_for::<Option<u64>>();
+        let head_lines = generator.subschema_for::<Option<usize>>();
         let tail_lines = generator.subschema_for::<Option<usize>>();
+        let max_output_bytes = generator.subschema_for::<Option<usize>>();
+        let grep = generator.subschema_for::<Option<String>>();
         object_schema(
             vec![
-                ("pid", pid),
+                ("execution_id", execution_id),
                 ("timeout_secs", timeout_secs),
+                ("head_lines", head_lines),
                 ("tail_lines", tail_lines),
+                ("max_output_bytes", max_output_bytes),
+                ("grep", grep),
             ],
-            &["pid"],
+            &["execution_id"],
         )
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct TerminateParams {
-    pid: u32,
+    execution_id: String,
     #[serde(default)]
     signal: Option<String>,
 }
@@ -190,9 +205,12 @@ impl JsonSchema for TerminateParams {
     }
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        let pid = generator.subschema_for::<u32>();
+        let execution_id = generator.subschema_for::<String>();
         let signal = generator.subschema_for::<Option<String>>();
-        object_schema(vec![("pid", pid), ("signal", signal)], &["pid"])
+        object_schema(
+            vec![("execution_id", execution_id), ("signal", signal)],
+            &["execution_id"],
+        )
     }
 }
 
@@ -225,17 +243,16 @@ struct SpawnedProcess {
     child: Box<dyn ChildWrapper>,
     command: String,
     working_dir: PathBuf,
-    log_path: PathBuf,
+    stdout_log_path: PathBuf,
+    stderr_log_path: PathBuf,
     before_snap_ids: Vec<(PathBuf, gix::ObjectId)>,
 }
 
 struct BashServerInner {
     roots: RwLock<Vec<PathBuf>>,
     roots_initialized: AtomicBool,
-    spawned: Mutex<HashMap<u32, SpawnedProcess>>,
+    spawned: Mutex<HashMap<String, SpawnedProcess>>,
     log_dir: PathBuf,
-    spawn_counter: AtomicU64,
-    exec_counter: AtomicU64,
     history: Arc<HistoryManager>,
 }
 
@@ -261,8 +278,6 @@ impl BashServer {
                 roots_initialized: AtomicBool::new(false),
                 spawned: Mutex::new(HashMap::new()),
                 log_dir,
-                spawn_counter: AtomicU64::new(0),
-                exec_counter: AtomicU64::new(0),
                 history: Arc::new(HistoryManager::new(&initial_roots)),
             }),
         }
@@ -325,28 +340,11 @@ impl BashServer {
             })
     }
 
-    fn next_exec_log_paths(&self) -> (PathBuf, PathBuf) {
-        let seq = self.inner.exec_counter.fetch_add(1, Ordering::SeqCst);
-        (
-            self.inner.log_dir.join(format!("exec-{seq}.stdout.log")),
-            self.inner.log_dir.join(format!("exec-{seq}.stderr.log")),
-        )
-    }
-
-    fn validate_log_path(&self, requested: &str) -> Result<PathBuf, ErrorData> {
-        validate_path(requested, std::slice::from_ref(&self.inner.log_dir)).map_err(|err| {
-            if err.starts_with("Cannot resolve path") {
-                ErrorData::invalid_params(
-                    format!("cannot resolve log path '{requested}': {err}"),
-                    None,
-                )
-            } else {
-                ErrorData::invalid_params(
-                    format!("log path '{requested}' is outside the bash server temp log directory"),
-                    None,
-                )
-            }
-        })
+    fn next_exec_dir(&self) -> Result<tempfile::TempDir, ErrorData> {
+        tempfile::Builder::new()
+            .prefix("exec-")
+            .tempdir_in(&self.inner.log_dir)
+            .map_err(|err| internal_error(format!("failed to create exec directory: {err}")))
     }
 
     // -----------------------------------------------------------------------
@@ -390,7 +388,11 @@ impl BashServer {
         };
 
         self.ensure_log_dir().await?;
-        let (stdout_log_path, stderr_log_path) = self.next_exec_log_paths();
+
+        let exec_dir = self.next_exec_dir()?.keep();
+        let stdout_log_path = exec_dir.join("stdout.log");
+        let stderr_log_path = exec_dir.join("stderr.log");
+        let execution_id = exec_dir.file_name().unwrap().to_string_lossy().into_owned();
 
         let stdout_file = tokio::fs::File::create(&stdout_log_path)
             .await
@@ -471,17 +473,27 @@ impl BashServer {
             let _ = f.sync_all().await;
         }
 
-        let output_bytes = merge_output(&stdout_bytes, &stderr_bytes);
-        let total_bytes = output_bytes.len();
-        let sanitized_output = sanitize_output_text(&String::from_utf8_lossy(&output_bytes));
-        let total_lines = count_lines(&sanitized_output);
-        let truncated_output = truncate_output(&sanitized_output, &truncate_opts);
-        let output_truncated = truncated_output != sanitized_output;
+        let stdout_str = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        let stderr_str = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        // exec does not expose a grep param; pass None
+        let (streams_block, stdout_lines, stderr_lines, stdout_bytes_len, stderr_bytes_len) =
+            render_streams_block(
+                &stdout_str,
+                &stderr_str,
+                &truncate_opts,
+                None,
+                &execution_id,
+                &stdout_log_path,
+                &stderr_log_path,
+            );
+        let total_lines = stdout_lines + stderr_lines;
+        let total_bytes = stdout_bytes_len + stderr_bytes_len;
 
         match (status, timed_out) {
             (Some(status), false) => {
                 let exit_code = status.code().unwrap_or(-1);
                 let mut output = String::new();
+                let _ = writeln!(output, "execution_id: {execution_id}");
                 let _ = writeln!(output, "exit_code: {exit_code}");
                 let _ = writeln!(output, "working_dir: {}", working_dir.display());
                 let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
@@ -492,15 +504,7 @@ impl BashServer {
                     "total_bytes: {total_bytes} ({})",
                     format_size(total_bytes)
                 );
-                let _ = write!(
-                    output,
-                    "\n{}",
-                    render_output_block(
-                        &sanitized_output,
-                        &truncated_output,
-                        Some((&stdout_log_path, &stderr_log_path)),
-                    )
-                );
+                let _ = write!(output, "\n{streams_block}");
                 let summary = format!(
                     "exit_code: {exit_code}, {total_lines} lines, {}",
                     format_size(total_bytes)
@@ -552,14 +556,15 @@ impl BashServer {
                 let _ = status;
                 tool_error(render_timeout_message(TimeoutRenderContext {
                     working_dir: &working_dir,
+                    execution_id: &execution_id,
                     timeout_secs,
                     total_lines,
                     total_bytes,
-                    original: &sanitized_output,
-                    truncated: &truncated_output,
+                    stdout: &stdout_str,
+                    stderr: &stderr_str,
+                    truncate_opts: &truncate_opts,
                     stdout_log_path: &stdout_log_path,
                     stderr_log_path: &stderr_log_path,
-                    output_truncated,
                 }))
             }
             (None, _) => tool_error("process exited without status".to_string()),
@@ -581,7 +586,48 @@ impl BashServer {
             ));
         }
 
-        let path = self.validate_log_path(&params.path)?;
+        // Validate stream parameter
+        if params.stream != "stdout" && params.stream != "stderr" {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "stream must be 'stdout' or 'stderr', got '{}'",
+                    params.stream
+                ),
+                None,
+            ));
+        }
+
+        // Construct absolute path: log_dir/execution_id/stream.log
+        // We pass the absolute path string so validate_path uses canonicalize() correctly
+        // (passing a relative string would resolve against cwd, not log_dir).
+        let abs = self
+            .inner
+            .log_dir
+            .join(&params.execution_id)
+            .join(format!("{}.log", params.stream));
+        let path = validate_path(
+            abs.to_string_lossy().as_ref(),
+            std::slice::from_ref(&self.inner.log_dir),
+        )
+        .map_err(|err| {
+            if err.starts_with("Cannot resolve path") {
+                ErrorData::invalid_params(
+                    format!(
+                        "cannot resolve execution_id '{}': {}",
+                        params.execution_id, err
+                    ),
+                    None,
+                )
+            } else {
+                ErrorData::invalid_params(
+                    format!(
+                        "execution_id '{}' is outside the bash server temp log directory",
+                        params.execution_id
+                    ),
+                    None,
+                )
+            }
+        })?;
         let metadata = tokio::fs::metadata(&path)
             .await
             .map_err(|err| internal_error(format!("cannot access '{}': {err}", path.display())))?;
@@ -590,9 +636,12 @@ impl BashServer {
             return tool_error(format!("'{}' is not a regular log file.", path.display()));
         }
 
-        let content = tokio::fs::read_to_string(&path)
+        let raw_content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|err| internal_error(format!("failed to read '{}': {err}", path.display())))?;
+        // Apply same sanitization as exec/wait output rendering so control characters
+        // don't leak through the log-read path.
+        let content = sanitize_output_text(&raw_content);
 
         let grep_regex = match params.grep.as_deref() {
             Some(pattern) => Some(Regex::new(pattern).map_err(|err| {
@@ -709,8 +758,9 @@ impl BashServer {
         }
 
         let summary = format!(
-            "Read {} ({} lines, {})",
-            path.display(),
+            "Read {}/{} ({} lines, {})",
+            params.execution_id,
+            params.stream,
             total_matching_lines,
             format_size(raw_output.len())
         );
@@ -746,26 +796,31 @@ impl BashServer {
 
         self.ensure_log_dir().await?;
 
-        let seq = self.inner.spawn_counter.fetch_add(1, Ordering::SeqCst);
-        let log_path = self.inner.log_dir.join(format!("bg-{seq}.log"));
+        let exec_dir = self.next_exec_dir()?.keep();
+        let stdout_log_path = exec_dir.join("stdout.log");
+        let stderr_log_path = exec_dir.join("stderr.log");
+        let execution_id = exec_dir.file_name().unwrap().to_string_lossy().into_owned();
 
-        let log_file = std::fs::File::create(&log_path).map_err(|err| {
+        let stdout_file = std::fs::File::create(&stdout_log_path).map_err(|err| {
             internal_error(format!(
-                "failed to create log file '{}': {err}",
-                log_path.display()
+                "failed to create stdout log file '{}': {err}",
+                stdout_log_path.display()
             ))
         })?;
-        let log_file_err = log_file
-            .try_clone()
-            .map_err(|err| internal_error(format!("failed to clone log file handle: {err}")))?;
+        let stderr_file = std::fs::File::create(&stderr_log_path).map_err(|err| {
+            internal_error(format!(
+                "failed to create stderr log file '{}': {err}",
+                stderr_log_path.display()
+            ))
+        })?;
 
         let mut command = CommandWrap::with_new("bash", |command| {
             command
                 .args(["-c", &params.command])
                 .current_dir(&working_dir)
                 .stdin(Stdio::null())
-                .stdout(Stdio::from(log_file))
-                .stderr(Stdio::from(log_file_err));
+                .stdout(Stdio::from(stdout_file))
+                .stderr(Stdio::from(stderr_file));
         });
         #[cfg(unix)]
         command.wrap(ProcessGroup::leader());
@@ -776,26 +831,28 @@ impl BashServer {
             .spawn()
             .map_err(|err| internal_error(format!("failed to spawn command: {err}")))?;
 
-        let pid = child
-            .id()
-            .ok_or_else(|| internal_error("spawned process exited before PID could be read"))?;
-
         let entry = SpawnedProcess {
             child,
             command: params.command.clone(),
             working_dir: working_dir.clone(),
-            log_path: log_path.clone(),
+            stdout_log_path: stdout_log_path.clone(),
+            stderr_log_path: stderr_log_path.clone(),
             before_snap_ids,
         };
 
-        self.inner.spawned.lock().await.insert(pid, entry);
+        self.inner
+            .spawned
+            .lock()
+            .await
+            .insert(execution_id.clone(), entry);
 
         let mut output = String::new();
-        let _ = writeln!(output, "pid: {pid}");
-        let _ = writeln!(output, "log_path: {}", log_path.display());
+        let _ = writeln!(output, "execution_id: {execution_id}");
+        let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
+        let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
         let _ = writeln!(output, "working_dir: {}", working_dir.display());
         let _ = write!(output, "command: {}", params.command);
-        let summary = format!("spawned pid {pid}, log: {}", log_path.display());
+        let summary = format!("spawned {execution_id}");
 
         Ok(CallToolResult::success(vec![
             Content::text(output).with_audience(vec![Role::Assistant]),
@@ -809,15 +866,25 @@ impl BashServer {
 
     async fn wait_impl(&self, params: WaitParams) -> Result<CallToolResult, ErrorData> {
         let timeout_secs = params.timeout_secs.unwrap_or(120);
-        let tail_line_count = params.tail_lines.unwrap_or(20);
+        let default_opts = TruncateOpts::default();
+        let truncate_opts = TruncateOpts {
+            head_lines: params.head_lines.unwrap_or(default_opts.head_lines),
+            tail_lines: params.tail_lines.unwrap_or(default_opts.tail_lines),
+            line_head_bytes: default_opts.line_head_bytes,
+            line_tail_bytes: default_opts.line_tail_bytes,
+            max_output_bytes: params
+                .max_output_bytes
+                .unwrap_or(default_opts.max_output_bytes),
+            ..default_opts
+        };
 
-        let (mut child, command, working_dir, log_path, before_snap_ids) = {
+        let (mut child, command, working_dir, stdout_log_path, stderr_log_path, before_snap_ids) = {
             let mut map = self.inner.spawned.lock().await;
-            let entry = map.remove(&params.pid).ok_or_else(|| {
+            let entry = map.remove(&params.execution_id).ok_or_else(|| {
                 ErrorData::invalid_params(
                     format!(
-                        "pid {} is not a tracked background process (or already waited on)",
-                        params.pid
+                        "execution_id '{}' is not a tracked background process (or already waited on)",
+                        params.execution_id
                     ),
                     None,
                 )
@@ -826,7 +893,8 @@ impl BashServer {
                 entry.child,
                 entry.command,
                 entry.working_dir,
-                entry.log_path,
+                entry.stdout_log_path,
+                entry.stderr_log_path,
                 entry.before_snap_ids,
             )
         };
@@ -834,20 +902,55 @@ impl BashServer {
         let timeout = Duration::from_secs(timeout_secs);
         let wait_result = tokio::time::timeout(timeout, child.wait()).await;
 
-        let log_tail = read_log_tail(&log_path, tail_line_count);
+        // Read both log files
+        let stdout_content = tokio::fs::read_to_string(&stdout_log_path)
+            .await
+            .unwrap_or_default();
+        let stderr_content = tokio::fs::read_to_string(&stderr_log_path)
+            .await
+            .unwrap_or_default();
+
+        let grep_regex = match params.grep.as_deref() {
+            Some(pattern) => Some(Regex::new(pattern).map_err(|err| {
+                ErrorData::invalid_params(format!("invalid grep pattern: {err}"), None)
+            })?),
+            None => None,
+        };
+        let (streams_block, stdout_lines, stderr_lines, stdout_bytes_len, stderr_bytes_len) =
+            render_streams_block(
+                &stdout_content,
+                &stderr_content,
+                &truncate_opts,
+                grep_regex.as_ref(),
+                &params.execution_id,
+                &stdout_log_path,
+                &stderr_log_path,
+            );
+        let total_lines = stdout_lines + stderr_lines;
+        let total_bytes = stdout_bytes_len + stderr_bytes_len;
 
         match wait_result {
             Ok(Ok(status)) => {
                 let exit_code = status.code().unwrap_or(-1);
                 let mut output = String::new();
-                let _ = writeln!(output, "pid: {}", params.pid);
+                let _ = writeln!(output, "execution_id: {}", params.execution_id);
                 let _ = writeln!(output, "status: exited");
                 let _ = writeln!(output, "exit_code: {exit_code}");
                 let _ = writeln!(output, "working_dir: {}", working_dir.display());
                 let _ = writeln!(output, "command: {command}");
-                let _ = writeln!(output, "log_path: {}", log_path.display());
-                let _ = write!(output, "\n{log_tail}");
-                let summary = format!("pid {} exited with code {exit_code}", params.pid);
+                let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
+                let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
+                let _ = writeln!(output, "total_lines: {total_lines}");
+                let _ = writeln!(
+                    output,
+                    "total_bytes: {total_bytes} ({})",
+                    format_size(total_bytes)
+                );
+                let _ = write!(output, "\n{streams_block}");
+                let summary = format!(
+                    "execution_id '{}' exited with code {exit_code}",
+                    params.execution_id
+                );
 
                 // HISTORY: after snapshot + diff (non-fatal)
                 let mut diff_parts: Vec<String> = Vec::new();
@@ -891,30 +994,41 @@ impl BashServer {
                 Ok(CallToolResult::success(contents))
             }
             Ok(Err(err)) => Err(internal_error(format!(
-                "failed waiting for pid {}: {err}",
-                params.pid
+                "failed waiting for execution_id '{}': {err}",
+                params.execution_id
             ))),
             Err(_) => {
                 let mut map = self.inner.spawned.lock().await;
                 map.insert(
-                    params.pid,
+                    params.execution_id.clone(),
                     SpawnedProcess {
                         child,
                         command: command.clone(),
                         working_dir: working_dir.clone(),
-                        log_path: log_path.clone(),
+                        stdout_log_path: stdout_log_path.clone(),
+                        stderr_log_path: stderr_log_path.clone(),
                         before_snap_ids,
                     },
                 );
 
                 let mut output = String::new();
-                let _ = writeln!(output, "pid: {}", params.pid);
+                let _ = writeln!(output, "execution_id: {}", params.execution_id);
                 let _ = writeln!(output, "status: running");
                 let _ = writeln!(output, "working_dir: {}", working_dir.display());
                 let _ = writeln!(output, "command: {command}");
-                let _ = writeln!(output, "log_path: {}", log_path.display());
-                let _ = write!(output, "\n{log_tail}");
-                let summary = format!("pid {} still running after {}s", params.pid, timeout_secs);
+                let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
+                let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
+                let _ = writeln!(output, "total_lines: {total_lines}");
+                let _ = writeln!(
+                    output,
+                    "total_bytes: {total_bytes} ({})",
+                    format_size(total_bytes)
+                );
+                let _ = write!(output, "\n{streams_block}");
+                let summary = format!(
+                    "execution_id '{}' still running after {}s",
+                    params.execution_id, timeout_secs
+                );
                 Ok(CallToolResult::success(vec![
                     Content::text(output).with_audience(vec![Role::Assistant]),
                     Content::text(summary).with_audience(vec![Role::User]),
@@ -946,26 +1060,38 @@ impl BashServer {
             };
 
             let map = self.inner.spawned.lock().await;
-            let entry = map.get(&params.pid).ok_or_else(|| {
+            let entry = map.get(&params.execution_id).ok_or_else(|| {
                 ErrorData::invalid_params(
-                    format!("pid {} is not a tracked background process", params.pid),
+                    format!(
+                        "execution_id '{}' is not a tracked background process",
+                        params.execution_id
+                    ),
                     None,
                 )
             })?;
 
             entry.child.signal(signum).map_err(|err| {
                 internal_error(format!(
-                    "failed to send {signal_name} to pid {}: {err}",
-                    params.pid
+                    "failed to send {signal_name} to execution_id '{}': {err}",
+                    params.execution_id
                 ))
             })?;
 
             let mut output = String::new();
-            let _ = writeln!(output, "pid: {}", params.pid);
+            let _ = writeln!(output, "execution_id: {}", params.execution_id);
             let _ = writeln!(output, "signal: {}", normalized);
             let _ = writeln!(output, "command: {}", entry.command);
-            let _ = write!(output, "log_path: {}", entry.log_path.display());
-            let summary = format!("sent {} to pid {}", normalized, params.pid);
+            let _ = writeln!(
+                output,
+                "stdout_log_path: {}",
+                entry.stdout_log_path.display()
+            );
+            let _ = write!(
+                output,
+                "stderr_log_path: {}",
+                entry.stderr_log_path.display()
+            );
+            let summary = format!("sent {} to {}", normalized, params.execution_id);
 
             Ok(CallToolResult::success(vec![
                 Content::text(output).with_audience(vec![Role::Assistant]),
@@ -976,29 +1102,34 @@ impl BashServer {
         #[cfg(windows)]
         {
             let mut map = self.inner.spawned.lock().await;
-            let entry = map.get_mut(&params.pid).ok_or_else(|| {
+            let entry = map.get_mut(&params.execution_id).ok_or_else(|| {
                 ErrorData::invalid_params(
-                    format!("pid {} is not a tracked background process", params.pid),
+                    format!(
+                        "execution_id '{}' is not a tracked background process",
+                        params.execution_id
+                    ),
                     None,
                 )
             })?;
 
             if let Err(e) = entry.child.start_kill() {
                 return Err(internal_error(format!(
-                    "failed to terminate pid {}: {e}",
-                    params.pid
+                    "failed to terminate execution_id '{}': {e}",
+                    params.execution_id
                 )));
             }
 
             let command = entry.command.clone();
-            let log_path = entry.log_path.clone();
+            let stdout_log_path = entry.stdout_log_path.clone();
+            let stderr_log_path = entry.stderr_log_path.clone();
 
             let mut output = String::new();
-            let _ = writeln!(output, "pid: {}", params.pid);
+            let _ = writeln!(output, "execution_id: {}", params.execution_id);
             let _ = writeln!(output, "signal: {}", normalized);
             let _ = writeln!(output, "command: {}", command);
-            let _ = write!(output, "log_path: {}", log_path.display());
-            let summary = format!("sent {} to pid {}", normalized, params.pid);
+            let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
+            let _ = write!(output, "stderr_log_path: {}", stderr_log_path.display());
+            let summary = format!("sent {} to {}", normalized, params.execution_id);
 
             Ok(CallToolResult::success(vec![
                 Content::text(output).with_audience(vec![Role::Assistant]),
@@ -1147,17 +1278,17 @@ impl ServerHandler for BashServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "read_exec_log",
-                    "Read a temp stdout/stderr log file generated by this bash server. Supports offset/limit/tail/grep/head_lines/tail_lines/max_output_bytes, but only for server-owned temp logs.",
+                    "Read a temp stdout/stderr log file generated by this bash server. Use execution_id from exec/wait response with stream 'stdout' or 'stderr'. Supports offset/limit/tail/grep/head_lines/tail_lines/max_output_bytes, but only for server-owned temp logs.",
                     Map::new(),
                 )
                 .with_input_schema::<ReadExecLogParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**read log** `{{ args.path }}`",
+                    "call_template": "**read log** `{{ args.execution_id }}/{{ args.stream }}`",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "spawn",
-                    "Spawn a background bash command. Returns the PID and log file path immediately without waiting for the command to finish. Output is written to a log file. Use 'wait' to check for completion and 'terminate' to stop it.",
+                    "Spawn a background bash command. Returns an execution_id and log file paths immediately without waiting for the command to finish. Output is written to separate stdout.log and stderr.log files. Use 'wait' to check for completion and 'terminate' to stop it.",
                     Map::new(),
                 )
                 .with_input_schema::<SpawnCommandParams>()
@@ -1167,12 +1298,12 @@ impl ServerHandler for BashServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "wait",
-                    "Wait for a spawned background process to exit. Returns the exit code and tail of the log file. If the process does not exit within the timeout, returns its current status and log tail without killing it.",
+                    "Wait for a spawned background process to exit. Returns the exit code, output metrics, and truncated output. If the process does not exit within the timeout, returns its current status and partial output without killing it.",
                     Map::new(),
                 )
                 .with_input_schema::<WaitParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**wait** for PID {{ args.pid }}",
+                    "call_template": "**wait** for {{ args.execution_id }}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -1182,7 +1313,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<TerminateParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**terminate** PID {{ args.pid }}{% if args.signal %} ({{ args.signal }}){% endif %}",
+                    "call_template": "**terminate** {{ args.execution_id }}{% if args.signal %} ({{ args.signal }}){% endif %}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -1340,24 +1471,6 @@ async fn join_pipe(
         .map_err(|err| internal_error(format!("failed to read {name}: {err}")))
 }
 
-fn merge_output(stdout: &[u8], stderr: &[u8]) -> Vec<u8> {
-    if stdout.is_empty() {
-        return stderr.to_vec();
-    }
-    if stderr.is_empty() {
-        return stdout.to_vec();
-    }
-
-    let needs_separator = !stdout.ends_with(b"\n") && !stderr.starts_with(b"\n");
-    let mut merged = Vec::with_capacity(stdout.len() + stderr.len() + usize::from(needs_separator));
-    merged.extend_from_slice(stdout);
-    if needs_separator {
-        merged.push(b'\n');
-    }
-    merged.extend_from_slice(stderr);
-    merged
-}
-
 fn count_lines(s: &str) -> usize {
     if s.is_empty() {
         0
@@ -1366,65 +1479,135 @@ fn count_lines(s: &str) -> usize {
     }
 }
 
-fn render_output_block(
-    original: &str,
-    truncated: &str,
-    log_paths: Option<(&Path, &Path)>,
+/// Render one stream's output block with `===== stdout =====` / `===== /stdout =====` markers.
+/// Each stream is truncated independently using `truncate_opts`.
+/// Returns the rendered block string (no trailing newline).
+fn render_stream_block(
+    name: &str,
+    content: &str,
+    truncate_opts: &TruncateOpts,
+    log_hint: Option<(&str, &Path)>, // (execution_id, log_path) for truncation hint
 ) -> String {
-    if truncated.is_empty() {
-        return "output: <empty>".to_string();
+    let sanitized = sanitize_output_text(content);
+    if sanitized.is_empty() {
+        return format!("===== {name} (empty) =====");
     }
-
-    if original == truncated {
-        format!("output:\n{truncated}")
-    } else {
-        let mut message = format!(
-            "output:\n{truncated}\n\n[output truncated from {} to {}. Use max_output_bytes, head_lines, or tail_lines to see more",
-            format_size(original.len()),
-            format_size(truncated.len())
-        );
-        if let Some((stdout_log_path, stderr_log_path)) = log_paths {
+    let truncated = truncate_output(&sanitized, truncate_opts);
+    let was_truncated = truncated != sanitized;
+    let mut block = format!("===== {name} =====\n{truncated}");
+    if was_truncated {
+        if let Some((execution_id, log_path)) = log_hint {
             let _ = write!(
-                message,
-                "; full logs available via read_exec_log: stdout={}, stderr={}",
-                stdout_log_path.display(),
-                stderr_log_path.display()
+                block,
+                "\n\n[{name} truncated from {} to {}. Use max_output_bytes, head_lines, or tail_lines to see more; full log via read_exec_log: execution_id={execution_id}, stream={name} ({})]",
+                format_size(sanitized.len()),
+                format_size(truncated.len()),
+                log_path.display()
+            );
+        } else {
+            let _ = write!(
+                block,
+                "\n\n[{name} truncated from {} to {}. Use max_output_bytes, head_lines, or tail_lines to see more]",
+                format_size(sanitized.len()),
+                format_size(truncated.len())
             );
         }
-        message.push(']');
-        message
     }
+    let _ = write!(block, "\n===== /{name} =====");
+    block
+}
+
+/// Render separate stdout and stderr blocks, each truncated independently.
+/// Returns (rendered_string, stdout_lines, stderr_lines, stdout_bytes, stderr_bytes).
+/// Apply a grep regex filter to each line of `content`, returning only matching lines joined by `\n`.
+/// Lines that fail regex evaluation are kept (fail-open).
+fn grep_filter(content: &str, grep_regex: &Regex) -> String {
+    content
+        .lines()
+        .filter(|line| grep_regex.is_match(line).unwrap_or(true))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render separate stdout and stderr blocks, each grep-filtered and truncated independently.
+/// Returns (rendered_string, stdout_lines, stderr_lines, stdout_bytes, stderr_bytes).
+/// Metrics reflect post-grep content so callers see accurate totals.
+fn render_streams_block(
+    stdout: &str,
+    stderr: &str,
+    truncate_opts: &TruncateOpts,
+    grep_regex: Option<&Regex>,
+    execution_id: &str,
+    stdout_log_path: &Path,
+    stderr_log_path: &Path,
+) -> (String, usize, usize, usize, usize) {
+    let stdout_filtered = grep_regex
+        .map(|r| grep_filter(stdout, r))
+        .unwrap_or_else(|| stdout.to_owned());
+    let stderr_filtered = grep_regex
+        .map(|r| grep_filter(stderr, r))
+        .unwrap_or_else(|| stderr.to_owned());
+
+    let stdout_lines = count_lines(&stdout_filtered);
+    let stderr_lines = count_lines(&stderr_filtered);
+    let stdout_bytes = stdout_filtered.len();
+    let stderr_bytes = stderr_filtered.len();
+
+    let stdout_block = render_stream_block(
+        "stdout",
+        &stdout_filtered,
+        truncate_opts,
+        Some((execution_id, stdout_log_path)),
+    );
+    let stderr_block = render_stream_block(
+        "stderr",
+        &stderr_filtered,
+        truncate_opts,
+        Some((execution_id, stderr_log_path)),
+    );
+
+    let rendered = format!("{stdout_block}\n{stderr_block}");
+    (
+        rendered,
+        stdout_lines,
+        stderr_lines,
+        stdout_bytes,
+        stderr_bytes,
+    )
 }
 
 struct TimeoutRenderContext<'a> {
     working_dir: &'a Path,
+    execution_id: &'a str,
     timeout_secs: u64,
     total_lines: usize,
     total_bytes: usize,
-    original: &'a str,
-    truncated: &'a str,
+    stdout: &'a str,
+    stderr: &'a str,
+    truncate_opts: &'a TruncateOpts,
     stdout_log_path: &'a Path,
     stderr_log_path: &'a Path,
-    output_truncated: bool,
 }
 
 fn render_timeout_message(ctx: TimeoutRenderContext<'_>) -> String {
     let TimeoutRenderContext {
         working_dir,
+        execution_id,
         timeout_secs,
         total_lines,
         total_bytes,
-        original,
-        truncated,
+        stdout,
+        stderr,
+        truncate_opts,
         stdout_log_path,
         stderr_log_path,
-        output_truncated,
     } = ctx;
     let mut output = String::new();
     let _ = writeln!(
         output,
         "command timed out after {timeout_secs}s and was terminated"
     );
+    let _ = writeln!(output, "execution_id: {execution_id}");
     let _ = writeln!(output, "working_dir: {}", working_dir.display());
     let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
     let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
@@ -1434,34 +1617,17 @@ fn render_timeout_message(ctx: TimeoutRenderContext<'_>) -> String {
         "total_bytes: {total_bytes} ({})",
         format_size(total_bytes)
     );
-    let _ = write!(
-        output,
-        "\n{}",
-        render_output_block(
-            original,
-            truncated,
-            output_truncated.then_some((stdout_log_path, stderr_log_path)),
-        )
+    let (streams_block, _, _, _, _) = render_streams_block(
+        stdout,
+        stderr,
+        truncate_opts,
+        None,
+        execution_id,
+        stdout_log_path,
+        stderr_log_path,
     );
+    let _ = write!(output, "\n{streams_block}");
     output
-}
-
-fn read_log_tail(path: &Path, n: usize) -> String {
-    let content = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(err) => return format!("log: <error reading {}: {err}>", path.display()),
-    };
-    if content.is_empty() {
-        return "log: <empty>".to_string();
-    }
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
-    if total <= n {
-        format!("log ({total} lines):\n{content}")
-    } else {
-        let tail = lines[total - n..].join("\n");
-        format!("log (last {n} of {total} lines):\n{tail}")
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1612,7 +1778,7 @@ mod tests {
             )
             .with_input_schema::<WaitParams>()
             .with_meta(Meta(json!({
-                "call_template": "**wait** for PID {{ args.pid }}",
+                "call_template": "**wait** for {{ args.execution_id }}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
             Tool::new(
@@ -1622,7 +1788,7 @@ mod tests {
             )
             .with_input_schema::<TerminateParams>()
             .with_meta(Meta(json!({
-                "call_template": "**terminate** PID {{ args.pid }}{% if args.signal %} ({{ args.signal }}){% endif %}",
+                "call_template": "**terminate** {{ args.execution_id }}{% if args.signal %} ({{ args.signal }}){% endif %}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
         ];
@@ -1787,15 +1953,14 @@ mod tests {
             .unwrap();
 
         let text = text_content(&result);
-        let stdout_log_path = extract_field(&text, "stdout_log_path");
-        let stderr_log_path = extract_field(&text, "stderr_log_path");
-        assert!(text.contains("full logs available via read_exec_log"));
-        assert!(text.contains(&stdout_log_path));
-        assert!(text.contains(&stderr_log_path));
+        let execution_id = extract_field(&text, "execution_id");
+        assert!(text.contains("full log via read_exec_log"));
+        assert!(text.contains(&execution_id));
 
         let stdout_read = server
             .read_exec_log_impl(ReadExecLogParams {
-                path: stdout_log_path.clone(),
+                execution_id: execution_id.clone(),
+                stream: "stdout".to_string(),
                 offset: None,
                 limit: None,
                 tail: None,
@@ -1813,7 +1978,8 @@ mod tests {
 
         let stderr_read = server
             .read_exec_log_impl(ReadExecLogParams {
-                path: stderr_log_path,
+                execution_id,
+                stream: "stderr".to_string(),
                 offset: None,
                 limit: None,
                 tail: Some(1),
@@ -1830,15 +1996,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_exec_log_rejects_outside_path() {
+    async fn test_read_exec_log_rejects_invalid_stream() {
         let temp_dir = TestDir::new();
-        let outside = temp_dir.path().join("outside.log");
-        std::fs::write(&outside, "hello\n").unwrap();
         let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
 
         let result = server
             .read_exec_log_impl(ReadExecLogParams {
-                path: outside.to_string_lossy().to_string(),
+                execution_id: "exec-test".to_string(),
+                stream: "invalid".to_string(),
                 offset: None,
                 limit: None,
                 tail: None,
@@ -1853,7 +2018,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .message
-            .contains("outside the bash server temp log directory"));
+            .contains("stream must be 'stdout' or 'stderr'"));
     }
 
     #[tokio::test]
@@ -1896,20 +2061,16 @@ mod tests {
             .unwrap();
 
         let text = text_content(&result);
-        let pid: u32 = text
-            .lines()
-            .find(|l| l.starts_with("pid:"))
-            .unwrap()
-            .trim_start_matches("pid:")
-            .trim()
-            .parse()
-            .unwrap();
+        let execution_id = extract_field(&text, "execution_id");
 
         let result = server
             .wait_impl(WaitParams {
-                pid,
+                execution_id,
                 timeout_secs: Some(5),
+                head_lines: None,
                 tail_lines: Some(10),
+                max_output_bytes: None,
+                grep: None,
             })
             .await
             .unwrap();
@@ -1933,20 +2094,16 @@ mod tests {
             .unwrap();
 
         let text = text_content(&result);
-        let pid: u32 = text
-            .lines()
-            .find(|l| l.starts_with("pid:"))
-            .unwrap()
-            .trim_start_matches("pid:")
-            .trim()
-            .parse()
-            .unwrap();
+        let execution_id = extract_field(&text, "execution_id");
 
         let result = server
             .wait_impl(WaitParams {
-                pid,
+                execution_id,
                 timeout_secs: Some(1),
+                head_lines: None,
                 tail_lines: Some(10),
+                max_output_bytes: None,
+                grep: None,
             })
             .await
             .unwrap();
@@ -1969,18 +2126,11 @@ mod tests {
             .unwrap();
 
         let text = text_content(&result);
-        let pid: u32 = text
-            .lines()
-            .find(|l| l.starts_with("pid:"))
-            .unwrap()
-            .trim_start_matches("pid:")
-            .trim()
-            .parse()
-            .unwrap();
+        let execution_id = extract_field(&text, "execution_id");
 
         let result = server
             .terminate_impl(TerminateParams {
-                pid,
+                execution_id,
                 signal: Some("SIGTERM".to_string()),
             })
             .await
@@ -1991,15 +2141,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wait_unknown_pid() {
+    async fn test_wait_unknown_execution_id() {
         let temp_dir = TestDir::new();
         let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
 
         let result = server
             .wait_impl(WaitParams {
-                pid: 99999999,
+                execution_id: "exec-does-not-exist".to_string(),
                 timeout_secs: Some(1),
+                head_lines: None,
                 tail_lines: None,
+                max_output_bytes: None,
+                grep: None,
             })
             .await;
 
@@ -2007,13 +2160,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_terminate_unknown_pid() {
+    async fn test_terminate_unknown_execution_id() {
         let temp_dir = TestDir::new();
         let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
 
         let result = server
             .terminate_impl(TerminateParams {
-                pid: 99999999,
+                execution_id: "exec-does-not-exist".to_string(),
                 signal: None,
             })
             .await;
@@ -2035,20 +2188,16 @@ mod tests {
             .unwrap();
 
         let text = text_content(&result);
-        let pid: u32 = text
-            .lines()
-            .find(|l| l.starts_with("pid:"))
-            .unwrap()
-            .trim_start_matches("pid:")
-            .trim()
-            .parse()
-            .unwrap();
+        let execution_id = extract_field(&text, "execution_id");
 
         let result = server
             .wait_impl(WaitParams {
-                pid,
+                execution_id,
                 timeout_secs: Some(5),
+                head_lines: None,
                 tail_lines: Some(10),
+                max_output_bytes: None,
+                grep: None,
             })
             .await
             .unwrap();

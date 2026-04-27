@@ -5,23 +5,36 @@ set -e
 # @env DRY_RUN Dry run mode
 
 # @cmd Install all harnx binaries (harnx, harnx-serve, harnx-acp-server, harnx-mcp-*) from the local workspace
-# Release profile by default. Pass --debug for a faster build with slower runtime.
+# Single workspace build then copy into $CARGO_HOME/bin -- avoids the per-crate scratch
+# rebuilds that `cargo install --path` does. Release profile by default; pass --debug for
+# a faster build with slower runtime.
 # @flag --debug Install debug build instead of the default release build
-# @flag --force Overwrite an existing installed binary of the same name
-# @flag --locked Use the committed Cargo.lock (recommended for reproducible installs)
-# @arg pkgs*[harnx|harnx-serve|harnx-acp-server] Restrict the install to one or more bins (default: all three)
+# @arg bins*[harnx|harnx-serve|harnx-acp-server|harnx-mcp-bash|harnx-mcp-fs|harnx-mcp-time|harnx-mcp-todo] Restrict the install to one or more bins (default: all)
 install() {
-    args=()
-    [[ -n "$argc_debug" ]] && args+=(--debug)
-    [[ -n "$argc_force" ]] && args+=(--force)
-    [[ -n "$argc_locked" ]] && args+=(--locked)
-    pkgs=("${argc_pkgs[@]}")
-    if [[ ${#pkgs[@]} -eq 0 ]]; then
-        pkgs=(harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-fs harnx-mcp-time harnx-mcp-todo)
+    bins=("${argc_bins[@]}")
+    if [[ ${#bins[@]} -eq 0 ]]; then
+        bins=(harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-fs harnx-mcp-time harnx-mcp-todo)
     fi
-    for pkg in "${pkgs[@]}"; do
-        echo "==> Installing $pkg"
-        cargo install "${args[@]}" --path "crates/$pkg"
+
+    build_args=(--locked)
+    profile_dir="release"
+    if [[ -n "$argc_debug" ]]; then
+        profile_dir="debug"
+    else
+        build_args+=(--release)
+    fi
+    for bin in "${bins[@]}"; do
+        build_args+=(--bin "$bin")
+    done
+
+    cargo build "${build_args[@]}"
+
+    target_dir="${CARGO_TARGET_DIR:-target}"
+    install_dir="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin"
+    mkdir -p "$install_dir"
+    for bin in "${bins[@]}"; do
+        echo "==> Installing $bin -> $install_dir/$bin"
+        cp -f "$target_dir/$profile_dir/$bin" "$install_dir/$bin"
     done
 }
 

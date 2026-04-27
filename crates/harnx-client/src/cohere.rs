@@ -107,6 +107,7 @@ async fn chat_completions(
     }
 
     debug!("non-stream-data: {data}");
+    harnx_core::llm_trace::response("cohere", &data);
     extract_chat_completions(&data)
 }
 
@@ -204,6 +205,7 @@ async fn chat_completions_streaming(
         }
         let data: Value = serde_json::from_str(&message.data)?;
         debug!("stream-data: {data}");
+        harnx_core::llm_trace::stream_event("cohere", &data);
         cohere_handle_stream_event(&mut state, handler, &data)?;
         Ok(false)
     };
