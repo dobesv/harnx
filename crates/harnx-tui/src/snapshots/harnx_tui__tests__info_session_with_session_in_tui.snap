@@ -4,9 +4,9 @@ expression: rendered
 ---
 Welcome to harnx 0.30.0  •  Type .help for commands, Tab to
 complete.
+💬  info-session-with-session-test
 model               mock:mock-model
 save_session        true
-
 
 
 

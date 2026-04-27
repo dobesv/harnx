@@ -12,6 +12,7 @@ use crossterm::event::{
 };
 use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen};
 use crossterm::ExecutableCommand;
+use harnx_core::message::Message;
 use harnx_hooks::{drain_async_results, AsyncHookManager, PersistentHookManager};
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::utils::create_abort_signal;
@@ -102,7 +103,7 @@ impl Tui {
         })
     }
 
-    fn build_initial_transcript(config: &GlobalConfig) -> Vec<TranscriptItem> {
+    pub(crate) fn build_initial_transcript(config: &GlobalConfig) -> Vec<TranscriptItem> {
         let mut entries = vec![];
         let cfg = config.read();
         let state = cfg.state();
@@ -113,25 +114,30 @@ impl Tui {
             env!("CARGO_PKG_VERSION")
         )));
 
-        // Show agent banner and conversation starters if an agent is active
-        if state.contains(harnx_runtime::config::StateFlags::AGENT) {
-            if let Ok(banner) = cfg.agent_banner() {
-                if !banner.trim().is_empty() {
-                    entries.push(TranscriptItem::AssistantText(banner));
+        let history = session_history_transcript_items(config);
+        if !history.is_empty() {
+            entries.extend(history);
+        } else {
+            // Show agent banner and conversation starters if an agent is active
+            if state.contains(harnx_runtime::config::StateFlags::AGENT) {
+                if let Ok(banner) = cfg.agent_banner() {
+                    if !banner.trim().is_empty() {
+                        entries.push(TranscriptItem::AssistantText(banner));
+                    }
                 }
-            }
-            if let Some(agent) = &cfg.agent {
-                let starters = agent.conversation_staters();
-                if !starters.is_empty() {
-                    let list = starters
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| format!("  {}. {s}", i + 1))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    entries.push(TranscriptItem::SystemText(format!(
-                        "Conversation starters:\n{list}\n(type .starter <n> to use)"
-                    )));
+                if let Some(agent) = &cfg.agent {
+                    let starters = agent.conversation_staters();
+                    if !starters.is_empty() {
+                        let list = starters
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| format!("  {}. {s}", i + 1))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        entries.push(TranscriptItem::SystemText(format!(
+                            "Conversation starters:\n{list}\n(type .starter <n> to use)"
+                        )));
+                    }
                 }
             }
         }
@@ -271,4 +277,74 @@ impl Tui {
         })
         .await
     }
+}
+
+pub(crate) fn messages_to_transcript_items(messages: &[Message]) -> Vec<TranscriptItem> {
+    use harnx_core::message::{MessageContent, MessageRole};
+    use serde_json::Value;
+
+    let mut items = Vec::new();
+    for msg in messages {
+        match msg.role {
+            MessageRole::System => {}
+            MessageRole::User => {
+                let text = msg.content.to_text();
+                if !text.is_empty() {
+                    items.push(TranscriptItem::UserText(text));
+                }
+            }
+            MessageRole::Assistant => {
+                let text = msg.content.to_text();
+                if !text.is_empty() {
+                    items.push(TranscriptItem::AssistantText(text));
+                }
+            }
+            MessageRole::Tool => {
+                if let MessageContent::ToolCalls(ref tc) = msg.content {
+                    if !tc.thought.as_deref().unwrap_or("").trim().is_empty() {
+                        items.push(TranscriptItem::ThoughtText(
+                            tc.thought.as_deref().unwrap().trim().to_string(),
+                        ));
+                    }
+                    if !tc.text.trim().is_empty() {
+                        items.push(TranscriptItem::AssistantText(tc.text.clone()));
+                    }
+                    for r in &tc.tool_results {
+                        let input_yaml = if r.call.arguments == Value::Null {
+                            None
+                        } else {
+                            Some(harnx_runtime::utils::pretty_yaml_block(&r.call.arguments))
+                        };
+                        items.push(TranscriptItem::ToolCall {
+                            tool_name: r.call.name.clone(),
+                            input_yaml,
+                        });
+                        for line in crate::agent_event_sink::render_tool_result_text(&r.output, &[])
+                            .split('\n')
+                        {
+                            if !line.is_empty() {
+                                items.push(TranscriptItem::ToolResultText(line.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    items
+}
+
+pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<TranscriptItem> {
+    let cfg = config.read();
+    let session = match cfg.session.as_ref() {
+        Some(s) if !s.is_empty() => s,
+        _ => return vec![],
+    };
+    let mut items = Vec::new();
+    if !session.compressed_messages.is_empty() {
+        items.extend(messages_to_transcript_items(&session.compressed_messages));
+        items.push(TranscriptItem::SystemText("─── session compacted ───".to_string()));
+    }
+    items.extend(messages_to_transcript_items(&session.messages));
+    items
 }

@@ -1221,7 +1221,40 @@ impl Tui {
         vec![]
     }
 
+    fn reconcile_transcript_after_command(
+        &mut self,
+        prev_session: Option<String>,
+        prev_agent: Option<String>,
+        command_was: &str,
+    ) {
+        let (curr_session, curr_agent) = {
+            let cfg = self.config.read();
+            let s = cfg.session.as_ref().map(|s| s.name().to_string());
+            let a = cfg.agent.as_ref().map(|a| a.name().to_string());
+            (s, a)
+        };
+
+        let needs_reconcile = curr_session != prev_session
+            || curr_agent != prev_agent
+            || command_was.starts_with(".empty session")
+            || command_was.starts_with(".reset session")
+            || command_was.starts_with(".reset repl")
+            || command_was.starts_with(".compact session")
+            || command_was.starts_with(".edit session");
+
+        if !needs_reconcile {
+            return;
+        }
+
+        self.app.transcript.clear();
+        self.app.streaming_assistant_idx = None;
+        self.app.transcript = Self::build_initial_transcript(&self.config);
+        self.pin_transcript_to_bottom();
+    }
+
     pub(super) async fn run_command(&mut self, line: &str) -> Result<()> {
+        let prev_session = self.config.read().session.as_ref().map(|s| s.name().to_string());
+        let prev_agent = self.config.read().agent.as_ref().map(|a| a.name().to_string());
         // Run the command inside a block that owns the lock guards so they are
         // dropped before we touch `self` again for transcript / UI updates.
         let (result, captured) = {
@@ -1266,6 +1299,7 @@ impl Tui {
                     llm_busy,
                     pending_message,
                 );
+                self.reconcile_transcript_after_command(prev_session, prev_agent, line);
             }
             Err(err) => {
                 self.app
