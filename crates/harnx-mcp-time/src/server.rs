@@ -3,12 +3,12 @@ use chrono_tz::Tz;
 use jiff::{civil, Span, Timestamp};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    Meta, PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 #[derive(Clone)]
 pub struct TimeServer {
@@ -270,7 +270,11 @@ impl ServerHandler for TimeServer {
                     &["timezone"],
                 ),
             )
-            .annotate(read_only.clone()),
+            .annotate(read_only.clone())
+            .with_meta(Meta(json!({
+                "call_template": "**get time**{% if args.timezone %} ({{ args.timezone }}){% endif %}",
+                "result_template": "{{ result.content[0].text | default('') }}"
+            }).as_object().unwrap().clone())),
             Tool::new(
                 "convert_time",
                 "Convert, offset, and reformat timestamps",
@@ -329,7 +333,11 @@ impl ServerHandler for TimeServer {
                     &[],
                 ),
             )
-            .annotate(read_only.clone()),
+            .annotate(read_only.clone())
+            .with_meta(Meta(json!({
+                "call_template": "**convert time**{% if args.isoTimestamp %} from {{ args.isoTimestamp }}{% endif %}",
+                "result_template": "{{ result.content[0].text | default('') }}"
+            }).as_object().unwrap().clone())),
             Tool::new(
                 "wait",
                 "Wait/sleep for a specified number of seconds (max 3600). Useful for polling or rate-limiting.",
@@ -348,7 +356,11 @@ impl ServerHandler for TimeServer {
                     .destructive(false)
                     .idempotent(false)
                     .open_world(false),
-            ),
+            )
+            .with_meta(Meta(json!({
+                "call_template": "**wait** {{ args.seconds }}s",
+                "result_template": "{{ result.content[0].text | default('') }}"
+            }).as_object().unwrap().clone())),
             Tool::new(
                 "wait_until",
                 "Wait until a specific time. Accepts HH:MM (today/tomorrow), or full datetime YYYY-MM-DDTHH:MM. Max 24 hours.",
@@ -376,7 +388,11 @@ impl ServerHandler for TimeServer {
                     .destructive(false)
                     .idempotent(false)
                     .open_world(false),
-            ),
+            )
+            .with_meta(Meta(json!({
+                "call_template": "**wait until** {{ args.time }}",
+                "result_template": "{{ result.content[0].text | default('') }}"
+            }).as_object().unwrap().clone())),
         ];
 
         Ok(ListToolsResult {

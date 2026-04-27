@@ -7,13 +7,13 @@ use harnx_hooks::HookEvent;
 use harnx_mcp::safety::{truncate_output, TruncateOpts};
 
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use harnx_core::tool::ToolProvider;
 pub use harnx_core::tool::{
-    extract_user_display_text, JsonSchema, SwitchAgentData, ToolCall, ToolDeclaration, ToolResult,
-    Tools,
+    extract_user_display_text, render_tool_call_template, render_tool_result_template, JsonSchema,
+    SwitchAgentData, ToolCall, ToolDeclaration, ToolResult, Tools,
 };
 pub use harnx_engine::tool::{
     eval_tool_calls, ConfirmToolUseFn, DispatchHookFn, ToolCallEmitFn, ToolEvalContext,
@@ -88,11 +88,14 @@ pub fn build_tool_eval_context(
     agent_use_tools: Option<&str>,
 ) -> ToolEvalContext {
     let guard = config.read();
-    let allowed_tool_names: HashSet<String> = guard
-        .tool_declarations_for_use_tools(agent_use_tools)
-        .into_iter()
-        .map(|decl| decl.name)
-        .collect();
+    let decl_map: Arc<HashMap<String, ToolDeclaration>> = Arc::new(
+        guard
+            .tool_declarations_for_use_tools(agent_use_tools)
+            .into_iter()
+            .map(|d| (d.name.clone(), d))
+            .collect(),
+    );
+    let allowed_tool_names: HashSet<String> = decl_map.keys().cloned().collect();
     let hooks = guard.resolved_hooks();
     let acp_manager = guard.acp_manager.clone();
     let mcp_manager = guard.mcp_manager.clone();
@@ -127,8 +130,18 @@ pub fn build_tool_eval_context(
         })
     });
 
-    let emit_tool_call_fn: Arc<ToolCallEmitFn> = Arc::new(default_emit_tool_call);
-    let emit_tool_result_fn: Arc<ToolCallEmitFn> = Arc::new(default_emit_tool_result);
+    let decl_map_clone = Arc::clone(&decl_map);
+    let emit_tool_call_fn: Arc<ToolCallEmitFn> =
+        Arc::new(move |call: &ToolCall, json_data: &Value| {
+            emit_tool_call_with_template(call, json_data, &decl_map_clone);
+        });
+
+    let decl_map_clone2 = Arc::clone(&decl_map);
+    let emit_tool_result_fn: Arc<ToolCallEmitFn> =
+        Arc::new(move |call: &ToolCall, result: &Value| {
+            emit_tool_result_with_template(call, result, &decl_map_clone2);
+        });
+
     let confirm_tool_use_fn: Arc<ConfirmToolUseFn> = Arc::new(default_confirm_tool_use);
 
     ToolEvalContext {
@@ -142,57 +155,155 @@ pub fn build_tool_eval_context(
     }
 }
 
-fn default_emit_tool_call(call: &ToolCall, json_data: &Value) {
+/// Look up and render the call template for a tool, returning rendered string or None.
+/// Logs warning to stderr on render error.
+fn render_call(
+    call: &ToolCall,
+    json_data: &Value,
+    raw_fallback: &str,
+    decl_map: &HashMap<String, ToolDeclaration>,
+) -> Option<String> {
+    let tmpl = decl_map.get(&call.name)?.call_template.as_ref()?;
+    Some(
+        render_tool_call_template(tmpl, json_data, raw_fallback).unwrap_or_else(|e| {
+            eprintln!(
+                "⚠ template error in tool '{}' call_template: {e}",
+                call.name
+            );
+            raw_fallback.to_string()
+        }),
+    )
+}
+
+/// Look up and render result template for a tool, returning rendered string or None.
+/// Logs warning to stderr on render error.
+fn render_result(
+    call: &ToolCall,
+    result: &Value,
+    raw_fallback: &str,
+    decl_map: &HashMap<String, ToolDeclaration>,
+) -> Option<String> {
+    let tmpl = decl_map.get(&call.name)?.result_template.as_ref()?;
+    Some(
+        render_tool_result_template(tmpl, result, raw_fallback).unwrap_or_else(|e| {
+            eprintln!(
+                "⚠ template error in tool '{}' result_template: {e}",
+                call.name
+            );
+            raw_fallback.to_string()
+        }),
+    )
+}
+
+/// Emit a tool call event with optional template rendering.
+fn emit_tool_call_with_template(
+    call: &ToolCall,
+    json_data: &Value,
+    decl_map: &HashMap<String, ToolDeclaration>,
+) {
     use harnx_core::event::{AgentEvent, ToolEvent, ToolKind};
+
+    let raw_fallback = match json_data {
+        Value::Null => String::new(),
+        _ => pretty_yaml_block(json_data),
+    };
+
+    let title = render_call(call, json_data, &raw_fallback, decl_map);
+
     let event = AgentEvent::Tool(ToolEvent::Started {
         id: call.id.clone().unwrap_or_default(),
         name: call.name.clone(),
         kind: ToolKind::Other,
-        title: None,
+        title,
         input: json_data.clone(),
         locations: Vec::new(),
     });
+
     if !harnx_core::sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
-        // No sink installed (test context) — keep a visible fallback so
-        // the batch doesn't go dark.
-        let input_yaml = match json_data {
-            Value::Null => None,
-            _ => Some(pretty_yaml_block(json_data)),
-        };
-        let text = match input_yaml {
-            Some(yaml) => format!("[tool] {} {yaml}", call.name),
-            None => format!("[tool] {}", call.name),
+        print_tool_call_fallback(call, json_data, decl_map, &raw_fallback);
+    }
+}
+
+/// Fallback print for tool call when no sink is installed.
+fn print_tool_call_fallback(
+    call: &ToolCall,
+    json_data: &Value,
+    decl_map: &HashMap<String, ToolDeclaration>,
+    raw_fallback: &str,
+) {
+    if let Some(rendered) = render_call(call, json_data, raw_fallback, decl_map) {
+        println!("[tool] {} {}", call.name, rendered);
+    } else {
+        let text = if raw_fallback.is_empty() {
+            format!("[tool] {}", call.name)
+        } else {
+            format!("[tool] {} {raw_fallback}", call.name)
         };
         println!("{text}");
     }
 }
 
-fn default_emit_tool_result(call: &ToolCall, result: &Value) {
-    use harnx_core::event::{AgentEvent, ToolEvent};
+/// Emit a tool result event with optional template rendering.
+fn emit_tool_result_with_template(
+    call: &ToolCall,
+    result: &Value,
+    decl_map: &HashMap<String, ToolDeclaration>,
+) {
+    use harnx_core::event::{AgentEvent, ContentBlock, ToolEvent};
+
+    let raw_fallback = extract_user_display_text(result).unwrap_or_else(|| match result {
+        Value::String(s) => s.clone(),
+        _ => pretty_yaml_block(result),
+    });
+
+    let content = render_result(call, result, &raw_fallback, decl_map)
+        .map(|text| vec![ContentBlock::Text(text)])
+        .unwrap_or_default();
+
     let event = AgentEvent::Tool(ToolEvent::Completed {
         id: call.id.clone().unwrap_or_default(),
         output: result.clone(),
-        content: Vec::new(),
+        content,
     });
+
     if !harnx_core::sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
-        // No sink installed — fall back to the old format-and-print path.
-        let mut opts = TruncateOpts::default();
-        let marker = " [...] ";
-        if let Ok((cols, rows)) = crossterm::terminal::size() {
+        print_tool_result_fallback(call, result, decl_map, &raw_fallback);
+    }
+}
+
+/// Fallback print for tool result when no sink is installed.
+fn print_tool_result_fallback(
+    call: &ToolCall,
+    result: &Value,
+    decl_map: &HashMap<String, ToolDeclaration>,
+    raw_fallback: &str,
+) {
+    let output_str = render_result(call, result, raw_fallback, decl_map)
+        .unwrap_or_else(|| raw_fallback.to_string());
+
+    let mut opts = TruncateOpts::default();
+    let marker = " [...] ";
+    match crossterm::terminal::size() {
+        Ok((cols, rows)) => {
             opts.head_lines = 5.max((rows / 2) as usize);
             opts.tail_lines = 0;
             opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
             opts.line_tail_bytes = 0;
             opts.marker = Some(marker.to_string());
         }
-        let output_str = extract_user_display_text(result).unwrap_or_else(|| match result {
-            Value::String(s) => s.clone(),
-            _ => pretty_yaml_block(result),
-        });
-        let truncated = truncate_output(&output_str, &opts);
-        let text = format!("{}\n", dimmed_text(&truncated));
-        print!("{text}");
+        Err(e) => {
+            // Terminal size unavailable (e.g. CI, piped output) — use safe defaults
+            eprintln!("debug: failed to get terminal size: {e}");
+            opts.head_lines = 20;
+            opts.tail_lines = 0;
+            opts.line_head_bytes = 200;
+            opts.line_tail_bytes = 0;
+            opts.marker = Some(marker.to_string());
+        }
     }
+    let truncated = truncate_output(&output_str, &opts);
+    let text = format!("{}\n", dimmed_text(&truncated));
+    print!("{text}");
 }
 
 fn default_confirm_tool_use(tool_name: &str, arguments: &Value, reason: Option<&str>) -> bool {

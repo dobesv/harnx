@@ -7,6 +7,7 @@
 use crate::abort::AbortSignal;
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use minijinja::{Environment, Error, UndefinedBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -92,6 +93,46 @@ pub struct ToolDeclaration {
     pub parameters: JsonSchema,
     #[serde(skip, default)]
     pub mcp_tool_name: Option<String>,
+    #[serde(skip, default)]
+    pub call_template: Option<String>,
+    #[serde(skip, default)]
+    pub result_template: Option<String>,
+}
+
+fn make_template_env<'a>() -> Environment<'a> {
+    let mut env = Environment::new();
+    env.set_undefined_behavior(UndefinedBehavior::Lenient);
+    env
+}
+
+/// Render a MiniJinja call template.
+/// `raw_fallback` is default display string (YAML of args) — available as `raw()` in template.
+/// Returns `Err(minijinja::Error)` on failure so callers can log error.
+pub fn render_tool_call_template(
+    template: &str,
+    args: &serde_json::Value,
+    raw_fallback: &str,
+) -> Result<String, Error> {
+    let raw = raw_fallback.to_string();
+    let mut env = make_template_env();
+    env.add_function("raw", move || Ok(raw.clone()));
+    let ctx = serde_json::json!({ "args": args });
+    env.render_str(template, ctx)
+}
+
+/// Render a MiniJinja result template.
+/// `raw_fallback` is default display string (extract_user_display_text → YAML) — available as `raw()` in template.
+/// Returns `Err(minijinja::Error)` on failure so callers can log error.
+pub fn render_tool_result_template(
+    template: &str,
+    result: &serde_json::Value,
+    raw_fallback: &str,
+) -> Result<String, Error> {
+    let raw = raw_fallback.to_string();
+    let mut env = make_template_env();
+    env.add_function("raw", move || Ok(raw.clone()));
+    let ctx = serde_json::json!({ "result": result });
+    env.render_str(template, ctx)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -397,5 +438,104 @@ mod tests {
             extract_user_display_text(&result),
             Some("has annotations but no audience".to_string())
         );
+    }
+
+    #[test]
+    fn test_render_tool_call_template_basic() {
+        let result = render_tool_call_template(
+            "{{ args.command }}",
+            &serde_json::json!({"command": "ls"}),
+            "fallback",
+        );
+        assert_eq!(result.unwrap(), "ls");
+    }
+
+    #[test]
+    fn test_render_tool_call_template_nested() {
+        let result = render_tool_call_template(
+            "{{ args.path }}",
+            &serde_json::json!({"path": "/tmp"}),
+            "fallback",
+        );
+        assert_eq!(result.unwrap(), "/tmp");
+    }
+
+    #[test]
+    fn test_render_tool_call_template_missing_var() {
+        // Lenient mode: missing variable renders as empty string, not an error
+        let result =
+            render_tool_call_template("{{ args.missing }}", &serde_json::json!({}), "fallback");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "");
+    }
+
+    #[test]
+    fn test_render_tool_call_template_with_raw_fallback() {
+        let result = render_tool_call_template(
+            "{{ raw() }}",
+            &serde_json::json!({"command": "ls"}),
+            "fallback yaml",
+        );
+        assert_eq!(result.unwrap(), "fallback yaml");
+    }
+
+    #[test]
+    fn test_render_tool_call_template_default_with_raw() {
+        let result = render_tool_call_template(
+            "{{ args.command | default(raw()) }}",
+            &serde_json::json!({"command": "ls -la"}),
+            "fallback",
+        );
+        assert_eq!(result.unwrap(), "ls -la");
+    }
+
+    #[test]
+    fn test_render_tool_call_template_missing_uses_raw() {
+        let result = render_tool_call_template(
+            "{{ args.missing | default(raw()) }}",
+            &serde_json::json!({}),
+            "yaml fallback",
+        );
+        assert_eq!(result.unwrap(), "yaml fallback");
+    }
+
+    #[test]
+    fn test_render_tool_call_template_returns_err_on_bad_syntax() {
+        let result = render_tool_call_template(
+            "{{ args.command",
+            &serde_json::json!({"command": "ls"}),
+            "fallback",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_render_tool_result_template_basic() {
+        let result_val = serde_json::json!({"content": [{"text": "hello world"}]});
+        let rendered =
+            render_tool_result_template("{{ result.content[0].text }}", &result_val, "fallback");
+        assert_eq!(rendered.unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_render_tool_result_template_with_conditional() {
+        let result_val = serde_json::json!({"content": [{"text": "output"}], "isError": false});
+        let rendered = render_tool_result_template(
+            "{% if result.isError %}ERROR: {% endif %}{{ result.content[0].text | default(raw()) }}",
+            &result_val,
+            "raw fallback",
+        );
+        assert_eq!(rendered.unwrap(), "output");
+    }
+
+    #[test]
+    fn test_render_tool_result_template_error_flag() {
+        let result_val = serde_json::json!({"content": [{"text": "boom"}], "isError": true});
+        let rendered = render_tool_result_template(
+            "{% if result.isError %}ERROR: {% endif %}{{ result.content[0].text | default(raw()) }}",
+            &result_val,
+            "raw fallback",
+        );
+        assert_eq!(rendered.unwrap(), "ERROR: boom");
     }
 }
