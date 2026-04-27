@@ -55,6 +55,12 @@ Harnx can load environment variables from a `.env` file located in the configura
 - **<AGENT_NAME>_CONFIG_FILE**: The configuration file for a specific agent.
 - **Agent config env vars**: Environment variables for agent configuration.
 
+## Local History Envs
+
+- **HARNX_HISTORY_MAX_FILES**: Maximum number of files allowed in a single snapshot. Default: `10000`
+- **HARNX_HISTORY_MAX_FILE_BYTES**: Maximum size in bytes for an individual file in a snapshot. Default: `10485760` (10 MiB)
+- **HARNX_HISTORY_MAX_TOTAL_BYTES**: Maximum total size in bytes for all files in a single snapshot. Default: `104857600` (100 MiB)
+
 ## Logging Envs
 
 - **HARNX_LOG_LEVEL**: The log level (e.g., `debug`, `info`).

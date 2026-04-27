@@ -10,8 +10,11 @@ description = "MCP server that exposes filesystem operations with safety guards"
 [dependencies]
 anyhow = { workspace = true }
 fancy-regex = { workspace = true }
+gix = { workspace = true }
 glob = { workspace = true }
 harnx-mcp = { path = "../harnx-mcp" }
+harnx-mcp-history = { workspace = true }
+log = { workspace = true }
 rmcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

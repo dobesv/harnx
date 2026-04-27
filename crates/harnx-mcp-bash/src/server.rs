@@ -4,6 +4,8 @@ use harnx_mcp::safety::{
 };
 
 use fancy_regex::Regex;
+use gix::ObjectId;
+use harnx_mcp_history::HistoryManager;
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
@@ -194,6 +196,27 @@ impl JsonSchema for TerminateParams {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct RollbackParams {
+    commit_id: String,
+    repo_path: String,
+}
+
+impl JsonSchema for RollbackParams {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("RollbackParams")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let commit_id = generator.subschema_for::<String>();
+        let repo_path = generator.subschema_for::<String>();
+        object_schema(
+            vec![("commit_id", commit_id), ("repo_path", repo_path)],
+            &["commit_id", "repo_path"],
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Spawned process tracking
 // ---------------------------------------------------------------------------
@@ -203,6 +226,7 @@ struct SpawnedProcess {
     command: String,
     working_dir: PathBuf,
     log_path: PathBuf,
+    before_snap_ids: Vec<(PathBuf, gix::ObjectId)>,
 }
 
 struct BashServerInner {
@@ -212,6 +236,7 @@ struct BashServerInner {
     log_dir: PathBuf,
     spawn_counter: AtomicU64,
     exec_counter: AtomicU64,
+    history: Arc<HistoryManager>,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,12 +257,13 @@ impl BashServer {
         ));
         Self {
             inner: Arc::new(BashServerInner {
-                roots: RwLock::new(initial_roots),
+                roots: RwLock::new(initial_roots.clone()),
                 roots_initialized: AtomicBool::new(false),
                 spawned: Mutex::new(HashMap::new()),
                 log_dir,
                 spawn_counter: AtomicU64::new(0),
                 exec_counter: AtomicU64::new(0),
+                history: Arc::new(HistoryManager::new(&initial_roots)),
             }),
         }
     }
@@ -338,6 +364,18 @@ impl BashServer {
         let working_dir = self
             .resolve_working_dir(params.working_dir.as_deref())
             .await?;
+
+        // HISTORY: before snapshot (non-fatal)
+        let before_snaps = self
+            .inner
+            .history
+            .snapshot_repos_for_dir(&working_dir, "before exec")
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("history before-snapshot failed: {e}");
+                vec![]
+            });
+
         let timeout_secs = params.timeout_secs.unwrap_or(120);
         let default_opts = TruncateOpts::default();
         let truncate_opts = TruncateOpts {
@@ -467,10 +505,48 @@ impl BashServer {
                     "exit_code: {exit_code}, {total_lines} lines, {}",
                     format_size(total_bytes)
                 );
-                Ok(CallToolResult::success(vec![
+
+                // HISTORY: after snapshot + diff (non-fatal)
+                let mut diff_parts: Vec<String> = Vec::new();
+                if !before_snaps.is_empty() {
+                    let after_snaps = self
+                        .inner
+                        .history
+                        .snapshot_repos_for_dir(&working_dir, "after exec")
+                        .await
+                        .unwrap_or_else(|e| {
+                            log::warn!("history after-snapshot failed: {e}");
+                            vec![]
+                        });
+
+                    for (repo_dir, before_id) in &before_snaps {
+                        if let Some((_, after_id)) = after_snaps.iter().find(|(d, _)| d == repo_dir)
+                        {
+                            // Always emit snapshot ID
+                            if before_id != after_id {
+                                match self
+                                    .inner
+                                    .history
+                                    .diff_commits(repo_dir, *before_id, *after_id)
+                                    .await
+                                {
+                                    Ok(diff) if !diff.is_empty() => diff_parts.push(diff),
+                                    Ok(_) => {}
+                                    Err(e) => log::warn!("history diff failed: {e}"),
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut contents = vec![
                     Content::text(output).with_audience(vec![Role::Assistant]),
                     Content::text(summary).with_audience(vec![Role::User]),
-                ]))
+                ];
+                for diff in diff_parts {
+                    contents.push(Content::text(diff));
+                }
+                Ok(CallToolResult::success(contents))
             }
             (Some(status), true) => {
                 let _ = status;
@@ -657,6 +733,17 @@ impl BashServer {
             .resolve_working_dir(params.working_dir.as_deref())
             .await?;
 
+        // HISTORY: before snapshot (non-fatal)
+        let before_snap_ids = self
+            .inner
+            .history
+            .snapshot_repos_for_dir(&working_dir, "before spawn")
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("history before-snapshot failed: {e}");
+                vec![]
+            });
+
         self.ensure_log_dir().await?;
 
         let seq = self.inner.spawn_counter.fetch_add(1, Ordering::SeqCst);
@@ -698,6 +785,7 @@ impl BashServer {
             command: params.command.clone(),
             working_dir: working_dir.clone(),
             log_path: log_path.clone(),
+            before_snap_ids,
         };
 
         self.inner.spawned.lock().await.insert(pid, entry);
@@ -723,7 +811,7 @@ impl BashServer {
         let timeout_secs = params.timeout_secs.unwrap_or(120);
         let tail_line_count = params.tail_lines.unwrap_or(20);
 
-        let (mut child, command, working_dir, log_path) = {
+        let (mut child, command, working_dir, log_path, before_snap_ids) = {
             let mut map = self.inner.spawned.lock().await;
             let entry = map.remove(&params.pid).ok_or_else(|| {
                 ErrorData::invalid_params(
@@ -739,6 +827,7 @@ impl BashServer {
                 entry.command,
                 entry.working_dir,
                 entry.log_path,
+                entry.before_snap_ids,
             )
         };
 
@@ -759,10 +848,47 @@ impl BashServer {
                 let _ = writeln!(output, "log_path: {}", log_path.display());
                 let _ = write!(output, "\n{log_tail}");
                 let summary = format!("pid {} exited with code {exit_code}", params.pid);
-                Ok(CallToolResult::success(vec![
+
+                // HISTORY: after snapshot + diff (non-fatal)
+                let mut diff_parts: Vec<String> = Vec::new();
+                if !before_snap_ids.is_empty() {
+                    let after_snaps = self
+                        .inner
+                        .history
+                        .snapshot_repos_for_dir(&working_dir, "after wait")
+                        .await
+                        .unwrap_or_else(|e| {
+                            log::warn!("history after-snapshot failed: {e}");
+                            vec![]
+                        });
+                    for (repo_dir, before_id) in &before_snap_ids {
+                        if let Some((_, after_id)) = after_snaps.iter().find(|(d, _)| d == repo_dir)
+                        {
+                            // Always emit snapshot ID
+                            if before_id != after_id {
+                                match self
+                                    .inner
+                                    .history
+                                    .diff_commits(repo_dir, *before_id, *after_id)
+                                    .await
+                                {
+                                    Ok(diff) if !diff.is_empty() => diff_parts.push(diff),
+                                    Ok(_) => {}
+                                    Err(e) => log::warn!("history diff failed: {e}"),
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut contents = vec![
                     Content::text(output).with_audience(vec![Role::Assistant]),
                     Content::text(summary).with_audience(vec![Role::User]),
-                ]))
+                ];
+                for diff in diff_parts {
+                    contents.push(Content::text(diff));
+                }
+                Ok(CallToolResult::success(contents))
             }
             Ok(Err(err)) => Err(internal_error(format!(
                 "failed waiting for pid {}: {err}",
@@ -777,6 +903,7 @@ impl BashServer {
                         command: command.clone(),
                         working_dir: working_dir.clone(),
                         log_path: log_path.clone(),
+                        before_snap_ids,
                     },
                 );
 
@@ -878,6 +1005,39 @@ impl BashServer {
                 Content::text(summary).with_audience(vec![Role::User]),
             ]))
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // rollback_file
+    // -----------------------------------------------------------------------
+
+    async fn rollback_file_impl(
+        &self,
+        params: RollbackParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let roots = self.inner.roots.read().await;
+        let path = validate_path(&params.repo_path, &roots).map_err(invalid_params)?;
+        drop(roots);
+
+        let commit_id = ObjectId::from_hex(params.commit_id.as_bytes())
+            .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
+
+        let repo_dir = harnx_mcp_history::discover::find_repo_for_path(&path).ok_or_else(|| {
+            ErrorData::invalid_params("path is not inside a git repository".to_string(), None)
+        })?;
+
+        let new_commit_id = self
+            .inner
+            .history
+            .rollback(&repo_dir, commit_id)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("rollback failed: {e}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Rolled back to harnx snapshot {}; new commit {} created (can be reverted)",
+            &params.commit_id[..8.min(params.commit_id.len())],
+            new_commit_id.to_hex(),
+        ))]))
     }
 
     // -----------------------------------------------------------------------
@@ -1025,6 +1185,16 @@ impl ServerHandler for BashServer {
                     "call_template": "**terminate** PID {{ args.pid }}{% if args.signal %} ({{ args.signal }}){% endif %}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
+                Tool::new(
+                    "rollback_file",
+                    "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.",
+                    Map::new(),
+                )
+                .with_input_schema::<RollbackParams>()
+                .with_meta(Meta(json!({
+                    "call_template": "**rollback_file** to `{{ args.commit_id | truncate(8, end='') }}`",
+                    "result_template": "{{ result.content[0].text | default('') }}"
+                }).as_object().unwrap().clone())),
             ],
             next_cursor: None,
         })
@@ -1063,6 +1233,10 @@ impl ServerHandler for BashServer {
                 let params = parse_arguments::<TerminateParams>(request.arguments)?;
                 self.terminate_impl(params).await
             }
+            "rollback_file" => {
+                let params = parse_arguments::<RollbackParams>(request.arguments)?;
+                self.rollback_file_impl(params).await
+            }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
                 None,
@@ -1099,6 +1273,10 @@ fn parse_arguments<T: DeserializeOwned>(
 
 fn tool_error(msg: impl Into<String>) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::error(vec![Content::text(msg.into())]))
+}
+
+fn invalid_params(msg: impl Into<Cow<'static, str>>) -> ErrorData {
+    ErrorData::invalid_params(msg, None)
 }
 
 fn internal_error(msg: impl Into<Cow<'static, str>>) -> ErrorData {
