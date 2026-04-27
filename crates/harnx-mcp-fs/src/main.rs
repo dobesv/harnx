@@ -12,6 +12,7 @@
 //! If no roots are specified (via CLI or MCP client), all operations are denied.
 
 mod server;
+mod summary;
 
 use rmcp::ServiceExt;
 use server::FsServer;
