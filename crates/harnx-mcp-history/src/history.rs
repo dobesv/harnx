@@ -501,6 +501,14 @@ mod tests {
             .status()
             .expect("config user.email");
         assert!(status.success(), "git config user.email failed");
+
+        // Disable autocrlf so line endings are preserved exactly on Windows.
+        let status = std::process::Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(dir)
+            .status()
+            .expect("config core.autocrlf");
+        assert!(status.success(), "git config core.autocrlf failed");
     }
 
     fn add_file_to_git(dir: &Path, rel: &str, contents: &[u8]) {

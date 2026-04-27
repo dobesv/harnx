@@ -88,12 +88,18 @@ mod tests {
         String::from_utf8(output.stdout).expect("utf8 git output")
     }
 
+    fn init_git_repo(dir: &std::path::Path) {
+        run_git(dir, &["init"]);
+        run_git(dir, &["config", "user.name", "Test User"]);
+        run_git(dir, &["config", "user.email", "test@example.com"]);
+        // Disable autocrlf so line endings are preserved exactly on Windows.
+        run_git(dir, &["config", "core.autocrlf", "false"]);
+    }
+
     #[test]
     fn test_diff_commits() {
         let temp = tempdir().expect("tempdir");
-        run_git(temp.path(), &["init"]);
-        run_git(temp.path(), &["config", "user.name", "Test User"]);
-        run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+        init_git_repo(temp.path());
 
         let file = temp.path().join("note.txt");
         fs::write(&file, "before\n").expect("write before");

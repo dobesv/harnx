@@ -144,6 +144,16 @@ mod tests {
         assert!(status.success(), "git {:?} failed", args);
     }
 
+    fn init_git_repo(dir: &std::path::Path) {
+        run_git(dir, &["init"]);
+        run_git(dir, &["config", "user.name", "Test User"]);
+        run_git(dir, &["config", "user.email", "test@example.com"]);
+        // Disable autocrlf so line endings in snapshotted files are preserved
+        // exactly on Windows; without this git rewrites LF→CRLF on checkout
+        // and the restored file content no longer matches what we snapshotted.
+        run_git(dir, &["config", "core.autocrlf", "false"]);
+    }
+
     fn output_git(dir: &std::path::Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .args(args)
@@ -157,9 +167,7 @@ mod tests {
     #[test]
     fn test_rollback_rejects_non_history_commit() {
         let temp = tempdir().expect("tempdir");
-        run_git(temp.path(), &["init"]);
-        run_git(temp.path(), &["config", "user.name", "Test User"]);
-        run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+        init_git_repo(temp.path());
 
         let file = temp.path().join("file.txt");
         fs::write(&file, "hello\n").expect("write file");
@@ -189,9 +197,7 @@ mod tests {
     #[test]
     fn test_rollback_restores_file() {
         let temp = tempdir().expect("tempdir");
-        run_git(temp.path(), &["init"]);
-        run_git(temp.path(), &["config", "user.name", "Test User"]);
-        run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+        init_git_repo(temp.path());
 
         let file = temp.path().join("file.txt");
         fs::write(&file, "before\n").expect("write before");
