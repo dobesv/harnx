@@ -20,6 +20,17 @@ pub fn diff_commits_blocking(
         .peel_to_tree()
         .context("peel after commit to tree")?;
 
+    let after_commit = repo
+        .find_object(after_id)
+        .context("find after commit for header")?
+        .peel_to_commit()
+        .context("peel after commit for header")?;
+    let title = after_commit
+        .message()
+        .map(|m| m.title.to_string())
+        .unwrap_or_else(|_| String::from("harnx snapshot"));
+    let header = format!("commit {}\n    {}\n\n", after_id.to_hex(), title.trim());
+
     let workdir = repo.workdir().unwrap_or_else(|| repo.path());
     let output = Command::new("git")
         .arg("diff")
@@ -34,10 +45,15 @@ pub fn diff_commits_blocking(
         anyhow::bail!("git diff failed: {stderr}");
     }
 
-    let mut diff = String::from_utf8(output.stdout).context("git diff output not utf-8")?;
+    let mut diff = header;
+    diff.push_str(&String::from_utf8(output.stdout).context("git diff output not utf-8")?);
     if diff.len() > MAX_DIFF_BYTES {
         diff.truncate(MAX_DIFF_BYTES);
-        diff.push_str("\n[diff truncated]");
+        let short = &after_id.to_hex().to_string()[..12];
+        diff.push_str(&format!(
+            "\n[ ... diff truncated, use 'git show {}' to view full diff ... ]",
+            short
+        ));
     }
     Ok(diff)
 }
@@ -97,6 +113,8 @@ mod tests {
         )
         .expect("diff works");
 
+        assert!(diff.starts_with("commit "));
+        assert!(diff.contains(&after));
         assert!(diff.contains("-before"));
         assert!(diff.contains("+after"));
     }

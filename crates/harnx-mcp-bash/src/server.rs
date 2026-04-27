@@ -523,7 +523,6 @@ impl BashServer {
                         if let Some((_, after_id)) = after_snaps.iter().find(|(d, _)| d == repo_dir)
                         {
                             // Always emit snapshot ID
-                            diff_parts.push(format!("harnx-snapshot: {}", after_id.to_hex()));
                             if before_id != after_id {
                                 match self
                                     .inner
@@ -545,7 +544,7 @@ impl BashServer {
                     Content::text(summary).with_audience(vec![Role::User]),
                 ];
                 for diff in diff_parts {
-                    contents.push(Content::text(diff).with_audience(vec![Role::Assistant]));
+                    contents.push(Content::text(diff));
                 }
                 Ok(CallToolResult::success(contents))
             }
@@ -866,7 +865,6 @@ impl BashServer {
                         if let Some((_, after_id)) = after_snaps.iter().find(|(d, _)| d == repo_dir)
                         {
                             // Always emit snapshot ID
-                            diff_parts.push(format!("harnx-snapshot: {}", after_id.to_hex()));
                             if before_id != after_id {
                                 match self
                                     .inner
@@ -888,7 +886,7 @@ impl BashServer {
                     Content::text(summary).with_audience(vec![Role::User]),
                 ];
                 for diff in diff_parts {
-                    contents.push(Content::text(diff).with_audience(vec![Role::Assistant]));
+                    contents.push(Content::text(diff));
                 }
                 Ok(CallToolResult::success(contents))
             }
@@ -1035,16 +1033,11 @@ impl BashServer {
             .await
             .map_err(|e| ErrorData::internal_error(format!("rollback failed: {e}"), None))?;
 
-        let short_sha = &params.commit_id[..8.min(params.commit_id.len())];
-        let new_commit_hex = new_commit_id.to_hex().to_string();
-        let new_short_sha = &new_commit_hex[..8.min(new_commit_hex.len())];
-        Ok(CallToolResult::success(vec![
-            Content::text(format!(
-                "Rolled back to harnx snapshot {short_sha}; new commit {new_short_sha} created (can be reverted)"
-            )),
-            Content::text(format!("harnx-snapshot: {}", new_commit_id.to_hex()))
-                .with_audience(vec![Role::Assistant]),
-        ]))
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Rolled back to harnx snapshot {}; new commit {} created (can be reverted)",
+            &params.commit_id[..8.min(params.commit_id.len())],
+            new_commit_id.to_hex(),
+        ))]))
     }
 
     // -----------------------------------------------------------------------
@@ -1194,7 +1187,7 @@ impl ServerHandler for BashServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "rollback_file",
-                    "Restore a repository to a prior harnx history snapshot by creating a new reversible commit. The snapshot commit ID is returned in the tool response after write_file, edit_file, exec, or spawn/wait.",
+                    "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.",
                     Map::new(),
                 )
                 .with_input_schema::<RollbackParams>()

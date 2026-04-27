@@ -2875,12 +2875,10 @@ name = "harnx-mcp-history"
 version = "0.30.0"
 dependencies = [
  "anyhow",
- "dirs",
  "gix",
  "log",
  "tempfile",
  "tokio",
- "uuid",
 ]
 
 [[package]]

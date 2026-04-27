@@ -513,13 +513,10 @@ impl FsServer {
             params.content.lines().count(),
             params.path
         ))];
-        if let Some((after_id, diff_content)) = after_snap_result {
-            let mut assistant_block = diff_content;
-            if !assistant_block.is_empty() {
-                assistant_block.push('\n');
+        if let Some((_after_id, diff_content)) = after_snap_result {
+            if !diff_content.is_empty() {
+                contents.push(Content::text(diff_content));
             }
-            assistant_block.push_str(&format!("harnx-snapshot: {}", after_id.to_hex()));
-            contents.push(Content::text(assistant_block).with_audience(vec![Role::Assistant]));
         }
         Ok(CallToolResult::success(contents))
     }
@@ -626,13 +623,10 @@ impl FsServer {
             replacements,
             if replacements == 1 { "" } else { "s" }
         ))];
-        if let Some((after_id, diff_content)) = after_snap_result {
-            let mut assistant_block = diff_content;
-            if !assistant_block.is_empty() {
-                assistant_block.push('\n');
+        if let Some((_after_id, diff_content)) = after_snap_result {
+            if !diff_content.is_empty() {
+                contents.push(Content::text(diff_content));
             }
-            assistant_block.push_str(&format!("harnx-snapshot: {}", after_id.to_hex()));
-            contents.push(Content::text(assistant_block).with_audience(vec![Role::Assistant]));
         }
         Ok(CallToolResult::success(contents))
     }
@@ -868,16 +862,11 @@ impl FsServer {
             .await
             .map_err(|e| ErrorData::internal_error(format!("rollback failed: {e}"), None))?;
 
-        let short_sha = &params.commit_id[..8.min(params.commit_id.len())];
-        let new_commit_hex = new_commit_id.to_hex().to_string();
-        let new_short_sha = &new_commit_hex[..8.min(new_commit_hex.len())];
-        Ok(CallToolResult::success(vec![
-            Content::text(format!(
-                "Rolled back to harnx snapshot {short_sha}; new commit {new_short_sha} created (can be reverted)"
-            )),
-            Content::text(format!("harnx-snapshot: {}", new_commit_id.to_hex()))
-                .with_audience(vec![Role::Assistant]),
-        ]))
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Rolled back to harnx snapshot {}; new commit {} created (can be reverted)",
+            &params.commit_id[..8.min(params.commit_id.len())],
+            new_commit_id.to_hex(),
+        ))]))
     }
 }
 
@@ -934,7 +923,7 @@ impl ServerHandler for FsServer {
                     .with_input_schema::<FindFilesParams>()
                     .annotate(read_only.clone())
                     .with_meta(make_tool_meta("**find** `{{ args.pattern }}`")),
-                Tool::new("rollback_file", "Restore a repository to a prior harnx history snapshot by creating a new reversible commit. The snapshot commit ID is returned in the tool response after write_file, edit_file, exec, or spawn/wait.", Map::new())
+                Tool::new("rollback_file", "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.", Map::new())
                     .with_input_schema::<RollbackParams>()
                     .with_meta(make_tool_meta("**rollback_file** to `{{ args.commit_id | truncate(8, end='') }}`")),
             ];

@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use uuid::Uuid;
+use gix::bstr::ByteSlice;
 
 use crate::diff::diff_commits_blocking;
-use crate::discover::{find_repos_under_roots, history_dir};
+use crate::discover::find_repos_under_roots;
 use crate::rollback::rollback_to_commit_blocking;
 
 /// Maximum number of files per snapshot. Override with HARNX_HISTORY_MAX_FILES.
@@ -23,20 +23,39 @@ pub struct HistoryManager {
 
 struct HistoryManagerInner {
     repos: tokio::sync::Mutex<HashMap<PathBuf, RepoSession>>,
-    session_id: String,
-    fallback_history_dir: PathBuf,
+    last_gc: std::sync::Mutex<HashMap<PathBuf, std::time::Instant>>,
 }
 
 struct RepoSession {
     repo: gix::ThreadSafeRepository,
     last_commit_id: Option<gix::ObjectId>,
-    session_ref: String,
+}
+
+fn maybe_trigger_gc(
+    workdir: &Path,
+    last_gc: &std::sync::Mutex<HashMap<PathBuf, std::time::Instant>>,
+) {
+    const GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+    let now = std::time::Instant::now();
+    let mut map = last_gc.lock().unwrap_or_else(|e| e.into_inner());
+    let should_run = map
+        .get(workdir)
+        .map(|t| now.duration_since(*t) >= GC_INTERVAL)
+        .unwrap_or(true);
+    if should_run {
+        map.insert(workdir.to_path_buf(), now);
+        drop(map);
+        let _ = std::process::Command::new("git")
+            .args(["gc", "--auto", "--quiet"])
+            .current_dir(workdir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
 }
 
 impl HistoryManager {
     pub fn new(roots: &[PathBuf]) -> Self {
-        let session_id = Uuid::new_v4().to_string();
-        let session_ref = format!("refs/harnx-history/{session_id}");
         let mut repos = HashMap::new();
 
         for repo_root in find_repos_under_roots(roots) {
@@ -46,7 +65,6 @@ impl HistoryManager {
                     RepoSession {
                         repo: repo.into_sync(),
                         last_commit_id: None,
-                        session_ref: session_ref.clone(),
                     },
                 );
             }
@@ -55,8 +73,7 @@ impl HistoryManager {
         Self {
             inner: Arc::new(HistoryManagerInner {
                 repos: tokio::sync::Mutex::new(repos),
-                session_id,
-                fallback_history_dir: history_dir(),
+                last_gc: std::sync::Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -65,7 +82,7 @@ impl HistoryManager {
         let path = paths
             .first()
             .context("snapshot requires at least one path")?;
-        let (repo_workdir, ts_repo, parent, session_ref) = {
+        let (repo_workdir, ts_repo, parent) = {
             let repos = self.inner.repos.lock().await;
             let (workdir, session) = repos
                 .iter()
@@ -75,7 +92,6 @@ impl HistoryManager {
                 workdir.clone(),
                 session.repo.clone(),
                 session.last_commit_id,
-                session.session_ref.clone(),
             )
         };
 
@@ -83,15 +99,18 @@ impl HistoryManager {
         let repo_workdir_for_task = repo_workdir.clone();
         let commit_id = tokio::task::spawn_blocking(move || {
             let repo = ts_repo.to_thread_local();
-            capture_tree_blocking(&repo, &repo_workdir_for_task, parent, &session_ref, &label)
+            capture_tree_blocking(&repo, &repo_workdir_for_task, parent, &label)
         })
         .await
         .context("snapshot task join failed")??;
 
-        let mut repos = self.inner.repos.lock().await;
-        if let Some(session) = repos.get_mut(&repo_workdir) {
-            session.last_commit_id = Some(commit_id);
+        {
+            let mut repos = self.inner.repos.lock().await;
+            if let Some(session) = repos.get_mut(&repo_workdir) {
+                session.last_commit_id = Some(commit_id);
+            }
         }
+        maybe_trigger_gc(&repo_workdir, &self.inner.last_gc);
 
         Ok(commit_id)
     }
@@ -113,26 +132,28 @@ impl HistoryManager {
                         repo_root.clone(),
                         session.repo.clone(),
                         session.last_commit_id,
-                        session.session_ref.clone(),
                     )
                 })
                 .collect::<Vec<_>>()
         };
 
         let mut results = Vec::new();
-        for (repo_root, ts_repo, parent, session_ref) in candidates {
+        for (repo_root, ts_repo, parent) in candidates {
             let label = label.to_owned();
             let repo_root_for_task = repo_root.clone();
             let commit_id = tokio::task::spawn_blocking(move || {
                 let repo = ts_repo.to_thread_local();
-                capture_tree_blocking(&repo, &repo_root_for_task, parent, &session_ref, &label)
+                capture_tree_blocking(&repo, &repo_root_for_task, parent, &label)
             })
             .await
             .context("snapshot_repos_for_dir task join failed")??;
-            let mut repos = self.inner.repos.lock().await;
-            if let Some(session) = repos.get_mut(&repo_root) {
-                session.last_commit_id = Some(commit_id);
+            {
+                let mut repos = self.inner.repos.lock().await;
+                if let Some(session) = repos.get_mut(&repo_root) {
+                    session.last_commit_id = Some(commit_id);
+                }
             }
+            maybe_trigger_gc(&repo_root, &self.inner.last_gc);
             results.push((repo_root, commit_id));
         }
 
@@ -166,7 +187,7 @@ impl HistoryManager {
         repo_workdir: &Path,
         commit_id: gix::ObjectId,
     ) -> Result<gix::ObjectId> {
-        let (ts_repo, workdir, parent, session_ref) = {
+        let (ts_repo, workdir, parent) = {
             let repos = self.inner.repos.lock().await;
             let session = repos
                 .get(repo_workdir)
@@ -175,20 +196,12 @@ impl HistoryManager {
                 session.repo.clone(),
                 repo_workdir.to_path_buf(),
                 session.last_commit_id,
-                session.session_ref.clone(),
             )
         };
 
         let result = tokio::task::spawn_blocking(move || {
             let repo = ts_repo.to_thread_local();
-            rollback_to_commit_blocking(
-                &repo,
-                commit_id,
-                &workdir,
-                parent,
-                &session_ref,
-                "rollback",
-            )
+            rollback_to_commit_blocking(&repo, commit_id, &workdir, parent, "rollback")
         })
         .await
         .context("rollback task join failed")??;
@@ -202,35 +215,31 @@ impl HistoryManager {
         }
         Ok(after_id)
     }
-
-    #[allow(dead_code)]
-    pub fn session_id(&self) -> &str {
-        &self.inner.session_id
-    }
-
-    #[allow(dead_code)]
-    pub fn fallback_history_dir(&self) -> &Path {
-        &self.inner.fallback_history_dir
-    }
 }
 
 pub(crate) fn capture_tree_blocking(
     repo: &gix::Repository,
     workdir: &Path,
     parent: Option<gix::ObjectId>,
-    session_ref: &str,
     label: &str,
 ) -> Result<gix::ObjectId> {
+    let files = match collect_files(workdir)? {
+        Some(f) => f,
+        None => {
+            return Err(anyhow::anyhow!(
+                "snapshot skipped: file count exceeds limit"
+            ))
+        }
+    };
+
     let mut editor = repo
         .edit_tree(repo.empty_tree().id)
         .context("create tree editor")?;
 
-    let files = collect_files(workdir)?;
     let mut total_bytes: u64 = 0;
     let mut files_processed: usize = 0;
 
     for file_path in files {
-        // Guard 3: Per-file size check (skip oversized files with a warning)
         let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
         let max_file = std::env::var("HARNX_HISTORY_MAX_FILE_BYTES")
             .ok()
@@ -246,73 +255,79 @@ pub(crate) fn capture_tree_blocking(
             continue;
         }
 
-        // Guard 3: Cumulative total bytes abort
         let max_total = std::env::var("HARNX_HISTORY_MAX_TOTAL_BYTES")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(MAX_TOTAL_BYTES);
-        total_bytes += file_size;
-        if total_bytes > max_total {
+        if total_bytes + file_size > max_total {
             log::warn!(
-                "harnx-history: snapshot of {} aborted after {} bytes — \
-                 exceeds total limit of {} bytes (set HARNX_HISTORY_MAX_TOTAL_BYTES to override). \
-                 {} files processed before cutoff.",
+                "harnx-history: snapshot of {} truncated after {} files / {} bytes — exceeds total \
+                 limit of {} bytes (set HARNX_HISTORY_MAX_TOTAL_BYTES to override)",
                 workdir.display(),
+                files_processed,
                 total_bytes,
                 max_total,
-                files_processed,
             );
             break;
         }
 
-        let relative_path = file_path
-            .strip_prefix(workdir)
-            .context("strip workdir prefix")?;
-        let relative_path = relative_path.to_string_lossy().replace('\\', "/");
-        let data =
-            fs::read(&file_path).with_context(|| format!("read file {}", file_path.display()))?;
-        let blob_id = repo
-            .write_blob(&data)
-            .with_context(|| format!("write blob for {}", file_path.display()))?
-            .detach();
-        editor
-            .upsert(
-                relative_path.clone(),
-                gix::object::tree::EntryKind::Blob,
-                blob_id,
-            )
-            .with_context(|| format!("add tree entry {relative_path}"))?;
+        let rel = match file_path.strip_prefix(workdir) {
+            Ok(rel) => rel,
+            Err(_) => continue,
+        };
 
+        let data = match fs::read(&file_path) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+
+        total_bytes += file_size;
         files_processed += 1;
+
+        let blob_id: gix::ObjectId = repo.write_blob(data).context("write blob")?.into();
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        editor
+            .upsert(rel.as_str(), gix::object::tree::EntryKind::Blob, blob_id)
+            .with_context(|| format!("insert {} into tree", rel))?;
     }
 
     let tree_id = editor.write().context("write tree")?.detach();
-    let now = gix::date::Time::now_local_or_utc().to_string();
+
+    let time = gix::date::Time::now_utc();
+    let mut time_buf = Vec::with_capacity(time.size());
+    time.write_to(&mut time_buf)
+        .context("serialize snapshot time")?;
+    let time_str = std::str::from_utf8(&time_buf).context("snapshot time not utf-8")?;
     let signature = gix::actor::SignatureRef {
-        name: "harnx-history".into(),
-        email: "harnx-history@localhost".into(),
-        time: now.as_str(),
-    };
+        name: "harnx-history".as_bytes().as_bstr(),
+        email: "harnx-history@localhost".as_bytes().as_bstr(),
+        time: time_str,
+    }
+    .to_owned()
+    .context("build snapshot signature")?;
 
     let mut parents = Vec::new();
     if let Some(parent) = parent {
         parents.push(parent);
-    } else if let Ok(reference) = repo.find_reference(session_ref) {
-        if let Some(id) = reference.target().try_id() {
-            parents.push(id.to_owned());
-        }
     }
 
+    let commit = gix::objs::Commit {
+        tree: tree_id,
+        parents: parents.into_iter().collect(),
+        author: signature.clone(),
+        committer: signature,
+        encoding: None,
+        message: label.into(),
+        extra_headers: vec![],
+    };
     let commit_id = repo
-        .commit_as(signature, signature, session_ref, label, tree_id, parents)
+        .write_object(&commit)
         .context("write snapshot commit")?
         .detach();
     Ok(commit_id)
 }
 
-fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
-    // Use git ls-files to get all tracked + untracked non-ignored files
-    // This correctly respects .gitignore
+fn collect_files(root: &Path) -> Result<Option<Vec<PathBuf>>> {
     let output = std::process::Command::new("git")
         .args([
             "ls-files",
@@ -327,13 +342,10 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // If git ls-files fails (e.g. not a git repo), fall back to empty list
-        // The snapshot will still create a valid (empty) tree
         log::warn!("git ls-files failed in {}: {stderr}", root.display());
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
-    // Use NUL-delimited output (-z) to correctly handle filenames containing newlines
     let mut files: Vec<PathBuf> = output
         .stdout
         .split(|&b| b == 0)
@@ -344,14 +356,6 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
         .collect();
     files.sort();
 
-    // Guard 1: Exclude the harnx history directory to prevent the cache from snapshotting itself
-    let history = history_dir();
-    let files: Vec<PathBuf> = files
-        .into_iter()
-        .filter(|p| !p.starts_with(&history))
-        .collect();
-
-    // Guard 2: File count cap
     let max_files = std::env::var("HARNX_HISTORY_MAX_FILES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -364,10 +368,10 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
             files.len(),
             max_files,
         );
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
-    Ok(files)
+    Ok(Some(files))
 }
 
 #[cfg(test)]
@@ -381,84 +385,49 @@ mod tests {
     }
 
     fn init_git_repo(dir: &Path) {
-        std::process::Command::new("git")
+        let status = std::process::Command::new("git")
             .args(["init"])
             .current_dir(dir)
-            .output()
-            .expect("git init");
-        std::process::Command::new("git")
+            .status()
+            .expect("init repo");
+        assert!(status.success(), "git init failed");
+
+        let status = std::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir)
+            .status()
+            .expect("config user.name");
+        assert!(status.success(), "git config user.name failed");
+
+        let status = std::process::Command::new("git")
             .args(["config", "user.email", "test@example.com"])
             .current_dir(dir)
-            .output()
-            .expect("git config user.email");
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir)
-            .output()
-            .expect("git config user.name");
+            .status()
+            .expect("config user.email");
+        assert!(status.success(), "git config user.email failed");
     }
 
-    fn add_file_to_git(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
-        let file_path = dir.join(name);
+    fn add_file_to_git(dir: &Path, rel: &str, contents: &[u8]) {
+        let file_path = dir.join(rel);
         if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent).expect("create parent dir");
+            std::fs::create_dir_all(parent).expect("create parent dirs");
         }
-        std::fs::write(&file_path, content).expect("write file");
-        std::process::Command::new("git")
-            .args(["add", name])
+        std::fs::write(&file_path, contents).expect("write file");
+        let status = std::process::Command::new("git")
+            .args(["add", rel])
             .current_dir(dir)
-            .output()
+            .status()
             .expect("git add");
-        file_path
+        assert!(status.success(), "git add failed");
     }
 
     fn commit_git(dir: &Path) {
-        std::process::Command::new("git")
+        let status = std::process::Command::new("git")
             .args(["commit", "-m", "test commit"])
             .current_dir(dir)
-            .output()
+            .status()
             .expect("git commit");
-    }
-
-    #[test]
-    fn test_collect_files_excludes_history_dir() {
-        let guard = env_lock().lock().expect("env lock");
-
-        // Keep temp_dir alive for the duration of the test
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let repo_dir = temp_dir.path().join("repo");
-        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
-
-        init_git_repo(&repo_dir);
-
-        // Create a regular file in the repo
-        let _regular_file = add_file_to_git(&repo_dir, "regular.txt", b"regular content");
-
-        // Create a file inside a history dir that's inside the repo
-        let history_subdir = repo_dir.join("history-subdir");
-        std::fs::create_dir_all(&history_subdir).expect("create history subdir");
-        let _history_file =
-            add_file_to_git(&repo_dir, "history-subdir/history.txt", b"history content");
-
-        // Commit to make git ls-files work correctly
-        commit_git(&repo_dir);
-
-        // Set HARNX_LOCAL_HISTORY_DIR to point to the history subdir
-        unsafe { std::env::set_var("HARNX_LOCAL_HISTORY_DIR", &history_subdir) };
-
-        let result = collect_files(&repo_dir).expect("collect_files should succeed");
-
-        unsafe { std::env::remove_var("HARNX_LOCAL_HISTORY_DIR") };
-
-        // Regular file should be included, history file should be excluded
-        let has_regular = result.iter().any(|p| p.ends_with("regular.txt"));
-        let has_history = result.iter().any(|p| p.ends_with("history.txt"));
-
-        drop(guard);
-        drop(temp_dir); // Keep temp_dir alive until after the check
-
-        assert!(has_regular, "regular file should be included in result");
-        assert!(!has_history, "history file should be excluded from result");
+        assert!(status.success(), "git commit failed");
     }
 
     #[test]
@@ -471,13 +440,11 @@ mod tests {
 
         init_git_repo(&repo_dir);
 
-        // Create 3 files
         add_file_to_git(&repo_dir, "file1.txt", b"content 1");
         add_file_to_git(&repo_dir, "file2.txt", b"content 2");
         add_file_to_git(&repo_dir, "file3.txt", b"content 3");
         commit_git(&repo_dir);
 
-        // Set a low file count limit
         unsafe { std::env::set_var("HARNX_HISTORY_MAX_FILES", "2") };
 
         let result = collect_files(&repo_dir).expect("collect_files should succeed");
@@ -485,10 +452,9 @@ mod tests {
         unsafe { std::env::remove_var("HARNX_HISTORY_MAX_FILES") };
         drop(guard);
 
-        // Result should be empty because cap was triggered
         assert!(
-            result.is_empty(),
-            "result should be empty when file count exceeds cap"
+            result.is_none(),
+            "result should be None when file count exceeds cap"
         );
     }
 
@@ -502,36 +468,24 @@ mod tests {
 
         init_git_repo(&repo_dir);
 
-        // Create a small file
         add_file_to_git(&repo_dir, "small.txt", b"tiny");
-        // Create a "large" file (larger than our test limit of 10 bytes)
         add_file_to_git(&repo_dir, "large.txt", b"this is larger than ten bytes");
         commit_git(&repo_dir);
 
-        // Set a very low per-file size limit (10 bytes)
         unsafe { std::env::set_var("HARNX_HISTORY_MAX_FILE_BYTES", "10") };
 
-        // Create a git repo for the history snapshots
         let history_repo_dir = temp_dir.path().join("history-repo");
         std::fs::create_dir_all(&history_repo_dir).expect("create history repo dir");
         init_git_repo(&history_repo_dir);
         let history_repo = gix::open(&history_repo_dir).expect("open history repo");
 
-        let result = capture_tree_blocking(
-            &history_repo,
-            &repo_dir,
-            None,
-            "refs/heads/main",
-            "test snapshot",
-        );
+        let result = capture_tree_blocking(&history_repo, &repo_dir, None, "test snapshot");
 
         unsafe { std::env::remove_var("HARNX_HISTORY_MAX_FILE_BYTES") };
         drop(guard);
 
-        // Should succeed (not error)
         assert!(result.is_ok(), "capture_tree_blocking should succeed");
 
-        // Verify the commit was created
         let commit_id = result.expect("commit id");
         let commit = history_repo.find_object(commit_id).expect("find commit");
         assert_eq!(commit.kind, gix::object::Kind::Commit, "should be a commit");

@@ -57,7 +57,6 @@ Harnx can load environment variables from a `.env` file located in the configura
 
 ## Local History Envs
 
-- **HARNX_LOCAL_HISTORY_DIR**: Fallback storage location for history snapshots (currently reserved). Default: `$HARNX_CONFIG_DIR/harnx/history`
 - **HARNX_HISTORY_MAX_FILES**: Maximum number of files allowed in a single snapshot. Default: `10000`
 - **HARNX_HISTORY_MAX_FILE_BYTES**: Maximum size in bytes for an individual file in a snapshot. Default: `10485760` (10 MiB)
 - **HARNX_HISTORY_MAX_TOTAL_BYTES**: Maximum total size in bytes for all files in a single snapshot. Default: `104857600` (100 MiB)

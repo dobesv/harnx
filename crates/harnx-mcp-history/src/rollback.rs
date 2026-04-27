@@ -8,14 +8,15 @@ use gix::object::tree::EntryKind;
 use crate::history::capture_tree_blocking;
 
 fn is_harnx_history_commit(repo: &gix::Repository, commit_id: gix::ObjectId) -> bool {
-    let prefix = "refs/harnx-history/";
-    repo.references()
+    repo.find_object(commit_id)
         .ok()
-        .and_then(|refs| {
-            refs.prefixed(prefix.as_bytes()).ok().map(|iter| {
-                iter.flatten()
-                    .any(|r| r.target().try_id() == Some(commit_id.as_ref()))
-            })
+        .and_then(|obj| obj.peel_to_commit().ok())
+        .map(|commit| {
+            commit
+                .author()
+                .ok()
+                .map(|a| a.email == "harnx-history@localhost")
+                .unwrap_or(false)
         })
         .unwrap_or(false)
 }
@@ -23,40 +24,23 @@ fn is_harnx_history_commit(repo: &gix::Repository, commit_id: gix::ObjectId) -> 
 fn flatten_tree(
     repo: &gix::Repository,
     tree_id: gix::ObjectId,
-) -> Result<HashMap<PathBuf, gix::ObjectId>> {
-    let tree = repo.find_object(tree_id)?.peel_to_tree()?;
-    let mut recorder = gix::traverse::tree::Recorder::default();
-    tree.traverse().breadthfirst(&mut recorder)?;
-
-    let mut files = HashMap::new();
-    for entry in recorder.records {
-        if matches!(
-            entry.mode.kind(),
-            EntryKind::Blob | EntryKind::BlobExecutable
-        ) {
-            files.insert(
-                PathBuf::from(entry.filepath.to_string()),
-                entry.oid.to_owned(),
-            );
-        }
-    }
-    Ok(files)
-}
-
-fn remove_empty_parent_dirs(path: &Path, stop_at: &Path) -> Result<()> {
-    let mut current = path.parent();
-    while let Some(dir) = current {
-        if dir == stop_at || !dir.starts_with(stop_at) {
-            break;
-        }
-        match fs::remove_dir(dir) {
-            Ok(()) => current = dir.parent(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => current = dir.parent(),
-            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("remove empty directory {}", dir.display()));
+    prefix: &Path,
+    out: &mut HashMap<PathBuf, gix::ObjectId>,
+) -> Result<()> {
+    let tree = repo
+        .find_object(tree_id)
+        .context("find tree")?
+        .peel_to_tree()
+        .context("peel tree")?;
+    for entry in tree.iter() {
+        let entry = entry.context("decode tree entry")?;
+        let rel = prefix.join(std::str::from_utf8(entry.filename().as_ref()).unwrap_or_default());
+        match entry.mode().kind() {
+            EntryKind::Tree => flatten_tree(repo, entry.oid().to_owned(), &rel, out)?,
+            EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
+                out.insert(rel, entry.oid().to_owned());
             }
+            EntryKind::Commit => {}
         }
     }
     Ok(())
@@ -64,119 +48,85 @@ fn remove_empty_parent_dirs(path: &Path, stop_at: &Path) -> Result<()> {
 
 pub fn rollback_to_commit_blocking(
     repo: &gix::Repository,
-    commit_id: gix::ObjectId,
+    target_commit: gix::ObjectId,
     workdir: &Path,
     parent: Option<gix::ObjectId>,
-    session_ref: &str,
     label: &str,
 ) -> Result<(gix::ObjectId, gix::ObjectId)> {
-    let _ = repo
-        .find_commit(commit_id)
-        .with_context(|| format!("find commit {commit_id}"))?;
-
-    if !is_harnx_history_commit(repo, commit_id) {
-        anyhow::bail!("commit {commit_id} is not a harnx history snapshot");
+    if !is_harnx_history_commit(repo, target_commit) {
+        anyhow::bail!("target commit is not a harnx history snapshot");
     }
 
-    let target_commit = repo
-        .find_object(commit_id)
-        .with_context(|| format!("find target object {commit_id}"))?
+    let before_snap = capture_tree_blocking(repo, workdir, parent, "before rollback")?;
+
+    let target_tree_id = repo
+        .find_object(target_commit)
+        .context("find target commit")?
         .peel_to_commit()
-        .context("peel target commit")?;
-    let target_tree = target_commit.tree().context("read target tree")?;
-    let target_tree_id = target_tree.id().detach();
-    let target_files = flatten_tree(repo, target_tree_id).context("flatten target tree")?;
+        .context("peel target commit")?
+        .tree_id()?
+        .detach();
 
-    let head_id = repo.head_id().context("read HEAD commit for rollback")?;
-    let head_commit = repo
-        .find_object(head_id)
-        .with_context(|| format!("find HEAD object {head_id}"))?
-        .peel_to_commit()
-        .context("peel HEAD commit")?;
-    let head_tree = head_commit.tree().context("read HEAD tree")?;
-    let head_files = flatten_tree(repo, head_tree.id().detach()).context("flatten HEAD tree")?;
+    let mut current_paths = HashMap::new();
+    let mut target_paths = HashMap::new();
 
-    // Before-snapshot: capture current state before any mutations
-    let before_id = capture_tree_blocking(repo, workdir, parent, session_ref, "before rollback")?;
+    if let Ok(head_commit) = repo.head_commit() {
+        flatten_tree(
+            repo,
+            head_commit.tree_id()?.detach(),
+            Path::new(""),
+            &mut current_paths,
+        )?;
+    }
+    flatten_tree(repo, target_tree_id, Path::new(""), &mut target_paths)?;
 
-    let all_paths: BTreeSet<PathBuf> = target_files
+    let all_paths: BTreeSet<PathBuf> = current_paths
         .keys()
-        .chain(head_files.keys())
         .cloned()
+        .chain(target_paths.keys().cloned())
         .collect();
 
-    for relative_path in all_paths {
-        let target_blob = target_files.get(&relative_path);
-        let head_blob = head_files.get(&relative_path);
-        let full_path = workdir.join(&relative_path);
-
-        match (target_blob, head_blob) {
-            (Some(target_blob), Some(head_blob)) if target_blob == head_blob => {}
-            (Some(target_blob), _) => {
+    for rel in all_paths {
+        let abs = workdir.join(&rel);
+        match target_paths.get(&rel) {
+            Some(blob_id) => {
                 let data = repo
-                    .find_object(*target_blob)
-                    .with_context(|| {
-                        format!("find blob {target_blob} for {}", relative_path.display())
-                    })?
+                    .find_object(*blob_id)
+                    .context("find target blob")?
                     .data
-                    .to_owned();
-                if let Some(parent) = full_path.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("create parent directories for {}", full_path.display())
+                    .to_vec();
+                if let Some(parent_dir) = abs.parent() {
+                    fs::create_dir_all(parent_dir).with_context(|| {
+                        format!("create parent directories for {}", abs.display())
                     })?;
                 }
-                fs::write(&full_path, data)
-                    .with_context(|| format!("write rollback file {}", full_path.display()))?;
+                fs::write(&abs, data)
+                    .with_context(|| format!("write restored file {}", abs.display()))?;
             }
-            (None, Some(_)) => {
-                if full_path.exists() {
-                    if full_path.is_dir() {
-                        fs::remove_dir_all(&full_path).with_context(|| {
-                            format!("remove rollback directory {}", full_path.display())
-                        })?;
-                    } else {
-                        fs::remove_file(&full_path).with_context(|| {
-                            format!("remove rollback file {}", full_path.display())
-                        })?;
-                    }
+            None => {
+                if abs.exists() {
+                    fs::remove_file(&abs)
+                        .with_context(|| format!("remove extra file {}", abs.display()))?;
                 }
-                remove_empty_parent_dirs(&full_path, workdir)?;
             }
-            (None, None) => {}
         }
     }
 
-    // After-snapshot: capture state after mutations
-    let short_commit = &commit_id.to_hex().to_string()[..8];
-    let after_label = format!("harnx rollback to {short_commit}: {label}");
-    let after_id =
-        capture_tree_blocking(repo, workdir, Some(before_id), session_ref, &after_label)?;
+    let after_parent = Some(before_snap);
+    let after_snap = capture_tree_blocking(repo, workdir, after_parent, label)?;
 
-    // Advance the current branch ref (or HEAD if detached) to the after-snapshot,
-    // so the rollback commit is visible in `git log` without detaching HEAD.
-    let head = repo.head().context("read HEAD for rollback ref update")?;
-    if let Some(branch) = head.referent_name() {
-        // Attached HEAD — advance the branch ref directly, preserving branch attachment.
-        // Pass branch as &FullNameRef which implements TryInto<FullName>.
-        repo.reference(
-            branch,
-            after_id,
-            gix::refs::transaction::PreviousValue::Any,
-            "harnx rollback",
-        )
-        .context("update branch ref after rollback")?;
-    } else {
-        // Detached HEAD — update HEAD directly (already detached, nothing to break).
-        repo.reference(
-            "HEAD",
-            after_id,
-            gix::refs::transaction::PreviousValue::Any,
-            "harnx rollback",
-        )
-        .context("update HEAD after rollback")?;
+    let status = std::process::Command::new("git")
+        .arg("reset")
+        .arg("--hard")
+        .arg(after_snap.to_hex().to_string())
+        .current_dir(workdir)
+        .status()
+        .context("run git reset --hard")?;
+    if !status.success() {
+        anyhow::bail!("git reset --hard failed");
     }
 
-    Ok((before_id, after_id))
+    Ok((before_snap, after_snap))
 }
 
 #[cfg(test)]
@@ -205,72 +155,89 @@ mod tests {
     }
 
     #[test]
+    fn test_rollback_rejects_non_history_commit() {
+        let temp = tempdir().expect("tempdir");
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.name", "Test User"]);
+        run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+
+        let file = temp.path().join("file.txt");
+        fs::write(&file, "hello\n").expect("write file");
+        run_git(temp.path(), &["add", "."]);
+        run_git(temp.path(), &["commit", "-m", "regular commit"]);
+
+        let commit = output_git(temp.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned();
+        let repo = gix::open(temp.path()).expect("open repo");
+
+        let err = rollback_to_commit_blocking(
+            &repo,
+            gix::ObjectId::from_hex(commit.as_bytes()).expect("oid"),
+            temp.path(),
+            None,
+            "rollback",
+        )
+        .expect_err("non-history commit should be rejected");
+
+        assert!(
+            err.to_string().contains("not a harnx history snapshot"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn test_rollback_restores_file() {
         let temp = tempdir().expect("tempdir");
         run_git(temp.path(), &["init"]);
         run_git(temp.path(), &["config", "user.name", "Test User"]);
         run_git(temp.path(), &["config", "user.email", "test@example.com"]);
 
-        let file = temp.path().join("note.txt");
+        let file = temp.path().join("file.txt");
         fs::write(&file, "before\n").expect("write before");
         run_git(temp.path(), &["add", "."]);
         run_git(temp.path(), &["commit", "-m", "before"]);
-        let before = output_git(temp.path(), &["rev-parse", "HEAD"])
+        let before_regular = output_git(temp.path(), &["rev-parse", "HEAD"])
             .trim()
             .to_owned();
 
-        run_git(
+        let repo = gix::open(temp.path()).expect("open repo");
+        let before_regular_oid =
+            gix::ObjectId::from_hex(before_regular.as_bytes()).expect("before regular oid");
+        let before_snap_id = capture_tree_blocking(
+            &repo,
             temp.path(),
-            &["update-ref", "refs/harnx-history/test-session", &before],
-        );
+            Some(before_regular_oid),
+            "before snapshot",
+        )
+        .expect("before snapshot");
 
         fs::write(&file, "after\n").expect("write after");
         run_git(temp.path(), &["add", "."]);
         run_git(temp.path(), &["commit", "-m", "after"]);
+        let head_oid = gix::ObjectId::from_hex(
+            output_git(temp.path(), &["rev-parse", "HEAD"])
+                .trim()
+                .as_bytes(),
+        )
+        .expect("head oid");
 
-        let repo = gix::open(temp.path()).expect("open repo");
         let result = rollback_to_commit_blocking(
             &repo,
-            gix::ObjectId::from_hex(before.as_bytes()).expect("before oid"),
+            before_snap_id,
             temp.path(),
-            None,
-            "refs/harnx-history/test-session",
+            Some(head_oid),
             "rollback",
         );
 
-        // Verify rollback succeeded and returned two commit IDs
-        let (before_snap_id, after_snap_id) = result.expect("rollback works");
+        let (before_rollback_id, after_snap_id) = result.expect("rollback works");
 
-        // Verify file content was restored
         let contents = fs::read_to_string(&file).expect("read file");
         assert_eq!(
             contents, "before\n",
             "file should be restored to before state"
         );
 
-        // Verify commit chain
-        let log = output_git(temp.path(), &["log", "--oneline"]);
-        eprintln!("git log:\n{}", log);
-        let log_lines: Vec<_> = log.lines().collect();
-
-        // We expect at least: before, after, before-rollback-snap, after-rollback-snap
-        assert!(
-            log_lines.len() >= 2,
-            "expected at least 2 commits, got {}: {:?}",
-            log_lines.len(),
-            log_lines
-        );
-
-        // The most recent commit should be the after-rollback snapshot
-        assert!(
-            log_lines[0].contains("harnx rollback")
-                || log_lines[0].contains("before rollback")
-                || log_lines[0].contains("after"),
-            "top commit should be rollback-related, got: {:?}",
-            log_lines[0]
-        );
-
-        // HEAD should point to after_snap_id
         let head = output_git(temp.path(), &["rev-parse", "HEAD"])
             .trim()
             .to_owned();
@@ -280,7 +247,6 @@ mod tests {
             "HEAD should be after-snapshot"
         );
 
-        // before_snap_id should be the parent of after_snap_id
         let parent = output_git(
             temp.path(),
             &["rev-parse", &format!("{}^", after_snap_id.to_hex())],
@@ -289,8 +255,20 @@ mod tests {
         .to_owned();
         assert_eq!(
             parent,
-            before_snap_id.to_hex().to_string(),
+            before_rollback_id.to_hex().to_string(),
             "before-snap should be parent of after-snap"
+        );
+
+        let rollback_parent = output_git(
+            temp.path(),
+            &["rev-parse", &format!("{}^", before_rollback_id.to_hex())],
+        )
+        .trim()
+        .to_owned();
+        assert_eq!(
+            rollback_parent,
+            head_oid.to_hex().to_string(),
+            "before rollback snapshot should chain from original head"
         );
     }
 }
