@@ -979,6 +979,16 @@ pub fn build_messages(session: &Session, input: &Input) -> Result<Vec<Message>> 
             messages.extend(session.compressed_messages[index..].to_vec());
         }
     }
+    // Continuation: if the last saved message is a pending Tool round,
+    // we're mid-tool-round (the agent loop is iterating with the same
+    // `Input`). The user's original message is already in the session,
+    // so don't append a duplicate copy at the end — that fooled the
+    // model into treating each round as a fresh user re-ask and looping
+    // on "Let me look at the current state…". Mirrors the same heuristic
+    // `begin_turn` uses when saving the round.
+    if need_add_msg && messages.last().is_some_and(|m| m.role == MessageRole::Tool) {
+        need_add_msg = false;
+    }
     if need_add_msg {
         // When the agent was swapped after construction (e.g. compaction),
         // inject_system_prompt is true and we must prepend the agent's
@@ -1467,6 +1477,78 @@ mod tests {
         assert_eq!(
             injected_count_after_clear, 2,
             "after clearing injected_user_text, no further duplicates are appended"
+        );
+    }
+
+    /// Regression test: during multi-round tool execution, the agent
+    /// loop reuses the same `Input` per round. `session.messages`
+    /// already contains the user's original query (saved by
+    /// `begin_turn` on round 1), so `build_messages` must NOT append
+    /// another copy of `input.message_content()` at the end. The
+    /// continuation marker is the last in-memory message being a
+    /// `Tool`-role pending tool round — same heuristic `begin_turn`
+    /// uses to skip its own user-message push.
+    ///
+    /// Original symptom: every multi-round request ended with the
+    /// user's original question appended after the tool_result, so the
+    /// model treated each round as if the user had re-asked the same
+    /// question and looped emitting "Let me look at the current state…"
+    /// forever.
+    #[test]
+    fn build_messages_does_not_append_duplicate_user_during_tool_round() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+        let user_text =
+            "I noticed something in the agent prompts and want to look at it".to_string();
+        let input = crate::config::input::from_str(&global_config, &user_text, Some(agent));
+
+        // Round 1: save a tool round to the session as the agent loop would.
+        let call = ToolCall {
+            name: "Read".to_string(),
+            arguments: json!({"path": "/tmp/x"}),
+            id: Some("toolu_round1".to_string()),
+            thought_signature: None,
+        };
+        super::add_tool_calls(
+            &mut session,
+            &input,
+            "Let me look at the directory.",
+            None,
+            std::slice::from_ref(&call),
+        )
+        .unwrap();
+        super::add_tool_results(
+            &mut session,
+            &[ToolResult::new(call, json!({"content": "file body"}))],
+        )
+        .unwrap();
+
+        // session.messages now ends with a Tool message — that's the
+        // signal that we're mid-tool-round. The next agent_loop iteration
+        // calls build_messages with the *same* input.
+        assert_eq!(session.messages.last().unwrap().role, MessageRole::Tool);
+
+        let messages = super::build_messages(&session, &input).unwrap();
+
+        let user_text_count = messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User && m.content.to_text() == user_text)
+            .count();
+        assert_eq!(
+            user_text_count, 1,
+            "user's original question should appear exactly once in the wire-format \
+             request; appending it again after the tool round makes the model think \
+             the user re-asked and loops on 'Let me look at the current state…'. \
+             messages: {messages:#?}"
         );
     }
 }

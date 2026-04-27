@@ -168,16 +168,25 @@ pub fn prepare_completion_data(
 }
 
 pub fn build_messages(input: &Input, config: &GlobalConfig) -> Result<Vec<Message>> {
-    let mut messages = if let Some(session) = session_of(input, &config.read().session) {
+    let guard = config.read();
+    let session = session_of(input, &guard.session);
+    let with_session = session.is_some();
+    let mut messages = if let Some(session) = session {
         crate::config::session::build_messages(session, input)?
     } else {
         input.agent().build_messages(input)?
     };
-    if let Some(tool_calls) = &input.tool_calls {
-        messages.push(Message::new(
-            MessageRole::Assistant,
-            MessageContent::ToolCalls(tool_calls.clone()),
-        ))
+    drop(guard);
+    // Append `input.tool_calls` only when there's no session. With a session,
+    // `save_session_tool_calls` + `save_session_tool_results` already pushed
+    // the same `(call, result)` pair into `session.messages`.
+    if !with_session {
+        if let Some(tool_calls) = &input.tool_calls {
+            messages.push(Message::new(
+                MessageRole::Assistant,
+                MessageContent::ToolCalls(tool_calls.clone()),
+            ))
+        }
     }
     if let Some(text) = &input.injected_user_text {
         messages.push(Message::new(
@@ -365,4 +374,99 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
     let data_url = format!("data:{mime_type};base64,{encoded_image}");
 
     Ok(data_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{session, Config, ConfigData, GlobalConfig};
+    use crate::tool::{ToolCall, ToolResult};
+    use parking_lot::RwLock;
+    use serde_json::json;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// Regression test for the "continue replayed all Edits" bug.
+    ///
+    /// The agent loop saves each tool round to `session.messages` via
+    /// `save_session_tool_calls` + `save_session_tool_results`, then
+    /// calls `Input::merge_tool_results` to accumulate the same
+    /// `(call, result)` pair onto `input.tool_calls`. On the next loop
+    /// iteration, `build_messages` (this module) was appending
+    /// `input.tool_calls` as an extra `Assistant(ToolCalls)` message —
+    /// so the wire-format request contained the same tool round twice:
+    /// once as a Tool message in `session.messages`, and once as the
+    /// trailing assistant turn from `input.tool_calls`.
+    ///
+    /// As multi-round tool execution accumulated, the trailing duplicate
+    /// grew round by round. The model, seeing a single assistant turn
+    /// listing every prior tool call, generated narrations like
+    /// "continue replayed all Edits in order".
+    #[test]
+    fn build_messages_does_not_duplicate_tool_calls_when_session_has_them() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data: ConfigData {
+                stream: false,
+                save_session: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut sess = session::new(&config, "trace-repro").unwrap();
+        sess.set_sessions_dir(tmp.path().to_path_buf());
+        config.session = Some(sess);
+        let global_config: GlobalConfig = Arc::new(RwLock::new(config));
+
+        let call = ToolCall {
+            name: "Edit".to_string(),
+            arguments: json!({"file_path": "/tmp/x", "old_string": "a", "new_string": "b"}),
+            id: Some("toolu_round1".to_string()),
+            thought_signature: None,
+        };
+        let result = ToolResult::new(
+            call.clone(),
+            json!({"content": [{"type": "text", "text": "edited"}]}),
+        );
+
+        let input = from_str(&global_config, "do the edit", None);
+        global_config
+            .write()
+            .save_session_tool_calls(
+                &input,
+                "thinking out loud",
+                None,
+                std::slice::from_ref(&call),
+            )
+            .unwrap();
+        global_config
+            .write()
+            .save_session_tool_results(std::slice::from_ref(&result))
+            .unwrap();
+
+        let merged =
+            input.merge_tool_results("thinking out loud".to_string(), None, vec![result.clone()]);
+
+        let messages = build_messages(&merged, &global_config).unwrap();
+
+        let id = call.id.as_deref().unwrap();
+        let hits = messages
+            .iter()
+            .filter(|msg| match &msg.content {
+                MessageContent::ToolCalls(tc) => tc
+                    .tool_results
+                    .iter()
+                    .any(|r| r.call.id.as_deref() == Some(id)),
+                _ => false,
+            })
+            .count();
+
+        assert_eq!(
+            hits, 1,
+            "tool call id {id} should appear in exactly one message; \
+             duplication makes the wire request re-send the prior tool \
+             round and triggers 'continue replayed all Edits' narrations \
+             from the model. messages: {messages:#?}",
+        );
+    }
 }

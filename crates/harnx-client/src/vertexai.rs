@@ -180,6 +180,7 @@ pub async fn gemini_chat_completions(
         catch_error(&data, status.as_u16(), retry_after)?;
     }
     debug!("non-stream-data: {data}");
+    harnx_core::llm_trace::response("vertexai", &data);
     gemini_extract_chat_completions_text(&data)
 }
 
@@ -251,6 +252,7 @@ pub async fn gemini_chat_completions_streaming(
             }
             let data: Value = serde_json::from_str(value)?;
             debug!("stream-data: {data}");
+            harnx_core::llm_trace::stream_event("vertexai", &data);
             gemini_handle_stream_chunk(handler, &data)?;
             Ok(false)
         };
