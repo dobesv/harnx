@@ -210,6 +210,53 @@ impl HistoryManager {
         Ok(results)
     }
 
+    pub async fn snapshot_repos_for_dir_targeted(
+        &self,
+        working_dir: &Path,
+        files: &[PathBuf],
+        label: &str,
+    ) -> Result<Vec<(PathBuf, gix::ObjectId)>> {
+        let candidates = {
+            let repos = self.inner.repos.lock().await;
+            repos
+                .iter()
+                .filter(|(repo_root, _)| {
+                    working_dir.starts_with(repo_root) || repo_root.starts_with(working_dir)
+                })
+                .map(|(repo_root, session)| {
+                    (
+                        repo_root.clone(),
+                        session.repo.clone(),
+                        session.last_commit_id,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut results = Vec::new();
+        for (repo_root, ts_repo, parent) in candidates {
+            let label = label.to_owned();
+            let repo_root_for_task = repo_root.clone();
+            let files_for_task = files.to_vec();
+            let commit_id = tokio::task::spawn_blocking(move || {
+                let repo = ts_repo.to_thread_local();
+                capture_files_blocking(&repo, &repo_root_for_task, &files_for_task, parent, &label)
+            })
+            .await
+            .context("snapshot_repos_for_dir_targeted task join failed")??;
+            {
+                let mut repos = self.inner.repos.lock().await;
+                if let Some(session) = repos.get_mut(&repo_root) {
+                    session.last_commit_id = Some(commit_id);
+                }
+            }
+            maybe_trigger_gc(&repo_root, &self.inner.last_gc);
+            results.push((repo_root, commit_id));
+        }
+
+        Ok(results)
+    }
+
     pub async fn diff_commits(
         &self,
         repo_workdir: &Path,
