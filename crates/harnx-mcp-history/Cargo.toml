@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 gix = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 log = { workspace = true }
+shell-words = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
