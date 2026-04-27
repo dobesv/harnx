@@ -45,12 +45,17 @@ fn maybe_trigger_gc(
     if should_run {
         map.insert(workdir.to_path_buf(), now);
         drop(map);
-        let _ = std::process::Command::new("git")
-            .args(["gc", "--auto", "--quiet"])
-            .current_dir(workdir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        // Spawn gc and immediately wait in a detached thread so the child is
+        // reaped and never becomes a zombie. We don't care about the exit code.
+        let workdir_owned = workdir.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("git")
+                .args(["gc", "--auto", "--quiet"])
+                .current_dir(&workdir_owned)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
     }
 }
 
@@ -84,9 +89,12 @@ impl HistoryManager {
             .context("snapshot requires at least one path")?;
         let (repo_workdir, ts_repo, parent) = {
             let repos = self.inner.repos.lock().await;
+            // Pick the longest matching workdir so an inner repo wins over an
+            // outer one when both are tracked (e.g. a workspace with submodules).
             let (workdir, session) = repos
                 .iter()
-                .find(|(workdir, _)| path.starts_with(workdir))
+                .filter(|(workdir, _)| path.starts_with(workdir.as_path()))
+                .max_by_key(|(workdir, _)| workdir.as_os_str().len())
                 .context("no tracked repo found for snapshot path")?;
             (
                 workdir.clone(),
@@ -103,6 +111,48 @@ impl HistoryManager {
         })
         .await
         .context("snapshot task join failed")??;
+
+        {
+            let mut repos = self.inner.repos.lock().await;
+            if let Some(session) = repos.get_mut(&repo_workdir) {
+                session.last_commit_id = Some(commit_id);
+            }
+        }
+        maybe_trigger_gc(&repo_workdir, &self.inner.last_gc);
+
+        Ok(commit_id)
+    }
+
+    pub async fn snapshot_file(&self, file_path: &Path, label: &str) -> Result<gix::ObjectId> {
+        let (repo_workdir, ts_repo, parent) = {
+            let repos = self.inner.repos.lock().await;
+            let (workdir, session) = repos
+                .iter()
+                .filter(|(workdir, _)| file_path.starts_with(workdir.as_path()))
+                .max_by_key(|(workdir, _)| workdir.as_os_str().len())
+                .context("no tracked repo found for file path")?;
+            (
+                workdir.clone(),
+                session.repo.clone(),
+                session.last_commit_id,
+            )
+        };
+
+        let label = label.to_owned();
+        let file_path_owned = file_path.to_path_buf();
+        let repo_workdir_for_task = repo_workdir.clone();
+        let commit_id = tokio::task::spawn_blocking(move || {
+            let repo = ts_repo.to_thread_local();
+            capture_file_blocking(
+                &repo,
+                &repo_workdir_for_task,
+                &file_path_owned,
+                parent,
+                &label,
+            )
+        })
+        .await
+        .context("snapshot_file task join failed")??;
 
         {
             let mut repos = self.inner.repos.lock().await;
@@ -217,6 +267,84 @@ impl HistoryManager {
     }
 }
 
+fn write_snapshot_commit(
+    repo: &gix::Repository,
+    tree_id: gix::ObjectId,
+    parent: Option<gix::ObjectId>,
+    label: &str,
+) -> Result<gix::ObjectId> {
+    let time = gix::date::Time::now_utc();
+    let mut time_buf = Vec::with_capacity(time.size());
+    time.write_to(&mut time_buf)
+        .context("serialize snapshot time")?;
+    let time_str = std::str::from_utf8(&time_buf).context("snapshot time not utf-8")?;
+    let signature = gix::actor::SignatureRef {
+        name: "harnx-history".as_bytes().as_bstr(),
+        email: "harnx-history@localhost".as_bytes().as_bstr(),
+        time: time_str,
+    }
+    .to_owned()
+    .context("build snapshot signature")?;
+
+    let mut parents = Vec::new();
+    if let Some(parent) = parent {
+        parents.push(parent);
+    }
+
+    let commit = gix::objs::Commit {
+        tree: tree_id,
+        parents: parents.into_iter().collect(),
+        author: signature.clone(),
+        committer: signature,
+        encoding: None,
+        message: label.into(),
+        extra_headers: vec![],
+    };
+    let commit_id = repo
+        .write_object(&commit)
+        .context("write snapshot commit")?
+        .detach();
+    Ok(commit_id)
+}
+
+/// Snapshot a single specific file into a git commit.
+/// The tree contains only that one file at its repo-relative path.
+/// If the file does not exist on disk (e.g. before a new-file write),
+/// the commit tree is empty — the diff will show it as a new addition.
+pub(crate) fn capture_file_blocking(
+    repo: &gix::Repository,
+    repo_workdir: &Path,
+    file_path: &Path,
+    parent: Option<gix::ObjectId>,
+    label: &str,
+) -> Result<gix::ObjectId> {
+    let mut editor = repo
+        .edit_tree(repo.empty_tree().id)
+        .context("create tree editor")?;
+
+    if file_path.is_file() {
+        let rel = file_path
+            .strip_prefix(repo_workdir)
+            .context("file not under repo workdir")?;
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+        let data =
+            fs::read(file_path).with_context(|| format!("read file {}", file_path.display()))?;
+
+        let blob_id: gix::ObjectId = repo.write_blob(data).context("write blob")?.into();
+        editor
+            .upsert(
+                rel_str.as_str(),
+                gix::object::tree::EntryKind::Blob,
+                blob_id,
+            )
+            .context("insert file into tree")?;
+    }
+
+    let tree_id = editor.write().context("write tree")?.detach();
+    write_snapshot_commit(repo, tree_id, parent, label)
+}
+
 pub(crate) fn capture_tree_blocking(
     repo: &gix::Repository,
     workdir: &Path,
@@ -292,39 +420,7 @@ pub(crate) fn capture_tree_blocking(
     }
 
     let tree_id = editor.write().context("write tree")?.detach();
-
-    let time = gix::date::Time::now_utc();
-    let mut time_buf = Vec::with_capacity(time.size());
-    time.write_to(&mut time_buf)
-        .context("serialize snapshot time")?;
-    let time_str = std::str::from_utf8(&time_buf).context("snapshot time not utf-8")?;
-    let signature = gix::actor::SignatureRef {
-        name: "harnx-history".as_bytes().as_bstr(),
-        email: "harnx-history@localhost".as_bytes().as_bstr(),
-        time: time_str,
-    }
-    .to_owned()
-    .context("build snapshot signature")?;
-
-    let mut parents = Vec::new();
-    if let Some(parent) = parent {
-        parents.push(parent);
-    }
-
-    let commit = gix::objs::Commit {
-        tree: tree_id,
-        parents: parents.into_iter().collect(),
-        author: signature.clone(),
-        committer: signature,
-        encoding: None,
-        message: label.into(),
-        extra_headers: vec![],
-    };
-    let commit_id = repo
-        .write_object(&commit)
-        .context("write snapshot commit")?
-        .detach();
-    Ok(commit_id)
+    write_snapshot_commit(repo, tree_id, parent, label)
 }
 
 fn collect_files(root: &Path) -> Result<Option<Vec<PathBuf>>> {

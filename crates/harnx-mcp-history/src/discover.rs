@@ -20,19 +20,43 @@ pub fn find_repos_under_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut repos = Vec::new();
 
     for root in roots {
-        let Some(repo) = discover_repo(root) else {
-            continue;
-        };
-        let Some(workdir) = repo.workdir() else {
-            continue;
-        };
-        let workdir = workdir.to_path_buf();
-        if seen.insert(workdir.clone()) {
-            repos.push(workdir);
-        }
+        // Walk the directory tree downward from root, collecting any git repo
+        // worktrees found within it. gix::discover walks UP (finds the enclosing
+        // repo), so we use a manual descent: try each subdirectory recursively.
+        collect_repos_in_dir(root, &mut seen, &mut repos);
     }
 
     repos
+}
+
+fn collect_repos_in_dir(dir: &Path, seen: &mut HashSet<PathBuf>, repos: &mut Vec<PathBuf>) {
+    // Check if this directory is itself a repo root (has a .git entry)
+    if dir.join(".git").exists() {
+        if let Ok(canonical) = dir.canonicalize() {
+            if seen.insert(canonical.clone()) {
+                repos.push(canonical);
+            }
+        }
+        // Don't descend into subdirectories of a repo root — nested repos
+        // (submodules) would need to be found via their own root entry.
+        return;
+    }
+
+    // Descend into immediate subdirectories
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name();
+            // Skip hidden dirs (including .git itself) and common non-repo dirs
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            collect_repos_in_dir(&path, seen, repos);
+        }
+    }
 }
 
 #[cfg(test)]

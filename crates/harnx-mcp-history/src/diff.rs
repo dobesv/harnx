@@ -48,7 +48,12 @@ pub fn diff_commits_blocking(
     let mut diff = header;
     diff.push_str(&String::from_utf8(output.stdout).context("git diff output not utf-8")?);
     if diff.len() > MAX_DIFF_BYTES {
-        diff.truncate(MAX_DIFF_BYTES);
+        // Truncate to a char boundary — String::truncate panics on a mid-char cut
+        let mut cut = MAX_DIFF_BYTES;
+        while !diff.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        diff.truncate(cut);
         let short = &after_id.to_hex().to_string()[..12];
         diff.push_str(&format!(
             "\n[ ... diff truncated, use 'git show {}' to view full diff ... ]",

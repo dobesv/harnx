@@ -459,7 +459,7 @@ impl FsServer {
         // HISTORY: before snapshot
         let before_snap = self
             .history
-            .snapshot(std::slice::from_ref(&path), "before write_file")
+            .snapshot_file(&path, "before write_file")
             .await
             .map_err(|e| {
                 log::warn!("history before-snapshot failed: {e}");
@@ -480,11 +480,7 @@ impl FsServer {
 
         // HISTORY: after snapshot + diff
         let after_snap_result = if let Some(before) = before_snap {
-            match self
-                .history
-                .snapshot(std::slice::from_ref(&path), "after write_file")
-                .await
-            {
+            match self.history.snapshot_file(&path, "after write_file").await {
                 Ok(after) => {
                     let diff = if let Some(repo_dir) =
                         harnx_mcp_history::discover::find_repo_for_path(&path)
@@ -529,7 +525,7 @@ impl FsServer {
         // HISTORY: before snapshot
         let before_snap = self
             .history
-            .snapshot(std::slice::from_ref(&path), "before edit_file")
+            .snapshot_file(&path, "before edit_file")
             .await
             .map_err(|e| {
                 log::warn!("history before-snapshot failed: {e}");
@@ -590,11 +586,7 @@ impl FsServer {
 
         // HISTORY: after snapshot + diff
         let after_snap_result = if let Some(before) = before_snap {
-            match self
-                .history
-                .snapshot(std::slice::from_ref(&path), "after edit_file")
-                .await
-            {
+            match self.history.snapshot_file(&path, "after edit_file").await {
                 Ok(after) => {
                     let diff = if let Some(repo_dir) =
                         harnx_mcp_history::discover::find_repo_for_path(&path)
