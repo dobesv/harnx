@@ -5,6 +5,7 @@ use harnx_mcp::safety::{
     GREP_MAX_LINE_LENGTH, LS_SCAN_HARD_LIMIT, READ_MAX_FILE_BYTES, SEARCH_FILE_MAX_BYTES,
     WRITE_MAX_BYTES,
 };
+use harnx_mcp_history::HistoryManager;
 
 use fancy_regex::Regex;
 use rmcp::model::{
@@ -88,6 +89,12 @@ pub struct FindFilesParams {
     pub path: Option<String>,
     #[serde(default)]
     pub max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RollbackParams {
+    pub commit_id: String,
+    pub repo_path: String,
 }
 
 impl JsonSchema for ReadFileParams {
@@ -215,17 +222,34 @@ impl JsonSchema for FindFilesParams {
     }
 }
 
+impl JsonSchema for RollbackParams {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("RollbackParams")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let commit_id = generator.subschema_for::<String>();
+        let repo_path = generator.subschema_for::<String>();
+        object_schema(
+            vec![("commit_id", commit_id), ("repo_path", repo_path)],
+            &["commit_id", "repo_path"],
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct FsServer {
     roots: Arc<RwLock<Vec<PathBuf>>>,
     roots_initialized: Arc<AtomicBool>,
+    history: Arc<HistoryManager>,
 }
 
 impl FsServer {
     pub fn new(initial_roots: Vec<PathBuf>) -> Self {
         Self {
-            roots: Arc::new(RwLock::new(initial_roots)),
+            roots: Arc::new(RwLock::new(initial_roots.clone())),
             roots_initialized: Arc::new(AtomicBool::new(false)),
+            history: Arc::new(HistoryManager::new(&initial_roots)),
         }
     }
 
@@ -432,6 +456,16 @@ impl FsServer {
             ));
         }
 
+        // HISTORY: before snapshot
+        let before_snap = self
+            .history
+            .snapshot(std::slice::from_ref(&path), "before write_file")
+            .await
+            .map_err(|e| {
+                log::warn!("history before-snapshot failed: {e}");
+            })
+            .ok();
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| {
                 internal_error(format!(
@@ -444,18 +478,66 @@ impl FsServer {
         std::fs::write(&path, &params.content)
             .map_err(|err| internal_error(format!("failed to write '{}': {err}", params.path)))?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        // HISTORY: after snapshot + diff
+        let after_snap_result = if let Some(before) = before_snap {
+            match self
+                .history
+                .snapshot(std::slice::from_ref(&path), "after write_file")
+                .await
+            {
+                Ok(after) => {
+                    let diff = if let Some(repo_dir) =
+                        harnx_mcp_history::discover::find_repo_for_path(&path)
+                    {
+                        self.history
+                            .diff_commits(&repo_dir, before, after)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    Some((after, diff))
+                }
+                Err(e) => {
+                    log::warn!("history after-snapshot failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut contents = vec![Content::text(format!(
             "Wrote {} ({} lines) to {}",
             format_size(params.content.len()),
             params.content.lines().count(),
             params.path
-        ))]))
+        ))];
+        if let Some((after_id, diff_content)) = after_snap_result {
+            let mut assistant_block = diff_content;
+            if !assistant_block.is_empty() {
+                assistant_block.push('\n');
+            }
+            assistant_block.push_str(&format!("harnx-snapshot: {}", after_id.to_hex()));
+            contents.push(Content::text(assistant_block).with_audience(vec![Role::Assistant]));
+        }
+        Ok(CallToolResult::success(contents))
     }
 
     async fn edit_file_impl(&self, params: EditFileParams) -> Result<CallToolResult, ErrorData> {
         let roots = self.roots.read().await;
         let path = validate_path(&params.path, &roots).map_err(invalid_params)?;
         drop(roots);
+
+        // HISTORY: before snapshot
+        let before_snap = self
+            .history
+            .snapshot(std::slice::from_ref(&path), "before edit_file")
+            .await
+            .map_err(|e| {
+                log::warn!("history before-snapshot failed: {e}");
+            })
+            .ok();
 
         let content = std::fs::read_to_string(&path)
             .map_err(|err| internal_error(format!("failed to read '{}': {err}", params.path)))?;
@@ -508,12 +590,51 @@ impl FsServer {
 
         std::fs::write(&path, new_content)
             .map_err(|err| internal_error(format!("failed to write '{}': {err}", params.path)))?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+
+        // HISTORY: after snapshot + diff
+        let after_snap_result = if let Some(before) = before_snap {
+            match self
+                .history
+                .snapshot(std::slice::from_ref(&path), "after edit_file")
+                .await
+            {
+                Ok(after) => {
+                    let diff = if let Some(repo_dir) =
+                        harnx_mcp_history::discover::find_repo_for_path(&path)
+                    {
+                        self.history
+                            .diff_commits(&repo_dir, before, after)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    Some((after, diff))
+                }
+                Err(e) => {
+                    log::warn!("history after-snapshot failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut contents = vec![Content::text(format!(
             "Edited {} ({} replacement{})",
             params.path,
             replacements,
             if replacements == 1 { "" } else { "s" }
-        ))]))
+        ))];
+        if let Some((after_id, diff_content)) = after_snap_result {
+            let mut assistant_block = diff_content;
+            if !assistant_block.is_empty() {
+                assistant_block.push('\n');
+            }
+            assistant_block.push_str(&format!("harnx-snapshot: {}", after_id.to_hex()));
+            contents.push(Content::text(assistant_block).with_audience(vec![Role::Assistant]));
+        }
+        Ok(CallToolResult::success(contents))
     }
 
     async fn list_directory_impl(
@@ -725,6 +846,39 @@ impl FsServer {
             Content::text(summary).with_audience(vec![Role::User]),
         ]))
     }
+
+    async fn rollback_file_impl(
+        &self,
+        params: RollbackParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let roots = self.roots.read().await;
+        let path = validate_path(&params.repo_path, &roots).map_err(invalid_params)?;
+        drop(roots);
+
+        let commit_id = gix::ObjectId::from_hex(params.commit_id.as_bytes())
+            .map_err(|e| ErrorData::invalid_params(format!("invalid commit_id: {e}"), None))?;
+
+        let repo_dir = harnx_mcp_history::discover::find_repo_for_path(&path).ok_or_else(|| {
+            ErrorData::invalid_params("path is not inside a git repository".to_string(), None)
+        })?;
+
+        let new_commit_id = self
+            .history
+            .rollback(&repo_dir, commit_id)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("rollback failed: {e}"), None))?;
+
+        let short_sha = &params.commit_id[..8.min(params.commit_id.len())];
+        let new_commit_hex = new_commit_id.to_hex().to_string();
+        let new_short_sha = &new_commit_hex[..8.min(new_commit_hex.len())];
+        Ok(CallToolResult::success(vec![
+            Content::text(format!(
+                "Rolled back to harnx snapshot {short_sha}; new commit {new_short_sha} created (can be reverted)"
+            )),
+            Content::text(format!("harnx-snapshot: {}", new_commit_id.to_hex()))
+                .with_audience(vec![Role::Assistant]),
+        ]))
+    }
 }
 
 fn make_tool_meta(call_template: &str) -> Meta {
@@ -778,8 +932,11 @@ impl ServerHandler for FsServer {
                     .with_meta(make_tool_meta("**grep** `{{ args.pattern }}`")),
                 Tool::new("find", "Find files by glob pattern.", Map::new())
                     .with_input_schema::<FindFilesParams>()
-                    .annotate(read_only)
+                    .annotate(read_only.clone())
                     .with_meta(make_tool_meta("**find** `{{ args.pattern }}`")),
+                Tool::new("rollback_file", "Restore a repository to a prior harnx history snapshot by creating a new reversible commit. The snapshot commit ID is returned in the tool response after write_file, edit_file, exec, or spawn/wait.", Map::new())
+                    .with_input_schema::<RollbackParams>()
+                    .with_meta(make_tool_meta("**rollback_file** to `{{ args.commit_id | truncate(8, end='') }}`")),
             ];
 
         Ok(ListToolsResult {
@@ -822,6 +979,10 @@ impl ServerHandler for FsServer {
             "find" => {
                 let params = parse_arguments::<FindFilesParams>(request.arguments)?;
                 self.find_files_impl(params).await
+            }
+            "rollback_file" => {
+                let params = parse_arguments::<RollbackParams>(request.arguments)?;
+                self.rollback_file_impl(params).await
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
@@ -1253,7 +1414,18 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["read", "write", "edit", "ls", "grep", "find"]);
+        assert_eq!(
+            names,
+            vec![
+                "read",
+                "write",
+                "edit",
+                "ls",
+                "grep",
+                "find",
+                "rollback_file"
+            ]
+        );
     }
 
     #[tokio::test]

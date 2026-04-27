@@ -1,0 +1,19 @@
+[package]
+name = "harnx-mcp-history"
+version = "0.30.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Git-backed local history and rollback for harnx MCP servers"
+
+[dependencies]
+anyhow = { workspace = true }
+gix = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+uuid = { workspace = true }
+log = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
