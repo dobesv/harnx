@@ -343,7 +343,9 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
     let mut items = Vec::new();
     if !session.compressed_messages.is_empty() {
         items.extend(messages_to_transcript_items(&session.compressed_messages));
-        items.push(TranscriptItem::SystemText("─── session compacted ───".to_string()));
+        items.push(TranscriptItem::SystemText(
+            "─── session compacted ───".to_string(),
+        ));
     }
     items.extend(messages_to_transcript_items(&session.messages));
     items

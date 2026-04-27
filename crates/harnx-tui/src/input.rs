@@ -1253,8 +1253,18 @@ impl Tui {
     }
 
     pub(super) async fn run_command(&mut self, line: &str) -> Result<()> {
-        let prev_session = self.config.read().session.as_ref().map(|s| s.name().to_string());
-        let prev_agent = self.config.read().agent.as_ref().map(|a| a.name().to_string());
+        let prev_session = self
+            .config
+            .read()
+            .session
+            .as_ref()
+            .map(|s| s.name().to_string());
+        let prev_agent = self
+            .config
+            .read()
+            .agent
+            .as_ref()
+            .map(|a| a.name().to_string());
         // Run the command inside a block that owns the lock guards so they are
         // dropped before we touch `self` again for transcript / UI updates.
         let (result, captured) = {
