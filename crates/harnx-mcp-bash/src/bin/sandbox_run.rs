@@ -123,6 +123,38 @@ fn add_path_exception(
 }
 
 #[cfg(unix)]
+fn add_write_exception(sandbox: &mut Birdcage, path: &Path) -> Result<(), String> {
+    let target = if path.exists() {
+        path.to_path_buf()
+    } else {
+        let mut current = path.parent();
+        loop {
+            match current {
+                Some(parent) if parent.exists() => break parent.to_path_buf(),
+                Some(parent) => current = parent.parent(),
+                None => {
+                    eprintln!(
+                        "sandbox-run: skipping write path with no existing ancestor: {}",
+                        path.display()
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    sandbox
+        .add_exception(Exception::WriteAndRead(target.clone()))
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "sandbox-run: failed to add write exception for {}: {error}",
+                target.display()
+            )
+        })
+}
+
+#[cfg(unix)]
 fn run() -> Result<i32, String> {
     let Some(config) = parse_args()? else {
         print_usage();
@@ -140,7 +172,7 @@ fn run() -> Result<i32, String> {
         add_path_exception(&mut sandbox, path, Exception::ExecuteAndRead)?;
     }
     for path in &config.write_paths {
-        add_path_exception(&mut sandbox, path, Exception::WriteAndRead)?;
+        add_write_exception(&mut sandbox, path)?;
     }
     for path in &config.read_paths {
         add_path_exception(&mut sandbox, path, Exception::Read)?;
@@ -151,7 +183,19 @@ fn run() -> Result<i32, String> {
             .map_err(|error| format!("sandbox-run: failed to add Networking exception: {error}"))?;
     }
 
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new(&config.command[0]);
+        if let Some(working_dir) = &config.working_dir {
+            command.current_dir(working_dir);
+        }
+        command
+    };
+
+    #[cfg(not(target_os = "macos"))]
     let mut command = if let Some(working_dir) = &config.working_dir {
+        // birdcage::process::Command on Linux lacks current_dir; rely on GNU env's
+        // --chdir extension for now. Known limitation on Alpine/Busybox systems.
         let mut wrapped = Command::new("/usr/bin/env");
         wrapped.arg("--chdir");
         wrapped.arg(working_dir);

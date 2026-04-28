@@ -2,7 +2,7 @@ mod server;
 
 use rmcp::ServiceExt;
 use server::BashServer;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,6 +62,20 @@ fn parse_env_paths(var_name: &str) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn path_is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .map(|metadata| metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0))
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn path_is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn push_root(roots: &mut Vec<PathBuf>, raw: &str) {
@@ -182,16 +196,16 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
     if sandbox_enabled {
         let path = resolved_sandbox_run_path
             .unwrap_or_else(|| PathBuf::from("harnx-mcp-bash-sandbox-run"));
-        if path.is_file() {
+        if path_is_executable(&path) {
             sandbox_config.sandbox_run_path = path;
         } else if sandbox_run_override.is_some() {
             anyhow::bail!(
-                "harnx-mcp-bash: error: sandbox helper not found at {}; fix --sandbox-run or pass --no-sandbox to disable sandboxing explicitly",
+                "harnx-mcp-bash: error: sandbox helper at {} does not exist or is not executable; fix --sandbox-run or pass --no-sandbox to disable sandboxing explicitly",
                 path.display()
             );
         } else {
             anyhow::bail!(
-                "harnx-mcp-bash: error: sandbox helper not found at {}; place harnx-mcp-bash-sandbox-run next to harnx-mcp-bash, use --sandbox-run <path>, or pass --no-sandbox to disable sandboxing explicitly",
+                "harnx-mcp-bash: error: sandbox helper at {} does not exist or is not executable; place harnx-mcp-bash-sandbox-run next to harnx-mcp-bash, use --sandbox-run <path>, or pass --no-sandbox to disable sandboxing explicitly",
                 path.display()
             );
         }

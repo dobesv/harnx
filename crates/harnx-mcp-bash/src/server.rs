@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::future::Future;
@@ -472,6 +473,7 @@ impl BashServer {
         let mut args = Vec::new();
         let mut readable_paths = Vec::new();
         let mut writable_paths = Vec::new();
+        let inputs_explicit_empty = matches!(inputs, Some([]));
 
         for path in Self::SYSTEM_EXEC_PATHS {
             args.push(OsString::from("--exec"));
@@ -513,7 +515,7 @@ impl BashServer {
                 }
             }
             Some([]) => {
-                if !matches!(inputs, Some([])) {
+                if !inputs_explicit_empty {
                     for root in roots {
                         args.push(OsString::from("--read"));
                         args.push(root.clone().into_os_string());
@@ -540,13 +542,15 @@ impl BashServer {
             }
         }
 
-        let covered = writable_paths
-            .iter()
-            .chain(readable_paths.iter())
-            .any(|path| working_dir.starts_with(path));
-        if !covered {
-            args.push(OsString::from("--read"));
-            args.push(working_dir.as_os_str().to_os_string());
+        if !inputs_explicit_empty {
+            let covered = writable_paths
+                .iter()
+                .chain(readable_paths.iter())
+                .any(|path| working_dir.starts_with(path));
+            if !covered {
+                args.push(OsString::from("--read"));
+                args.push(working_dir.as_os_str().to_os_string());
+            }
         }
 
         args
@@ -1756,7 +1760,7 @@ fn internal_error(msg: impl Into<Cow<'static, str>>) -> ErrorData {
     ErrorData::internal_error(msg, None)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 fn sandbox_run_test_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/harnx-mcp-bash-sandbox-run")
 }
@@ -2337,6 +2341,7 @@ mod tests {
 
         assert!(!pairs.contains(&("--write".into(), "/test/root".into())));
         assert!(!pairs.contains(&("--read".into(), "/test/root".into())));
+        assert!(!pairs.contains(&("--read".into(), "/tmp/test_wd_xxx".into())));
     }
 
     #[cfg(unix)]

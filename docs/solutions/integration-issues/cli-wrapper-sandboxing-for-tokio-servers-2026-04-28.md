@@ -52,7 +52,7 @@ Birdcage uses thread-local state and signal handlers that must run in a controll
    - Existing process management (KillOnDrop, ProcessGroup, timeouts) works transparently
 
 **Architecture:**
-```
+```text
 [MCP Server (tokio multi-threaded)]
         |
         | spawn wrapper process
@@ -89,16 +89,24 @@ This preserves:
 - `Exception::FullEnvironment` — full environment access (required for basic process spawning)
 - `Exception::Networking` — allow network access
 
-**No `current_dir` on `birdcage::process::Command`:**
-Birdcage's `Command` wrapper does not expose `current_dir()`. Workaround used in initial implementation:
+**Working directory handling is platform-conditional:**
+- macOS: birdcage re-exports `std::process::Command`, so wrapper uses `current_dir(working_dir)` directly.
+- Linux: `birdcage::process::Command` lacks `current_dir()`, so wrapper uses `/usr/bin/env --chdir <dir> <command>`.
+
 ```rust
-let mut wrapped = Command::new("/usr/bin/env");
-wrapped.arg("--chdir");
-wrapped.arg(working_dir);
-wrapped.arg(&command[0]);
+#[cfg(target_os = "macos")]
+command.current_dir(working_dir);
+
+#[cfg(not(target_os = "macos"))]
+{
+    let mut wrapped = Command::new("/usr/bin/env");
+    wrapped.arg("--chdir");
+    wrapped.arg(working_dir);
+    wrapped.arg(&command[0]);
+}
 ```
 
-**Portability Note:** `env --chdir` is GNU-only, fails on Alpine/Busybox. Future fix should explore alternatives.
+**Portability Note:** Linux path still relies on GNU `env --chdir`, so Alpine/Busybox remain known limitations.
 
 ## PID Model
 
@@ -113,7 +121,7 @@ The `inputs` and `outputs` tool parameters control sandbox exceptions:
 
 | Parameter | `None` | `Some([])` | `Some([paths...])` |
 |-----------|--------|------------|---------------------|
-| `inputs` | Default readable paths | No root read access | Only listed paths readable |
+| `inputs` | Default readable paths | Deny all extra reads, including no working-dir fallback | Only listed paths readable |
 | `outputs` | Default writable roots | No root write access | Only listed paths writable |
 
 **Interaction:** `inputs=Some([])` + `outputs=Some([])` = roots absent entirely from sandbox (deny-by-default).
@@ -155,6 +163,6 @@ fn sandbox_run_test_path() -> PathBuf {
 
 ## Related Issues
 
-- **GitHub Issue:** [#360 — Good sandboxing for bash commands](https://github.com/example/repo/issues/360)
+- **GitHub Issue:** [#360 — Good sandboxing for bash commands](https://github.com/dobesv/harnx/issues/360)
 - **Plan:** bash-sandboxing-birdcage
 - **Commit:** f6a0449 — Add filesystem sandboxing to harnx-mcp-bash using birdcage
