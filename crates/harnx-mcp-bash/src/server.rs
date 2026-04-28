@@ -2403,26 +2403,31 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn test_inputs_relative_paths_resolved_against_working_dir() {
+        // Verifies that a relative `inputs` path is resolved against the
+        // tool's `working_dir` at validation time (not the server's CWD).
+        // We don't run bash here — that's a separate concern covered by the
+        // Linux-only sandbox-runtime tests below; we just check that
+        // validation accepts the relative path.
         let root = TestDir::new();
         std::fs::create_dir(root.path().join("subdir")).unwrap();
-        let server = sandboxed_server(vec![root.path().to_path_buf()]);
+        let roots = vec![root.path().to_path_buf()];
 
-        let result = server
-            .exec_command_impl(ExecCommandParams {
-                command: "test -d subdir".to_string(),
-                working_dir: Some(root.path().to_string_lossy().to_string()),
-                timeout_secs: Some(15),
-                head_lines: None,
-                tail_lines: None,
-                max_output_bytes: None,
-                inputs: Some(vec!["subdir".into()]),
-                outputs: None,
-            })
-            .await
-            .unwrap();
+        let validated =
+            parse_input_path_list(&Some(vec!["subdir".to_string()]), &roots, root.path())
+                .expect("relative input path under working_dir must validate");
 
-        let text = text_content(&result);
-        assert_eq!(extract_field(&text, "exit_code"), "0");
+        let paths = validated.expect("Some(_) when input list provided");
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0].ends_with("subdir"),
+            "validated path should canonicalize to .../subdir, got {}",
+            paths[0].display()
+        );
+        assert!(
+            paths[0].starts_with(root.path().canonicalize().unwrap()),
+            "validated path should be under root, got {}",
+            paths[0].display()
+        );
     }
 
     #[cfg(target_os = "linux")]
