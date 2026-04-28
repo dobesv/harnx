@@ -5,3 +5,18 @@ description: >-
   Allow the agent to run commands or script snippets
 rename_tools:
   exec: Bash
+
+# Sandbox configuration examples (uncomment as needed):
+#
+# args:
+#   - --no-sandbox                                          # Disable sandboxing entirely
+#   - --extra-readable                                      # Add read-only path to sandbox
+#   - /opt/sdk
+#   - --extra-exec                                          # Add executable path to sandbox
+#   - /opt/tools/bin
+#   - --sandbox-run                                         # Override sandbox helper binary
+#   - /opt/harnx/harnx-mcp-bash-sandbox-run
+#
+# env:
+#   HARNX_BASH_EXTRA_READABLE: /opt/sdk      # Extra readable path via environment
+#   HARNX_BASH_EXTRA_EXEC: /opt/tools/bin    # Extra executable path via environment

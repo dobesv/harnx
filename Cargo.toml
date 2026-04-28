@@ -65,6 +65,7 @@ fancy-regex = "0.18.0"
 base64 = "0.22.0"
 nu-ansi-term = "0.50.0"
 async-trait = "0.1.74"
+birdcage = "0.8"
 textwrap = "0.16.0"
 ansi_colours = "1.2.2"
 reqwest-eventsource = { git = "https://github.com/jpopesculian/reqwest-eventsource", rev = "356e2f61827b193bd5ab389c38059bcc2eed90aa" }
