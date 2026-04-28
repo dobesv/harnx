@@ -1,7 +1,7 @@
 use harnx::mcp::McpServerConfig;
 use harnx::test_utils::{
     harnx_mcp_repro249_bin, MockOpenAiError, MockOpenAiScript, MockOpenAiServer,
-    MockOpenAiToolCall, MockOpenAiTurn, TmuxHarness,
+    MockOpenAiToolCall, MockOpenAiTurn, MockTurnExpectation, TmuxHarness,
 };
 use harnx_acp::AcpServerConfig;
 
@@ -277,6 +277,7 @@ fn script() -> MockOpenAiScript {
                     id: Some("call_delegate_1".to_string()),
                 }],
                 error: None,
+                expect: None,
             },
             // Turn 1: sub-agent calls the MCP tool
             MockOpenAiTurn {
@@ -287,6 +288,7 @@ fn script() -> MockOpenAiScript {
                     id: Some("call_mcp_1".to_string()),
                 }],
                 error: None,
+                expect: None,
             },
             // Turn 2: sub-agent summarizes and returns
             MockOpenAiTurn {
@@ -295,6 +297,7 @@ fn script() -> MockOpenAiScript {
                 )],
                 tool_calls: vec![],
                 error: None,
+                expect: None,
             },
             // Turn 3: parent final reply after delegated task completes
             MockOpenAiTurn {
@@ -303,6 +306,7 @@ fn script() -> MockOpenAiScript {
                 )],
                 tool_calls: vec![],
                 error: None,
+                expect: None,
             },
         ],
         fallback_text: "No more scripted responses.".to_string(),
@@ -853,12 +857,14 @@ fn handoff_script() -> MockOpenAiScript {
                 text_chunks: vec![PLANNER_QUESTION.to_string()],
                 tool_calls: vec![],
                 error: None,
+                expect: None,
             },
             // Turn 2: Planner receives answer, creates plan, asks about handoff
             MockOpenAiTurn {
                 text_chunks: vec![format!("{}. {}", PLANNER_PLAN_CREATED, PLANNER_HANDOFF_ASK)],
                 tool_calls: vec![],
                 error: None,
+                expect: None,
             },
             // Turn 3: Planner receives confirmation, hands off to executor
             MockOpenAiTurn {
@@ -872,6 +878,7 @@ fn handoff_script() -> MockOpenAiScript {
                     id: Some("call_handoff_1".to_string()),
                 }],
                 error: None,
+                expect: None,
             },
             // Turn 4: Executor runs step 1 (create_file tool)
             MockOpenAiTurn {
@@ -885,12 +892,14 @@ fn handoff_script() -> MockOpenAiScript {
                     id: Some("call_create_file_1".to_string()),
                 }],
                 error: None,
+                expect: None,
             },
             // Turn 5: Executor reports done
             MockOpenAiTurn {
                 text_chunks: vec![EXECUTOR_DONE_RESPONSE.to_string()],
                 tool_calls: vec![],
                 error: None,
+                expect: None,
             },
             // Turn 6: Executor receives feedback, runs step 2 (edit_file tool)
             MockOpenAiTurn {
@@ -904,12 +913,14 @@ fn handoff_script() -> MockOpenAiScript {
                     id: Some("call_edit_file_1".to_string()),
                 }],
                 error: None,
+                expect: None,
             },
             // Turn 7: Executor reports final done
             MockOpenAiTurn {
                 text_chunks: vec![EXECUTOR_FINAL_RESPONSE.to_string()],
                 tool_calls: vec![],
                 error: None,
+                expect: None,
             },
         ],
         fallback_text: "No more scripted responses.".to_string(),
@@ -933,6 +944,7 @@ fn simple_handoff_script() -> MockOpenAiScript {
                     id: Some("call_handoff_1".to_string()),
                 }],
                 error: None,
+                expect: None,
             },
             // Turn 2: Sub-agent runs a tool
             MockOpenAiTurn {
@@ -945,12 +957,14 @@ fn simple_handoff_script() -> MockOpenAiScript {
                     id: Some("call_tool_1".to_string()),
                 }],
                 error: None,
+                expect: None,
             },
             // Turn 3: Sub-agent responds
             MockOpenAiTurn {
                 text_chunks: vec![HANDOFF_FINAL_RESPONSE.to_string()],
                 tool_calls: vec![],
                 error: None,
+                expect: None,
             },
         ],
         fallback_text: "No more scripted responses.".to_string(),
@@ -1220,6 +1234,9 @@ fn nested_script() -> MockOpenAiScript {
                     arguments: json!({"message": "Research this deeply and delegate analysis."}),
                     id: Some("call_nested_parent_1".to_string()),
                 }],
+                expect: Some(MockTurnExpectation {
+                    system_contains: Some("nested-parent".to_string()),
+                }),
                 error: None,
             },
             MockOpenAiTurn {
@@ -1229,21 +1246,33 @@ fn nested_script() -> MockOpenAiScript {
                     arguments: json!({"message": "Analyze data and report back."}),
                     id: Some("call_nested_researcher_1".to_string()),
                 }],
+                expect: Some(MockTurnExpectation {
+                    system_contains: Some("nested-researcher".to_string()),
+                }),
                 error: None,
             },
             MockOpenAiTurn {
                 text_chunks: vec!["Analyst complete".to_string()],
                 tool_calls: vec![],
+                expect: Some(MockTurnExpectation {
+                    system_contains: Some("nested-analyst".to_string()),
+                }),
                 error: None,
             },
             MockOpenAiTurn {
                 text_chunks: vec!["Researcher complete".to_string()],
                 tool_calls: vec![],
+                expect: Some(MockTurnExpectation {
+                    system_contains: Some("nested-researcher".to_string()),
+                }),
                 error: None,
             },
             MockOpenAiTurn {
                 text_chunks: vec!["Nested task complete".to_string()],
                 tool_calls: vec![],
+                expect: Some(MockTurnExpectation {
+                    system_contains: Some("nested-parent".to_string()),
+                }),
                 error: None,
             },
         ],
@@ -1463,6 +1492,7 @@ fn retry_all_fail_shows_warnings_in_tui() -> Result<()> {
                     error_type: "server_error".to_string(),
                     headers: vec![],
                 }),
+                expect: None,
             })
             .collect(),
         fallback_text: "Should not reach here.".to_string(),
@@ -1541,6 +1571,7 @@ fn retry_succeed_after_retry_shows_warning_then_response() -> Result<()> {
                     error_type: "server_error".to_string(),
                     headers: vec![],
                 }),
+                expect: None,
             },
             // Second attempt: success
             MockOpenAiTurn {
@@ -1549,6 +1580,7 @@ fn retry_succeed_after_retry_shows_warning_then_response() -> Result<()> {
                 ],
                 tool_calls: vec![],
                 error: None,
+                expect: None,
             },
         ],
         fallback_text: "Should not reach here.".to_string(),
@@ -1622,6 +1654,7 @@ fn retry_succeed_after_fallback_shows_transition() -> Result<()> {
                     error_type: "server_error".to_string(),
                     headers: vec![],
                 }),
+                expect: None,
             },
             MockOpenAiTurn {
                 text_chunks: vec![],
@@ -1632,12 +1665,14 @@ fn retry_succeed_after_fallback_shows_transition() -> Result<()> {
                     error_type: "server_error".to_string(),
                     headers: vec![],
                 }),
+                expect: None,
             },
             // Fallback model: succeeds on first attempt
             MockOpenAiTurn {
                 text_chunks: vec!["FALLBACK_SUCCESS: The fallback model handled it!".to_string()],
                 tool_calls: vec![],
                 error: None,
+                expect: None,
             },
         ],
         fallback_text: "Should not reach here.".to_string(),

@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -24,6 +23,13 @@ fn default_fallback_text() -> String {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MockTurnExpectation {
+    /// If set, system prompt (messages[0].content) must contain this substring.
+    #[serde(default)]
+    pub system_contains: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MockOpenAiTurn {
     #[serde(default)]
     pub text_chunks: Vec<String>,
@@ -32,6 +38,9 @@ pub struct MockOpenAiTurn {
     /// If set, return an HTTP error instead of a normal response.
     #[serde(default)]
     pub error: Option<MockOpenAiError>,
+    /// If set, request must match before this turn can be consumed.
+    #[serde(default)]
+    pub expect: Option<MockTurnExpectation>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -56,35 +65,140 @@ pub struct MockOpenAiToolCall {
 
 struct ServerState {
     script: MockOpenAiScript,
-    turn_index: AtomicUsize,
+    consumed_turns: Mutex<Vec<bool>>,
     request_log: Arc<Mutex<Vec<Value>>>,
 }
 
 impl ServerState {
     fn new(script: MockOpenAiScript, request_log: Arc<Mutex<Vec<Value>>>) -> Self {
+        let consumed_turns = vec![false; script.turns.len()];
         Self {
             script,
-            turn_index: AtomicUsize::new(0),
+            consumed_turns: Mutex::new(consumed_turns),
             request_log,
         }
     }
 
-    fn next_turn(&self) -> MockOpenAiTurn {
-        let idx = self.turn_index.fetch_add(1, Ordering::SeqCst);
-        self.script
+    fn next_turn_for_request(&self, request: &Value) -> MockOpenAiTurn {
+        let mut consumed_turns = self.consumed_turns.lock().unwrap();
+
+        if let Some((idx, _)) = self
+            .script
             .turns
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| MockOpenAiTurn {
-                text_chunks: vec![self.script.fallback_text.clone()],
-                ..Default::default()
-            })
+            .iter()
+            .enumerate()
+            .find(|(idx, turn)| !consumed_turns[*idx] && turn_matches_request(turn, request))
+        {
+            consumed_turns[idx] = true;
+            return self.script.turns[idx].clone();
+        }
+
+        let remaining: Vec<(usize, &MockOpenAiTurn)> = self
+            .script
+            .turns
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !consumed_turns[*idx])
+            .collect();
+
+        if remaining.iter().all(|(_, turn)| turn.expect.is_some()) && !remaining.is_empty() {
+            return diagnostic_error_turn(request, &remaining);
+        }
+
+        if let Some((idx, _)) = remaining.iter().find(|(_, turn)| turn.expect.is_none()) {
+            consumed_turns[*idx] = true;
+            return self.script.turns[*idx].clone();
+        }
+
+        MockOpenAiTurn {
+            text_chunks: vec![self.script.fallback_text.clone()],
+            ..Default::default()
+        }
     }
 
     fn log_request(&self, request: Value) {
         if let Ok(mut log) = self.request_log.lock() {
             log.push(request);
         }
+    }
+}
+
+fn turn_matches_request(turn: &MockOpenAiTurn, request: &Value) -> bool {
+    let Some(expectation) = &turn.expect else {
+        return false;
+    };
+
+    let system_prompt = extract_system_prompt(request);
+    if let Some(expected) = &expectation.system_contains {
+        return system_prompt.contains(expected);
+    }
+
+    true
+}
+
+fn extract_system_prompt(request: &Value) -> String {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
+        })
+        .and_then(|message| message.get("content"))
+        .map(extract_message_content)
+        .unwrap_or_default()
+}
+
+fn extract_message_content(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    Some(text.to_string())
+                } else {
+                    part.as_str().map(str::to_string)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn diagnostic_error_turn(
+    request: &Value,
+    remaining: &[(usize, &MockOpenAiTurn)],
+) -> MockOpenAiTurn {
+    let expected = remaining
+        .iter()
+        .map(|(idx, turn)| match &turn.expect {
+            Some(expect) => format!("turn {idx}: {}", describe_expectation(expect)),
+            None => format!("turn {idx}: no expectation"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let actual = extract_system_prompt(request);
+
+    MockOpenAiTurn {
+        error: Some(MockOpenAiError {
+            status: 500,
+            message: format!(
+                "No unconsumed mock turn matched request. Expected one of [{expected}]. Actual system prompt: {actual:?}"
+            ),
+            error_type: "mock_turn_mismatch".to_string(),
+            headers: Vec::new(),
+        }),
+        ..Default::default()
+    }
+}
+
+fn describe_expectation(expectation: &MockTurnExpectation) -> String {
+    match &expectation.system_contains {
+        Some(expected) => format!("system_contains={expected:?}"),
+        None => "empty expectation".to_string(),
     }
 }
 
@@ -285,7 +399,7 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut Tcp
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let turn = state.next_turn();
+    let turn = state.next_turn_for_request(&request);
 
     // Handle error responses
     if let Some(error) = &turn.error {
