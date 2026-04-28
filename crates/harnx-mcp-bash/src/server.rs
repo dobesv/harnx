@@ -5,6 +5,7 @@ use harnx_mcp::safety::{
 
 use fancy_regex::Regex;
 use gix::ObjectId;
+use harnx_mcp_history::classify::{classify_command, SnapshotDecision};
 use harnx_mcp_history::HistoryManager;
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
@@ -246,6 +247,7 @@ struct SpawnedProcess {
     stdout_log_path: PathBuf,
     stderr_log_path: PathBuf,
     before_snap_ids: Vec<(PathBuf, gix::ObjectId)>,
+    snapshot_decision: SnapshotDecision,
 }
 
 struct BashServerInner {
@@ -362,17 +364,30 @@ impl BashServer {
         let working_dir = self
             .resolve_working_dir(params.working_dir.as_deref())
             .await?;
+        let snapshot_decision = classify_command(&params.command, &working_dir);
 
         // HISTORY: before snapshot (non-fatal)
-        let before_snaps = self
-            .inner
-            .history
-            .snapshot_repos_for_dir(&working_dir, "before exec")
-            .await
-            .unwrap_or_else(|e| {
-                log::warn!("history before-snapshot failed: {e}");
-                vec![]
-            });
+        let before_snaps = match &snapshot_decision {
+            SnapshotDecision::ReadOnly => vec![],
+            SnapshotDecision::Targeted(paths) => self
+                .inner
+                .history
+                .snapshot_repos_for_dir_targeted(&working_dir, paths, "before exec")
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("history before-snapshot failed: {e}");
+                    vec![]
+                }),
+            SnapshotDecision::FullSnapshot => self
+                .inner
+                .history
+                .snapshot_repos_for_dir(&working_dir, "before exec")
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("history before-snapshot failed: {e}");
+                    vec![]
+                }),
+        };
 
         let timeout_secs = params.timeout_secs.unwrap_or(120);
         let default_opts = TruncateOpts::default();
@@ -513,15 +528,27 @@ impl BashServer {
                 // HISTORY: after snapshot + diff (non-fatal)
                 let mut diff_parts: Vec<String> = Vec::new();
                 if !before_snaps.is_empty() {
-                    let after_snaps = self
-                        .inner
-                        .history
-                        .snapshot_repos_for_dir(&working_dir, "after exec")
-                        .await
-                        .unwrap_or_else(|e| {
-                            log::warn!("history after-snapshot failed: {e}");
-                            vec![]
-                        });
+                    let after_snaps = match &snapshot_decision {
+                        SnapshotDecision::ReadOnly => vec![],
+                        SnapshotDecision::Targeted(paths) => self
+                            .inner
+                            .history
+                            .snapshot_repos_for_dir_targeted(&working_dir, paths, "after exec")
+                            .await
+                            .unwrap_or_else(|e| {
+                                log::warn!("history after-snapshot failed: {e}");
+                                vec![]
+                            }),
+                        SnapshotDecision::FullSnapshot => self
+                            .inner
+                            .history
+                            .snapshot_repos_for_dir(&working_dir, "after exec")
+                            .await
+                            .unwrap_or_else(|e| {
+                                log::warn!("history after-snapshot failed: {e}");
+                                vec![]
+                            }),
+                    };
 
                     for (repo_dir, before_id) in &before_snaps {
                         if let Some((_, after_id)) = after_snaps.iter().find(|(d, _)| d == repo_dir)
@@ -782,17 +809,30 @@ impl BashServer {
         let working_dir = self
             .resolve_working_dir(params.working_dir.as_deref())
             .await?;
+        let snapshot_decision = classify_command(&params.command, &working_dir);
 
         // HISTORY: before snapshot (non-fatal)
-        let before_snap_ids = self
-            .inner
-            .history
-            .snapshot_repos_for_dir(&working_dir, "before spawn")
-            .await
-            .unwrap_or_else(|e| {
-                log::warn!("history before-snapshot failed: {e}");
-                vec![]
-            });
+        let before_snap_ids = match &snapshot_decision {
+            SnapshotDecision::ReadOnly => vec![],
+            SnapshotDecision::Targeted(paths) => self
+                .inner
+                .history
+                .snapshot_repos_for_dir_targeted(&working_dir, paths, "before spawn")
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("history before-snapshot failed: {e}");
+                    vec![]
+                }),
+            SnapshotDecision::FullSnapshot => self
+                .inner
+                .history
+                .snapshot_repos_for_dir(&working_dir, "before spawn")
+                .await
+                .unwrap_or_else(|e| {
+                    log::warn!("history before-snapshot failed: {e}");
+                    vec![]
+                }),
+        };
 
         self.ensure_log_dir().await?;
 
@@ -838,6 +878,7 @@ impl BashServer {
             stdout_log_path: stdout_log_path.clone(),
             stderr_log_path: stderr_log_path.clone(),
             before_snap_ids,
+            snapshot_decision: snapshot_decision.clone(),
         };
 
         self.inner
@@ -878,7 +919,15 @@ impl BashServer {
             ..default_opts
         };
 
-        let (mut child, command, working_dir, stdout_log_path, stderr_log_path, before_snap_ids) = {
+        let (
+            mut child,
+            command,
+            working_dir,
+            stdout_log_path,
+            stderr_log_path,
+            before_snap_ids,
+            snapshot_decision,
+        ) = {
             let mut map = self.inner.spawned.lock().await;
             let entry = map.remove(&params.execution_id).ok_or_else(|| {
                 ErrorData::invalid_params(
@@ -896,6 +945,7 @@ impl BashServer {
                 entry.stdout_log_path,
                 entry.stderr_log_path,
                 entry.before_snap_ids,
+                entry.snapshot_decision,
             )
         };
 
@@ -955,15 +1005,27 @@ impl BashServer {
                 // HISTORY: after snapshot + diff (non-fatal)
                 let mut diff_parts: Vec<String> = Vec::new();
                 if !before_snap_ids.is_empty() {
-                    let after_snaps = self
-                        .inner
-                        .history
-                        .snapshot_repos_for_dir(&working_dir, "after wait")
-                        .await
-                        .unwrap_or_else(|e| {
-                            log::warn!("history after-snapshot failed: {e}");
-                            vec![]
-                        });
+                    let after_snaps = match &snapshot_decision {
+                        SnapshotDecision::ReadOnly => vec![],
+                        SnapshotDecision::Targeted(paths) => self
+                            .inner
+                            .history
+                            .snapshot_repos_for_dir_targeted(&working_dir, paths, "after wait")
+                            .await
+                            .unwrap_or_else(|e| {
+                                log::warn!("history after-snapshot failed: {e}");
+                                vec![]
+                            }),
+                        SnapshotDecision::FullSnapshot => self
+                            .inner
+                            .history
+                            .snapshot_repos_for_dir(&working_dir, "after wait")
+                            .await
+                            .unwrap_or_else(|e| {
+                                log::warn!("history after-snapshot failed: {e}");
+                                vec![]
+                            }),
+                    };
                     for (repo_dir, before_id) in &before_snap_ids {
                         if let Some((_, after_id)) = after_snaps.iter().find(|(d, _)| d == repo_dir)
                         {
@@ -1008,6 +1070,7 @@ impl BashServer {
                         stdout_log_path: stdout_log_path.clone(),
                         stderr_log_path: stderr_log_path.clone(),
                         before_snap_ids,
+                        snapshot_decision,
                     },
                 );
 
