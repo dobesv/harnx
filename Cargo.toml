@@ -70,7 +70,7 @@ ansi_colours = "1.2.2"
 reqwest-eventsource = { git = "https://github.com/jpopesculian/reqwest-eventsource", rev = "356e2f61827b193bd5ab389c38059bcc2eed90aa" }
 simplelog = "0.12.1"
 log = "0.4.20"
-gix = { version = "0.82.0", features = ["blob-diff", "worktree-mutation", "tree-editor"] }
+gix = { version = "0.83.0", features = ["blob-diff", "worktree-mutation", "tree-editor"] }
 shell-words = "1.1.0"
 sha2 = "0.11.0"
 unicode-width = "0.2.0"
