@@ -210,6 +210,53 @@ impl HistoryManager {
         Ok(results)
     }
 
+    pub async fn snapshot_repos_for_dir_targeted(
+        &self,
+        working_dir: &Path,
+        files: &[PathBuf],
+        label: &str,
+    ) -> Result<Vec<(PathBuf, gix::ObjectId)>> {
+        let candidates = {
+            let repos = self.inner.repos.lock().await;
+            repos
+                .iter()
+                .filter(|(repo_root, _)| {
+                    working_dir.starts_with(repo_root) || repo_root.starts_with(working_dir)
+                })
+                .map(|(repo_root, session)| {
+                    (
+                        repo_root.clone(),
+                        session.repo.clone(),
+                        session.last_commit_id,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut results = Vec::new();
+        for (repo_root, ts_repo, parent) in candidates {
+            let label = label.to_owned();
+            let repo_root_for_task = repo_root.clone();
+            let files_for_task = files.to_vec();
+            let commit_id = tokio::task::spawn_blocking(move || {
+                let repo = ts_repo.to_thread_local();
+                capture_files_blocking(&repo, &repo_root_for_task, &files_for_task, parent, &label)
+            })
+            .await
+            .context("snapshot_repos_for_dir_targeted task join failed")??;
+            {
+                let mut repos = self.inner.repos.lock().await;
+                if let Some(session) = repos.get_mut(&repo_root) {
+                    session.last_commit_id = Some(commit_id);
+                }
+            }
+            maybe_trigger_gc(&repo_root, &self.inner.last_gc);
+            results.push((repo_root, commit_id));
+        }
+
+        Ok(results)
+    }
+
     pub async fn diff_commits(
         &self,
         repo_workdir: &Path,
@@ -423,6 +470,86 @@ pub(crate) fn capture_tree_blocking(
     write_snapshot_commit(repo, tree_id, parent, label)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn capture_files_blocking(
+    repo: &gix::Repository,
+    workdir: &Path,
+    files: &[PathBuf],
+    parent: Option<gix::ObjectId>,
+    label: &str,
+) -> Result<gix::ObjectId> {
+    let mut editor = repo
+        .edit_tree(repo.empty_tree().id)
+        .context("create tree editor")?;
+
+    let mut total_bytes: u64 = 0;
+    let mut files_processed: usize = 0;
+
+    for path in files {
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workdir.join(path)
+        };
+        if !resolved.is_file() {
+            continue;
+        }
+
+        let file_size = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+        let max_file = std::env::var("HARNX_HISTORY_MAX_FILE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(MAX_FILE_BYTES);
+        if file_size > max_file {
+            log::warn!(
+                "harnx-history: skipping {} ({} bytes) — exceeds per-file limit of {} bytes",
+                resolved.display(),
+                file_size,
+                max_file,
+            );
+            continue;
+        }
+
+        let max_total = std::env::var("HARNX_HISTORY_MAX_TOTAL_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(MAX_TOTAL_BYTES);
+        if total_bytes + file_size > max_total {
+            log::warn!(
+                "harnx-history: snapshot of {} truncated after {} files / {} bytes — exceeds total \
+                 limit of {} bytes (set HARNX_HISTORY_MAX_TOTAL_BYTES to override)",
+                workdir.display(),
+                files_processed,
+                total_bytes,
+                max_total,
+            );
+            break;
+        }
+
+        let rel = match resolved.strip_prefix(workdir) {
+            Ok(rel) => rel,
+            Err(_) => continue,
+        };
+
+        let data = match fs::read(&resolved) {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+
+        total_bytes += file_size;
+        files_processed += 1;
+
+        let blob_id: gix::ObjectId = repo.write_blob(data).context("write blob")?.into();
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        editor
+            .upsert(rel.as_str(), gix::object::tree::EntryKind::Blob, blob_id)
+            .with_context(|| format!("insert {} into tree", rel))?;
+    }
+
+    let tree_id = editor.write().context("write tree")?.detach();
+    write_snapshot_commit(repo, tree_id, parent, label)
+}
+
 fn collect_files(root: &Path) -> Result<Option<Vec<PathBuf>>> {
     let output = std::process::Command::new("git")
         .args([
@@ -593,5 +720,61 @@ mod tests {
         let commit_id = result.expect("commit id");
         let commit = history_repo.find_object(commit_id).expect("find commit");
         assert_eq!(commit.kind, gix::object::Kind::Commit, "should be a commit");
+    }
+
+    #[test]
+    fn test_capture_files_blocking_targeted() {
+        let guard = env_lock().lock().expect("env lock");
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo_dir = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+
+        init_git_repo(&repo_dir);
+        std::fs::write(repo_dir.join("kept.txt"), b"keep").expect("write kept file");
+        std::fs::write(repo_dir.join("unkept.txt"), b"skip").expect("write unkept file");
+
+        let history_repo_dir = temp_dir.path().join("history-repo");
+        std::fs::create_dir_all(&history_repo_dir).expect("create history repo dir");
+        init_git_repo(&history_repo_dir);
+        let history_repo = gix::open(&history_repo_dir).expect("open history repo");
+
+        let commit_id = capture_files_blocking(
+            &history_repo,
+            &repo_dir,
+            &[repo_dir.join("kept.txt")],
+            None,
+            "test targeted snapshot",
+        )
+        .expect("capture targeted snapshot");
+
+        drop(guard);
+
+        let commit = history_repo.find_object(commit_id).expect("find commit");
+        let commit = commit.into_commit();
+        let tree = commit.tree().expect("commit tree");
+        let kept_entry = tree
+            .lookup_entry_by_path("kept.txt")
+            .expect("lookup kept.txt")
+            .expect("kept.txt should exist");
+        let kept_blob = kept_entry.object().expect("kept object").into_blob();
+        assert_eq!(kept_blob.data, b"keep", "kept.txt content should match");
+
+        let unkept_entry = tree
+            .lookup_entry_by_path("unkept.txt")
+            .expect("lookup unkept.txt");
+        assert!(unkept_entry.is_none(), "unkept.txt should be absent");
+
+        let raw_tree = history_repo
+            .find_object(tree.id())
+            .expect("find tree object")
+            .data
+            .to_vec();
+        let names = raw_tree
+            .split(|byte| *byte == 0)
+            .filter_map(|entry| entry.split(|byte| *byte == b' ').nth(1))
+            .filter_map(|name| std::str::from_utf8(name).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["kept.txt"], "tree should contain only kept.txt");
     }
 }

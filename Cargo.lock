@@ -2878,6 +2878,7 @@ dependencies = [
  "anyhow",
  "gix",
  "log",
+ "shell-words",
  "tempfile",
  "tokio",
 ]
