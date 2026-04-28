@@ -127,6 +127,22 @@ range of tasks.
 Integrate external tools to automate tasks, retrieve information, and perform actions directly 
 within your workflow.
 
+#### Bundled MCP servers
+
+Harnx ships with several built-in MCP servers ready to enable in your config. See 
+`example_config/mcp_servers/` for ready-to-use templates.
+
+*   **`harnx-mcp-fs`** — Filesystem access (`read`, `write`, `edit`, `ls`, `grep`, `find`, `rollback_file`)
+    *   Path validation against allowed roots; smart output truncation; binary detection.
+    *   [Local history snapshots](docs/local-history-guide.md) before and after every mutation.
+*   **`harnx-mcp-bash`** — Bash command execution (`exec`, `spawn`, `wait`, `terminate`, `read_exec_log`)
+    *   **Filesystem sandboxing via [birdcage](https://crates.io/crates/birdcage)** (Linux/macOS) — write access limited to roots by default; per-call `inputs`/`outputs` overrides.
+    *   Process group management (kill-on-drop) and background `spawn` + `wait` pattern.
+    *   Path validation and history snapshots around mutating commands.
+*   **`harnx-mcp-time`** — Time and timezone utilities (`get_current_time`, `convert_time`, `wait`).
+*   **`harnx-mcp-todo`** — File-based todo and plan tracking (`todo_list`, `todo_get`, `todo_update`, etc.)
+    *   Plain-markdown storage for plan and scoped todos for multi-step agent work.
+
 #### AI Agents (CLI version of OpenAI GPTs)
 
 AI Agent = Instructions (Prompt) + Tools (Function Callings) + Documents (RAG).
