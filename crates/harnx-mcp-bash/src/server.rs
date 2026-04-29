@@ -385,6 +385,18 @@ impl BashServer {
         "TMPDIR",
         "TMP",
         "TEMP",
+        // Windows-specific names. std::env::var returns Err on Unix where
+        // these are unset, so listing them here is a no-op on POSIX builds.
+        "SYSTEMROOT",
+        "SystemRoot",
+        "WINDIR",
+        "USERPROFILE",
+        "USERNAME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "COMSPEC",
+        "HOMEDRIVE",
+        "HOMEPATH",
     ];
 
     #[allow(dead_code)]
@@ -1959,6 +1971,9 @@ fn load_bash_env_file() -> Vec<(String, String)> {
             let mut parts = trimmed.splitn(2, '=');
             let key = parts.next()?.trim();
             let value = parts.next()?.trim();
+            if key.is_empty() {
+                return None;
+            }
             Some((key.to_string(), value.to_string()))
         })
         .collect()

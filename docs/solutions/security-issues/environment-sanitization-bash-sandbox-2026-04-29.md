@@ -22,6 +22,8 @@ Bash child processes inherited the full host environment, exposing secrets (AWS 
 
 ## Symptoms
 
+These symptoms describe the original implementation before the fix in PR #381 (gh-375), where `Exception::FullEnvironment` allowed the birdcage sandbox to inherit the full host environment, the `--no-sandbox` path inherited host env unchanged, and `#[cfg(unix)]`-gated env curation left Windows builds without any sanitization.
+
 - `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, and other secrets visible to bash commands via `echo $VAR`
 - Non-sandboxed path (`--no-sandbox`) inherited full host environment unchanged
 - Windows builds bypassed env curation entirely via `#[cfg(unix)]` guards
@@ -38,7 +40,7 @@ Bash child processes inherited the full host environment, exposing secrets (AWS 
 
 Two separate issues:
 
-1. **birdcage environment model**: `birdcage::process::Command` (wrapper around `std::process::Command`) does NOT expose `env`/`envs`/`env_clear`. To restrict environment, you must (a) call `std::env::set_var()` to set desired values on the current process BEFORE `sandbox.spawn()`, and (b) add `Exception::Environment(name)` for each var. Birdcage's `restrict_env_variables()` then iterates `std::env::vars()` and removes anything not excepted — operating on the current process env, not the Command.
+1. **birdcage environment model**: `birdcage::process::Command` (a wrapper around `std::process::Command`) does not expose `env`, `envs`, or `env_clear`, so child env cannot be set on the Command directly. The required workaround is two-step: (a) call `std::env::set_var()` on the current process to stage each desired value before invoking `sandbox.spawn()`, and (b) add an `Exception::Environment(name)` entry to the sandbox for every var that should survive. Birdcage's `restrict_env_variables()` (invoked from inside `spawn`) then iterates `std::env::vars()` and removes everything except the names listed via `Exception::Environment` — it operates on the current process env, not on the Command.
 
 2. **Platform-gated env curation**: Env sanitization was `#[cfg(unix)]`-guarded, matching the sandboxing code. This meant Windows builds inherited full host env even for non-sandboxed spawns.
 
@@ -90,7 +92,9 @@ Plus `XDG_*` prefix pattern expanded at runtime.
 
 ### 3. Layered env configuration with explicit precedence
 
-**Precedence (CLI > Passthrough > Dotfile > Allowlist):**
+**Precedence (CLI > Passthrough > Dotfile > XDG_* > Allowlist):**
+
+`XDG_*` is treated as part of the default allowlist layer: applied after `DEFAULT_ENV_ALLOWLIST` but before `.env.bash` (so dotfile values override `XDG_*`).
 
 ```rust
 fn build_child_env(&self) -> Vec<(String, String)> {
