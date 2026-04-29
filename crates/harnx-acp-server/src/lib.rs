@@ -385,16 +385,49 @@ impl acp::Agent for HarnxAgent {
             pending_async_context: None,
         };
 
+        // Bridge cancel_notify → abort_signal for any caller that signals
+        // via the notify without setting the signal directly (HarnxAgent::
+        // cancel does both, but this keeps the contract resilient).
+        let abort_for_listener = abort_signal.clone();
+        let cancel_listener = tokio::task::spawn_local(async move {
+            cancel_notify.notified().await;
+            abort_for_listener.set_ctrlc();
+        });
+
+        // Two-stage cancellation:
+        //   1. When `abort_signal` fires, give cooperative-cancel layers
+        //      (e.g. AcpManager.session_prompt_with_abort) a grace
+        //      window to dispatch `session/cancel` down to any
+        //      sub-agents. They poll abort every ~25 ms and then send
+        //      a JSON-RPC cancel notification — fast, but not free.
+        //   2. After the grace window, hard-cancel `run_agent_loop` by
+        //      losing the select! race. This drops any stuck SSE/TCP
+        //      reads or stuck tool dispatchers that don't observe
+        //      abort — so a hung upstream can't pin the prompt.
+        // Pure hard-cancel-on-notify (the previous approach) skipped
+        // step 1 — sub-agents were leaked because the AcpManager call
+        // was dropped before it could dispatch `session/cancel`.
+        // 100 ms is well above the ~30 ms a single AcpManager
+        // observes-abort + dispatches-cancel takes; nested layers each
+        // run their own grace in parallel, so the bound doesn't
+        // compound across depth.
+        let abort_for_grace = abort_signal.clone();
+        let grace_cancel = async move {
+            harnx_core::abort::wait_abort_signal(&abort_for_grace).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+
         let loop_result = tokio::select! {
             r = harnx_runtime::run_agent_loop(&loop_ctx, input) => r,
-            _ = cancel_notify.notified() => {
-                abort_signal.set_ctrlc();
+            _ = grace_cancel => {
+                cancel_listener.abort();
                 harnx_core::sink::clear_agent_event_sink();
                 fwd_task.abort();
                 return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
             }
         };
 
+        cancel_listener.abort();
         harnx_core::sink::clear_agent_event_sink();
         // Drop loop_ctx so all senders into chunk_rx are dropped and
         // fwd_task can exit cleanly.

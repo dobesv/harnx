@@ -94,6 +94,15 @@ impl AcpManager {
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
+        self.call_tool_inner(name, arguments, None).await
+    }
+
+    async fn call_tool_inner(
+        &self,
+        name: &str,
+        arguments: Value,
+        abort: Option<&AbortSignal>,
+    ) -> Result<Value> {
         let (client, method) = self
             .find_client_for_tool(name)
             .ok_or_else(|| anyhow!("Unknown ACP tool '{}'", name))?;
@@ -112,8 +121,28 @@ impl AcpManager {
                     None => client.session_new().await?,
                 };
 
-                session_prompt_with_abort(&client, session_id, message, tokio::signal::ctrl_c())
-                    .await
+                // Race against the AbortSignal when one was provided so a
+                // TUI Ctrl-C (which never produces SIGINT in raw mode)
+                // still triggers `session/cancel` to the ACP subprocess.
+                // Falls back to `tokio::signal::ctrl_c()` for callers that
+                // don't have an AbortSignal — primarily one-shot mode and
+                // direct unit tests.
+                match abort {
+                    Some(abort) => {
+                        let abort = abort.clone();
+                        let abort_future = async move { wait_abort_signal(&abort).await };
+                        session_prompt_with_abort(&client, session_id, message, abort_future).await
+                    }
+                    None => {
+                        session_prompt_with_abort(
+                            &client,
+                            session_id,
+                            message,
+                            tokio::signal::ctrl_c(),
+                        )
+                        .await
+                    }
+                }
             }
             "session_load" => {
                 let session_id = required_string(&arguments, "session_id")?.to_owned();
@@ -427,16 +456,20 @@ impl ToolProvider for AcpManager {
         let spinner_msg = format!("  {} working…", tool_name);
         let forward_handle = tokio::spawn(forward_acp_chunks(chunk_rx, spinner_clone, spinner_msg));
 
-        // Race the sub-agent call against our abort_signal so Ctrl-C
-        // interrupts nested ACP delegations the same way it interrupts
-        // MCP tools.
+        // Plumb the AbortSignal into the inner dispatcher so a TUI Ctrl-C
+        // — which never reaches us as SIGINT because crossterm captures
+        // the keystroke in raw mode — still triggers `session/cancel` on
+        // the ACP subprocess. Previously an outer `select!` raced the
+        // call against `wait_abort_signal(abort)` and on abort just
+        // dropped the inner future, so `session_prompt_with_abort`'s
+        // cancel branch (gated on `tokio::signal::ctrl_c()`) was never
+        // reached. The sub-agent then kept running and its late chunks
+        // leaked into the parent transcript through
+        // `AcpNotificationClient`'s no-forwarder fallback path.
         let tool_name_owned = tool_name.to_string();
-        let call_result = tokio::select! {
-            result = AcpManager::call_tool(self, &tool_name_owned, arguments) => result,
-            _ = wait_abort_signal(abort) => {
-                Err(anyhow!("ACP tool call aborted by user"))
-            }
-        };
+        let call_result = self
+            .call_tool_inner(&tool_name_owned, arguments, Some(abort))
+            .await;
 
         // Tear down: drop every sender for this subscription, then await
         // the forwarder so it can drain anything still queued before

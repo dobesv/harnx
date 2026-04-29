@@ -86,6 +86,25 @@ pub fn script_stall_streaming() -> MockOpenAiScript {
     }
 }
 
+/// A mock-LLM response that emits a quick first chunk, then a `SENTINEL_END`
+/// chunk after a delay. Used by sub-agent cancellation tests: if cancel
+/// propagation works, the child's mock stream is closed before the sentinel
+/// is written and `SENTINEL_END` never reaches the parent transcript. If
+/// cancellation does NOT propagate (the bug), the child keeps reading from
+/// the mock and `SENTINEL_END` eventually appears.
+pub fn script_streaming_with_sentinel() -> MockOpenAiScript {
+    MockOpenAiScript {
+        turns: vec![MockOpenAiTurn {
+            text_chunks: vec!["tick-first".to_string(), "SENTINEL_END".to_string()],
+            tool_calls: vec![],
+            expect: None,
+            error: None,
+        }],
+        fallback_text: "sentinel script exhausted".to_string(),
+        chunk_delay_ms: 1_500,
+    }
+}
+
 pub struct ConfigPaths {
     pub dir: PathBuf,
     pub harnx_config_dir: PathBuf,
