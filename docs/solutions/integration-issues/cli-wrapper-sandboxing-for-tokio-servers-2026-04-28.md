@@ -86,8 +86,10 @@ This preserves:
 - `Exception::Read` — read-only access
 - `Exception::WriteAndRead` — read-write access (NOT `Write` alone)
 - `Exception::ExecuteAndRead` — execute + read (NOT `Execute`)
-- `Exception::FullEnvironment` — full environment access (required for basic process spawning)
+- `Exception::Environment(String)` — allow single environment variable (repeatable)
 - `Exception::Networking` — allow network access
+
+> ⚠️ **Avoid `Exception::FullEnvironment`** — it bypasses all env restrictions and leaks secrets to child processes. Use `Exception::Environment(name)` per variable instead. See [environment-sanitization-bash-sandbox-2026-04-29.md](../security-issues/environment-sanitization-bash-sandbox-2026-04-29.md) for the full pattern.
 
 **Working directory handling is platform-conditional:**
 - macOS: birdcage re-exports `std::process::Command`, so wrapper uses `current_dir(working_dir)` directly.
@@ -166,3 +168,4 @@ fn sandbox_run_test_path() -> PathBuf {
 - **GitHub Issue:** [#360 — Good sandboxing for bash commands](https://github.com/dobesv/harnx/issues/360)
 - **Plan:** bash-sandboxing-birdcage
 - **Commit:** f6a0449 — Add filesystem sandboxing to harnx-mcp-bash using birdcage
+- **Related Solution:** [security-issues/environment-sanitization-bash-sandbox-2026-04-29.md](../security-issues/environment-sanitization-bash-sandbox-2026-04-29.md) — Environment variable sanitization pattern
