@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -67,15 +68,27 @@ struct ServerState {
     script: MockOpenAiScript,
     consumed_turns: Mutex<Vec<bool>>,
     request_log: Arc<Mutex<Vec<Value>>>,
+    /// Total number of chunks the streaming responder has successfully
+    /// written to client connections across all requests. Useful for
+    /// cancellation tests: if a client closes its stream mid-flight
+    /// (e.g. because it was cancelled), later chunks fail to write and
+    /// don't bump this counter. Live, atomic; readable while the server
+    /// is still serving.
+    chunks_written: Arc<AtomicUsize>,
 }
 
 impl ServerState {
-    fn new(script: MockOpenAiScript, request_log: Arc<Mutex<Vec<Value>>>) -> Self {
+    fn new(
+        script: MockOpenAiScript,
+        request_log: Arc<Mutex<Vec<Value>>>,
+        chunks_written: Arc<AtomicUsize>,
+    ) -> Self {
         let consumed_turns = vec![false; script.turns.len()];
         Self {
             script,
             consumed_turns: Mutex::new(consumed_turns),
             request_log,
+            chunks_written,
         }
     }
 
@@ -207,6 +220,7 @@ pub struct MockOpenAiServer {
     shutdown: Option<TcpStream>,
     accept_thread: Option<JoinHandle<()>>,
     request_log: Arc<Mutex<Vec<Value>>>,
+    chunks_written: Arc<AtomicUsize>,
 }
 
 impl MockOpenAiServer {
@@ -232,7 +246,12 @@ impl MockOpenAiServer {
             .context("failed to accept shutdown channel")?;
 
         let request_log = Arc::new(Mutex::new(Vec::new()));
-        let state = Arc::new(ServerState::new(script, Arc::clone(&request_log)));
+        let chunks_written = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(ServerState::new(
+            script,
+            Arc::clone(&request_log),
+            Arc::clone(&chunks_written),
+        ));
         let accept_thread =
             thread::spawn(move || run_accept_loop(listener, shutdown_server, state));
 
@@ -241,6 +260,7 @@ impl MockOpenAiServer {
             shutdown: Some(shutdown),
             accept_thread: Some(accept_thread),
             request_log,
+            chunks_written,
         })
     }
 
@@ -250,6 +270,15 @@ impl MockOpenAiServer {
 
     pub fn get_request_log(&self) -> Vec<Value> {
         self.request_log.lock().unwrap().clone()
+    }
+
+    /// Cumulative count of streaming text/tool-call chunks that this
+    /// server has successfully written to client sockets. Useful for
+    /// validating that a client actually closed its stream mid-flight
+    /// when it was supposed to be cancelled — later chunks then fail to
+    /// write and don't increment this counter.
+    pub fn chunks_written(&self) -> usize {
+        self.chunks_written.load(Ordering::SeqCst)
     }
 }
 
@@ -454,6 +483,7 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut Tcp
             &turn.text_chunks,
             state.script.chunk_delay_ms,
             &tool_calls,
+            &state.chunks_written,
         );
     } else {
         let full_text = turn.text_chunks.join("");
@@ -464,11 +494,25 @@ fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut Tcp
     }
 }
 
+/// Returns true if the peer has half-closed the connection (sent FIN).
+/// Uses a non-blocking peek: read of 0 bytes on a fully connected socket
+/// returns WouldBlock; on a half-closed socket it returns Ok(0).
+fn peer_closed(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    let result = stream.peek(&mut probe);
+    let _ = stream.set_nonblocking(false);
+    matches!(result, Ok(0))
+}
+
 fn write_streaming_response(
     stream: &mut TcpStream,
     text_chunks: &[String],
     chunk_delay_ms: u64,
     tool_calls: &[Value],
+    chunks_written: &AtomicUsize,
 ) {
     // Write HTTP headers for SSE (no Content-Length so we can flush per-event).
     let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
@@ -485,6 +529,14 @@ fn write_streaming_response(
         if i > 0 && chunk_delay_ms > 0 {
             thread::sleep(delay);
         }
+        // Bail out if the client closed its end while we were sleeping.
+        // `write_all` on a half-closed socket can still succeed (kernel
+        // accepts into its send buffer), which would falsely bump
+        // chunks_written even though the peer is gone. Cancellation
+        // tests rely on this counter being accurate.
+        if peer_closed(stream) {
+            return;
+        }
         let event = format!(
             "data: {}\n\n",
             json!({
@@ -499,14 +551,19 @@ fn write_streaming_response(
                 }]
             })
         );
-        let _ = stream.write_all(event.as_bytes());
-        let _ = stream.flush();
+        if stream.write_all(event.as_bytes()).is_err() || stream.flush().is_err() {
+            return;
+        }
+        chunks_written.fetch_add(1, Ordering::SeqCst);
     }
 
     // Emit tool_calls or stop event.
     if !tool_calls.is_empty() {
         if chunk_delay_ms > 0 && !text_chunks.is_empty() {
             thread::sleep(delay);
+        }
+        if peer_closed(stream) {
+            return;
         }
         let event = format!(
             "data: {}\n\n",
@@ -522,8 +579,10 @@ fn write_streaming_response(
                 }]
             })
         );
-        let _ = stream.write_all(event.as_bytes());
-        let _ = stream.flush();
+        if stream.write_all(event.as_bytes()).is_err() || stream.flush().is_err() {
+            return;
+        }
+        chunks_written.fetch_add(1, Ordering::SeqCst);
     } else {
         let event = format!(
             "data: {}\n\n",

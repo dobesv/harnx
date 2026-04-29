@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use harnx::test_utils::interrupt::{
     script_call_sub_agent, script_call_trivial_tool, script_call_wait_tool, script_stall_streaming,
-    send_sigint, spawn_acp_client, spawn_oneshot, spawn_tui, wait_for_exit, wait_for_prompt_return,
-    write_acp_agent, write_minimal_config, write_with_blocking_hook, write_with_sub_agent,
-    write_with_wait_tool,
+    script_streaming_with_sentinel, send_sigint, spawn_acp_client, spawn_oneshot, spawn_tui,
+    wait_for_exit, wait_for_prompt_return, write_acp_agent, write_minimal_config,
+    write_with_blocking_hook, write_with_sub_agent, write_with_wait_tool,
 };
 use harnx::test_utils::mock_openai_server::MockOpenAiServer;
 use harnx::test_utils::tmux_harness::TmuxHarness;
@@ -152,6 +152,61 @@ fn interrupt_tui_during_sub_agent() -> Result<()> {
     tmux.send_keys(&["C-c"])?;
 
     wait_for_prompt_return(&tmux, Duration::from_secs(2))?;
+    Ok(())
+}
+
+/// Regression for issue #358: Ctrl-C in the parent TUI must propagate
+/// `session/cancel` to a sub-agent that is actively streaming, otherwise
+/// the child's late chunks leak through `AcpNotificationClient`'s
+/// fallback path and continue to render in the parent transcript after
+/// the abort message.
+///
+/// The child mock emits `tick-first` immediately and `SENTINEL_END` after
+/// 1.5s. We Ctrl-C right after `tick-first` arrives. With the bug, the
+/// child keeps running, the mock writes `SENTINEL_END`, and the chunk
+/// reaches the parent transcript via the fallback emit. With the fix,
+/// the child receives ACP cancel, drops its mock stream, and the sentinel
+/// is never written.
+#[test]
+fn interrupt_tui_sub_agent_cancel_stops_late_chunks() -> Result<()> {
+    if !TmuxHarness::is_available() {
+        eprintln!("tmux unavailable; skipping interrupt_tui_sub_agent_cancel_stops_late_chunks");
+        return Ok(());
+    }
+
+    let parent_mock = MockOpenAiServer::start(script_call_sub_agent("child"))?;
+    let child_mock = MockOpenAiServer::start(script_streaming_with_sentinel())?;
+    let tmp = tempfile::tempdir()?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let paths = write_with_sub_agent(
+        tmp.path(),
+        &format!("http://127.0.0.1:{}/v1", parent_mock.port()),
+        &format!("http://127.0.0.1:{}/v1", child_mock.port()),
+        &harnx_bin,
+    )?;
+    let tmux = spawn_tui(&paths, &harnx_bin, &repo_root)?;
+
+    tmux.send_text("delegate please")?;
+    tmux.send_keys(&["Enter"])?;
+    // Confirm parent delegated and child started streaming.
+    tmux.wait_for_contains("Delegating", Duration::from_secs(10))?;
+    tmux.wait_for_contains("tick-first", Duration::from_secs(5))?;
+
+    tmux.send_keys(&["C-c"])?;
+    wait_for_prompt_return(&tmux, Duration::from_secs(2))?;
+
+    // Wait past the child mock's 1.5s sentinel deadline plus margin. If
+    // the child was actually cancelled, no further chunks reach the
+    // parent. If cancel propagation is broken, `SENTINEL_END` lands in
+    // the transcript via AcpNotificationClient's fallback emit path.
+    std::thread::sleep(Duration::from_millis(2500));
+
+    let screen = tmux.capture_pane()?;
+    assert!(
+        !screen.contains("SENTINEL_END"),
+        "SENTINEL_END appeared in transcript after Ctrl-C — sub-agent was not cancelled.\nTranscript:\n{screen}"
+    );
     Ok(())
 }
 
@@ -358,11 +413,24 @@ async fn interrupt_acp_session_cancel_during_hook() -> Result<()> {
     Ok(())
 }
 
+/// Cancel sent to the top-level ACP server must propagate `session/cancel`
+/// down to its sub-agent so the sub-agent stops reading from its upstream.
+///
+/// Why the assertion uses `child_mock.chunks_written()` rather than the
+/// test client's `response_text`: the parent ACP server clears its
+/// agent-event sink as part of returning `Cancelled`, so any leaked
+/// chunks the sub-agent forwards arrive at a `None` sink and never reach
+/// the test client. The child mock's chunk counter, with its
+/// peer-closed peek before every write, is what catches the leak — if
+/// the child's ACP-side cancel never fires, its connection to the mock
+/// stays open past the 1.5 s chunk delay and the mock writes a second
+/// chunk; if cancel propagates correctly, the child closes the
+/// connection and the second chunk write is skipped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
 async fn interrupt_acp_session_cancel_propagates_to_sub_agent() -> Result<()> {
     let parent_mock = MockOpenAiServer::start(script_call_sub_agent("child"))?;
-    let child_mock = MockOpenAiServer::start(script_stall_streaming())?;
+    let child_mock = MockOpenAiServer::start(script_streaming_with_sentinel())?;
     let tmp = tempfile::tempdir()?;
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
     let paths = write_with_sub_agent(
@@ -373,19 +441,51 @@ async fn interrupt_acp_session_cancel_propagates_to_sub_agent() -> Result<()> {
     )?;
     write_acp_agent(&paths, "default")?;
 
-    let client = spawn_acp_client(&paths, &harnx_bin, "default").await?;
+    let client = std::sync::Arc::new(spawn_acp_client(&paths, &harnx_bin, "default").await?);
     let session = client.session_new().await?;
 
-    let prompt_fut = client.session_prompt(Some(&session), "delegate please");
-    tokio::pin!(prompt_fut);
-    tokio::time::sleep(TokioDuration::from_millis(2000)).await;
+    // Spawn the prompt on its own task so the runtime polls it while
+    // we sleep. The previous `tokio::pin!(prompt_fut) + sleep` shape
+    // never actually dispatched the prompt during the sleep — the
+    // cancel-notify permit then fired immediately on the next prompt's
+    // first `.notified()` poll and aborted it before any chunks
+    // accumulated, masking the bug.
+    let prompt_client = std::sync::Arc::clone(&client);
+    let prompt_session = session.clone();
+    let prompt_handle = tokio::spawn(async move {
+        prompt_client
+            .session_prompt(Some(&prompt_session), "delegate please")
+            .await
+    });
+
+    // Wait long enough for "tick-first" to flow through the chain
+    // (parent delegates → child harnx subprocess starts up → child
+    // receives prompt → child streams first chunk). Subprocess startup
+    // + ACP handshake is the slow link (~1 s on CI). The 1.5 s sentinel
+    // deadline inside the child mock starts when the child opens its
+    // mock connection, so cancelling at 1.2 s — before the child has
+    // advanced to its second chunk — is the right window for catching
+    // missed cancel propagation.
+    tokio::time::sleep(TokioDuration::from_millis(1200)).await;
 
     client.session_cancel(&session).await?;
 
-    let result = timeout(TokioDuration::from_secs(2), &mut prompt_fut).await;
+    let _response = timeout(TokioDuration::from_secs(5), prompt_handle)
+        .await
+        .expect("parent prompt task should resolve within 5 s after cancel")
+        .expect("prompt task should not panic")?;
+
+    // Wait past the child mock's 1.5 s sentinel deadline before
+    // reading the counter. With cancel propagating, the child closes
+    // its mock connection inside the 100 ms HarnxAgent grace and the
+    // mock skips the second write; without propagation, the mock
+    // bumps chunks_written to 2.
+    tokio::time::sleep(TokioDuration::from_millis(2500)).await;
+
+    let chunks = child_mock.chunks_written();
     assert!(
-        result.is_ok(),
-        "parent prompt did not resolve after cancel — sub-agent likely not cancelled"
+        chunks <= 1,
+        "child mock wrote {chunks} chunks; expected at most 1 (tick-first). Cancel did not propagate to the sub-agent."
     );
     Ok(())
 }
