@@ -73,11 +73,6 @@ fn path_is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(unix))]
-fn path_is_executable(path: &Path) -> bool {
-    path.is_file()
-}
-
 fn push_root(roots: &mut Vec<PathBuf>, raw: &str) {
     let path = PathBuf::from(raw);
     if path.exists() {

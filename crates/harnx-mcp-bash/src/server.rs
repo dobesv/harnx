@@ -1,6 +1,8 @@
+#[cfg(unix)]
+use harnx_mcp::safety::validate_write_path;
 use harnx_mcp::safety::{
     file_uri_to_path, format_size, sanitize_output_text, truncate_output, validate_path,
-    validate_write_path, TruncateOpts,
+    TruncateOpts,
 };
 
 use fancy_regex::Regex;
