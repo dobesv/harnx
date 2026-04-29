@@ -1,8 +1,6 @@
-#[cfg(unix)]
-use harnx_mcp::safety::validate_write_path;
 use harnx_mcp::safety::{
     file_uri_to_path, format_size, sanitize_output_text, truncate_output, validate_path,
-    TruncateOpts,
+    validate_write_path, TruncateOpts,
 };
 
 use fancy_regex::Regex;
@@ -273,6 +271,9 @@ struct SpawnedProcess {
     stderr_log_path: PathBuf,
     before_snap_ids: Vec<(PathBuf, gix::ObjectId)>,
     snapshot_decision: SnapshotDecision,
+    /// Resolved output paths from params.outputs; drives history snapshot in wait_impl.
+    /// None = use snapshot_decision (classifier); Some([]) = ReadOnly; Some(paths) = Targeted.
+    output_paths: Option<Vec<PathBuf>>,
 }
 
 #[cfg(unix)]
@@ -573,7 +574,16 @@ impl BashServer {
         let working_dir = self
             .resolve_working_dir(params.working_dir.as_deref())
             .await?;
-        let snapshot_decision = classify_command(&params.command, &working_dir);
+        let snapshot_decision = {
+            let roots_guard = self.inner.roots.read().await;
+            let resolved = parse_output_path_list(&params.outputs, &roots_guard, &working_dir)?;
+            drop(roots_guard);
+            match resolved {
+                None => classify_command(&params.command, &working_dir),
+                Some(paths) if paths.is_empty() => SnapshotDecision::ReadOnly,
+                Some(paths) => SnapshotDecision::Targeted(paths),
+            }
+        };
 
         // HISTORY: before snapshot (non-fatal)
         let before_snaps = match &snapshot_decision {
@@ -1056,7 +1066,14 @@ impl BashServer {
         let working_dir = self
             .resolve_working_dir(params.working_dir.as_deref())
             .await?;
-        let snapshot_decision = classify_command(&params.command, &working_dir);
+        let roots_guard = self.inner.roots.read().await;
+        let output_paths = parse_output_path_list(&params.outputs, &roots_guard, &working_dir)?;
+        drop(roots_guard);
+        let snapshot_decision = match &output_paths {
+            None => classify_command(&params.command, &working_dir),
+            Some(paths) if paths.is_empty() => SnapshotDecision::ReadOnly,
+            Some(paths) => SnapshotDecision::Targeted(paths.clone()),
+        };
 
         // HISTORY: before snapshot (non-fatal)
         let before_snap_ids = match &snapshot_decision {
@@ -1164,6 +1181,7 @@ impl BashServer {
             stderr_log_path: stderr_log_path.clone(),
             before_snap_ids,
             snapshot_decision: snapshot_decision.clone(),
+            output_paths,
         };
 
         self.inner
@@ -1212,6 +1230,7 @@ impl BashServer {
             stderr_log_path,
             before_snap_ids,
             snapshot_decision,
+            output_paths,
         ) = {
             let mut map = self.inner.spawned.lock().await;
             let entry = map.remove(&params.execution_id).ok_or_else(|| {
@@ -1231,7 +1250,14 @@ impl BashServer {
                 entry.stderr_log_path,
                 entry.before_snap_ids,
                 entry.snapshot_decision,
+                entry.output_paths,
             )
+        };
+
+        let snapshot_decision = match &output_paths {
+            None => snapshot_decision,
+            Some(paths) if paths.is_empty() => SnapshotDecision::ReadOnly,
+            Some(paths) => SnapshotDecision::Targeted(paths.clone()),
         };
 
         let timeout = Duration::from_secs(timeout_secs);
@@ -1356,6 +1382,7 @@ impl BashServer {
                         stderr_log_path: stderr_log_path.clone(),
                         before_snap_ids,
                         snapshot_decision,
+                        output_paths,
                     },
                 );
 
@@ -1776,7 +1803,6 @@ fn parse_input_path_list(
     parse_validated_path_list(list, roots, working_dir, validate_path)
 }
 
-#[cfg(unix)]
 fn parse_output_path_list(
     list: &Option<Vec<String>>,
     roots: &[PathBuf],
@@ -1785,7 +1811,6 @@ fn parse_output_path_list(
     parse_validated_path_list(list, roots, working_dir, validate_write_path)
 }
 
-#[cfg(unix)]
 fn parse_validated_path_list(
     list: &Option<Vec<String>>,
     roots: &[PathBuf],
@@ -2328,6 +2353,31 @@ mod tests {
             .find_map(|line| line.strip_prefix(&format!("{field}: ")))
             .unwrap()
             .to_string()
+    }
+
+    async fn git(args: &[&str], cwd: &Path) {
+        let status = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .await
+            .unwrap();
+        assert!(
+            status.success(),
+            "git command failed: git {}",
+            args.join(" ")
+        );
+    }
+
+    async fn init_git_repo(root: &Path) {
+        tokio::fs::write(root.join("tracked.txt"), "baseline\n")
+            .await
+            .unwrap();
+        git(&["init"], root).await;
+        git(&["config", "user.name", "Test User"], root).await;
+        git(&["config", "user.email", "test@example.com"], root).await;
+        git(&["add", "tracked.txt"], root).await;
+        git(&["commit", "-m", "initial"], root).await;
     }
 
     #[cfg(unix)]
@@ -3052,5 +3102,107 @@ mod tests {
         assert!(text.contains("line1"));
         assert!(text.contains("line2"));
         assert!(text.contains("line3"));
+    }
+
+    #[tokio::test]
+    async fn test_exec_with_outputs_uses_targeted_snapshot() {
+        let temp_dir = TestDir::new();
+        init_git_repo(temp_dir.path()).await;
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "printf 'one\n' > specific_file.txt && printf 'two\n' > other_file.txt"
+                    .to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: Some(20),
+                max_output_bytes: None,
+                inputs: None,
+                outputs: Some(vec!["specific_file.txt".to_string()]),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("specific_file.txt"));
+        assert!(!text.contains("other_file.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_exec_with_empty_outputs_skips_snapshot() {
+        let temp_dir = TestDir::new();
+        init_git_repo(temp_dir.path()).await;
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "printf 'one\n' > specific_file.txt && printf 'two\n' > other_file.txt"
+                    .to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: Some(20),
+                max_output_bytes: None,
+                inputs: None,
+                outputs: Some(vec![]),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(text.contains("exit_code: 0"));
+        assert!(!text.contains("diff --git"));
+        assert!(!text.contains("specific_file.txt"));
+        assert!(!text.contains("other_file.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_wait_with_outputs_uses_targeted_snapshot() {
+        let temp_dir = TestDir::new();
+        init_git_repo(temp_dir.path()).await;
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "printf 'one\n' > out.txt && printf 'two\n' > other.txt".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: Some(vec!["out.txt".to_string()]),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        let execution_id = extract_field(&text, "execution_id");
+
+        let result = server
+            .wait_impl(WaitParams {
+                execution_id,
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: Some(20),
+                max_output_bytes: None,
+                grep: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        let diff_text = result
+            .content
+            .iter()
+            .skip(2)
+            .filter_map(|content| match &content.raw {
+                rmcp::model::RawContent::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("exit_code: 0"));
+        assert!(diff_text.contains("out.txt"));
+        assert!(!diff_text.contains("other.txt"));
     }
 }
