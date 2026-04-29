@@ -1760,7 +1760,7 @@ fn internal_error(msg: impl Into<Cow<'static, str>>) -> ErrorData {
     ErrorData::internal_error(msg, None)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 fn sandbox_run_test_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/harnx-mcp-bash-sandbox-run")
 }
@@ -2241,7 +2241,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn sandboxed_server(roots: Vec<PathBuf>) -> BashServer {
         BashServer::new_with_sandbox(
             roots,
