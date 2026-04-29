@@ -2,7 +2,9 @@ mod server;
 
 use rmcp::ServiceExt;
 use server::BashServer;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
