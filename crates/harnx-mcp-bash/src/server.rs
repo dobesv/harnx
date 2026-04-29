@@ -2254,6 +2254,73 @@ mod tests {
         )
     }
 
+    /// Probe whether birdcage's sandbox can actually initialize in the current
+    /// environment. GitHub Actions Ubuntu runners and other restricted Linux
+    /// environments commonly disallow unprivileged user namespaces, which
+    /// causes `Sandbox::spawn()` to fail with EPERM at runtime. The
+    /// sandbox-runtime tests below short-circuit and log a "skipping" message
+    /// when this returns false, instead of failing the build.
+    #[cfg(target_os = "linux")]
+    fn sandbox_runtime_works() -> bool {
+        let helper = sandbox_run_test_path();
+        if !helper.exists() {
+            eprintln!(
+                "sandbox runtime probe: helper not built at {} — skipping",
+                helper.display()
+            );
+            return false;
+        }
+        let output = std::process::Command::new(&helper)
+            .args([
+                "--exec",
+                "/usr/bin",
+                "--exec",
+                "/bin",
+                "--exec",
+                "/lib",
+                "--exec",
+                "/lib64",
+                "--exec",
+                "/usr/lib",
+                "--exec",
+                "/usr/lib64",
+                "--exec",
+                "/usr/lib/x86_64-linux-gnu",
+                "--exec",
+                "/etc",
+                "--exec",
+                "/proc",
+                "--exec",
+                "/dev",
+                "--exec",
+                "/tmp",
+                "--exec",
+                "/usr/share",
+                "--working-dir",
+                "/tmp",
+                "--",
+                "bash",
+                "-c",
+                "exit 0",
+            ])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                eprintln!(
+                    "sandbox runtime probe: birdcage cannot initialize here (exit={:?}, stderr={:?}) — skipping",
+                    o.status.code(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                false
+            }
+            Err(err) => {
+                eprintln!("sandbox runtime probe: failed to spawn helper: {err} — skipping");
+                false
+            }
+        }
+    }
+
     fn extract_field(text: &str, field: &str) -> String {
         text.lines()
             .find_map(|line| line.strip_prefix(&format!("{field}: ")))
@@ -2433,6 +2500,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_sandbox_exec_write_allowed() {
+        if !sandbox_runtime_works() {
+            return;
+        }
         let root = TestDir::new();
         let server = sandboxed_server(vec![root.path().to_path_buf()]);
 
@@ -2466,6 +2536,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_sandbox_exec_write_denied_outside_root() {
+        if !sandbox_runtime_works() {
+            return;
+        }
         let root = TestDir::new();
         let server = sandboxed_server(vec![root.path().to_path_buf()]);
 
@@ -2504,6 +2577,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_sandbox_exec_custom_outputs() {
+        if !sandbox_runtime_works() {
+            return;
+        }
         let root = TestDir::new();
         let other = TestDir::new();
         let server = sandboxed_server(vec![root.path().to_path_buf(), other.path().to_path_buf()]);
