@@ -19,6 +19,7 @@ struct SandboxConfig {
     exec_paths: Vec<PathBuf>,
     write_paths: Vec<PathBuf>,
     read_paths: Vec<PathBuf>,
+    env_vars: Vec<(String, String)>,
     no_network: bool,
     working_dir: Option<PathBuf>,
     command: Vec<OsString>,
@@ -27,7 +28,7 @@ struct SandboxConfig {
 #[cfg(unix)]
 fn print_usage() {
     println!(
-        "harnx-mcp-bash-sandbox-run [OPTIONS] -- <command> [args...]\n\nOptions:\n  --write <path>       Allow read+write (repeatable)\n  --read <path>        Allow read-only (repeatable)\n  --exec <path>        Allow read+execute (repeatable)\n  --no-network         Disable networking (default: networking allowed)\n  --working-dir <path> Set working directory of spawned command\n  --help, -h           Print this help"
+        "harnx-mcp-bash-sandbox-run [OPTIONS] -- <command> [args...]\n\nOptions:\n  --write <path>       Allow read+write (repeatable)\n  --read <path>        Allow read-only (repeatable)\n  --exec <path>        Allow read+execute (repeatable)\n  --env VAR[=VALUE]    Pass VAR from host env or set VALUE explicitly (repeatable)\n  --no-network         Disable networking (default: networking allowed)\n  --working-dir <path> Set working directory of spawned command\n  --help, -h           Print this help"
     );
 }
 
@@ -42,11 +43,31 @@ where
 }
 
 #[cfg(unix)]
+fn parse_env_arg(raw: &OsStr) -> Result<(String, Option<String>), String> {
+    let s = raw
+        .to_str()
+        .ok_or_else(|| "sandbox-run: --env value is not valid UTF-8".to_string())?;
+    if s.is_empty() {
+        return Err("sandbox-run: --env requires a non-empty variable name".to_string());
+    }
+    match s.split_once('=') {
+        Some((key, value)) => {
+            if key.is_empty() {
+                return Err("sandbox-run: --env requires a non-empty variable name".to_string());
+            }
+            Ok((key.to_string(), Some(value.to_string())))
+        }
+        None => Ok((s.to_string(), None)),
+    }
+}
+
+#[cfg(unix)]
 fn parse_args() -> Result<Option<SandboxConfig>, String> {
     let mut args = env::args_os().skip(1);
     let mut exec_paths = Vec::new();
     let mut write_paths = Vec::new();
     let mut read_paths = Vec::new();
+    let mut env_vars = Vec::new();
     let mut no_network = false;
     let mut working_dir = None;
 
@@ -60,6 +81,7 @@ fn parse_args() -> Result<Option<SandboxConfig>, String> {
                 exec_paths,
                 write_paths,
                 read_paths,
+                env_vars,
                 no_network,
                 working_dir,
                 command,
@@ -75,6 +97,17 @@ fn parse_args() -> Result<Option<SandboxConfig>, String> {
             }
             flag if flag == OsStr::new("--exec") => {
                 exec_paths.push(parse_path_arg(&mut args, "--exec")?);
+            }
+            flag if flag == OsStr::new("--env") => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "sandbox-run: missing value for --env".to_string())?;
+                let (key, value) = parse_env_arg(&raw)?;
+                if let Some(value) = value {
+                    env_vars.push((key, value));
+                } else if let Ok(value) = env::var(&key) {
+                    env_vars.push((key, value));
+                }
             }
             flag if flag == OsStr::new("--working-dir") => {
                 working_dir = Some(parse_path_arg(&mut args, "--working-dir")?);
@@ -162,11 +195,6 @@ fn run() -> Result<i32, String> {
     };
 
     let mut sandbox = Birdcage::new();
-    sandbox
-        .add_exception(Exception::FullEnvironment)
-        .map_err(|error| {
-            format!("sandbox-run: failed to add FullEnvironment exception: {error}")
-        })?;
 
     for path in &config.exec_paths {
         add_path_exception(&mut sandbox, path, Exception::ExecuteAndRead)?;
@@ -181,6 +209,28 @@ fn run() -> Result<i32, String> {
         sandbox
             .add_exception(Exception::Networking)
             .map_err(|error| format!("sandbox-run: failed to add Networking exception: {error}"))?;
+    }
+
+    for (key, value) in &config.env_vars {
+        // Ensure the value lives in the current process env so birdcage's
+        // restrict_env_variables() preserves it for the child.
+        //
+        // SAFETY: `env::set_var` is unsafe because it mutates process-global
+        // state and is not thread-safe. This binary is the `sandbox_run`
+        // helper, which runs single-threaded up to this point — `parse_args`
+        // and the sandbox setup never spawn threads, and we have not yet
+        // called `sandbox.spawn(...)`. No other code in the process can be
+        // observing the environment concurrently, so the call is sound. We
+        // must do this before `sandbox.spawn(...)` because birdcage's
+        // `restrict_env_variables()` (invoked from `Birdcage::lock` inside
+        // `spawn`) inspects `std::env::vars()` and removes any variable not
+        // listed via `Exception::Environment`.
+        unsafe { env::set_var(key, value) };
+        sandbox
+            .add_exception(Exception::Environment(key.clone()))
+            .map_err(|error| {
+                format!("sandbox-run: failed to add env exception for {key}: {error}")
+            })?;
     }
 
     #[cfg(target_os = "macos")]

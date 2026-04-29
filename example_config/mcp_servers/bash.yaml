@@ -16,7 +16,14 @@ rename_tools:
 #   - /opt/tools/bin
 #   - --sandbox-run                                         # Override sandbox helper binary
 #   - /opt/harnx/harnx-mcp-bash-sandbox-run
+#   - --env                                                 # Pass through a host env var (e.g. for git push / gh)
+#   - GITHUB_TOKEN
+#   - --env                                                 # Set an env var explicitly
+#   - MY_VAR=my_value
+#   - --env                                                 # Allow git push over SSH
+#   - SSH_AUTH_SOCK
 #
 # env:
 #   HARNX_BASH_EXTRA_READABLE: /opt/sdk      # Extra readable path via environment
 #   HARNX_BASH_EXTRA_EXEC: /opt/tools/bin    # Extra executable path via environment
+#   HARNX_BASH_ENV_PASSTHROUGH: GITHUB_TOKEN,SSH_AUTH_SOCK  # Comma-separated list to pass through
