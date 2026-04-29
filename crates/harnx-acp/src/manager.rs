@@ -438,10 +438,14 @@ impl ToolProvider for AcpManager {
             }
         };
 
-        // Tear down: unsubscribe first (closes the channel), then
-        // await the forward task.
+        // Tear down: drop every sender for this subscription, then await
+        // the forwarder so it can drain anything still queued before
+        // exiting. Calling `abort()` here would race with that drain and
+        // silently swallow late events (e.g. the sub-agent's final text
+        // chunk arriving just before its session_prompt response), which
+        // showed up as flaky standalone activity rendering in the
+        // nested-sub-agent transcript.
         self.unsubscribe_chunks(subscription_id).await;
-        forward_handle.abort();
         let _ = forward_handle.await;
 
         if let Some(s) = spinner {
