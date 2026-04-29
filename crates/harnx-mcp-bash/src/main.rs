@@ -8,10 +8,7 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    #[cfg(unix)]
     let (roots, sandbox_config) = parse_args()?;
-    #[cfg(not(unix))]
-    let roots = parse_args();
 
     eprintln!(
         "harnx-mcp-bash v{}: starting ({} root{})",
@@ -39,10 +36,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    #[cfg(unix)]
     let server = BashServer::new_with_sandbox(roots, sandbox_config);
-    #[cfg(not(unix))]
-    let server = BashServer::new(roots);
     let cleanup_server = server.clone();
     let transport = rmcp::transport::stdio();
     let service = server.serve(transport).await?;
@@ -64,6 +58,17 @@ fn parse_env_paths(var_name: &str) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn parse_env_passthrough() -> Vec<String> {
+    std::env::var("HARNX_BASH_ENV_PASSTHROUGH")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 #[cfg(unix)]
@@ -99,6 +104,8 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
         extra_exec: parse_env_paths("HARNX_BASH_EXTRA_EXEC"),
         extra_readable: parse_env_paths("HARNX_BASH_EXTRA_READABLE"),
         sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
+        extra_env_passthrough: parse_env_passthrough(),
+        env_overrides: vec![],
     };
     let mut sandbox_run_override = None;
     let mut i = 1;
@@ -148,6 +155,30 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                     std::process::exit(1);
                 }
             }
+            "--env" | "-e" => {
+                if i + 1 < args.len() {
+                    let raw = &args[i + 1];
+                    if let Some((key, value)) = raw.split_once('=') {
+                        if key.is_empty() {
+                            eprintln!("harnx-mcp-bash: --env requires a non-empty variable name");
+                            std::process::exit(1);
+                        }
+                        sandbox_config
+                            .env_overrides
+                            .push((key.to_string(), value.to_string()));
+                    } else {
+                        if raw.is_empty() {
+                            eprintln!("harnx-mcp-bash: --env requires a non-empty variable name");
+                            std::process::exit(1);
+                        }
+                        sandbox_config.extra_env_passthrough.push(raw.clone());
+                    }
+                    i += 2;
+                } else {
+                    eprintln!("harnx-mcp-bash: --env requires an argument");
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
                 eprintln!("harnx-mcp-bash: MCP shell command server");
                 eprintln!();
@@ -159,14 +190,19 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                 eprintln!("  --extra-readable <path> Add sandbox read-only path (repeatable)");
                 eprintln!("  --extra-exec <path>     Add sandbox execute path (repeatable)");
                 eprintln!("  --sandbox-run <path>    Override sandbox helper binary path");
+                eprintln!("  --env, -e <VAR>         Pass VAR from host env to child (repeatable)");
+                eprintln!("  --env, -e <VAR=VALUE>   Set VAR=VALUE in child env (repeatable)");
                 eprintln!("  --help, -h              Show this help message");
                 eprintln!();
                 eprintln!("Environment:");
                 eprintln!(
-                    "  HARNX_BASH_EXTRA_READABLE  Colon-separated extra sandbox read-only paths"
+                    "  HARNX_BASH_EXTRA_READABLE   Colon-separated extra sandbox read-only paths"
                 );
                 eprintln!(
-                    "  HARNX_BASH_EXTRA_EXEC      Colon-separated extra sandbox execute paths"
+                    "  HARNX_BASH_EXTRA_EXEC       Colon-separated extra sandbox execute paths"
+                );
+                eprintln!(
+                    "  HARNX_BASH_ENV_PASSTHROUGH  Comma-separated extra env var names to pass through"
                 );
                 eprintln!();
                 eprintln!("Sandboxing is enabled by default on Unix. Use --no-sandbox to disable it explicitly.");
@@ -216,9 +252,29 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
 }
 
 #[cfg(not(unix))]
-fn parse_args() -> Vec<PathBuf> {
+fn parse_env_passthrough() -> Vec<String> {
+    std::env::var("HARNX_BASH_ENV_PASSTHROUGH")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
     let args: Vec<String> = std::env::args().collect();
     let mut roots = Vec::new();
+    let mut sandbox_config = server::SandboxConfig {
+        // Sandbox itself is Unix-only; on Windows these fields are unused.
+        enabled: false,
+        extra_exec: vec![],
+        extra_readable: vec![],
+        sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
+        extra_env_passthrough: parse_env_passthrough(),
+        env_overrides: vec![],
+    };
     let mut i = 1;
 
     while i < args.len() {
@@ -232,19 +288,51 @@ fn parse_args() -> Vec<PathBuf> {
                     std::process::exit(1);
                 }
             }
+            "--env" | "-e" => {
+                if i + 1 < args.len() {
+                    let raw = &args[i + 1];
+                    if let Some((key, value)) = raw.split_once('=') {
+                        if key.is_empty() {
+                            eprintln!("harnx-mcp-bash: --env requires a non-empty variable name");
+                            std::process::exit(1);
+                        }
+                        sandbox_config
+                            .env_overrides
+                            .push((key.to_string(), value.to_string()));
+                    } else {
+                        if raw.is_empty() {
+                            eprintln!("harnx-mcp-bash: --env requires a non-empty variable name");
+                            std::process::exit(1);
+                        }
+                        sandbox_config.extra_env_passthrough.push(raw.clone());
+                    }
+                    i += 2;
+                } else {
+                    eprintln!("harnx-mcp-bash: --env requires an argument");
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
                 eprintln!("harnx-mcp-bash: MCP shell command server");
                 eprintln!();
                 eprintln!("Usage: harnx-mcp-bash [OPTIONS]");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  --root, -r <path>  Add an allowed root directory (repeatable)");
-                eprintln!("  --help, -h         Show this help message");
+                eprintln!("  --root, -r <path>       Add an allowed root directory (repeatable)");
+                eprintln!("  --env, -e <VAR>         Pass VAR from host env to child (repeatable)");
+                eprintln!("  --env, -e <VAR=VALUE>   Set VAR=VALUE in child env (repeatable)");
+                eprintln!("  --help, -h              Show this help message");
                 eprintln!();
-                eprintln!("Sandboxing is enabled by default on Unix. Use --no-sandbox to disable it explicitly.");
+                eprintln!("Environment:");
+                eprintln!(
+                    "  HARNX_BASH_ENV_PASSTHROUGH  Comma-separated extra env var names to pass through"
+                );
+                eprintln!();
+                eprintln!("Sandboxing is Unix-only. On other platforms the child bash process");
+                eprintln!("still receives only the curated environment built from the default");
+                eprintln!("allowlist plus any --env / passthrough configuration.");
                 eprintln!("The server communicates via stdio using the MCP protocol.");
                 eprintln!("If no roots are specified, operations are denied until the client provides roots.");
-                eprintln!("Roots can also be provided dynamically by the MCP client.");
                 std::process::exit(0);
             }
             other => {
@@ -255,5 +343,5 @@ fn parse_args() -> Vec<PathBuf> {
         }
     }
 
-    roots
+    Ok((roots, sandbox_config))
 }

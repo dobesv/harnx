@@ -74,6 +74,12 @@ Harnx can load environment variables from a `.env` file located in the configura
   message history the harness built is responsible. The file is appended,
   not truncated, so set a fresh path per session.
 
+## Bash MCP Server Envs
+
+- **HARNX_BASH_ENV_PASSTHROUGH**: Comma-separated list of extra host env var names to pass through to child bash processes spawned by `harnx-mcp-bash`. Example: `HARNX_BASH_ENV_PASSTHROUGH=GITHUB_TOKEN,SSH_AUTH_SOCK`.
+- **HARNX_BASH_EXTRA_READABLE**: Colon-separated extra sandbox read-only paths.
+- **HARNX_BASH_EXTRA_EXEC**: Colon-separated extra sandbox executable paths.
+
 ## Generic Envs
 
 - **HTTPS_PROXY / ALL_PROXY**: Proxy settings for network requests.

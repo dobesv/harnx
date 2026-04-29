@@ -276,12 +276,28 @@ struct SpawnedProcess {
     output_paths: Option<Vec<PathBuf>>,
 }
 
-#[cfg(unix)]
+/// Configuration for the bash MCP server's sandboxing and child env handling.
+///
+/// The sandboxing fields (`enabled`, `extra_exec`, `extra_readable`,
+/// `sandbox_run_path`) are honoured only on Unix; on other platforms they
+/// are accepted for API compatibility and ignored.
+///
+/// The env-control fields (`extra_env_passthrough`, `env_overrides`) are
+/// honoured on every platform — even when sandboxing is unavailable, the
+/// child bash process receives only the curated environment.
 #[derive(Clone, Debug)]
 pub struct SandboxConfig {
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub enabled: bool,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub extra_exec: Vec<PathBuf>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub extra_readable: Vec<PathBuf>,
+    /// Extra var names to pass through from host (allowlist additions).
+    pub extra_env_passthrough: Vec<String>,
+    /// Explicit overrides: KEY → VALUE (highest precedence).
+    pub env_overrides: Vec<(String, String)>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub sandbox_run_path: PathBuf,
 }
 
@@ -291,7 +307,10 @@ struct BashServerInner {
     spawned: Mutex<HashMap<String, SpawnedProcess>>,
     log_dir: PathBuf,
     history: Arc<HistoryManager>,
-    #[cfg(unix)]
+    /// Sandbox + env config. Sandbox-specific fields (`enabled`,
+    /// `extra_exec`, `extra_readable`, `sandbox_run_path`) are only used on
+    /// Unix; env fields (`extra_env_passthrough`, `env_overrides`) are
+    /// honoured on every platform.
     sandbox_config: SandboxConfig,
 }
 
@@ -348,41 +367,41 @@ impl BashServer {
     #[allow(dead_code)]
     const SYSTEM_EXEC_PATHS: &[&str] = &["/usr/bin", "/bin", "/tmp", "/etc"];
 
-    #[cfg_attr(unix, allow(dead_code))]
-    pub fn new(initial_roots: Vec<PathBuf>) -> Self {
-        #[cfg(unix)]
-        {
-            Self::new_with_sandbox(
-                initial_roots,
-                SandboxConfig {
-                    enabled: false,
-                    extra_exec: vec![],
-                    extra_readable: vec![],
-                    sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
-                },
-            )
-        }
+    const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
+        "HOME",
+        "PATH",
+        "LANG",
+        "LANGUAGE",
+        "USER",
+        "SHELL",
+        "TERM",
+        "DISPLAY",
+        "EDITOR",
+        "NODE_OPTIONS",
+        "NODE_EXTRA_CA_CERTS",
+        "PWD",
+        "SHLVL",
+        "LOGNAME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    ];
 
-        #[cfg(not(unix))]
-        {
-            let log_dir = std::env::temp_dir().join(format!(
-                "harnx-bash-{}-{}",
-                std::process::id(),
-                Uuid::new_v4()
-            ));
-            Self {
-                inner: Arc::new(BashServerInner {
-                    roots: RwLock::new(initial_roots.clone()),
-                    roots_initialized: AtomicBool::new(false),
-                    spawned: Mutex::new(HashMap::new()),
-                    log_dir,
-                    history: Arc::new(HistoryManager::new(&initial_roots)),
-                }),
-            }
-        }
+    #[allow(dead_code)]
+    pub fn new(initial_roots: Vec<PathBuf>) -> Self {
+        Self::new_with_sandbox(
+            initial_roots,
+            SandboxConfig {
+                enabled: false,
+                extra_exec: vec![],
+                extra_readable: vec![],
+                extra_env_passthrough: vec![],
+                env_overrides: vec![],
+                sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
+            },
+        )
     }
 
-    #[cfg(unix)]
     pub fn new_with_sandbox(initial_roots: Vec<PathBuf>, sandbox_config: SandboxConfig) -> Self {
         let log_dir = std::env::temp_dir().join(format!(
             "harnx-bash-{}-{}",
@@ -463,6 +482,63 @@ impl BashServer {
             .prefix("exec-")
             .tempdir_in(&self.inner.log_dir)
             .map_err(|err| internal_error(format!("failed to create exec directory: {err}")))
+    }
+
+    /// Build the child process environment from the configured sources.
+    ///
+    /// Layers, applied in order from lowest to highest precedence (later
+    /// entries replace earlier ones with the same key):
+    /// 1. Default allowlist values inherited from the host process env.
+    /// 2. `XDG_*` variables inherited from the host process env.
+    /// 3. `.env.bash` dotfile values.
+    /// 4. `extra_env_passthrough` — host values for explicitly named vars.
+    /// 5. `env_overrides` — explicit `KEY=VALUE` overrides.
+    ///
+    /// This applies on every platform; sandbox-specific behaviour
+    /// (birdcage exceptions, `sandbox_run` helper) remains Unix-only.
+    fn build_child_env(&self) -> Vec<(String, String)> {
+        fn upsert(env_vars: &mut Vec<(String, String)>, key: String, value: String) {
+            if let Some((_, existing)) = env_vars.iter_mut().find(|(k, _)| k == &key) {
+                *existing = value;
+            } else {
+                env_vars.push((key, value));
+            }
+        }
+
+        let mut env_vars: Vec<(String, String)> = Vec::new();
+
+        // 1. Default allowlist.
+        for name in Self::DEFAULT_ENV_ALLOWLIST {
+            if let Ok(value) = std::env::var(name) {
+                upsert(&mut env_vars, (*name).to_string(), value);
+            }
+        }
+
+        // 2. XDG_* vars from host env.
+        for (name, value) in std::env::vars() {
+            if name.starts_with("XDG_") {
+                upsert(&mut env_vars, name, value);
+            }
+        }
+
+        // 3. .env.bash dotfile.
+        for (key, value) in load_bash_env_file() {
+            upsert(&mut env_vars, key, value);
+        }
+
+        // 4. Explicit passthrough names — host value wins over dotfile.
+        for name in &self.inner.sandbox_config.extra_env_passthrough {
+            if let Ok(value) = std::env::var(name) {
+                upsert(&mut env_vars, name.clone(), value);
+            }
+        }
+
+        // 5. Explicit overrides — highest precedence.
+        for (key, value) in &self.inner.sandbox_config.env_overrides {
+            upsert(&mut env_vars, key.clone(), value.clone());
+        }
+
+        env_vars
     }
 
     #[cfg(unix)]
@@ -554,6 +630,11 @@ impl BashServer {
                 args.push(OsString::from("--read"));
                 args.push(working_dir.as_os_str().to_os_string());
             }
+        }
+
+        for (key, value) in self.build_child_env() {
+            args.push(OsString::from("--env"));
+            args.push(OsString::from(format!("{key}={value}")));
         }
 
         args
@@ -682,13 +763,15 @@ impl BashServer {
             #[cfg(not(unix))]
             unreachable!()
         } else {
+            let child_env = self.build_child_env();
             CommandWrap::with_new("bash", |command| {
                 command
                     .args(["-c", &params.command])
                     .current_dir(&working_dir)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
+                    .stdin(Stdio::null());
+                command.env_clear();
+                command.envs(child_env.iter().map(|(k, v)| (k, v)));
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
             })
         };
         command.wrap(KillOnDrop);
@@ -1155,11 +1238,15 @@ impl BashServer {
             #[cfg(not(unix))]
             unreachable!()
         } else {
+            let child_env = self.build_child_env();
             CommandWrap::with_new("bash", |command| {
                 command
                     .args(["-c", &params.command])
                     .current_dir(&working_dir)
-                    .stdin(Stdio::null())
+                    .stdin(Stdio::null());
+                command.env_clear();
+                command.envs(child_env.iter().map(|(k, v)| (k, v)));
+                command
                     .stdout(Stdio::from(stdout_file))
                     .stderr(Stdio::from(stderr_file));
             })
@@ -1842,6 +1929,41 @@ fn parse_validated_path_list(
     }
 }
 
+fn load_bash_env_file() -> Vec<(String, String)> {
+    fn bash_config_dir() -> PathBuf {
+        if let Ok(v) = std::env::var("HARNX_CONFIG_DIR") {
+            return PathBuf::from(v);
+        }
+        if let Ok(v) = std::env::var("XDG_CONFIG_HOME") {
+            return PathBuf::from(v).join("harnx");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".config/harnx");
+        }
+        PathBuf::from(".config/harnx")
+    }
+
+    let env_file = bash_config_dir().join(".env.bash");
+    let Ok(contents) = std::fs::read_to_string(env_file) else {
+        return vec![];
+    };
+
+    contents
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+
+            let mut parts = trimmed.splitn(2, '=');
+            let key = parts.next()?.trim();
+            let value = parts.next()?.trim();
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 fn object_schema(properties: Vec<(&str, Schema)>, required: &[&str]) -> Schema {
     let mut schema = Map::new();
     schema.insert("type".to_string(), Value::String("object".to_string()));
@@ -2067,7 +2189,9 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
+    #[cfg(unix)]
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{ClientCapabilities, InitializeRequestParams, ListRootsResult, Root};
@@ -2259,12 +2383,70 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    #[cfg(unix)]
+    struct EnvVar {
+        key: String,
+        prev: Option<OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVar {
+        fn set(key: &str, value: impl AsRef<OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value.as_ref()) };
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+
+        fn unset(key: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var(&self.key, value),
+                    None => std::env::remove_var(&self.key),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
     fn enabled_sandbox_config() -> SandboxConfig {
         SandboxConfig {
             enabled: true,
             extra_exec: vec![],
             extra_readable: vec![],
+            extra_env_passthrough: vec![],
+            env_overrides: vec![],
             sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn disabled_sandbox_config() -> SandboxConfig {
+        SandboxConfig {
+            enabled: false,
+            ..enabled_sandbox_config()
         }
     }
 
@@ -2276,6 +2458,8 @@ mod tests {
                 enabled: true,
                 extra_exec: vec![],
                 extra_readable: vec![],
+                extra_env_passthrough: vec![],
+                env_overrides: vec![],
                 sandbox_run_path: sandbox_run_test_path(),
             },
         )
@@ -2461,6 +2645,132 @@ mod tests {
         assert!(!pairs.contains(&("--write".into(), "/test/root".into())));
         assert!(!pairs.contains(&("--read".into(), "/test/root".into())));
         assert!(!pairs.contains(&("--read".into(), "/tmp/test_wd_xxx".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_default_allowlist_vars_passed_through() {
+        let _env_guard = env_lock();
+        let _home = EnvVar::set("HOME", "/tmp/harnx-home-4-1");
+        let _path = EnvVar::set("PATH", "/tmp/harnx-bin-4-1");
+        let _secret = EnvVar::set("HARNX_TEST_SECRET_4_1", "hunter2");
+        let _config_dir = EnvVar::unset("HARNX_CONFIG_DIR");
+
+        let server = BashServer::new_with_sandbox(vec![], enabled_sandbox_config());
+        let child_env = server.build_child_env();
+
+        assert!(child_env
+            .iter()
+            .any(|(key, value)| key == "HOME" && value == "/tmp/harnx-home-4-1"));
+        assert!(child_env
+            .iter()
+            .any(|(key, value)| key == "PATH" && value == "/tmp/harnx-bin-4-1"));
+        assert!(
+            !child_env
+                .iter()
+                .any(|(key, _)| key == "HARNX_TEST_SECRET_4_1"),
+            "non-allowlisted env leaked into child env: {child_env:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_overrides_and_passthrough() {
+        let _env_guard = env_lock();
+        let _host_value = EnvVar::set("HARNX_TEST_CUSTOM_4_2", "from_host");
+        let _config_dir = EnvVar::unset("HARNX_CONFIG_DIR");
+
+        let mut passthrough_config = enabled_sandbox_config();
+        passthrough_config.extra_env_passthrough = vec!["HARNX_TEST_CUSTOM_4_2".to_string()];
+        let passthrough_server = BashServer::new_with_sandbox(vec![], passthrough_config);
+        let passthrough_env = passthrough_server.build_child_env();
+        assert!(passthrough_env
+            .iter()
+            .any(|(key, value)| { key == "HARNX_TEST_CUSTOM_4_2" && value == "from_host" }));
+
+        let mut override_config = enabled_sandbox_config();
+        override_config.extra_env_passthrough = vec!["HARNX_TEST_CUSTOM_4_2".to_string()];
+        override_config.env_overrides = vec![(
+            "HARNX_TEST_CUSTOM_4_2".to_string(),
+            "overridden".to_string(),
+        )];
+        let override_server = BashServer::new_with_sandbox(vec![], override_config);
+        let override_env = override_server.build_child_env();
+        assert!(override_env
+            .iter()
+            .any(|(key, value)| { key == "HARNX_TEST_CUSTOM_4_2" && value == "overridden" }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_precedence_cli_over_passthrough_over_dotfile() {
+        let _env_guard = env_lock();
+
+        // Set host value for the var so passthrough can pick it up.
+        let _host_value = EnvVar::set("HARNX_TEST_PRECEDENCE_VAR", "from_host_passthrough");
+
+        // Point dotfile at a tempdir whose .env.bash sets a different value.
+        let temp_dir = TestDir::new();
+        std::fs::write(
+            temp_dir.path().join(".env.bash"),
+            "HARNX_TEST_PRECEDENCE_VAR=from_dotfile\n",
+        )
+        .unwrap();
+        let _config_dir = EnvVar::set("HARNX_CONFIG_DIR", temp_dir.path().as_os_str());
+
+        // Case 1: dotfile only (no passthrough, no override).
+        // Expect dotfile value to win over (absent) default allowlist value.
+        let dotfile_only = enabled_sandbox_config();
+        let dotfile_server = BashServer::new_with_sandbox(vec![], dotfile_only);
+        let dotfile_env = dotfile_server.build_child_env();
+        assert!(dotfile_env
+            .iter()
+            .any(|(k, v)| { k == "HARNX_TEST_PRECEDENCE_VAR" && v == "from_dotfile" }));
+
+        // Case 2: dotfile + passthrough → passthrough beats dotfile.
+        let mut passthrough_cfg = enabled_sandbox_config();
+        passthrough_cfg.extra_env_passthrough = vec!["HARNX_TEST_PRECEDENCE_VAR".to_string()];
+        let passthrough_server = BashServer::new_with_sandbox(vec![], passthrough_cfg);
+        let passthrough_env = passthrough_server.build_child_env();
+        assert!(passthrough_env
+            .iter()
+            .any(|(k, v)| { k == "HARNX_TEST_PRECEDENCE_VAR" && v == "from_host_passthrough" }));
+
+        // Case 3: dotfile + passthrough + override → override beats both.
+        let mut override_cfg = enabled_sandbox_config();
+        override_cfg.extra_env_passthrough = vec!["HARNX_TEST_PRECEDENCE_VAR".to_string()];
+        override_cfg.env_overrides = vec![(
+            "HARNX_TEST_PRECEDENCE_VAR".to_string(),
+            "from_cli_override".to_string(),
+        )];
+        let override_server = BashServer::new_with_sandbox(vec![], override_cfg);
+        let override_env = override_server.build_child_env();
+        assert!(override_env
+            .iter()
+            .any(|(k, v)| { k == "HARNX_TEST_PRECEDENCE_VAR" && v == "from_cli_override" }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_bash_dotfile_loaded() {
+        let _env_guard = env_lock();
+        let temp_dir = TestDir::new();
+        std::fs::write(
+            temp_dir.path().join(".env.bash"),
+            "# comment line\n\nHARNX_TEST_INJECT_4_3=s3cr3t\nHARNX_TEST_INJECT_KV_4_3=a=b\n",
+        )
+        .unwrap();
+        let _config_dir = EnvVar::set("HARNX_CONFIG_DIR", temp_dir.path().as_os_str());
+
+        let env_vars = load_bash_env_file();
+
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| { key == "HARNX_TEST_INJECT_4_3" && value == "s3cr3t" }));
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| { key == "HARNX_TEST_INJECT_KV_4_3" && value == "a=b" }));
+        assert!(!env_vars.iter().any(|(key, _)| key == "# comment line"));
     }
 
     #[cfg(unix)]
@@ -2790,6 +3100,43 @@ mod tests {
         let stderr_log_path = PathBuf::from(extract_field(&text, "stderr_log_path"));
         assert!(stdout_log_path.exists());
         assert!(stderr_log_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn env_secret_not_leaked_to_child() {
+        let _env_guard = env_lock();
+        let _secret = EnvVar::set("AWS_SECRET_ACCESS_KEY", "hunter2_4_4");
+        let _config_dir = EnvVar::unset("HARNX_CONFIG_DIR");
+        let root = TestDir::new();
+        let server = BashServer::new_with_sandbox(
+            vec![root.path().to_path_buf()],
+            disabled_sandbox_config(),
+        );
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "echo ${AWS_SECRET_ACCESS_KEY:-empty}".to_string(),
+                working_dir: Some(root.path().to_string_lossy().to_string()),
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("empty"), "unexpected exec output: {text}");
+        assert!(
+            !text.contains("hunter2_4_4"),
+            "secret leaked into child output: {text}"
+        );
     }
 
     #[tokio::test]
