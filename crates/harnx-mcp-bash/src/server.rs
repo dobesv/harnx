@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use harnx_mcp::safety::validate_write_path;
 use harnx_mcp::safety::{
     file_uri_to_path, format_size, sanitize_output_text, truncate_output, validate_path,
     TruncateOpts,
@@ -24,6 +26,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -38,6 +42,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ExecCommandParams {
     command: String,
     #[serde(default)]
@@ -50,6 +55,10 @@ struct ExecCommandParams {
     tail_lines: Option<usize>,
     #[serde(default)]
     max_output_bytes: Option<usize>,
+    #[serde(default)]
+    inputs: Option<Vec<String>>,
+    #[serde(default)]
+    outputs: Option<Vec<String>>,
 }
 
 impl JsonSchema for ExecCommandParams {
@@ -64,6 +73,8 @@ impl JsonSchema for ExecCommandParams {
         let head_lines = generator.subschema_for::<Option<usize>>();
         let tail_lines = generator.subschema_for::<Option<usize>>();
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
+        let inputs = generator.subschema_for::<Option<Vec<String>>>();
+        let outputs = generator.subschema_for::<Option<Vec<String>>>();
         object_schema(
             vec![
                 ("command", command),
@@ -72,6 +83,8 @@ impl JsonSchema for ExecCommandParams {
                 ("head_lines", head_lines),
                 ("tail_lines", tail_lines),
                 ("max_output_bytes", max_output_bytes),
+                ("inputs", inputs),
+                ("outputs", outputs),
             ],
             &["command"],
         )
@@ -131,10 +144,15 @@ impl JsonSchema for ReadExecLogParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct SpawnCommandParams {
     command: String,
     #[serde(default)]
     working_dir: Option<String>,
+    #[serde(default)]
+    inputs: Option<Vec<String>>,
+    #[serde(default)]
+    outputs: Option<Vec<String>>,
 }
 
 impl JsonSchema for SpawnCommandParams {
@@ -145,8 +163,15 @@ impl JsonSchema for SpawnCommandParams {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let command = generator.subschema_for::<String>();
         let working_dir = generator.subschema_for::<Option<String>>();
+        let inputs = generator.subschema_for::<Option<Vec<String>>>();
+        let outputs = generator.subschema_for::<Option<Vec<String>>>();
         object_schema(
-            vec![("command", command), ("working_dir", working_dir)],
+            vec![
+                ("command", command),
+                ("working_dir", working_dir),
+                ("inputs", inputs),
+                ("outputs", outputs),
+            ],
             &["command"],
         )
     }
@@ -250,12 +275,23 @@ struct SpawnedProcess {
     snapshot_decision: SnapshotDecision,
 }
 
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct SandboxConfig {
+    pub enabled: bool,
+    pub extra_exec: Vec<PathBuf>,
+    pub extra_readable: Vec<PathBuf>,
+    pub sandbox_run_path: PathBuf,
+}
+
 struct BashServerInner {
     roots: RwLock<Vec<PathBuf>>,
     roots_initialized: AtomicBool,
     spawned: Mutex<HashMap<String, SpawnedProcess>>,
     log_dir: PathBuf,
     history: Arc<HistoryManager>,
+    #[cfg(unix)]
+    sandbox_config: SandboxConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,7 +304,85 @@ pub struct BashServer {
 }
 
 impl BashServer {
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    const SYSTEM_EXEC_PATHS: &[&str] = &[
+        "/usr/bin",
+        "/bin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/sbin",
+        "/usr/lib",
+        "/usr/lib64",
+        "/lib",
+        "/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/libexec",
+        "/proc",
+        "/dev",
+        "/sys",
+        "/etc",
+        "/tmp",
+        "/run",
+        "/var/run",
+        "/usr/share",
+    ];
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    const SYSTEM_EXEC_PATHS: &[&str] = &[
+        "/usr/bin",
+        "/bin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/sbin",
+        "/usr/lib",
+        "/usr/local/lib",
+        "/Library",
+        "/System",
+        "/private/tmp",
+        "/private/var",
+        "/dev",
+    ];
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    #[allow(dead_code)]
+    const SYSTEM_EXEC_PATHS: &[&str] = &["/usr/bin", "/bin", "/tmp", "/etc"];
+
+    #[cfg_attr(unix, allow(dead_code))]
     pub fn new(initial_roots: Vec<PathBuf>) -> Self {
+        #[cfg(unix)]
+        {
+            Self::new_with_sandbox(
+                initial_roots,
+                SandboxConfig {
+                    enabled: false,
+                    extra_exec: vec![],
+                    extra_readable: vec![],
+                    sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
+                },
+            )
+        }
+
+        #[cfg(not(unix))]
+        {
+            let log_dir = std::env::temp_dir().join(format!(
+                "harnx-bash-{}-{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ));
+            Self {
+                inner: Arc::new(BashServerInner {
+                    roots: RwLock::new(initial_roots.clone()),
+                    roots_initialized: AtomicBool::new(false),
+                    spawned: Mutex::new(HashMap::new()),
+                    log_dir,
+                    history: Arc::new(HistoryManager::new(&initial_roots)),
+                }),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn new_with_sandbox(initial_roots: Vec<PathBuf>, sandbox_config: SandboxConfig) -> Self {
         let log_dir = std::env::temp_dir().join(format!(
             "harnx-bash-{}-{}",
             std::process::id(),
@@ -281,6 +395,7 @@ impl BashServer {
                 spawned: Mutex::new(HashMap::new()),
                 log_dir,
                 history: Arc::new(HistoryManager::new(&initial_roots)),
+                sandbox_config,
             }),
         }
     }
@@ -347,6 +462,100 @@ impl BashServer {
             .prefix("exec-")
             .tempdir_in(&self.inner.log_dir)
             .map_err(|err| internal_error(format!("failed to create exec directory: {err}")))
+    }
+
+    #[cfg(unix)]
+    fn build_sandbox_args(
+        &self,
+        working_dir: &Path,
+        inputs: Option<&[PathBuf]>,
+        outputs: Option<&[PathBuf]>,
+        roots: &[PathBuf],
+    ) -> Vec<OsString> {
+        let mut args = Vec::new();
+        let mut readable_paths = Vec::new();
+        let mut writable_paths = Vec::new();
+        let inputs_explicit_empty = matches!(inputs, Some([]));
+
+        for path in Self::SYSTEM_EXEC_PATHS {
+            args.push(OsString::from("--exec"));
+            args.push(OsString::from(path));
+        }
+
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            args.push(OsString::from("--exec"));
+            args.push(home.join(".local/bin").into_os_string());
+
+            let cargo_home = std::env::var_os("CARGO_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".cargo"));
+            args.push(OsString::from("--exec"));
+            args.push(cargo_home.join("bin").into_os_string());
+        } else if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+            args.push(OsString::from("--exec"));
+            args.push(PathBuf::from(cargo_home).join("bin").into_os_string());
+        }
+
+        for path in &self.inner.sandbox_config.extra_exec {
+            args.push(OsString::from("--exec"));
+            args.push(path.clone().into_os_string());
+        }
+
+        for path in &self.inner.sandbox_config.extra_readable {
+            args.push(OsString::from("--read"));
+            args.push(path.clone().into_os_string());
+            readable_paths.push(path.clone());
+        }
+
+        match outputs {
+            None => {
+                for root in roots {
+                    args.push(OsString::from("--write"));
+                    args.push(root.clone().into_os_string());
+                    writable_paths.push(root.clone());
+                }
+            }
+            Some([]) => {
+                if !inputs_explicit_empty {
+                    for root in roots {
+                        args.push(OsString::from("--read"));
+                        args.push(root.clone().into_os_string());
+                        readable_paths.push(root.clone());
+                    }
+                }
+            }
+            Some(paths) => {
+                for path in paths {
+                    args.push(OsString::from("--write"));
+                    args.push(path.clone().into_os_string());
+                    writable_paths.push(path.clone());
+                }
+            }
+        }
+
+        if let Some(paths) = inputs {
+            if !paths.is_empty() {
+                for path in paths {
+                    args.push(OsString::from("--read"));
+                    args.push(path.clone().into_os_string());
+                    readable_paths.push(path.clone());
+                }
+            }
+        }
+
+        if !inputs_explicit_empty {
+            let covered = writable_paths
+                .iter()
+                .chain(readable_paths.iter())
+                .any(|path| working_dir.starts_with(path));
+            if !covered {
+                args.push(OsString::from("--read"));
+                args.push(working_dir.as_os_str().to_os_string());
+            }
+        }
+
+        args
     }
 
     // -----------------------------------------------------------------------
@@ -426,14 +635,52 @@ impl BashServer {
                 ))
             })?;
 
-        let mut command = CommandWrap::with_new("bash", |command| {
-            command
-                .args(["-c", &params.command])
-                .current_dir(&working_dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-        });
+        #[cfg(unix)]
+        let use_sandbox = self.inner.sandbox_config.enabled;
+        #[cfg(not(unix))]
+        let use_sandbox = false;
+
+        let mut command = if use_sandbox {
+            #[cfg(unix)]
+            {
+                let roots_guard = self.inner.roots.read().await;
+                let inputs = parse_input_path_list(&params.inputs, &roots_guard, &working_dir)?;
+                let outputs = parse_output_path_list(&params.outputs, &roots_guard, &working_dir)?;
+                let mut sb_args = self.build_sandbox_args(
+                    &working_dir,
+                    inputs.as_deref(),
+                    outputs.as_deref(),
+                    &roots_guard,
+                );
+                sb_args.push(OsString::from("--working-dir"));
+                sb_args.push(working_dir.as_os_str().to_owned());
+                sb_args.push(OsString::from("--"));
+                sb_args.push(OsString::from("bash"));
+                sb_args.push(OsString::from("-c"));
+                sb_args.push(OsString::from(&params.command));
+                drop(roots_guard);
+                let sandbox_run_path = self.inner.sandbox_config.sandbox_run_path.clone();
+                CommandWrap::with_new(sandbox_run_path, |command| {
+                    command
+                        .args(&sb_args)
+                        .current_dir(&working_dir)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                })
+            }
+            #[cfg(not(unix))]
+            unreachable!()
+        } else {
+            CommandWrap::with_new("bash", |command| {
+                command
+                    .args(["-c", &params.command])
+                    .current_dir(&working_dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            })
+        };
         command.wrap(KillOnDrop);
         #[cfg(unix)]
         command.wrap(ProcessGroup::leader());
@@ -854,14 +1101,52 @@ impl BashServer {
             ))
         })?;
 
-        let mut command = CommandWrap::with_new("bash", |command| {
-            command
-                .args(["-c", &params.command])
-                .current_dir(&working_dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(stdout_file))
-                .stderr(Stdio::from(stderr_file));
-        });
+        #[cfg(unix)]
+        let use_sandbox = self.inner.sandbox_config.enabled;
+        #[cfg(not(unix))]
+        let use_sandbox = false;
+
+        let mut command = if use_sandbox {
+            #[cfg(unix)]
+            {
+                let roots_guard = self.inner.roots.read().await;
+                let inputs = parse_input_path_list(&params.inputs, &roots_guard, &working_dir)?;
+                let outputs = parse_output_path_list(&params.outputs, &roots_guard, &working_dir)?;
+                let mut sb_args = self.build_sandbox_args(
+                    &working_dir,
+                    inputs.as_deref(),
+                    outputs.as_deref(),
+                    &roots_guard,
+                );
+                sb_args.push(OsString::from("--working-dir"));
+                sb_args.push(working_dir.as_os_str().to_owned());
+                sb_args.push(OsString::from("--"));
+                sb_args.push(OsString::from("bash"));
+                sb_args.push(OsString::from("-c"));
+                sb_args.push(OsString::from(&params.command));
+                drop(roots_guard);
+                let sandbox_run_path = self.inner.sandbox_config.sandbox_run_path.clone();
+                CommandWrap::with_new(sandbox_run_path, |command| {
+                    command
+                        .args(&sb_args)
+                        .current_dir(&working_dir)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(stdout_file))
+                        .stderr(Stdio::from(stderr_file));
+                })
+            }
+            #[cfg(not(unix))]
+            unreachable!()
+        } else {
+            CommandWrap::with_new("bash", |command| {
+                command
+                    .args(["-c", &params.command])
+                    .current_dir(&working_dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(stdout_file))
+                    .stderr(Stdio::from(stderr_file));
+            })
+        };
         #[cfg(unix)]
         command.wrap(ProcessGroup::leader());
         #[cfg(windows)]
@@ -1477,6 +1762,61 @@ fn internal_error(msg: impl Into<Cow<'static, str>>) -> ErrorData {
     ErrorData::internal_error(msg, None)
 }
 
+#[cfg(all(test, target_os = "linux"))]
+fn sandbox_run_test_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/harnx-mcp-bash-sandbox-run")
+}
+
+#[cfg(unix)]
+fn parse_input_path_list(
+    list: &Option<Vec<String>>,
+    roots: &[PathBuf],
+    working_dir: &Path,
+) -> Result<Option<Vec<PathBuf>>, ErrorData> {
+    parse_validated_path_list(list, roots, working_dir, validate_path)
+}
+
+#[cfg(unix)]
+fn parse_output_path_list(
+    list: &Option<Vec<String>>,
+    roots: &[PathBuf],
+    working_dir: &Path,
+) -> Result<Option<Vec<PathBuf>>, ErrorData> {
+    parse_validated_path_list(list, roots, working_dir, validate_write_path)
+}
+
+#[cfg(unix)]
+fn parse_validated_path_list(
+    list: &Option<Vec<String>>,
+    roots: &[PathBuf],
+    working_dir: &Path,
+    validator: fn(&str, &[PathBuf]) -> Result<PathBuf, String>,
+) -> Result<Option<Vec<PathBuf>>, ErrorData> {
+    match list {
+        None => Ok(None),
+        Some(strs) => {
+            let mut out = Vec::with_capacity(strs.len());
+            for raw in strs {
+                if raw.trim().is_empty() {
+                    return Err(ErrorData::invalid_params(
+                        "path list contains empty string",
+                        None,
+                    ));
+                }
+                let resolved = if Path::new(raw).is_relative() {
+                    working_dir.join(raw)
+                } else {
+                    PathBuf::from(raw)
+                };
+                let validated = validator(&resolved.to_string_lossy(), roots)
+                    .map_err(|err| ErrorData::invalid_params(err, None))?;
+                out.push(validated);
+            }
+            Ok(Some(out))
+        }
+    }
+}
+
 fn object_schema(properties: Vec<(&str, Schema)>, required: &[&str]) -> Schema {
     let mut schema = Map::new();
     schema.insert("type".to_string(), Value::String("object".to_string()));
@@ -1701,6 +2041,9 @@ fn render_timeout_message(ctx: TimeoutRenderContext<'_>) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::ffi::OsString;
+
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{ClientCapabilities, InitializeRequestParams, ListRootsResult, Root};
     use rmcp::service::{
@@ -1874,11 +2217,428 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn collect_arg_pairs(args: &[OsString]) -> Vec<(String, String)> {
+        args.chunks(2)
+            .filter_map(|w| {
+                if w.len() == 2 {
+                    Some((
+                        w[0].to_string_lossy().into_owned(),
+                        w[1].to_string_lossy().into_owned(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn enabled_sandbox_config() -> SandboxConfig {
+        SandboxConfig {
+            enabled: true,
+            extra_exec: vec![],
+            extra_readable: vec![],
+            sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sandboxed_server(roots: Vec<PathBuf>) -> BashServer {
+        BashServer::new_with_sandbox(
+            roots,
+            SandboxConfig {
+                enabled: true,
+                extra_exec: vec![],
+                extra_readable: vec![],
+                sandbox_run_path: sandbox_run_test_path(),
+            },
+        )
+    }
+
+    /// Probe whether birdcage's sandbox can actually initialize in the current
+    /// environment. GitHub Actions Ubuntu runners and other restricted Linux
+    /// environments commonly disallow unprivileged user namespaces, which
+    /// causes `Sandbox::spawn()` to fail with EPERM at runtime. The
+    /// sandbox-runtime tests below short-circuit and log a "skipping" message
+    /// when this returns false, instead of failing the build.
+    #[cfg(target_os = "linux")]
+    fn sandbox_runtime_works() -> bool {
+        let helper = sandbox_run_test_path();
+        if !helper.exists() {
+            eprintln!(
+                "sandbox runtime probe: helper not built at {} — skipping",
+                helper.display()
+            );
+            return false;
+        }
+        let output = std::process::Command::new(&helper)
+            .args([
+                "--exec",
+                "/usr/bin",
+                "--exec",
+                "/bin",
+                "--exec",
+                "/lib",
+                "--exec",
+                "/lib64",
+                "--exec",
+                "/usr/lib",
+                "--exec",
+                "/usr/lib64",
+                "--exec",
+                "/usr/lib/x86_64-linux-gnu",
+                "--exec",
+                "/etc",
+                "--exec",
+                "/proc",
+                "--exec",
+                "/dev",
+                "--exec",
+                "/tmp",
+                "--exec",
+                "/usr/share",
+                "--working-dir",
+                "/tmp",
+                "--",
+                "bash",
+                "-c",
+                "exit 0",
+            ])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                eprintln!(
+                    "sandbox runtime probe: birdcage cannot initialize here (exit={:?}, stderr={:?}) — skipping",
+                    o.status.code(),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                false
+            }
+            Err(err) => {
+                eprintln!("sandbox runtime probe: failed to spawn helper: {err} — skipping");
+                false
+            }
+        }
+    }
+
     fn extract_field(text: &str, field: &str) -> String {
         text.lines()
             .find_map(|line| line.strip_prefix(&format!("{field}: ")))
             .unwrap()
             .to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_args_defaults() {
+        let server = BashServer::new_with_sandbox(
+            vec![PathBuf::from("/test/root")],
+            enabled_sandbox_config(),
+        );
+        let args = server.build_sandbox_args(
+            Path::new("/test/root/workdir"),
+            None,
+            None,
+            &[PathBuf::from("/test/root")],
+        );
+        let pairs = collect_arg_pairs(&args);
+
+        assert!(pairs.contains(&("--write".into(), "/test/root".into())));
+        assert!(pairs.contains(&("--exec".into(), "/usr/bin".into())));
+        assert!(!pairs.contains(&("--write".into(), "/usr/bin".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_args_empty_outputs() {
+        let server = BashServer::new_with_sandbox(
+            vec![PathBuf::from("/test/root")],
+            enabled_sandbox_config(),
+        );
+        let empty: [PathBuf; 0] = [];
+        let args = server.build_sandbox_args(
+            Path::new("/test/root/workdir"),
+            None,
+            Some(&empty),
+            &[PathBuf::from("/test/root")],
+        );
+        let pairs = collect_arg_pairs(&args);
+
+        assert!(pairs.contains(&("--read".into(), "/test/root".into())));
+        assert!(!pairs.contains(&("--write".into(), "/test/root".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_args_custom_outputs() {
+        let server = BashServer::new_with_sandbox(
+            vec![PathBuf::from("/test/root")],
+            enabled_sandbox_config(),
+        );
+        let outputs = [PathBuf::from("/custom/out")];
+        let args = server.build_sandbox_args(
+            Path::new("/custom/out/workdir"),
+            None,
+            Some(&outputs),
+            &[PathBuf::from("/test/root")],
+        );
+        let pairs = collect_arg_pairs(&args);
+
+        assert!(pairs.contains(&("--write".into(), "/custom/out".into())));
+        assert!(!pairs.contains(&("--write".into(), "/test/root".into())));
+        assert!(!pairs.contains(&("--read".into(), "/test/root".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_args_empty_inputs_empty_outputs() {
+        let server = BashServer::new_with_sandbox(
+            vec![PathBuf::from("/test/root")],
+            enabled_sandbox_config(),
+        );
+        let empty: [PathBuf; 0] = [];
+        let working_dir = PathBuf::from("/tmp/test_wd_xxx");
+        let args = server.build_sandbox_args(
+            &working_dir,
+            Some(&empty),
+            Some(&empty),
+            &[PathBuf::from("/test/root")],
+        );
+        let pairs = collect_arg_pairs(&args);
+
+        assert!(!pairs.contains(&("--write".into(), "/test/root".into())));
+        assert!(!pairs.contains(&("--read".into(), "/test/root".into())));
+        assert!(!pairs.contains(&("--read".into(), "/tmp/test_wd_xxx".into())));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_inputs_validation_rejects_paths_outside_roots() {
+        let root = TestDir::new();
+        let server =
+            BashServer::new_with_sandbox(vec![root.path().to_path_buf()], enabled_sandbox_config());
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "cat /etc/passwd".to_string(),
+                working_dir: Some(root.path().to_string_lossy().to_string()),
+                timeout_secs: Some(15),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: Some(vec!["/etc".into()]),
+                outputs: None,
+            })
+            .await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code.0, -32602);
+        assert!(
+            err.message.contains("outside allowed roots")
+                || err.message.contains("not under allowed roots")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_outputs_validation_rejects_paths_outside_roots() {
+        let root = TestDir::new();
+        let server =
+            BashServer::new_with_sandbox(vec![root.path().to_path_buf()], enabled_sandbox_config());
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "echo hi".to_string(),
+                working_dir: Some(root.path().to_string_lossy().to_string()),
+                timeout_secs: Some(15),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: Some(vec!["/etc".into()]),
+            })
+            .await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code.0, -32602);
+        assert!(
+            err.message.contains("outside allowed roots")
+                || err.message.contains("not under allowed roots")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_inputs_relative_paths_resolved_against_working_dir() {
+        // Verifies that a relative `inputs` path is resolved against the
+        // tool's `working_dir` at validation time (not the server's CWD).
+        // We don't run bash here — that's a separate concern covered by the
+        // Linux-only sandbox-runtime tests below; we just check that
+        // validation accepts the relative path.
+        let root = TestDir::new();
+        std::fs::create_dir(root.path().join("subdir")).unwrap();
+        let roots = vec![root.path().to_path_buf()];
+
+        let validated =
+            parse_input_path_list(&Some(vec!["subdir".to_string()]), &roots, root.path())
+                .expect("relative input path under working_dir must validate");
+
+        let paths = validated.expect("Some(_) when input list provided");
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0].ends_with("subdir"),
+            "validated path should canonicalize to .../subdir, got {}",
+            paths[0].display()
+        );
+        assert!(
+            paths[0].starts_with(root.path().canonicalize().unwrap()),
+            "validated path should be under root, got {}",
+            paths[0].display()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_sandbox_exec_write_allowed() {
+        if !sandbox_runtime_works() {
+            return;
+        }
+        let root = TestDir::new();
+        let server = sandboxed_server(vec![root.path().to_path_buf()]);
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "echo hi > out.txt".to_string(),
+                working_dir: Some(root.path().to_string_lossy().to_string()),
+                timeout_secs: Some(15),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        eprintln!(
+            "sandbox write allowed output:
+{text}"
+        );
+        assert_eq!(extract_field(&text, "exit_code"), "0");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("out.txt")).unwrap(),
+            "hi
+"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_sandbox_exec_write_denied_outside_root() {
+        if !sandbox_runtime_works() {
+            return;
+        }
+        let root = TestDir::new();
+        let server = sandboxed_server(vec![root.path().to_path_buf()]);
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "echo hi > out.txt".to_string(),
+                working_dir: Some(root.path().to_string_lossy().to_string()),
+                timeout_secs: Some(15),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: Some(vec![]),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        eprintln!(
+            "sandbox write denied output:
+{text}"
+        );
+        let exit_code = extract_field(&text, "exit_code").parse::<i32>().unwrap();
+        let denied = exit_code != 0
+            || text.contains("denied")
+            || text.contains("Permission")
+            || text.contains("permission");
+        assert!(
+            denied,
+            "expected sandbox denial evidence, got:
+{text}"
+        );
+        assert!(!root.path().join("out.txt").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_sandbox_exec_custom_outputs() {
+        if !sandbox_runtime_works() {
+            return;
+        }
+        let root = TestDir::new();
+        let other = TestDir::new();
+        let server = sandboxed_server(vec![root.path().to_path_buf(), other.path().to_path_buf()]);
+        let outputs = vec![other.path().to_string_lossy().to_string()];
+
+        let fail_result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "echo hi > in_root.txt".to_string(),
+                working_dir: Some(root.path().to_string_lossy().to_string()),
+                timeout_secs: Some(15),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: Some(outputs.clone()),
+            })
+            .await
+            .unwrap();
+        let fail_text = text_content(&fail_result);
+        eprintln!(
+            "sandbox custom outputs fail output:
+{fail_text}"
+        );
+        let fail_exit_code = extract_field(&fail_text, "exit_code")
+            .parse::<i32>()
+            .unwrap();
+        assert_ne!(
+            fail_exit_code, 0,
+            "expected root write failure, got:
+{fail_text}"
+        );
+        assert!(!root.path().join("in_root.txt").exists());
+
+        let success_result = server
+            .exec_command_impl(ExecCommandParams {
+                command: format!("echo bye > {}", other.path().join("in_other.txt").display()),
+                working_dir: Some(root.path().to_string_lossy().to_string()),
+                timeout_secs: Some(15),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: Some(outputs),
+            })
+            .await
+            .unwrap();
+        let success_text = text_content(&success_result);
+        eprintln!(
+            "sandbox custom outputs success output:
+{success_text}"
+        );
+        assert_eq!(extract_field(&success_text, "exit_code"), "0");
+        assert_eq!(
+            std::fs::read_to_string(other.path().join("in_other.txt")).unwrap(),
+            "bye
+"
+        );
     }
 
     #[tokio::test]
@@ -1895,6 +2655,8 @@ mod tests {
                 head_lines: None,
                 tail_lines: None,
                 max_output_bytes: None,
+                inputs: None,
+                outputs: None,
             })
             .await;
 
@@ -1918,6 +2680,8 @@ mod tests {
                 head_lines: None,
                 tail_lines: None,
                 max_output_bytes: None,
+                inputs: None,
+                outputs: None,
             })
             .await;
 
@@ -1937,6 +2701,8 @@ mod tests {
                 head_lines: None,
                 tail_lines: None,
                 max_output_bytes: None,
+                inputs: None,
+                outputs: None,
             })
             .await
             .unwrap();
@@ -1959,6 +2725,8 @@ mod tests {
                 head_lines: None,
                 tail_lines: None,
                 max_output_bytes: None,
+                inputs: None,
+                outputs: None,
             })
             .await
             .unwrap();
@@ -1987,6 +2755,8 @@ mod tests {
                 head_lines: None,
                 tail_lines: None,
                 max_output_bytes: None,
+                inputs: None,
+                outputs: None,
             })
             .await
             .unwrap();
@@ -2011,6 +2781,8 @@ mod tests {
                 head_lines: Some(1),
                 tail_lines: Some(1),
                 max_output_bytes: Some(16),
+                inputs: None,
+                outputs: None,
             })
             .await
             .unwrap();
@@ -2097,6 +2869,8 @@ mod tests {
                 head_lines: None,
                 tail_lines: None,
                 max_output_bytes: None,
+                inputs: None,
+                outputs: None,
             })
             .await
             .unwrap();
@@ -2119,6 +2893,8 @@ mod tests {
             .spawn_impl(SpawnCommandParams {
                 command: "echo background && sleep 1".to_string(),
                 working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
             })
             .await
             .unwrap();
@@ -2152,6 +2928,8 @@ mod tests {
             .spawn_impl(SpawnCommandParams {
                 command: "sleep 5".to_string(),
                 working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
             })
             .await
             .unwrap();
@@ -2184,6 +2962,8 @@ mod tests {
             .spawn_impl(SpawnCommandParams {
                 command: "sleep 30".to_string(),
                 working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
             })
             .await
             .unwrap();
@@ -2246,6 +3026,8 @@ mod tests {
             .spawn_impl(SpawnCommandParams {
                 command: "for i in 1 2 3; do echo line$i; done".to_string(),
                 working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
             })
             .await
             .unwrap();
