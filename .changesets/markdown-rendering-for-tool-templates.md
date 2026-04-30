@@ -20,6 +20,12 @@ producing styling.
   can't initialize, when `--no-highlight` is set, or when stdout isn't a
   TTY.
 
-The TUI's other transcript items (`AssistantText`, `Plan`, etc.) still
-render plain — broadening markdown support across the TUI is a separate
-concern outside this fix.
+`AssistantText` is also wired through the same renderer so headings,
+lists, code fences, and inline emphasis from the LLM display correctly
+(this rendering was lost in the original ratatui transition). Single
+input newlines are preserved as visible line breaks rather than being
+collapsed into reflowed paragraphs the way CommonMark normally would.
+
+Other transcript items (`Plan`, `SystemText`, `ErrorText`, etc.) still
+render plain — they're not user-content and don't benefit from
+markdown.

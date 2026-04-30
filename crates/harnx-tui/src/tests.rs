@@ -4409,3 +4409,105 @@ async fn tui_completed_template_styles_spans() {
     assert!(saw_bold, "expected a BOLD span from `**OK**`");
     assert!(saw_code, "expected a visually distinct span for `` `hello` ``");
 }
+
+#[tokio::test]
+async fn tui_assistant_text_renders_inline_markdown() {
+    // Sanity check that markdown styling on `AssistantText` survives the
+    // full transcript-render pass — the templated tool path was the
+    // motivating case for adding markdown rendering, but assistant
+    // messages benefit equally and are exercised here as a regression
+    // guard against future "pin every assistant line as plain" changes.
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+    tui.app.transcript.push(crate::types::TranscriptItem::AssistantText(
+        "Here's some **bold** and `code`.".to_string(),
+    ));
+
+    use ratatui::style::Modifier;
+    let rendered: Vec<ratatui::text::Line<'static>> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect();
+    let plain = rendered
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !plain.contains("**bold**"),
+        "expected `**bold**` markers consumed; got:\n{plain}"
+    );
+    assert!(
+        !plain.contains("`code`"),
+        "expected backticks consumed; got:\n{plain}"
+    );
+
+    let mut saw_bold = false;
+    let mut saw_code = false;
+    for line in &rendered {
+        for span in &line.spans {
+            if span.content.as_ref() == "bold"
+                && span.style.add_modifier.contains(Modifier::BOLD)
+            {
+                saw_bold = true;
+            }
+            if span.content.as_ref() == "code"
+                && (span.style.fg.is_some() || span.style.bg.is_some())
+            {
+                saw_code = true;
+            }
+        }
+    }
+    assert!(saw_bold, "assistant text should style `**bold**`");
+    assert!(saw_code, "assistant text should style `` `code` ``");
+}
+
+#[tokio::test]
+async fn tui_assistant_text_preserves_line_breaks() {
+    // LLM output frequently uses single `\n` for line breaks where they
+    // intend visible newlines. CommonMark would collapse those into a
+    // reflowed paragraph; the markdown_lines helper preprocesses to
+    // CommonMark hard breaks so each input newline shows.
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+    tui.app.transcript.push(crate::types::TranscriptItem::AssistantText(
+        "first line\nsecond line\nthird line".to_string(),
+    ));
+
+    let rendered: Vec<ratatui::text::Line<'static>> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect();
+    let line_texts: Vec<String> = rendered
+        .iter()
+        .map(line_to_plain)
+        .filter(|t| !t.is_empty())
+        .collect();
+    assert!(
+        line_texts.iter().any(|t| t == "first line"),
+        "expected `first line` on its own line; got {line_texts:?}"
+    );
+    assert!(
+        line_texts.iter().any(|t| t == "third line"),
+        "expected `third line` on its own line; got {line_texts:?}"
+    );
+    // Should NOT be collapsed into one paragraph.
+    assert!(
+        !line_texts
+            .iter()
+            .any(|t| t.contains("first line") && t.contains("second line")),
+        "lines were collapsed instead of preserved: {line_texts:?}"
+    );
+}

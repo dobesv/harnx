@@ -63,7 +63,22 @@ impl Tui {
                 true,
             ),
             TranscriptItem::AssistantText(text) => {
-                Self::render_text_entry("", text, Style::default(), !text.contains('\n'))
+                // Render assistant messages as markdown so headings, lists,
+                // code fences, and inline emphasis show their styling.
+                // Streaming chunks rebuild this entry on every render — an
+                // unclosed `**bold` mid-stream simply renders as literal
+                // asterisks for the moment, then upgrades to bold once the
+                // closing `**` arrives in a later chunk.
+                let mut lines =
+                    crate::render_helpers::markdown_lines(text, Style::default());
+                // Match the prior trailing-spacing rule: pad after a
+                // single-line message (so the next entry has breathing
+                // room) but skip the pad when the text already contains
+                // newlines.
+                if !text.contains('\n') {
+                    lines.push(Line::from(""));
+                }
+                lines
             }
             TranscriptItem::ErrorText(text) => Self::render_text_entry(
                 "error: ",

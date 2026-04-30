@@ -25,19 +25,56 @@ pub(crate) fn markdown_line_spans(text: &str, base_style: Style) -> Line<'static
         _ => return plain_fallback(),
     };
 
-    // Patch `base_style` under each parsed span so the dim/grey context
-    // (set by the caller) applies wherever the parsed span doesn't
-    // explicitly override it. `Style::patch` keeps the right-hand side's
-    // explicit fields and falls through to the left for `None` ones.
-    let spans: Vec<Span<'static>> = first
-        .spans
+    Line::from(patch_spans(first.spans.into_iter().collect(), base_style))
+}
+
+/// Render multi-line markdown into ratatui lines, patching `base_style`
+/// under each parsed span. Used for assistant messages where the input
+/// may include code fences, lists, headings, and other block-level
+/// markdown — `tui-markdown` handles the whole document at once.
+///
+/// Single newlines in the input are converted to CommonMark hard line
+/// breaks (`  \n`) before parsing. CommonMark normally collapses single
+/// newlines into spaces (paragraph reflow), but in a CLI/TUI the LLM's
+/// chosen line breaks are part of the formatting the user wants to see.
+/// Paragraph breaks (`\n\n`) and fenced code blocks keep working: the
+/// extra trailing spaces inside fences are invisible.
+///
+/// Falls back to one plain `Line` per input newline when `tui-markdown`
+/// produces an empty result, so streaming partial markdown (e.g. an
+/// unclosed `**bold` while the chunk is still arriving) keeps showing.
+pub(crate) fn markdown_lines(text: &str, base_style: Style) -> Vec<Line<'static>> {
+    let with_hard_breaks = text.replace('\n', "  \n");
+    let parsed = tui_markdown::from_str(&with_hard_breaks);
+    if parsed.lines.is_empty() {
+        return text
+            .split('\n')
+            .map(|line| Line::from(Span::styled(line.to_string(), base_style)))
+            .collect();
+    }
+    parsed
+        .lines
+        .into_iter()
+        .map(|line| Line::from(patch_spans(line.spans, base_style)))
+        .collect()
+}
+
+/// Patch `base_style` under each parsed span so caller context (e.g. dim
+/// grey for tool body lines) flows through wherever the parsed span
+/// doesn't override it. `Style::patch(left, right)` keeps right's
+/// explicit fields and falls through to left for `None` ones.
+///
+/// Generic over the parsed span's lifetime so it can take output from
+/// `tui_markdown::from_str` (which borrows from the input string), then
+/// upgrades to `Span<'static>` via `Cow::into_owned`.
+fn patch_spans<'a>(spans: Vec<Span<'a>>, base_style: Style) -> Vec<Span<'static>> {
+    spans
         .into_iter()
         .map(|span| {
             let merged = base_style.patch(span.style);
             Span::styled(span.content.into_owned(), merged)
         })
-        .collect();
-    Line::from(spans)
+        .collect()
 }
 
 pub(crate) fn render_status_line(title: Option<&str>, status: Option<&str>) -> Option<String> {
@@ -197,6 +234,72 @@ mod markdown_tests {
             .find(|s| s.content.as_ref() == "ls -la /tmp")
             .unwrap();
         assert!(code.style.fg.is_some() || code.style.bg.is_some());
+    }
+
+    #[test]
+    fn multi_line_preserves_each_input_newline() {
+        // Without hard-break preprocessing CommonMark would collapse the
+        // three-line input into one line. We need each `\n` in the source
+        // to become a separate ratatui line.
+        let lines = markdown_lines("line-01\nline-02\nline-03", Style::default());
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "line-01"),
+            "expected `line-01` as its own line; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == "line-03"),
+            "expected `line-03` as its own line; got {texts:?}"
+        );
+        // No "line-01 line-02 line-03" reflowed paragraph.
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t.contains("line-01") && t.contains("line-02")),
+            "lines were collapsed instead of preserved: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn multi_line_keeps_paragraph_breaks() {
+        // `\n\n` is a paragraph break — should still produce an empty
+        // line between paragraphs after preprocessing.
+        let lines = markdown_lines("para1\n\npara2", Style::default());
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let para1_idx = texts.iter().position(|t| t.contains("para1")).unwrap();
+        let para2_idx = texts.iter().position(|t| t.contains("para2")).unwrap();
+        assert!(
+            para2_idx > para1_idx + 1,
+            "expected an empty line between paragraphs; got {texts:?}"
+        );
+    }
+
+    #[test]
+    fn multi_line_renders_inline_emphasis() {
+        // Emphasis still works across lines.
+        let lines = markdown_lines("first line\n**bold line**", Style::default());
+        let bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == "bold line")
+            .expect("expected bold span");
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
