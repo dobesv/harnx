@@ -4216,3 +4216,184 @@ async fn tui_falls_back_to_output_when_no_template_title() {
         "expected raw output when no template title; got:\n{joined}"
     );
 }
+
+// ----------------------------------------------------------------------------
+// Templated tool calls/results render with inline markdown styling
+// (`**bold**`, `*italic*`, `` `code` ``). Plain output paths stay plain.
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tui_started_template_strips_markers_and_styles_spans() {
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+
+    // Producer-side render of `**$** \`{{ args.command }}\``.
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "call-1".into(),
+            name: "bash_exec".into(),
+            kind: ToolKind::Other,
+            title: Some("**$** `ls -la /tmp`".into()),
+            input: yaml_to_json("command: ls -la /tmp"),
+            locations: vec![],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let rendered_lines: Vec<ratatui::text::Line<'static>> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect();
+
+    // Markers should be consumed (not appear as literal text), and the
+    // styled span text should appear instead.
+    let plain = rendered_lines
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !plain.contains("**$**"),
+        "expected `**$**` markers to be consumed by markdown render; got:\n{plain}"
+    );
+    assert!(
+        !plain.contains("`ls -la /tmp`"),
+        "expected backticks to be consumed; got:\n{plain}"
+    );
+    assert!(
+        plain.contains("$ ls -la /tmp"),
+        "expected stripped text in transcript; got:\n{plain}"
+    );
+
+    // At least one span should be BOLD ("$"), and at least one should be
+    // styled with the code color (Yellow) for "ls -la /tmp".
+    use ratatui::style::{Color, Modifier};
+    let mut saw_bold = false;
+    let mut saw_code = false;
+    for line in &rendered_lines {
+        for span in &line.spans {
+            if span.style.add_modifier.contains(Modifier::BOLD) {
+                saw_bold = true;
+            }
+            if span.style.fg == Some(Color::Yellow) {
+                saw_code = true;
+            }
+        }
+    }
+    assert!(saw_bold, "expected a BOLD span from `**$**`");
+    assert!(saw_code, "expected a code-colored span from `` `ls -la /tmp` ``");
+}
+
+#[tokio::test]
+async fn tui_started_no_template_keeps_yaml_unstyled() {
+    // Regression guard: when no template, the body is YAML and must NOT
+    // get markdown styling — yaml content like `tags: [_priv]` would
+    // accidentally italicize.
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "call-1".into(),
+            name: "no_template_tool".into(),
+            kind: ToolKind::Other,
+            title: None,
+            input: yaml_to_json("flag: _priv_value"),
+            locations: vec![],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    use ratatui::style::Modifier;
+    let rendered: Vec<ratatui::text::Line<'static>> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect();
+    let plain = rendered
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plain.contains("_priv_value"),
+        "raw yaml value should appear unaltered; got:\n{plain}"
+    );
+    for line in &rendered {
+        for span in &line.spans {
+            assert!(
+                !span.style.add_modifier.contains(Modifier::ITALIC),
+                "yaml body should not be italicized: {:?}",
+                span.content
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tui_completed_template_styles_spans() {
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Completed {
+            id: "call-1".into(),
+            output: serde_json::json!({"content": [{"type": "text", "text": "hello"}]}),
+            title: Some("**OK**: `hello`".into()),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    use ratatui::style::{Color, Modifier};
+    let rendered: Vec<ratatui::text::Line<'static>> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect();
+    let plain = rendered
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !plain.contains("**OK**"),
+        "expected `**OK**` markers to be consumed; got:\n{plain}"
+    );
+    assert!(plain.contains("OK: hello"));
+
+    let mut saw_bold = false;
+    let mut saw_code = false;
+    for line in &rendered {
+        for span in &line.spans {
+            if span.style.add_modifier.contains(Modifier::BOLD) {
+                saw_bold = true;
+            }
+            if span.style.fg == Some(Color::Yellow) {
+                saw_code = true;
+            }
+        }
+    }
+    assert!(saw_bold, "expected a BOLD span from `**OK**`");
+    assert!(saw_code, "expected a code-colored span from `` `hello` ``");
+}

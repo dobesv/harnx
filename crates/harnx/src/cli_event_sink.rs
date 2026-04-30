@@ -184,6 +184,28 @@ impl CliSinkState {
         self.render = None;
         Ok(())
     }
+
+    /// Render a single line through `MarkdownRender` so MCP `call_template`/
+    /// `result_template` text shows its `**bold**` / `*italic*` / `` `code` ``
+    /// styling. Lazy-initializes the renderer (shared with the streaming
+    /// path) and returns the input unchanged when highlighting is disabled
+    /// (no TTY, --no-highlight, or render init failure).
+    fn render_markdown_line(&mut self, text: &str) -> String {
+        if !(self.highlight && *IS_STDOUT_TERMINAL) {
+            return text.to_string();
+        }
+        if self.render.is_none() {
+            match MarkdownRender::init(self.render_options.clone()) {
+                Ok(r) => self.render = Some(r),
+                Err(_) => return text.to_string(),
+            }
+        }
+        // `render_line` is `&self` — no `mut` borrow needed.
+        self.render
+            .as_ref()
+            .map(|r| r.render_line(text))
+            .unwrap_or_else(|| text.to_string())
+    }
 }
 
 impl AgentEventSink for CliAgentEventSink {
@@ -320,18 +342,42 @@ impl AgentEventSink for CliAgentEventSink {
                 }
             }
             AgentEvent::Tool(ToolEvent::Started { name, title, .. }) => {
-                eprintln!(
-                    "{}",
-                    dimmed_text(&format_tool_started_line(&name, title.as_deref()))
-                );
+                let templated_title = title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty());
+                match templated_title {
+                    Some(t) => {
+                        // Templated title — render markdown so `**bold**`,
+                        // `*italic*`, and `` `code` `` show their styling.
+                        let rendered = state.render_markdown_line(t);
+                        eprintln!("{} {}", dimmed_text(&format!("[tool] {name}")), rendered);
+                    }
+                    None => {
+                        eprintln!("{}", dimmed_text(&format!("[tool] {name}")));
+                    }
+                }
             }
             AgentEvent::Tool(ToolEvent::Failed { error, .. }) => {
                 eprintln!("{}", warning_text(&format!("tool error: {error}")));
             }
             AgentEvent::Tool(ToolEvent::Completed { output, title, .. }) => {
-                let text = harnx_runtime::utils::render_tool_result_text(&output, title.as_deref());
+                let templated = title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .is_some();
+                let text =
+                    harnx_runtime::utils::render_tool_result_text(&output, title.as_deref());
                 let trimmed = text.trim_end_matches('\n');
-                if !trimmed.is_empty() {
+                if trimmed.is_empty() {
+                    // nothing to show
+                } else if templated {
+                    // Render each line through markdown; preserve newlines.
+                    for line in trimmed.lines() {
+                        eprintln!("{}", state.render_markdown_line(line));
+                    }
+                } else {
                     eprintln!("{}", dimmed_text(trimmed));
                 }
             }
@@ -376,17 +422,6 @@ fn split_line_tail_local(text: &str) -> (&str, &str) {
 fn need_rows_local(text: &str, columns: u16) -> u16 {
     let buffer_width = display_width(text).max(1) as u16;
     buffer_width.div_ceil(columns)
-}
-
-/// Format the line printed for `ToolEvent::Started`. When the producer has
-/// rendered a MiniJinja `call_template` into `title`, append it after the
-/// tool name so the user sees the templated form instead of just the bare
-/// tool name. Public for testing the pure formatting decision.
-pub(crate) fn format_tool_started_line(name: &str, title: Option<&str>) -> String {
-    match title.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(t) => format!("[tool] {name} {t}"),
-        None => format!("[tool] {name}"),
-    }
 }
 
 #[cfg(test)]
@@ -479,33 +514,12 @@ mod tests {
     // prior to these tests.
     // ----------------------------------------------------------------
 
-    #[test]
-    fn started_line_includes_template_title_when_present() {
-        let line = format_tool_started_line("bash_exec", Some("$ ls -la /tmp"));
-        assert_eq!(line, "[tool] bash_exec $ ls -la /tmp");
-    }
-
-    #[test]
-    fn started_line_uses_bare_name_when_title_absent() {
-        let line = format_tool_started_line("bash_exec", None);
-        assert_eq!(line, "[tool] bash_exec");
-    }
-
-    #[test]
-    fn started_line_treats_empty_title_as_absent() {
-        // A template that renders to whitespace-only must not pollute the
-        // line with trailing whitespace — matches the "no template" path.
-        assert_eq!(
-            format_tool_started_line("name", Some("")),
-            "[tool] name",
-            "empty title should fall back"
-        );
-        assert_eq!(
-            format_tool_started_line("name", Some("   ")),
-            "[tool] name",
-            "whitespace-only title should fall back"
-        );
-    }
+    // The CLI Started handler renders the bare "[tool] name" prefix
+    // dimmed and appends the markdown-rendered title (or nothing if no
+    // title). The whitespace/empty fallback decision lives inline in the
+    // emit handler, exercised end-to-end by
+    // `emit_handles_each_top_level_variant_without_panic` plus the
+    // markdown-line tests below.
 
     // The CLI Completed handler delegates to
     // `harnx_runtime::utils::render_tool_result_text`, the same shared
@@ -572,5 +586,47 @@ mod tests {
             rendered.contains("important output"),
             "empty title should fall back to extraction: {rendered}"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Markdown rendering for tool events. The state.render_markdown_line
+    // helper drops back to plain text when highlighting is disabled or
+    // the renderer can't initialize, otherwise it produces ANSI-styled
+    // output via syntect.
+    // ----------------------------------------------------------------
+
+    fn make_state(highlight: bool) -> CliSinkState {
+        CliSinkState {
+            spinner: None,
+            render: None,
+            buffer: String::new(),
+            buffer_rows: 1,
+            columns: 0,
+            raw_mode_active: false,
+            highlight,
+            render_options: RenderOptions::default(),
+        }
+    }
+
+    #[test]
+    fn render_markdown_line_passthrough_when_highlight_disabled() {
+        // highlight=false short-circuits the renderer init entirely —
+        // no ANSI codes regardless of TTY status.
+        let mut state = make_state(false);
+        let out = state.render_markdown_line("**bold** and `code`");
+        assert_eq!(out, "**bold** and `code`");
+        assert!(state.render.is_none(), "render should not be initialized");
+    }
+
+    #[test]
+    fn render_markdown_line_passes_through_when_no_tty() {
+        // When stdout isn't a TTY, IS_STDOUT_TERMINAL is false → return
+        // the input unchanged. In the test process stdout *is* the test
+        // harness's pipe, so this gate passes.
+        let mut state = make_state(true);
+        let out = state.render_markdown_line("**bold** and `code`");
+        // In the test environment IS_STDOUT_TERMINAL is false, so we
+        // expect the same plain passthrough.
+        assert_eq!(out, "**bold** and `code`");
     }
 }

@@ -600,24 +600,32 @@ impl Tui {
             }
             AgentEvent::Tool(ToolEvent::Completed { output, title, .. }) => {
                 // The TuiAgentEventSink forwards Tool::Completed through
-                // render_agent_event. The truncation + formatting live
-                // here (mirror of default_emit_tool_result). Strip ANSI
-                // from a string-valued output BEFORE truncation so
-                // pre-dimmed test inputs get their ESC-introduced
-                // sequences removed cleanly — otherwise
-                // `truncate_output`'s `sanitize_output_text` strips the
-                // ESC char but leaves literal `[2m`/`[0m` markers.
-                // `render_tool_result_text` no longer wraps in ANSI dim:
-                // the TUI renderer applies `Modifier::DIM` via
-                // `TranscriptItem::ToolResultText`.
+                // render_agent_event. Strip ANSI from string-valued output
+                // BEFORE truncation so pre-dimmed test inputs get their
+                // ESC sequences removed cleanly. When `title` carries a
+                // rendered MCP `result_template`, route it through
+                // `ToolResultMarkdown` so the renderer styles `**bold**`
+                // / `` `code` `` / `*italic*`. Otherwise the extracted
+                // raw output goes through `ToolResultText` (plain dim).
+                let templated = title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .is_some();
                 let raw = match &output {
                     serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
                     _ => output.clone(),
                 };
-                let text = crate::agent_event_sink::render_tool_result_text(&raw, title.as_deref());
+                let text =
+                    crate::agent_event_sink::render_tool_result_text(&raw, title.as_deref());
                 let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
                 if clean.is_empty() {
                     vec![]
+                } else if templated {
+                    clean
+                        .lines()
+                        .map(|line| TranscriptItem::ToolResultMarkdown(line.to_string()))
+                        .collect()
                 } else {
                     clean
                         .lines()
@@ -774,16 +782,16 @@ impl Tui {
             AgentEvent::Tool(ToolEvent::Started {
                 name, title, input, ..
             }) => {
-                let input_yaml = match title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-                    Some(t) => Some(t.to_string()),
+                let body = match title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    Some(t) => Some(crate::types::ToolCallBody::Markdown(t.to_string())),
                     None => match &input {
                         serde_json::Value::Null => None,
-                        _ => Some(pretty_yaml_block(&input)),
+                        _ => Some(crate::types::ToolCallBody::Yaml(pretty_yaml_block(&input))),
                     },
                 };
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
-                    input_yaml,
+                    body,
                 }]
             }
             // Not rendered by the TUI: Turn, Session, Status, Tool::Progress,

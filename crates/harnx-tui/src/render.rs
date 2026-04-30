@@ -1,5 +1,7 @@
 use crate::types::Tui;
-use crate::types::{App, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES};
+use crate::types::{
+    App, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES,
+};
 use harnx_runtime::config::GlobalConfig;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -85,6 +87,22 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
                 false,
             ),
+            TranscriptItem::ToolResultMarkdown(text) => {
+                // Templated MCP `result_template` output. Render as inline
+                // markdown so `**bold**` / `*italic*` / `` `code` `` show
+                // their styling. The base style is dim gray so the result
+                // body stays visually subordinate to the conversation.
+                let base = Style::default().add_modifier(Modifier::DIM);
+                let mut spans = vec![Span::styled(
+                    "   ".to_string(),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                )];
+                let line = crate::render_helpers::markdown_line_spans(text, base);
+                spans.extend(line.spans);
+                vec![Line::from(spans)]
+            }
             TranscriptItem::StatusLine(text) => Self::render_text_entry(
                 "",
                 text,
@@ -122,10 +140,7 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
                 false,
             ),
-            TranscriptItem::ToolCall {
-                tool_name,
-                input_yaml,
-            } => {
+            TranscriptItem::ToolCall { tool_name, body } => {
                 // Use the plain rightwards arrow `→` (U+2192) as the
                 // tool-call marker.  The previous glyph was `->` followed by
                 // VS16 (U+FE0F), which requests an emoji-style presentation
@@ -135,25 +150,34 @@ impl Tui {
                 // same frame, leaving stray glyphs (stray letters, corrupted
                 // words) at columns the next render doesn't explicitly
                 // repaint.
-                let mut lines = Self::render_text_entry(
-                    "",
-                    &format!("→ {tool_name}"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                    false,
-                );
-                if let Some(yaml) = input_yaml {
-                    for line in yaml.lines() {
-                        lines.extend(Self::render_text_entry(
-                            "   ",
-                            line,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM),
-                            false,
-                        ));
+                let dim_gray = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM);
+                let mut lines =
+                    Self::render_text_entry("", &format!("→ {tool_name}"), dim_gray, false);
+                match body {
+                    Some(ToolCallBody::Yaml(yaml)) => {
+                        for line in yaml.lines() {
+                            lines.extend(Self::render_text_entry("   ", line, dim_gray, false));
+                        }
                     }
+                    Some(ToolCallBody::Markdown(md)) => {
+                        // Templated MCP `call_template` — render inline
+                        // markdown styling. Indent prefix stays dim gray;
+                        // the body uses DIM as its base style so `**`/`*`
+                        // /`` ` `` add styling on top without losing the
+                        // subordinate visual weight.
+                        let body_base = Style::default().add_modifier(Modifier::DIM);
+                        for line_text in md.lines() {
+                            let mut spans =
+                                vec![Span::styled("   ".to_string(), dim_gray)];
+                            let parsed =
+                                crate::render_helpers::markdown_line_spans(line_text, body_base);
+                            spans.extend(parsed.spans);
+                            lines.push(Line::from(spans));
+                        }
+                    }
+                    None => {}
                 }
                 lines
             }
