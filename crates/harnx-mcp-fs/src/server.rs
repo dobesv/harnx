@@ -754,9 +754,18 @@ impl FsServer {
                 None,
             ));
         }
-        // The glob crate always expects '/' as the path separator, even on Windows,
-        // so normalize the base path before escaping (Path::display yields '\' on Windows).
+        // The glob crate doesn't understand Windows verbatim prefixes (`\\?\`)
+        // produced by canonicalize(), and expects '/' as the path separator on
+        // every platform — normalize both before building the pattern.
         let mut base_str = search_path.display().to_string();
+        #[cfg(windows)]
+        {
+            if let Some(rest) = base_str.strip_prefix(r"\\?\UNC\").map(str::to_owned) {
+                base_str = format!(r"\\{rest}");
+            } else if let Some(rest) = base_str.strip_prefix(r"\\?\").map(str::to_owned) {
+                base_str = rest;
+            }
+        }
         if std::path::MAIN_SEPARATOR != '/' {
             base_str = base_str.replace(std::path::MAIN_SEPARATOR, "/");
         }
