@@ -8,26 +8,64 @@
 //! be able to install/clear sinks even though harnx-core is compiled
 //! as a non-test dep). The uncontended-lock cost per emit is
 //! negligible compared to rendering.
+//!
+//! Events emitted before any sink is installed (e.g. MCP connection
+//! warnings raised during `agent::init`, which runs before the TUI/CLI
+//! sink is wired up) are held in a small bounded buffer and replayed
+//! to the first sink that gets installed. Without this, those early
+//! events fall through to ad-hoc `eprintln!` fallbacks and never reach
+//! the TUI transcript (issue #391).
 
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::event::{AgentEvent, AgentEventSink, AgentSource};
 
-static AGENT_EVENT_SINK: Mutex<Option<Arc<dyn AgentEventSink>>> = Mutex::new(None);
+/// Cap on the pre-install buffer. Large enough to capture a handful of
+/// startup warnings (one per misconfigured MCP server, plus a few
+/// hook/config notices), small enough that we don't grow unboundedly
+/// if a sink never gets installed (e.g. a non-interactive subcommand
+/// that never enters the chat path).
+const PENDING_EVENTS_CAP: usize = 64;
+
+struct SinkState {
+    sink: Option<Arc<dyn AgentEventSink>>,
+    pending: Vec<(AgentEvent, Option<AgentSource>)>,
+}
+
+impl SinkState {
+    const fn new() -> Self {
+        Self {
+            sink: None,
+            pending: Vec::new(),
+        }
+    }
+}
+
+static AGENT_EVENT_SINK: Mutex<SinkState> = Mutex::new(SinkState::new());
 
 pub fn install_agent_event_sink(sink: Arc<dyn AgentEventSink>) {
-    let mut guard = AGENT_EVENT_SINK
-        .lock()
-        .expect("AGENT_EVENT_SINK mutex poisoned");
-    *guard = Some(sink);
+    // Take the buffered events out under the lock, install the new
+    // sink, then drop the lock before replaying — replaying while
+    // holding the lock would deadlock any sink whose `emit` reaches
+    // back into the registry (none today, but cheap insurance).
+    let pending = {
+        let mut guard = AGENT_EVENT_SINK
+            .lock()
+            .expect("AGENT_EVENT_SINK mutex poisoned");
+        guard.sink = Some(sink.clone());
+        std::mem::take(&mut guard.pending)
+    };
+    for (event, source) in pending {
+        sink.emit(event, source);
+    }
 }
 
 pub fn has_agent_event_sink() -> bool {
     let guard = AGENT_EVENT_SINK
         .lock()
         .expect("AGENT_EVENT_SINK mutex poisoned");
-    guard.is_some()
+    guard.sink.is_some()
 }
 
 pub fn emit_agent_event(event: AgentEvent) -> bool {
@@ -36,28 +74,34 @@ pub fn emit_agent_event(event: AgentEvent) -> bool {
 
 pub fn emit_agent_event_with_source(event: AgentEvent, source: Option<AgentSource>) -> bool {
     let sink = {
-        let guard = AGENT_EVENT_SINK
+        let mut guard = AGENT_EVENT_SINK
             .lock()
             .expect("AGENT_EVENT_SINK mutex poisoned");
-        guard.as_ref().cloned()
-    };
-    match sink {
-        Some(sink) => {
-            sink.emit(event, source);
-            true
+        match guard.sink.as_ref().cloned() {
+            Some(sink) => sink,
+            None => {
+                if guard.pending.len() == PENDING_EVENTS_CAP {
+                    guard.pending.remove(0);
+                }
+                guard.pending.push((event, source));
+                return true;
+            }
         }
-        None => false,
-    }
+    };
+    sink.emit(event, source);
+    true
 }
 
-/// Clear the installed sink. Intended for test use — both harnx-core's
-/// own `#[cfg(test)]` tests and harnx's cross-crate tests call this
-/// between cases to prevent sink leakage.
+/// Clear the installed sink and drop any buffered pending events.
+/// Intended for test use — both harnx-core's own `#[cfg(test)]` tests
+/// and harnx's cross-crate tests call this between cases to prevent
+/// sink leakage.
 pub fn clear_agent_event_sink() {
     let mut guard = AGENT_EVENT_SINK
         .lock()
         .expect("AGENT_EVENT_SINK mutex poisoned");
-    *guard = None;
+    guard.sink = None;
+    guard.pending.clear();
 }
 
 #[cfg(test)]
@@ -101,8 +145,11 @@ mod tests {
     fn install_and_emit_cycle() {
         let _guard = lock_sink_tests();
         clear_agent_event_sink();
+        // No sink installed yet — the event is buffered (delivered=true
+        // because the caller no longer needs to fall back to ad-hoc
+        // stderr output).
         let delivered = emit_agent_event(AgentEvent::Notice(NoticeEvent::Info("hi".into())));
-        assert!(!delivered);
+        assert!(delivered);
         assert!(!has_agent_event_sink());
 
         let sink = CollectingSink::new();
@@ -111,10 +158,79 @@ mod tests {
         let delivered = emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning("whoa".into())));
         assert!(delivered);
         let events = sink.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
+        // Both the pre-install "hi" (replayed) and the post-install
+        // "whoa" reach the sink in order.
+        assert_eq!(events.len(), 2);
         match &events[0] {
+            AgentEvent::Notice(NoticeEvent::Info(msg)) => assert_eq!(msg, "hi"),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        match &events[1] {
             AgentEvent::Notice(NoticeEvent::Warning(msg)) => assert_eq!(msg, "whoa"),
-            other => panic!("unexpected event: {other:?}"),
+            other => panic!("unexpected second event: {other:?}"),
+        }
+        drop(events);
+        clear_agent_event_sink();
+    }
+
+    #[test]
+    fn pending_events_replayed_to_first_installed_sink() {
+        use crate::event::AgentSource;
+        let _guard = lock_sink_tests();
+        clear_agent_event_sink();
+
+        emit_agent_event(AgentEvent::Notice(NoticeEvent::Warning("first".into())));
+        emit_agent_event_with_source(
+            AgentEvent::Notice(NoticeEvent::Warning("second".into())),
+            Some(AgentSource {
+                agent: "argus".into(),
+                session_id: None,
+            }),
+        );
+
+        let sink = Arc::new(SourceRecordingSink::default());
+        install_agent_event_sink(sink.clone());
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        match &events[0].0 {
+            AgentEvent::Notice(NoticeEvent::Warning(msg)) => assert_eq!(msg, "first"),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        assert!(events[0].1.is_none());
+        match &events[1].0 {
+            AgentEvent::Notice(NoticeEvent::Warning(msg)) => assert_eq!(msg, "second"),
+            other => panic!("unexpected second event: {other:?}"),
+        }
+        assert_eq!(events[1].1.as_ref().unwrap().agent, "argus");
+        drop(events);
+        clear_agent_event_sink();
+    }
+
+    #[test]
+    fn pending_buffer_is_capped() {
+        let _guard = lock_sink_tests();
+        clear_agent_event_sink();
+
+        for i in 0..(PENDING_EVENTS_CAP + 5) {
+            emit_agent_event(AgentEvent::Notice(NoticeEvent::Info(format!("e{i}"))));
+        }
+
+        let sink = CollectingSink::new();
+        install_agent_event_sink(sink.clone());
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), PENDING_EVENTS_CAP);
+        // Oldest events are dropped first — first survivor is e5.
+        match &events[0] {
+            AgentEvent::Notice(NoticeEvent::Info(msg)) => assert_eq!(msg, "e5"),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        match events.last().unwrap() {
+            AgentEvent::Notice(NoticeEvent::Info(msg)) => {
+                assert_eq!(msg, &format!("e{}", PENDING_EVENTS_CAP + 4))
+            }
+            other => panic!("unexpected last event: {other:?}"),
         }
         drop(events);
         clear_agent_event_sink();
