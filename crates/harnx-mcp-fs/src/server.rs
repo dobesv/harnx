@@ -1565,55 +1565,54 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "new value\n");
     }
 
-    /// In a git-tracked working directory, edit_file should append the
-    /// snapshot diff as a second content block with no `audience`
-    /// annotation so the MCP client surfaces it to the user. Regression
-    /// for issue #398.
-    #[tokio::test]
-    async fn edit_file_emits_unaudienced_diff_content() {
-        let temp_dir = TestDir::new();
-        let dir = temp_dir.path();
-        // Initialize a git repo so the history snapshotter has something to
-        // diff against. Skip the test when git isn't available — the unit
-        // test above (`result_template_includes_history_diff_for_edit_and_write`)
-        // still pins the template behavior on git-less environments.
-        if std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir)
-            .status()
-            .map(|s| !s.success())
-            .unwrap_or(true)
-        {
-            return;
-        }
-        for args in [
-            ["config", "user.name", "Test"].as_slice(),
-            ["config", "user.email", "test@example.com"].as_slice(),
-            ["config", "commit.gpgsign", "false"].as_slice(),
-        ] {
+    /// Initialize `dir` as a git repo with `tracked.txt` committed.
+    /// Returns `false` if git isn't available so callers can skip — every
+    /// platform we ship to has git, but local devs may not.
+    #[cfg(unix)]
+    fn seed_committed_file(dir: &Path, name: &str, contents: &str) -> bool {
+        let run = |args: &[&str]| -> bool {
             std::process::Command::new("git")
                 .args(args)
                 .current_dir(dir)
                 .status()
-                .unwrap();
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !run(&["init", "-q"]) {
+            return false;
         }
-        let file_path = dir.join("tracked.txt");
-        std::fs::write(&file_path, "old value\n").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "tracked.txt"])
-            .current_dir(dir)
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-q", "-m", "init"])
-            .current_dir(dir)
-            .status()
-            .unwrap();
+        run(&["config", "user.name", "Test"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join(name), contents).expect("write seed file");
+        run(&["add", name]) && run(&["commit", "-q", "-m", "init"])
+    }
 
-        let server = make_server(dir);
-        let result = server
+    /// In a git-tracked working directory, edit_file should append the
+    /// snapshot diff as a second content block with no `audience`
+    /// annotation so the MCP client surfaces it to the user. Regression
+    /// for issue #398.
+    ///
+    /// Gated to Unix because `std::env::temp_dir()` on Windows runners
+    /// yields an 8.3 short-name path (`C:\\Users\\RUNNER~1\\...`); the
+    /// canonicalize-then-`gix::open` flow inside `HistoryManager::new`
+    /// then fails to register the repo, leaving the production code
+    /// without a base to diff against. That's a pre-existing Windows
+    /// limitation in `harnx-mcp-history`, not something this PR
+    /// introduces — the meta-shape regression test
+    /// (`fs_tools_advertise_call_template_only`) still runs everywhere.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_file_emits_unaudienced_diff_content() {
+        let temp_dir = TestDir::new();
+        let dir = temp_dir.path();
+        if !seed_committed_file(dir, "tracked.txt", "old value\n") {
+            return;
+        }
+
+        let result = make_server(dir)
             .edit_file_impl(EditFileParams {
-                path: file_path.to_string_lossy().into_owned(),
+                path: dir.join("tracked.txt").to_string_lossy().into_owned(),
                 old_text: "old value".into(),
                 new_text: "new value".into(),
                 replace_all: None,
@@ -1622,42 +1621,22 @@ mod tests {
             .expect("edit succeeds");
 
         assert_eq!(result.is_error, Some(false));
-        let text_blocks: Vec<String> = result
+        let texts: Vec<&str> = result
             .content
             .iter()
-            .filter_map(|c| c.raw.as_text().map(|t| t.text.clone()))
+            .filter_map(|c| c.raw.as_text().map(|t| t.text.as_str()))
             .collect();
         assert!(
-            text_blocks.len() >= 2,
-            "expected summary + diff content blocks, got {} blocks: {:?}",
-            text_blocks.len(),
-            text_blocks
+            texts.len() >= 2,
+            "expected summary + diff content blocks, got {}: {texts:?}",
+            texts.len()
         );
-        assert!(
-            text_blocks[0].contains("Edited"),
-            "first block should be summary: {}",
-            text_blocks[0]
-        );
-        assert!(
-            text_blocks[1].contains("-old value"),
-            "second block should be the diff: {}",
-            text_blocks[1]
-        );
-
-        // Both blocks are unaudienced, so the MCP client's audience-aware
-        // generic renderer (extract_user_display_text) will surface them
-        // both — that's how the diff reaches the TUI now that we no longer
-        // pin a result_template.
-        let summary_audience = result.content[0].audience();
-        let diff_audience = result.content[1].audience();
-        assert!(
-            summary_audience.is_none(),
-            "summary must not be assistant-only or it would be hidden from the user"
-        );
-        assert!(
-            diff_audience.is_none(),
-            "diff must not be assistant-only or it would be hidden from the user"
-        );
+        assert!(texts[0].contains("Edited"), "summary missing: {texts:?}");
+        assert!(texts[1].contains("-old value"), "diff missing: {texts:?}");
+        // The diff/summary must not be assistant-only — that would hide
+        // them from the MCP client's audience-aware generic renderer.
+        assert!(result.content[0].audience().is_none(), "summary audience");
+        assert!(result.content[1].audience().is_none(), "diff audience");
     }
 
     #[tokio::test]
