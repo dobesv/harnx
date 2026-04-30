@@ -45,22 +45,29 @@ pub fn diff_commits_blocking(
         anyhow::bail!("git diff failed: {stderr}");
     }
 
-    let mut diff = header;
-    diff.push_str(&String::from_utf8(output.stdout).context("git diff output not utf-8")?);
-    if diff.len() > MAX_DIFF_BYTES {
-        // Truncate to a char boundary — String::truncate panics on a mid-char cut
+    let mut body = String::from_utf8(output.stdout).context("git diff output not utf-8")?;
+    // Reserve room for the markdown fence so the truncation marker still
+    // fits inside it. Underscoring the byte budget against MAX_DIFF_BYTES
+    // is approximate — the header and fence add a few hundred bytes — but
+    // it keeps the total response well under the previous cap.
+    if body.len() > MAX_DIFF_BYTES {
         let mut cut = MAX_DIFF_BYTES;
-        while !diff.is_char_boundary(cut) {
+        while !body.is_char_boundary(cut) {
             cut -= 1;
         }
-        diff.truncate(cut);
+        body.truncate(cut);
         let short = &after_id.to_hex().to_string()[..12];
-        diff.push_str(&format!(
+        body.push_str(&format!(
             "\n[ ... diff truncated, use 'git show {}' to view full diff ... ]",
             short
         ));
     }
-    Ok(diff)
+    // Fence the unified diff as a markdown ```diff block so downstream
+    // markdown renderers (TUI: tui-markdown + syntect; CLI: harnx-render
+    // MarkdownRender) syntax-highlight the +/-/@@ lines automatically.
+    // The plain-text `commit <sha>` header lives above the fence so the
+    // assistant can still grep it out for `rollback_file`.
+    Ok(format!("{header}```diff\n{body}\n```\n"))
 }
 
 #[cfg(test)]
@@ -128,5 +135,24 @@ mod tests {
         assert!(diff.contains(&after));
         assert!(diff.contains("-before"));
         assert!(diff.contains("+after"));
+
+        // The diff body must be wrapped in a ```diff fence so the TUI/CLI
+        // markdown renderer can syntax-highlight it. The header lives
+        // above the fence so the assistant can still see the SHA.
+        let header_end = diff.find("```diff\n").expect("```diff fence opens");
+        let header = &diff[..header_end];
+        assert!(
+            header.contains(&format!("commit {}", after)),
+            "commit header must precede the fence: {header}"
+        );
+        assert!(
+            diff.trim_end().ends_with("```"),
+            "fence must be closed: {diff}"
+        );
+        let fenced_body = &diff[header_end + "```diff\n".len()..diff.rfind("```").unwrap()];
+        assert!(
+            fenced_body.contains("-before") && fenced_body.contains("+after"),
+            "diff content lives inside the fence: {fenced_body}"
+        );
     }
 }

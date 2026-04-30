@@ -136,16 +136,25 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
                 false,
             ),
-            TranscriptItem::ToolResultText(text) => Self::render_text_entry(
-                "   ",
-                text,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-                false,
-            ),
             TranscriptItem::ToolResultMarkdown(text) => {
-                vec![Self::render_indented_markdown_line(text)]
+                // Whole-document markdown path so block-level constructs
+                // (fenced ```diff, lists, headings) parse correctly. Each
+                // ratatui `Line` gets a 3-space indent prefix to keep the
+                // visual subordination of tool result rows; the dim base
+                // style is patched under each parsed span so plain text
+                // still reads as dim.
+                let dim_gray = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM);
+                let body_base = Style::default().add_modifier(Modifier::DIM);
+                crate::render_helpers::markdown_lines(text, body_base)
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::styled("   ".to_string(), dim_gray)];
+                        spans.extend(line.spans);
+                        Line::from(spans)
+                    })
+                    .collect()
             }
             TranscriptItem::StatusLine(text) => Self::render_text_entry(
                 "",

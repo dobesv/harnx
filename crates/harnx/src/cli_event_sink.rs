@@ -199,24 +199,42 @@ impl CliSinkState {
         }
     }
 
-    /// Stderr render for `ToolEvent::Completed`: when an MCP
-    /// `result_template` produced a `title`, render each output line
-    /// through markdown (preserves emphasis); otherwise fall back to the
-    /// dim plain-text path the historic emit used.
+    /// Stderr render for `ToolEvent::Completed`. Always routes through the
+    /// multi-line `MarkdownRender::render` so block-level constructs work
+    /// — fenced code (e.g. the ```diff blocks emitted by harnx-mcp-fs /
+    /// harnx-mcp-bash for history diffs) gets syntect highlighting,
+    /// inline emphasis from a templated MCP `result_template` still
+    /// renders, and plain text passes through unchanged. Falls back to
+    /// dim plain text when highlighting is disabled or the renderer
+    /// can't initialize.
     fn print_tool_completed(&mut self, output: &serde_json::Value, title: Option<&str>) {
-        let templated = title.map(str::trim).filter(|t| !t.is_empty()).is_some();
         let text = harnx_runtime::utils::render_tool_result_text(output, title);
         let trimmed = text.trim_end_matches('\n');
         if trimmed.is_empty() {
             return;
         }
-        if templated {
-            for line in trimmed.lines() {
-                eprintln!("{}", self.render_markdown_line(line));
-            }
-        } else {
-            eprintln!("{}", dimmed_text(trimmed));
+        eprintln!("{}", self.render_markdown_block(trimmed));
+    }
+
+    /// Render a multi-line markdown document via `MarkdownRender::render`,
+    /// which preserves state across lines so fenced code blocks and
+    /// per-language syntect highlighting work. Lazy-initializes the
+    /// renderer the same way `render_markdown_line` does and returns
+    /// dim plain text when highlighting is disabled.
+    fn render_markdown_block(&mut self, text: &str) -> String {
+        if !(self.highlight && *IS_STDOUT_TERMINAL) {
+            return dimmed_text(text);
         }
+        if self.render.is_none() {
+            match MarkdownRender::init(self.render_options.clone()) {
+                Ok(r) => self.render = Some(r),
+                Err(_) => return dimmed_text(text),
+            }
+        }
+        self.render
+            .as_mut()
+            .map(|r| r.render(text))
+            .unwrap_or_else(|| dimmed_text(text))
     }
 
     /// Render a single line through `MarkdownRender` so MCP `call_template`/
