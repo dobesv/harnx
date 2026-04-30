@@ -754,8 +754,13 @@ impl FsServer {
                 None,
             ));
         }
-        let escaped_base = glob::Pattern::escape(&search_path.display().to_string());
-        // The glob crate always expects '/' as the path separator, even on Windows.
+        // The glob crate always expects '/' as the path separator, even on Windows,
+        // so normalize the base path before escaping (Path::display yields '\' on Windows).
+        let mut base_str = search_path.display().to_string();
+        if std::path::MAIN_SEPARATOR != '/' {
+            base_str = base_str.replace(std::path::MAIN_SEPARATOR, "/");
+        }
+        let escaped_base = glob::Pattern::escape(&base_str);
         let full_pattern = format!("{escaped_base}/{}", params.pattern);
         let glob_results = glob::glob(&full_pattern).map_err(|err| {
             ErrorData::invalid_params(format!("invalid glob pattern: {err}"), None)
