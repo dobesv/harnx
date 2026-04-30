@@ -865,6 +865,19 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
     Ok(())
 }
 
+/// Returns `true` when `input` is a genuine tool-call continuation of
+/// `session` — i.e. the session's last message is a `Tool` result AND
+/// the input carries accumulated tool-call results from `merge_tool_results`.
+///
+/// Used in both `begin_turn` (persistence) and `build_messages` (wire
+/// format) so that future edits to the heuristic only need to happen
+/// in one place.  Fixes #390: without the `tool_calls.is_some()` guard,
+/// a fresh user prompt arriving after an interrupted/resumed session that
+/// ended with a `Tool` message was silently dropped.
+fn is_tool_continuation(input: &Input, messages: &[Message]) -> bool {
+    input.tool_calls.is_some() && messages.last().is_some_and(|m| m.role == MessageRole::Tool)
+}
+
 /// Shared round-opening setup used by both `add_assistant_text` and
 /// `add_tool_calls`: first-turn agent-message injection, user-message
 /// push (skipped on continuation rounds), data-URL persistence, and
@@ -872,13 +885,7 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
 /// append succeeded.
 fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool> {
     let mut all_appended = true;
-    // Detect continuation rounds: if the last saved message is a Tool
-    // message, we're continuing after tool execution and should NOT
-    // add a duplicate user message.
-    let is_continuation = session
-        .messages
-        .last()
-        .is_some_and(|m| m.role == MessageRole::Tool);
+    let is_continuation = is_tool_continuation(input, &session.messages);
     if session.messages.is_empty() {
         if session.name == TEMP_SESSION_NAME && session.save_session != Some(false) {
             let raw_input = input.raw();
@@ -979,14 +986,9 @@ pub fn build_messages(session: &Session, input: &Input) -> Result<Vec<Message>> 
             messages.extend(session.compressed_messages[index..].to_vec());
         }
     }
-    // Continuation: if the last saved message is a pending Tool round,
-    // we're mid-tool-round (the agent loop is iterating with the same
-    // `Input`). The user's original message is already in the session,
-    // so don't append a duplicate copy at the end — that fooled the
-    // model into treating each round as a fresh user re-ask and looping
-    // on "Let me look at the current state…". Mirrors the same heuristic
-    // `begin_turn` uses when saving the round.
-    if need_add_msg && messages.last().is_some_and(|m| m.role == MessageRole::Tool) {
+    // Continuation: suppress the duplicate user message only when the
+    // input is genuinely mid-tool-round — see `is_tool_continuation`.
+    if need_add_msg && is_tool_continuation(input, &messages) {
         need_add_msg = false;
     }
     if need_add_msg {
@@ -1117,7 +1119,11 @@ mod tests {
 
         // Now a second round with a plain text reply — continuation
         // detection should skip the duplicate user message.
-        let input2 = crate::config::input::from_str(&global_config, "hello", Some(agent));
+        // The agent loop always calls merge_tool_results before the next
+        // LLM call (setting tool_calls on the input), so the continuation
+        // input must carry those tool results to be recognised as a
+        // mid-round continuation rather than a fresh user prompt.
+        let input2 = input.merge_tool_results("I'll call a tool".to_string(), None, results);
         super::add_assistant_text(&mut session, &input2, "final answer", None).unwrap();
 
         let user_count = session
@@ -1132,6 +1138,122 @@ mod tests {
         assert_eq!(
             session.messages.last().unwrap().content.to_text(),
             "final answer"
+        );
+    }
+
+    /// Regression test for #390: a fresh user message sent after a
+    /// session that ended with a Tool message (e.g. Ctrl-C mid-round,
+    /// then resume) must NOT be dropped.
+    ///
+    /// Old code: `build_messages` checked only `last.role == Tool` →
+    /// treated a fresh prompt as a continuation and suppressed the
+    /// user message entirely.
+    ///
+    /// Fixed: also requires `input.tool_calls.is_some()`.
+    #[test]
+    fn fresh_message_after_tool_tail_is_included_in_build_messages() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+
+        // Build a session that ends with a Tool message (simulates
+        // an interrupted session or one resumed after Ctrl-C).
+        let input1 =
+            crate::config::input::from_str(&global_config, "original query", Some(agent.clone()));
+        let call = ToolCall {
+            name: "Bash".to_string(),
+            arguments: json!({"command": "ls"}),
+            id: Some("c1".to_string()),
+            thought_signature: None,
+        };
+        let result = ToolResult::new(call.clone(), json!({"stdout": "file1\n"}));
+        super::add_tool_calls(&mut session, &input1, "running bash", None, &[call]).unwrap();
+        super::add_tool_results(&mut session, &[result]).unwrap();
+        assert_eq!(
+            session.messages.last().unwrap().role,
+            MessageRole::Tool,
+            "session tail must be Tool to exercise the regression"
+        );
+
+        // Now simulate a fresh user message (no tool_calls on the input —
+        // this is the post-interrupt / post-resume scenario from #390).
+        let fresh_input = crate::config::input::from_str(
+            &global_config,
+            "new message after interrupt",
+            Some(agent),
+        );
+        assert!(
+            fresh_input.tool_calls.is_none(),
+            "fresh input must have no tool_calls"
+        );
+
+        let messages = super::build_messages(&session, &fresh_input).unwrap();
+
+        // The fresh user message must appear in the built message list.
+        let user_messages: Vec<_> = messages.iter().filter(|m| m.role.is_user()).collect();
+        assert!(
+            user_messages
+                .iter()
+                .any(|m| m.content.to_text().contains("new message after interrupt")),
+            "fresh user message must be included; got messages: {messages:#?}"
+        );
+    }
+
+    /// Regression test for #390 (persistence side): `begin_turn` must
+    /// persist a fresh user message even when the session tail is Tool.
+    #[test]
+    fn fresh_message_after_tool_tail_is_saved_by_begin_turn() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+
+        // Build a session ending in a Tool message.
+        let input1 =
+            crate::config::input::from_str(&global_config, "original query", Some(agent.clone()));
+        let call = ToolCall {
+            name: "Bash".to_string(),
+            arguments: json!({"command": "ls"}),
+            id: Some("c2".to_string()),
+            thought_signature: None,
+        };
+        let result = ToolResult::new(call.clone(), json!({"stdout": "file1\n"}));
+        super::add_tool_calls(&mut session, &input1, "running bash", None, &[call]).unwrap();
+        super::add_tool_results(&mut session, &[result]).unwrap();
+
+        // Fresh message (no tool_calls) — `add_assistant_text` calls
+        // `begin_turn` internally.
+        let fresh_input =
+            crate::config::input::from_str(&global_config, "follow-up after resume", Some(agent));
+        super::add_assistant_text(&mut session, &fresh_input, "here is my reply", None).unwrap();
+
+        // The follow-up user message must have been saved to the session.
+        let user_messages: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|m| m.role.is_user())
+            .collect();
+        assert!(
+            user_messages
+                .iter()
+                .any(|m| m.content.to_text().contains("follow-up after resume")),
+            "fresh user message must be persisted; messages: {:#?}",
+            session.messages
         );
     }
 
@@ -1274,6 +1396,60 @@ mod tests {
         assert!(
             output_str.contains("tool response lost"),
             "expected synthesized lost-response error, got: {output_str}"
+        );
+    }
+
+    /// Regression test for #390 (orphan-repair path): after a crash
+    /// mid-tool-round the session is repaired on reload (orphan tool
+    /// calls get a synthesised "lost" result so the tail is a proper
+    /// `Tool` message).  A fresh user prompt sent to that repaired
+    /// session must still be included in `build_messages` — not dropped
+    /// because the session tail happens to be `Tool`.
+    #[test]
+    fn fresh_message_after_orphan_repair_is_included_in_build_messages() {
+        use crate::tool::ToolCall;
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+        let input = crate::config::input::from_str(&global_config, "first query", Some(agent));
+
+        // Write tool_calls but NOT tool_results — simulates crash mid-round.
+        let call = ToolCall {
+            name: "Bash".to_string(),
+            arguments: json!({"command": "ls"}),
+            id: Some("orphan_c1".to_string()),
+            thought_signature: None,
+        };
+        super::add_tool_calls(&mut session, &input, "running bash", None, &[call]).unwrap();
+
+        // Reload — orphan repair synthesises a lost-response Tool tail.
+        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        let repaired = super::load_from_log_for_test(&content);
+        assert_eq!(
+            repaired.messages.last().unwrap().role,
+            MessageRole::Tool,
+            "repaired session tail must be Tool"
+        );
+
+        // Fresh user prompt after resume — no tool_calls on the input.
+        let fresh_input =
+            crate::config::input::from_str(&global_config, "fresh prompt after crash", None);
+        let messages = super::build_messages(&repaired, &fresh_input).unwrap();
+
+        assert!(
+            messages
+                .iter()
+                .filter(|m| m.role.is_user())
+                .any(|m| m.content.to_text().contains("fresh prompt after crash")),
+            "fresh user message must be included in build_messages after orphan repair; \
+             got: {messages:#?}"
         );
     }
 
@@ -1534,10 +1710,26 @@ mod tests {
 
         // session.messages now ends with a Tool message — that's the
         // signal that we're mid-tool-round. The next agent_loop iteration
-        // calls build_messages with the *same* input.
+        // calls `merge_tool_results` on the input to carry the tool-call
+        // context, then calls `build_messages` with that merged input.
         assert_eq!(session.messages.last().unwrap().role, MessageRole::Tool);
 
-        let messages = super::build_messages(&session, &input).unwrap();
+        let result = ToolResult::new(
+            ToolCall {
+                name: "Read".to_string(),
+                arguments: json!({"path": "/tmp/x"}),
+                id: Some("toolu_round1".to_string()),
+                thought_signature: None,
+            },
+            json!({"content": "file body"}),
+        );
+        let merged_input = input.merge_tool_results(
+            "Let me look at the directory.".to_string(),
+            None,
+            vec![result],
+        );
+
+        let messages = super::build_messages(&session, &merged_input).unwrap();
 
         let user_text_count = messages
             .iter()
