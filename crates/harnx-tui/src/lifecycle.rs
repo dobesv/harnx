@@ -325,9 +325,8 @@ pub(crate) fn messages_to_transcript_items(messages: &[Message]) -> Vec<Transcri
                             tool_name: r.call.name.clone(),
                             body,
                         });
-                        let rendered = crate::agent_event_sink::render_tool_result_text(
-                            &r.output, None,
-                        );
+                        let rendered =
+                            crate::agent_event_sink::render_tool_result_text(&r.output, None);
                         let trimmed = rendered.trim_end_matches('\n');
                         if !trimmed.is_empty() {
                             items.push(TranscriptItem::ToolResultMarkdown(trimmed.to_string()));

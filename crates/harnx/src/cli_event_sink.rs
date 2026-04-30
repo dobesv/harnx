@@ -216,47 +216,43 @@ impl CliSinkState {
         eprintln!("{}", self.render_markdown_block(trimmed));
     }
 
-    /// Render a multi-line markdown document via `MarkdownRender::render`,
-    /// which preserves state across lines so fenced code blocks and
-    /// per-language syntect highlighting work. Lazy-initializes the
-    /// renderer the same way `render_markdown_line` does and returns
-    /// dim plain text when highlighting is disabled.
-    fn render_markdown_block(&mut self, text: &str) -> String {
+    /// Lazy-initialize the shared `MarkdownRender` and run `with_render`
+    /// against it. Returns `fallback(text)` when highlighting is disabled
+    /// (no TTY, `--no-highlight`, or renderer init failure) so callers
+    /// can choose between dim plain text and the input unchanged.
+    fn with_markdown<F, G>(&mut self, text: &str, with_render: F, fallback: G) -> String
+    where
+        F: FnOnce(&mut MarkdownRender, &str) -> String,
+        G: FnOnce(&str) -> String,
+    {
         if !(self.highlight && *IS_STDOUT_TERMINAL) {
-            return dimmed_text(text);
+            return fallback(text);
         }
         if self.render.is_none() {
             match MarkdownRender::init(self.render_options.clone()) {
                 Ok(r) => self.render = Some(r),
-                Err(_) => return dimmed_text(text),
+                Err(_) => return fallback(text),
             }
         }
         self.render
             .as_mut()
-            .map(|r| r.render(text))
-            .unwrap_or_else(|| dimmed_text(text))
+            .map(|r| with_render(r, text))
+            .unwrap_or_else(|| fallback(text))
+    }
+
+    /// Render a multi-line markdown document via `MarkdownRender::render`,
+    /// which preserves state across lines so fenced code blocks and
+    /// per-language syntect highlighting work. Falls back to dim plain
+    /// text when highlighting is disabled.
+    fn render_markdown_block(&mut self, text: &str) -> String {
+        self.with_markdown(text, |r, t| r.render(t), dimmed_text)
     }
 
     /// Render a single line through `MarkdownRender` so MCP `call_template`/
     /// `result_template` text shows its `**bold**` / `*italic*` / `` `code` ``
-    /// styling. Lazy-initializes the renderer (shared with the streaming
-    /// path) and returns the input unchanged when highlighting is disabled
-    /// (no TTY, --no-highlight, or render init failure).
+    /// styling. Returns the input unchanged when highlighting is disabled.
     fn render_markdown_line(&mut self, text: &str) -> String {
-        if !(self.highlight && *IS_STDOUT_TERMINAL) {
-            return text.to_string();
-        }
-        if self.render.is_none() {
-            match MarkdownRender::init(self.render_options.clone()) {
-                Ok(r) => self.render = Some(r),
-                Err(_) => return text.to_string(),
-            }
-        }
-        // `render_line` is `&self` — no `mut` borrow needed.
-        self.render
-            .as_ref()
-            .map(|r| r.render_line(text))
-            .unwrap_or_else(|| text.to_string())
+        self.with_markdown(text, |r, t| r.render_line(t), str::to_string)
     }
 }
 

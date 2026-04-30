@@ -4214,8 +4214,12 @@ async fn tui_renders_fenced_diff_tool_result_with_per_line_syntect_styling() {
     .await
     .unwrap();
 
-    let lines: Vec<ratatui::text::Line<'static>> =
-        tui.app.transcript.iter().flat_map(Tui::render_entry).collect();
+    let lines: Vec<ratatui::text::Line<'static>> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect();
     let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
     let joined = plain.join("\n");
 

@@ -50,6 +50,26 @@ impl Tui {
         Line::from(spans)
     }
 
+    /// 3-space indent + multi-line markdown body, used for tool results
+    /// where block-level constructs like fenced ```diff need the
+    /// whole-document parser to see them. Each parsed ratatui line gets
+    /// the indent prefixed and the dim base style patched under each
+    /// span so plain text still reads as dim.
+    fn render_indented_markdown_block(text: &str) -> Vec<Line<'static>> {
+        let dim_gray = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        let body_base = Style::default().add_modifier(Modifier::DIM);
+        crate::render_helpers::markdown_lines(text, body_base)
+            .into_iter()
+            .map(|line| {
+                let mut spans = vec![Span::styled("   ".to_string(), dim_gray)];
+                spans.extend(line.spans);
+                Line::from(spans)
+            })
+            .collect()
+    }
+
     /// Render a `ToolCall` transcript item: `→ tool_name` header followed
     /// by the body lines. Body rendering depends on its origin —
     /// `Yaml` is shown verbatim (raw arguments), `Markdown` is rendered
@@ -136,26 +156,7 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
                 false,
             ),
-            TranscriptItem::ToolResultMarkdown(text) => {
-                // Whole-document markdown path so block-level constructs
-                // (fenced ```diff, lists, headings) parse correctly. Each
-                // ratatui `Line` gets a 3-space indent prefix to keep the
-                // visual subordination of tool result rows; the dim base
-                // style is patched under each parsed span so plain text
-                // still reads as dim.
-                let dim_gray = Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM);
-                let body_base = Style::default().add_modifier(Modifier::DIM);
-                crate::render_helpers::markdown_lines(text, body_base)
-                    .into_iter()
-                    .map(|line| {
-                        let mut spans = vec![Span::styled("   ".to_string(), dim_gray)];
-                        spans.extend(line.spans);
-                        Line::from(spans)
-                    })
-                    .collect()
-            }
+            TranscriptItem::ToolResultMarkdown(text) => Self::render_indented_markdown_block(text),
             TranscriptItem::StatusLine(text) => Self::render_text_entry(
                 "",
                 text,
