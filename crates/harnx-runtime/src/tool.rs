@@ -4,7 +4,6 @@ use crate::{
 };
 use anyhow::Result;
 use harnx_hooks::HookEvent;
-use harnx_mcp::safety::{truncate_output, TruncateOpts};
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -268,39 +267,18 @@ fn emit_tool_result_with_template(
     }
 }
 
-/// Fallback print for tool result when no sink is installed.
+/// Fallback print for tool result when no sink is installed. Routes
+/// through the shared `render_tool_result_text` helper so this no-sink
+/// path stays consistent with what the TUI/CLI sinks render.
 fn print_tool_result_fallback(
     call: &ToolCall,
     result: &Value,
     decl_map: &HashMap<String, ToolDeclaration>,
     raw_fallback: &str,
 ) {
-    let output_str = render_result(call, result, raw_fallback, decl_map)
-        .unwrap_or_else(|| raw_fallback.to_string());
-
-    let mut opts = TruncateOpts::default();
-    let marker = " [...] ";
-    match crossterm::terminal::size() {
-        Ok((cols, rows)) => {
-            opts.head_lines = 5.max((rows / 2) as usize);
-            opts.tail_lines = 0;
-            opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
-            opts.line_tail_bytes = 0;
-            opts.marker = Some(marker.to_string());
-        }
-        Err(e) => {
-            // Terminal size unavailable (e.g. CI, piped output) — use safe defaults
-            log::debug!("failed to get terminal size: {e}");
-            opts.head_lines = 20;
-            opts.tail_lines = 0;
-            opts.line_head_bytes = 200;
-            opts.line_tail_bytes = 0;
-            opts.marker = Some(marker.to_string());
-        }
-    }
-    let truncated = truncate_output(&output_str, &opts);
-    let text = format!("{}\n", dimmed_text(&truncated));
-    print!("{text}");
+    let title = render_result(call, result, raw_fallback, decl_map);
+    let truncated = render_tool_result_text(result, title.as_deref());
+    println!("{}", dimmed_text(&truncated));
 }
 
 fn default_confirm_tool_use(tool_name: &str, arguments: &Value, reason: Option<&str>) -> bool {

@@ -28,7 +28,9 @@ Extracted a shared `render_tool_result_text` helper into
 `harnx_runtime::utils` so the TUI and CLI sinks format identically.
 
 Test changes:
-- New TUI tests verify the title/content path for both Started and Completed.
+- New TUI tests verify the templated title and fallback rendering paths for
+  both `ToolEvent::Started` and `ToolEvent::Completed` (templated `title`
+  honored, raw input/output used when `title` is `None`).
 - New CLI tests verify the helper covers the template-present, MCP content
   extraction, raw String, JSON YAML fallback, and empty-title paths.
 - New producer-side tests in `harnx-runtime` verify that the emit functions
