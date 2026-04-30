@@ -90,8 +90,9 @@ On Linux and macOS, `harnx-mcp-bash` uses [birdcage](https://github.com/phylum-d
 
 ### Default Permissions
 
+- **Read/Write/Execute**:
+  - The repository root(s) specified via `--root`. This allows agents to run compilers (like `cargo build`) and load native extensions built within the project.
 - **Writable**:
-  - The repository root(s) specified via `--root`.
   - The system temporary directory (`/tmp` on Linux, `/private/tmp` on macOS).
   - The path in the `$TMPDIR` environment variable, if set.
 - **Readable/Executable**:
@@ -103,14 +104,15 @@ You can grant additional filesystem access using CLI flags or environment variab
 
 | CLI Flag | Environment Variable | Description |
 |----------|----------------------|-------------|
-| `--root <path>` | (N/A) | Adds a project root (writable). |
+| `--root <path>` | (N/A) | Adds a project root (read/write/exec). |
 | `--extra-read <path>` | `HARNX_BASH_EXTRA_READABLE` | Adds a path as read-only. |
 | `--extra-write <path>` | `HARNX_BASH_EXTRA_WRITABLE` | Adds a path as writable. |
 | `--extra-exec <path>` | `HARNX_BASH_EXTRA_EXEC` | Adds a path to the execution allowlist. |
+| `--extra-rwx <path>` | `HARNX_BASH_EXTRA_RWX` | Adds a path with read, write, and execute permissions. |
 
 **Notes:**
 - CLI flags can be repeated to add multiple paths.
-- Environment variables accept a colon-separated list of paths (e.g., `HARNX_BASH_EXTRA_READABLE=/path/one:/path/two`).
+- Environment variables accept a colon-separated list of paths (e.g., `HARNX_BASH_EXTRA_RWX=/path/one:/path/two`). This applies to all `HARNX_BASH_EXTRA_*` variables.
 
 ### Disabling Sandboxing
 
@@ -174,4 +176,9 @@ args: ["--extra-write", "~/.npm"]
 #### Read-only cargo registry
 ```yaml
 args: ["--extra-read", "~/.cargo/registry"]
+```
+
+#### Allow cargo registry proc-macros to be loaded (dlopen) by rustc
+```yaml
+args: ["--extra-rwx", "~/.cargo"]
 ```
