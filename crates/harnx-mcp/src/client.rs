@@ -18,12 +18,45 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleClient, RunningService, ServiceError};
 use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::process::Stdio;
 use std::time::Duration;
 use std::{collections::HashMap, fmt, path::Path, sync::Arc};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::runtime::{Builder, Handle, RuntimeFlavor};
+
+/// Maximum number of stderr lines to keep from an MCP child process for
+/// inclusion in connection error messages. Old lines are dropped first.
+const MCP_STDERR_TAIL_LINES: usize = 64;
+
+/// How long to wait for the stderr reader to drain after a connection
+/// error before snapshotting the buffer for the error message. Short
+/// enough to keep startup snappy, long enough that a child that exited
+/// just before initialize completed has time to flush.
+const MCP_STDERR_DRAIN_DELAY: Duration = Duration::from_millis(150);
+
+type StderrBuffer = Arc<parking_lot::Mutex<VecDeque<String>>>;
+
+fn new_stderr_buffer() -> StderrBuffer {
+    Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(
+        MCP_STDERR_TAIL_LINES,
+    )))
+}
+
+fn render_stderr_tail(buffer: &StderrBuffer) -> String {
+    let buf = buffer.lock();
+    if buf.is_empty() {
+        return String::new();
+    }
+    let joined = buf.iter().cloned().collect::<Vec<_>>().join("\n");
+    format!("\nMCP server stderr:\n{joined}")
+}
+
+async fn snapshot_stderr_tail(buffer: &StderrBuffer) -> String {
+    tokio::time::sleep(MCP_STDERR_DRAIN_DELAY).await;
+    render_stderr_tail(buffer)
+}
 
 pub struct McpClient {
     name: String,
@@ -160,6 +193,8 @@ impl McpClient {
         #[cfg(unix)]
         wrap.wrap(ProcessGroup::leader());
 
+        let stderr_buffer = new_stderr_buffer();
+
         let (transport, stderr) = TokioChildProcess::builder(wrap)
             .stderr(Stdio::piped())
             .spawn()
@@ -167,85 +202,124 @@ impl McpClient {
 
         if let Some(stderr) = stderr {
             let server_name = self.name.clone();
+            let buffer = stderr_buffer.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     log::debug!("[mcp:{}] {}", server_name, line);
+                    let mut buf = buffer.lock();
+                    if buf.len() == MCP_STDERR_TAIL_LINES {
+                        buf.pop_front();
+                    }
+                    buf.push_back(line);
                 }
             });
         }
 
         let handler = McpClientHandler::new(self.roots.clone());
-        let service = tokio::time::timeout(
+        let serve_result = tokio::time::timeout(
             Duration::from_secs(30),
             rmcp::service::serve_client(handler, transport),
         )
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "MCP server '{}' timed out during initialization (30s)",
-                self.name
-            )
-        })?
-        .with_context(|| format!("Failed to initialize MCP client for server '{}'", self.name))?;
+        .await;
+        let service = match serve_result {
+            Err(_) => {
+                let tail = snapshot_stderr_tail(&stderr_buffer).await;
+                bail!(
+                    "MCP server '{}' timed out during initialization (30s){}",
+                    self.name,
+                    tail,
+                );
+            }
+            Ok(Err(err)) => {
+                let tail = snapshot_stderr_tail(&stderr_buffer).await;
+                return Err(anyhow::Error::from(err)).with_context(|| {
+                    format!(
+                        "Failed to initialize MCP client for server '{}'{}",
+                        self.name, tail,
+                    )
+                });
+            }
+            Ok(Ok(service)) => service,
+        };
 
-        let functions = tokio::time::timeout(
+        let list_result = tokio::time::timeout(
             Duration::from_secs(10),
             service.peer().list_tools(Default::default()),
         )
-        .await
-        .map_err(|_| anyhow!("MCP server '{}' timed out listing tools (10s)", self.name))?
-        .with_context(|| format!("Failed to list tools for MCP server '{}'", self.name))?
-        .tools
-        .into_iter()
-        .map(|tool| {
-            let input_schema = Value::Object((*tool.input_schema).clone());
-            let server_tool_name = tool.name.to_string();
-            let final_name =
-                if let Some(renamed) = self.config.rename_tools.get(server_tool_name.as_str()) {
+        .await;
+        let tools_result = match list_result {
+            Err(_) => {
+                let tail = snapshot_stderr_tail(&stderr_buffer).await;
+                bail!(
+                    "MCP server '{}' timed out listing tools (10s){}",
+                    self.name,
+                    tail,
+                );
+            }
+            Ok(Err(err)) => {
+                let tail = snapshot_stderr_tail(&stderr_buffer).await;
+                return Err(anyhow::Error::from(err)).with_context(|| {
+                    format!(
+                        "Failed to list tools for MCP server '{}'{}",
+                        self.name, tail
+                    )
+                });
+            }
+            Ok(Ok(result)) => result,
+        };
+        let functions = tools_result
+            .tools
+            .into_iter()
+            .map(|tool| {
+                let input_schema = Value::Object((*tool.input_schema).clone());
+                let server_tool_name = tool.name.to_string();
+                let final_name = if let Some(renamed) =
+                    self.config.rename_tools.get(server_tool_name.as_str())
+                {
                     renamed.clone()
                 } else {
                     format!("{}_{}", self.name, server_tool_name)
                 };
 
-            // Extract _meta templates (server-provided)
-            let meta_call_tmpl = tool
-                .meta
-                .as_ref()
-                .and_then(|m| m.0.get("call_template"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let meta_result_tmpl = tool
-                .meta
-                .as_ref()
-                .and_then(|m| m.0.get("result_template"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                // Extract _meta templates (server-provided)
+                let meta_call_tmpl = tool
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.0.get("call_template"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let meta_result_tmpl = tool
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.0.get("result_template"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
 
-            // Apply config override (higher precedence)
-            let cfg_templates: Option<&ToolDisplayTemplates> =
-                self.config.tool_templates.get(&server_tool_name);
-            let call_template = cfg_templates
-                .and_then(|t| t.call_template.clone())
-                .or(meta_call_tmpl);
-            let result_template = cfg_templates
-                .and_then(|t| t.result_template.clone())
-                .or(meta_result_tmpl);
-            let templates = ToolTemplates {
-                call_template,
-                result_template,
-            };
+                // Apply config override (higher precedence)
+                let cfg_templates: Option<&ToolDisplayTemplates> =
+                    self.config.tool_templates.get(&server_tool_name);
+                let call_template = cfg_templates
+                    .and_then(|t| t.call_template.clone())
+                    .or(meta_call_tmpl);
+                let result_template = cfg_templates
+                    .and_then(|t| t.result_template.clone())
+                    .or(meta_result_tmpl);
+                let templates = ToolTemplates {
+                    call_template,
+                    result_template,
+                };
 
-            mcp_tool_to_declaration(
-                &final_name,
-                &server_tool_name,
-                tool.description.as_deref().unwrap_or_default(),
-                &input_schema,
-                templates,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+                mcp_tool_to_declaration(
+                    &final_name,
+                    &server_tool_name,
+                    tool.description.as_deref().unwrap_or_default(),
+                    &input_schema,
+                    templates,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         *self.tools.write() = functions;
         *self.connected.write() = true;
@@ -771,6 +845,66 @@ mod tests {
         assert_eq!(call_template, Some("cfg call".to_string()));
         assert_eq!(result_template, Some("meta result".to_string()));
     }
+
+    #[test]
+    fn test_render_stderr_tail_empty() {
+        let buffer = new_stderr_buffer();
+        assert_eq!(render_stderr_tail(&buffer), "");
+    }
+
+    #[test]
+    fn test_render_stderr_tail_caps_lines() {
+        let buffer = new_stderr_buffer();
+        for i in 0..(MCP_STDERR_TAIL_LINES + 5) {
+            let mut buf = buffer.lock();
+            if buf.len() == MCP_STDERR_TAIL_LINES {
+                buf.pop_front();
+            }
+            buf.push_back(format!("line-{i}"));
+        }
+        let rendered = render_stderr_tail(&buffer);
+        assert!(rendered.starts_with("\nMCP server stderr:\n"));
+        let body = rendered.trim_start_matches("\nMCP server stderr:\n");
+        let lines: Vec<&str> = body.split('\n').collect();
+        assert_eq!(lines.len(), MCP_STDERR_TAIL_LINES);
+        assert_eq!(lines[0], "line-5");
+        assert_eq!(
+            lines[lines.len() - 1],
+            format!("line-{}", MCP_STDERR_TAIL_LINES + 4)
+        );
+    }
+
+    /// Spawning a fake "MCP server" (`sh -c "echo MARKER >&2; exit 1"`)
+    /// fails initialization and the resulting error message must include
+    /// the captured stderr line so users can diagnose bad-args failures
+    /// (issue #391) instead of seeing a generic transport error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_connect_includes_child_stderr_in_error() {
+        let mut config = test_mcp_config("badserver");
+        config.command = "sh".to_string();
+        config.args = vec![
+            "-c".to_string(),
+            "echo 'unknown argument: --xyz' >&2; exit 1".to_string(),
+        ];
+        let client = McpClient::new(config);
+
+        let err = client.connect().await.expect_err("expected connect error");
+        let rendered = format!("{:#}", err);
+
+        assert!(
+            rendered.contains("badserver"),
+            "error should mention server name; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("MCP server stderr:"),
+            "error should include captured stderr header; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("unknown argument: --xyz"),
+            "error should include actual stderr line; got: {rendered}"
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -827,8 +961,12 @@ impl McpManager {
                 let client = client.clone();
                 async move {
                     if let Err(err) = client.connect().await {
+                        // {:#} renders the full anyhow error chain so the
+                        // MCP server's actual error (and any captured
+                        // stderr tail) reaches the user, not just the
+                        // outermost context.
                         let msg = format!(
-                            "MCP server '{}' failed to connect: {}. Use '.mcp connect {}' to retry.",
+                            "MCP server '{}' failed to connect: {:#}\nUse '.mcp connect {}' to retry.",
                             client.name(),
                             err,
                             client.name(),
@@ -840,7 +978,7 @@ impl McpManager {
                             eprintln!("Warning: {msg}");
                         }
                         log::warn!(
-                            "MCP server '{}' connection failed: {}",
+                            "MCP server '{}' connection failed: {:#}",
                             client.name(),
                             err,
                         );
