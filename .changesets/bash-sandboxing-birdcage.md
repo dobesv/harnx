@@ -11,7 +11,7 @@ New per-call MCP parameters on `exec` and `spawn`:
 
 New `harnx-mcp-bash` server flags (Unix only):
 - `--no-sandbox` — disable sandboxing (restore prior unsandboxed behavior).
-- `--extra-readable <path>` (repeatable) — additional read-only paths.
+- `--extra-read <path>` (repeatable) — additional read-only paths.
 - `--extra-exec <path>` (repeatable) — additional exec paths.
 - `--sandbox-run <path>` — override the helper-binary location.
 

@@ -84,9 +84,49 @@ When a variable is defined in multiple places, the value from the source highest
 3. `.env.bash` dotfile (value from file)
 4. Default allowlist (value from host environment)
 
+## Filesystem Sandboxing
+
+On Linux and macOS, `harnx-mcp-bash` uses [birdcage](https://github.com/phylum-dev/birdcage) to sandbox child processes. This restricts the agent's ability to read or write files outside of explicitly permitted locations.
+
+### Default Permissions
+
+- **Writable**:
+  - The repository root(s) specified via `--root`.
+  - The system temporary directory (`/tmp` on Linux, `/private/tmp` on macOS).
+  - The path in the `$TMPDIR` environment variable, if set.
+- **Readable/Executable**:
+  - Standard system directories required for bash and common utilities (e.g., `/usr/bin`, `/bin`, `/lib`).
+
+### Configuration Options
+
+You can grant additional filesystem access using CLI flags or environment variables. All path flags support the `~` prefix, which is expanded to the user's home directory.
+
+| CLI Flag | Environment Variable | Description |
+|----------|----------------------|-------------|
+| `--root <path>` | (N/A) | Adds a project root (writable). |
+| `--extra-read <path>` | `HARNX_BASH_EXTRA_READABLE` | Adds a path as read-only. |
+| `--extra-write <path>` | `HARNX_BASH_EXTRA_WRITABLE` | Adds a path as writable. |
+| `--extra-exec <path>` | `HARNX_BASH_EXTRA_EXEC` | Adds a path to the execution allowlist. |
+
+**Notes:**
+- CLI flags can be repeated to add multiple paths.
+- Environment variables accept a colon-separated list of paths (e.g., `HARNX_BASH_EXTRA_READABLE=/path/one:/path/two`).
+
+### Disabling Sandboxing
+
+Use the `--no-sandbox` flag to disable filesystem restrictions entirely.
+
+```yaml
+# mcp_servers/bash.yaml
+args:
+  - --no-sandbox
+```
+
 ## Common Recipes
 
-### Enable `git push` over SSH
+### Environment Variables
+
+#### Enable `git push` over SSH
 
 Pass `SSH_AUTH_SOCK` (and optionally `SSH_AGENT_PID`) so the agent's bash process can use your existing SSH agent connection:
 
@@ -94,7 +134,7 @@ Pass `SSH_AUTH_SOCK` (and optionally `SSH_AGENT_PID`) so the agent's bash proces
 args: ["-e", "SSH_AUTH_SOCK"]
 ```
 
-### Enable GitHub CLI (`gh`)
+#### Enable GitHub CLI (`gh`)
 
 Pass `GH_TOKEN` or `GITHUB_TOKEN`:
 
@@ -104,10 +144,34 @@ args: ["-e", "GITHUB_TOKEN"]
 
 Alternatively, you can persist these in `~/.config/harnx/.env.bash`.
 
-### Non-interactive Editor
+#### Non-interactive Editor
 
 Override the `EDITOR` variable to ensure that AI tools that shell out use a non-interactive editor:
 
 ```yaml
 args: ["-e", "EDITOR=true"]
+```
+
+### Sandbox Configuration
+
+Allow tools to use home-directory caches or persistent configuration:
+
+#### Allow cargo to cache
+```yaml
+args: ["--extra-write", "~/.cargo"]
+```
+
+#### Allow pip to cache
+```yaml
+args: ["--extra-write", "~/.cache/pip"]
+```
+
+#### Allow npm globals
+```yaml
+args: ["--extra-write", "~/.npm"]
+```
+
+#### Read-only cargo registry
+```yaml
+args: ["--extra-read", "~/.cargo/registry"]
 ```

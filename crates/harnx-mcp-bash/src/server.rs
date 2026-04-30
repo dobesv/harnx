@@ -293,6 +293,8 @@ pub struct SandboxConfig {
     pub extra_exec: Vec<PathBuf>,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub extra_readable: Vec<PathBuf>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub extra_writable: Vec<PathBuf>,
     /// Extra var names to pass through from host (allowlist additions).
     pub extra_env_passthrough: Vec<String>,
     /// Explicit overrides: KEY → VALUE (highest precedence).
@@ -367,6 +369,29 @@ impl BashServer {
     #[allow(dead_code)]
     const SYSTEM_EXEC_PATHS: &[&str] = &["/usr/bin", "/bin", "/tmp", "/etc"];
 
+    #[cfg(unix)]
+    fn system_writable_paths() -> Vec<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            vec![PathBuf::from("/tmp")]
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut paths = vec![PathBuf::from("/private/tmp")];
+            if let Ok(tmpdir) = std::env::var("TMPDIR") {
+                let path = PathBuf::from(&tmpdir);
+                if path != Path::new("/private/tmp") {
+                    paths.push(path);
+                }
+            }
+            paths
+        }
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        {
+            vec![PathBuf::from("/tmp")]
+        }
+    }
+
     const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
         "HOME",
         "PATH",
@@ -407,6 +432,7 @@ impl BashServer {
                 enabled: false,
                 extra_exec: vec![],
                 extra_readable: vec![],
+                extra_writable: vec![],
                 extra_env_passthrough: vec![],
                 env_overrides: vec![],
                 sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
@@ -571,6 +597,11 @@ impl BashServer {
             args.push(OsString::from(path));
         }
 
+        for path in Self::system_writable_paths() {
+            args.push(OsString::from("--write"));
+            args.push(path.into_os_string());
+        }
+
         if let Some(home) = std::env::var_os("HOME") {
             let home = PathBuf::from(home);
             args.push(OsString::from("--exec"));
@@ -595,6 +626,12 @@ impl BashServer {
             args.push(OsString::from("--read"));
             args.push(path.clone().into_os_string());
             readable_paths.push(path.clone());
+        }
+
+        for path in &self.inner.sandbox_config.extra_writable {
+            args.push(OsString::from("--write"));
+            args.push(path.clone().into_os_string());
+            writable_paths.push(path.clone());
         }
 
         match outputs {
@@ -2451,6 +2488,7 @@ mod tests {
             enabled: true,
             extra_exec: vec![],
             extra_readable: vec![],
+            extra_writable: vec![],
             extra_env_passthrough: vec![],
             env_overrides: vec![],
             sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
@@ -2473,6 +2511,7 @@ mod tests {
                 enabled: true,
                 extra_exec: vec![],
                 extra_readable: vec![],
+                extra_writable: vec![],
                 extra_env_passthrough: vec![],
                 env_overrides: vec![],
                 sandbox_run_path: sandbox_run_test_path(),
@@ -2660,6 +2699,61 @@ mod tests {
         assert!(!pairs.contains(&("--write".into(), "/test/root".into())));
         assert!(!pairs.contains(&("--read".into(), "/test/root".into())));
         assert!(!pairs.contains(&("--read".into(), "/tmp/test_wd_xxx".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_args_extra_writable() {
+        let mut config = enabled_sandbox_config();
+        config
+            .extra_writable
+            .push(PathBuf::from("/custom/writable"));
+        let server = BashServer::new_with_sandbox(vec![PathBuf::from("/test/root")], config);
+        let args = server.build_sandbox_args(
+            Path::new("/custom/writable/workdir"),
+            None,
+            None,
+            &[PathBuf::from("/test/root")],
+        );
+        let pairs = collect_arg_pairs(&args);
+
+        assert!(pairs.contains(&("--write".into(), "/custom/writable".into())));
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn test_sandbox_args_temp_dir_writable() {
+        let server = BashServer::new_with_sandbox(
+            vec![PathBuf::from("/test/root")],
+            enabled_sandbox_config(),
+        );
+        let args = server.build_sandbox_args(
+            Path::new("/test/root/workdir"),
+            None,
+            None,
+            &[PathBuf::from("/test/root")],
+        );
+        let pairs = collect_arg_pairs(&args);
+
+        assert!(pairs.contains(&("--write".into(), "/tmp".into())));
+    }
+
+    #[cfg(all(unix, target_os = "macos"))]
+    #[test]
+    fn test_sandbox_args_temp_dir_writable() {
+        let server = BashServer::new_with_sandbox(
+            vec![PathBuf::from("/test/root")],
+            enabled_sandbox_config(),
+        );
+        let args = server.build_sandbox_args(
+            Path::new("/test/root/workdir"),
+            None,
+            None,
+            &[PathBuf::from("/test/root")],
+        );
+        let pairs = collect_arg_pairs(&args);
+
+        assert!(pairs.contains(&("--write".into(), "/private/tmp".into())));
     }
 
     #[cfg(unix)]
