@@ -295,6 +295,8 @@ pub struct SandboxConfig {
     pub extra_readable: Vec<PathBuf>,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub extra_writable: Vec<PathBuf>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub extra_rwx: Vec<PathBuf>,
     /// Extra var names to pass through from host (allowlist additions).
     pub extra_env_passthrough: Vec<String>,
     /// Explicit overrides: KEY → VALUE (highest precedence).
@@ -433,6 +435,7 @@ impl BashServer {
                 extra_exec: vec![],
                 extra_readable: vec![],
                 extra_writable: vec![],
+                extra_rwx: vec![],
                 extra_env_passthrough: vec![],
                 env_overrides: vec![],
                 sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
@@ -634,10 +637,23 @@ impl BashServer {
             writable_paths.push(path.clone());
         }
 
+        for path in &self.inner.sandbox_config.extra_rwx {
+            args.push(OsString::from("--read"));
+            args.push(path.clone().into_os_string());
+            args.push(OsString::from("--write"));
+            args.push(path.clone().into_os_string());
+            args.push(OsString::from("--exec"));
+            args.push(path.clone().into_os_string());
+            readable_paths.push(path.clone());
+            writable_paths.push(path.clone());
+        }
+
         match outputs {
             None => {
                 for root in roots {
                     args.push(OsString::from("--write"));
+                    args.push(root.clone().into_os_string());
+                    args.push(OsString::from("--exec"));
                     args.push(root.clone().into_os_string());
                     writable_paths.push(root.clone());
                 }
@@ -646,6 +662,8 @@ impl BashServer {
                 if !inputs_explicit_empty {
                     for root in roots {
                         args.push(OsString::from("--read"));
+                        args.push(root.clone().into_os_string());
+                        args.push(OsString::from("--exec"));
                         args.push(root.clone().into_os_string());
                         readable_paths.push(root.clone());
                     }
@@ -656,6 +674,10 @@ impl BashServer {
                     args.push(OsString::from("--write"));
                     args.push(path.clone().into_os_string());
                     writable_paths.push(path.clone());
+                }
+                for root in roots {
+                    args.push(OsString::from("--exec"));
+                    args.push(root.clone().into_os_string());
                 }
             }
         }
@@ -2489,6 +2511,7 @@ mod tests {
             extra_exec: vec![],
             extra_readable: vec![],
             extra_writable: vec![],
+            extra_rwx: vec![],
             extra_env_passthrough: vec![],
             env_overrides: vec![],
             sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
@@ -2512,6 +2535,7 @@ mod tests {
                 extra_exec: vec![],
                 extra_readable: vec![],
                 extra_writable: vec![],
+                extra_rwx: vec![],
                 extra_env_passthrough: vec![],
                 env_overrides: vec![],
                 sandbox_run_path: sandbox_run_test_path(),
@@ -2718,6 +2742,37 @@ mod tests {
         let pairs = collect_arg_pairs(&args);
 
         assert!(pairs.contains(&("--write".into(), "/custom/writable".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_args_extra_rwx() {
+        let mut config = enabled_sandbox_config();
+        config.extra_rwx.push(PathBuf::from("/custom/rwx"));
+        let server = BashServer::new_with_sandbox(vec![PathBuf::from("/test/root")], config);
+        let args = server.build_sandbox_args(
+            Path::new("/custom/rwx/workdir"),
+            None,
+            None,
+            &[PathBuf::from("/test/root")],
+        );
+        let pairs = collect_arg_pairs(&args);
+
+        assert!(pairs.contains(&("--read".into(), "/custom/rwx".into())));
+        assert!(pairs.contains(&("--write".into(), "/custom/rwx".into())));
+        assert!(pairs.contains(&("--exec".into(), "/custom/rwx".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_args_roots_get_exec() {
+        let root = PathBuf::from("/test/root");
+        let server = BashServer::new_with_sandbox(vec![root.clone()], enabled_sandbox_config());
+        let args = server.build_sandbox_args(Path::new("/test/root/workdir"), None, None, &[root]);
+        let pairs = collect_arg_pairs(&args);
+
+        assert!(pairs.contains(&("--write".into(), "/test/root".into())));
+        assert!(pairs.contains(&("--exec".into(), "/test/root".into())));
     }
 
     #[cfg(all(unix, target_os = "linux"))]

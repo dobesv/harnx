@@ -125,6 +125,7 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
         extra_exec: parse_env_paths("HARNX_BASH_EXTRA_EXEC"),
         extra_readable: parse_env_paths("HARNX_BASH_EXTRA_READABLE"),
         extra_writable: parse_env_paths("HARNX_BASH_EXTRA_WRITABLE"),
+        extra_rwx: parse_env_paths("HARNX_BASH_EXTRA_RWX"),
         sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
         extra_env_passthrough: parse_env_passthrough(),
         env_overrides: vec![],
@@ -181,9 +182,20 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                     std::process::exit(1);
                 }
             }
+            "--extra-rwx" => {
+                if i + 1 < args.len() {
+                    sandbox_config
+                        .extra_rwx
+                        .push(PathBuf::from(expand_tilde(&args[i + 1])));
+                    i += 2;
+                } else {
+                    eprintln!("harnx-mcp-bash: --extra-rwx requires a path argument");
+                    std::process::exit(1);
+                }
+            }
             "--sandbox-run" => {
                 if i + 1 < args.len() {
-                    sandbox_run_override = Some(PathBuf::from(&args[i + 1]));
+                    sandbox_run_override = Some(PathBuf::from(expand_tilde(&args[i + 1])));
                     i += 2;
                 } else {
                     eprintln!("harnx-mcp-bash: --sandbox-run requires a path argument");
@@ -225,6 +237,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                 eprintln!("  --extra-read <path> Add sandbox read-only path (repeatable)");
                 eprintln!("  --extra-exec <path>     Add sandbox execute path (repeatable)");
                 eprintln!("  --extra-write <path>    Add sandbox writable path (repeatable)");
+                eprintln!(
+                    "  --extra-rwx <path>      Add sandbox read/write/exec path (repeatable)"
+                );
                 eprintln!("  --sandbox-run <path>    Override sandbox helper binary path");
                 eprintln!("  --env, -e <VAR>         Pass VAR from host env to child (repeatable)");
                 eprintln!("  --env, -e <VAR=VALUE>   Set VAR=VALUE in child env (repeatable)");
@@ -239,6 +254,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                 );
                 eprintln!(
                     "  HARNX_BASH_EXTRA_WRITABLE   Colon-separated extra sandbox writable paths"
+                );
+                eprintln!(
+                    "  HARNX_BASH_EXTRA_RWX        Colon-separated extra sandbox read/write/exec paths"
                 );
                 eprintln!(
                     "  HARNX_BASH_ENV_PASSTHROUGH  Comma-separated extra env var names to pass through"
@@ -311,6 +329,7 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
         extra_exec: vec![],
         extra_readable: vec![],
         extra_writable: vec![],
+        extra_rwx: vec![],
         sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
         extra_env_passthrough: parse_env_passthrough(),
         env_overrides: vec![],
@@ -352,6 +371,25 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                     std::process::exit(1);
                 }
             }
+            "--extra-rwx" => {
+                if i + 1 < args.len() {
+                    i += 2;
+                } else {
+                    eprintln!("harnx-mcp-bash: --extra-rwx requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--no-sandbox" => {
+                i += 1;
+            }
+            "--sandbox-run" => {
+                if i + 1 < args.len() {
+                    i += 2;
+                } else {
+                    eprintln!("harnx-mcp-bash: --sandbox-run requires a path argument");
+                    std::process::exit(1);
+                }
+            }
             "--env" | "-e" => {
                 if i + 1 < args.len() {
                     let raw = &args[i + 1];
@@ -386,6 +424,7 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                 eprintln!("  --extra-read <path> Accept sandbox read-only path flag (ignored on this platform)");
                 eprintln!("  --extra-exec <path>     Accept sandbox execute path flag (ignored on this platform)");
                 eprintln!("  --extra-write <path>    Accept sandbox writable path flag (ignored on this platform)");
+                eprintln!("  --extra-rwx <path>      Accept sandbox read/write/exec path flag (ignored on this platform)");
                 eprintln!("  --env, -e <VAR>         Pass VAR from host env to child (repeatable)");
                 eprintln!("  --env, -e <VAR=VALUE>   Set VAR=VALUE in child env (repeatable)");
                 eprintln!("  --help, -h              Show this help message");
