@@ -127,10 +127,10 @@ pub(crate) enum TranscriptItem {
     AssistantText(String),
     ErrorText(String),
     ThoughtText(String),
-    /// Plain tool result line — extracted from the raw output. Rendered dim.
-    ToolResultText(String),
-    /// Templated tool result line — produced from a MCP `result_template`.
-    /// Rendered as inline markdown so the styling shows up.
+    /// Tool result body — the full multi-line text extracted from the
+    /// MCP `CallToolResult`. Rendered through `markdown_lines` (with a
+    /// dim base style) so block-level markdown like fenced diffs and
+    /// inline emphasis from a `result_template` both display correctly.
     ToolResultMarkdown(String),
     StatusLine(String),
     Plan(Vec<PlanEntry>),

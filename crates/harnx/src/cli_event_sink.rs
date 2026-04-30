@@ -199,46 +199,60 @@ impl CliSinkState {
         }
     }
 
-    /// Stderr render for `ToolEvent::Completed`: when an MCP
-    /// `result_template` produced a `title`, render each output line
-    /// through markdown (preserves emphasis); otherwise fall back to the
-    /// dim plain-text path the historic emit used.
+    /// Stderr render for `ToolEvent::Completed`. Always routes through the
+    /// multi-line `MarkdownRender::render` so block-level constructs work
+    /// — fenced code (e.g. the ```diff blocks emitted by harnx-mcp-fs /
+    /// harnx-mcp-bash for history diffs) gets syntect highlighting,
+    /// inline emphasis from a templated MCP `result_template` still
+    /// renders, and plain text passes through unchanged. Falls back to
+    /// dim plain text when highlighting is disabled or the renderer
+    /// can't initialize.
     fn print_tool_completed(&mut self, output: &serde_json::Value, title: Option<&str>) {
-        let templated = title.map(str::trim).filter(|t| !t.is_empty()).is_some();
         let text = harnx_runtime::utils::render_tool_result_text(output, title);
         let trimmed = text.trim_end_matches('\n');
         if trimmed.is_empty() {
             return;
         }
-        if templated {
-            for line in trimmed.lines() {
-                eprintln!("{}", self.render_markdown_line(line));
-            }
-        } else {
-            eprintln!("{}", dimmed_text(trimmed));
-        }
+        eprintln!("{}", self.render_markdown_block(trimmed));
     }
 
-    /// Render a single line through `MarkdownRender` so MCP `call_template`/
-    /// `result_template` text shows its `**bold**` / `*italic*` / `` `code` ``
-    /// styling. Lazy-initializes the renderer (shared with the streaming
-    /// path) and returns the input unchanged when highlighting is disabled
-    /// (no TTY, --no-highlight, or render init failure).
-    fn render_markdown_line(&mut self, text: &str) -> String {
+    /// Lazy-initialize the shared `MarkdownRender` and run `with_render`
+    /// against it. Returns `fallback(text)` when highlighting is disabled
+    /// (no TTY, `--no-highlight`, or renderer init failure) so callers
+    /// can choose between dim plain text and the input unchanged.
+    fn with_markdown<F, G>(&mut self, text: &str, with_render: F, fallback: G) -> String
+    where
+        F: FnOnce(&mut MarkdownRender, &str) -> String,
+        G: FnOnce(&str) -> String,
+    {
         if !(self.highlight && *IS_STDOUT_TERMINAL) {
-            return text.to_string();
+            return fallback(text);
         }
         if self.render.is_none() {
             match MarkdownRender::init(self.render_options.clone()) {
                 Ok(r) => self.render = Some(r),
-                Err(_) => return text.to_string(),
+                Err(_) => return fallback(text),
             }
         }
-        // `render_line` is `&self` — no `mut` borrow needed.
         self.render
-            .as_ref()
-            .map(|r| r.render_line(text))
-            .unwrap_or_else(|| text.to_string())
+            .as_mut()
+            .map(|r| with_render(r, text))
+            .unwrap_or_else(|| fallback(text))
+    }
+
+    /// Render a multi-line markdown document via `MarkdownRender::render`,
+    /// which preserves state across lines so fenced code blocks and
+    /// per-language syntect highlighting work. Falls back to dim plain
+    /// text when highlighting is disabled.
+    fn render_markdown_block(&mut self, text: &str) -> String {
+        self.with_markdown(text, |r, t| r.render(t), dimmed_text)
+    }
+
+    /// Render a single line through `MarkdownRender` so MCP `call_template`/
+    /// `result_template` text shows its `**bold**` / `*italic*` / `` `code` ``
+    /// styling. Returns the input unchanged when highlighting is disabled.
+    fn render_markdown_line(&mut self, text: &str) -> String {
+        self.with_markdown(text, |r, t| r.render_line(t), str::to_string)
     }
 }
 

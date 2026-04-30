@@ -4183,6 +4183,90 @@ async fn tui_renders_completed_template_title_when_provided() {
     );
 }
 
+/// Issue #398 follow-up: history diffs arrive as ```diff fenced
+/// markdown blocks. The TUI must detect the fence, route the whole
+/// body through the multi-line markdown renderer, and apply the
+/// `Diff` syntect highlighter so `-` lines, `+` lines, and `@@` hunk
+/// headers each get distinct fg colors.
+#[tokio::test]
+async fn tui_renders_fenced_diff_tool_result_with_per_line_syntect_styling() {
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+
+    let diff_body = "diff --git a/foo b/foo\n@@ -1 +1 @@\n-old line\n+new line";
+    let result_text = format!("Edited /tmp/foo (1 replacement)\n\n```diff\n{diff_body}\n```");
+    let output = serde_json::json!({
+        "content": [{"type": "text", "text": result_text}],
+        "isError": false,
+    });
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Completed {
+            id: "call-1".into(),
+            output,
+            title: None,
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let lines: Vec<ratatui::text::Line<'static>> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect();
+    let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
+    let joined = plain.join("\n");
+
+    assert!(
+        joined.contains("Edited /tmp/foo"),
+        "summary missing from rendered transcript:\n{joined}"
+    );
+    // Diff body lines arrive as separate ratatui lines so syntect can
+    // style each one independently.
+    assert!(
+        plain.iter().any(|l| l.contains("-old line")),
+        "expected '-old line' on its own ratatui line:\n{joined}"
+    );
+    assert!(
+        plain.iter().any(|l| l.contains("+new line")),
+        "expected '+new line' on its own ratatui line:\n{joined}"
+    );
+    // The minus and plus lines must have distinct fg colors — that's
+    // syntect's `Diff` highlighter doing its job. tui-markdown may
+    // split a single source line across multiple spans (e.g. one for
+    // the `-` and one for the rest), so we hash the set of fg colors
+    // per ratatui line and require the `-` line and `+` line to have
+    // different color sets. We don't pin specific RGB values because
+    // tui-markdown picks its own theme.
+    let fg_vec_for = |needle: &str| -> Vec<ratatui::style::Color> {
+        lines
+            .iter()
+            .find(|l| line_to_plain(l).contains(needle))
+            .map(|l| l.spans.iter().filter_map(|s| s.style.fg).collect())
+            .unwrap_or_default()
+    };
+    let minus_fgs = fg_vec_for("-old line");
+    let plus_fgs = fg_vec_for("+new line");
+    assert!(
+        !minus_fgs.is_empty(),
+        "'-old line' should have at least one styled span"
+    );
+    assert!(
+        !plus_fgs.is_empty(),
+        "'+new line' should have at least one styled span"
+    );
+    assert_ne!(
+        minus_fgs, plus_fgs,
+        "diff `-` and `+` lines must render with distinct fg colors"
+    );
+}
+
 #[tokio::test]
 async fn tui_falls_back_to_output_when_no_template_title() {
     // Regression guard: when title is None (no result template), the

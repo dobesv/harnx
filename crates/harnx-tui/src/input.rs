@@ -101,16 +101,17 @@ fn tool_call_body(
 }
 
 /// Convert a `Completed` event's `output` + `title` into transcript items.
-/// Strips ANSI escapes from string outputs before truncation so pre-dimmed
-/// test inputs render cleanly. When `title` carries a rendered MCP
-/// `result_template`, each line goes through `ToolResultMarkdown` so
-/// `**bold**` / `` `code` `` / `*italic*` produce inline styling;
-/// otherwise the extracted output goes through plain `ToolResultText`.
+/// The whole multi-line text is wrapped in a single `ToolResultMarkdown`
+/// item so `markdown_lines` can parse block-level constructs — fenced
+/// code (e.g. the ```diff blocks emitted by harnx-mcp-fs / harnx-mcp-bash
+/// for history diffs), inline emphasis from a templated MCP
+/// `result_template`, and plain text alike. Strips ANSI escapes from
+/// string outputs before extraction so pre-dimmed test inputs render
+/// cleanly.
 fn tool_completed_to_transcript_items(
     output: &serde_json::Value,
     title: Option<&str>,
 ) -> Vec<TranscriptItem> {
-    let templated = title.map(str::trim).filter(|t| !t.is_empty()).is_some();
     let raw = match output {
         serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
         _ => output.clone(),
@@ -120,12 +121,7 @@ fn tool_completed_to_transcript_items(
     if clean.is_empty() {
         return vec![];
     }
-    let make = if templated {
-        |line: &str| TranscriptItem::ToolResultMarkdown(line.to_string())
-    } else {
-        |line: &str| TranscriptItem::ToolResultText(line.to_string())
-    };
-    clean.lines().map(make).collect()
+    vec![TranscriptItem::ToolResultMarkdown(clean)]
 }
 
 impl Tui {
