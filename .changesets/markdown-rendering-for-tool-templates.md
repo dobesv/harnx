@@ -10,9 +10,9 @@ markers leaked through as literal asterisks and backticks instead of
 producing styling.
 
 - TUI: new `ToolCallBody::Markdown` and `TranscriptItem::ToolResultMarkdown`
-  variants route templated text through a small inline-markdown helper that
-  produces ratatui spans with `BOLD` / `ITALIC` modifiers and a code-color
-  fg for `` `code` `` runs. Raw YAML/output bodies still render plain so
+  variants route templated text through `tui-markdown`, which produces
+  ratatui spans with `BOLD` / `ITALIC` modifiers and a styled fg/bg for
+  inline `` `code` `` runs. Raw YAML/output bodies still render plain so
   YAML keys/values are never accidentally styled.
 - CLI: templated `Started` titles and templated `Completed` lines run
   through the existing `MarkdownRender` (syntect ANSI). Raw output keeps

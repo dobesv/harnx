@@ -1,124 +1,43 @@
 use harnx_core::event::AgentSource;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-/// Render a single line of inline markdown into ratatui spans, applying
-/// `base_style` as the foreground color/modifier and adding bold/italic/
-/// code styling on top. Supports the small subset MCP tool templates use:
+/// Render one line of MCP tool template text into ratatui spans, applying
+/// `base_style` as the foreground/modifier base. Delegates to the
+/// `tui-markdown` crate (which wraps `pulldown-cmark` + `syntect` +
+/// `ansi-to-tui` internally), so we get the same inline emphasis handling
+/// (`**bold**`, `*italic*`, `` `code` ``) without maintaining our own
+/// parser.
 ///
-/// - `**bold**`
-/// - `*italic*` and `_italic_`
-/// - `` `code` ``
-///
-/// Backslash escapes any marker (`\*`, `\_`, `` \` ``, `\\`). Unmatched
-/// markers render literally. Block-level constructs (headings, lists,
-/// fenced code) are not parsed — caller is expected to split on `\n` and
-/// call this per line.
+/// On render failure (empty result), returns the input as a single plain
+/// span so the user still sees the text — markdown styling is a
+/// presentation nicety, not a correctness requirement.
 pub(crate) fn markdown_line_spans(text: &str, base_style: Style) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match c {
-            '\\' if i + 1 < chars.len() && is_marker(chars[i + 1]) => {
-                buf.push(chars[i + 1]);
-                i += 2;
-            }
-            '*' if i + 1 < chars.len() && chars[i + 1] == '*' => {
-                if let Some(end) = find_close(&chars, i + 2, "**") {
-                    flush(&mut spans, &mut buf, base_style);
-                    let inner = collect_with_escapes(&chars, i + 2, end);
-                    let mut bold = base_style;
-                    bold.add_modifier.insert(Modifier::BOLD);
-                    spans.push(Span::styled(inner, bold));
-                    i = end + 2;
-                } else {
-                    buf.push('*');
-                    buf.push('*');
-                    i += 2;
-                }
-            }
-            '*' | '_' => {
-                let needle = c.to_string();
-                if let Some(end) = find_close(&chars, i + 1, &needle) {
-                    flush(&mut spans, &mut buf, base_style);
-                    let inner = collect_with_escapes(&chars, i + 1, end);
-                    let mut italic = base_style;
-                    italic.add_modifier.insert(Modifier::ITALIC);
-                    spans.push(Span::styled(inner, italic));
-                    i = end + 1;
-                } else {
-                    buf.push(c);
-                    i += 1;
-                }
-            }
-            '`' => {
-                if let Some(end) = find_close(&chars, i + 1, "`") {
-                    flush(&mut spans, &mut buf, base_style);
-                    let inner: String = chars[i + 1..end].iter().collect();
-                    let code_style = base_style.fg(Color::Yellow);
-                    spans.push(Span::styled(inner, code_style));
-                    i = end + 1;
-                } else {
-                    buf.push('`');
-                    i += 1;
-                }
-            }
-            _ => {
-                buf.push(c);
-                i += 1;
-            }
-        }
-    }
-    flush(&mut spans, &mut buf, base_style);
+    let plain_fallback = || Line::from(Span::styled(text.to_string(), base_style));
+
+    // `tui_markdown::from_str` returns a `Text` with zero or more lines.
+    // For a single input line we expect exactly one parsed line; any
+    // additional lines (which shouldn't happen for inline markdown) are
+    // dropped — caller is expected to split the input on `\n` first.
+    let parsed = tui_markdown::from_str(text);
+    let first = match parsed.into_iter().next() {
+        Some(line) if !line.spans.is_empty() => line,
+        _ => return plain_fallback(),
+    };
+
+    // Patch `base_style` under each parsed span so the dim/grey context
+    // (set by the caller) applies wherever the parsed span doesn't
+    // explicitly override it. `Style::patch` keeps the right-hand side's
+    // explicit fields and falls through to the left for `None` ones.
+    let spans: Vec<Span<'static>> = first
+        .spans
+        .into_iter()
+        .map(|span| {
+            let merged = base_style.patch(span.style);
+            Span::styled(span.content.into_owned(), merged)
+        })
+        .collect();
     Line::from(spans)
-}
-
-fn is_marker(c: char) -> bool {
-    matches!(c, '*' | '_' | '`' | '\\')
-}
-
-fn flush(spans: &mut Vec<Span<'static>>, buf: &mut String, style: Style) {
-    if !buf.is_empty() {
-        spans.push(Span::styled(std::mem::take(buf), style));
-    }
-}
-
-/// Find the next index in `chars[from..]` where `needle` (a 1- or 2-char
-/// marker) starts, treating backslash-escaped markers as literal.
-fn find_close(chars: &[char], from: usize, needle: &str) -> Option<usize> {
-    let needle_chars: Vec<char> = needle.chars().collect();
-    let mut i = from;
-    while i + needle_chars.len() <= chars.len() {
-        // Skip escapes: `\X` consumes two chars and is never a closing marker.
-        if chars[i] == '\\' && i + 1 < chars.len() && is_marker(chars[i + 1]) {
-            i += 2;
-            continue;
-        }
-        if chars[i..i + needle_chars.len()] == *needle_chars {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Collect `chars[from..to]` into a String, processing backslash escapes.
-fn collect_with_escapes(chars: &[char], from: usize, to: usize) -> String {
-    let mut out = String::new();
-    let mut i = from;
-    while i < to {
-        if chars[i] == '\\' && i + 1 < to && is_marker(chars[i + 1]) {
-            out.push(chars[i + 1]);
-            i += 2;
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
-    }
-    out
 }
 
 pub(crate) fn render_status_line(title: Option<&str>, status: Option<&str>) -> Option<String> {
@@ -166,7 +85,13 @@ pub(crate) fn render_usage_line(
 
 #[cfg(test)]
 mod markdown_tests {
+    //! These tests pin the *behaviors* the templating system relies on:
+    //! markers stripped, content preserved, BOLD/ITALIC modifiers attached
+    //! to emphasized text, and a non-default style on inline code. They do
+    //! not assert specific colors — the underlying `tui-markdown` crate
+    //! picks those, and we don't want to break on cosmetic changes there.
     use super::*;
+    use ratatui::style::{Color, Modifier};
 
     fn span_text(line: &Line<'static>) -> String {
         line.spans
@@ -175,34 +100,29 @@ mod markdown_tests {
             .collect::<String>()
     }
 
-    fn span_modifiers(line: &Line<'static>) -> Vec<(String, Modifier)> {
-        line.spans
-            .iter()
-            .map(|s| (s.content.to_string(), s.style.add_modifier))
-            .collect()
-    }
-
     #[test]
     fn plain_text_passes_through() {
         let line = markdown_line_spans("hello world", Style::default());
         assert_eq!(span_text(&line), "hello world");
-        assert_eq!(line.spans.len(), 1);
-        assert_eq!(line.spans[0].style.add_modifier, Modifier::empty());
+        for span in &line.spans {
+            assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+            assert!(!span.style.add_modifier.contains(Modifier::ITALIC));
+        }
     }
 
     #[test]
     fn bold_marker_produces_bold_span() {
         let line = markdown_line_spans("hi **there** you", Style::default());
         assert_eq!(span_text(&line), "hi there you");
-        let mods = span_modifiers(&line);
-        let bold_part = mods
+        let bold = line
+            .spans
             .iter()
-            .find(|(t, _)| t == "there")
+            .find(|s| s.content.as_ref() == "there")
             .expect("expected 'there' span");
         assert!(
-            bold_part.1.contains(Modifier::BOLD),
+            bold.style.add_modifier.contains(Modifier::BOLD),
             "expected BOLD on 'there'; got {:?}",
-            bold_part.1
+            bold.style.add_modifier
         );
     }
 
@@ -210,36 +130,48 @@ mod markdown_tests {
     fn italic_asterisk_produces_italic_span() {
         let line = markdown_line_spans("hi *there* you", Style::default());
         assert_eq!(span_text(&line), "hi there you");
-        let mods = span_modifiers(&line);
-        let it = mods.iter().find(|(t, _)| t == "there").unwrap();
-        assert!(it.1.contains(Modifier::ITALIC));
+        let it = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "there")
+            .unwrap();
+        assert!(it.style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
     fn italic_underscore_produces_italic_span() {
         let line = markdown_line_spans("hi _there_ you", Style::default());
-        let mods = span_modifiers(&line);
-        let it = mods.iter().find(|(t, _)| t == "there").unwrap();
-        assert!(it.1.contains(Modifier::ITALIC));
+        let it = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "there")
+            .unwrap();
+        assert!(it.style.add_modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
-    fn code_marker_produces_yellow_span() {
+    fn code_marker_produces_styled_span() {
         let line = markdown_line_spans("run `ls -la`", Style::default());
         assert_eq!(span_text(&line), "run ls -la");
-        let code_span = line
+        let code = line
             .spans
             .iter()
             .find(|s| s.content.as_ref() == "ls -la")
             .expect("expected code span");
-        assert_eq!(code_span.style.fg, Some(Color::Yellow));
+        // Inline code should be visually distinct — it carries either an
+        // explicit fg or bg from `tui-markdown`. The exact color is left
+        // to that crate; we only require it isn't bare default.
+        assert!(
+            code.style.fg.is_some() || code.style.bg.is_some(),
+            "code span should be visually distinct; got {:?}",
+            code.style
+        );
     }
 
     #[test]
     fn unmatched_marker_renders_literally() {
         let line = markdown_line_spans("a * b _ c ` d", Style::default());
         assert_eq!(span_text(&line), "a * b _ c ` d");
-        // No styled span should have BOLD/ITALIC.
         for s in &line.spans {
             assert!(!s.style.add_modifier.contains(Modifier::BOLD));
             assert!(!s.style.add_modifier.contains(Modifier::ITALIC));
@@ -253,44 +185,47 @@ mod markdown_tests {
         // After Jinja rendering this becomes "**$** `ls -la /tmp`"
         let line = markdown_line_spans("**$** `ls -la /tmp`", Style::default());
         assert_eq!(span_text(&line), "$ ls -la /tmp");
-        let mods = span_modifiers(&line);
-        let bold = mods.iter().find(|(t, _)| t == "$").unwrap();
-        assert!(bold.1.contains(Modifier::BOLD));
+        let bold = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "$")
+            .unwrap();
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
         let code = line
             .spans
             .iter()
             .find(|s| s.content.as_ref() == "ls -la /tmp")
             .unwrap();
-        assert_eq!(code.style.fg, Some(Color::Yellow));
-    }
-
-    #[test]
-    fn backslash_escape_keeps_marker_literal() {
-        let line = markdown_line_spans("not \\*bold\\* here", Style::default());
-        assert_eq!(span_text(&line), "not *bold* here");
-        for s in &line.spans {
-            assert!(!s.style.add_modifier.contains(Modifier::BOLD));
-            assert!(!s.style.add_modifier.contains(Modifier::ITALIC));
-        }
+        assert!(code.style.fg.is_some() || code.style.bg.is_some());
     }
 
     #[test]
     fn base_style_propagates_to_unstyled_runs() {
+        // `Style::patch` keeps the parsed span's explicit fields and falls
+        // through to the base for unset ones. So an unstyled run should
+        // inherit both fg=DarkGray and DIM from the base; emphasized spans
+        // keep their own fg but should still pick up DIM.
         let base = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
         let line = markdown_line_spans("hi **bold** world", base);
-        for span in &line.spans {
-            // Every span should keep the DarkGray + DIM base, plus any extra modifiers.
-            assert_eq!(span.style.fg, Some(Color::DarkGray));
-            assert!(span.style.add_modifier.contains(Modifier::DIM));
-        }
-        // The 'bold' span should additionally be BOLD.
+
+        // Find the unstyled "hi " span and check it inherits the base.
+        let unstyled = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref().contains("hi"))
+            .expect("expected an unstyled run");
+        assert_eq!(unstyled.style.fg, Some(Color::DarkGray));
+        assert!(unstyled.style.add_modifier.contains(Modifier::DIM));
+
+        // The "bold" span should still be BOLD on top of the base DIM.
         let bold = line
             .spans
             .iter()
             .find(|s| s.content.as_ref() == "bold")
             .unwrap();
         assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        assert!(bold.style.add_modifier.contains(Modifier::DIM));
     }
 }

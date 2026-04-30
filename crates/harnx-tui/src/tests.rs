@@ -4274,8 +4274,9 @@ async fn tui_started_template_strips_markers_and_styles_spans() {
     );
 
     // At least one span should be BOLD ("$"), and at least one should be
-    // styled with the code color (Yellow) for "ls -la /tmp".
-    use ratatui::style::{Color, Modifier};
+    // visually distinct (fg or bg set) for the inline code ("ls -la /tmp").
+    // We don't pin a specific color — that's chosen by `tui-markdown`.
+    use ratatui::style::Modifier;
     let mut saw_bold = false;
     let mut saw_code = false;
     for line in &rendered_lines {
@@ -4283,13 +4284,20 @@ async fn tui_started_template_strips_markers_and_styles_spans() {
             if span.style.add_modifier.contains(Modifier::BOLD) {
                 saw_bold = true;
             }
-            if span.style.fg == Some(Color::Yellow) {
+            // The code span carries an explicit fg or bg — distinct from
+            // the dim grey base used for surrounding spans.
+            if span.content.as_ref() == "ls -la /tmp"
+                && (span.style.fg.is_some() || span.style.bg.is_some())
+            {
                 saw_code = true;
             }
         }
     }
     assert!(saw_bold, "expected a BOLD span from `**$**`");
-    assert!(saw_code, "expected a code-colored span from `` `ls -la /tmp` ``");
+    assert!(
+        saw_code,
+        "expected a visually distinct span for `` `ls -la /tmp` ``"
+    );
 }
 
 #[tokio::test]
@@ -4364,7 +4372,7 @@ async fn tui_completed_template_styles_spans() {
     .await
     .unwrap();
 
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Modifier;
     let rendered: Vec<ratatui::text::Line<'static>> = tui
         .app
         .transcript
@@ -4389,11 +4397,15 @@ async fn tui_completed_template_styles_spans() {
             if span.style.add_modifier.contains(Modifier::BOLD) {
                 saw_bold = true;
             }
-            if span.style.fg == Some(Color::Yellow) {
+            // The `hello` code span is visually distinct via fg or bg —
+            // exact color picked by `tui-markdown`.
+            if span.content.as_ref() == "hello"
+                && (span.style.fg.is_some() || span.style.bg.is_some())
+            {
                 saw_code = true;
             }
         }
     }
     assert!(saw_bold, "expected a BOLD span from `**OK**`");
-    assert!(saw_code, "expected a code-colored span from `` `hello` ``");
+    assert!(saw_code, "expected a visually distinct span for `` `hello` ``");
 }
