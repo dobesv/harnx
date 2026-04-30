@@ -83,6 +83,51 @@ fn render_attachment_preview(path: &Path) -> Option<String> {
     Some(preview)
 }
 
+/// Build the body for a `TranscriptItem::ToolCall` from a `Started`
+/// event's `title` and `input`. A non-empty rendered template `title`
+/// becomes `ToolCallBody::Markdown`; otherwise the raw input is YAML-
+/// formatted (or omitted entirely when input is `null`).
+fn tool_call_body(
+    title: Option<&str>,
+    input: &serde_json::Value,
+) -> Option<crate::types::ToolCallBody> {
+    match title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => Some(crate::types::ToolCallBody::Markdown(t.to_string())),
+        None => match input {
+            serde_json::Value::Null => None,
+            _ => Some(crate::types::ToolCallBody::Yaml(pretty_yaml_block(input))),
+        },
+    }
+}
+
+/// Convert a `Completed` event's `output` + `title` into transcript items.
+/// Strips ANSI escapes from string outputs before truncation so pre-dimmed
+/// test inputs render cleanly. When `title` carries a rendered MCP
+/// `result_template`, each line goes through `ToolResultMarkdown` so
+/// `**bold**` / `` `code` `` / `*italic*` produce inline styling;
+/// otherwise the extracted output goes through plain `ToolResultText`.
+fn tool_completed_to_transcript_items(
+    output: &serde_json::Value,
+    title: Option<&str>,
+) -> Vec<TranscriptItem> {
+    let templated = title.map(str::trim).filter(|t| !t.is_empty()).is_some();
+    let raw = match output {
+        serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
+        _ => output.clone(),
+    };
+    let text = crate::agent_event_sink::render_tool_result_text(&raw, title);
+    let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
+    if clean.is_empty() {
+        return vec![];
+    }
+    let make = if templated {
+        |line: &str| TranscriptItem::ToolResultMarkdown(line.to_string())
+    } else {
+        |line: &str| TranscriptItem::ToolResultText(line.to_string())
+    };
+    clean.lines().map(make).collect()
+}
+
 impl Tui {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
@@ -599,31 +644,7 @@ impl Tui {
                 }
             }
             AgentEvent::Tool(ToolEvent::Completed { output, title, .. }) => {
-                // The TuiAgentEventSink forwards Tool::Completed through
-                // render_agent_event. The truncation + formatting live
-                // here (mirror of default_emit_tool_result). Strip ANSI
-                // from a string-valued output BEFORE truncation so
-                // pre-dimmed test inputs get their ESC-introduced
-                // sequences removed cleanly — otherwise
-                // `truncate_output`'s `sanitize_output_text` strips the
-                // ESC char but leaves literal `[2m`/`[0m` markers.
-                // `render_tool_result_text` no longer wraps in ANSI dim:
-                // the TUI renderer applies `Modifier::DIM` via
-                // `TranscriptItem::ToolResultText`.
-                let raw = match &output {
-                    serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
-                    _ => output.clone(),
-                };
-                let text = crate::agent_event_sink::render_tool_result_text(&raw, title.as_deref());
-                let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
-                if clean.is_empty() {
-                    vec![]
-                } else {
-                    clean
-                        .lines()
-                        .map(|line| TranscriptItem::ToolResultText(line.to_string()))
-                        .collect()
-                }
+                tool_completed_to_transcript_items(&output, title.as_deref())
             }
             AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
                 let text = concat_text_blocks(&blocks);
@@ -774,16 +795,9 @@ impl Tui {
             AgentEvent::Tool(ToolEvent::Started {
                 name, title, input, ..
             }) => {
-                let input_yaml = match title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-                    Some(t) => Some(t.to_string()),
-                    None => match &input {
-                        serde_json::Value::Null => None,
-                        _ => Some(pretty_yaml_block(&input)),
-                    },
-                };
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
-                    input_yaml,
+                    body: tool_call_body(title.as_deref(), &input),
                 }]
             }
             // Not rendered by the TUI: Turn, Session, Status, Tool::Progress,

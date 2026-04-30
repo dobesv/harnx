@@ -4216,3 +4216,264 @@ async fn tui_falls_back_to_output_when_no_template_title() {
         "expected raw output when no template title; got:\n{joined}"
     );
 }
+
+// ----------------------------------------------------------------------------
+// Templated tool calls/results render with inline markdown styling
+// (`**bold**`, `*italic*`, `` `code` ``). Plain output paths stay plain.
+// ----------------------------------------------------------------------------
+
+/// Walk the rendered transcript looking for a span whose content matches
+/// `text` and whose style satisfies `pred`. Used by the markdown styling
+/// tests to assert "this content was rendered with these style hints"
+/// without pinning specific colors that `tui-markdown` may tweak.
+fn rendered_span_matches(
+    lines: &[ratatui::text::Line<'static>],
+    text: &str,
+    pred: impl Fn(&ratatui::style::Style) -> bool,
+) -> bool {
+    lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .any(|s| s.content.as_ref() == text && pred(&s.style))
+}
+
+fn rendered_lines(tui: &Tui) -> Vec<ratatui::text::Line<'static>> {
+    tui.app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect()
+}
+
+#[tokio::test]
+async fn tui_started_template_strips_markers_and_styles_spans() {
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+
+    // Producer-side render of `**$** \`{{ args.command }}\``.
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "call-1".into(),
+            name: "bash_exec".into(),
+            kind: ToolKind::Other,
+            title: Some("**$** `ls -la /tmp`".into()),
+            input: yaml_to_json("command: ls -la /tmp"),
+            locations: vec![],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    use ratatui::style::Modifier;
+    let lines = rendered_lines(&tui);
+    let plain = lines
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Markers should be consumed and stripped text should appear.
+    assert!(!plain.contains("**$**"), "markers leaked: {plain}");
+    assert!(
+        !plain.contains("`ls -la /tmp`"),
+        "backticks leaked: {plain}"
+    );
+    assert!(
+        plain.contains("$ ls -la /tmp"),
+        "stripped text missing: {plain}"
+    );
+
+    // `**$**` → BOLD; `` `ls -la /tmp` `` → visually distinct (fg or bg).
+    assert!(
+        rendered_span_matches(&lines, "$", |s| s.add_modifier.contains(Modifier::BOLD)),
+        "expected a BOLD span for `$`"
+    );
+    assert!(
+        rendered_span_matches(&lines, "ls -la /tmp", |s| {
+            s.fg.is_some() || s.bg.is_some()
+        }),
+        "expected a visually distinct span for `ls -la /tmp`"
+    );
+}
+
+#[tokio::test]
+async fn tui_started_no_template_keeps_yaml_unstyled() {
+    // Regression guard: when no template, the body is YAML and must NOT
+    // get markdown styling — yaml content like `tags: [_priv]` would
+    // accidentally italicize.
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "call-1".into(),
+            name: "no_template_tool".into(),
+            kind: ToolKind::Other,
+            title: None,
+            input: yaml_to_json("flag: _priv_value"),
+            locations: vec![],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    use ratatui::style::Modifier;
+    let rendered: Vec<ratatui::text::Line<'static>> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect();
+    let plain = rendered
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plain.contains("_priv_value"),
+        "raw yaml value should appear unaltered; got:\n{plain}"
+    );
+    for line in &rendered {
+        for span in &line.spans {
+            assert!(
+                !span.style.add_modifier.contains(Modifier::ITALIC),
+                "yaml body should not be italicized: {:?}",
+                span.content
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tui_completed_template_styles_spans() {
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Completed {
+            id: "call-1".into(),
+            output: serde_json::json!({"content": [{"type": "text", "text": "hello"}]}),
+            title: Some("**OK**: `hello`".into()),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    use ratatui::style::Modifier;
+    let lines = rendered_lines(&tui);
+    let plain = lines
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plain.contains("**OK**"), "markers leaked: {plain}");
+    assert!(plain.contains("OK: hello"));
+
+    assert!(
+        rendered_span_matches(&lines, "OK", |s| s.add_modifier.contains(Modifier::BOLD)),
+        "expected a BOLD span for `OK`"
+    );
+    assert!(
+        rendered_span_matches(&lines, "hello", |s| s.fg.is_some() || s.bg.is_some()),
+        "expected a visually distinct span for `hello`"
+    );
+}
+
+#[tokio::test]
+async fn tui_assistant_text_renders_inline_markdown() {
+    // Sanity check that markdown styling on `AssistantText` survives the
+    // full transcript-render pass — the templated tool path was the
+    // motivating case for adding markdown rendering, but assistant
+    // messages benefit equally and are exercised here as a regression
+    // guard against future "pin every assistant line as plain" changes.
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+    tui.app
+        .transcript
+        .push(crate::types::TranscriptItem::AssistantText(
+            "Here's some **bold** and `code`.".to_string(),
+        ));
+
+    use ratatui::style::Modifier;
+    let lines = rendered_lines(&tui);
+    let plain = lines
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!plain.contains("**bold**"), "markers leaked: {plain}");
+    assert!(!plain.contains("`code`"), "backticks leaked: {plain}");
+
+    assert!(
+        rendered_span_matches(&lines, "bold", |s| s.add_modifier.contains(Modifier::BOLD)),
+        "assistant text should style `**bold**`"
+    );
+    assert!(
+        rendered_span_matches(&lines, "code", |s| s.fg.is_some() || s.bg.is_some()),
+        "assistant text should style `` `code` ``"
+    );
+}
+
+#[tokio::test]
+async fn tui_assistant_text_preserves_line_breaks() {
+    // LLM output frequently uses single `\n` for line breaks where they
+    // intend visible newlines. CommonMark would collapse those into a
+    // reflowed paragraph; the markdown_lines helper preprocesses to
+    // CommonMark hard breaks so each input newline shows.
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+    tui.app
+        .transcript
+        .push(crate::types::TranscriptItem::AssistantText(
+            "first line\nsecond line\nthird line".to_string(),
+        ));
+
+    let rendered: Vec<ratatui::text::Line<'static>> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect();
+    let line_texts: Vec<String> = rendered
+        .iter()
+        .map(line_to_plain)
+        .filter(|t| !t.is_empty())
+        .collect();
+    assert!(
+        line_texts.iter().any(|t| t == "first line"),
+        "expected `first line` on its own line; got {line_texts:?}"
+    );
+    assert!(
+        line_texts.iter().any(|t| t == "third line"),
+        "expected `third line` on its own line; got {line_texts:?}"
+    );
+    // Should NOT be collapsed into one paragraph.
+    assert!(
+        !line_texts
+            .iter()
+            .any(|t| t.contains("first line") && t.contains("second line")),
+        "lines were collapsed instead of preserved: {line_texts:?}"
+    );
+}

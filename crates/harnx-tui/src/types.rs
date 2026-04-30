@@ -106,6 +106,19 @@ pub(super) fn cleanup_attachment_dir(dir: &std::path::Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Body of a `ToolCall` transcript item. Distinguishes raw YAML (rendered
+/// plainly) from rendered MiniJinja template text (rendered with inline
+/// markdown styling). Mutually exclusive — a tool call has exactly one or
+/// no body, never both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ToolCallBody {
+    /// YAML rendering of the raw tool-call arguments. Displayed verbatim.
+    Yaml(String),
+    /// Rendered MCP `call_template` output. Each line is treated as inline
+    /// markdown (`**bold**`, `*italic*`, `` `code` ``).
+    Markdown(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TranscriptItem {
     SourceHeading(AgentSource),
@@ -114,13 +127,17 @@ pub(crate) enum TranscriptItem {
     AssistantText(String),
     ErrorText(String),
     ThoughtText(String),
+    /// Plain tool result line — extracted from the raw output. Rendered dim.
     ToolResultText(String),
+    /// Templated tool result line — produced from a MCP `result_template`.
+    /// Rendered as inline markdown so the styling shows up.
+    ToolResultMarkdown(String),
     StatusLine(String),
     Plan(Vec<PlanEntry>),
     UsageLine(String),
     ToolCall {
         tool_name: String,
-        input_yaml: Option<String>,
+        body: Option<ToolCallBody>,
     },
     AttachmentHeader(String),
     AttachmentItem(String),

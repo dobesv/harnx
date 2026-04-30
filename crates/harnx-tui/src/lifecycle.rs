@@ -310,14 +310,20 @@ pub(crate) fn messages_to_transcript_items(messages: &[Message]) -> Vec<Transcri
                         items.push(TranscriptItem::AssistantText(tc.text.clone()));
                     }
                     for r in &tc.tool_results {
-                        let input_yaml = if r.call.arguments == Value::Null {
+                        // Restored sessions don't have access to the live
+                        // tool declaration map, so templates can't be
+                        // re-rendered here — fall back to YAML/raw output.
+                        // Tracked in #385.
+                        let body = if r.call.arguments == Value::Null {
                             None
                         } else {
-                            Some(harnx_runtime::utils::pretty_yaml_block(&r.call.arguments))
+                            Some(crate::types::ToolCallBody::Yaml(
+                                harnx_runtime::utils::pretty_yaml_block(&r.call.arguments),
+                            ))
                         };
                         items.push(TranscriptItem::ToolCall {
                             tool_name: r.call.name.clone(),
-                            input_yaml,
+                            body,
                         });
                         for line in
                             crate::agent_event_sink::render_tool_result_text(&r.output, None)

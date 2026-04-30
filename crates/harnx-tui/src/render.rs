@@ -1,5 +1,7 @@
 use crate::types::Tui;
-use crate::types::{App, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES};
+use crate::types::{
+    App, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES,
+};
 use harnx_runtime::config::GlobalConfig;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -34,6 +36,49 @@ impl Tui {
         lines
     }
 
+    /// 3-space indent + a single line of inline-markdown body, used by
+    /// templated tool result/call lines so `**bold**` / `` `code` `` add
+    /// styling on top of the dim base without losing visual subordination.
+    fn render_indented_markdown_line(text: &str) -> Line<'static> {
+        let dim_gray = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        let body_base = Style::default().add_modifier(Modifier::DIM);
+        let mut spans = vec![Span::styled("   ".to_string(), dim_gray)];
+        let parsed = crate::render_helpers::markdown_line_spans(text, body_base);
+        spans.extend(parsed.spans);
+        Line::from(spans)
+    }
+
+    /// Render a `ToolCall` transcript item: `→ tool_name` header followed
+    /// by the body lines. Body rendering depends on its origin —
+    /// `Yaml` is shown verbatim (raw arguments), `Markdown` is rendered
+    /// inline (templated `call_template` output).
+    fn render_tool_call(tool_name: &str, body: Option<&ToolCallBody>) -> Vec<Line<'static>> {
+        // Use the plain rightwards arrow `→` (U+2192). The previous glyph
+        // was `->` followed by VS16 (U+FE0F) which requested an emoji-style
+        // presentation and produced unicode-width vs. terminal-rendered-
+        // width disagreement, leaving stray glyphs in subsequent frames.
+        let dim_gray = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        let mut lines = Self::render_text_entry("", &format!("→ {tool_name}"), dim_gray, false);
+        match body {
+            Some(ToolCallBody::Yaml(yaml)) => {
+                for line in yaml.lines() {
+                    lines.extend(Self::render_text_entry("   ", line, dim_gray, false));
+                }
+            }
+            Some(ToolCallBody::Markdown(md)) => {
+                for line_text in md.lines() {
+                    lines.push(Self::render_indented_markdown_line(line_text));
+                }
+            }
+            None => {}
+        }
+        lines
+    }
+
     pub(super) fn render_entry(entry: &TranscriptItem) -> Vec<Line<'static>> {
         match entry {
             TranscriptItem::SourceHeading(source) => Self::render_text_entry(
@@ -61,7 +106,21 @@ impl Tui {
                 true,
             ),
             TranscriptItem::AssistantText(text) => {
-                Self::render_text_entry("", text, Style::default(), !text.contains('\n'))
+                // Render assistant messages as markdown so headings, lists,
+                // code fences, and inline emphasis show their styling.
+                // Streaming chunks rebuild this entry on every render — an
+                // unclosed `**bold` mid-stream simply renders as literal
+                // asterisks for the moment, then upgrades to bold once the
+                // closing `**` arrives in a later chunk.
+                let mut lines = crate::render_helpers::markdown_lines(text, Style::default());
+                // Match the prior trailing-spacing rule: pad after a
+                // single-line message (so the next entry has breathing
+                // room) but skip the pad when the text already contains
+                // newlines.
+                if !text.contains('\n') {
+                    lines.push(Line::from(""));
+                }
+                lines
             }
             TranscriptItem::ErrorText(text) => Self::render_text_entry(
                 "error: ",
@@ -85,6 +144,9 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
                 false,
             ),
+            TranscriptItem::ToolResultMarkdown(text) => {
+                vec![Self::render_indented_markdown_line(text)]
+            }
             TranscriptItem::StatusLine(text) => Self::render_text_entry(
                 "",
                 text,
@@ -122,40 +184,8 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
                 false,
             ),
-            TranscriptItem::ToolCall {
-                tool_name,
-                input_yaml,
-            } => {
-                // Use the plain rightwards arrow `→` (U+2192) as the
-                // tool-call marker.  The previous glyph was `->` followed by
-                // VS16 (U+FE0F), which requests an emoji-style presentation
-                // and causes unicode-width vs. terminal-rendered-width
-                // disagreement in some terminals.  That off-by-one width
-                // mismatch propagates through every subsequent line of the
-                // same frame, leaving stray glyphs (stray letters, corrupted
-                // words) at columns the next render doesn't explicitly
-                // repaint.
-                let mut lines = Self::render_text_entry(
-                    "",
-                    &format!("→ {tool_name}"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                    false,
-                );
-                if let Some(yaml) = input_yaml {
-                    for line in yaml.lines() {
-                        lines.extend(Self::render_text_entry(
-                            "   ",
-                            line,
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM),
-                            false,
-                        ));
-                    }
-                }
-                lines
+            TranscriptItem::ToolCall { tool_name, body } => {
+                Self::render_tool_call(tool_name, body.as_ref())
             }
             TranscriptItem::AttachmentHeader(text) => Self::render_text_entry(
                 "",
