@@ -919,16 +919,19 @@ impl BashServer {
             (Some(status), false) => {
                 let exit_code = status.code().unwrap_or(-1);
                 let mut output = String::new();
-                let _ = writeln!(output, "execution_id: {execution_id}");
-                let _ = writeln!(output, "exit_code: {exit_code}");
-                let _ = writeln!(output, "working_dir: {}", working_dir.display());
-                let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
-                let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
-                let _ = writeln!(output, "total_lines: {total_lines}");
-                let _ = writeln!(
-                    output,
-                    "total_bytes: {total_bytes} ({})",
-                    format_size(total_bytes)
+                render_metadata_header(
+                    &mut output,
+                    MetadataHeader {
+                        execution_id: Some(&execution_id),
+                        status: Some("exited"),
+                        exit_code: Some(exit_code),
+                        command: Some(&params.command),
+                        working_dir: Some(&working_dir),
+                        stdout_log_path: Some(&stdout_log_path),
+                        stderr_log_path: Some(&stderr_log_path),
+                        total_lines: Some(total_lines),
+                        total_bytes: Some(total_bytes),
+                    },
                 );
                 let _ = write!(output, "\n{streams_block}");
                 let summary = format!(
@@ -993,6 +996,7 @@ impl BashServer {
             (Some(status), true) => {
                 let _ = status;
                 tool_error(render_timeout_message(TimeoutRenderContext {
+                    command: &params.command,
                     working_dir: &working_dir,
                     execution_id: &execution_id,
                     timeout_secs,
@@ -1349,11 +1353,21 @@ impl BashServer {
             .insert(execution_id.clone(), entry);
 
         let mut output = String::new();
-        let _ = writeln!(output, "execution_id: {execution_id}");
-        let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
-        let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
-        let _ = writeln!(output, "working_dir: {}", working_dir.display());
-        let _ = write!(output, "command: {}", params.command);
+        render_metadata_header(
+            &mut output,
+            MetadataHeader {
+                execution_id: Some(&execution_id),
+                status: Some("spawned"),
+                exit_code: None,
+                command: Some(&params.command),
+                working_dir: Some(&working_dir),
+                stdout_log_path: Some(&stdout_log_path),
+                stderr_log_path: Some(&stderr_log_path),
+                total_lines: None,
+                total_bytes: None,
+            },
+        );
+        output.pop();
         let summary = format!("spawned {execution_id}");
 
         Ok(CallToolResult::success(vec![
@@ -1452,18 +1466,19 @@ impl BashServer {
             Ok(Ok(status)) => {
                 let exit_code = status.code().unwrap_or(-1);
                 let mut output = String::new();
-                let _ = writeln!(output, "execution_id: {}", params.execution_id);
-                let _ = writeln!(output, "status: exited");
-                let _ = writeln!(output, "exit_code: {exit_code}");
-                let _ = writeln!(output, "working_dir: {}", working_dir.display());
-                let _ = writeln!(output, "command: {command}");
-                let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
-                let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
-                let _ = writeln!(output, "total_lines: {total_lines}");
-                let _ = writeln!(
-                    output,
-                    "total_bytes: {total_bytes} ({})",
-                    format_size(total_bytes)
+                render_metadata_header(
+                    &mut output,
+                    MetadataHeader {
+                        execution_id: Some(&params.execution_id),
+                        status: Some("exited"),
+                        exit_code: Some(exit_code),
+                        command: Some(&command),
+                        working_dir: Some(&working_dir),
+                        stdout_log_path: Some(&stdout_log_path),
+                        stderr_log_path: Some(&stderr_log_path),
+                        total_lines: Some(total_lines),
+                        total_bytes: Some(total_bytes),
+                    },
                 );
                 let _ = write!(output, "\n{streams_block}");
                 let summary = format!(
@@ -1545,17 +1560,19 @@ impl BashServer {
                 );
 
                 let mut output = String::new();
-                let _ = writeln!(output, "execution_id: {}", params.execution_id);
-                let _ = writeln!(output, "status: running");
-                let _ = writeln!(output, "working_dir: {}", working_dir.display());
-                let _ = writeln!(output, "command: {command}");
-                let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
-                let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
-                let _ = writeln!(output, "total_lines: {total_lines}");
-                let _ = writeln!(
-                    output,
-                    "total_bytes: {total_bytes} ({})",
-                    format_size(total_bytes)
+                render_metadata_header(
+                    &mut output,
+                    MetadataHeader {
+                        execution_id: Some(&params.execution_id),
+                        status: Some("running"),
+                        exit_code: None,
+                        command: Some(&command),
+                        working_dir: Some(&working_dir),
+                        stdout_log_path: Some(&stdout_log_path),
+                        stderr_log_path: Some(&stderr_log_path),
+                        total_lines: Some(total_lines),
+                        total_bytes: Some(total_bytes),
+                    },
                 );
                 let _ = write!(output, "\n{streams_block}");
                 let summary = format!(
@@ -1611,19 +1628,21 @@ impl BashServer {
             })?;
 
             let mut output = String::new();
-            let _ = writeln!(output, "execution_id: {}", params.execution_id);
-            let _ = writeln!(output, "signal: {}", normalized);
-            let _ = writeln!(output, "command: {}", entry.command);
-            let _ = writeln!(
-                output,
-                "stdout_log_path: {}",
-                entry.stdout_log_path.display()
+            render_metadata_header(
+                &mut output,
+                MetadataHeader {
+                    execution_id: Some(&params.execution_id),
+                    status: Some("terminated"),
+                    exit_code: None,
+                    command: Some(&entry.command),
+                    working_dir: Some(&entry.working_dir),
+                    stdout_log_path: Some(&entry.stdout_log_path),
+                    stderr_log_path: Some(&entry.stderr_log_path),
+                    total_lines: None,
+                    total_bytes: None,
+                },
             );
-            let _ = write!(
-                output,
-                "stderr_log_path: {}",
-                entry.stderr_log_path.display()
-            );
+            let _ = write!(output, "signal: {}", normalized);
             let summary = format!("sent {} to {}", normalized, params.execution_id);
 
             Ok(CallToolResult::success(vec![
@@ -1652,16 +1671,22 @@ impl BashServer {
                 )));
             }
 
-            let command = entry.command.clone();
-            let stdout_log_path = entry.stdout_log_path.clone();
-            let stderr_log_path = entry.stderr_log_path.clone();
-
             let mut output = String::new();
-            let _ = writeln!(output, "execution_id: {}", params.execution_id);
-            let _ = writeln!(output, "signal: {}", normalized);
-            let _ = writeln!(output, "command: {}", command);
-            let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
-            let _ = write!(output, "stderr_log_path: {}", stderr_log_path.display());
+            render_metadata_header(
+                &mut output,
+                MetadataHeader {
+                    execution_id: Some(&params.execution_id),
+                    status: Some("terminated"),
+                    exit_code: None,
+                    command: Some(&entry.command),
+                    working_dir: Some(&entry.working_dir),
+                    stdout_log_path: Some(&entry.stdout_log_path),
+                    stderr_log_path: Some(&entry.stderr_log_path),
+                    total_lines: None,
+                    total_bytes: None,
+                },
+            );
+            let _ = write!(output, "signal: {}", normalized);
             let summary = format!("sent {} to {}", normalized, params.execution_id);
 
             Ok(CallToolResult::success(vec![
@@ -2194,7 +2219,66 @@ fn render_streams_block(
     )
 }
 
+struct MetadataHeader<'a> {
+    execution_id: Option<&'a str>,
+    status: Option<&'a str>,
+    exit_code: Option<i32>,
+    command: Option<&'a str>,
+    working_dir: Option<&'a Path>,
+    stdout_log_path: Option<&'a Path>,
+    stderr_log_path: Option<&'a Path>,
+    total_lines: Option<usize>,
+    total_bytes: Option<usize>,
+}
+
+fn render_metadata_header(output: &mut String, metadata: MetadataHeader<'_>) {
+    let MetadataHeader {
+        execution_id,
+        status,
+        exit_code,
+        command,
+        working_dir,
+        stdout_log_path,
+        stderr_log_path,
+        total_lines,
+        total_bytes,
+    } = metadata;
+
+    if let Some(execution_id) = execution_id {
+        let _ = writeln!(output, "execution_id: {execution_id}");
+    }
+    if let Some(status) = status {
+        let _ = writeln!(output, "status: {status}");
+    }
+    if let Some(exit_code) = exit_code {
+        let _ = writeln!(output, "exit_code: {exit_code}");
+    }
+    if let Some(command) = command {
+        let _ = writeln!(output, "command: {command}");
+    }
+    if let Some(working_dir) = working_dir {
+        let _ = writeln!(output, "working_dir: {}", working_dir.display());
+    }
+    if let Some(stdout_log_path) = stdout_log_path {
+        let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
+    }
+    if let Some(stderr_log_path) = stderr_log_path {
+        let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
+    }
+    if let Some(total_lines) = total_lines {
+        let _ = writeln!(output, "total_lines: {total_lines}");
+    }
+    if let Some(total_bytes) = total_bytes {
+        let _ = writeln!(
+            output,
+            "total_bytes: {total_bytes} ({})",
+            format_size(total_bytes)
+        );
+    }
+}
+
 struct TimeoutRenderContext<'a> {
+    command: &'a str,
     working_dir: &'a Path,
     execution_id: &'a str,
     timeout_secs: u64,
@@ -2209,6 +2293,7 @@ struct TimeoutRenderContext<'a> {
 
 fn render_timeout_message(ctx: TimeoutRenderContext<'_>) -> String {
     let TimeoutRenderContext {
+        command,
         working_dir,
         execution_id,
         timeout_secs,
@@ -2225,15 +2310,19 @@ fn render_timeout_message(ctx: TimeoutRenderContext<'_>) -> String {
         output,
         "command timed out after {timeout_secs}s and was terminated"
     );
-    let _ = writeln!(output, "execution_id: {execution_id}");
-    let _ = writeln!(output, "working_dir: {}", working_dir.display());
-    let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
-    let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
-    let _ = writeln!(output, "total_lines: {total_lines}");
-    let _ = writeln!(
-        output,
-        "total_bytes: {total_bytes} ({})",
-        format_size(total_bytes)
+    render_metadata_header(
+        &mut output,
+        MetadataHeader {
+            execution_id: Some(execution_id),
+            status: Some("timeout"),
+            exit_code: None,
+            command: Some(command),
+            working_dir: Some(working_dir),
+            stdout_log_path: Some(stdout_log_path),
+            stderr_log_path: Some(stderr_log_path),
+            total_lines: Some(total_lines),
+            total_bytes: Some(total_bytes),
+        },
     );
     let (streams_block, _, _, _, _) = render_streams_block(
         stdout,
@@ -3218,8 +3307,26 @@ mod tests {
 
         let text = text_content(&result);
         assert_eq!(result.is_error, Some(false));
+        assert!(text.contains("status: exited"));
         assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("command: echo test"));
+        assert!(text.contains("working_dir:"));
         assert!(text.contains("test"));
+
+        // Verify canonical field order: execution_id < status < exit_code < command < working_dir
+        let pos_execution_id = text.find("execution_id:").unwrap();
+        let pos_status = text.find("status:").unwrap();
+        let pos_exit_code = text.find("exit_code:").unwrap();
+        let pos_command = text.find("command:").unwrap();
+        let pos_working_dir = text.find("working_dir:").unwrap();
+        let pos_stdout_log = text.find("stdout_log_path:").unwrap();
+        let pos_stderr_log = text.find("stderr_log_path:").unwrap();
+        assert!(pos_execution_id < pos_status);
+        assert!(pos_status < pos_exit_code);
+        assert!(pos_exit_code < pos_command);
+        assert!(pos_command < pos_working_dir);
+        assert!(pos_working_dir < pos_stdout_log);
+        assert!(pos_stdout_log < pos_stderr_log);
 
         let stdout_log_path = PathBuf::from(extract_field(&text, "stdout_log_path"));
         let stderr_log_path = PathBuf::from(extract_field(&text, "stderr_log_path"));
@@ -3286,6 +3393,10 @@ mod tests {
         let text = text_content(&result);
         assert_eq!(result.is_error, Some(true));
         assert!(text.contains("command timed out after 1s and was terminated"));
+        assert!(text.contains("execution_id:"));
+        assert!(text.contains("status: timeout"));
+        assert!(text.contains("command: sleep 10"));
+        assert!(text.contains("working_dir:"));
         assert!(text.contains("stdout_log_path:"));
         assert!(text.contains("stderr_log_path:"));
     }
@@ -3422,6 +3533,12 @@ mod tests {
             .unwrap();
 
         let text = text_content(&result);
+        // Verify spawn metadata
+        assert!(text.contains("status: spawned"));
+        assert!(text.contains("command: echo background && sleep 1"));
+        assert!(text.contains("working_dir:"));
+        assert!(text.contains("stdout_log_path:"));
+        assert!(text.contains("stderr_log_path:"));
         let execution_id = extract_field(&text, "execution_id");
 
         let result = server
@@ -3438,6 +3555,8 @@ mod tests {
 
         let text = text_content(&result);
         assert!(text.contains("status: exited"));
+        assert!(text.contains("command: echo background && sleep 1"));
+        assert!(text.contains("working_dir:"));
         assert!(text.contains("background"));
     }
 
@@ -3502,6 +3621,12 @@ mod tests {
             .unwrap();
 
         let text = text_content(&result);
+        assert!(text.contains("execution_id:"));
+        assert!(text.contains("status: terminated"));
+        assert!(text.contains("command: sleep 30"));
+        assert!(text.contains("working_dir:"));
+        assert!(text.contains("stdout_log_path:"));
+        assert!(text.contains("stderr_log_path:"));
         assert!(text.contains("signal: SIGTERM"));
     }
 
@@ -3599,8 +3724,10 @@ mod tests {
 
         let text = text_content(&result);
         assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("status: exited"));
+        assert!(text.contains("diff --git"));
         assert!(text.contains("specific_file.txt"));
-        assert!(!text.contains("other_file.txt"));
+        assert!(!text.contains("diff --git a/other_file.txt b/other_file.txt"));
     }
 
     #[tokio::test]
@@ -3626,9 +3753,8 @@ mod tests {
 
         let text = text_content(&result);
         assert!(text.contains("exit_code: 0"));
+        assert!(text.contains("status: exited"));
         assert!(!text.contains("diff --git"));
-        assert!(!text.contains("specific_file.txt"));
-        assert!(!text.contains("other_file.txt"));
     }
 
     #[tokio::test]
