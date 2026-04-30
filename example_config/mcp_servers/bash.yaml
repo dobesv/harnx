@@ -8,18 +8,74 @@ rename_tools:
 
 # Sandbox configuration examples (uncomment as needed):
 #
-# args:
+args:
 #   - --no-sandbox                                          # Disable sandboxing entirely
-#   - --extra-readable                                      # Add read-only path to sandbox
-#   - /opt/sdk
-#   - --extra-exec                                          # Add executable path to sandbox
-#   - /opt/tools/bin
+  # Allow access to asdf installed binaries
+  - --extra-exec
+  - ~/.asdf
+  # Allow access to bun binaries and cache
+  - --extra-exec
+  - ~/.bun
+  - --extra-write
+  - ~/.bun/install/cache
+  # Allow access to various caches
+  - --extra-write
+  - ~/.cache
+  # Alllow access to various config files
+  - --extra-read
+  - ~/.config/acli
+  - --extra-write
+  - ~/.config/chromium
+  - --extra-read
+  - ~/.config/dcg
+  - --extra-read
+  - ~/.config/git
+  - --extra-write
+  - ~/.config/go
+  - --extra-read
+  - ~/.config/rtk
+  # Allow access to codescene config/license
+  - --extra-write
+  - ~/.codescene
+  # Git config
+  - --extra-read
+  - ~/.gitconfig
+  - --extra-read
+  - ~/.gitignore
+  - --extra-read
+  - ~/.gitignore_global
+  # Allow access to user-local binaries
+  - --extra-exec
+  - ~/.local/bin
+  # Allow access to mono
+  - --extra-exec
+  - ~/.mono
+  - --extra-write
+  - ~/.mono
+  # Allow access to npm config and cache
+  - --extra-write
+  - ~/.npm
+  # Allow access to npm config and cache
+  - --extra-write
+  - ~/.nvm
+  - --extra-write
+  - ~/.ruff_cache
+  - --extra-exec
+  - ~/.rustup
+  - --extra-write
+  - ~/.yarn
+  # Disable interactive editor
+  - --env
+  - EDITOR=true
+  # Passthrough GITHUB_TOKEN and GH_TOKEN so the agent can do remote git operations
+  - --env
+  - GITHUB_TOKEN
+  - --env
+  - GH_TOKEN
+  - --env
+  - CS_ACCESS_TOKEN
 #   - --sandbox-run                                         # Override sandbox helper binary
 #   - /opt/harnx/harnx-mcp-bash-sandbox-run
-#   - --env                                                 # Pass through a host env var (e.g. for git push / gh)
-#   - GITHUB_TOKEN
-#   - --env                                                 # Set an env var explicitly
-#   - MY_VAR=my_value
 #   - --env                                                 # Allow git push over SSH
 #   - SSH_AUTH_SOCK
 #

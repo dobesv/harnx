@@ -55,6 +55,7 @@ fn parse_env_paths(var_name: &str) -> Vec<PathBuf> {
         .map(|value| {
             std::env::split_paths(&value)
                 .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| PathBuf::from(expand_tilde(&path.to_string_lossy())))
                 .collect()
         })
         .unwrap_or_default()
@@ -80,8 +81,28 @@ fn path_is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn expand_tilde(raw: &str) -> String {
+    if !raw.starts_with('~') {
+        return raw.to_string();
+    }
+
+    let home = match std::env::var("HOME") {
+        Ok(home) => home,
+        Err(_) => return raw.to_string(),
+    };
+
+    if raw == "~" {
+        home
+    } else if let Some(suffix) = raw.strip_prefix("~/") {
+        format!("{home}/{suffix}")
+    } else {
+        raw.to_string()
+    }
+}
+
 fn push_root(roots: &mut Vec<PathBuf>, raw: &str) {
-    let path = PathBuf::from(raw);
+    let raw = expand_tilde(raw);
+    let path = PathBuf::from(&raw);
     if path.exists() {
         match path.canonicalize() {
             Ok(canonical) => roots.push(canonical),
@@ -103,6 +124,7 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
         enabled: true,
         extra_exec: parse_env_paths("HARNX_BASH_EXTRA_EXEC"),
         extra_readable: parse_env_paths("HARNX_BASH_EXTRA_READABLE"),
+        extra_writable: parse_env_paths("HARNX_BASH_EXTRA_WRITABLE"),
         sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
         extra_env_passthrough: parse_env_passthrough(),
         env_overrides: vec![],
@@ -126,23 +148,36 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                 sandbox_config.enabled = false;
                 i += 1;
             }
-            "--extra-readable" => {
+            "--extra-read" => {
                 if i + 1 < args.len() {
                     sandbox_config
                         .extra_readable
-                        .push(PathBuf::from(&args[i + 1]));
+                        .push(PathBuf::from(expand_tilde(&args[i + 1])));
                     i += 2;
                 } else {
-                    eprintln!("harnx-mcp-bash: --extra-readable requires a path argument");
+                    eprintln!("harnx-mcp-bash: --extra-read requires a path argument");
                     std::process::exit(1);
                 }
             }
             "--extra-exec" => {
                 if i + 1 < args.len() {
-                    sandbox_config.extra_exec.push(PathBuf::from(&args[i + 1]));
+                    sandbox_config
+                        .extra_exec
+                        .push(PathBuf::from(expand_tilde(&args[i + 1])));
                     i += 2;
                 } else {
                     eprintln!("harnx-mcp-bash: --extra-exec requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--extra-write" => {
+                if i + 1 < args.len() {
+                    sandbox_config
+                        .extra_writable
+                        .push(PathBuf::from(expand_tilde(&args[i + 1])));
+                    i += 2;
+                } else {
+                    eprintln!("harnx-mcp-bash: --extra-write requires a path argument");
                     std::process::exit(1);
                 }
             }
@@ -187,8 +222,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                 eprintln!("Options:");
                 eprintln!("  --root, -r <path>        Add an allowed root directory (repeatable)");
                 eprintln!("  --no-sandbox            Disable filesystem sandboxing explicitly");
-                eprintln!("  --extra-readable <path> Add sandbox read-only path (repeatable)");
+                eprintln!("  --extra-read <path> Add sandbox read-only path (repeatable)");
                 eprintln!("  --extra-exec <path>     Add sandbox execute path (repeatable)");
+                eprintln!("  --extra-write <path>    Add sandbox writable path (repeatable)");
                 eprintln!("  --sandbox-run <path>    Override sandbox helper binary path");
                 eprintln!("  --env, -e <VAR>         Pass VAR from host env to child (repeatable)");
                 eprintln!("  --env, -e <VAR=VALUE>   Set VAR=VALUE in child env (repeatable)");
@@ -200,6 +236,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                 );
                 eprintln!(
                     "  HARNX_BASH_EXTRA_EXEC       Colon-separated extra sandbox execute paths"
+                );
+                eprintln!(
+                    "  HARNX_BASH_EXTRA_WRITABLE   Colon-separated extra sandbox writable paths"
                 );
                 eprintln!(
                     "  HARNX_BASH_ENV_PASSTHROUGH  Comma-separated extra env var names to pass through"
@@ -271,6 +310,7 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
         enabled: false,
         extra_exec: vec![],
         extra_readable: vec![],
+        extra_writable: vec![],
         sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
         extra_env_passthrough: parse_env_passthrough(),
         env_overrides: vec![],
@@ -285,6 +325,30 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                     i += 2;
                 } else {
                     eprintln!("harnx-mcp-bash: --root requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--extra-read" => {
+                if i + 1 < args.len() {
+                    i += 2;
+                } else {
+                    eprintln!("harnx-mcp-bash: --extra-read requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--extra-exec" => {
+                if i + 1 < args.len() {
+                    i += 2;
+                } else {
+                    eprintln!("harnx-mcp-bash: --extra-exec requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+            "--extra-write" => {
+                if i + 1 < args.len() {
+                    i += 2;
+                } else {
+                    eprintln!("harnx-mcp-bash: --extra-write requires a path argument");
                     std::process::exit(1);
                 }
             }
@@ -319,6 +383,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --root, -r <path>       Add an allowed root directory (repeatable)");
+                eprintln!("  --extra-read <path> Accept sandbox read-only path flag (ignored on this platform)");
+                eprintln!("  --extra-exec <path>     Accept sandbox execute path flag (ignored on this platform)");
+                eprintln!("  --extra-write <path>    Accept sandbox writable path flag (ignored on this platform)");
                 eprintln!("  --env, -e <VAR>         Pass VAR from host env to child (repeatable)");
                 eprintln!("  --env, -e <VAR=VALUE>   Set VAR=VALUE in child env (repeatable)");
                 eprintln!("  --help, -h              Show this help message");
@@ -344,4 +411,56 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
     }
 
     Ok((roots, sandbox_config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_tilde;
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    struct EnvVar {
+        key: String,
+        prev: Option<OsString>,
+    }
+
+    impl EnvVar {
+        fn set(key: &str, value: impl AsRef<OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value.as_ref()) };
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var(&self.key, value),
+                    None => std::env::remove_var(&self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_expand_tilde_replaces_prefix() {
+        let _env_guard = env_lock();
+        let _home = EnvVar::set("HOME", "/tmp/test-home");
+
+        assert_eq!(expand_tilde("~/foo"), "/tmp/test-home/foo");
+        assert_eq!(expand_tilde("~"), "/tmp/test-home");
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+    }
 }
