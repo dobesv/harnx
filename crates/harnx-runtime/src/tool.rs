@@ -4,7 +4,6 @@ use crate::{
 };
 use anyhow::Result;
 use harnx_hooks::HookEvent;
-use harnx_mcp::safety::{truncate_output, TruncateOpts};
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -156,7 +155,8 @@ pub fn build_tool_eval_context(
 }
 
 /// Look up and render the call template for a tool, returning rendered string or None.
-/// Logs warning to stderr on render error.
+/// On template render error, logs a warning via `log::warn!` and falls back to
+/// `raw_fallback` so display continues uninterrupted.
 fn render_call(
     call: &ToolCall,
     json_data: &Value,
@@ -166,17 +166,15 @@ fn render_call(
     let tmpl = decl_map.get(&call.name)?.call_template.as_ref()?;
     Some(
         render_tool_call_template(tmpl, json_data, raw_fallback).unwrap_or_else(|e| {
-            eprintln!(
-                "⚠ template error in tool '{}' call_template: {e}",
-                call.name
-            );
+            log::warn!("template error in tool '{}' call_template: {e}", call.name);
             raw_fallback.to_string()
         }),
     )
 }
 
 /// Look up and render result template for a tool, returning rendered string or None.
-/// Logs warning to stderr on render error.
+/// On template render error, logs a warning via `log::warn!` and falls back to
+/// `raw_fallback` so display continues uninterrupted.
 fn render_result(
     call: &ToolCall,
     result: &Value,
@@ -186,8 +184,8 @@ fn render_result(
     let tmpl = decl_map.get(&call.name)?.result_template.as_ref()?;
     Some(
         render_tool_result_template(tmpl, result, raw_fallback).unwrap_or_else(|e| {
-            eprintln!(
-                "⚠ template error in tool '{}' result_template: {e}",
+            log::warn!(
+                "template error in tool '{}' result_template: {e}",
                 call.name
             );
             raw_fallback.to_string()
@@ -249,21 +247,19 @@ fn emit_tool_result_with_template(
     result: &Value,
     decl_map: &HashMap<String, ToolDeclaration>,
 ) {
-    use harnx_core::event::{AgentEvent, ContentBlock, ToolEvent};
+    use harnx_core::event::{AgentEvent, ToolEvent};
 
     let raw_fallback = extract_user_display_text(result).unwrap_or_else(|| match result {
         Value::String(s) => s.clone(),
         _ => pretty_yaml_block(result),
     });
 
-    let content = render_result(call, result, &raw_fallback, decl_map)
-        .map(|text| vec![ContentBlock::Text(text)])
-        .unwrap_or_default();
+    let title = render_result(call, result, &raw_fallback, decl_map);
 
     let event = AgentEvent::Tool(ToolEvent::Completed {
         id: call.id.clone().unwrap_or_default(),
         output: result.clone(),
-        content,
+        title,
     });
 
     if !harnx_core::sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
@@ -271,39 +267,18 @@ fn emit_tool_result_with_template(
     }
 }
 
-/// Fallback print for tool result when no sink is installed.
+/// Fallback print for tool result when no sink is installed. Routes
+/// through the shared `render_tool_result_text` helper so this no-sink
+/// path stays consistent with what the TUI/CLI sinks render.
 fn print_tool_result_fallback(
     call: &ToolCall,
     result: &Value,
     decl_map: &HashMap<String, ToolDeclaration>,
     raw_fallback: &str,
 ) {
-    let output_str = render_result(call, result, raw_fallback, decl_map)
-        .unwrap_or_else(|| raw_fallback.to_string());
-
-    let mut opts = TruncateOpts::default();
-    let marker = " [...] ";
-    match crossterm::terminal::size() {
-        Ok((cols, rows)) => {
-            opts.head_lines = 5.max((rows / 2) as usize);
-            opts.tail_lines = 0;
-            opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
-            opts.line_tail_bytes = 0;
-            opts.marker = Some(marker.to_string());
-        }
-        Err(e) => {
-            // Terminal size unavailable (e.g. CI, piped output) — use safe defaults
-            eprintln!("debug: failed to get terminal size: {e}");
-            opts.head_lines = 20;
-            opts.tail_lines = 0;
-            opts.line_head_bytes = 200;
-            opts.line_tail_bytes = 0;
-            opts.marker = Some(marker.to_string());
-        }
-    }
-    let truncated = truncate_output(&output_str, &opts);
-    let text = format!("{}\n", dimmed_text(&truncated));
-    print!("{text}");
+    let title = render_result(call, result, raw_fallback, decl_map);
+    let truncated = render_tool_result_text(result, title.as_deref());
+    println!("{}", dimmed_text(&truncated));
 }
 
 fn default_confirm_tool_use(tool_name: &str, arguments: &Value, reason: Option<&str>) -> bool {
@@ -402,5 +377,180 @@ mod tests {
         let flattened = schema.flatten_any_of();
         assert_eq!(flattened.type_value.as_deref(), Some("string"));
         assert_eq!(flattened.description.as_deref(), Some("A name"));
+    }
+
+    // ----------------------------------------------------------------
+    // MCP MiniJinja templating, producer side: verify that
+    // `emit_tool_call_with_template` and `emit_tool_result_with_template`
+    // populate `title` on both `ToolEvent::Started` and
+    // `ToolEvent::Completed` when the matching tool declaration carries
+    // a `call_template` / `result_template`. These are the values the
+    // TUI/CLI consumers then render — without these events being
+    // populated, the consumer-side rendering has nothing to display.
+    // ----------------------------------------------------------------
+
+    use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, ToolEvent};
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: StdMutex<Vec<AgentEvent>>,
+    }
+    impl AgentEventSink for RecordingSink {
+        fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn make_decl_with_templates(
+        name: &str,
+        call_template: Option<&str>,
+        result_template: Option<&str>,
+    ) -> ToolDeclaration {
+        ToolDeclaration {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: Default::default(),
+            mcp_tool_name: Some(name.to_string()),
+            call_template: call_template.map(String::from),
+            result_template: result_template.map(String::from),
+        }
+    }
+
+    /// Lock around the global sink so producer-side emit tests don't race
+    /// with each other. The sink is process-global state. Ignore poisoning
+    /// so a panic in one test doesn't cascade-fail every other test that
+    /// touches the sink.
+    fn with_recording_sink<R>(test_body: impl FnOnce(Arc<RecordingSink>) -> R) -> R {
+        static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        harnx_core::sink::clear_agent_event_sink();
+        let sink: Arc<RecordingSink> = Arc::new(RecordingSink::default());
+        harnx_core::sink::install_agent_event_sink(sink.clone());
+        let result = test_body(sink);
+        harnx_core::sink::clear_agent_event_sink();
+        result
+    }
+
+    #[test]
+    fn emit_tool_call_with_template_sets_started_title() {
+        let decl = make_decl_with_templates("bash_exec", Some("$ {{ args.command }}"), None);
+        let mut decl_map = HashMap::new();
+        decl_map.insert(decl.name.clone(), decl);
+
+        let call = ToolCall::new(
+            "bash_exec".to_string(),
+            json!({"command": "ls -la"}),
+            Some("call-1".to_string()),
+            None,
+        );
+        let args = json!({"command": "ls -la"});
+
+        with_recording_sink(|sink| {
+            emit_tool_call_with_template(&call, &args, &decl_map);
+            let events = sink.events.lock().unwrap();
+            assert_eq!(events.len(), 1, "expected one Started event");
+            match &events[0] {
+                AgentEvent::Tool(ToolEvent::Started { title, name, .. }) => {
+                    assert_eq!(name, "bash_exec");
+                    assert_eq!(
+                        title.as_deref(),
+                        Some("$ ls -la"),
+                        "template should be rendered into Started.title"
+                    );
+                }
+                other => panic!("expected Started event, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn emit_tool_call_without_template_leaves_title_none() {
+        let decl = make_decl_with_templates("plain_tool", None, None);
+        let mut decl_map = HashMap::new();
+        decl_map.insert(decl.name.clone(), decl);
+        let call = ToolCall::new(
+            "plain_tool".to_string(),
+            json!({"x": 1}),
+            Some("call-1".to_string()),
+            None,
+        );
+        let args = json!({"x": 1});
+
+        with_recording_sink(|sink| {
+            emit_tool_call_with_template(&call, &args, &decl_map);
+            let events = sink.events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                AgentEvent::Tool(ToolEvent::Started { title, .. }) => {
+                    assert!(title.is_none(), "no template => title must be None");
+                }
+                other => panic!("expected Started event, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn emit_tool_result_with_template_sets_completed_title() {
+        let decl =
+            make_decl_with_templates("bash_exec", None, Some("OK: {{ result.content[0].text }}"));
+        let mut decl_map = HashMap::new();
+        decl_map.insert(decl.name.clone(), decl);
+
+        let call = ToolCall::new(
+            "bash_exec".to_string(),
+            json!({}),
+            Some("call-1".to_string()),
+            None,
+        );
+        let result_json = json!({
+            "content": [{"type": "text", "text": "hello"}],
+            "isError": false,
+        });
+
+        with_recording_sink(|sink| {
+            emit_tool_result_with_template(&call, &result_json, &decl_map);
+            let events = sink.events.lock().unwrap();
+            assert_eq!(events.len(), 1, "expected one Completed event");
+            match &events[0] {
+                AgentEvent::Tool(ToolEvent::Completed { title, .. }) => {
+                    assert_eq!(
+                        title.as_deref(),
+                        Some("OK: hello"),
+                        "template should be rendered into Completed.title"
+                    );
+                }
+                other => panic!("expected Completed event, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn emit_tool_result_without_template_leaves_title_none() {
+        let decl = make_decl_with_templates("plain_tool", None, None);
+        let mut decl_map = HashMap::new();
+        decl_map.insert(decl.name.clone(), decl);
+        let call = ToolCall::new(
+            "plain_tool".to_string(),
+            json!({}),
+            Some("call-1".to_string()),
+            None,
+        );
+        let result_json = json!({"content": [{"type": "text", "text": "hi"}]});
+
+        with_recording_sink(|sink| {
+            emit_tool_result_with_template(&call, &result_json, &decl_map);
+            let events = sink.events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                AgentEvent::Tool(ToolEvent::Completed { title, .. }) => {
+                    assert!(
+                        title.is_none(),
+                        "no template => title must be None (consumer falls back to output)"
+                    );
+                }
+                other => panic!("expected Completed event, got {other:?}"),
+            }
+        });
     }
 }

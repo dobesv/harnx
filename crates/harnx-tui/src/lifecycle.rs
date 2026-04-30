@@ -319,8 +319,9 @@ pub(crate) fn messages_to_transcript_items(messages: &[Message]) -> Vec<Transcri
                             tool_name: r.call.name.clone(),
                             input_yaml,
                         });
-                        for line in crate::agent_event_sink::render_tool_result_text(&r.output, &[])
-                            .split('\n')
+                        for line in
+                            crate::agent_event_sink::render_tool_result_text(&r.output, None)
+                                .split('\n')
                         {
                             if !line.is_empty() {
                                 items.push(TranscriptItem::ToolResultText(line.to_string()));

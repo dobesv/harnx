@@ -1069,7 +1069,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         AgentEvent::Tool(ToolEvent::Completed {
             id: String::new(),
             output: serde_json::Value::String("\u{1b}[2mline one\nline two\u{1b}[0m\n".to_string()),
-            content: vec![],
+            title: None,
         }),
         None,
     ))
@@ -4041,4 +4041,178 @@ async fn test_tall_item_scroll_window_moves_in_correct_direction() {
     }
     harness.render();
     assert_window(&mut harness, 1, 10, "after scroll_up x10 (top of item)");
+}
+
+// ----------------------------------------------------------------------------
+// MCP MiniJinja templating: TUI must use the rendered title/content fields
+// produced by harnx-runtime when a tool's `_meta.call_template` /
+// `_meta.result_template` (or config override) is set. Covers issue #340 /
+// PR #349 — the producer side wires templates into ToolEvent fields, but the
+// TUI consumer was discarding them prior to these tests.
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tui_renders_started_title_when_template_provides_it() {
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+
+    // Producer-side render result: a `call_template` like
+    // `**$** \`{{ args.command }}\`` produces this `title`. The raw
+    // `input` JSON is also kept on the event for transcript serialization,
+    // but the user-facing rendering must prefer the rendered title.
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "call-1".into(),
+            name: "bash_exec".into(),
+            kind: ToolKind::Other,
+            title: Some("**$** `ls -la /tmp`".into()),
+            input: yaml_to_json("command: ls -la /tmp"),
+            locations: vec![],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let lines: Vec<String> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .map(|line| line_to_plain(&line))
+        .collect();
+
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("ls -la /tmp"),
+        "expected rendered title `ls -la /tmp` in transcript, got:\n{joined}"
+    );
+    assert!(
+        !joined.contains("command: ls -la /tmp"),
+        "expected rendered title to replace yaml-formatted input, but raw yaml is still shown:\n{joined}"
+    );
+}
+
+#[tokio::test]
+async fn tui_falls_back_to_yaml_when_no_template_title() {
+    // Regression guard: when title is None (no template configured), the
+    // existing yaml-of-input behavior must be preserved.
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "call-1".into(),
+            name: "no_template_tool".into(),
+            kind: ToolKind::Other,
+            title: None,
+            input: yaml_to_json("command: ls"),
+            locations: vec![],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let lines: Vec<String> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .map(|line| line_to_plain(&line))
+        .collect();
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("command: ls"),
+        "expected raw yaml of input when no template; got:\n{joined}"
+    );
+}
+
+#[tokio::test]
+async fn tui_renders_completed_template_title_when_provided() {
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+
+    // Producer-side render result: a `result_template` like
+    // `OK: {{ result.content[0].text }}` is rendered into `title`. The
+    // raw `output` JSON would yaml-render to something like
+    // `content:\n- text: hello\n  type: text` — the user-facing rendering
+    // must prefer the rendered title.
+    let raw_output = serde_json::json!({
+        "content": [{"type": "text", "text": "hello"}],
+        "isError": false,
+    });
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Completed {
+            id: "call-1".into(),
+            output: raw_output,
+            title: Some("OK: hello".into()),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let lines: Vec<String> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .map(|line| line_to_plain(&line))
+        .collect();
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("OK: hello"),
+        "expected rendered template title `OK: hello` in transcript, got:\n{joined}"
+    );
+    assert!(
+        !joined.contains("isError"),
+        "raw output JSON leaked into transcript instead of using rendered title:\n{joined}"
+    );
+}
+
+#[tokio::test]
+async fn tui_falls_back_to_output_when_no_template_title() {
+    // Regression guard: when title is None (no result template), the
+    // existing extract-from-output behavior must be preserved.
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Completed {
+            id: "call-1".into(),
+            output: serde_json::Value::String("plain output line".into()),
+            title: None,
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+    let lines: Vec<String> = tui
+        .app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .map(|line| line_to_plain(&line))
+        .collect();
+    let joined = lines.join("\n");
+    assert!(
+        joined.contains("plain output line"),
+        "expected raw output when no template title; got:\n{joined}"
+    );
 }

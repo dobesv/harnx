@@ -66,6 +66,19 @@ mod tests {
     use crate::event::{AgentEvent, NoticeEvent};
     use std::sync::Mutex;
 
+    /// `AGENT_EVENT_SINK` is process-global state, but cargo runs tests in
+    /// the same process in parallel. Without serialization, two tests
+    /// racing on `clear_agent_event_sink` / `install_agent_event_sink` /
+    /// `emit_agent_event` see each other's sinks and events. Acquire this
+    /// guard at the top of every test that touches the global sink.
+    static SINK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Ignore `PoisonError` so a panic in one test doesn't cascade-fail
+    /// every other sink test in this module.
+    fn lock_sink_tests() -> std::sync::MutexGuard<'static, ()> {
+        SINK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     struct CollectingSink {
         events: Mutex<Vec<AgentEvent>>,
     }
@@ -86,6 +99,7 @@ mod tests {
 
     #[test]
     fn install_and_emit_cycle() {
+        let _guard = lock_sink_tests();
         clear_agent_event_sink();
         let delivered = emit_agent_event(AgentEvent::Notice(NoticeEvent::Info("hi".into())));
         assert!(!delivered);
@@ -120,6 +134,7 @@ mod tests {
     #[test]
     fn emit_with_source_preserves_source() {
         use crate::event::AgentSource;
+        let _guard = lock_sink_tests();
         clear_agent_event_sink();
         let sink = Arc::new(SourceRecordingSink::default());
         install_agent_event_sink(sink.clone());

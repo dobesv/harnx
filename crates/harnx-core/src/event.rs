@@ -72,7 +72,12 @@ pub enum ToolEvent {
     Completed {
         id: String,
         output: serde_json::Value,
-        content: Vec<ContentBlock>,
+        /// Pre-rendered display text for the result. `Some(text)` when an
+        /// MCP `result_template` (or per-tool config override) has been
+        /// rendered against `output`; `None` when no template applied,
+        /// in which case consumers fall back to extracting text from
+        /// `output` themselves. Mirrors `title` on `Started`/`Update`.
+        title: Option<String>,
     },
     Failed {
         id: String,
