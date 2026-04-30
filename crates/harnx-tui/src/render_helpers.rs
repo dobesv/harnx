@@ -164,26 +164,22 @@ mod markdown_tests {
     }
 
     #[test]
-    fn italic_asterisk_produces_italic_span() {
-        let line = markdown_line_spans("hi *there* you", Style::default());
-        assert_eq!(span_text(&line), "hi there you");
-        let it = line
-            .spans
-            .iter()
-            .find(|s| s.content.as_ref() == "there")
-            .unwrap();
-        assert!(it.style.add_modifier.contains(Modifier::ITALIC));
-    }
-
-    #[test]
-    fn italic_underscore_produces_italic_span() {
-        let line = markdown_line_spans("hi _there_ you", Style::default());
-        let it = line
-            .spans
-            .iter()
-            .find(|s| s.content.as_ref() == "there")
-            .unwrap();
-        assert!(it.style.add_modifier.contains(Modifier::ITALIC));
+    fn italic_marker_produces_italic_span() {
+        // Both `*text*` and `_text_` should produce an ITALIC-modifier span.
+        for input in ["hi *there* you", "hi _there_ you"] {
+            let line = markdown_line_spans(input, Style::default());
+            assert_eq!(span_text(&line), "hi there you", "input: {input}");
+            let it = line
+                .spans
+                .iter()
+                .find(|s| s.content.as_ref() == "there")
+                .unwrap_or_else(|| panic!("expected `there` span for {input}"));
+            assert!(
+                it.style.add_modifier.contains(Modifier::ITALIC),
+                "{input} should produce ITALIC; got {:?}",
+                it.style.add_modifier
+            );
+        }
     }
 
     #[test]

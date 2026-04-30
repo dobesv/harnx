@@ -185,6 +185,40 @@ impl CliSinkState {
         Ok(())
     }
 
+    /// Stderr render for `ToolEvent::Started`: dim "[tool] {name}", and
+    /// when the producer rendered an MCP `call_template` into `title`,
+    /// append the markdown-styled rendering after it.
+    fn print_tool_started(&mut self, name: &str, title: Option<&str>) {
+        let prefix = dimmed_text(&format!("[tool] {name}"));
+        match title.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => {
+                let rendered = self.render_markdown_line(t);
+                eprintln!("{prefix} {rendered}");
+            }
+            None => eprintln!("{prefix}"),
+        }
+    }
+
+    /// Stderr render for `ToolEvent::Completed`: when an MCP
+    /// `result_template` produced a `title`, render each output line
+    /// through markdown (preserves emphasis); otherwise fall back to the
+    /// dim plain-text path the historic emit used.
+    fn print_tool_completed(&mut self, output: &serde_json::Value, title: Option<&str>) {
+        let templated = title.map(str::trim).filter(|t| !t.is_empty()).is_some();
+        let text = harnx_runtime::utils::render_tool_result_text(output, title);
+        let trimmed = text.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            return;
+        }
+        if templated {
+            for line in trimmed.lines() {
+                eprintln!("{}", self.render_markdown_line(line));
+            }
+        } else {
+            eprintln!("{}", dimmed_text(trimmed));
+        }
+    }
+
     /// Render a single line through `MarkdownRender` so MCP `call_template`/
     /// `result_template` text shows its `**bold**` / `*italic*` / `` `code` ``
     /// styling. Lazy-initializes the renderer (shared with the streaming
@@ -342,44 +376,13 @@ impl AgentEventSink for CliAgentEventSink {
                 }
             }
             AgentEvent::Tool(ToolEvent::Started { name, title, .. }) => {
-                let templated_title = title
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty());
-                match templated_title {
-                    Some(t) => {
-                        // Templated title — render markdown so `**bold**`,
-                        // `*italic*`, and `` `code` `` show their styling.
-                        let rendered = state.render_markdown_line(t);
-                        eprintln!("{} {}", dimmed_text(&format!("[tool] {name}")), rendered);
-                    }
-                    None => {
-                        eprintln!("{}", dimmed_text(&format!("[tool] {name}")));
-                    }
-                }
+                state.print_tool_started(&name, title.as_deref());
             }
             AgentEvent::Tool(ToolEvent::Failed { error, .. }) => {
                 eprintln!("{}", warning_text(&format!("tool error: {error}")));
             }
             AgentEvent::Tool(ToolEvent::Completed { output, title, .. }) => {
-                let templated = title
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .is_some();
-                let text =
-                    harnx_runtime::utils::render_tool_result_text(&output, title.as_deref());
-                let trimmed = text.trim_end_matches('\n');
-                if trimmed.is_empty() {
-                    // nothing to show
-                } else if templated {
-                    // Render each line through markdown; preserve newlines.
-                    for line in trimmed.lines() {
-                        eprintln!("{}", state.render_markdown_line(line));
-                    }
-                } else {
-                    eprintln!("{}", dimmed_text(trimmed));
-                }
+                state.print_tool_completed(&output, title.as_deref());
             }
             // Silent for Progress / Update — they are streamed mid-call
             // updates that would clutter stderr.

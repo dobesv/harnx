@@ -36,6 +36,49 @@ impl Tui {
         lines
     }
 
+    /// 3-space indent + a single line of inline-markdown body, used by
+    /// templated tool result/call lines so `**bold**` / `` `code` `` add
+    /// styling on top of the dim base without losing visual subordination.
+    fn render_indented_markdown_line(text: &str) -> Line<'static> {
+        let dim_gray = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        let body_base = Style::default().add_modifier(Modifier::DIM);
+        let mut spans = vec![Span::styled("   ".to_string(), dim_gray)];
+        let parsed = crate::render_helpers::markdown_line_spans(text, body_base);
+        spans.extend(parsed.spans);
+        Line::from(spans)
+    }
+
+    /// Render a `ToolCall` transcript item: `→ tool_name` header followed
+    /// by the body lines. Body rendering depends on its origin —
+    /// `Yaml` is shown verbatim (raw arguments), `Markdown` is rendered
+    /// inline (templated `call_template` output).
+    fn render_tool_call(tool_name: &str, body: Option<&ToolCallBody>) -> Vec<Line<'static>> {
+        // Use the plain rightwards arrow `→` (U+2192). The previous glyph
+        // was `->` followed by VS16 (U+FE0F) which requested an emoji-style
+        // presentation and produced unicode-width vs. terminal-rendered-
+        // width disagreement, leaving stray glyphs in subsequent frames.
+        let dim_gray = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        let mut lines = Self::render_text_entry("", &format!("→ {tool_name}"), dim_gray, false);
+        match body {
+            Some(ToolCallBody::Yaml(yaml)) => {
+                for line in yaml.lines() {
+                    lines.extend(Self::render_text_entry("   ", line, dim_gray, false));
+                }
+            }
+            Some(ToolCallBody::Markdown(md)) => {
+                for line_text in md.lines() {
+                    lines.push(Self::render_indented_markdown_line(line_text));
+                }
+            }
+            None => {}
+        }
+        lines
+    }
+
     pub(super) fn render_entry(entry: &TranscriptItem) -> Vec<Line<'static>> {
         match entry {
             TranscriptItem::SourceHeading(source) => Self::render_text_entry(
@@ -69,8 +112,7 @@ impl Tui {
                 // unclosed `**bold` mid-stream simply renders as literal
                 // asterisks for the moment, then upgrades to bold once the
                 // closing `**` arrives in a later chunk.
-                let mut lines =
-                    crate::render_helpers::markdown_lines(text, Style::default());
+                let mut lines = crate::render_helpers::markdown_lines(text, Style::default());
                 // Match the prior trailing-spacing rule: pad after a
                 // single-line message (so the next entry has breathing
                 // room) but skip the pad when the text already contains
@@ -103,20 +145,7 @@ impl Tui {
                 false,
             ),
             TranscriptItem::ToolResultMarkdown(text) => {
-                // Templated MCP `result_template` output. Render as inline
-                // markdown so `**bold**` / `*italic*` / `` `code` `` show
-                // their styling. The base style is dim gray so the result
-                // body stays visually subordinate to the conversation.
-                let base = Style::default().add_modifier(Modifier::DIM);
-                let mut spans = vec![Span::styled(
-                    "   ".to_string(),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                )];
-                let line = crate::render_helpers::markdown_line_spans(text, base);
-                spans.extend(line.spans);
-                vec![Line::from(spans)]
+                vec![Self::render_indented_markdown_line(text)]
             }
             TranscriptItem::StatusLine(text) => Self::render_text_entry(
                 "",
@@ -156,45 +185,7 @@ impl Tui {
                 false,
             ),
             TranscriptItem::ToolCall { tool_name, body } => {
-                // Use the plain rightwards arrow `→` (U+2192) as the
-                // tool-call marker.  The previous glyph was `->` followed by
-                // VS16 (U+FE0F), which requests an emoji-style presentation
-                // and causes unicode-width vs. terminal-rendered-width
-                // disagreement in some terminals.  That off-by-one width
-                // mismatch propagates through every subsequent line of the
-                // same frame, leaving stray glyphs (stray letters, corrupted
-                // words) at columns the next render doesn't explicitly
-                // repaint.
-                let dim_gray = Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM);
-                let mut lines =
-                    Self::render_text_entry("", &format!("→ {tool_name}"), dim_gray, false);
-                match body {
-                    Some(ToolCallBody::Yaml(yaml)) => {
-                        for line in yaml.lines() {
-                            lines.extend(Self::render_text_entry("   ", line, dim_gray, false));
-                        }
-                    }
-                    Some(ToolCallBody::Markdown(md)) => {
-                        // Templated MCP `call_template` — render inline
-                        // markdown styling. Indent prefix stays dim gray;
-                        // the body uses DIM as its base style so `**`/`*`
-                        // /`` ` `` add styling on top without losing the
-                        // subordinate visual weight.
-                        let body_base = Style::default().add_modifier(Modifier::DIM);
-                        for line_text in md.lines() {
-                            let mut spans =
-                                vec![Span::styled("   ".to_string(), dim_gray)];
-                            let parsed =
-                                crate::render_helpers::markdown_line_spans(line_text, body_base);
-                            spans.extend(parsed.spans);
-                            lines.push(Line::from(spans));
-                        }
-                    }
-                    None => {}
-                }
-                lines
+                Self::render_tool_call(tool_name, body.as_ref())
             }
             TranscriptItem::AttachmentHeader(text) => Self::render_text_entry(
                 "",

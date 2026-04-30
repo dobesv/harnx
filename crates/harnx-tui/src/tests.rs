@@ -4222,6 +4222,29 @@ async fn tui_falls_back_to_output_when_no_template_title() {
 // (`**bold**`, `*italic*`, `` `code` ``). Plain output paths stay plain.
 // ----------------------------------------------------------------------------
 
+/// Walk the rendered transcript looking for a span whose content matches
+/// `text` and whose style satisfies `pred`. Used by the markdown styling
+/// tests to assert "this content was rendered with these style hints"
+/// without pinning specific colors that `tui-markdown` may tweak.
+fn rendered_span_matches(
+    lines: &[ratatui::text::Line<'static>],
+    text: &str,
+    pred: impl Fn(&ratatui::style::Style) -> bool,
+) -> bool {
+    lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .any(|s| s.content.as_ref() == text && pred(&s.style))
+}
+
+fn rendered_lines(tui: &Tui) -> Vec<ratatui::text::Line<'static>> {
+    tui.app
+        .transcript
+        .iter()
+        .flat_map(Tui::render_entry)
+        .collect()
+}
+
 #[tokio::test]
 async fn tui_started_template_strips_markers_and_styles_spans() {
     let mut tui = Tui::init(
@@ -4246,57 +4269,35 @@ async fn tui_started_template_strips_markers_and_styles_spans() {
     .await
     .unwrap();
 
-    let rendered_lines: Vec<ratatui::text::Line<'static>> = tui
-        .app
-        .transcript
-        .iter()
-        .flat_map(Tui::render_entry)
-        .collect();
-
-    // Markers should be consumed (not appear as literal text), and the
-    // styled span text should appear instead.
-    let plain = rendered_lines
+    use ratatui::style::Modifier;
+    let lines = rendered_lines(&tui);
+    let plain = lines
         .iter()
         .map(line_to_plain)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        !plain.contains("**$**"),
-        "expected `**$**` markers to be consumed by markdown render; got:\n{plain}"
-    );
+
+    // Markers should be consumed and stripped text should appear.
+    assert!(!plain.contains("**$**"), "markers leaked: {plain}");
     assert!(
         !plain.contains("`ls -la /tmp`"),
-        "expected backticks to be consumed; got:\n{plain}"
+        "backticks leaked: {plain}"
     );
     assert!(
         plain.contains("$ ls -la /tmp"),
-        "expected stripped text in transcript; got:\n{plain}"
+        "stripped text missing: {plain}"
     );
 
-    // At least one span should be BOLD ("$"), and at least one should be
-    // visually distinct (fg or bg set) for the inline code ("ls -la /tmp").
-    // We don't pin a specific color — that's chosen by `tui-markdown`.
-    use ratatui::style::Modifier;
-    let mut saw_bold = false;
-    let mut saw_code = false;
-    for line in &rendered_lines {
-        for span in &line.spans {
-            if span.style.add_modifier.contains(Modifier::BOLD) {
-                saw_bold = true;
-            }
-            // The code span carries an explicit fg or bg — distinct from
-            // the dim grey base used for surrounding spans.
-            if span.content.as_ref() == "ls -la /tmp"
-                && (span.style.fg.is_some() || span.style.bg.is_some())
-            {
-                saw_code = true;
-            }
-        }
-    }
-    assert!(saw_bold, "expected a BOLD span from `**$**`");
+    // `**$**` → BOLD; `` `ls -la /tmp` `` → visually distinct (fg or bg).
     assert!(
-        saw_code,
-        "expected a visually distinct span for `` `ls -la /tmp` ``"
+        rendered_span_matches(&lines, "$", |s| s.add_modifier.contains(Modifier::BOLD)),
+        "expected a BOLD span for `$`"
+    );
+    assert!(
+        rendered_span_matches(&lines, "ls -la /tmp", |s| {
+            s.fg.is_some() || s.bg.is_some()
+        }),
+        "expected a visually distinct span for `ls -la /tmp`"
     );
 }
 
@@ -4373,41 +4374,23 @@ async fn tui_completed_template_styles_spans() {
     .unwrap();
 
     use ratatui::style::Modifier;
-    let rendered: Vec<ratatui::text::Line<'static>> = tui
-        .app
-        .transcript
-        .iter()
-        .flat_map(Tui::render_entry)
-        .collect();
-    let plain = rendered
+    let lines = rendered_lines(&tui);
+    let plain = lines
         .iter()
         .map(line_to_plain)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        !plain.contains("**OK**"),
-        "expected `**OK**` markers to be consumed; got:\n{plain}"
-    );
+    assert!(!plain.contains("**OK**"), "markers leaked: {plain}");
     assert!(plain.contains("OK: hello"));
 
-    let mut saw_bold = false;
-    let mut saw_code = false;
-    for line in &rendered {
-        for span in &line.spans {
-            if span.style.add_modifier.contains(Modifier::BOLD) {
-                saw_bold = true;
-            }
-            // The `hello` code span is visually distinct via fg or bg —
-            // exact color picked by `tui-markdown`.
-            if span.content.as_ref() == "hello"
-                && (span.style.fg.is_some() || span.style.bg.is_some())
-            {
-                saw_code = true;
-            }
-        }
-    }
-    assert!(saw_bold, "expected a BOLD span from `**OK**`");
-    assert!(saw_code, "expected a visually distinct span for `` `hello` ``");
+    assert!(
+        rendered_span_matches(&lines, "OK", |s| s.add_modifier.contains(Modifier::BOLD)),
+        "expected a BOLD span for `OK`"
+    );
+    assert!(
+        rendered_span_matches(&lines, "hello", |s| s.fg.is_some() || s.bg.is_some()),
+        "expected a visually distinct span for `hello`"
+    );
 }
 
 #[tokio::test]
@@ -4423,49 +4406,30 @@ async fn tui_assistant_text_renders_inline_markdown() {
         Arc::new(Mutex::new(PersistentHookManager::new())),
     )
     .unwrap();
-    tui.app.transcript.push(crate::types::TranscriptItem::AssistantText(
-        "Here's some **bold** and `code`.".to_string(),
-    ));
+    tui.app
+        .transcript
+        .push(crate::types::TranscriptItem::AssistantText(
+            "Here's some **bold** and `code`.".to_string(),
+        ));
 
     use ratatui::style::Modifier;
-    let rendered: Vec<ratatui::text::Line<'static>> = tui
-        .app
-        .transcript
-        .iter()
-        .flat_map(Tui::render_entry)
-        .collect();
-    let plain = rendered
+    let lines = rendered_lines(&tui);
+    let plain = lines
         .iter()
         .map(line_to_plain)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        !plain.contains("**bold**"),
-        "expected `**bold**` markers consumed; got:\n{plain}"
-    );
-    assert!(
-        !plain.contains("`code`"),
-        "expected backticks consumed; got:\n{plain}"
-    );
+    assert!(!plain.contains("**bold**"), "markers leaked: {plain}");
+    assert!(!plain.contains("`code`"), "backticks leaked: {plain}");
 
-    let mut saw_bold = false;
-    let mut saw_code = false;
-    for line in &rendered {
-        for span in &line.spans {
-            if span.content.as_ref() == "bold"
-                && span.style.add_modifier.contains(Modifier::BOLD)
-            {
-                saw_bold = true;
-            }
-            if span.content.as_ref() == "code"
-                && (span.style.fg.is_some() || span.style.bg.is_some())
-            {
-                saw_code = true;
-            }
-        }
-    }
-    assert!(saw_bold, "assistant text should style `**bold**`");
-    assert!(saw_code, "assistant text should style `` `code` ``");
+    assert!(
+        rendered_span_matches(&lines, "bold", |s| s.add_modifier.contains(Modifier::BOLD)),
+        "assistant text should style `**bold**`"
+    );
+    assert!(
+        rendered_span_matches(&lines, "code", |s| s.fg.is_some() || s.bg.is_some()),
+        "assistant text should style `` `code` ``"
+    );
 }
 
 #[tokio::test]
@@ -4480,9 +4444,11 @@ async fn tui_assistant_text_preserves_line_breaks() {
         Arc::new(Mutex::new(PersistentHookManager::new())),
     )
     .unwrap();
-    tui.app.transcript.push(crate::types::TranscriptItem::AssistantText(
-        "first line\nsecond line\nthird line".to_string(),
-    ));
+    tui.app
+        .transcript
+        .push(crate::types::TranscriptItem::AssistantText(
+            "first line\nsecond line\nthird line".to_string(),
+        ));
 
     let rendered: Vec<ratatui::text::Line<'static>> = tui
         .app
