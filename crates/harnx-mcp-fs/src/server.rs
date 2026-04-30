@@ -848,15 +848,17 @@ impl FsServer {
     }
 }
 
+/// Build a `_meta` block with only the call template. We deliberately
+/// omit `result_template` so the MCP client falls back to its generic
+/// audience-aware renderer (`extract_user_display_text`), which surfaces
+/// every user-audience and unaudienced content block. That includes the
+/// history diff that mutating tools append after the summary.
 fn make_tool_meta(call_template: &str) -> Meta {
     Meta(
-        json!({
-            "call_template": call_template,
-            "result_template": "{{ result.content[0].text | default('') }}"
-        })
-        .as_object()
-        .unwrap()
-        .clone(),
+        json!({ "call_template": call_template })
+            .as_object()
+            .unwrap()
+            .clone(),
     )
 }
 
@@ -1377,6 +1379,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fs_tools_advertise_call_template_only() {
+        // Each tool ships a `_meta.call_template` for the TUI's call header.
+        // We deliberately omit `result_template` so the MCP client falls
+        // back to its audience-aware generic renderer — that's what surfaces
+        // the history diff content blocks (issue #398).
+        let temp_dir = TestDir::new();
+        let TestConnection {
+            _server_service,
+            client_service,
+        } = connect_server(
+            make_server(temp_dir.path()),
+            vec![temp_dir.path().to_path_buf()],
+        )
+        .await;
+        let peer = client_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        let tools = peer.list_tools(Default::default()).await.unwrap().tools;
+        assert!(!tools.is_empty(), "server should expose at least one tool");
+        for tool in &tools {
+            let meta = tool
+                .meta
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool '{}' has no _meta", tool.name));
+            assert!(
+                meta.0.contains_key("call_template"),
+                "tool '{}' missing call_template in _meta",
+                tool.name
+            );
+            assert!(
+                !meta.0.contains_key("result_template"),
+                "tool '{}' must not pin result_template — let the client fall back to its generic audience-aware renderer",
+                tool.name
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_fs_server_list_tools() {
         let temp_dir = TestDir::new();
         let TestConnection {
@@ -1521,6 +1563,101 @@ mod tests {
             .unwrap();
         assert_eq!(edit_result.is_error, Some(false));
         assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "new value\n");
+    }
+
+    /// In a git-tracked working directory, edit_file should append the
+    /// snapshot diff as a second content block with no `audience`
+    /// annotation so the MCP client surfaces it to the user. Regression
+    /// for issue #398.
+    #[tokio::test]
+    async fn edit_file_emits_unaudienced_diff_content() {
+        let temp_dir = TestDir::new();
+        let dir = temp_dir.path();
+        // Initialize a git repo so the history snapshotter has something to
+        // diff against. Skip the test when git isn't available — the unit
+        // test above (`result_template_includes_history_diff_for_edit_and_write`)
+        // still pins the template behavior on git-less environments.
+        if std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        for args in [
+            ["config", "user.name", "Test"].as_slice(),
+            ["config", "user.email", "test@example.com"].as_slice(),
+            ["config", "commit.gpgsign", "false"].as_slice(),
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+        }
+        let file_path = dir.join("tracked.txt");
+        std::fs::write(&file_path, "old value\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+
+        let server = make_server(dir);
+        let result = server
+            .edit_file_impl(EditFileParams {
+                path: file_path.to_string_lossy().into_owned(),
+                old_text: "old value".into(),
+                new_text: "new value".into(),
+                replace_all: None,
+            })
+            .await
+            .expect("edit succeeds");
+
+        assert_eq!(result.is_error, Some(false));
+        let text_blocks: Vec<String> = result
+            .content
+            .iter()
+            .filter_map(|c| c.raw.as_text().map(|t| t.text.clone()))
+            .collect();
+        assert!(
+            text_blocks.len() >= 2,
+            "expected summary + diff content blocks, got {} blocks: {:?}",
+            text_blocks.len(),
+            text_blocks
+        );
+        assert!(
+            text_blocks[0].contains("Edited"),
+            "first block should be summary: {}",
+            text_blocks[0]
+        );
+        assert!(
+            text_blocks[1].contains("-old value"),
+            "second block should be the diff: {}",
+            text_blocks[1]
+        );
+
+        // Both blocks are unaudienced, so the MCP client's audience-aware
+        // generic renderer (extract_user_display_text) will surface them
+        // both — that's how the diff reaches the TUI now that we no longer
+        // pin a result_template.
+        let summary_audience = result.content[0].audience();
+        let diff_audience = result.content[1].audience();
+        assert!(
+            summary_audience.is_none(),
+            "summary must not be assistant-only or it would be hidden from the user"
+        );
+        assert!(
+            diff_audience.is_none(),
+            "diff must not be assistant-only or it would be hidden from the user"
+        );
     }
 
     #[tokio::test]
