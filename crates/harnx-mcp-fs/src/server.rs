@@ -1,9 +1,13 @@
+use crate::summary::{
+    apply_search_notices, find_summary, ls_summary, render_read_result, search_summary,
+    SearchTruncation,
+};
+
 use harnx_mcp::safety::{
     file_uri_to_path, format_size, is_binary_content, sanitize_output_text, truncate_line,
-    truncate_output, validate_path, validate_write_path, TruncateOpts, DEFAULT_FIND_LIMIT,
-    DEFAULT_GREP_LIMIT, DEFAULT_LS_LIMIT, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
-    GREP_MAX_LINE_LENGTH, LS_SCAN_HARD_LIMIT, READ_MAX_FILE_BYTES, SEARCH_FILE_MAX_BYTES,
-    WRITE_MAX_BYTES,
+    validate_path, validate_write_path, DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT, DEFAULT_LS_LIMIT,
+    DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, LS_SCAN_HARD_LIMIT, READ_MAX_FILE_BYTES,
+    SEARCH_FILE_MAX_BYTES, WRITE_MAX_BYTES,
 };
 use harnx_mcp_history::HistoryManager;
 
@@ -367,7 +371,10 @@ impl FsServer {
         let total_matching_lines = numbered_lines.len();
         let mut notices = Vec::new();
 
-        if let Some(tail_count) = params.tail {
+        let (shown_line_start, shown_line_end) = if let Some(tail_count) = params.tail {
+            if tail_count == 0 {
+                return tool_error("tail must be at least 1".to_string());
+            }
             if tail_count < total_matching_lines {
                 notices.push(format!(
                     "showing last {} of {} matching lines",
@@ -376,6 +383,7 @@ impl FsServer {
             }
             let start = total_matching_lines.saturating_sub(tail_count);
             numbered_lines = numbered_lines.into_iter().skip(start).collect();
+            (start + 1, total_matching_lines)
         } else {
             let offset = params.offset.unwrap_or(1).max(1);
             let limit = params.limit.unwrap_or(DEFAULT_MAX_LINES);
@@ -385,6 +393,10 @@ impl FsServer {
                     "Offset {} is beyond end of result set ({} matching lines total)",
                     offset, total_matching_lines
                 ));
+            }
+
+            if limit == 0 {
+                return tool_error("limit must be at least 1".to_string());
             }
 
             let start = offset - 1;
@@ -397,50 +409,18 @@ impl FsServer {
                 ));
             }
             numbered_lines = numbered_lines[start..end].to_vec();
-        }
-
-        let raw_output = numbered_lines
-            .into_iter()
-            .map(|(line_number, line)| format!("{line_number}: {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let default_opts = TruncateOpts::default();
-        let truncate_opts = TruncateOpts {
-            head_lines: params.head_lines.unwrap_or(default_opts.head_lines),
-            tail_lines: params.tail_lines.unwrap_or(default_opts.tail_lines),
-            line_head_bytes: default_opts.line_head_bytes,
-            line_tail_bytes: default_opts.line_tail_bytes,
-            max_output_bytes: params
-                .max_output_bytes
-                .unwrap_or(default_opts.max_output_bytes.min(DEFAULT_MAX_BYTES)),
-            ..default_opts
+            (offset, end)
         };
-        let truncated_output = truncate_output(&raw_output, &truncate_opts);
 
-        if truncated_output != raw_output {
-            notices.push(format!(
-                "output truncated from {} to {}. Use head_lines, tail_lines, or max_output_bytes to see more",
-                format_size(raw_output.len()),
-                format_size(truncated_output.len())
-            ));
-        }
-
-        let mut output = truncated_output;
-        if !notices.is_empty() {
-            let _ = write!(output, "\n\n[{}]", notices.join(". "));
-        }
-
-        let summary = format!(
-            "Read {} ({} lines, {})",
-            params.path,
+        render_read_result(
+            &params,
+            numbered_lines,
             total_matching_lines,
-            format_size(raw_output.len())
-        );
-        Ok(CallToolResult::success(vec![
-            Content::text(output).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
-        ]))
+            shown_line_start,
+            shown_line_end,
+            bytes.len(),
+            notices,
+        )
     }
 
     async fn write_file_impl(&self, params: WriteFileParams) -> Result<CallToolResult, ErrorData> {
@@ -679,7 +659,7 @@ impl FsServer {
             );
         }
 
-        let summary = format!("Listed {} entries in {}", entry_count, params.path);
+        let summary = ls_summary(&params.path, entry_count, scan_count, limit_reached);
         Ok(CallToolResult::success(vec![
             Content::text(output).with_audience(vec![Role::Assistant]),
             Content::text(summary).with_audience(vec![Role::User]),
@@ -738,31 +718,20 @@ impl FsServer {
         let match_count = results.len();
 
         let raw_output = results.join("\n");
-        let truncated_output = truncate_output(&raw_output, &TruncateOpts::default());
-        let mut notices = Vec::new();
-        if limit_reached {
-            notices.push(format!(
-                "results limited to {} matches. Refine the pattern for more specific results",
-                max_results
-            ));
-        }
-        if truncated_output != raw_output {
-            notices.push(format!(
-                "output truncated from {} to {}. Use max_results to increase the limit",
-                format_size(raw_output.len()),
-                format_size(truncated_output.len())
-            ));
-        }
+        let raw_bytes = raw_output.len();
+        let (output, byte_truncated) = apply_search_notices(raw_output, limit_reached, max_results);
 
-        let mut output = truncated_output;
-        if !notices.is_empty() {
-            let _ = write!(output, "\n\n[{}]", notices.join(". "));
-        }
-
-        let summary = format!(
-            "Found {} matches in {}",
-            match_count,
-            params.path.as_deref().unwrap_or("workspace")
+        let search_location = params.path.as_deref().unwrap_or("workspace");
+        let summary = search_summary(
+            search_location,
+            &SearchTruncation {
+                match_count,
+                max_results,
+                limit_reached,
+                output_bytes: output.len(),
+                raw_bytes,
+                byte_truncated,
+            },
         );
         Ok(CallToolResult::success(vec![
             Content::text(output).with_audience(vec![Role::Assistant]),
@@ -785,7 +754,22 @@ impl FsServer {
                 None,
             ));
         }
-        let escaped_base = glob::Pattern::escape(&search_path.display().to_string());
+        // The glob crate doesn't understand Windows verbatim prefixes (`\\?\`)
+        // produced by canonicalize(), and expects '/' as the path separator on
+        // every platform — normalize both before building the pattern.
+        let mut base_str = search_path.display().to_string();
+        #[cfg(windows)]
+        {
+            if let Some(rest) = base_str.strip_prefix(r"\\?\UNC\").map(str::to_owned) {
+                base_str = format!(r"\\{rest}");
+            } else if let Some(rest) = base_str.strip_prefix(r"\\?\").map(str::to_owned) {
+                base_str = rest;
+            }
+        }
+        if std::path::MAIN_SEPARATOR != '/' {
+            base_str = base_str.replace(std::path::MAIN_SEPARATOR, "/");
+        }
+        let escaped_base = glob::Pattern::escape(&base_str);
         let full_pattern = format!("{escaped_base}/{}", params.pattern);
         let glob_results = glob::glob(&full_pattern).map_err(|err| {
             ErrorData::invalid_params(format!("invalid glob pattern: {err}"), None)
@@ -826,13 +810,15 @@ impl FsServer {
             );
         }
 
-        let summary = format!("Found {} matches", path_count);
+        let summary = find_summary(path_count, max_results, limit_reached);
         Ok(CallToolResult::success(vec![
             Content::text(output).with_audience(vec![Role::Assistant]),
             Content::text(summary).with_audience(vec![Role::User]),
         ]))
     }
+}
 
+impl FsServer {
     async fn rollback_file_impl(
         &self,
         params: RollbackParams,
@@ -1368,6 +1354,24 @@ mod tests {
             .unwrap()
     }
 
+    fn make_server(dir: &std::path::Path) -> FsServer {
+        FsServer::new(vec![dir.to_path_buf()])
+    }
+
+    fn user_summary(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter(|content| {
+                content
+                    .audience()
+                    .map(|a| a.contains(&Role::User))
+                    .unwrap_or(false)
+            })
+            .find_map(|content| content.raw.as_text().map(|text| text.text.clone()))
+            .unwrap_or_default()
+    }
+
     fn tool_args(value: Value) -> Map<String, Value> {
         value.as_object().unwrap().clone()
     }
@@ -1379,7 +1383,7 @@ mod tests {
             _server_service,
             client_service,
         } = connect_server(
-            FsServer::new(vec![temp_dir.path().to_path_buf()]),
+            make_server(temp_dir.path()),
             vec![temp_dir.path().to_path_buf()],
         )
         .await;
@@ -1419,7 +1423,7 @@ mod tests {
             _server_service,
             client_service,
         } = connect_server(
-            FsServer::new(vec![temp_dir.path().to_path_buf()]),
+            make_server(temp_dir.path()),
             vec![temp_dir.path().to_path_buf()],
         )
         .await;
@@ -1452,7 +1456,7 @@ mod tests {
             _server_service,
             client_service,
         } = connect_server(
-            FsServer::new(vec![temp_dir.path().to_path_buf()]),
+            make_server(temp_dir.path()),
             vec![temp_dir.path().to_path_buf()],
         )
         .await;
@@ -1496,7 +1500,7 @@ mod tests {
             _server_service,
             client_service,
         } = connect_server(
-            FsServer::new(vec![temp_dir.path().to_path_buf()]),
+            make_server(temp_dir.path()),
             vec![temp_dir.path().to_path_buf()],
         )
         .await;
@@ -1524,7 +1528,7 @@ mod tests {
         let temp_dir = TestDir::new();
         let file_path = temp_dir.path().join("offset.txt");
         std::fs::write(&file_path, "one\ntwo\nthree\nfour\n").unwrap();
-        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+        let server = make_server(temp_dir.path());
 
         let result = server
             .read_file_impl(ReadFileParams {
@@ -1551,7 +1555,7 @@ mod tests {
         let temp_dir = TestDir::new();
         let file_path = temp_dir.path().join("grep.txt");
         std::fs::write(&file_path, "alpha\nmatch-one\nbeta\nmatch-two\n").unwrap();
-        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+        let server = make_server(temp_dir.path());
 
         let result = server
             .read_file_impl(ReadFileParams {
@@ -1578,7 +1582,7 @@ mod tests {
         let temp_dir = TestDir::new();
         let file_path = temp_dir.path().join("tail.txt");
         std::fs::write(&file_path, "one\ntwo\nthree\nfour\n").unwrap();
-        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+        let server = make_server(temp_dir.path());
 
         let result = server
             .read_file_impl(ReadFileParams {
@@ -1605,7 +1609,7 @@ mod tests {
         let temp_dir = TestDir::new();
         let file_path = temp_dir.path().join("binary.bin");
         std::fs::write(&file_path, b"hello\0world").unwrap();
-        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+        let server = make_server(temp_dir.path());
 
         let result = server
             .read_file_impl(ReadFileParams {
@@ -1714,5 +1718,235 @@ mod tests {
         let text = text_content(&result);
         assert!(text.contains("one.txt:2: needle"));
         assert!(!text.contains("two.txt"));
+    }
+
+    // ── truncation-in-user-summary tests (issue #144) ──────────────────────
+
+    #[tokio::test]
+    async fn test_read_file_summary_limited_on_pagination() {
+        // offset=1 limit=2 on a 4-line file → shows lines 1–2, more remain.
+        // Summary must show the slice range and byte counts.
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("paginated.txt");
+        std::fs::write(&file_path, "one\ntwo\nthree\nfour\n").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .read_file_impl(ReadFileParams {
+                path: file_path.to_string_lossy().to_string(),
+                offset: Some(1),
+                limit: Some(2),
+                tail: None,
+                grep: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+
+        let summary = user_summary(&result);
+        assert!(
+            summary.contains("lines 1\u{2013}2 of 4"),
+            "expected exact paginated range 'lines 1\u{2013}2 of 4' in summary, got: {summary:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_summary_not_limited_when_small() {
+        let temp_dir = TestDir::new();
+        for i in 0..3 {
+            std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .list_directory_impl(ListDirectoryParams {
+                path: temp_dir.path().to_string_lossy().to_string(),
+                recursive: Some(false),
+            })
+            .await
+            .unwrap();
+
+        let summary = user_summary(&result);
+        assert!(
+            !summary.contains("limited"),
+            "expected no 'limited' for small listing, got: {summary:?}"
+        );
+        assert!(
+            summary.contains("Listed 3 entries"),
+            "expected count in summary, got: {summary:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_directory_summary_limited_when_over_default_limit() {
+        // Create DEFAULT_LS_LIMIT + 1 files to trigger limit_reached.
+        // Summary should show "Listed 500 of 501 entries in …".
+        let temp_dir = TestDir::new();
+        for i in 0..=DEFAULT_LS_LIMIT {
+            std::fs::write(temp_dir.path().join(format!("f{i:04}.txt")), "x").unwrap();
+        }
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .list_directory_impl(ListDirectoryParams {
+                path: temp_dir.path().to_string_lossy().to_string(),
+                recursive: Some(false),
+            })
+            .await
+            .unwrap();
+
+        let summary = user_summary(&result);
+        // Should show "Listed 500 of 501 entries" — capped count + true total.
+        assert!(
+            summary.contains(&format!(
+                "Listed {} of {} entries",
+                DEFAULT_LS_LIMIT,
+                DEFAULT_LS_LIMIT + 1
+            )),
+            "expected 'Listed N of M entries' in summary, got: {summary:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_files_summary_variants() {
+        struct Case {
+            files: &'static [(&'static str, &'static str)],
+            max_results: usize,
+            check: fn(&str),
+        }
+
+        let cases: &[Case] = &[
+            Case {
+                files: &[
+                    ("match0.txt", "needle\n"),
+                    ("match1.txt", "needle\n"),
+                    ("match2.txt", "needle\n"),
+                ],
+                max_results: 1,
+                check: |summary| {
+                    assert!(
+                        summary.contains("1+"),
+                        "expected '1+' in summary when max_results hit, got: {summary:?}"
+                    );
+                    assert!(
+                        summary.contains("showing 1"),
+                        "expected 'showing 1' in summary, got: {summary:?}"
+                    );
+                },
+            },
+            Case {
+                files: &[("one.txt", "needle\n")],
+                max_results: 10,
+                check: |summary| {
+                    assert!(
+                        !summary.contains("limited"),
+                        "expected no 'limited' when all results returned, got: {summary:?}"
+                    );
+                },
+            },
+        ];
+
+        for case in cases {
+            let temp_dir = TestDir::new();
+            for (name, content) in case.files {
+                std::fs::write(temp_dir.path().join(name), content).unwrap();
+            }
+            let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+            let result = server
+                .search_files_impl(SearchFilesParams {
+                    pattern: "needle".to_string(),
+                    path: Some(temp_dir.path().to_string_lossy().to_string()),
+                    include: None,
+                    context_lines: Some(0),
+                    ignore_case: Some(false),
+                    max_results: Some(case.max_results),
+                })
+                .await
+                .unwrap();
+
+            (case.check)(user_summary(&result).as_str());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_files_basic() {
+        // Regression: glob pattern must use '/' not MAIN_SEPARATOR —
+        // the glob crate expects Unix separators on all platforms.
+        let temp_dir = TestDir::new();
+        std::fs::write(temp_dir.path().join("hello.txt"), "").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .find_files_impl(FindFilesParams {
+                pattern: "*.txt".to_string(),
+                path: Some(temp_dir.path().to_string_lossy().to_string()),
+                max_results: Some(10),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("hello.txt"),
+            "find_files should locate files on any platform, got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_files_summary_variants() {
+        struct Case {
+            files: &'static [&'static str],
+            max_results: usize,
+            check: fn(&str),
+        }
+
+        let cases: &[Case] = &[
+            Case {
+                files: &["file0.txt", "file1.txt", "file2.txt"],
+                max_results: 1,
+                check: |summary| {
+                    assert!(
+                        summary.contains("1+"),
+                        "expected '1+' in find_files summary when max_results hit, got: {summary:?}"
+                    );
+                    assert!(
+                        summary.contains("showing 1"),
+                        "expected 'showing 1' in find_files summary, got: {summary:?}"
+                    );
+                },
+            },
+            Case {
+                files: &["only.txt"],
+                max_results: 10,
+                check: |summary| {
+                    assert!(
+                        !summary.contains("limited"),
+                        "expected no 'limited' when all files returned, got: {summary:?}"
+                    );
+                },
+            },
+        ];
+
+        for case in cases {
+            let temp_dir = TestDir::new();
+            for name in case.files {
+                std::fs::write(temp_dir.path().join(name), "").unwrap();
+            }
+            let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+            let result = server
+                .find_files_impl(FindFilesParams {
+                    pattern: "*.txt".to_string(),
+                    path: Some(temp_dir.path().to_string_lossy().to_string()),
+                    max_results: Some(case.max_results),
+                })
+                .await
+                .unwrap();
+
+            (case.check)(user_summary(&result).as_str());
+        }
     }
 }
