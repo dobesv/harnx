@@ -319,15 +319,24 @@ impl AgentEventSink for CliAgentEventSink {
                     );
                 }
             }
-            AgentEvent::Tool(ToolEvent::Started { name, .. }) => {
-                eprintln!("{}", dimmed_text(&format!("[tool] {name}")));
+            AgentEvent::Tool(ToolEvent::Started { name, title, .. }) => {
+                eprintln!(
+                    "{}",
+                    dimmed_text(&format_tool_started_line(&name, title.as_deref()))
+                );
             }
             AgentEvent::Tool(ToolEvent::Failed { error, .. }) => {
                 eprintln!("{}", warning_text(&format!("tool error: {error}")));
             }
-            // Silent for Progress / Update / Completed: CLI doesn't stream
-            // per-chunk tool updates; Completed's output is usually internal
-            // and shouldn't clutter stderr.
+            AgentEvent::Tool(ToolEvent::Completed { output, title, .. }) => {
+                let text = harnx_runtime::utils::render_tool_result_text(&output, title.as_deref());
+                let trimmed = text.trim_end_matches('\n');
+                if !trimmed.is_empty() {
+                    eprintln!("{}", dimmed_text(trimmed));
+                }
+            }
+            // Silent for Progress / Update — they are streamed mid-call
+            // updates that would clutter stderr.
             AgentEvent::Tool(_) => {}
             // Every other variant — Session, Status, Plan — still gets
             // captured so nothing silently disappears. These receive dedicated
@@ -367,6 +376,17 @@ fn split_line_tail_local(text: &str) -> (&str, &str) {
 fn need_rows_local(text: &str, columns: u16) -> u16 {
     let buffer_width = display_width(text).max(1) as u16;
     buffer_width.div_ceil(columns)
+}
+
+/// Format the line printed for `ToolEvent::Started`. When the producer has
+/// rendered a MiniJinja `call_template` into `title`, append it after the
+/// tool name so the user sees the templated form instead of just the bare
+/// tool name. Public for testing the pure formatting decision.
+pub(crate) fn format_tool_started_line(name: &str, title: Option<&str>) -> String {
+    match title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => format!("[tool] {name} {t}"),
+        None => format!("[tool] {name}"),
+    }
 }
 
 #[cfg(test)]
@@ -447,6 +467,110 @@ mod tests {
                 outcome: Default::default(),
             }),
             None,
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // MCP MiniJinja templating: CLI must surface the rendered title/
+    // content fields produced by harnx-runtime when an MCP tool's
+    // `_meta.call_template` / `_meta.result_template` is set. Covers
+    // issue #340 / PR #349 — the producer wired templates into the
+    // ToolEvent fields, but the CLI consumer was discarding them
+    // prior to these tests.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn started_line_includes_template_title_when_present() {
+        let line = format_tool_started_line("bash_exec", Some("$ ls -la /tmp"));
+        assert_eq!(line, "[tool] bash_exec $ ls -la /tmp");
+    }
+
+    #[test]
+    fn started_line_uses_bare_name_when_title_absent() {
+        let line = format_tool_started_line("bash_exec", None);
+        assert_eq!(line, "[tool] bash_exec");
+    }
+
+    #[test]
+    fn started_line_treats_empty_title_as_absent() {
+        // A template that renders to whitespace-only must not pollute the
+        // line with trailing whitespace — matches the "no template" path.
+        assert_eq!(
+            format_tool_started_line("name", Some("")),
+            "[tool] name",
+            "empty title should fall back"
+        );
+        assert_eq!(
+            format_tool_started_line("name", Some("   ")),
+            "[tool] name",
+            "whitespace-only title should fall back"
+        );
+    }
+
+    // The CLI Completed handler delegates to
+    // `harnx_runtime::utils::render_tool_result_text`, the same shared
+    // helper the TUI uses. We assert against that helper directly so any
+    // future tweak to the rendering rules updates a single test surface.
+
+    #[test]
+    fn completed_uses_template_title_when_present() {
+        // With a template-rendered title, prefer it over the raw output.
+        let raw_output = serde_json::json!({
+            "content": [{"type": "text", "text": "hello"}],
+            "isError": false,
+        });
+        let rendered =
+            harnx_runtime::utils::render_tool_result_text(&raw_output, Some("OK: hello"));
+        assert!(rendered.contains("OK: hello"));
+        assert!(
+            !rendered.contains("isError"),
+            "raw output JSON leaked when title was provided: {rendered}"
+        );
+    }
+
+    #[test]
+    fn completed_falls_back_to_extracted_text_when_no_title() {
+        // No template => extract user-display text from MCP-style output.
+        // Restores pre-0daecac CLI behavior (was silent in the interim).
+        let raw_output = serde_json::json!({
+            "content": [{"type": "text", "text": "tool stdout here"}],
+        });
+        let rendered = harnx_runtime::utils::render_tool_result_text(&raw_output, None);
+        assert!(
+            rendered.contains("tool stdout here"),
+            "expected extracted user-display text in output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn completed_falls_back_to_string_when_no_title_and_string_output() {
+        // String-typed output passes through without yaml-wrapping.
+        let raw_output = serde_json::Value::String("plain stdout line".into());
+        let rendered = harnx_runtime::utils::render_tool_result_text(&raw_output, None);
+        assert!(rendered.contains("plain stdout line"));
+    }
+
+    #[test]
+    fn completed_falls_back_to_yaml_for_arbitrary_json() {
+        // Arbitrary JSON with no extractable text falls through to YAML —
+        // not silent, not the Debug form. Better-than-nothing display.
+        let raw_output = serde_json::json!({"exitCode": 0, "duration_ms": 42});
+        let rendered = harnx_runtime::utils::render_tool_result_text(&raw_output, None);
+        assert!(
+            rendered.contains("exitCode") && rendered.contains("duration_ms"),
+            "expected YAML keys in fallback output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn completed_treats_empty_title_as_no_title() {
+        // A template that renders to "" must not blank out the result —
+        // fall back to extraction so the user still sees the tool's work.
+        let raw_output = serde_json::Value::String("important output".into());
+        let rendered = harnx_runtime::utils::render_tool_result_text(&raw_output, Some(""));
+        assert!(
+            rendered.contains("important output"),
+            "empty title should fall back to extraction: {rendered}"
         );
     }
 }

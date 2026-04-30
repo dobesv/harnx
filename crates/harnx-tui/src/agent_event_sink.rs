@@ -29,37 +29,12 @@ impl AgentEventSink for TuiAgentEventSink {
     }
 }
 
-/// Extract and truncate a tool result for transcript display. Used by
-/// `render_agent_event`'s `Tool::Completed` arm in `input.rs`. The
+/// Re-export of `harnx_runtime::utils::render_tool_result_text` so the
+/// TUI sink and the CLI sink format tool results identically. The
 /// returned text is NOT dim-wrapped — the TUI renderer applies the dim
-/// `Modifier` via `TranscriptItem::ToolResultText`'s style so an ANSI
-/// dim escape would be redundant (and would fight test inputs that
-/// pre-dim their text — `sanitize_output_text` strips the ESC, leaving
-/// literal `[2m`/`[0m` markers visible).
-///
-/// Mirrors the head/line sizing used by `default_emit_tool_result` so
-/// production and TUI transcripts truncate at the same boundary.
-pub(crate) fn render_tool_result_text(
-    output: &serde_json::Value,
-    _content: &[harnx_core::event::ContentBlock],
-) -> String {
-    use harnx_core::tool::extract_user_display_text;
-    use harnx_mcp::safety::{truncate_output, TruncateOpts};
-
-    let mut opts = TruncateOpts::default();
-    let marker = " [...] ";
-    if let Ok((cols, rows)) = crossterm::terminal::size() {
-        opts.head_lines = 5.max((rows / 2) as usize);
-        opts.tail_lines = 0;
-        opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
-        opts.line_tail_bytes = 0;
-        opts.marker = Some(marker.to_string());
-    }
-    let output_str = extract_user_display_text(output).unwrap_or_else(|| match output {
-        serde_json::Value::String(s) => s.clone(),
-        _ => harnx_runtime::utils::pretty_yaml_block(output),
-    });
-    truncate_output(&output_str, &opts)
+/// `Modifier` via `TranscriptItem::ToolResultText`'s style.
+pub(crate) fn render_tool_result_text(output: &serde_json::Value, title: Option<&str>) -> String {
+    harnx_runtime::utils::render_tool_result_text(output, title)
 }
 
 /// Install the `TuiAgentEventSink`. Called by TUI-mode startup with
@@ -132,7 +107,7 @@ mod tests {
             AgentEvent::Tool(ToolEvent::Completed {
                 id: String::new(),
                 output: serde_json::Value::String("ok".into()),
-                content: vec![],
+                title: None,
             }),
             Some(AgentSource {
                 agent: "hephaestus".into(),

@@ -66,6 +66,47 @@ pub fn pretty_yaml_block(value: &serde_json::Value) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
+/// Format a tool's `Completed` event for terminal display.
+///
+/// Prefers `title` (set by harnx-runtime when an MCP `result_template`
+/// matched the call) over the raw `output`. When `title` is `None` or
+/// renders to whitespace, falls back to `extract_user_display_text` →
+/// string passthrough → YAML, then truncates to fit the current
+/// terminal. Both the TUI sink and the CLI sink call this so they
+/// render identically.
+pub fn render_tool_result_text(output: &serde_json::Value, title: Option<&str>) -> String {
+    use harnx_core::tool::extract_user_display_text;
+    use harnx_mcp::safety::{truncate_output, TruncateOpts};
+
+    let mut opts = TruncateOpts::default();
+    let marker = " [...] ";
+    // Drop (0, 0) sizes from non-TTY environments — `(cols as usize)
+    // .saturating_sub(...)` would yield 0 and truncate every line to
+    // nothing. Falling through leaves the safer `TruncateOpts::default()`
+    // (head_lines=25, line_head_bytes=500) in place.
+    if let Ok((cols, rows)) = crossterm::terminal::size().and_then(|(c, r)| {
+        if c > 0 && r > 0 {
+            Ok((c, r))
+        } else {
+            Err(std::io::Error::other("non-TTY: terminal size unavailable"))
+        }
+    }) {
+        opts.head_lines = 5.max((rows / 2) as usize);
+        opts.tail_lines = 0;
+        opts.line_head_bytes = (cols as usize).saturating_sub(3 + marker.len());
+        opts.line_tail_bytes = 0;
+        opts.marker = Some(marker.to_string());
+    }
+    let text = match title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => t.to_string(),
+        None => extract_user_display_text(output).unwrap_or_else(|| match output {
+            serde_json::Value::String(s) => s.clone(),
+            _ => pretty_yaml_block(output),
+        }),
+    };
+    truncate_output(&text, &opts)
+}
+
 pub use harnx_core::config_paths::get_env_name;
 
 pub fn parse_bool(value: &str) -> Option<bool> {

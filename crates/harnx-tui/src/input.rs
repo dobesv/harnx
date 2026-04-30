@@ -598,9 +598,7 @@ impl Tui {
                     vec![TranscriptItem::SystemText(clean)]
                 }
             }
-            AgentEvent::Tool(ToolEvent::Completed {
-                output, content, ..
-            }) => {
+            AgentEvent::Tool(ToolEvent::Completed { output, title, .. }) => {
                 // The TuiAgentEventSink forwards Tool::Completed through
                 // render_agent_event. The truncation + formatting live
                 // here (mirror of default_emit_tool_result). Strip ANSI
@@ -616,7 +614,7 @@ impl Tui {
                     serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
                     _ => output.clone(),
                 };
-                let text = crate::agent_event_sink::render_tool_result_text(&raw, &content);
+                let text = crate::agent_event_sink::render_tool_result_text(&raw, title.as_deref());
                 let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
                 if clean.is_empty() {
                     vec![]
@@ -773,10 +771,15 @@ impl Tui {
                     vec![]
                 }
             }
-            AgentEvent::Tool(ToolEvent::Started { name, input, .. }) => {
-                let input_yaml = match &input {
-                    serde_json::Value::Null => None,
-                    _ => Some(pretty_yaml_block(&input)),
+            AgentEvent::Tool(ToolEvent::Started {
+                name, title, input, ..
+            }) => {
+                let input_yaml = match title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    Some(t) => Some(t.to_string()),
+                    None => match &input {
+                        serde_json::Value::Null => None,
+                        _ => Some(pretty_yaml_block(&input)),
+                    },
                 };
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
