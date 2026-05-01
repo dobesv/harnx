@@ -1512,9 +1512,7 @@ mod tests {
                     "expected ToolStatus::Completed, got {status:?}"
                 );
             }
-            other => panic!(
-                "expected ToolEvent::Update with Completed status, got {other:?}"
-            ),
+            other => panic!("expected ToolEvent::Update with Completed status, got {other:?}"),
         }
     }
 

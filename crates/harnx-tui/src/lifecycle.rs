@@ -322,21 +322,18 @@ pub(crate) fn messages_to_transcript_items(
                         };
                         // Always attempt template rendering, even for zero-arg tools
                         // (raw_call_fallback may be empty but a call_template can still render).
-                        let body =
-                            match harnx_runtime::tool::render_call_for_display(
-                                &r.call,
-                                &r.call.arguments,
-                                &raw_call_fallback,
-                                decl_map,
-                            ) {
-                                Some(rendered) => {
-                                    Some(crate::types::ToolCallBody::Markdown(rendered))
-                                }
-                                None if !raw_call_fallback.is_empty() => {
-                                    Some(crate::types::ToolCallBody::Yaml(raw_call_fallback))
-                                }
-                                None => None,
-                            };
+                        let body = match harnx_runtime::tool::render_call_for_display(
+                            &r.call,
+                            &r.call.arguments,
+                            &raw_call_fallback,
+                            decl_map,
+                        ) {
+                            Some(rendered) => Some(crate::types::ToolCallBody::Markdown(rendered)),
+                            None if !raw_call_fallback.is_empty() => {
+                                Some(crate::types::ToolCallBody::Yaml(raw_call_fallback))
+                            }
+                            None => None,
+                        };
                         items.push(TranscriptItem::ToolCall {
                             tool_name: r.call.name.clone(),
                             body,
