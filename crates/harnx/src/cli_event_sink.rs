@@ -437,6 +437,9 @@ fn split_line_tail_local(text: &str) -> (&str, &str) {
 }
 
 fn need_rows_local(text: &str, columns: u16) -> u16 {
+    if columns == 0 {
+        return 0;
+    }
     let buffer_width = display_width(text).max(1) as u16;
     buffer_width.div_ceil(columns)
 }
