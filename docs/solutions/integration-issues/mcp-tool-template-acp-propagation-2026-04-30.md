@@ -245,11 +245,11 @@ acp::SessionUpdate::ToolCallUpdate(tcu) => {
     let markdown = tcu.fields.title.clone();
     let status = tcu.fields.status;
     match status {
-        Some(acp::ToolCallStatus::Completed) if tcu.raw_output.is_some() => {
+        Some(acp::ToolCallStatus::Completed) if tcu.fields.raw_output.is_some() => {
             // Completed with output -> ToolEvent::Completed
             Some(AgentEvent::Tool(ToolEvent::Completed {
                 id: tcu.tool_call_id.to_string(),
-                output: tcu.raw_output.unwrap(),
+                output: tcu.fields.raw_output.clone().unwrap(),
                 markdown,
             }))
         }

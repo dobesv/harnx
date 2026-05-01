@@ -769,6 +769,15 @@ enabled: false
         harnx_core::sink::clear_agent_event_sink();
         harnx_core::sink::install_agent_event_sink(sink.clone());
 
+        // RAII guard — clears the global sink even if assertions panic.
+        struct SinkCleanupGuard;
+        impl Drop for SinkCleanupGuard {
+            fn drop(&mut self) {
+                harnx_core::sink::clear_agent_event_sink();
+            }
+        }
+        let _cleanup = SinkCleanupGuard;
+
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tx.send(NestedAcpEvent::Agent(
             AgentEvent::Tool(ToolEvent::Completed {
@@ -817,8 +826,6 @@ enabled: false
             }
             other => panic!("unexpected second event: {other:?}"),
         }
-        drop(events);
-        harnx_core::sink::clear_agent_event_sink();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
