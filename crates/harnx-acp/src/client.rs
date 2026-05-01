@@ -227,30 +227,53 @@ impl acp::Client for AcpNotificationClient {
             }
             acp::SessionUpdate::ToolCall(tc) => {
                 let input = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
+                let meta = tc.meta.as_ref().map(|m| serde_json::json!(m));
+                let markdown = meta.as_ref().and_then(markdown_from_meta_value);
+                // ACP protocol ToolCall.title is the tool name — distinct from our internal markdown field
                 Some(AgentEvent::Tool(ToolEvent::Started {
                     id: tc.tool_call_id.to_string(),
                     name: tc.title.clone(),
                     kind: ToolKind::Other,
-                    title: None,
+                    markdown,
                     input,
                     locations: vec![],
                 }))
             }
             acp::SessionUpdate::ToolCallUpdate(tcu) => {
-                let title = tcu.fields.title.clone();
+                // ACP ToolCallUpdate.fields.title carries the rendered display text (our internal "markdown")
+                let markdown = tcu.fields.title.clone();
+                let raw_output = tcu.fields.raw_output.clone();
                 let status_str = tcu.fields.status.as_ref().map(|status| {
                     serde_json::to_value(status)
                         .ok()
                         .and_then(|v| v.as_str().map(String::from))
                         .unwrap_or_else(|| format!("{:?}", status))
                 });
-                if title.is_none() && status_str.is_none() {
+                let is_completed = status_str.as_deref() == Some("completed");
+                if is_completed {
+                    if let Some(output) = raw_output {
+                        Some(AgentEvent::Tool(ToolEvent::Completed {
+                            id: tcu.tool_call_id.to_string(),
+                            output,
+                            markdown,
+                        }))
+                    } else {
+                        // status=completed but no raw_output — emit an Update with
+                        // Completed status so the parent TUI can close the tool bubble.
+                        Some(AgentEvent::Tool(ToolEvent::Update {
+                            id: tcu.tool_call_id.to_string(),
+                            markdown,
+                            status: Some(ToolStatus::Completed),
+                            content: None,
+                        }))
+                    }
+                } else if markdown.is_none() && status_str.is_none() {
                     None
                 } else {
                     let status = status_str.as_deref().and_then(parse_tool_status_str);
                     Some(AgentEvent::Tool(ToolEvent::Update {
                         id: tcu.tool_call_id.to_string(),
-                        title,
+                        markdown,
                         status,
                         content: None,
                     }))
@@ -959,6 +982,14 @@ fn session_from_meta_value(value: &serde_json::Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn markdown_from_meta_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("harnx:markdown")
+        .and_then(serde_json::Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn resolve_notification_source(
     fallback_agent: &str,
     notification: &acp::SessionNotification,
@@ -1319,5 +1350,215 @@ mod tests {
             source.session_id.as_deref(),
             Some("608e48b6-c880-4168-b028-1bda3469be07")
         );
+    }
+
+    #[tokio::test]
+    async fn nested_tool_call_update_with_completed_status_and_raw_output_emits_completed_event() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let expected_output = json!({"result": "file.txt"});
+        let notification = acp::SessionNotification::new(
+            acp::SessionId::new("outer-session"),
+            acp::SessionUpdate::ToolCallUpdate(
+                acp::ToolCallUpdate::new(
+                    "call-id-1",
+                    acp::ToolCallUpdateFields::new()
+                        .status(acp::ToolCallStatus::Completed)
+                        .raw_output(expected_output.clone()),
+                )
+                .meta(serde_json::Map::from_iter([
+                    ("agent".to_string(), json!("pytheas")),
+                    (
+                        "session".to_string(),
+                        json!("608e48b6-c880-4168-b028-1bda3469be07"),
+                    ),
+                ])),
+            ),
+        );
+
+        client
+            .session_notification(notification)
+            .await
+            .expect("session notification should succeed");
+
+        let NestedAcpEvent::Agent(forwarded_event, forwarded_source) =
+            chunk_rx.recv().await.expect("forwarded nested ACP event")
+        else {
+            panic!("unexpected nested ACP event");
+        };
+
+        match forwarded_event {
+            AgentEvent::Tool(ToolEvent::Completed { id, output, .. }) => {
+                assert_eq!(id, "call-id-1");
+                assert_eq!(output, expected_output);
+            }
+            other => panic!("unexpected forwarded event: {other:?}"),
+        }
+        let source = forwarded_source.expect("forwarded agent source");
+        assert_eq!(source.agent, "pytheas");
+        assert_eq!(
+            source.session_id.as_deref(),
+            Some("608e48b6-c880-4168-b028-1bda3469be07")
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_tool_call_update_with_in_progress_status_emits_update_event() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = acp::SessionNotification::new(
+            acp::SessionId::new("outer-session"),
+            acp::SessionUpdate::ToolCallUpdate(
+                acp::ToolCallUpdate::new(
+                    "call-id-1",
+                    acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
+                )
+                .meta(serde_json::Map::from_iter([
+                    ("agent".to_string(), json!("pytheas")),
+                    (
+                        "session".to_string(),
+                        json!("608e48b6-c880-4168-b028-1bda3469be07"),
+                    ),
+                ])),
+            ),
+        );
+
+        client
+            .session_notification(notification)
+            .await
+            .expect("session notification should succeed");
+
+        let NestedAcpEvent::Agent(forwarded_event, forwarded_source) =
+            chunk_rx.recv().await.expect("forwarded nested ACP event")
+        else {
+            panic!("unexpected nested ACP event");
+        };
+
+        match forwarded_event {
+            AgentEvent::Tool(ToolEvent::Update { id, status, .. }) => {
+                assert_eq!(id, "call-id-1");
+                assert!(matches!(status, Some(ToolStatus::InProgress)));
+            }
+            other => panic!("unexpected forwarded event: {other:?}"),
+        }
+        let source = forwarded_source.expect("forwarded agent source");
+        assert_eq!(source.agent, "pytheas");
+        assert_eq!(
+            source.session_id.as_deref(),
+            Some("608e48b6-c880-4168-b028-1bda3469be07")
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_tool_call_completed_status_without_raw_output_emits_update_with_completed_status(
+    ) {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        // status=completed but NO raw_output — must not drop the event
+        let notification = acp::SessionNotification::new(
+            acp::SessionId::new("outer-session"),
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                "call-no-output",
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+            )),
+        );
+
+        client
+            .session_notification(notification)
+            .await
+            .expect("session notification should succeed");
+
+        let NestedAcpEvent::Agent(forwarded_event, _) =
+            chunk_rx.recv().await.expect("forwarded nested ACP event")
+        else {
+            panic!("unexpected nested ACP event");
+        };
+
+        match forwarded_event {
+            AgentEvent::Tool(ToolEvent::Update { id, status, .. }) => {
+                assert_eq!(id, "call-no-output");
+                assert!(
+                    matches!(status, Some(ToolStatus::Completed)),
+                    "expected ToolStatus::Completed, got {status:?}"
+                );
+            }
+            other => panic!("expected ToolEvent::Update with Completed status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_tool_call_markdown_round_trips_through_acp_meta() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = acp::SessionNotification::new(
+            acp::SessionId::new("outer-session"),
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("call-1", "bash_exec")
+                    .raw_input(json!({"command": "ls -la /tmp"}))
+                    .meta(serde_json::Map::from_iter([
+                        ("agent".to_string(), json!("pytheas")),
+                        ("harnx:markdown".to_string(), json!("**$** `ls -la /tmp`")),
+                    ])),
+            ),
+        );
+
+        client.session_notification(notification).await.unwrap();
+
+        let forwarded = chunk_rx.recv().await.expect("forwarded nested ACP event");
+        let (forwarded_event, _) = match forwarded {
+            NestedAcpEvent::Agent(event, source) => (event, source),
+            other => panic!("unexpected nested ACP event: {other:?}"),
+        };
+
+        match &forwarded_event {
+            AgentEvent::Tool(ToolEvent::Started { markdown, .. }) => {
+                assert_eq!(
+                    markdown.as_deref(),
+                    Some("**$** `ls -la /tmp`"),
+                    "markdown should round-trip through ACP meta"
+                );
+            }
+            other => panic!("unexpected forwarded event: {other:?}"),
+        }
     }
 }

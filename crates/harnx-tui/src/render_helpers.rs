@@ -77,10 +77,12 @@ fn patch_spans<'a>(spans: Vec<Span<'a>>, base_style: Style) -> Vec<Span<'static>
         .collect()
 }
 
-pub(crate) fn render_status_line(title: Option<&str>, status: Option<&str>) -> Option<String> {
-    let line = [title, status]
+pub(crate) fn render_status_line(markdown: Option<&str>, status: Option<&str>) -> Option<String> {
+    let line = [markdown, status]
         .into_iter()
         .flatten()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
     (!line.is_empty()).then_some(format!("-> {line}"))
@@ -296,6 +298,25 @@ mod markdown_tests {
             .find(|s| s.content.as_ref() == "bold line")
             .expect("expected bold span");
         assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn render_status_line_ignores_whitespace_only_parts() {
+        use super::render_status_line;
+        // whitespace-only markdown → should not produce "->  " garbage
+        assert_eq!(render_status_line(Some("  "), None), None);
+        assert_eq!(render_status_line(None, Some("\t")), None);
+        assert_eq!(render_status_line(Some("  "), Some("  ")), None);
+        // real content is preserved
+        assert_eq!(
+            render_status_line(Some("  hello  "), None),
+            Some("-> hello".to_string())
+        );
+        // whitespace-only part is excluded, real part kept
+        assert_eq!(
+            render_status_line(Some("  "), Some("running")),
+            Some("-> running".to_string())
+        );
     }
 
     #[test]

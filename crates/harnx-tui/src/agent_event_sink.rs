@@ -33,8 +33,11 @@ impl AgentEventSink for TuiAgentEventSink {
 /// TUI sink and the CLI sink format tool results identically. The
 /// returned text is NOT dim-wrapped — the TUI renderer applies the dim
 /// `Modifier` via the `TranscriptItem::ToolResultMarkdown` render path.
-pub(crate) fn render_tool_result_text(output: &serde_json::Value, title: Option<&str>) -> String {
-    harnx_runtime::utils::render_tool_result_text(output, title)
+pub(crate) fn render_tool_result_text(
+    output: &serde_json::Value,
+    markdown: Option<&str>,
+) -> String {
+    harnx_runtime::utils::render_tool_result_text(output, markdown)
 }
 
 /// Install the `TuiAgentEventSink`. Called by TUI-mode startup with
@@ -107,7 +110,7 @@ mod tests {
             AgentEvent::Tool(ToolEvent::Completed {
                 id: String::new(),
                 output: serde_json::Value::String("ok".into()),
-                title: None,
+                markdown: None,
             }),
             Some(AgentSource {
                 agent: "hephaestus".into(),

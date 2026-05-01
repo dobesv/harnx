@@ -186,11 +186,11 @@ impl CliSinkState {
     }
 
     /// Stderr render for `ToolEvent::Started`: dim "[tool] {name}", and
-    /// when the producer rendered an MCP `call_template` into `title`,
+    /// when the producer rendered an MCP `call_template` into `markdown`,
     /// append the markdown-styled rendering after it.
-    fn print_tool_started(&mut self, name: &str, title: Option<&str>) {
+    fn print_tool_started(&mut self, name: &str, markdown: Option<&str>) {
         let prefix = dimmed_text(&format!("[tool] {name}"));
-        match title.map(str::trim).filter(|t| !t.is_empty()) {
+        match markdown.map(str::trim).filter(|t| !t.is_empty()) {
             Some(t) => {
                 let rendered = self.render_markdown_line(t);
                 eprintln!("{prefix} {rendered}");
@@ -207,8 +207,8 @@ impl CliSinkState {
     /// renders, and plain text passes through unchanged. Falls back to
     /// dim plain text when highlighting is disabled or the renderer
     /// can't initialize.
-    fn print_tool_completed(&mut self, output: &serde_json::Value, title: Option<&str>) {
-        let text = harnx_runtime::utils::render_tool_result_text(output, title);
+    fn print_tool_completed(&mut self, output: &serde_json::Value, markdown: Option<&str>) {
+        let text = harnx_runtime::utils::render_tool_result_text(output, markdown);
         let trimmed = text.trim_end_matches('\n');
         if trimmed.is_empty() {
             return;
@@ -374,14 +374,16 @@ impl AgentEventSink for CliAgentEventSink {
                     );
                 }
             }
-            AgentEvent::Tool(ToolEvent::Started { name, title, .. }) => {
-                state.print_tool_started(&name, title.as_deref());
+            AgentEvent::Tool(ToolEvent::Started { name, markdown, .. }) => {
+                state.print_tool_started(&name, markdown.as_deref());
             }
             AgentEvent::Tool(ToolEvent::Failed { error, .. }) => {
                 eprintln!("{}", warning_text(&format!("tool error: {error}")));
             }
-            AgentEvent::Tool(ToolEvent::Completed { output, title, .. }) => {
-                state.print_tool_completed(&output, title.as_deref());
+            AgentEvent::Tool(ToolEvent::Completed {
+                output, markdown, ..
+            }) => {
+                state.print_tool_completed(&output, markdown.as_deref());
             }
             // Silent for Progress / Update — they are streamed mid-call
             // updates that would clutter stderr.
@@ -499,7 +501,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // MCP MiniJinja templating: CLI must surface the rendered title/
+    // MCP MiniJinja templating: CLI must surface the rendered markdown/
     // content fields produced by harnx-runtime when an MCP tool's
     // `_meta.call_template` / `_meta.result_template` is set. Covers
     // issue #340 / PR #349 — the producer wired templates into the
@@ -508,8 +510,8 @@ mod tests {
     // ----------------------------------------------------------------
 
     // The CLI Started handler renders the bare "[tool] name" prefix
-    // dimmed and appends the markdown-rendered title (or nothing if no
-    // title). The whitespace/empty fallback decision lives inline in the
+    // dimmed and appends the markdown-rendered text (or nothing if no
+    // markdown). The whitespace/empty fallback decision lives inline in the
     // emit handler, exercised end-to-end by
     // `emit_handles_each_top_level_variant_without_panic` plus the
     // markdown-line tests below.
@@ -520,8 +522,8 @@ mod tests {
     // future tweak to the rendering rules updates a single test surface.
 
     #[test]
-    fn completed_uses_template_title_when_present() {
-        // With a template-rendered title, prefer it over the raw output.
+    fn completed_uses_template_markdown_when_present() {
+        // With a template-rendered markdown, prefer it over the raw output.
         let raw_output = serde_json::json!({
             "content": [{"type": "text", "text": "hello"}],
             "isError": false,
@@ -531,12 +533,12 @@ mod tests {
         assert!(rendered.contains("OK: hello"));
         assert!(
             !rendered.contains("isError"),
-            "raw output JSON leaked when title was provided: {rendered}"
+            "raw output JSON leaked when markdown was provided: {rendered}"
         );
     }
 
     #[test]
-    fn completed_falls_back_to_extracted_text_when_no_title() {
+    fn completed_falls_back_to_extracted_text_when_no_markdown() {
         // No template => extract user-display text from MCP-style output.
         // Restores pre-0daecac CLI behavior (was silent in the interim).
         let raw_output = serde_json::json!({
@@ -550,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_falls_back_to_string_when_no_title_and_string_output() {
+    fn completed_falls_back_to_string_when_no_markdown_and_string_output() {
         // String-typed output passes through without yaml-wrapping.
         let raw_output = serde_json::Value::String("plain stdout line".into());
         let rendered = harnx_runtime::utils::render_tool_result_text(&raw_output, None);
@@ -570,14 +572,14 @@ mod tests {
     }
 
     #[test]
-    fn completed_treats_empty_title_as_no_title() {
+    fn completed_treats_empty_markdown_as_no_markdown() {
         // A template that renders to "" must not blank out the result —
         // fall back to extraction so the user still sees the tool's work.
         let raw_output = serde_json::Value::String("important output".into());
         let rendered = harnx_runtime::utils::render_tool_result_text(&raw_output, Some(""));
         assert!(
             rendered.contains("important output"),
-            "empty title should fall back to extraction: {rendered}"
+            "empty markdown should fall back to extraction: {rendered}"
         );
     }
 

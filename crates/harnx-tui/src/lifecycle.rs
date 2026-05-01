@@ -15,10 +15,12 @@ use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
 use harnx_hooks::{drain_async_results, AsyncHookManager, PersistentHookManager};
 use harnx_runtime::config::GlobalConfig;
+use harnx_runtime::tool::ToolDeclaration;
 use harnx_runtime::utils::create_abort_signal;
 use ratatui::Terminal;
 #[cfg(test)]
 use ratatui_textarea::Input as TextInput;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Instant;
@@ -279,7 +281,10 @@ impl Tui {
     }
 }
 
-pub(crate) fn messages_to_transcript_items(messages: &[Message]) -> Vec<TranscriptItem> {
+pub(crate) fn messages_to_transcript_items(
+    messages: &[Message],
+    decl_map: &HashMap<String, ToolDeclaration>,
+) -> Vec<TranscriptItem> {
     use harnx_core::message::{MessageContent, MessageRole};
     use serde_json::Value;
 
@@ -310,23 +315,43 @@ pub(crate) fn messages_to_transcript_items(messages: &[Message]) -> Vec<Transcri
                         items.push(TranscriptItem::AssistantText(tc.text.clone()));
                     }
                     for r in &tc.tool_results {
-                        // Restored sessions don't have access to the live
-                        // tool declaration map, so templates can't be
-                        // re-rendered here — fall back to YAML/raw output.
-                        // Tracked in #385.
-                        let body = if r.call.arguments == Value::Null {
-                            None
+                        let raw_call_fallback = if r.call.arguments == Value::Null {
+                            String::new()
                         } else {
-                            Some(crate::types::ToolCallBody::Yaml(
-                                harnx_runtime::utils::pretty_yaml_block(&r.call.arguments),
-                            ))
+                            harnx_runtime::utils::pretty_yaml_block(&r.call.arguments)
+                        };
+                        // Always attempt template rendering, even for zero-arg tools
+                        // (raw_call_fallback may be empty but a call_template can still render).
+                        let body = match harnx_runtime::tool::render_call_for_display(
+                            &r.call,
+                            &r.call.arguments,
+                            &raw_call_fallback,
+                            decl_map,
+                        ) {
+                            Some(rendered) => Some(crate::types::ToolCallBody::Markdown(rendered)),
+                            None if !raw_call_fallback.is_empty() => {
+                                Some(crate::types::ToolCallBody::Yaml(raw_call_fallback))
+                            }
+                            None => None,
                         };
                         items.push(TranscriptItem::ToolCall {
                             tool_name: r.call.name.clone(),
                             body,
                         });
-                        let rendered =
-                            crate::agent_event_sink::render_tool_result_text(&r.output, None);
+                        let raw_result_fallback = harnx_core::tool::extract_user_display_text(
+                            &r.output,
+                        )
+                        .unwrap_or_else(|| harnx_runtime::utils::pretty_yaml_block(&r.output));
+                        let rendered_result = harnx_runtime::tool::render_result_for_display(
+                            &r.call,
+                            &r.output,
+                            &raw_result_fallback,
+                            decl_map,
+                        );
+                        let rendered = crate::agent_event_sink::render_tool_result_text(
+                            &r.output,
+                            rendered_result.as_deref(),
+                        );
                         let trimmed = rendered.trim_end_matches('\n');
                         if !trimmed.is_empty() {
                             items.push(TranscriptItem::ToolResultMarkdown(trimmed.to_string()));
@@ -345,13 +370,131 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
         Some(s) if !s.is_empty() => s,
         _ => return vec![],
     };
+    let decl_map: HashMap<String, ToolDeclaration> = cfg
+        .tool_declarations_for_use_tools(Some("*"))
+        .into_iter()
+        .map(|d| (d.name.clone(), d))
+        .collect();
     let mut items = Vec::new();
     if !session.compressed_messages.is_empty() {
-        items.extend(messages_to_transcript_items(&session.compressed_messages));
+        items.extend(messages_to_transcript_items(
+            &session.compressed_messages,
+            &decl_map,
+        ));
         items.push(TranscriptItem::SystemText(
             "─── session compacted ───".to_string(),
         ));
     }
-    items.extend(messages_to_transcript_items(&session.messages));
+    items.extend(messages_to_transcript_items(&session.messages, &decl_map));
     items
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ToolCallBody, TranscriptItem};
+    use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+    use harnx_core::tool::{ToolCall, ToolResult};
+    use harnx_runtime::tool::ToolDeclaration;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn messages_to_transcript_uses_markdown_when_template_exists() {
+        let mut decl_map: HashMap<String, ToolDeclaration> = HashMap::new();
+        let decl = ToolDeclaration {
+            name: "bash_exec".to_string(),
+            description: String::new(),
+            parameters: Default::default(),
+            mcp_tool_name: Some("bash_exec".to_string()),
+            call_template: Some("${{ args.command }}".to_string()),
+            result_template: None,
+        };
+        decl_map.insert(decl.name.clone(), decl);
+
+        let call = ToolCall::new(
+            "bash_exec".to_string(),
+            json!({"command": "ls -la"}),
+            Some("call-1".to_string()),
+            None,
+        );
+        let tool_result = ToolResult::new(call, json!({"output": "file.txt"}));
+        let tc = MessageContentToolCalls::new(vec![tool_result], String::new(), None);
+        let messages = vec![Message {
+            role: MessageRole::Tool,
+            content: MessageContent::ToolCalls(tc),
+        }];
+
+        let items = messages_to_transcript_items(&messages, &decl_map);
+
+        let tool_call_item = items.iter().find(|item| {
+            matches!(item, TranscriptItem::ToolCall { tool_name, .. } if tool_name == "bash_exec")
+        });
+        assert!(
+            tool_call_item.is_some(),
+            "expected ToolCall transcript item"
+        );
+        match tool_call_item.unwrap() {
+            TranscriptItem::ToolCall {
+                body: Some(ToolCallBody::Markdown(rendered)),
+                ..
+            } => {
+                assert!(
+                    rendered.contains("ls -la"),
+                    "rendered body should contain command: got {rendered:?}"
+                );
+            }
+            TranscriptItem::ToolCall { body, .. } => {
+                panic!("expected ToolCallBody::Markdown, got {body:?}");
+            }
+            _ => panic!("wrong item type"),
+        }
+    }
+
+    #[test]
+    fn messages_to_transcript_falls_back_to_yaml_when_no_template() {
+        let decl = ToolDeclaration {
+            name: "no_template_tool".to_string(),
+            description: String::new(),
+            parameters: Default::default(),
+            mcp_tool_name: Some("no_template_tool".to_string()),
+            call_template: None,
+            result_template: None,
+        };
+        let mut decl_map = HashMap::new();
+        decl_map.insert(decl.name.clone(), decl);
+
+        let call = ToolCall::new(
+            "no_template_tool".to_string(),
+            json!({"key": "value"}),
+            Some("call-2".to_string()),
+            None,
+        );
+        let tool_result = ToolResult::new(call, json!({"output": "ok"}));
+        let tc = MessageContentToolCalls::new(vec![tool_result], String::new(), None);
+        let messages = vec![Message {
+            role: MessageRole::Tool,
+            content: MessageContent::ToolCalls(tc),
+        }];
+
+        let items = messages_to_transcript_items(&messages, &decl_map);
+
+        let tool_call_item = items.iter().find(|item| {
+            matches!(item, TranscriptItem::ToolCall { tool_name, .. } if tool_name == "no_template_tool")
+        });
+        assert!(
+            tool_call_item.is_some(),
+            "expected ToolCall transcript item"
+        );
+        match tool_call_item.unwrap() {
+            TranscriptItem::ToolCall {
+                body: Some(ToolCallBody::Yaml(_)),
+                ..
+            } => {}
+            TranscriptItem::ToolCall { body, .. } => {
+                panic!("expected ToolCallBody::Yaml fallback, got {body:?}");
+            }
+            _ => panic!("wrong item type"),
+        }
+    }
 }
