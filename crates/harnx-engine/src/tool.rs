@@ -157,12 +157,7 @@ pub async fn eval_tool_calls(
     let dispatch_futures = approved.iter().map(|approved_call| {
         let call = approved_call.call.clone();
         let json_data = approved_call.json_data.clone();
-        async move {
-            tokio::select! {
-                result = dispatch_tool_call(call, json_data, ctx, abort_signal) => result,
-                _ = wait_abort_signal(abort_signal) => Err(ToolError::Recoverable(anyhow!("aborted"))),
-            }
-        }
+        async move { dispatch_tool_call(call, json_data, ctx, abort_signal).await }
     });
     let dispatch_results = join_all(dispatch_futures).await;
 
@@ -209,18 +204,9 @@ pub async fn eval_tool_calls(
                     "is_error": true,
                     "error": error_display,
                 });
-                (ctx.emit_tool_result_fn)(&call, &error_result);
                 output.push(ToolResult::new(call, error_result));
             }
             Err(ToolError::Fatal(err)) => {
-                let error_display = format!("{err:#}");
-                (ctx.emit_tool_result_fn)(
-                    &call,
-                    &json!({
-                        "is_error": true,
-                        "error": error_display,
-                    }),
-                );
                 if fatal_err.is_none() {
                     fatal_err = Some(err);
                 }
@@ -566,7 +552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recoverable_error_emits_result() {
+    async fn recoverable_error_does_not_emit_result() {
         let result_emit_count = Arc::new(AtomicUsize::new(0));
         let result_emit_count_clone = Arc::clone(&result_emit_count);
         let ctx = test_context_with_emitters(
@@ -588,7 +574,7 @@ mod tests {
             .expect("recoverable error should return output");
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result_emit_count.load(Ordering::SeqCst), 1);
+        assert_eq!(result_emit_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
