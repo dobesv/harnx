@@ -7,6 +7,7 @@
 //! constructed on the harnx side by `build_tool_eval_context`.
 
 use anyhow::{anyhow, bail, Result};
+use futures_util::future::join_all;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
 use harnx_core::tool::{SwitchAgentData, ToolCall, ToolError, ToolProvider, ToolResult};
@@ -23,25 +24,23 @@ pub type ToolCallEmitFn = dyn Fn(&ToolCall, &Value) + Send + Sync;
 
 /// Callback invoked when a PreToolUse hook returns `Ask { reason }`.
 /// Receives the tool name, parsed arguments, and optional reason.
-/// Returns `true` if the user allows the tool; `false` otherwise.
 pub type ConfirmToolUseFn = dyn Fn(&str, &Value, Option<&str>) -> bool + Send + Sync;
 
-/// Callback that dispatches a hook event and resolves to an outcome.
-/// Takes the `HookEvent` by value (events are constructed fresh at
-/// each site) and returns a boxed future. Captured state (hook
-/// entries, session id, cwd) is owned by the closure so the returned
-/// future is `'static` and can cross `tokio::select!` and
-/// `block_on_async` boundaries.
+/// Async callback used to dispatch hook events. Returns a `HookOutcome`
+/// so callers can inspect `control` (Block/Ask/Continue) and any future
+/// structured data carried in `result`.
 pub type DispatchHookFn =
     dyn Fn(HookEvent) -> Pin<Box<dyn Future<Output = HookOutcome> + Send>> + Send + Sync;
 
-/// Narrow runtime context for one batch of tool calls. Constructed on
-/// the harnx side (see `harnx::tool::build_tool_eval_context`) from a
-/// `GlobalConfig` snapshot plus harnx's default callback implementations.
-/// The loop reads nothing from the context beyond these fields.
 pub struct ToolEvalContext {
+    /// Ordered tool providers to search when dispatching a call.
     pub providers: Vec<Arc<dyn ToolProvider>>,
+    /// Optional session name used when synthesizing `_session_handoff`
+    /// results and the call omitted `session_id`.
     pub session_name: Option<String>,
+    /// Allow-list of synthetic tool names that do not come from a real
+    /// provider but are handled directly in `eval_tool_call_mcp`
+    /// (currently `_session_handoff`).
     pub allowed_tool_names: HashSet<String>,
     /// Called when a tool is about to be dispatched. Receives the tool
     /// call and the parsed arguments JSON. Harnx's default emits an
@@ -68,6 +67,13 @@ pub struct ToolEvalContext {
     pub dispatch_hook_fn: Arc<DispatchHookFn>,
 }
 
+struct ApprovedToolCall {
+    call: ToolCall,
+    json_data: Value,
+    tool_input: Value,
+    tool_use_id: String,
+}
+
 pub async fn eval_tool_calls(
     ctx: &ToolEvalContext,
     mut calls: Vec<ToolCall>,
@@ -83,10 +89,29 @@ pub async fn eval_tool_calls(
     }
 
     let mut is_all_null = true;
+    let mut approved = Vec::new();
+
     for call in calls {
+        if abort_signal.aborted() {
+            bail!("interrupted during pre-tool phase");
+        }
+
+        let json_data = match parse_call_arguments(&call) {
+            Ok(json_data) => json_data,
+            Err(ToolError::Recoverable(err)) => {
+                is_all_null = false;
+                let error_result = json!({
+                    "is_error": true,
+                    "error": format!("{err:#}"),
+                });
+                output.push(ToolResult::new(call, error_result));
+                continue;
+            }
+            Err(ToolError::Fatal(err)) => return Err(err),
+        };
+
         let tool_input = call.arguments.clone();
         let tool_use_id = call.id.clone().unwrap_or_default();
-
         let pre_event = HookEvent::PreToolUse {
             tool_name: call.name.clone(),
             tool_input: tool_input.clone(),
@@ -111,7 +136,7 @@ pub async fn eval_tool_calls(
             continue;
         }
         if let HookResultControl::Ask { reason } = pre_outcome.control {
-            if !(ctx.confirm_tool_use_fn)(&call.name, &call.arguments, reason.as_deref()) {
+            if !(ctx.confirm_tool_use_fn)(&call.name, &json_data, reason.as_deref()) {
                 let deny_reason = reason.unwrap_or_else(|| "Denied by user".to_string());
                 let blocked_result = json!({"error": deny_reason, "blocked_by_hook": true});
                 output.push(ToolResult::new(call, blocked_result));
@@ -120,48 +145,48 @@ pub async fn eval_tool_calls(
             }
         }
 
-        // Short-circuit remaining tool calls if a cancel already fired.
-        if abort_signal.aborted() {
-            bail!("tool execution aborted by user");
-        }
+        (ctx.emit_tool_call_fn)(&call, &json_data);
+        approved.push(ApprovedToolCall {
+            call,
+            json_data,
+            tool_input,
+            tool_use_id,
+        });
+    }
 
-        let eval_result = eval_tool_call_mcp(&call, ctx, abort_signal).await;
-        match eval_result {
+    let dispatch_futures = approved.iter().map(|approved_call| {
+        let call = approved_call.call.clone();
+        let json_data = approved_call.json_data.clone();
+        async move { dispatch_tool_call(call, json_data, ctx, abort_signal).await }
+    });
+    let dispatch_results = join_all(dispatch_futures).await;
+
+    let mut fatal_err = None;
+    for (approved_call, result) in approved.into_iter().zip(dispatch_results) {
+        let ApprovedToolCall {
+            call,
+            tool_input,
+            tool_use_id,
+            ..
+        } = approved_call;
+
+        match result {
             Ok(mut result) => {
                 let post_event = HookEvent::PostToolUse {
                     tool_name: call.name.clone(),
                     tool_input: tool_input.clone(),
-                    tool_response: result.clone(),
                     tool_use_id: tool_use_id.clone(),
+                    tool_response: result.clone(),
                 };
                 let _ = (ctx.dispatch_hook_fn)(post_event).await;
-
-                // Emit tool result to TUI or terminal
                 (ctx.emit_tool_result_fn)(&call, &result);
-
-                if result.is_null() {
-                    result = json!("DONE");
-                } else {
+                if !result.is_null() {
                     is_all_null = false;
+                } else {
+                    result = json!("DONE");
                 }
                 let mut result_obj = ToolResult::new(call, result);
-                if let Some(obj) = result_obj.output.as_object() {
-                    if obj.get("action").and_then(|v| v.as_str()) == Some("switch_agent") {
-                        if let (Some(agent), Some(prompt)) = (
-                            obj.get("agent").and_then(|v| v.as_str()),
-                            obj.get("prompt").and_then(|v| v.as_str()),
-                        ) {
-                            result_obj.switch_agent = Some(SwitchAgentData {
-                                agent: agent.to_string(),
-                                prompt: prompt.to_string(),
-                                session_id: obj
-                                    .get("session_id")
-                                    .and_then(|v| v.as_str())
-                                    .map(ToString::to_string),
-                            });
-                        }
-                    }
-                }
+                result_obj.switch_agent = detect_switch_agent(&result_obj.output);
                 output.push(result_obj);
             }
             Err(ToolError::Recoverable(err)) => {
@@ -181,8 +206,16 @@ pub async fn eval_tool_calls(
                 });
                 output.push(ToolResult::new(call, error_result));
             }
-            Err(ToolError::Fatal(err)) => return Err(err),
+            Err(ToolError::Fatal(err)) => {
+                if fatal_err.is_none() {
+                    fatal_err = Some(err);
+                }
+            }
         }
+    }
+
+    if let Some(err) = fatal_err {
+        return Err(err);
     }
     if is_all_null {
         output = vec![];
@@ -190,33 +223,51 @@ pub async fn eval_tool_calls(
     Ok(output)
 }
 
-async fn eval_tool_call_mcp(
-    call: &ToolCall,
-    ctx: &ToolEvalContext,
-    abort_signal: &AbortSignal,
-) -> Result<Value, ToolError> {
-    let json_data = if call.arguments.is_null() {
-        Value::Null
-    } else if call.arguments.is_object() {
-        call.arguments.clone()
-    } else if let Some(arguments) = call.arguments.as_str() {
-        serde_json::from_str(arguments).map_err(|_| {
+fn parse_call_arguments(call: &ToolCall) -> Result<Value, ToolError> {
+    if call.arguments.is_null() {
+        return Ok(Value::Null);
+    }
+    if call.arguments.is_object() {
+        return Ok(call.arguments.clone());
+    }
+    if let Some(arguments) = call.arguments.as_str() {
+        return serde_json::from_str(arguments).map_err(|_| {
             ToolError::Recoverable(anyhow!(
                 "The call '{}' has invalid arguments: {arguments}",
                 call.name
             ))
-        })?
-    } else {
-        return Err(ToolError::Recoverable(anyhow!(
-            "The call '{}' has invalid arguments: {}",
-            call.name,
-            call.arguments
-        )));
-    };
+        });
+    }
+    Err(ToolError::Recoverable(anyhow!(
+        "The call '{}' has invalid arguments: {}",
+        call.name,
+        call.arguments
+    )))
+}
 
-    // Emit tool call info to TUI or terminal
-    (ctx.emit_tool_call_fn)(call, &json_data);
+fn detect_switch_agent(output: &Value) -> Option<SwitchAgentData> {
+    let obj = output.as_object()?;
+    if obj.get("action").and_then(|v| v.as_str()) != Some("switch_agent") {
+        return None;
+    }
+    let agent = obj.get("agent").and_then(|v| v.as_str())?;
+    let prompt = obj.get("prompt").and_then(|v| v.as_str())?;
+    Some(SwitchAgentData {
+        agent: agent.to_string(),
+        prompt: prompt.to_string(),
+        session_id: obj
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+    })
+}
 
+async fn dispatch_tool_call(
+    call: ToolCall,
+    json_data: Value,
+    ctx: &ToolEvalContext,
+    abort_signal: &AbortSignal,
+) -> Result<Value, ToolError> {
     let allowed_tool_names = &ctx.allowed_tool_names;
 
     if call.name.ends_with("_session_handoff") {
@@ -253,8 +304,9 @@ async fn eval_tool_call_mcp(
             continue;
         }
         let tool_name = call.name.clone();
-        let args = json_data.clone();
-        let result = provider.call_tool(&tool_name, args, abort_signal).await?;
+        let result = provider
+            .call_tool(&tool_name, json_data.clone(), abort_signal)
+            .await?;
         return Ok(result);
     }
 
@@ -262,4 +314,296 @@ async fn eval_tool_call_mcp(
         "No tool provider configured for '{}'",
         call.name
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+    use harnx_core::abort::create_abort_signal;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+    use tokio::time::Instant;
+
+    struct MockToolProvider {
+        tool_name: String,
+        delay: Duration,
+        result: Mutex<Option<Result<Value, ToolError>>>,
+        panic_on_call: bool,
+    }
+
+    impl MockToolProvider {
+        fn ok(tool_name: &str, delay: Duration, result: Value) -> Self {
+            Self {
+                tool_name: tool_name.to_string(),
+                delay,
+                result: Mutex::new(Some(Ok(result))),
+                panic_on_call: false,
+            }
+        }
+
+        fn err(tool_name: &str, delay: Duration, error: ToolError) -> Self {
+            Self {
+                tool_name: tool_name.to_string(),
+                delay,
+                result: Mutex::new(Some(Err(error))),
+                panic_on_call: false,
+            }
+        }
+
+        fn panic(tool_name: &str) -> Self {
+            Self {
+                tool_name: tool_name.to_string(),
+                delay: Duration::ZERO,
+                result: Mutex::new(None),
+                panic_on_call: true,
+            }
+        }
+    }
+
+    impl ToolProvider for MockToolProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn has_tool(&self, tool_name: &str) -> bool {
+            self.tool_name == tool_name
+        }
+
+        fn call_tool<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            tool_name: &'life1 str,
+            _arguments: Value,
+            _abort: &'life2 AbortSignal,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                assert_eq!(tool_name, self.tool_name);
+                assert!(!self.panic_on_call, "tool should not have been dispatched");
+                tokio::time::sleep(self.delay).await;
+                self.result
+                    .lock()
+                    .await
+                    .take()
+                    .expect("mock tool called more than once")
+            })
+        }
+    }
+
+    fn continue_hook_outcome() -> HookOutcome {
+        HookOutcome {
+            control: HookResultControl::Continue,
+            result: HookResult::default(),
+        }
+    }
+
+    fn test_context(
+        providers: Vec<Arc<dyn ToolProvider>>,
+        dispatch_hook: impl Fn(HookEvent) -> HookOutcome + Send + Sync + 'static,
+    ) -> ToolEvalContext {
+        test_context_with_emitters(providers, dispatch_hook, |_, _| {}, |_, _| {})
+    }
+
+    fn test_context_with_emitters(
+        providers: Vec<Arc<dyn ToolProvider>>,
+        dispatch_hook: impl Fn(HookEvent) -> HookOutcome + Send + Sync + 'static,
+        emit_tool_call: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
+        emit_tool_result: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
+    ) -> ToolEvalContext {
+        ToolEvalContext {
+            providers,
+            session_name: None,
+            allowed_tool_names: HashSet::new(),
+            emit_tool_call_fn: Arc::new(emit_tool_call),
+            emit_tool_result_fn: Arc::new(emit_tool_result),
+            confirm_tool_use_fn: Arc::new(|_, _, _| true),
+            dispatch_hook_fn: Arc::new(move |event| {
+                let outcome = dispatch_hook(event);
+                Box::pin(async move { outcome })
+            }),
+        }
+    }
+
+    fn two_tool_context(
+        name_a: &str,
+        delay_a: Duration,
+        result_a: Value,
+        name_b: &str,
+        delay_b: Duration,
+        result_b: Value,
+    ) -> ToolEvalContext {
+        test_context(
+            vec![
+                Arc::new(MockToolProvider::ok(name_a, delay_a, result_a)),
+                Arc::new(MockToolProvider::ok(name_b, delay_b, result_b)),
+            ],
+            |_| continue_hook_outcome(),
+        )
+    }
+
+    fn test_call(name: &str) -> ToolCall {
+        ToolCall::new(name.to_string(), json!({}), None, None)
+    }
+
+    #[tokio::test]
+    async fn parallel_calls_run_concurrently() {
+        let ctx = two_tool_context(
+            "tool_a",
+            Duration::from_millis(50),
+            json!("a"),
+            "tool_b",
+            Duration::from_millis(50),
+            json!("b"),
+        );
+        let abort_signal = create_abort_signal();
+
+        let start = Instant::now();
+        let result = eval_tool_calls(
+            &ctx,
+            vec![test_call("tool_a"), test_call("tool_b")],
+            &abort_signal,
+        )
+        .await
+        .expect("tool calls should succeed");
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.len(), 2);
+        assert!(elapsed < Duration::from_millis(80), "elapsed: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn result_order_preserved() {
+        let ctx = two_tool_context(
+            "tool_a",
+            Duration::from_millis(60),
+            json!("slow"),
+            "tool_b",
+            Duration::from_millis(10),
+            json!("fast"),
+        );
+        let abort_signal = create_abort_signal();
+
+        let result = eval_tool_calls(
+            &ctx,
+            vec![test_call("tool_a"), test_call("tool_b")],
+            &abort_signal,
+        )
+        .await
+        .expect("tool calls should succeed");
+
+        assert_eq!(result[0].output, json!("slow"));
+        assert_eq!(result[1].output, json!("fast"));
+    }
+
+    #[tokio::test]
+    async fn fatal_error_propagates() {
+        let ctx = test_context(
+            vec![Arc::new(MockToolProvider::err(
+                "tool_a",
+                Duration::ZERO,
+                ToolError::Fatal(anyhow!("boom")),
+            ))],
+            |_| continue_hook_outcome(),
+        );
+        let abort_signal = create_abort_signal();
+
+        let err = eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
+            .await
+            .expect_err("fatal error should propagate");
+
+        assert!(format!("{err:#}").contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn blocked_call_not_dispatched() {
+        let ctx =
+            test_context(
+                vec![Arc::new(MockToolProvider::panic("tool_a"))],
+                |event| match event {
+                    HookEvent::PreToolUse { .. } => HookOutcome {
+                        control: HookResultControl::Block {
+                            reason: "no".to_string(),
+                        },
+                        result: HookResult::default(),
+                    },
+                    _ => continue_hook_outcome(),
+                },
+            );
+        let abort_signal = create_abort_signal();
+
+        let result = eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
+            .await
+            .expect("blocked call should still return output");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].output,
+            json!({"error": "no", "blocked_by_hook": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn recoverable_error_does_not_emit_result() {
+        let result_emit_count = Arc::new(AtomicUsize::new(0));
+        let result_emit_count_clone = Arc::clone(&result_emit_count);
+        let ctx = test_context_with_emitters(
+            vec![Arc::new(MockToolProvider::err(
+                "tool_a",
+                Duration::ZERO,
+                ToolError::Recoverable(anyhow!("retry")),
+            ))],
+            |_| continue_hook_outcome(),
+            |_, _| {},
+            move |_, _| {
+                result_emit_count_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let abort_signal = create_abort_signal();
+
+        let result = eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
+            .await
+            .expect("recoverable error should return output");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result_emit_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn blocked_call_does_not_emit_started() {
+        let started_emit_count = Arc::new(AtomicUsize::new(0));
+        let started_emit_count_clone = Arc::clone(&started_emit_count);
+        let ctx = test_context_with_emitters(
+            vec![Arc::new(MockToolProvider::panic("tool_a"))],
+            |event| match event {
+                HookEvent::PreToolUse { .. } => HookOutcome {
+                    control: HookResultControl::Block {
+                        reason: "no".to_string(),
+                    },
+                    result: HookResult::default(),
+                },
+                _ => continue_hook_outcome(),
+            },
+            move |_, _| {
+                started_emit_count_clone.fetch_add(1, Ordering::SeqCst);
+            },
+            |_, _| {},
+        );
+        let abort_signal = create_abort_signal();
+
+        let result = eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
+            .await
+            .expect("blocked call should still return output");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(started_emit_count.load(Ordering::SeqCst), 0);
+    }
 }

@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use harnx::test_utils::interrupt::{
     script_call_sub_agent, script_call_trivial_tool, script_call_wait_tool, script_stall_streaming,
-    script_streaming_with_sentinel, send_sigint, spawn_acp_client, spawn_oneshot, spawn_tui,
-    wait_for_exit, wait_for_prompt_return, write_acp_agent, write_minimal_config,
-    write_with_blocking_hook, write_with_sub_agent, write_with_wait_tool,
+    script_streaming_with_sentinel, send_sigint, spawn_acp_client, spawn_oneshot,
+    spawn_oneshot_in_tmux, spawn_tui, wait_for_cmd_exit, wait_for_exit, wait_for_prompt_return,
+    write_acp_agent, write_minimal_config, write_with_blocking_hook, write_with_sub_agent,
+    write_with_wait_tool,
 };
 use harnx::test_utils::mock_openai_server::MockOpenAiServer;
 use harnx::test_utils::tmux_harness::TmuxHarness;
@@ -541,5 +542,47 @@ fn interrupt_acp_sigint_cancels_and_exits() -> Result<()> {
     send_sigint(&child)?;
 
     let _status = wait_for_exit(&mut child, Duration::from_secs(2))?;
+    Ok(())
+}
+
+/// Verify that Ctrl-C cancels a one-shot (Cmd) prompt while streaming output
+/// is in progress and crossterm raw mode is active.
+///
+/// Unlike the existing `interrupt_oneshot_during_streaming` test (which sends
+/// `SIGINT` directly via `kill(2)`, bypassing the terminal), this test runs
+/// harnx inside a real tmux pane so that Ctrl-C is delivered as a terminal key
+/// event through crossterm's event stream — exactly as a real user would
+/// experience it.  If the raw-mode key watcher (`spawn_raw_mode_key_watcher`)
+/// is missing or broken, Ctrl-C is swallowed and this test times out.
+#[test]
+fn interrupt_cmd_raw_mode_ctrlc() -> Result<()> {
+    if !TmuxHarness::is_available() {
+        eprintln!("tmux unavailable; skipping interrupt_cmd_raw_mode_ctrlc");
+        return Ok(());
+    }
+
+    let mock = MockOpenAiServer::start(script_stall_streaming())?;
+    let tmp = tempfile::tempdir()?;
+    let paths = write_minimal_config(tmp.path(), &format!("http://127.0.0.1:{}/v1", mock.port()))?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let tmux = spawn_oneshot_in_tmux(&paths, &harnx_bin, "hello", &repo_root)?;
+
+    // Wait until at least the first streaming chunk ("Thinking") is visible
+    // in the pane — this means harnx has received data from the mock LLM and
+    // crossterm raw mode is active inside CliAgentEventSink.
+    tmux.wait_for_contains("Thinking", Duration::from_secs(10))?;
+
+    // Send Ctrl-C as a real terminal key event (not SIGINT).  In raw mode
+    // this is the only reliable way to interrupt the process.
+    tmux.send_keys(&["C-c"])?;
+
+    // harnx should exit non-zero quickly.  On success the shell prints
+    // "HARNX_EXIT:<code>"; wait_for_cmd_exit polls for that sentinel.
+    let nonzero = wait_for_cmd_exit(&tmux, Duration::from_secs(5))?;
+    assert!(
+        nonzero,
+        "expected non-zero exit after Ctrl-C in raw-mode streaming"
+    );
     Ok(())
 }

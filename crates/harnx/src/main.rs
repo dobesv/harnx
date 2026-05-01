@@ -212,7 +212,11 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
                 let cfg = config.read();
                 (cfg.highlight, cfg.render_options().unwrap_or_default())
             };
-            agent_event_sink::install_cli_agent_event_sink(highlight, render_options);
+            agent_event_sink::install_cli_agent_event_sink(
+                highlight,
+                render_options,
+                abort_signal.clone(),
+            );
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
             let mut async_manager = AsyncHookManager::new();
             let persistent_manager =
