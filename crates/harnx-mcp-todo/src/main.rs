@@ -1,9 +1,12 @@
 //! harnx-mcp-todo: File-based todo/plan management MCP server.
 //!
-//! Stores todos as JSON+markdown files in `.agent/todos/` (configurable via
-//! AGENT_TODO_PATH env var). Inspired by mitsuhiko's pi-extensions/todos.ts.
+//! Stores todos as YAML-frontmatter markdown files in per-plan subdirectories
+//! under `.agent/todos/` (configurable via `--dir` or `AGENT_TODO_PATH` env var).
 //!
-//! Provides: todo_list, todo_get, todo_create, todo_update, todo_append, todo_delete
+//! Layout: `<dir>/<plan>/plan.md` and `<dir>/<plan>/todo-<id>.md`
+//!
+//! Provides: todo_list, todo_get, todo_create, todo_update, todo_append,
+//! todo_delete, read_plan, write_plan, plan_add_note, plan_get_todo
 
 mod server;
 

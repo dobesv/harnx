@@ -1,7 +1,7 @@
 //! Todo MCP server implementation.
 //!
-//! Stores todos as JSON-frontmatter + markdown body files in a configurable directory.
-//! File format: `<8-hex-id>.md` containing a JSON header block followed by markdown body.
+//! Stores todos under per-plan directories using YAML front matter + markdown body.
+//! Layout: `<data-dir>/<plan>/plan.md` and `<data-dir>/<plan>/todo-<8-hex-id>.md`.
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
@@ -13,6 +13,7 @@ use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 // ── Data types ──────────────────────────────────────────────────────────────
@@ -23,18 +24,15 @@ struct TodoFrontMatter {
     title: String,
     #[serde(default)]
     tags: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    plan: Option<String>,
+    plan: String,
     #[serde(default = "default_status")]
     status: String,
     #[serde(default)]
     created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
-    /// Key that uniquely identifies this todo within its plan
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key: Option<String>,
-    /// List of keys of todos this todo depends on (within the same plan)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     dependencies: Vec<String>,
 }
@@ -51,17 +49,28 @@ struct TodoRecord {
     body: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TodoWithBody<'a> {
+    id: &'a str,
+    title: &'a str,
+    tags: &'a [String],
+    plan: &'a str,
+    status: &'a str,
+    created_at: &'a str,
+    updated_at: &'a Option<String>,
+    key: &'a Option<String>,
+    dependencies: &'a [String],
+    body: &'a str,
+}
+
 // ── Tool parameter structs ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct TodoListParams {
-    /// Filter: "open" (default), "closed", "all"
     #[serde(default = "default_filter")]
     filter: String,
-    /// Optional tag filter
     #[serde(default)]
     tag: Option<String>,
-    /// Optional plan filter
     #[serde(default)]
     plan: Option<String>,
 }
@@ -72,142 +81,108 @@ fn default_filter() -> String {
 
 #[derive(Debug, Deserialize)]
 struct TodoGetParams {
-    /// Todo ID (hex or TODO-hex)
     id: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct TodoCreateParams {
-    /// Short title
     title: String,
-    /// Optional tags
     #[serde(default)]
     tags: Vec<String>,
-    /// Optional plan association
-    #[serde(default)]
-    plan: Option<String>,
-    /// Initial status (default: "open")
+    plan: String,
     #[serde(default)]
     status: Option<String>,
-    /// Optional markdown body
     #[serde(default)]
     body: Option<String>,
-    /// Key that uniquely identifies this todo within its plan
     #[serde(default)]
     key: Option<String>,
-    /// List of keys of todos this todo depends on (within the same plan)
     #[serde(default)]
     dependencies: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TodoUpdateParams {
-    /// Todo ID
     id: String,
-    /// New title (optional)
     #[serde(default)]
     title: Option<String>,
-    /// New status (optional)
-    #[serde(default)]
-    status: Option<String>,
-    /// New tags (optional, replaces all)
     #[serde(default)]
     tags: Option<Vec<String>>,
-    /// New plan (optional)
     #[serde(default)]
     plan: Option<String>,
-    /// New body (optional, replaces body)
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     body: Option<String>,
-    /// New key (optional)
     #[serde(default)]
     key: Option<String>,
-    /// New dependencies (optional, replaces all)
     #[serde(default)]
     dependencies: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TodoAppendParams {
-    /// Todo ID
     id: String,
-    /// Text to append to body
     text: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct TodoDeleteParams {
-    /// Todo ID
     id: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct PlanReadParams {
-    /// Plan name (8-char hex or descriptive name)
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct PlanWriteParams {
-    /// Plan name
-    name: String,
-    /// Full plan markdown text
-    content: String,
-    /// Optional list of todos to create along with the plan
-    #[serde(default)]
-    todos: Vec<TodoSpec>,
-}
-
-/// A todo specification for creating todos with a plan
 #[derive(Debug, Deserialize)]
 struct TodoSpec {
-    /// Short title
     title: String,
-    /// Key that uniquely identifies this todo within the plan
-    #[serde(default)]
-    key: Option<String>,
-    /// Optional tags
     #[serde(default)]
     tags: Vec<String>,
-    /// Initial status (default: "open")
     #[serde(default)]
     status: Option<String>,
-    /// Optional markdown body
     #[serde(default)]
     body: Option<String>,
-    /// List of keys of todos this todo depends on (within the same plan)
+    #[serde(default)]
+    key: Option<String>,
     #[serde(default)]
     dependencies: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PlanAddNoteParams {
-    /// Plan name
+struct PlanWriteParams {
     name: String,
-    /// Note text to append to the end of the plan
+    content: String,
+    #[serde(default)]
+    todos: Option<Vec<TodoSpec>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanAddNoteParams {
+    name: String,
     text: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct PlanGetTodoParams {
-    /// Plan name or ID
     plan: String,
-    /// Todo key within the plan
     key: String,
 }
 
-// ── JsonSchema impls ────────────────────────────────────────────────────────
-
 macro_rules! impl_json_schema {
-    ($name:ident, $schema_name:literal, $props:expr, $required:expr) => {
-        impl JsonSchema for $name {
+    ($ty:ty, $title:expr, $properties_fn:expr, $required:expr) => {
+        impl JsonSchema for $ty {
             fn schema_name() -> Cow<'static, str> {
-                Cow::Borrowed($schema_name)
+                Cow::Borrowed($title)
             }
-            fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-                let props: Vec<(&str, &str, Schema)> = $props(generator);
-                let required: &[&str] = $required;
-                object_schema_with_desc(props, required)
+
+            fn schema_id() -> Cow<'static, str> {
+                Cow::Borrowed(concat!(module_path!(), "::", $title))
+            }
+
+            fn json_schema(gen: &mut SchemaGenerator) -> Schema {
+                object_schema_with_desc($properties_fn(gen), $required)
             }
         }
     };
@@ -219,17 +194,17 @@ impl_json_schema!(
     |gen: &mut SchemaGenerator| vec![
         (
             "filter",
-            "Filter: 'open' (default), 'closed', or 'all'",
-            gen.subschema_for::<Option<String>>()
+            "Filter by status: 'open' (default), 'closed', or 'all'",
+            gen.subschema_for::<String>()
         ),
         (
             "tag",
-            "Optional tag to filter by",
+            "Optional tag filter",
             gen.subschema_for::<Option<String>>()
         ),
         (
             "plan",
-            "Optional plan name to filter by",
+            "Optional plan filter; if omitted, list across all plans",
             gen.subschema_for::<Option<String>>()
         ),
     ],
@@ -239,11 +214,7 @@ impl_json_schema!(
 impl_json_schema!(
     TodoGetParams,
     "TodoGetParams",
-    |gen: &mut SchemaGenerator| vec![(
-        "id",
-        "Todo ID (8-char hex, or TODO-<hex>)",
-        gen.subschema_for::<String>()
-    ),],
+    |gen: &mut SchemaGenerator| vec![("id", "Todo ID", gen.subschema_for::<String>()),],
     &["id"]
 );
 
@@ -251,20 +222,12 @@ impl_json_schema!(
     TodoCreateParams,
     "TodoCreateParams",
     |gen: &mut SchemaGenerator| vec![
-        (
-            "title",
-            "Short summary shown in lists",
-            gen.subschema_for::<String>()
-        ),
-        (
-            "tags",
-            "Optional tags",
-            gen.subschema_for::<Option<Vec<String>>>()
-        ),
+        ("title", "Short title", gen.subschema_for::<String>()),
+        ("tags", "Optional tags", gen.subschema_for::<Vec<String>>()),
         (
             "plan",
-            "Optional plan name/ID to associate with this todo",
-            gen.subschema_for::<Option<String>>()
+            "Plan name this todo belongs to (required)",
+            gen.subschema_for::<String>()
         ),
         (
             "status",
@@ -273,7 +236,7 @@ impl_json_schema!(
         ),
         (
             "body",
-            "Long-form markdown details",
+            "Optional markdown body",
             gen.subschema_for::<Option<String>>()
         ),
         (
@@ -283,11 +246,11 @@ impl_json_schema!(
         ),
         (
             "dependencies",
-            "List of keys of todos this todo depends on (within the same plan)",
-            gen.subschema_for::<Option<Vec<String>>>()
+            "List of keys of todos this todo depends on (within same plan)",
+            gen.subschema_for::<Vec<String>>()
         ),
     ],
-    &["title"]
+    &["title", "plan"]
 );
 
 impl_json_schema!(
@@ -301,23 +264,23 @@ impl_json_schema!(
             gen.subschema_for::<Option<String>>()
         ),
         (
-            "status",
-            "New status (optional)",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
             "tags",
             "New tags (replaces all, optional)",
             gen.subschema_for::<Option<Vec<String>>>()
         ),
         (
             "plan",
-            "New plan name/ID (optional)",
+            "New plan name (optional)",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "status",
+            "New status (optional)",
             gen.subschema_for::<Option<String>>()
         ),
         (
             "body",
-            "New body (replaces, optional)",
+            "New body (replaces full body, optional)",
             gen.subschema_for::<Option<String>>()
         ),
         (
@@ -341,7 +304,7 @@ impl_json_schema!(
         ("id", "Todo ID", gen.subschema_for::<String>()),
         (
             "text",
-            "Text to append to the body (markdown)",
+            "Text to append to body (markdown)",
             gen.subschema_for::<String>()
         ),
     ],
@@ -363,6 +326,36 @@ impl_json_schema!(
 );
 
 impl_json_schema!(
+    TodoSpec,
+    "TodoSpec",
+    |gen: &mut SchemaGenerator| vec![
+        ("title", "Short title", gen.subschema_for::<String>()),
+        ("tags", "Optional tags", gen.subschema_for::<Vec<String>>()),
+        (
+            "status",
+            "Initial status (default: 'open')",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "body",
+            "Optional markdown body",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "key",
+            "Key that uniquely identifies this todo within its plan",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "dependencies",
+            "List of keys of todos this todo depends on (within same plan)",
+            gen.subschema_for::<Vec<String>>()
+        ),
+    ],
+    &["title"]
+);
+
+impl_json_schema!(
     PlanWriteParams,
     "PlanWriteParams",
     |gen: &mut SchemaGenerator| vec![
@@ -374,7 +367,7 @@ impl_json_schema!(
         ),
         (
             "todos",
-            "Optional list of todos to create along with the plan",
+            "Optional list of todos to create along with plan",
             gen.subschema_for::<Option<Vec<TodoSpec>>>()
         ),
     ],
@@ -400,273 +393,239 @@ impl_json_schema!(
     "PlanGetTodoParams",
     |gen: &mut SchemaGenerator| vec![
         ("plan", "Plan name or ID", gen.subschema_for::<String>()),
-        (
-            "key",
-            "Todo key within the plan",
-            gen.subschema_for::<String>()
-        ),
+        ("key", "Todo key within plan", gen.subschema_for::<String>()),
     ],
     &["plan", "key"]
 );
 
-impl_json_schema!(
-    TodoSpec,
-    "TodoSpec",
-    |gen: &mut SchemaGenerator| vec![
-        ("title", "Short title", gen.subschema_for::<String>()),
-        (
-            "key",
-            "Key that uniquely identifies this todo within the plan",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "tags",
-            "Optional tags",
-            gen.subschema_for::<Option<Vec<String>>>()
-        ),
-        (
-            "status",
-            "Initial status (default: 'open')",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "body",
-            "Optional markdown body",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "dependencies",
-            "List of keys of todos this todo depends on (within the same plan)",
-            gen.subschema_for::<Option<Vec<String>>>()
-        ),
-    ],
-    &["title"]
-);
+fn plan_dir(dir: &Path, plan_name: &str) -> PathBuf {
+    dir.join(plan_name)
+}
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+fn todo_file_path(dir: &Path, plan_name: &str, id: &str) -> PathBuf {
+    plan_dir(dir, plan_name).join(format!("todo-{}.md", normalize_id(id)))
+}
 
-const TODO_ID_PREFIX: &str = "TODO-";
+fn plan_file_path(dir: &Path, plan_name: &str) -> PathBuf {
+    plan_dir(dir, plan_name).join("plan.md")
+}
 
-fn normalize_id(raw: &str) -> String {
-    let s = raw.trim().trim_start_matches('#');
-    let s = if s.to_uppercase().starts_with(TODO_ID_PREFIX) {
-        &s[TODO_ID_PREFIX.len()..]
+fn parse_yaml_frontmatter(content: &str) -> Result<(TodoFrontMatter, String), String> {
+    let normalized;
+    let content = if content.contains('\r') {
+        normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+        normalized.as_str()
     } else {
-        s
+        content
     };
-    s.to_lowercase()
-}
 
-fn display_id(id: &str) -> String {
-    format!("{}{}", TODO_ID_PREFIX, id)
-}
-
-fn is_closed(status: &str) -> bool {
-    matches!(status.to_lowercase().as_str(), "closed" | "done")
-}
-
-fn now_iso() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
-fn generate_id() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    format!("{:08x}", hasher.finish() as u32)
-}
-
-fn todo_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{}.md", id))
-}
-
-fn parse_todo_content(content: &str, id_fallback: &str) -> TodoRecord {
-    if !content.starts_with('{') {
-        return TodoRecord {
-            front: TodoFrontMatter {
-                id: id_fallback.to_string(),
-                title: String::new(),
-                tags: vec![],
-                plan: None,
-                status: "open".to_string(),
-                created_at: String::new(),
-                updated_at: None,
-                key: None,
-                dependencies: vec![],
-            },
-            body: content.to_string(),
-        };
+    if !content.starts_with("---\n") {
+        return Err("missing YAML front matter".to_string());
     }
-    // Find the end of the JSON object
-    let end = find_json_end(content);
-    if end < 0 {
-        return TodoRecord {
-            front: TodoFrontMatter {
-                id: id_fallback.to_string(),
-                title: String::new(),
-                tags: vec![],
-                plan: None,
-                status: "open".to_string(),
-                created_at: String::new(),
-                updated_at: None,
-                key: None,
-                dependencies: vec![],
-            },
-            body: content.to_string(),
-        };
-    }
-    let json_str = &content[..=(end as usize)];
-    let body = content[(end as usize) + 1..]
-        .trim_start_matches('\r')
-        .trim_start_matches('\n')
-        .to_string();
 
-    let front: TodoFrontMatter = serde_json::from_str(json_str).unwrap_or(TodoFrontMatter {
-        id: id_fallback.to_string(),
-        title: String::new(),
-        tags: vec![],
-        plan: None,
-        status: "open".to_string(),
-        created_at: String::new(),
-        updated_at: None,
-        key: None,
-        dependencies: vec![],
-    });
-
-    TodoRecord { front, body }
+    let rest = &content[4..];
+    let end = rest
+        .find("\n---\n")
+        .ok_or_else(|| "missing YAML front matter closing delimiter".to_string())?;
+    let yaml = &rest[..end];
+    let body = rest[end + 5..].to_string();
+    let front = serde_yaml::from_str::<TodoFrontMatter>(yaml)
+        .map_err(|err| format!("invalid YAML front matter: {err}"))?;
+    Ok((front, body))
 }
 
-fn find_json_end(content: &str) -> i64 {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, ch) in content.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if ch == '"' {
-            in_string = true;
-            continue;
-        }
-        if ch == '{' {
-            depth += 1;
-        }
-        if ch == '}' {
-            depth -= 1;
-            if depth == 0 {
-                return i as i64;
-            }
-        }
-    }
-    -1
+fn serialize_todo(todo: &TodoRecord) -> Result<String, String> {
+    let yaml = serde_yaml::to_string(&todo.front)
+        .map_err(|err| format!("failed to serialize YAML front matter: {err}"))?;
+    Ok(format!(
+        "---
+{}---
+{}",
+        yaml, todo.body
+    ))
 }
 
-fn serialize_todo(todo: &TodoRecord) -> String {
-    let json = serde_json::to_string_pretty(&todo.front).unwrap_or_default();
-    let body = todo.body.trim();
-    if body.is_empty() {
-        format!("{}\n", json)
-    } else {
-        format!("{}\n\n{}\n", json, body)
-    }
-}
-
-fn read_todo(dir: &Path, id: &str) -> Result<TodoRecord, String> {
-    let path = todo_path(dir, id);
-    let content =
-        std::fs::read_to_string(&path).map_err(|_| format!("{} not found", display_id(id)))?;
-    Ok(parse_todo_content(&content, id))
+fn read_todo(dir: &Path, plan_name: &str, id: &str) -> Result<TodoRecord, String> {
+    let id = normalize_id(id);
+    let path = todo_file_path(dir, plan_name, &id);
+    let content = std::fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let (mut front, body) = parse_yaml_frontmatter(&content)?;
+    front.id = normalize_id(&front.id);
+    front.plan = normalize_plan_name(&front.plan)?;
+    Ok(TodoRecord { front, body })
 }
 
 fn write_todo(dir: &Path, todo: &TodoRecord) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create todo dir: {e}"))?;
-    let path = todo_path(dir, &todo.front.id);
-    std::fs::write(&path, serialize_todo(todo))
-        .map_err(|e| format!("Failed to write todo: {e}"))?;
-    Ok(())
+    let plan = normalize_plan_name(&todo.front.plan)?;
+    let plan_path = plan_dir(dir, &plan);
+    std::fs::create_dir_all(&plan_path)
+        .map_err(|err| format!("failed to create {}: {err}", plan_path.display()))?;
+
+    let mut normalized = todo.clone();
+    normalized.front.id = normalize_id(&normalized.front.id);
+    normalized.front.plan = plan;
+    let path = todo_file_path(dir, &normalized.front.plan, &normalized.front.id);
+    let content = serialize_todo(&normalized)?;
+    std::fs::write(&path, content)
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
-fn list_todos(dir: &Path) -> Vec<TodoRecord> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return vec![],
+fn plan_dirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
     };
-    let mut todos = Vec::new();
+
+    let mut dirs = Vec::new();
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".md") {
-            continue;
-        }
-        let id = &name[..name.len() - 3];
-        if let Ok(content) = std::fs::read_to_string(entry.path()) {
-            todos.push(parse_todo_content(&content, id));
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path);
         }
     }
-    // Sort: open first, then by created_at
-    todos.sort_by(|a, b| {
-        let a_closed = is_closed(&a.front.status);
-        let b_closed = is_closed(&b.front.status);
-        if a_closed != b_closed {
-            return if a_closed {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            };
+    dirs.sort();
+    dirs
+}
+
+fn find_todo_file(dir: &Path, id: &str) -> Result<(String, PathBuf), String> {
+    let id = normalize_id(id);
+    let file_name = format!("todo-{id}.md");
+    for plan_path in plan_dirs(dir) {
+        let candidate = plan_path.join(&file_name);
+        if candidate.is_file() {
+            let plan_name = plan_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| format!("invalid plan directory name: {}", plan_path.display()))?
+                .to_string();
+            return Ok((plan_name, candidate));
         }
-        a.front.created_at.cmp(&b.front.created_at)
+    }
+    Err(format!("Todo {} not found", display_id(&id)))
+}
+
+fn read_todo_by_id(dir: &Path, id: &str) -> Result<TodoRecord, String> {
+    let (plan_name, _) = find_todo_file(dir, id)?;
+    read_todo(dir, &plan_name, id)
+}
+
+fn list_todos(
+    dir: &Path,
+    plan_filter: Option<&str>,
+    tag_filter: Option<&str>,
+    status_filter: Option<&str>,
+) -> Vec<TodoRecord> {
+    let normalized_plan = plan_filter.and_then(|plan| normalize_plan_name(plan).ok());
+    let normalized_tag = tag_filter.map(|tag| tag.to_ascii_lowercase());
+    let normalized_status = status_filter.map(|status| status.to_ascii_lowercase());
+
+    let mut todos = Vec::new();
+    let plans = if let Some(plan) = normalized_plan.as_deref() {
+        vec![plan_dir(dir, plan)]
+    } else {
+        plan_dirs(dir)
+    };
+
+    for plan_path in plans {
+        let Ok(entries) = std::fs::read_dir(&plan_path) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            if !path.is_file() || !name.starts_with("todo-") || !name.ends_with(".md") {
+                continue;
+            }
+            let Some(plan_name) = plan_path.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            let Ok(todo) = read_todo(dir, plan_name, &name[5..name.len() - 3]) else {
+                continue;
+            };
+
+            let matches_tag = normalized_tag.as_ref().is_none_or(|tag| {
+                todo.front
+                    .tags
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(tag))
+            });
+            let matches_status = normalized_status
+                .as_ref()
+                .is_none_or(|status| todo.front.status.eq_ignore_ascii_case(status));
+
+            if matches_tag && matches_status {
+                todos.push(todo);
+            }
+        }
+    }
+
+    todos.sort_by(|a, b| {
+        a.front
+            .created_at
+            .cmp(&b.front.created_at)
+            .then(a.front.id.cmp(&b.front.id))
     });
     todos
 }
 
+fn is_closed(status: &str) -> bool {
+    matches!(status.to_ascii_lowercase().as_str(), "closed" | "done")
+}
+
+fn find_todo_by_key(dir: &Path, plan_name: &str, key: &str) -> Option<TodoRecord> {
+    list_todos(dir, Some(plan_name), None, None)
+        .into_iter()
+        .find(|todo| todo.front.key.as_deref() == Some(key))
+}
+
+fn normalize_plan_name(plan: &str) -> Result<String, String> {
+    let plan = plan.trim();
+    if plan.is_empty() {
+        return Err("Plan name cannot be empty".to_string());
+    }
+    if plan.contains('/') || plan.contains('\\') || plan.contains("..") {
+        return Err("Invalid plan name".to_string());
+    }
+    Ok(plan.to_string())
+}
+
 fn todo_to_json(todo: &TodoRecord) -> Value {
-    serde_json::json!({
-        "id": display_id(&todo.front.id),
-        "title": todo.front.title,
-        "plan": todo.front.plan,
-        "tags": todo.front.tags,
-        "status": todo.front.status,
-        "created_at": todo.front.created_at,
-        "updated_at": todo.front.updated_at,
-        "key": todo.front.key,
-        "dependencies": todo.front.dependencies,
-        "body": todo.body,
+    serde_json::to_value(TodoWithBody {
+        id: &todo.front.id,
+        title: &todo.front.title,
+        tags: &todo.front.tags,
+        plan: &todo.front.plan,
+        status: &todo.front.status,
+        created_at: &todo.front.created_at,
+        updated_at: &todo.front.updated_at,
+        key: &todo.front.key,
+        dependencies: &todo.front.dependencies,
+        body: &todo.body,
     })
+    .unwrap_or_else(|_| json!({}))
 }
 
 fn todo_list_to_json(todos: &[TodoRecord]) -> Value {
-    let open: Vec<Value> = todos
-        .iter()
-        .filter(|t| !is_closed(&t.front.status))
-        .map(todo_to_json)
-        .collect();
-    let closed: Vec<Value> = todos
-        .iter()
-        .filter(|t| is_closed(&t.front.status))
-        .map(todo_to_json)
-        .collect();
-    serde_json::json!({ "open": open, "closed": closed })
+    Value::Array(todos.iter().map(todo_to_json).collect())
 }
 
-// ── Server ──────────────────────────────────────────────────────────────────
+fn result_text(text: String, summary: String) -> CallToolResult {
+    CallToolResult::success(vec![
+        Content::text(text).with_audience(vec![Role::Assistant]),
+        Content::text(summary).with_audience(vec![Role::User]),
+    ])
+}
 
-#[derive(Debug, Clone)]
+fn result_json(value: Value, summary: String) -> CallToolResult {
+    result_text(
+        serde_json::to_string_pretty(&value).unwrap_or_default(),
+        summary,
+    )
+}
+
 pub struct TodoServer {
     dir: PathBuf,
 }
@@ -677,81 +636,56 @@ impl TodoServer {
     }
 
     fn handle_list(&self, params: TodoListParams) -> Result<CallToolResult, ErrorData> {
-        let all = list_todos(&self.dir);
-        let filtered: Vec<TodoRecord> = all
-            .into_iter()
-            .filter(|t| match params.filter.as_str() {
-                "closed" | "done" => is_closed(&t.front.status),
-                "all" => true,
-                _ => !is_closed(&t.front.status), // "open" default
-            })
-            .filter(|t| {
-                if let Some(ref tag) = params.tag {
-                    t.front.tags.iter().any(|tg| tg.eq_ignore_ascii_case(tag))
-                } else {
-                    true
-                }
-            })
-            .filter(|t| {
-                if let Some(ref plan) = params.plan {
-                    t.front
-                        .plan
-                        .as_ref()
-                        .is_some_and(|p| p.eq_ignore_ascii_case(plan))
-                } else {
-                    true
-                }
-            })
-            .collect();
-        let json = if params.filter == "all" {
-            todo_list_to_json(&filtered)
-        } else {
-            serde_json::json!(filtered.iter().map(todo_to_json).collect::<Vec<_>>())
+        let status_filter = match params.filter.as_str() {
+            "all" | "open" | "closed" | "done" => None,
+            other => Some(other),
         };
+
+        let mut filtered = list_todos(
+            &self.dir,
+            params.plan.as_deref(),
+            params.tag.as_deref(),
+            status_filter,
+        );
+        if params.filter == "open" {
+            filtered.retain(|todo| !is_closed(&todo.front.status));
+        } else if matches!(params.filter.as_str(), "closed" | "done") {
+            filtered.retain(|todo| is_closed(&todo.front.status));
+        }
+
         let count = filtered.len();
-        let text = serde_json::to_string_pretty(&json).unwrap_or_default();
-        let summary = format!("Found {count} todos");
-        Ok(CallToolResult::success(vec![
-            Content::text(text).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
-        ]))
+        Ok(result_json(
+            todo_list_to_json(&filtered),
+            format!("Found {count} todos"),
+        ))
     }
 
     fn handle_get(&self, params: TodoGetParams) -> Result<CallToolResult, ErrorData> {
-        let id = normalize_id(&params.id);
-        match read_todo(&self.dir, &id) {
-            Ok(todo) => {
-                let summary = format!(
+        match read_todo_by_id(&self.dir, &params.id) {
+            Ok(todo) => Ok(result_json(
+                todo_to_json(&todo),
+                format!(
                     "{}: {} [{}]",
                     display_id(&todo.front.id),
                     todo.front.title,
                     todo.front.status
-                );
-                let text = serde_json::to_string_pretty(&todo_to_json(&todo)).unwrap_or_default();
-                Ok(CallToolResult::success(vec![
-                    Content::text(text).with_audience(vec![Role::Assistant]),
-                    Content::text(summary).with_audience(vec![Role::User]),
-                ]))
-            }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(e)])),
+                ),
+            )),
+            Err(err) => Ok(CallToolResult::error(vec![Content::text(err)])),
         }
     }
 
     fn handle_create(&self, params: TodoCreateParams) -> Result<CallToolResult, ErrorData> {
+        let plan = normalize_plan_name(&params.plan)
+            .map_err(|err| ErrorData::invalid_params(err, None))?;
         let id = generate_id();
-        // Retry if collision (unlikely)
-        if todo_path(&self.dir, &id).exists() {
-            return Ok(CallToolResult::error(vec![Content::text(
-                "ID collision, please retry",
-            )]));
-        }
         let todo = TodoRecord {
             front: TodoFrontMatter {
                 id: id.clone(),
                 title: params.title,
                 tags: params.tags,
-                plan: params.plan,
-                status: params.status.unwrap_or_else(|| "open".to_string()),
+                plan,
+                status: params.status.unwrap_or_else(default_status),
                 created_at: now_iso(),
                 updated_at: None,
                 key: params.key,
@@ -759,38 +693,32 @@ impl TodoServer {
             },
             body: params.body.unwrap_or_default(),
         };
-        if let Err(e) = write_todo(&self.dir, &todo) {
-            return Ok(CallToolResult::error(vec![Content::text(e)]));
-        }
-        let summary = format!(
-            "Created {}: {}",
-            display_id(&todo.front.id),
-            todo.front.title
-        );
-        let text = serde_json::to_string_pretty(&todo_to_json(&todo)).unwrap_or_default();
-        Ok(CallToolResult::success(vec![
-            Content::text(text).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
-        ]))
+        write_todo(&self.dir, &todo).map_err(|err| ErrorData::internal_error(err, None))?;
+        Ok(result_json(
+            todo_to_json(&todo),
+            format!("Created {}", display_id(&todo.front.id)),
+        ))
     }
 
     fn handle_update(&self, params: TodoUpdateParams) -> Result<CallToolResult, ErrorData> {
-        let id = normalize_id(&params.id);
-        let mut todo = match read_todo(&self.dir, &id) {
-            Ok(t) => t,
-            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-        };
+        let old_todo = read_todo_by_id(&self.dir, &params.id)
+            .map_err(|err| ErrorData::invalid_params(err, None))?;
+        let old_plan = old_todo.front.plan.clone();
+        let old_id = old_todo.front.id.clone();
+        let mut todo = old_todo.clone();
+
         if let Some(title) = params.title {
             todo.front.title = title;
-        }
-        if let Some(status) = params.status {
-            todo.front.status = status;
         }
         if let Some(tags) = params.tags {
             todo.front.tags = tags;
         }
         if let Some(plan) = params.plan {
-            todo.front.plan = Some(plan);
+            todo.front.plan =
+                normalize_plan_name(&plan).map_err(|err| ErrorData::invalid_params(err, None))?;
+        }
+        if let Some(status) = params.status {
+            todo.front.status = status;
         }
         if let Some(body) = params.body {
             todo.body = body;
@@ -802,242 +730,209 @@ impl TodoServer {
             todo.front.dependencies = dependencies;
         }
         todo.front.updated_at = Some(now_iso());
-        if let Err(e) = write_todo(&self.dir, &todo) {
-            return Ok(CallToolResult::error(vec![Content::text(e)]));
+
+        write_todo(&self.dir, &todo).map_err(|err| ErrorData::internal_error(err, None))?;
+        if old_plan != todo.front.plan {
+            let old_path = todo_file_path(&self.dir, &old_plan, &old_id);
+            if old_path.exists() {
+                std::fs::remove_file(&old_path).map_err(|err| {
+                    ErrorData::internal_error(
+                        format!("failed to remove {}: {err}", old_path.display()),
+                        None,
+                    )
+                })?;
+            }
         }
-        let summary = format!(
-            "Updated {}: {}",
-            display_id(&todo.front.id),
-            todo.front.title
-        );
-        let text = serde_json::to_string_pretty(&todo_to_json(&todo)).unwrap_or_default();
-        Ok(CallToolResult::success(vec![
-            Content::text(text).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
-        ]))
+
+        Ok(result_json(
+            todo_to_json(&todo),
+            format!("Updated {}", display_id(&todo.front.id)),
+        ))
     }
 
     fn handle_append(&self, params: TodoAppendParams) -> Result<CallToolResult, ErrorData> {
-        let id = normalize_id(&params.id);
-        let mut todo = match read_todo(&self.dir, &id) {
-            Ok(t) => t,
-            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-        };
-        let spacer = if todo.body.trim().is_empty() {
-            ""
+        let mut todo = read_todo_by_id(&self.dir, &params.id)
+            .map_err(|err| ErrorData::invalid_params(err, None))?;
+        if todo.body.is_empty() {
+            todo.body = params.text;
         } else {
-            "\n\n"
-        };
-        todo.body = format!("{}{}{}", todo.body.trim_end(), spacer, params.text.trim());
-        todo.front.updated_at = Some(now_iso());
-        if let Err(e) = write_todo(&self.dir, &todo) {
-            return Ok(CallToolResult::error(vec![Content::text(e)]));
+            todo.body.push_str(&params.text);
         }
-        let summary = format!("Appended to {}", display_id(&todo.front.id));
-        let text = serde_json::to_string_pretty(&todo_to_json(&todo)).unwrap_or_default();
-        Ok(CallToolResult::success(vec![
-            Content::text(text).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
-        ]))
+        todo.front.updated_at = Some(now_iso());
+        write_todo(&self.dir, &todo).map_err(|err| ErrorData::internal_error(err, None))?;
+        Ok(result_json(
+            todo_to_json(&todo),
+            format!("Appended to {}", display_id(&todo.front.id)),
+        ))
     }
 
     fn handle_delete(&self, params: TodoDeleteParams) -> Result<CallToolResult, ErrorData> {
-        let id = normalize_id(&params.id);
-        let path = todo_path(&self.dir, &id);
-        if !path.exists() {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "{} not found",
-                display_id(&id)
-            ))]));
-        }
-        std::fs::remove_file(&path)
-            .map_err(|e| ErrorData::internal_error(format!("delete failed: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "{} deleted",
-            display_id(&id)
-        ))]))
+        let (_, path) = find_todo_file(&self.dir, &params.id)
+            .map_err(|err| ErrorData::invalid_params(err, None))?;
+        std::fs::remove_file(&path).map_err(|err| {
+            ErrorData::internal_error(format!("failed to delete {}: {err}", path.display()), None)
+        })?;
+        Ok(result_text(
+            format!("Deleted {}", display_id(&params.id)),
+            format!("Deleted {}", display_id(&params.id)),
+        ))
     }
 
     fn handle_plan_read(&self, params: PlanReadParams) -> Result<CallToolResult, ErrorData> {
-        let path = match self.plan_path(&params.name) {
-            Ok(p) => p,
-            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(content) => Ok(CallToolResult::success(vec![Content::text(content)])),
-            Err(_) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Plan '{}' not found",
-                params.name
-            ))])),
-        }
+        let name = normalize_plan_name(&params.name)
+            .map_err(|err| ErrorData::invalid_params(err, None))?;
+        let path = plan_file_path(&self.dir, &name);
+        let content = std::fs::read_to_string(&path).map_err(|err| {
+            ErrorData::invalid_params(format!("failed to read {}: {err}", path.display()), None)
+        })?;
+        Ok(result_text(content, format!("Read plan {name}")))
     }
 
     fn handle_plan_write(&self, params: PlanWriteParams) -> Result<CallToolResult, ErrorData> {
-        let plan_name = params.name.clone();
-        let path = match self.plan_path(&plan_name) {
-            Ok(p) => p,
-            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-        };
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to create plans directory: {e}"
-                ))]));
-            }
-        }
-        if let Err(e) = std::fs::write(&path, &params.content) {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to write plan: {e}"
-            ))]));
-        }
+        let name = normalize_plan_name(&params.name)
+            .map_err(|err| ErrorData::invalid_params(err, None))?;
+        let dir = plan_dir(&self.dir, &name);
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            ErrorData::internal_error(format!("failed to create {}: {err}", dir.display()), None)
+        })?;
+        let path = plan_file_path(&self.dir, &name);
+        std::fs::write(&path, params.content).map_err(|err| {
+            ErrorData::internal_error(format!("failed to write {}: {err}", path.display()), None)
+        })?;
 
-        // Create todos if provided
-        let mut created_todos = Vec::new();
-        let mut errors = Vec::new();
+        let mut created = 0usize;
+        for spec in params.todos.unwrap_or_default() {
+            let TodoSpec {
+                title,
+                tags,
+                status,
+                body,
+                key,
+                dependencies,
+            } = spec;
 
-        for spec in params.todos {
-            let id = generate_id();
-            if todo_path(&self.dir, &id).exists() {
-                errors.push(format!("ID collision for todo '{}', skipped", spec.title));
-                continue;
-            }
-            let todo = TodoRecord {
-                front: TodoFrontMatter {
-                    id: id.clone(),
-                    title: spec.title.clone(),
-                    tags: spec.tags.clone(),
-                    plan: Some(plan_name.clone()),
-                    status: spec.status.clone().unwrap_or_else(|| "open".to_string()),
-                    created_at: now_iso(),
-                    updated_at: None,
-                    key: spec.key.clone(),
-                    dependencies: spec.dependencies.clone(),
-                },
-                body: spec.body.clone().unwrap_or_default(),
+            let todo = if let Some(key) = key {
+                if let Some(mut existing) = find_todo_by_key(&self.dir, &name, &key) {
+                    existing.front.title = title;
+                    if !tags.is_empty() {
+                        existing.front.tags = tags;
+                    }
+                    existing.front.plan = name.clone();
+                    if let Some(status) = status {
+                        existing.front.status = status;
+                    }
+                    existing.front.updated_at = Some(now_iso());
+                    existing.front.key = Some(key);
+                    if !dependencies.is_empty() {
+                        existing.front.dependencies = dependencies;
+                    }
+                    if let Some(body) = body {
+                        existing.body = body;
+                    }
+                    existing
+                } else {
+                    created += 1;
+                    TodoRecord {
+                        front: TodoFrontMatter {
+                            id: generate_id(),
+                            title,
+                            tags,
+                            plan: name.clone(),
+                            status: status.unwrap_or_else(default_status),
+                            created_at: now_iso(),
+                            updated_at: None,
+                            key: Some(key),
+                            dependencies,
+                        },
+                        body: body.unwrap_or_default(),
+                    }
+                }
+            } else {
+                created += 1;
+                TodoRecord {
+                    front: TodoFrontMatter {
+                        id: generate_id(),
+                        title,
+                        tags,
+                        plan: name.clone(),
+                        status: status.unwrap_or_else(default_status),
+                        created_at: now_iso(),
+                        updated_at: None,
+                        key: None,
+                        dependencies,
+                    },
+                    body: body.unwrap_or_default(),
+                }
             };
-            match write_todo(&self.dir, &todo) {
-                Ok(()) => {
-                    created_todos.push(todo_to_json(&todo));
-                }
-                Err(e) => {
-                    errors.push(format!("Failed to create todo '{}': {}", spec.title, e));
-                }
-            }
+
+            write_todo(&self.dir, &todo).map_err(|err| ErrorData::internal_error(err, None))?;
         }
 
-        let mut messages = vec![format!("Plan '{}' saved", plan_name)];
-
-        if !created_todos.is_empty() {
-            messages.push(format!("Created {} todo(s)", created_todos.len()));
-        }
-        if !errors.is_empty() {
-            messages.push(errors.join("\n"));
-        }
-
-        let summary = messages.join(". ");
-        let mut result_json = serde_json::json!({
-            "plan": plan_name,
-            "todos_created": created_todos.len(),
-        });
-        if !created_todos.is_empty() {
-            result_json["todos"] = serde_json::to_value(&created_todos).unwrap_or_default();
-        }
-        if !errors.is_empty() {
-            result_json["errors"] = serde_json::to_value(&errors).unwrap_or_default();
-        }
-
-        let text = serde_json::to_string_pretty(&result_json).unwrap_or_default();
-        Ok(CallToolResult::success(vec![
-            Content::text(text).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
-        ]))
+        Ok(result_text(
+            format!("Wrote plan {name}"),
+            format!("Wrote plan {name} and created {created} todos"),
+        ))
     }
 
     fn handle_plan_add_note(&self, params: PlanAddNoteParams) -> Result<CallToolResult, ErrorData> {
-        let path = match self.plan_path(&params.name) {
-            Ok(p) => p,
-            Err(e) => return Ok(CallToolResult::error(vec![Content::text(e)])),
-        };
+        let name = normalize_plan_name(&params.name)
+            .map_err(|err| ErrorData::invalid_params(err, None))?;
+        let dir = plan_dir(&self.dir, &name);
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            ErrorData::internal_error(format!("failed to create {}: {err}", dir.display()), None)
+        })?;
+        let path = plan_file_path(&self.dir, &name);
         let mut content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to read existing plan: {e}"
-                ))]))
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(ErrorData::internal_error(
+                    format!("failed to read {}: {err}", path.display()),
+                    None,
+                ))
             }
         };
         if !content.is_empty() && !content.ends_with('\n') {
             content.push('\n');
         }
-        if !content.is_empty() {
-            content.push('\n');
-        }
-        content.push_str("### Note\n\n");
+        content.push_str("\n### Note\n\n");
         content.push_str(&params.text);
         content.push('\n');
-
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "Failed to create plans directory: {e}"
-                ))]));
-            }
-        }
-        if let Err(e) = std::fs::write(&path, content) {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to write plan: {e}"
-            ))]));
-        }
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Note added to plan '{}'",
-            params.name
-        ))]))
+        std::fs::write(&path, content).map_err(|err| {
+            ErrorData::internal_error(format!("failed to write {}: {err}", path.display()), None)
+        })?;
+        Ok(result_text(
+            format!("Added note to plan {name}"),
+            format!("Added note to plan {name}"),
+        ))
     }
 
     fn handle_plan_get_todo(&self, params: PlanGetTodoParams) -> Result<CallToolResult, ErrorData> {
-        let all_todos = list_todos(&self.dir);
-        let matching: Vec<_> = all_todos
-            .iter()
-            .filter(|t| {
-                t.front.plan.as_deref() == Some(params.plan.as_str())
-                    && t.front.key.as_deref() == Some(params.key.as_str())
-            })
+        let plan = normalize_plan_name(&params.plan)
+            .map_err(|err| ErrorData::invalid_params(err, None))?;
+        let matching: Vec<TodoRecord> = list_todos(&self.dir, Some(&plan), None, None)
+            .into_iter()
+            .filter(|todo| todo.front.key.as_deref() == Some(params.key.as_str()))
             .collect();
 
         if matching.is_empty() {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "No todo with key '{}' found in plan '{}'",
-                params.key, params.plan
+                params.key, plan
             ))]));
         }
-
         if matching.len() > 1 {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Multiple todos with key '{}' found in plan '{}' - this indicates data inconsistency",
-                params.key, params.plan
+                params.key, plan
             ))]));
         }
 
         let todo = &matching[0];
-        let summary = format!("Found {}: {}", display_id(&todo.front.id), todo.front.title);
-        let text = serde_json::to_string_pretty(&todo_to_json(todo)).unwrap_or_default();
-        Ok(CallToolResult::success(vec![
-            Content::text(text).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
-        ]))
-    }
-
-    fn plan_path(&self, name: &str) -> Result<PathBuf, String> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err("Plan name cannot be empty".to_string());
-        }
-        if name.contains('/') || name.contains('\\') || name.contains("..") {
-            return Err("Invalid plan name".to_string());
-        }
-        let plans_dir = self.dir.parent().unwrap_or(&self.dir).join("plans");
-        Ok(plans_dir.join(format!("{name}.md")))
+        Ok(result_json(
+            todo_to_json(todo),
+            format!("Found {}: {}", display_id(&todo.front.id), todo.front.title),
+        ))
     }
 }
 
@@ -1049,7 +944,7 @@ impl ServerHandler for TodoServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "File-based todo/plan management. Todos stored as markdown files with JSON front matter.",
+                "File-based todo/plan management. Todos stored as markdown files with YAML front matter in per-plan directories.",
             )
     }
 
@@ -1060,10 +955,11 @@ impl ServerHandler for TodoServer {
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult {
             meta: None,
+            next_cursor: None,
             tools: vec![
                 Tool::new(
                     "todo_list",
-                    "List todos. Filter by status ('open', 'closed', 'all') and optionally by tag.",
+                    "List todos. Filter by status ('open', 'closed', 'all') and optionally by tag or plan.",
                     Map::new(),
                 )
                 .with_input_schema::<TodoListParams>()
@@ -1073,7 +969,7 @@ impl ServerHandler for TodoServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "todo_get",
-                    "Get a single todo by ID, including its full body.",
+                    "Get single todo by ID, including full body.",
                     Map::new(),
                 )
                 .with_input_schema::<TodoGetParams>()
@@ -1083,7 +979,7 @@ impl ServerHandler for TodoServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "todo_create",
-                    "Create a new todo with title, optional tags, status, body, key, and dependencies.",
+                    "Create new todo with title, required plan, optional tags, status, body, key, and dependencies.",
                     Map::new(),
                 )
                 .with_input_schema::<TodoCreateParams>()
@@ -1093,7 +989,7 @@ impl ServerHandler for TodoServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "todo_update",
-                    "Update a todo's title, status, tags, key, dependencies, or body (replaces).",
+                    "Update todo title, status, tags, plan, key, dependencies, or body (replaces).",
                     Map::new(),
                 )
                 .with_input_schema::<TodoUpdateParams>()
@@ -1103,7 +999,7 @@ impl ServerHandler for TodoServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "todo_append",
-                    "Append text to a todo's body (adds, doesn't replace).",
+                    "Append text to todo body (adds, doesn't replace).",
                     Map::new(),
                 )
                 .with_input_schema::<TodoAppendParams>()
@@ -1111,13 +1007,13 @@ impl ServerHandler for TodoServer {
                     "call_template": "**append** to {{ args.id }}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
-                Tool::new("todo_delete", "Delete a todo by ID.", Map::new())
+                Tool::new("todo_delete", "Delete todo by ID.", Map::new())
                     .with_input_schema::<TodoDeleteParams>()
                     .with_meta(Meta(json!({
                         "call_template": "**delete todo** {{ args.id }}",
                         "result_template": "{{ result.content[0].text | default('') }}"
                     }).as_object().unwrap().clone())),
-                Tool::new("read_plan", "Read a plan's content by name.", Map::new())
+                Tool::new("read_plan", "Read plan markdown file.", Map::new())
                     .with_input_schema::<PlanReadParams>()
                     .with_meta(Meta(json!({
                         "call_template": "**read plan** {{ args.name }}",
@@ -1125,7 +1021,7 @@ impl ServerHandler for TodoServer {
                     }).as_object().unwrap().clone())),
                 Tool::new(
                     "write_plan",
-                    "Write/update a plan's content by name. Optionally create todos along with the plan.",
+                    "Write full plan markdown text and optionally create batch todos in that plan.",
                     Map::new(),
                 )
                 .with_input_schema::<PlanWriteParams>()
@@ -1135,26 +1031,25 @@ impl ServerHandler for TodoServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "plan_add_note",
-                    "Add a note to an existing plan.",
+                    "Append note section to plan markdown.",
                     Map::new(),
                 )
                 .with_input_schema::<PlanAddNoteParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**add note** to {{ args.name }}",
+                    "call_template": "**plan add note** {{ args.name }}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "plan_get_todo",
-                    "Get a todo by its plan name and key within the plan.",
+                    "Get todo in plan by key field.",
                     Map::new(),
                 )
                 .with_input_schema::<PlanGetTodoParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**get todo** {{ args.plan }}/{{ args.key }}",
+                    "call_template": "**plan get todo** {{ args.plan }} {{ args.key }}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
             ],
-            next_cursor: None,
         })
     }
 
@@ -1251,4 +1146,492 @@ fn object_schema_with_desc(properties: Vec<(&str, &str, Schema)>, required: &[&s
     }
 
     schema.into()
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn generate_id() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
+}
+
+fn normalize_id(id: &str) -> String {
+    let trimmed = id.trim();
+    let without_prefix = trimmed
+        .strip_prefix("todo-")
+        .or_else(|| trimmed.strip_prefix("TODO-"))
+        .unwrap_or(trimmed);
+    without_prefix.to_ascii_lowercase()
+}
+
+fn display_id(id: &str) -> String {
+    format!("TODO-{}", normalize_id(id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "harnx-mcp-todo-{name}-{}-{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        path.push(unique);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn unique_iso() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{nanos}")
+    }
+
+    fn sample_todo(plan: &str, id: &str, status: &str, key: Option<&str>) -> TodoRecord {
+        TodoRecord {
+            front: TodoFrontMatter {
+                id: id.to_string(),
+                title: format!("todo-{id}"),
+                tags: vec!["tag1".to_string()],
+                plan: plan.to_string(),
+                status: status.to_string(),
+                created_at: unique_iso(),
+                updated_at: Some(unique_iso()),
+                key: key.map(str::to_string),
+                dependencies: vec!["dep-1".to_string()],
+            },
+            body: format!("body-{id}"),
+        }
+    }
+
+    fn extract_text(result: CallToolResult) -> String {
+        result.content[0]
+            .raw
+            .as_text()
+            .map(|text| text.text.clone())
+            .unwrap_or_else(|| panic!("unexpected content: {:?}", result.content[0]))
+    }
+
+    #[test]
+    fn serialize_and_parse_yaml_frontmatter_roundtrip_and_crlf() {
+        let todo = sample_todo("alpha", "deadbeef", "open", Some("task-1"));
+        let serialized = serialize_todo(&todo).unwrap();
+        let (front, body) = parse_yaml_frontmatter(&serialized).unwrap();
+        assert_eq!(front.id, todo.front.id);
+        assert_eq!(front.title, todo.front.title);
+        assert_eq!(front.tags, todo.front.tags);
+        assert_eq!(front.plan, todo.front.plan);
+        assert_eq!(front.status, todo.front.status);
+        assert_eq!(front.created_at, todo.front.created_at);
+        assert_eq!(front.updated_at, todo.front.updated_at);
+        assert_eq!(front.key, todo.front.key);
+        assert_eq!(front.dependencies, todo.front.dependencies);
+        assert_eq!(body, todo.body);
+
+        let crlf = serialized.replace('\n', "\r\n");
+        let (crlf_front, crlf_body) = parse_yaml_frontmatter(&crlf).unwrap();
+        assert_eq!(crlf_front.id, todo.front.id);
+        assert_eq!(crlf_front.key, todo.front.key);
+        assert_eq!(crlf_body, todo.body);
+    }
+
+    #[test]
+    fn list_todos_status_filter_matches_literal_statuses() {
+        let dir = temp_test_dir("list-status-filter");
+        write_todo(&dir, &sample_todo("plan-a", "00000001", "open", None)).unwrap();
+        write_todo(&dir, &sample_todo("plan-a", "00000002", "closed", None)).unwrap();
+        write_todo(&dir, &sample_todo("plan-a", "00000003", "done", None)).unwrap();
+
+        let open = list_todos(&dir, Some("plan-a"), None, Some("open"));
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].front.status, "open");
+        assert!(open.iter().all(|todo| !is_closed(&todo.front.status)));
+
+        let closed = list_todos(&dir, Some("plan-a"), None, Some("closed"));
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].front.status, "closed");
+
+        let done = list_todos(&dir, Some("plan-a"), None, Some("done"));
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].front.status, "done");
+    }
+
+    #[test]
+    fn handle_list_returns_created_todo() {
+        let dir = temp_test_dir("handle-list");
+        let server = TodoServer::new(dir);
+
+        server
+            .handle_create(TodoCreateParams {
+                title: "first todo".to_string(),
+                tags: vec!["ship".to_string()],
+                plan: "plan-a".to_string(),
+                status: None,
+                body: Some("details".to_string()),
+                key: Some("task-1".to_string()),
+                dependencies: vec![],
+            })
+            .unwrap();
+
+        let result = server
+            .handle_list(TodoListParams {
+                filter: "all".to_string(),
+                tag: None,
+                plan: Some("plan-a".to_string()),
+            })
+            .unwrap();
+        let text = extract_text(result);
+        let todos: Vec<Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0]["title"], "first todo");
+        assert_eq!(todos[0]["plan"], "plan-a");
+    }
+
+    #[test]
+    fn write_plan_upserts_todo_by_key() {
+        let dir = temp_test_dir("write-plan-upsert");
+        let server = TodoServer::new(dir.clone());
+
+        server
+            .handle_plan_write(PlanWriteParams {
+                name: "plan-a".to_string(),
+                content: "# plan\n".to_string(),
+                todos: Some(vec![TodoSpec {
+                    title: "first".to_string(),
+                    tags: vec!["alpha".to_string()],
+                    status: Some("open".to_string()),
+                    body: Some("body one".to_string()),
+                    key: Some("task-1".to_string()),
+                    dependencies: vec!["dep-a".to_string()],
+                }]),
+            })
+            .unwrap();
+
+        server
+            .handle_plan_write(PlanWriteParams {
+                name: "plan-a".to_string(),
+                content: "# plan updated\n".to_string(),
+                todos: Some(vec![TodoSpec {
+                    title: "second".to_string(),
+                    tags: vec!["beta".to_string()],
+                    status: Some("done".to_string()),
+                    body: Some("body two".to_string()),
+                    key: Some("task-1".to_string()),
+                    dependencies: vec!["dep-b".to_string()],
+                }]),
+            })
+            .unwrap();
+
+        let todo_files: Vec<_> = fs::read_dir(dir.join("plan-a"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("todo-")
+            })
+            .collect();
+        assert_eq!(todo_files.len(), 1);
+
+        let todo = find_todo_by_key(&dir, "plan-a", "task-1").unwrap();
+        assert_eq!(todo.front.title, "second");
+        assert_eq!(todo.front.status, "done");
+        assert_eq!(todo.front.tags, vec!["beta".to_string()]);
+        assert_eq!(todo.front.dependencies, vec!["dep-b".to_string()]);
+        assert_eq!(todo.body, "body two");
+    }
+
+    #[test]
+    fn write_plan_upsert_preserves_omitted_optional_fields() {
+        let dir = temp_test_dir("write-plan-upsert-preserve");
+        let server = TodoServer::new(dir.clone());
+
+        server
+            .handle_plan_write(PlanWriteParams {
+                name: "plan-a".to_string(),
+                content: "# plan\n".to_string(),
+                todos: Some(vec![TodoSpec {
+                    title: "first".to_string(),
+                    tags: vec!["alpha".to_string()],
+                    status: Some("done".to_string()),
+                    body: Some("body one".to_string()),
+                    key: Some("task-1".to_string()),
+                    dependencies: vec!["dep-a".to_string()],
+                }]),
+            })
+            .unwrap();
+
+        server
+            .handle_plan_write(PlanWriteParams {
+                name: "plan-a".to_string(),
+                content: "# plan updated\n".to_string(),
+                todos: Some(vec![TodoSpec {
+                    title: "second".to_string(),
+                    tags: vec![],
+                    status: None,
+                    body: None,
+                    key: Some("task-1".to_string()),
+                    dependencies: vec![],
+                }]),
+            })
+            .unwrap();
+
+        let todo = find_todo_by_key(&dir, "plan-a", "task-1").unwrap();
+        assert_eq!(todo.front.title, "second");
+        assert_eq!(todo.front.status, "done");
+        assert_eq!(todo.front.tags, vec!["alpha".to_string()]);
+        assert_eq!(todo.front.dependencies, vec!["dep-a".to_string()]);
+        assert_eq!(todo.body, "body one");
+    }
+
+    #[test]
+    fn todo_get_finds_todo_across_plan_directories() {
+        let dir = temp_test_dir("todo-get-cross-plan");
+        let server = TodoServer::new(dir);
+
+        let created = server
+            .handle_create(TodoCreateParams {
+                title: "second todo".to_string(),
+                tags: vec![],
+                plan: "plan-b".to_string(),
+                status: None,
+                body: Some("details".to_string()),
+                key: None,
+                dependencies: vec![],
+            })
+            .unwrap();
+        let created_todo: Value = serde_json::from_str(&extract_text(created)).unwrap();
+
+        let result = server
+            .handle_get(TodoGetParams {
+                id: created_todo["id"].as_str().unwrap().to_string(),
+            })
+            .unwrap();
+        let fetched_todo: Value = serde_json::from_str(&extract_text(result)).unwrap();
+        assert_eq!(fetched_todo["plan"], "plan-b");
+    }
+
+    #[test]
+    fn todo_update_plan_move_moves_file_to_new_plan_directory() {
+        let dir = temp_test_dir("todo-update-plan-move");
+        let server = TodoServer::new(dir.clone());
+
+        let created = server
+            .handle_create(TodoCreateParams {
+                title: "movable todo".to_string(),
+                tags: vec![],
+                plan: "plan-a".to_string(),
+                status: None,
+                body: None,
+                key: None,
+                dependencies: vec![],
+            })
+            .unwrap();
+        let created_todo: Value = serde_json::from_str(&extract_text(created)).unwrap();
+        let id = created_todo["id"].as_str().unwrap().to_string();
+
+        server
+            .handle_update(TodoUpdateParams {
+                id: id.clone(),
+                title: None,
+                tags: None,
+                plan: Some("plan-b".to_string()),
+                status: None,
+                body: None,
+                key: None,
+                dependencies: None,
+            })
+            .unwrap();
+
+        assert!(!dir.join("plan-a").join(format!("todo-{id}.md")).exists());
+        assert!(dir.join("plan-b").join(format!("todo-{id}.md")).exists());
+    }
+
+    #[test]
+    fn todo_delete_removes_file_from_plan_directory() {
+        let dir = temp_test_dir("todo-delete");
+        let server = TodoServer::new(dir.clone());
+
+        let created = server
+            .handle_create(TodoCreateParams {
+                title: "delete me".to_string(),
+                tags: vec![],
+                plan: "plan-a".to_string(),
+                status: None,
+                body: None,
+                key: None,
+                dependencies: vec![],
+            })
+            .unwrap();
+        let created_todo: Value = serde_json::from_str(&extract_text(created)).unwrap();
+        let id = created_todo["id"].as_str().unwrap().to_string();
+
+        server
+            .handle_delete(TodoDeleteParams { id: id.clone() })
+            .unwrap();
+
+        assert!(!dir.join("plan-a").join(format!("todo-{id}.md")).exists());
+    }
+
+    #[test]
+    fn todo_append_appends_text_to_body() {
+        let dir = temp_test_dir("todo-append");
+        let server = TodoServer::new(dir.clone());
+
+        let created = server
+            .handle_create(TodoCreateParams {
+                title: "append me".to_string(),
+                tags: vec![],
+                plan: "plan-a".to_string(),
+                status: None,
+                body: Some("hello".to_string()),
+                key: None,
+                dependencies: vec![],
+            })
+            .unwrap();
+        let created_todo: Value = serde_json::from_str(&extract_text(created)).unwrap();
+        let id = created_todo["id"].as_str().unwrap().to_string();
+
+        server
+            .handle_append(TodoAppendParams {
+                id: id.clone(),
+                text: " world".to_string(),
+            })
+            .unwrap();
+
+        let todo = read_todo(&dir, "plan-a", &id).unwrap();
+        assert_eq!(todo.body, "hello world");
+    }
+
+    #[test]
+    fn list_todos_without_plan_filter_returns_multiple_plan_directories() {
+        let dir = temp_test_dir("list-cross-plan");
+        let server = TodoServer::new(dir);
+
+        for plan in ["plan-a", "plan-b"] {
+            server
+                .handle_create(TodoCreateParams {
+                    title: format!("todo for {plan}"),
+                    tags: vec![],
+                    plan: plan.to_string(),
+                    status: None,
+                    body: None,
+                    key: None,
+                    dependencies: vec![],
+                })
+                .unwrap();
+        }
+
+        let result = server
+            .handle_list(TodoListParams {
+                filter: "all".to_string(),
+                tag: None,
+                plan: None,
+            })
+            .unwrap();
+        let todos: Vec<Value> = serde_json::from_str(&extract_text(result)).unwrap();
+        assert_eq!(todos.len(), 2);
+    }
+
+    #[test]
+    fn plan_add_note_creates_missing_plan_file() {
+        let dir = temp_test_dir("plan-add-note-not-found");
+        let server = TodoServer::new(dir.clone());
+
+        let result = server
+            .handle_plan_add_note(PlanAddNoteParams {
+                name: "plan-a".to_string(),
+                text: "hello note".to_string(),
+            })
+            .unwrap();
+        let summary = extract_text(result);
+        assert!(summary.contains("Added note to plan plan-a"));
+
+        let content = fs::read_to_string(dir.join("plan-a").join("plan.md")).unwrap();
+        assert!(content.contains("### Note"));
+        assert!(content.contains("hello note"));
+    }
+
+    #[test]
+    fn handle_list_closed_bucket_includes_done_and_closed() {
+        let dir = temp_test_dir("handle-list-buckets");
+        let server = TodoServer::new(dir);
+        for (title, status) in [
+            ("open task", "open"),
+            ("closed task", "closed"),
+            ("done task", "done"),
+        ] {
+            server
+                .handle_create(TodoCreateParams {
+                    title: title.to_string(),
+                    tags: vec![],
+                    plan: "plan-a".to_string(),
+                    status: Some(status.to_string()),
+                    body: None,
+                    key: None,
+                    dependencies: vec![],
+                })
+                .unwrap();
+        }
+
+        let closed = server
+            .handle_list(TodoListParams {
+                filter: "closed".to_string(),
+                tag: None,
+                plan: Some("plan-a".to_string()),
+            })
+            .unwrap();
+        let closed_todos: Vec<Value> = serde_json::from_str(&extract_text(closed)).unwrap();
+        assert_eq!(closed_todos.len(), 2);
+        assert!(closed_todos
+            .iter()
+            .all(|todo| is_closed(todo["status"].as_str().unwrap())));
+
+        let done = server
+            .handle_list(TodoListParams {
+                filter: "done".to_string(),
+                tag: None,
+                plan: Some("plan-a".to_string()),
+            })
+            .unwrap();
+        let done_todos: Vec<Value> = serde_json::from_str(&extract_text(done)).unwrap();
+        assert_eq!(done_todos.len(), 2);
+        assert!(done_todos
+            .iter()
+            .all(|todo| is_closed(todo["status"].as_str().unwrap())));
+
+        let open = server
+            .handle_list(TodoListParams {
+                filter: "open".to_string(),
+                tag: None,
+                plan: Some("plan-a".to_string()),
+            })
+            .unwrap();
+        let open_todos: Vec<Value> = serde_json::from_str(&extract_text(open)).unwrap();
+        assert_eq!(open_todos.len(), 1);
+        assert_eq!(open_todos[0]["status"], "open");
+    }
 }
