@@ -1,6 +1,6 @@
 ---
 source: crates/harnx/tests/tmux_e2e.rs
-assertion_line: 1141
+assertion_line: 1214
 expression: normalized
 ---
 Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
@@ -21,13 +21,13 @@ Researcher delegating to analyst.
 Analyst complete
 
 > nested-researcher ▸ [UUID]
+   session_id: [UUID]
+   response: Analyst complete
 Researcher complete
 
    session_id: [UUID]
    response: Researcher delegating to analyst.Analyst completeResearcher complete
 Nested task complete
-
-
 
 
 
