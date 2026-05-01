@@ -1,0 +1,45 @@
+---
+source: crates/harnx/tests/tmux_e2e.rs
+expression: s
+---
+Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
+> first message  [2]
+
+FIRST_RESPONSE_SENTINEL  [3]
+
+> fifth message  [12]
+
+EDITED_RESPONSE_SENTINEL  [14]
+
+🤖 mutation-test-agent ▸ mutation-e2e-session
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+* 🤖 mutation-test-agent ▸ mutation-e2e-session   Context: 42(0%)
+
+
+# snap: 5-session2-loaded

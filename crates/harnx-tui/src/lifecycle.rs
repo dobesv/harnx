@@ -124,7 +124,10 @@ impl Tui {
             if state.contains(harnx_runtime::config::StateFlags::AGENT) {
                 if let Ok(banner) = cfg.agent_banner() {
                     if !banner.trim().is_empty() {
-                        entries.push(TranscriptItem::AssistantText(banner));
+                        entries.push(TranscriptItem::AssistantText {
+                            text: banner,
+                            seq: None,
+                        });
                     }
                 }
                 if let Some(agent) = &cfg.agent {
@@ -295,13 +298,19 @@ pub(crate) fn messages_to_transcript_items(
             MessageRole::User => {
                 let text = msg.content.to_text();
                 if !text.is_empty() {
-                    items.push(TranscriptItem::UserText(text));
+                    items.push(TranscriptItem::UserText {
+                        text,
+                        seq: msg.log_seq,
+                    });
                 }
             }
             MessageRole::Assistant => {
                 let text = msg.content.to_text();
                 if !text.is_empty() {
-                    items.push(TranscriptItem::AssistantText(text));
+                    items.push(TranscriptItem::AssistantText {
+                        text,
+                        seq: msg.log_seq,
+                    });
                 }
             }
             MessageRole::Tool => {
@@ -312,7 +321,10 @@ pub(crate) fn messages_to_transcript_items(
                         ));
                     }
                     if !tc.text.trim().is_empty() {
-                        items.push(TranscriptItem::AssistantText(tc.text.clone()));
+                        items.push(TranscriptItem::AssistantText {
+                            text: tc.text.clone(),
+                            seq: msg.log_seq,
+                        });
                     }
                     for r in &tc.tool_results {
                         let raw_call_fallback = if r.call.arguments == Value::Null {
@@ -337,6 +349,7 @@ pub(crate) fn messages_to_transcript_items(
                         items.push(TranscriptItem::ToolCall {
                             tool_name: r.call.name.clone(),
                             body,
+                            seq: msg.log_seq,
                         });
                         let raw_result_fallback = harnx_core::tool::extract_user_display_text(
                             &r.output,
@@ -423,6 +436,7 @@ mod tests {
         let messages = vec![Message {
             role: MessageRole::Tool,
             content: MessageContent::ToolCalls(tc),
+            log_seq: None,
         }];
 
         let items = messages_to_transcript_items(&messages, &decl_map);
@@ -475,6 +489,7 @@ mod tests {
         let messages = vec![Message {
             role: MessageRole::Tool,
             content: MessageContent::ToolCalls(tc),
+            log_seq: None,
         }];
 
         let items = messages_to_transcript_items(&messages, &decl_map);

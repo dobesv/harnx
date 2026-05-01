@@ -1,0 +1,26 @@
+---
+source: crates/harnx-tui/src/tests.rs
+expression: rendered
+---
+Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
+→ exec
+   command: ls -la
+   working_dir: /tmp
+→ write_file
+   write hello.txt with 3 lines
+→ think
+→ search
+   query: rust async patterns
+   max_results: 10
+   include_code: true
+
+
+
+
+
+
+
+
+
+
+• Input

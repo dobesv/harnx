@@ -369,7 +369,7 @@ pub fn gemini_build_chat_completions_body(
     let contents: Vec<Value> = messages
         .into_iter()
         .flat_map(|message| {
-            let Message { role, content } = message;
+            let Message { role, content, .. } = message;
             let role = match role {
                 MessageRole::User => "user",
                 _ => "model",

@@ -4,6 +4,8 @@ use harnx::test_utils::{
     MockOpenAiToolCall, MockOpenAiTurn, MockTurnExpectation, TmuxHarness,
 };
 use harnx_acp::AcpServerConfig;
+use harnx_core::message::MessageRole;
+use harnx_core::session::SessionLogEntry;
 
 use anyhow::{Context, Result};
 use insta::assert_snapshot;
@@ -1731,5 +1733,468 @@ fn retry_succeed_after_fallback_shows_transition() -> Result<()> {
     let normalized = normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen)));
     assert_snapshot!("retry_succeed_after_fallback_shows_transition", normalized);
 
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// session_mutation_e2e
+//
+// End-to-end test for .edit message, .delete message, and .rewind across two
+// harnx sessions.  Sequence:
+//
+//   Session 1
+//     Turn 1  user: "first message"   → LLM: "first response"
+//     Turn 2  user: "second message"  → LLM: "second response"
+//     Turn 3  user: "third message"   → LLM: "third response"
+//     SNAP 1  (baseline — three turns visible, seq numbers shown)
+//     .delete message  removes turn 2 (user + assistant pair)
+//     SNAP 2  (after delete — mutation notice visible)
+//     .rewind  rewinds to after the first turn
+//     SNAP 3  (after rewind — only turn 1 context remains)
+//     Turn 4  user: "fourth message"  → LLM: "fourth response"
+//     .edit message  opens turn 4 in $EDITOR (mock editor rewrites content)
+//     SNAP 4  (after edit — edited content visible, mutation notice visible)
+//     Exit harnx
+//
+//   Session 2 (same agent + session name, resuming from disk)
+//     Wait for TUI to load history
+//     SNAP 5  (session reload — history reconstructed from mutations)
+//     Turn 5  user: "fifth message"   → LLM: "fifth response"
+//     SNAP 6  (new turn in reloaded session, seq numbers continue)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MUTATION_AGENT_NAME: &str = "mutation-test-agent";
+const MUTATION_SESSION_NAME: &str = "mutation-e2e-session";
+
+const RESP_FIRST: &str = "FIRST_RESPONSE_SENTINEL";
+const RESP_SECOND: &str = "SECOND_RESPONSE_SENTINEL";
+const RESP_THIRD: &str = "THIRD_RESPONSE_SENTINEL";
+const RESP_FOURTH: &str = "FOURTH_RESPONSE_SENTINEL";
+const RESP_EDITED: &str = "EDITED_RESPONSE_SENTINEL";
+const RESP_FIFTH: &str = "FIFTH_RESPONSE_SENTINEL";
+
+fn mutation_script() -> MockOpenAiScript {
+    MockOpenAiScript {
+        turns: vec![
+            MockOpenAiTurn {
+                text_chunks: vec![RESP_FIRST.to_string()],
+                tool_calls: vec![],
+                error: None,
+                expect: None,
+            },
+            MockOpenAiTurn {
+                text_chunks: vec![RESP_SECOND.to_string()],
+                tool_calls: vec![],
+                error: None,
+                expect: None,
+            },
+            MockOpenAiTurn {
+                text_chunks: vec![RESP_THIRD.to_string()],
+                tool_calls: vec![],
+                error: None,
+                expect: None,
+            },
+            // Turn 4: the original response before .edit rewrites it
+            MockOpenAiTurn {
+                text_chunks: vec![RESP_FOURTH.to_string()],
+                tool_calls: vec![],
+                error: None,
+                expect: None,
+            },
+            // Session 2, turn 5
+            MockOpenAiTurn {
+                text_chunks: vec![RESP_FIFTH.to_string()],
+                tool_calls: vec![],
+                error: None,
+                expect: None,
+            },
+        ],
+        fallback_text: "No more scripted responses.".to_string(),
+        chunk_delay_ms: 0,
+    }
+}
+
+/// Write a tiny shell script that acts as $EDITOR: replaces the file contents
+/// with `replacement` and exits 0.  Returns the path to the script.
+fn write_mock_editor(dir: &Path, replacement: &str) -> Result<PathBuf> {
+    let script_path = dir.join("mock-editor.sh");
+    // The script receives the temp file path as $1.
+    std::fs::write(
+        &script_path,
+        format!("#!/bin/sh\ncat > \"$1\" <<'MOCK_EOF'\n{replacement}\nMOCK_EOF\n"),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(script_path)
+}
+
+fn write_mutation_fixture_files(paths: &TestPaths, editor_path: &Path) -> Result<()> {
+    std::fs::create_dir_all(&paths.harnx_config_dir)?;
+
+    // save_session enabled by default — but set editor to our mock script.
+    // Also set a fixed session name so session 2 can resume it.
+    std::fs::write(
+        &paths.config_path,
+        format!(
+            "editor: {}\n",
+            shell_escape(editor_path.to_string_lossy().as_ref())
+        ),
+    )?;
+
+    let clients_dir = paths.harnx_config_dir.join("clients");
+    std::fs::create_dir_all(&clients_dir)?;
+
+    let client = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
+        (
+            serde_yaml::Value::String("type".to_string()),
+            serde_yaml::Value::String("openai-compatible".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("name".to_string()),
+            serde_yaml::Value::String("mock-llm".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("api_base".to_string()),
+            serde_yaml::Value::String(format!("http://127.0.0.1:{}/v1", paths.port)),
+        ),
+        (
+            serde_yaml::Value::String("api_key".to_string()),
+            serde_yaml::Value::String("dummy".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("models".to_string()),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(
+                serde_yaml::Mapping::from_iter([
+                    (
+                        serde_yaml::Value::String("name".to_string()),
+                        serde_yaml::Value::String("test".to_string()),
+                    ),
+                    (
+                        serde_yaml::Value::String("max_input_tokens".to_string()),
+                        serde_yaml::Value::Number(32000.into()),
+                    ),
+                    (
+                        serde_yaml::Value::String("max_output_tokens".to_string()),
+                        serde_yaml::Value::Number(4096.into()),
+                    ),
+                    (
+                        serde_yaml::Value::String("supports_tool_use".to_string()),
+                        serde_yaml::Value::Bool(false),
+                    ),
+                ]),
+            )]),
+        ),
+    ]));
+    std::fs::write(
+        clients_dir.join("mock-llm.yaml"),
+        serde_yaml::to_string(&client)?,
+    )?;
+
+    std::fs::write(
+        paths.agents_dir.join(format!("{MUTATION_AGENT_NAME}.md")),
+        format!(
+            "---\nname: {MUTATION_AGENT_NAME}\nmodel: mock-llm:test\n\
+             agent_default_session: {MUTATION_SESSION_NAME}\n---\n\
+             You are a test agent for mutation e2e testing.\n"
+        ),
+    )?;
+
+    Ok(())
+}
+
+fn snap(label: &str, screen: &str) -> String {
+    normalize_spinner_chars(&normalize_uuids(&normalize_screen(screen)))
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + &format!("\n\n# snap: {label}")
+}
+
+#[test]
+fn session_mutation_edit_delete_rewind_persists_across_sessions() -> Result<()> {
+    if option_env!("CARGO_BIN_NAME") == Some("harnx") {
+        eprintln!("skipping session_mutation_e2e: binary test target");
+        return Ok(());
+    }
+    if !TmuxHarness::is_available() {
+        eprintln!("skipping session_mutation_e2e: tmux unavailable");
+        return Ok(());
+    }
+
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+
+    let temp = TempDir::new()?;
+    let mock = MockOpenAiServer::start(mutation_script())?;
+    let paths = TestPaths::new(temp.path(), mock.port())?;
+
+    // Mock editor: writes EDITED_RESPONSE_SENTINEL as the assistant message body.
+    // The edit target will be the assistant message YAML — we replace the whole
+    // document with a valid message entry containing our sentinel text.
+    let edited_yaml = format!("type: message\nrole: assistant\ncontent: {RESP_EDITED}\n");
+    let editor_path = write_mock_editor(temp.path(), &edited_yaml)?;
+
+    write_mutation_fixture_files(&paths, &editor_path)?;
+
+    let path_env = format!(
+        "{}:{}",
+        harnx_bin.parent().context("no parent")?.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let root = repo_root()?;
+
+    // ── Shared tmux setup helper ────────────────────────────────────────────
+    let setup_env = |tmux: &TmuxHarness, marker: &str| -> Result<()> {
+        tmux.send_keys(&["C-l"])?;
+        tmux.send_text(&format!(
+            "export HARNX_CONFIG_DIR={} PATH={} && cd {}; printf '{marker}\\n'",
+            shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
+            shell_escape(&path_env),
+            shell_escape(root.to_string_lossy().as_ref()),
+        ))?;
+        tmux.send_keys(&["Enter"])?;
+        tmux.wait_for(Duration::from_secs(10), |s| {
+            count_occurrences(s, marker) >= 2
+        })?;
+        Ok(())
+    };
+
+    let wait = Duration::from_secs(20);
+    let settle = Duration::from_millis(400);
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SESSION 1
+    // ════════════════════════════════════════════════════════════════════════
+    let tmux = match TmuxHarness::new(&root, 120, 40) {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("skipping: tmux unusable ({err:#})");
+            return Ok(());
+        }
+    };
+    setup_env(&tmux, "__MUTATION_READY__")?;
+
+    // Start harnx with the mutation agent and an explicit session name so
+    // both session 1 and session 2 operate on the same log file.
+    tmux.send_text(&format!(
+        "{} -a {} -s {} || echo HARNX_EXIT:$?",
+        shell_escape(harnx_bin.to_string_lossy().as_ref()),
+        MUTATION_AGENT_NAME,
+        MUTATION_SESSION_NAME,
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
+
+    // ── Turn 1 ───────────────────────────────────────────────────────────
+    tmux.send_text("first message")?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for_contains(RESP_FIRST, wait)?;
+
+    // ── Turn 2 ───────────────────────────────────────────────────────────
+    tmux.send_text("second message")?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for_contains(RESP_SECOND, wait)?;
+
+    // ── Turn 3 ───────────────────────────────────────────────────────────
+    tmux.send_text("third message")?;
+    tmux.send_keys(&["Enter"])?;
+    let screen_after_three_turns =
+        tmux.wait_for_stable(wait, settle, |s| s.contains(RESP_THIRD))?;
+
+    // SNAP 1 — three turns, seq numbers visible on each
+    {
+        let s = snap("1-baseline-three-turns", &screen_after_three_turns);
+        assert!(
+            screen_after_three_turns.contains(RESP_FIRST),
+            "snap1: RESP_FIRST missing\n{s}"
+        );
+        assert!(
+            screen_after_three_turns.contains(RESP_SECOND),
+            "snap1: RESP_SECOND missing\n{s}"
+        );
+        assert!(
+            screen_after_three_turns.contains(RESP_THIRD),
+            "snap1: RESP_THIRD missing\n{s}"
+        );
+        insta::assert_snapshot!("mutation_snap1_baseline_three_turns", s);
+    }
+
+    let session_log_path = paths
+        .harnx_config_dir
+        .join("agents")
+        .join(MUTATION_AGENT_NAME)
+        .join("sessions")
+        .join(format!("{MUTATION_SESSION_NAME}.yaml"));
+    let log_content = std::fs::read_to_string(&session_log_path)
+        .with_context(|| format!("failed to read session log {}", session_log_path.display()))?;
+    let mut first_assistant_seq = None;
+    let mut second_user_seq = None;
+    let mut second_assistant_seq = None;
+    let mut user_count = 0usize;
+    for (seq, document) in serde_yaml::Deserializer::from_str(&log_content).enumerate() {
+        let entry = serde::Deserialize::deserialize(document)?;
+        match entry {
+            SessionLogEntry::Message {
+                role: MessageRole::User,
+                ..
+            } => {
+                user_count += 1;
+                if user_count == 2 {
+                    second_user_seq = Some(seq);
+                }
+            }
+            SessionLogEntry::Message {
+                role: MessageRole::Assistant,
+                ..
+            } => {
+                if first_assistant_seq.is_none() {
+                    first_assistant_seq = Some(seq);
+                }
+                if second_user_seq.is_some() && second_assistant_seq.is_none() {
+                    second_assistant_seq = Some(seq);
+                }
+            }
+            _ => {}
+        }
+    }
+    let second_user_seq = second_user_seq.context("failed to find seq for second user message")?;
+    let second_assistant_seq =
+        second_assistant_seq.context("failed to find seq for second assistant message")?;
+    let first_assistant_seq =
+        first_assistant_seq.context("failed to find seq for first assistant message")?;
+
+    // ── .delete message — remove turn 2 (user + assistant) ───────────────
+    tmux.send_text(&format!(
+        ".delete message {second_user_seq}-{second_assistant_seq}"
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+    let screen_after_delete =
+        tmux.wait_for_stable(wait, settle, |s| s.contains("✗") || s.contains("Deleted"))?;
+
+    // SNAP 2 — after delete: mutation notice visible, turn 2 gone
+    {
+        let s = snap("2-after-delete", &screen_after_delete);
+        assert!(
+            !screen_after_delete.contains(RESP_SECOND),
+            "snap2: RESP_SECOND should be deleted from view\n{s}"
+        );
+        insta::assert_snapshot!("mutation_snap2_after_delete", s);
+    }
+
+    // ── Turn 4 ───────────────────────────────────────────────────────────
+    tmux.send_text("fourth message")?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for_contains(RESP_FOURTH, wait)?;
+
+    // ── .rewind — rewind to after turn 1
+    tmux.send_text(&format!(".rewind {first_assistant_seq}"))?;
+    tmux.send_keys(&["Enter"])?;
+    let screen_after_rewind =
+        tmux.wait_for_stable(wait, settle, |s| s.contains("↩") || s.contains("Rewound"))?;
+
+    // SNAP 3 — after rewind: only turn 1 in context, notice visible
+    {
+        let s = snap("3-after-rewind", &screen_after_rewind);
+        assert!(
+            !screen_after_rewind.contains(RESP_FOURTH),
+            "snap3: RESP_FOURTH should be rewound from view
+{s}"
+        );
+        insta::assert_snapshot!("mutation_snap3_after_rewind", s);
+    }
+
+    // ── Turn 5 (new turn after rewind, becomes the 2nd in effective context)
+    tmux.send_text("fifth message")?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for_contains(RESP_FIFTH, wait)?;
+
+    // ── .edit message — open the fifth message assistant response in $EDITOR
+    // Calculate the actual last seq by counting YAML documents in the session log.
+    // The last entry (assistant response to fifth message) is at seq = doc_count - 1.
+    let session_log_path = paths
+        .harnx_config_dir
+        .join("agents")
+        .join(MUTATION_AGENT_NAME)
+        .join("sessions")
+        .join(format!("{MUTATION_SESSION_NAME}.yaml"));
+    let log_content = std::fs::read_to_string(&session_log_path)
+        .with_context(|| format!("failed to read session log {}", session_log_path.display()))?;
+    // Count documents: number of "\n---\n" separators + 1 (for the opening doc).
+    let doc_count = serde_yaml::Deserializer::from_str(&log_content).count();
+    let last_seq = doc_count - 1;
+    tmux.send_text(&format!(".edit message {last_seq}"))?;
+    tmux.send_keys(&["Enter"])?;
+    // Mock editor runs non-interactively and exits immediately.
+    let screen_after_edit = tmux.wait_for_stable(wait, settle, |s| {
+        s.contains(RESP_EDITED) || s.contains("✎") || s.contains("Edited")
+    })?;
+
+    // SNAP 4 — after edit: edited content visible, mutation notice
+    {
+        let s = snap("4-after-edit", &screen_after_edit);
+        assert!(
+            screen_after_edit.contains(RESP_EDITED),
+            "snap4: edited sentinel not visible\n{s}"
+        );
+        insta::assert_snapshot!("mutation_snap4_after_edit", s);
+    }
+
+    // Exit harnx
+    tmux.send_keys(&["C-d"])?;
+    tmux.wait_for_stable(Duration::from_secs(10), settle, |s| {
+        // Back at shell prompt
+        !s.contains("Welcome to harnx") || s.contains("HARNX_EXIT")
+    })?;
+
+    drop(tmux);
+
+    // ════════════════════════════════════════════════════════════════════════
+    // SESSION 2 — resume the same agent+session from disk
+    // ════════════════════════════════════════════════════════════════════════
+    let tmux2 = match TmuxHarness::new(&root, 120, 40) {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("skipping session2: tmux unusable ({err:#})");
+            return Ok(());
+        }
+    };
+    setup_env(&tmux2, "__MUTATION_S2_READY__")?;
+
+    tmux2.send_text(&format!(
+        "{} -a {} -s {} || echo HARNX_EXIT:$?",
+        shell_escape(harnx_bin.to_string_lossy().as_ref()),
+        MUTATION_AGENT_NAME,
+        MUTATION_SESSION_NAME,
+    ))?;
+    tmux2.send_keys(&["Enter"])?;
+    tmux2.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
+
+    // Wait for session history to load (edited sentinel should appear if
+    // the replay replayed EditEntries correctly)
+    let screen_s2_loaded = tmux2.wait_for_stable(wait, settle, |s| {
+        // Either the edited content is visible, or we see seq [1] from turn 1
+        s.contains(RESP_EDITED) || s.contains(RESP_FIRST)
+    })?;
+
+    // SNAP 5 — session reload from disk: mutations replayed, seq numbers shown
+    {
+        let s = snap("5-session2-loaded", &screen_s2_loaded);
+        assert!(
+            screen_s2_loaded.contains(RESP_FIRST),
+            "snap5: turn 1 missing after reload\n{s}"
+        );
+        // Deleted turn 2 should NOT be visible in reconstructed history
+        assert!(
+            !screen_s2_loaded.contains(RESP_SECOND),
+            "snap5: deleted turn 2 still visible after reload\n{s}"
+        );
+        insta::assert_snapshot!("mutation_snap5_session2_loaded", s);
+    }
+
+    drop(tmux2);
+    drop(mock);
     Ok(())
 }

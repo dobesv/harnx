@@ -1,6 +1,5 @@
 ---
 source: crates/harnx/tests/tmux_e2e.rs
-assertion_line: 533
 expression: normalized
 ---
 What feature would you like me to plan?

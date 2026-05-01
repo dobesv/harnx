@@ -301,7 +301,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         .into_iter()
         .enumerate()
         .flat_map(|(i, message)| {
-            let Message { role, content } = message;
+            let Message { role, content, .. } = message;
             match content {
                 MessageContent::ToolCalls(MessageContentToolCalls {
                     tool_results,

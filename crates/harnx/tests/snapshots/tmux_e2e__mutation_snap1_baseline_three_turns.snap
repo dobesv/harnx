@@ -1,0 +1,45 @@
+---
+source: crates/harnx/tests/tmux_e2e.rs
+expression: s
+---
+Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
+# mutation-test-agent v
+🤖 mutation-test-agent ▸ mutation-e2e-session
+> first message
+
+FIRST_RESPONSE_SENTINEL
+
+> second message
+
+SECOND_RESPONSE_SENTINEL
+
+> third message
+
+THIRD_RESPONSE_SENTINEL
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+* 🤖 mutation-test-agent ▸ mutation-e2e-session   Context: 57(0%)
+
+
+# snap: 1-baseline-three-turns
