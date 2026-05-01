@@ -96,31 +96,18 @@ pub async fn eval_tool_calls(
             bail!("interrupted during pre-tool phase");
         }
 
-        let json_data = if call.arguments.is_null() {
-            Value::Null
-        } else if call.arguments.is_object() {
-            call.arguments.clone()
-        } else if let Some(arguments) = call.arguments.as_str() {
-            match serde_json::from_str(arguments) {
-                Ok(json_data) => json_data,
-                Err(_) => {
-                    is_all_null = false;
-                    let error_result = json!({
-                        "is_error": true,
-                        "error": format!("The call '{}' has invalid arguments: {arguments}", call.name),
-                    });
-                    output.push(ToolResult::new(call, error_result));
-                    continue;
-                }
+        let json_data = match parse_call_arguments(&call) {
+            Ok(json_data) => json_data,
+            Err(ToolError::Recoverable(err)) => {
+                is_all_null = false;
+                let error_result = json!({
+                    "is_error": true,
+                    "error": format!("{err:#}"),
+                });
+                output.push(ToolResult::new(call, error_result));
+                continue;
             }
-        } else {
-            is_all_null = false;
-            let error_result = json!({
-                "is_error": true,
-                "error": format!("The call '{}' has invalid arguments: {}", call.name, call.arguments),
-            });
-            output.push(ToolResult::new(call, error_result));
-            continue;
+            Err(ToolError::Fatal(err)) => return Err(err),
         };
 
         let tool_input = call.arguments.clone();
@@ -204,23 +191,7 @@ pub async fn eval_tool_calls(
                     result = json!("DONE");
                 }
                 let mut result_obj = ToolResult::new(call, result);
-                if let Some(obj) = result_obj.output.as_object() {
-                    if obj.get("action").and_then(|v| v.as_str()) == Some("switch_agent") {
-                        if let (Some(agent), Some(prompt)) = (
-                            obj.get("agent").and_then(|v| v.as_str()),
-                            obj.get("prompt").and_then(|v| v.as_str()),
-                        ) {
-                            result_obj.switch_agent = Some(SwitchAgentData {
-                                agent: agent.to_string(),
-                                prompt: prompt.to_string(),
-                                session_id: obj
-                                    .get("session_id")
-                                    .and_then(|v| v.as_str())
-                                    .map(ToString::to_string),
-                            });
-                        }
-                    }
-                }
+                result_obj.switch_agent = detect_switch_agent(&result_obj.output);
                 output.push(result_obj);
             }
             Err(ToolError::Recoverable(err)) => {
@@ -264,6 +235,45 @@ pub async fn eval_tool_calls(
         output = vec![];
     }
     Ok(output)
+}
+
+fn parse_call_arguments(call: &ToolCall) -> Result<Value, ToolError> {
+    if call.arguments.is_null() {
+        return Ok(Value::Null);
+    }
+    if call.arguments.is_object() {
+        return Ok(call.arguments.clone());
+    }
+    if let Some(arguments) = call.arguments.as_str() {
+        return serde_json::from_str(arguments).map_err(|_| {
+            ToolError::Recoverable(anyhow!(
+                "The call '{}' has invalid arguments: {arguments}",
+                call.name
+            ))
+        });
+    }
+    Err(ToolError::Recoverable(anyhow!(
+        "The call '{}' has invalid arguments: {}",
+        call.name,
+        call.arguments
+    )))
+}
+
+fn detect_switch_agent(output: &Value) -> Option<SwitchAgentData> {
+    let obj = output.as_object()?;
+    if obj.get("action").and_then(|v| v.as_str()) != Some("switch_agent") {
+        return None;
+    }
+    let agent = obj.get("agent").and_then(|v| v.as_str())?;
+    let prompt = obj.get("prompt").and_then(|v| v.as_str())?;
+    Some(SwitchAgentData {
+        agent: agent.to_string(),
+        prompt: prompt.to_string(),
+        session_id: obj
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+    })
 }
 
 async fn dispatch_tool_call(
@@ -437,26 +447,36 @@ mod tests {
         }
     }
 
+    fn two_tool_context(
+        name_a: &str,
+        delay_a: Duration,
+        result_a: Value,
+        name_b: &str,
+        delay_b: Duration,
+        result_b: Value,
+    ) -> ToolEvalContext {
+        test_context(
+            vec![
+                Arc::new(MockToolProvider::ok(name_a, delay_a, result_a)),
+                Arc::new(MockToolProvider::ok(name_b, delay_b, result_b)),
+            ],
+            |_| continue_hook_outcome(),
+        )
+    }
+
     fn test_call(name: &str) -> ToolCall {
         ToolCall::new(name.to_string(), json!({}), None, None)
     }
 
     #[tokio::test]
     async fn parallel_calls_run_concurrently() {
-        let ctx = test_context(
-            vec![
-                Arc::new(MockToolProvider::ok(
-                    "tool_a",
-                    Duration::from_millis(50),
-                    json!("a"),
-                )),
-                Arc::new(MockToolProvider::ok(
-                    "tool_b",
-                    Duration::from_millis(50),
-                    json!("b"),
-                )),
-            ],
-            |_| continue_hook_outcome(),
+        let ctx = two_tool_context(
+            "tool_a",
+            Duration::from_millis(50),
+            json!("a"),
+            "tool_b",
+            Duration::from_millis(50),
+            json!("b"),
         );
         let abort_signal = create_abort_signal();
 
@@ -476,20 +496,13 @@ mod tests {
 
     #[tokio::test]
     async fn result_order_preserved() {
-        let ctx = test_context(
-            vec![
-                Arc::new(MockToolProvider::ok(
-                    "tool_a",
-                    Duration::from_millis(60),
-                    json!("slow"),
-                )),
-                Arc::new(MockToolProvider::ok(
-                    "tool_b",
-                    Duration::from_millis(10),
-                    json!("fast"),
-                )),
-            ],
-            |_| continue_hook_outcome(),
+        let ctx = two_tool_context(
+            "tool_a",
+            Duration::from_millis(60),
+            json!("slow"),
+            "tool_b",
+            Duration::from_millis(10),
+            json!("fast"),
         );
         let abort_signal = create_abort_signal();
 

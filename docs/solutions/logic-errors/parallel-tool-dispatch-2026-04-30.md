@@ -142,7 +142,7 @@ if let Some(err) = fatal_err {
 - [ ] Parallel dispatch uses `join_all` + `.zip()` for order preservation
 
 **Pattern:**
-```
+```text
 Phase 1 (sequential): for each call → abort check → parse → hooks → confirm → emit Started → collect
 Phase 2 (parallel): join_all approved calls → sequential post-process (emit Completed per result)
 ```
