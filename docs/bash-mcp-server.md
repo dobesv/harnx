@@ -100,11 +100,11 @@ On Linux and macOS, `harnx-mcp-bash` uses [birdcage](https://github.com/phylum-d
   - Tool installation directories under `$HOME`: `~/.local/bin`, `~/.local/lib`, `~/.bun`, `~/.asdf`, `~/go/bin`.
 - **Readable**:
   - System C/C++ header directories needed by `cc`, `bindgen`, and crates with native build scripts (Linux: `/usr/include`, `/usr/include/x86_64-linux-gnu`).
-  - Common config files under `$HOME`: `~/.gitconfig`, `~/.gitignore`, `~/.gitignore_global`, `~/.tool-versions`, `~/.local`.
+  - Common config files under `$HOME`: `~/.gitconfig`, `~/.gitignore`, `~/.gitignore_global`, `~/.tool-versions`.
 - **Read+Write**:
   - Cache and module directories under `$HOME`: `~/.cache`, `~/go/pkg`.
 - **Read+Write+Execute**:
-  - Package-manager and version-manager directories under `$HOME`: `~/.npm`, `~/.yarn`, `~/.nvm`, `~/.cargo`, `~/.mono`, `~/.bun/install/cache`, `~/.pyenv`, `~/.rye`.
+  - Package-manager and version-manager directories under `$HOME`: `~/.npm`, `~/.yarn`, `~/.nvm`, `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, `~/.mono`, `~/.bun/install/cache`, `~/.pyenv`, `~/.rye`.
 
 These `$HOME`-relative defaults exist regardless of whether the directory is present on the host (sandbox-run silently skips non-existent paths).
 
@@ -177,24 +177,23 @@ args: ["-e", "EDITOR=true"]
 
 Allow tools to use home-directory caches or persistent configuration:
 
-#### Allow cargo to cache
-```yaml
-args: ["--extra-write", "~/.cargo"]
-```
+> **Note:** `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, and `~/.npm` are already included in the default allowlist with read+write+execute permissions. The examples below are only needed if you override the defaults or need additional paths.
 
 #### Allow pip to cache
 ```yaml
 args: ["--extra-write", "~/.cache/pip"]
 ```
 
-#### Allow npm globals
+#### Allow full cargo directory (non-default example)
+If you've removed the default cargo paths and want to grant broader access:
 ```yaml
-args: ["--extra-write", "~/.npm"]
+args: ["--extra-rwx", "~/.cargo"]
 ```
 
-#### Read-only cargo registry
+#### Allow full npm directory (non-default example)
+If you've removed the default npm path and want to grant broader access:
 ```yaml
-args: ["--extra-read", "~/.cargo/registry"]
+args: ["--extra-rwx", "~/.npm"]
 ```
 
 #### Allow cargo registry proc-macros to be loaded (dlopen) by rustc

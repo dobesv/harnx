@@ -390,7 +390,6 @@ impl BashServer {
     #[allow(dead_code)]
     const HOME_READ_PATHS: &[&str] = &[
         ".gitconfig",
-        ".local",
         ".gitignore",
         ".gitignore_global",
         ".tool-versions",
@@ -419,7 +418,9 @@ impl BashServer {
         ".npm",
         ".yarn",
         ".nvm",
-        ".cargo",
+        ".cargo/bin",
+        ".cargo/registry",
+        ".cargo/git",
         ".mono",
         ".bun/install/cache",
         ".pyenv",
