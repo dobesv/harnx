@@ -394,6 +394,33 @@ impl BashServer {
         }
     }
 
+    /// Safe defaults for non-interactive child processes: (key, fallback).
+    ///
+    /// Each entry is seeded as the host-env value when set, otherwise the
+    /// fallback.  This makes the host environment authoritative — if the user
+    /// already has e.g. `PAGER=bat` or `NO_COLOR=0` in their shell, that wins.
+    /// Later layers (.env.bash, extra_env_passthrough, env_overrides) can
+    /// override further.
+    const NON_INTERACTIVE_ENV_DEFAULTS: &[(&str, &str)] = &[
+        // credential/interactive-prompt suppression
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_ASKPASS", "true"),
+        ("SSH_ASKPASS", "true"),
+        ("SSH_ASKPASS_REQUIRE", "force"),
+        ("DEBIAN_FRONTEND", "noninteractive"),
+        // pager suppression
+        ("PAGER", "cat"),
+        ("GIT_PAGER", "cat"),
+        ("MANPAGER", "cat"),
+        ("SYSTEMD_PAGER", "cat"),
+        ("GH_PAGER", "cat"),
+        // ANSI color suppression
+        ("TERM", "dumb"),
+        ("NO_COLOR", "1"),
+        ("CLICOLOR", "0"),
+        ("FORCE_COLOR", "0"),
+    ];
+
     const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
         "HOME",
         "PATH",
@@ -529,11 +556,16 @@ impl BashServer {
     ///
     /// Layers, applied in order from lowest to highest precedence (later
     /// entries replace earlier ones with the same key):
-    /// 1. Default allowlist values inherited from the host process env.
-    /// 2. `XDG_*` variables inherited from the host process env.
-    /// 3. `.env.bash` dotfile values.
-    /// 4. `extra_env_passthrough` — host values for explicitly named vars.
-    /// 5. `env_overrides` — explicit `KEY=VALUE` overrides.
+    /// 1. Non-interactive safe defaults (`NON_INTERACTIVE_ENV_DEFAULTS`):
+    ///    each key is seeded with the host-env value when set, otherwise the
+    ///    fallback.  The host environment therefore beats these fallbacks, and
+    ///    all later layers beat the host.
+    /// 2. Default allowlist values inherited from the host process env.
+    /// 3. `XDG_*` variables inherited from the host process env.
+    /// 4. `.env.bash` dotfile values.
+    /// 5. `extra_env_passthrough` — host values for explicitly named vars.
+    /// 6. `env_overrides` — explicit `KEY=VALUE` overrides, highest
+    ///    precedence.
     ///
     /// This applies on every platform; sandbox-specific behaviour
     /// (birdcage exceptions, `sandbox_run` helper) remains Unix-only.
@@ -548,33 +580,88 @@ impl BashServer {
 
         let mut env_vars: Vec<(String, String)> = Vec::new();
 
-        // 1. Default allowlist.
+        // 1. Non-interactive safe defaults — lowest precedence.
+        //
+        // Child commands run non-interactively under an LLM agent.  Without
+        // sensible defaults, tools can:
+        //
+        //   • Write credential prompts via /dev/tty, bypassing
+        //     stdin(Stdio::null()) and corrupting the TUI display.
+        //   • Spawn interactive pagers (less, more) that hang forever waiting
+        //     for keystrokes that will never come.
+        //   • Emit ANSI escape sequences that clutter tool-result text sent
+        //     back to the model.
+        //
+        // Each default is seeded as: host-env value if set, otherwise the
+        // fallback.  This makes the host environment authoritative for all of
+        // these keys — if the user already has PAGER=bat or NO_COLOR=0 in
+        // their shell, that value is used.  Later layers (.env.bash,
+        // extra_env_passthrough, env_overrides) can still override further.
+        //
+        // --- Credential / interactive-prompt suppression ---
+        //
+        //   GIT_TERMINAL_PROMPT=0       — git won't open /dev/tty for
+        //                                 credential prompts; fails cleanly.
+        //   GIT_ASKPASS=true            — fallback no-op askpass helper
+        //                                 (exits 0 with empty output).
+        //   SSH_ASKPASS=true            — same for SSH passphrase prompts.
+        //   SSH_ASKPASS_REQUIRE=force   — force SSH to use SSH_ASKPASS even
+        //                                 when a terminal is available.
+        //   DEBIAN_FRONTEND=noninteractive — suppress apt/dpkg prompts.
+        //
+        // --- Pager suppression ---
+        //
+        //   PAGER=cat                   — generic pager (man, less wrappers).
+        //   GIT_PAGER=cat               — git log/diff/show/etc.
+        //   MANPAGER=cat                — man pages.
+        //   SYSTEMD_PAGER=cat           — journalctl, systemctl status, etc.
+        //   GH_PAGER=cat                — GitHub CLI.
+        //
+        // --- ANSI color suppression ---
+        //
+        //   TERM=dumb                   — the most universal signal: tools
+        //                                 that check $TERM will detect no
+        //                                 color support; less/more refuse to
+        //                                 run on a dumb terminal (fail-fast
+        //                                 rather than hang); readline still
+        //                                 works for the non-interactive -c
+        //                                 bash invocation we use.
+        //   NO_COLOR=1                  — canonical no-color.org standard,
+        //                                 adopted by 300+ tools.
+        //   CLICOLOR=0                  — BSD/macOS convention (ls, etc.).
+        //   FORCE_COLOR=0               — Node/chalk ecosystem override.
+        for (key, fallback) in Self::NON_INTERACTIVE_ENV_DEFAULTS {
+            let value = std::env::var(key).unwrap_or_else(|_| (*fallback).to_string());
+            env_vars.push(((*key).to_string(), value));
+        }
+
+        // 2. Default allowlist.
         for name in Self::DEFAULT_ENV_ALLOWLIST {
             if let Ok(value) = std::env::var(name) {
                 upsert(&mut env_vars, (*name).to_string(), value);
             }
         }
 
-        // 2. XDG_* vars from host env.
+        // 3. XDG_* vars from host env.
         for (name, value) in std::env::vars() {
             if name.starts_with("XDG_") {
                 upsert(&mut env_vars, name, value);
             }
         }
 
-        // 3. .env.bash dotfile.
+        // 4. .env.bash dotfile.
         for (key, value) in load_bash_env_file() {
             upsert(&mut env_vars, key, value);
         }
 
-        // 4. Explicit passthrough names — host value wins over dotfile.
+        // 5. Explicit passthrough names — host value wins over dotfile.
         for name in &self.inner.sandbox_config.extra_env_passthrough {
             if let Ok(value) = std::env::var(name) {
                 upsert(&mut env_vars, name.clone(), value);
             }
         }
 
-        // 5. Explicit overrides — highest precedence.
+        // 6. Explicit overrides — highest precedence.
         for (key, value) in &self.inner.sandbox_config.env_overrides {
             upsert(&mut env_vars, key.clone(), value.clone());
         }
@@ -2913,6 +3000,85 @@ mod tests {
         assert!(override_env
             .iter()
             .any(|(key, value)| { key == "HARNX_TEST_CUSTOM_4_2" && value == "overridden" }));
+    }
+
+    /// Non-interactive safe defaults (fallbacks) are present when neither the
+    /// host environment nor user config has set them, preventing programs from
+    /// corrupting the TUI, hanging on interactive pagers, or emitting ANSI
+    /// escapes.
+    #[cfg(unix)]
+    #[test]
+    fn env_non_interactive_defaults_applied_when_not_configured() {
+        let _env_guard = env_lock();
+        let _config_dir = EnvVar::unset("HARNX_CONFIG_DIR");
+
+        // Unset all vars that appear in NON_INTERACTIVE_ENV_DEFAULTS from the
+        // host environment so the fallback values are used.
+        let _unset: Vec<EnvVar> = BashServer::NON_INTERACTIVE_ENV_DEFAULTS
+            .iter()
+            .map(|(k, _)| EnvVar::unset(k))
+            .collect();
+
+        let server = BashServer::new_with_sandbox(vec![], enabled_sandbox_config());
+        let child_env = server.build_child_env();
+
+        let find =
+            |key: &str, expected: &str| child_env.iter().any(|(k, v)| k == key && v == expected);
+
+        for (key, fallback) in BashServer::NON_INTERACTIVE_ENV_DEFAULTS {
+            assert!(
+                find(key, fallback),
+                "{key} fallback must be {fallback} when host env is unset"
+            );
+        }
+    }
+
+    /// Non-interactive safe defaults can be overridden by the host environment,
+    /// .env.bash, or env_overrides.
+    #[cfg(unix)]
+    #[test]
+    fn env_non_interactive_defaults_overridable() {
+        let _env_guard = env_lock();
+
+        // Host env wins over the fallback for vars it sets.
+        let _host_pager = EnvVar::set("PAGER", "bat");
+        let _host_no_color = EnvVar::unset("NO_COLOR"); // ensure unset so dotfile wins
+
+        // .env.bash overrides NO_COLOR.
+        let temp_dir = TestDir::new();
+        std::fs::write(temp_dir.path().join(".env.bash"), "NO_COLOR=0\n").unwrap();
+        let _config_dir = EnvVar::set("HARNX_CONFIG_DIR", temp_dir.path().as_os_str());
+
+        // env_overrides wins for GIT_PAGER.
+        let mut cfg = enabled_sandbox_config();
+        cfg.env_overrides = vec![("GIT_PAGER".to_string(), "delta".to_string())];
+        let server = BashServer::new_with_sandbox(vec![], cfg);
+        let child_env = server.build_child_env();
+
+        let find =
+            |key: &str, expected: &str| child_env.iter().any(|(k, v)| k == key && v == expected);
+
+        // host env beats fallback
+        assert!(find("PAGER", "bat"), "host env must beat PAGER fallback");
+        // .env.bash beats fallback
+        assert!(
+            find("NO_COLOR", "0"),
+            ".env.bash must beat NO_COLOR fallback"
+        );
+        // env_overrides beats fallback
+        assert!(
+            find("GIT_PAGER", "delta"),
+            "env_override must beat GIT_PAGER fallback"
+        );
+        // vars not overridden still have their fallbacks
+        assert!(
+            find("GIT_TERMINAL_PROMPT", "0"),
+            "un-overridden GIT_TERMINAL_PROMPT must keep fallback"
+        );
+        assert!(
+            find("CLICOLOR", "0"),
+            "un-overridden CLICOLOR must keep fallback"
+        );
     }
 
     #[cfg(unix)]
