@@ -371,6 +371,122 @@ impl BashServer {
     #[allow(dead_code)]
     const SYSTEM_EXEC_PATHS: &[&str] = &["/usr/bin", "/bin", "/tmp", "/etc"];
 
+    /// Read-only system paths needed for compiling C/C++ code (e.g. `cc`, `bindgen`,
+    /// crates with native build scripts like `onig_sys`). These hold headers, not
+    /// executables, so they are granted as `--read` rather than `--exec`.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    const SYSTEM_READ_PATHS: &[&str] = &["/usr/include", "/usr/include/x86_64-linux-gnu"];
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
+    const SYSTEM_READ_PATHS: &[&str] = &[];
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    #[allow(dead_code)]
+    const SYSTEM_READ_PATHS: &[&str] = &["/usr/include"];
+
+    /// Read-only paths under `$HOME` for git/tool-version configuration that
+    /// most commands consult but should never modify.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    const HOME_READ_PATHS: &[&str] = &[
+        ".gitconfig",
+        ".local",
+        ".gitignore",
+        ".gitignore_global",
+        ".tool-versions",
+    ];
+
+    /// Read+execute paths under `$HOME` for tool installations (asdf, bun,
+    /// language version managers, locally-installed binaries).
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    const HOME_EXEC_PATHS: &[&str] = &[".local/bin", ".local/lib", ".bun", ".asdf", "go/bin"];
+
+    /// Read+write paths under `$HOME` for caches that hold data but should not
+    /// be executable.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    const HOME_WRITE_PATHS: &[&str] = &[".cache", "go/pkg"];
+
+    /// Read+write+execute paths under `$HOME` for tooling that installs and
+    /// runs binaries (npm, yarn, nvm, cargo, mono, bun cache, pyenv, rye).
+    /// `pyenv`/`rye` are Python version managers that install Pythons under
+    /// these directories and run them in place — needed for any project that
+    /// builds native Python packages outside the system Python.
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    const HOME_RWX_PATHS: &[&str] = &[
+        ".npm",
+        ".yarn",
+        ".nvm",
+        ".cargo",
+        ".mono",
+        ".bun/install/cache",
+        ".pyenv",
+        ".rye",
+    ];
+
+    #[cfg(unix)]
+    fn push_home_relative_defaults(args: &mut Vec<OsString>, home: &Path) {
+        for sub in Self::HOME_READ_PATHS {
+            args.push(OsString::from("--read"));
+            args.push(home.join(sub).into_os_string());
+        }
+        for sub in Self::HOME_EXEC_PATHS {
+            args.push(OsString::from("--exec"));
+            args.push(home.join(sub).into_os_string());
+        }
+        for sub in Self::HOME_WRITE_PATHS {
+            let path = home.join(sub);
+            args.push(OsString::from("--read"));
+            args.push(path.clone().into_os_string());
+            args.push(OsString::from("--write"));
+            args.push(path.into_os_string());
+        }
+        for sub in Self::HOME_RWX_PATHS {
+            let path = home.join(sub);
+            args.push(OsString::from("--read"));
+            args.push(path.clone().into_os_string());
+            args.push(OsString::from("--write"));
+            args.push(path.clone().into_os_string());
+            args.push(OsString::from("--exec"));
+            args.push(path.into_os_string());
+        }
+    }
+
+    /// Honour toolchain-locating environment variables so users with non-default
+    /// install locations don't have to set `HARNX_BASH_EXTRA_*` themselves.
+    ///
+    /// - `CARGO_HOME` — Rust toolchain. Adds `$CARGO_HOME/bin` as exec.
+    /// - `GOROOT`     — Go installation. Adds `$GOROOT` as exec (toolchain binaries live in `$GOROOT/bin` and runtime in `$GOROOT/pkg`).
+    /// - `GOPATH`     — Go workspace. Adds `$GOPATH/bin` as exec and `$GOPATH/pkg` as read+write.
+    /// - `GOBIN`      — `go install` output dir. Adds `$GOBIN` as exec.
+    #[cfg(unix)]
+    fn push_env_relative_defaults(args: &mut Vec<OsString>) {
+        if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+            args.push(OsString::from("--exec"));
+            args.push(PathBuf::from(cargo_home).join("bin").into_os_string());
+        }
+        if let Some(goroot) = std::env::var_os("GOROOT") {
+            args.push(OsString::from("--exec"));
+            args.push(PathBuf::from(goroot).into_os_string());
+        }
+        if let Some(gopath) = std::env::var_os("GOPATH") {
+            let gopath = PathBuf::from(gopath);
+            args.push(OsString::from("--exec"));
+            args.push(gopath.join("bin").into_os_string());
+            let pkg = gopath.join("pkg");
+            args.push(OsString::from("--read"));
+            args.push(pkg.clone().into_os_string());
+            args.push(OsString::from("--write"));
+            args.push(pkg.into_os_string());
+        }
+        if let Some(gobin) = std::env::var_os("GOBIN") {
+            args.push(OsString::from("--exec"));
+            args.push(PathBuf::from(gobin).into_os_string());
+        }
+    }
+
     #[cfg(unix)]
     fn system_writable_paths() -> Vec<PathBuf> {
         #[cfg(target_os = "linux")]
@@ -687,25 +803,21 @@ impl BashServer {
             args.push(OsString::from(path));
         }
 
+        for path in Self::SYSTEM_READ_PATHS {
+            args.push(OsString::from("--read"));
+            args.push(OsString::from(path));
+        }
+
         for path in Self::system_writable_paths() {
             args.push(OsString::from("--write"));
             args.push(path.into_os_string());
         }
 
         if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            args.push(OsString::from("--exec"));
-            args.push(home.join(".local/bin").into_os_string());
-
-            let cargo_home = std::env::var_os("CARGO_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".cargo"));
-            args.push(OsString::from("--exec"));
-            args.push(cargo_home.join("bin").into_os_string());
-        } else if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
-            args.push(OsString::from("--exec"));
-            args.push(PathBuf::from(cargo_home).join("bin").into_os_string());
+            Self::push_home_relative_defaults(&mut args, &PathBuf::from(home));
         }
+
+        Self::push_env_relative_defaults(&mut args);
 
         for path in &self.inner.sandbox_config.extra_exec {
             args.push(OsString::from("--exec"));
@@ -2797,6 +2909,51 @@ mod tests {
         assert!(pairs.contains(&("--write".into(), "/test/root".into())));
         assert!(pairs.contains(&("--exec".into(), "/usr/bin".into())));
         assert!(!pairs.contains(&("--write".into(), "/usr/bin".into())));
+
+        #[cfg(target_os = "linux")]
+        assert!(pairs.contains(&("--read".into(), "/usr/include".into())));
+
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = PathBuf::from(home);
+            let path_str = |sub: &str| home.join(sub).to_string_lossy().into_owned();
+            assert!(pairs.contains(&("--read".into(), path_str(".gitconfig"))));
+            assert!(pairs.contains(&("--exec".into(), path_str(".local/bin"))));
+            assert!(pairs.contains(&("--read".into(), path_str(".cache"))));
+            assert!(pairs.contains(&("--write".into(), path_str(".cache"))));
+            assert!(pairs.contains(&("--read".into(), path_str(".pyenv"))));
+            assert!(pairs.contains(&("--write".into(), path_str(".pyenv"))));
+            assert!(pairs.contains(&("--exec".into(), path_str(".pyenv"))));
+            assert!(pairs.contains(&("--exec".into(), path_str(".cargo"))));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_args_honours_toolchain_env_vars() {
+        let _env_guard = env_lock();
+        let _cargo = EnvVar::set("CARGO_HOME", "/opt/cargo-custom");
+        let _goroot = EnvVar::set("GOROOT", "/opt/go");
+        let _gopath = EnvVar::set("GOPATH", "/srv/go-workspace");
+        let _gobin = EnvVar::set("GOBIN", "/srv/go-workspace/installed");
+
+        let server = BashServer::new_with_sandbox(
+            vec![PathBuf::from("/test/root")],
+            enabled_sandbox_config(),
+        );
+        let args = server.build_sandbox_args(
+            Path::new("/test/root/workdir"),
+            None,
+            None,
+            &[PathBuf::from("/test/root")],
+        );
+        let pairs = collect_arg_pairs(&args);
+
+        assert!(pairs.contains(&("--exec".into(), "/opt/cargo-custom/bin".into())));
+        assert!(pairs.contains(&("--exec".into(), "/opt/go".into())));
+        assert!(pairs.contains(&("--exec".into(), "/srv/go-workspace/bin".into())));
+        assert!(pairs.contains(&("--read".into(), "/srv/go-workspace/pkg".into())));
+        assert!(pairs.contains(&("--write".into(), "/srv/go-workspace/pkg".into())));
+        assert!(pairs.contains(&("--exec".into(), "/srv/go-workspace/installed".into())));
     }
 
     #[cfg(unix)]
