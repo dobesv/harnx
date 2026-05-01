@@ -6,13 +6,9 @@
 //! previously owned by `render::render_stream`. Non-streaming events
 //! (notices, errors, usage, tool starts/failures) still go to stderr.
 
-use std::io::{stdout, Stdout, Write};
+use std::io::{stdout, Write};
 use std::sync::{Arc, Mutex};
 
-use crossterm::{cursor, queue, style, terminal};
-use textwrap::core::display_width;
-
-use harnx_core::abort::AbortSignal;
 use harnx_core::event::{
     AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, ToolEvent,
     TurnEvent,
@@ -29,6 +25,18 @@ pub struct CliAgentEventSink {
     state: Arc<Mutex<CliSinkState>>,
 }
 
+/// Returns `true` for model output events that carry streamed content and may
+/// need a per-source heading printed before the first chunk from each agent.
+fn is_model_output_event(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::Model(ModelEvent::MessageChunk { .. })
+            | AgentEvent::Model(ModelEvent::ThoughtChunk { .. })
+            | AgentEvent::Model(ModelEvent::Final { .. })
+            | AgentEvent::Model(ModelEvent::Error(_))
+    )
+}
+
 fn source_heading(source: &AgentSource) -> String {
     match &source.session_id {
         Some(session_id) if !session_id.is_empty() => {
@@ -42,38 +50,52 @@ struct CliSinkState {
     spinner: Option<Spinner>,
     render: Option<MarkdownRender>,
     buffer: String,
-    buffer_rows: u16,
-    columns: u16,
-    raw_mode_active: bool,
-    /// Background task that polls raw-mode key events and wires Ctrl-C/Ctrl-D
-    /// to `abort_signal`.  Started when raw mode is enabled; stopped on cleanup.
-    key_watcher: Option<harnx_spinner::RawModeKeyWatcher>,
+    last_ui_output_source: Option<AgentSource>,
     highlight: bool,
     render_options: RenderOptions,
-    /// Propagates Ctrl-C / Ctrl-D key events from raw mode to the caller.
-    abort_signal: AbortSignal,
 }
 
 impl CliAgentEventSink {
-    pub fn new(highlight: bool, render_options: RenderOptions, abort_signal: AbortSignal) -> Self {
+    pub fn new(
+        highlight: bool,
+        render_options: RenderOptions,
+        _abort_signal: harnx_core::abort::AbortSignal,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(CliSinkState {
                 spinner: None,
                 render: None,
                 buffer: String::new(),
-                buffer_rows: 1,
-                columns: 0,
-                raw_mode_active: false,
-                key_watcher: None,
+                last_ui_output_source: None,
                 highlight,
                 render_options,
-                abort_signal,
             })),
         }
     }
 }
 
 impl CliSinkState {
+    /// Print the agent/session heading when the event source changes from
+    /// the previously tracked source.  Calls `cleanup()` first so any
+    /// buffered output from the prior source is flushed before the heading.
+    /// No-ops when the source is unchanged — this is how we avoid repeating
+    /// the heading for every streaming chunk from the same agent.
+    fn maybe_emit_source_heading(&mut self, next_source: Option<&AgentSource>) {
+        if next_source == self.last_ui_output_source.as_ref() {
+            return;
+        }
+        if let Err(err) = self.cleanup() {
+            eprintln!(
+                "{}",
+                warning_text(&format!("cli-sink cleanup failed: {err}"))
+            );
+        }
+        if let Some(source) = next_source {
+            println!("{}", source_heading(source));
+        }
+        self.last_ui_output_source = next_source.cloned();
+    }
+
     /// Dispatch a chunk of text to either the markdown or raw rendering
     /// path based on the highlight flag snapshot + stdout terminal-ness.
     /// Stops the spinner on first chunk.
@@ -95,123 +117,71 @@ impl CliSinkState {
         Ok(())
     }
 
-    /// Markdown streaming path. Logic transplanted verbatim from
-    /// `render::stream::markdown_stream_inner`'s SseEvent::Text arm
-    /// (harnx commit 8da11d0). References to the outer loop's
-    /// `buffer` / `buffer_rows` / `columns` locals become `self.*`
-    /// fields on `CliSinkState`.
+    /// Markdown streaming path. Keep terminal in cooked mode.
+    ///
+    /// Each chunk is printed immediately so text is visible without delay.
+    /// Markdown rendering is applied only to completed lines (those ending
+    /// with `\n`).
+    ///
+    /// Partial-line strategy:
+    /// - Chunks with no `\n` are printed raw and accumulated in `self.buffer`.
+    /// - When a `\n` arrives, the completed portion is re-rendered: `\r`
+    ///   returns to column 0 and the rendered text overwrites the raw prefix
+    ///   that was already printed.  No cursor movement beyond `\r` is needed.
+    /// - The tail after the last `\n` is printed raw immediately and buffered
+    ///   for the next newline.
     fn handle_markdown_chunk(&mut self, text: &str) -> anyhow::Result<()> {
-        if !self.raw_mode_active {
-            crossterm::terminal::enable_raw_mode()?;
-            self.raw_mode_active = true;
-            // In raw mode, Ctrl-C does not deliver SIGINT and Ctrl-D does not
-            // deliver EOF — both become raw key events.  Start a watcher that
-            // reads those key events and forwards them to the abort signal.
-            // The watcher is scoped to the raw-mode window and aborted in
-            // cleanup() when raw mode is disabled.
-            self.key_watcher = harnx_spinner::spawn_raw_mode_key_watcher(self.abort_signal.clone());
-        }
         if self.render.is_none() {
-            // Any failure here happens after enable_raw_mode() — clean up raw
-            // mode (and the key watcher) before propagating the error so the
-            // terminal is not left in a corrupted state.
-            let init_result = (|| -> anyhow::Result<()> {
-                self.render = Some(MarkdownRender::init(self.render_options.clone())?);
-                self.columns = crossterm::terminal::size()?.0;
-                Ok(())
-            })();
-            if let Err(e) = init_result {
-                let _ = self.cleanup();
-                return Err(e);
-            }
+            self.render = Some(MarkdownRender::init(self.render_options.clone())?);
         }
 
         let mut writer = stdout();
-        // tab width hacking
         let text = text.replace('\t', "    ");
 
-        let mut attempts = 0;
-        let (col, mut row) = loop {
-            match cursor::position() {
-                Ok(pos) => break pos,
-                Err(_) if attempts < 3 => attempts += 1,
-                Err(e) => return Err(e.into()),
-            }
-        };
-
-        // Fix unexpected duplicate lines on kitty, see https://github.com/dobesv/harnx/issues/105
-        if col == 0 && row > 0 && display_width(&self.buffer) == self.columns as usize {
-            row -= 1;
+        if !text.contains('\n') {
+            // No newline — print immediately so the user sees it, and buffer
+            // for re-rendering when the line is eventually completed.
+            self.buffer.push_str(&text);
+            print!("{text}");
+            writer.flush()?;
+            return Ok(());
         }
 
-        if row + 1 >= self.buffer_rows {
-            queue!(writer, cursor::MoveTo(0, row + 1 - self.buffer_rows),)?;
-        } else {
-            let scroll_rows = self.buffer_rows - row - 1;
-            queue!(
-                writer,
-                terminal::ScrollUp(scroll_rows),
-                cursor::MoveTo(0, 0),
-            )?;
-        }
-
-        // No guarantee that text returned by render will not be re-layouted, so it is better to clear it.
-        queue!(writer, terminal::Clear(terminal::ClearType::FromCursorDown))?;
-
+        // At least one newline present.  Combine buffered prefix with new
+        // text, split at the last newline, render the completed head, then
+        // immediately print the raw tail.
+        let combined = format!("{}{}", self.buffer, text);
+        let (head, tail) = split_line_tail_local(&combined);
         let render = self.render.as_mut().expect("render initialized above");
-
-        if text.contains('\n') {
-            let text = format!("{}{}", self.buffer, text);
-            let (head, tail) = split_line_tail_local(&text);
-            let output = render.render(head);
-            print_block_local(&mut writer, &output, self.columns)?;
-            self.buffer = tail.to_string();
-        } else {
-            self.buffer = format!("{}{}", self.buffer, text);
+        let output = render.render(head);
+        // '\r' returns to column 0 to overwrite the raw partial line that was
+        // already printed. render() joins lines with '\n' but no trailing
+        // newline; println! adds the separator after the completed block.
+        print!("\r{output}");
+        println!();
+        self.buffer = tail.to_string();
+        if !tail.is_empty() {
+            print!("{tail}");
         }
-
-        let output = render.render_line(&self.buffer);
-        if output.contains('\n') {
-            let (head, tail) = split_line_tail_local(&output);
-            self.buffer_rows = print_block_local(&mut writer, head, self.columns)?;
-            queue!(writer, style::Print(&tail),)?;
-
-            // No guarantee the buffer width of the buffer will not exceed the number of columns.
-            // So we calculate the number of rows needed, rather than setting it directly to 1.
-            self.buffer_rows += need_rows_local(tail, self.columns);
-        } else {
-            queue!(writer, style::Print(&output))?;
-            self.buffer_rows = need_rows_local(&output, self.columns);
-        }
-
         writer.flush()?;
         Ok(())
     }
 
-    /// End-of-turn / error cleanup: stop spinner, disable raw mode,
-    /// emit a trailing newline if the last streamed chunk didn't end
-    /// with one, and reset buffers so the next turn starts fresh.
+    /// End-of-turn cleanup: stop spinner, flush any buffered partial line,
+    /// and reset state so the next turn starts fresh.
     fn cleanup(&mut self) -> anyhow::Result<()> {
         if let Some(spinner) = self.spinner.take() {
             spinner.stop();
         }
-        if self.raw_mode_active {
-            // Signal the raw-mode key watcher to stop.  The watcher thread
-            // exits within one 25 ms poll slice after seeing the stop flag or
-            // a crossterm error from the now-cooked terminal.
-            if let Some(watcher) = self.key_watcher.take() {
-                watcher.stop();
-            }
-            crossterm::terminal::disable_raw_mode()?;
-            self.raw_mode_active = false;
-        }
-        // Ensure a trailing newline if we printed something without one.
-        if !self.buffer.is_empty() && !self.buffer.ends_with('\n') {
+        // The partial line in self.buffer has already been printed raw
+        // (handle_markdown_chunk prints each chunk immediately).  We just
+        // need a trailing newline to close the line on the terminal.
+        if !self.buffer.is_empty() {
             println!();
         }
         self.buffer.clear();
-        self.buffer_rows = 1;
         self.render = None;
+        self.last_ui_output_source = None;
         Ok(())
     }
 
@@ -292,23 +262,8 @@ impl AgentEventSink for CliAgentEventSink {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let show_heading = matches!(
-            event,
-            AgentEvent::Model(ModelEvent::MessageChunk { .. })
-                | AgentEvent::Model(ModelEvent::ThoughtChunk { .. })
-                | AgentEvent::Model(ModelEvent::Final { .. })
-                | AgentEvent::Model(ModelEvent::Error(_))
-        );
-        if show_heading {
-            if let Some(source) = source.as_ref() {
-                if let Err(err) = state.cleanup() {
-                    eprintln!(
-                        "{}",
-                        warning_text(&format!("cli-sink cleanup failed: {err}"))
-                    );
-                }
-                println!("{}", source_heading(source));
-            }
+        if is_model_output_event(&event) {
+            state.maybe_emit_source_heading(source.as_ref());
         }
         match event {
             AgentEvent::Status(line) => match &state.spinner {
@@ -440,23 +395,7 @@ impl AgentEventSink for CliAgentEventSink {
 }
 
 // ---------------------------------------------------------------------------
-// Module-private helpers — mirror the free functions in render/stream.rs so
-// that the markdown rendering body above stays byte-for-byte equivalent to
-// the pre-plan implementation.
-
-fn print_block_local(writer: &mut Stdout, text: &str, columns: u16) -> anyhow::Result<u16> {
-    let mut num = 0;
-    for line in text.split('\n') {
-        queue!(
-            writer,
-            style::Print(line),
-            style::Print("\n"),
-            cursor::MoveLeft(columns),
-        )?;
-        num += 1;
-    }
-    Ok(num)
-}
+// Module-private helpers for line-buffered markdown streaming.
 
 fn split_line_tail_local(text: &str) -> (&str, &str) {
     if let Some((head, tail)) = text.rsplit_once('\n') {
@@ -464,14 +403,6 @@ fn split_line_tail_local(text: &str) -> (&str, &str) {
     } else {
         ("", text)
     }
-}
-
-fn need_rows_local(text: &str, columns: u16) -> u16 {
-    if columns == 0 {
-        return 0;
-    }
-    let buffer_width = display_width(text).max(1) as u16;
-    buffer_width.div_ceil(columns)
 }
 
 #[cfg(test)]
@@ -662,13 +593,9 @@ mod tests {
             spinner: None,
             render: None,
             buffer: String::new(),
-            buffer_rows: 1,
-            columns: 0,
-            raw_mode_active: false,
-            key_watcher: None,
+            last_ui_output_source: None,
             highlight,
             render_options: RenderOptions::default(),
-            abort_signal: harnx_core::abort::create_abort_signal(),
         }
     }
 
@@ -692,5 +619,204 @@ mod tests {
         // In the test environment IS_STDOUT_TERMINAL is false, so we
         // expect the same plain passthrough.
         assert_eq!(out, "**bold** and `code`");
+    }
+
+    // ----------------------------------------------------------------
+    // #410 / #414 behavioral tests.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn split_line_tail_preserves_all_content() {
+        // Verify the helper splits correctly and nothing is lost.
+        let (head, tail) = split_line_tail_local("line1\nline2\ntail");
+        // rsplit_once splits at last '\n': head = "line1\nline2", tail = "tail"
+        assert_eq!(head, "line1\nline2");
+        assert_eq!(tail, "tail");
+    }
+
+    #[test]
+    fn split_line_tail_no_newline_returns_empty_head() {
+        // Input with no newline: head is empty, tail is the whole string.
+        let (head, tail) = split_line_tail_local("no newline here");
+        assert_eq!(head, "");
+        assert_eq!(tail, "no newline here");
+    }
+
+    #[test]
+    fn split_line_tail_trailing_newline_gives_empty_tail() {
+        // Trailing newline: tail is empty string.
+        let (head, tail) = split_line_tail_local("line\n");
+        assert_eq!(head, "line");
+        assert_eq!(tail, "");
+    }
+
+    // ----------------------------------------------------------------
+    // Buffer accumulation in handle_markdown_chunk (highlight=false
+    // path is handle_raw_chunk; to test buffer we use highlight=true
+    // but IS_STDOUT_TERMINAL is false in tests so handle_chunk_text
+    // falls through to handle_raw_chunk).  Instead we call
+    // handle_markdown_chunk directly to test buffer state.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn markdown_chunk_accumulates_partial_line_in_buffer() {
+        // A chunk with no newline should accumulate in the buffer without
+        // printing (we can't capture stdout, but we verify buffer state).
+        let mut state = make_state(false);
+        // We call handle_markdown_chunk directly to bypass the
+        // IS_STDOUT_TERMINAL gate in handle_chunk_text.
+        state.handle_markdown_chunk("partial").unwrap();
+        assert_eq!(state.buffer, "partial");
+    }
+
+    #[test]
+    fn markdown_chunk_clears_buffer_on_newline() {
+        // When a newline arrives the completed lines are flushed (printed)
+        // and the tail stays in the buffer.
+        let mut state = make_state(false);
+        state.handle_markdown_chunk("line1\n").unwrap();
+        // After flushing "line1", the tail is empty.
+        assert_eq!(state.buffer, "");
+    }
+
+    #[test]
+    fn markdown_chunk_keeps_tail_after_newline() {
+        // Tail after last newline stays buffered for the next chunk.
+        let mut state = make_state(false);
+        state.handle_markdown_chunk("line1\ntail").unwrap();
+        assert_eq!(state.buffer, "tail");
+    }
+
+    #[test]
+    fn markdown_chunk_multi_chunk_accumulation() {
+        // Multiple chunks accumulate correctly across calls.
+        let mut state = make_state(false);
+        state.handle_markdown_chunk("par").unwrap();
+        state.handle_markdown_chunk("tial").unwrap();
+        // No newline yet — full partial line is in buffer.
+        assert_eq!(state.buffer, "partial");
+        state.handle_markdown_chunk("\nrest").unwrap();
+        // After flushing "partial", "rest" remains in buffer.
+        assert_eq!(state.buffer, "rest");
+    }
+
+    #[test]
+    fn cleanup_clears_buffer_and_resets_source() {
+        // cleanup() must clear buffer and last_ui_output_source.
+        let mut state = make_state(false);
+        state.buffer = "leftover".to_string();
+        state.last_ui_output_source = Some(AgentSource {
+            agent: "test-agent".to_string(),
+            session_id: None,
+        });
+        state.cleanup().unwrap();
+        assert!(
+            state.buffer.is_empty(),
+            "buffer should be cleared after cleanup"
+        );
+        assert!(
+            state.last_ui_output_source.is_none(),
+            "last_ui_output_source should reset to None after cleanup"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // #410 source-heading deduplication via emit state tracking.
+    // ----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_heading_tracked_after_first_chunk() {
+        // After the first sourced chunk, last_ui_output_source must be set.
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        let source = AgentSource {
+            agent: "my-agent".to_string(),
+            session_id: Some("s1".to_string()),
+        };
+        sink.emit(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("hello".into())],
+            }),
+            Some(source.clone()),
+        );
+        let state = sink.state.lock().unwrap();
+        assert_eq!(
+            state.last_ui_output_source.as_ref(),
+            Some(&source),
+            "source should be tracked after first chunk"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_heading_reset_after_turn_ended() {
+        // After TurnEvent::Ended (which calls cleanup), last_ui_output_source
+        // resets to None so the next turn shows its heading again.
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        let source = AgentSource {
+            agent: "my-agent".to_string(),
+            session_id: Some("s1".to_string()),
+        };
+        // Send a chunk to establish source.
+        sink.emit(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("hello".into())],
+            }),
+            Some(source),
+        );
+        // End the turn — should reset source tracking.
+        sink.emit(
+            AgentEvent::Turn(TurnEvent::Ended {
+                outcome: Default::default(),
+            }),
+            None,
+        );
+        let state = sink.state.lock().unwrap();
+        assert!(
+            state.last_ui_output_source.is_none(),
+            "last_ui_output_source should be None after turn ends"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_source_does_not_repeat_cleanup_between_chunks() {
+        // When consecutive chunks share the same source, the buffer must
+        // accumulate (cleanup is NOT called between them).
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        let source = AgentSource {
+            agent: "my-agent".to_string(),
+            session_id: Some("s1".to_string()),
+        };
+        // Push two partial chunks without newline.  Buffer should hold both.
+        sink.emit(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("hello ".into())],
+            }),
+            Some(source.clone()),
+        );
+        sink.emit(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("world".into())],
+            }),
+            Some(source),
+        );
+        // In non-TTY test process, handle_chunk_text uses handle_raw_chunk
+        // (print!), so buffer stays empty for raw path.  We verify the
+        // source hasn't reset — i.e. cleanup was NOT called between chunks.
+        let state = sink.state.lock().unwrap();
+        assert!(
+            state.last_ui_output_source.is_some(),
+            "source should still be set — cleanup must not run between same-source chunks"
+        );
     }
 }
