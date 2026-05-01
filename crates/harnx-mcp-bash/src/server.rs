@@ -2924,11 +2924,11 @@ mod tests {
             assert!(pairs.contains(&("--read".into(), path_str(".pyenv"))));
             assert!(pairs.contains(&("--write".into(), path_str(".pyenv"))));
             assert!(pairs.contains(&("--exec".into(), path_str(".pyenv"))));
-            assert!(pairs.contains(&("--exec".into(), path_str(".cargo"))));
+            assert!(pairs.contains(&("--exec".into(), path_str(".cargo/bin"))));
         }
     }
 
-    #[cfg(unix)]
+
     #[test]
     fn test_sandbox_args_honours_toolchain_env_vars() {
         let _env_guard = env_lock();
