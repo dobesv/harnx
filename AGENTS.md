@@ -6,7 +6,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 
 ## Technology Stack
 
-- **Language:** Rust (edition 2021, toolchain pinned in `.tool-versions`)
+- **Language:** Rust (edition 2021, toolchain pinned in `rust-toolchain.toml` — rustup and CI both read this file automatically)
 - **Async runtime:** Tokio (multi-threaded)
 - **HTTP client:** reqwest (rustls-tls)
 - **CLI framework:** clap (derive)
@@ -65,7 +65,7 @@ Run the full verification pipeline before committing:
 
 ```sh
 cargo build --workspace                                       # Compile the project
-cargo fmt --all                                               # Auto-format code (run without --check to fix)
+cargo fmt --all                                               # Auto-format code (rustup uses rust-toolchain.toml version — matches CI)
 cargo clippy --workspace --all-targets -- -D warnings         # Lint — treat warnings as errors
 cargo nextest run --workspace --stress-count=5                # Run all tests, repeat several times to catch flaky tests
 cs delta $(git merge-base HEAD origin/main)                   # Run CodeScene code quality analysis on current branch changes                                          
