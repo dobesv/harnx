@@ -28,7 +28,7 @@ Additionally, `ToolEvent::Update` and `ToolEvent::Completed` were silently dropp
 
 ## Symptoms
 
-```
+```text
 #385 - Session Restore:
 - Restored transcript showed: {"command": "ls -la"} instead of **$** `ls -la`
 - Tool results displayed raw JSON instead of template-rendered markdown

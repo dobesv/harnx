@@ -817,6 +817,8 @@ enabled: false
             }
             other => panic!("unexpected second event: {other:?}"),
         }
+        drop(events);
+        harnx_core::sink::clear_agent_event_sink();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

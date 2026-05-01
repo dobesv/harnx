@@ -258,7 +258,14 @@ impl acp::Client for AcpNotificationClient {
                             markdown,
                         }))
                     } else {
-                        None
+                        // status=completed but no raw_output — emit an Update with
+                        // Completed status so the parent TUI can close the tool bubble.
+                        Some(AgentEvent::Tool(ToolEvent::Update {
+                            id: tcu.tool_call_id.to_string(),
+                            markdown,
+                            status: Some(ToolStatus::Completed),
+                            content: None,
+                        }))
                     }
                 } else if markdown.is_none() && status_str.is_none() {
                     None
@@ -1460,6 +1467,55 @@ mod tests {
             source.session_id.as_deref(),
             Some("608e48b6-c880-4168-b028-1bda3469be07")
         );
+    }
+
+    #[tokio::test]
+    async fn nested_tool_call_completed_status_without_raw_output_emits_update_with_completed_status(
+    ) {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        // status=completed but NO raw_output — must not drop the event
+        let notification = acp::SessionNotification::new(
+            acp::SessionId::new("outer-session"),
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                "call-no-output",
+                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+            )),
+        );
+
+        client
+            .session_notification(notification)
+            .await
+            .expect("session notification should succeed");
+
+        let NestedAcpEvent::Agent(forwarded_event, _) =
+            chunk_rx.recv().await.expect("forwarded nested ACP event")
+        else {
+            panic!("unexpected nested ACP event");
+        };
+
+        match forwarded_event {
+            AgentEvent::Tool(ToolEvent::Update { id, status, .. }) => {
+                assert_eq!(id, "call-no-output");
+                assert!(
+                    matches!(status, Some(ToolStatus::Completed)),
+                    "expected ToolStatus::Completed, got {status:?}"
+                );
+            }
+            other => panic!(
+                "expected ToolEvent::Update with Completed status, got {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]

@@ -320,9 +320,9 @@ pub(crate) fn messages_to_transcript_items(
                         } else {
                             harnx_runtime::utils::pretty_yaml_block(&r.call.arguments)
                         };
-                        let body = if raw_call_fallback.is_empty() {
-                            None
-                        } else {
+                        // Always attempt template rendering, even for zero-arg tools
+                        // (raw_call_fallback may be empty but a call_template can still render).
+                        let body =
                             match harnx_runtime::tool::render_call_for_display(
                                 &r.call,
                                 &r.call.arguments,
@@ -332,9 +332,11 @@ pub(crate) fn messages_to_transcript_items(
                                 Some(rendered) => {
                                     Some(crate::types::ToolCallBody::Markdown(rendered))
                                 }
-                                None => Some(crate::types::ToolCallBody::Yaml(raw_call_fallback)),
-                            }
-                        };
+                                None if !raw_call_fallback.is_empty() => {
+                                    Some(crate::types::ToolCallBody::Yaml(raw_call_fallback))
+                                }
+                                None => None,
+                            };
                         items.push(TranscriptItem::ToolCall {
                             tool_name: r.call.name.clone(),
                             body,
