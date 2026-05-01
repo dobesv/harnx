@@ -2924,7 +2924,7 @@ mod tests {
             assert!(pairs.contains(&("--read".into(), path_str(".pyenv"))));
             assert!(pairs.contains(&("--write".into(), path_str(".pyenv"))));
             assert!(pairs.contains(&("--exec".into(), path_str(".pyenv"))));
-            assert!(pairs.contains(&("--exec".into(), path_str(".cargo"))));
+            assert!(pairs.contains(&("--exec".into(), path_str(".cargo/bin"))));
         }
     }
 
