@@ -206,13 +206,13 @@ fn emit_tool_call_with_template(
         _ => pretty_yaml_block(json_data),
     };
 
-    let title = render_call(call, json_data, &raw_fallback, decl_map);
+    let markdown = render_call(call, json_data, &raw_fallback, decl_map);
 
     let event = AgentEvent::Tool(ToolEvent::Started {
         id: call.id.clone().unwrap_or_default(),
         name: call.name.clone(),
         kind: ToolKind::Other,
-        title,
+        markdown,
         input: json_data.clone(),
         locations: Vec::new(),
     });
@@ -254,17 +254,39 @@ fn emit_tool_result_with_template(
         _ => pretty_yaml_block(result),
     });
 
-    let title = render_result(call, result, &raw_fallback, decl_map);
+    let markdown = render_result(call, result, &raw_fallback, decl_map);
 
     let event = AgentEvent::Tool(ToolEvent::Completed {
         id: call.id.clone().unwrap_or_default(),
         output: result.clone(),
-        title,
+        markdown,
     });
 
     if !harnx_core::sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
         print_tool_result_fallback(call, result, decl_map, &raw_fallback);
     }
+}
+
+/// Look up `call.name` in `decl_map`, render `call_template` against `json_data`
+/// using `raw_fallback`. Returns `Some(rendered_markdown)` or `None`.
+pub fn render_call_for_display(
+    call: &ToolCall,
+    json_data: &Value,
+    raw_fallback: &str,
+    decl_map: &HashMap<String, ToolDeclaration>,
+) -> Option<String> {
+    render_call(call, json_data, raw_fallback, decl_map)
+}
+
+/// Look up `call.name` in `decl_map`, render `result_template` against `result`
+/// using `raw_fallback`. Returns `Some(rendered_markdown)` or `None`.
+pub fn render_result_for_display(
+    call: &ToolCall,
+    result: &Value,
+    raw_fallback: &str,
+    decl_map: &HashMap<String, ToolDeclaration>,
+) -> Option<String> {
+    render_result(call, result, raw_fallback, decl_map)
 }
 
 /// Fallback print for tool result when no sink is installed. Routes
@@ -276,8 +298,8 @@ fn print_tool_result_fallback(
     decl_map: &HashMap<String, ToolDeclaration>,
     raw_fallback: &str,
 ) {
-    let title = render_result(call, result, raw_fallback, decl_map);
-    let truncated = render_tool_result_text(result, title.as_deref());
+    let markdown = render_result(call, result, raw_fallback, decl_map);
+    let truncated = render_tool_result_text(result, markdown.as_deref());
     println!("{}", dimmed_text(&truncated));
 }
 
@@ -382,7 +404,7 @@ mod tests {
     // ----------------------------------------------------------------
     // MCP MiniJinja templating, producer side: verify that
     // `emit_tool_call_with_template` and `emit_tool_result_with_template`
-    // populate `title` on both `ToolEvent::Started` and
+    // populate `markdown` on both `ToolEvent::Started` and
     // `ToolEvent::Completed` when the matching tool declaration carries
     // a `call_template` / `result_template`. These are the values the
     // TUI/CLI consumers then render — without these events being
@@ -433,7 +455,24 @@ mod tests {
     }
 
     #[test]
-    fn emit_tool_call_with_template_sets_started_title() {
+    fn render_call_for_display_returns_rendered_when_template_exists() {
+        let decl = make_decl_with_templates("bash_exec", Some("$ {{ args.command }}"), None);
+        let mut decl_map = HashMap::new();
+        decl_map.insert(decl.name.clone(), decl);
+        let call = ToolCall::new(
+            "bash_exec".to_string(),
+            json!({"command": "ls -la /tmp"}),
+            Some("call-1".to_string()),
+            None,
+        );
+        let json_data = json!({"command": "ls -la /tmp"});
+        let raw_fallback = "command: ls -la /tmp";
+        let result = render_call_for_display(&call, &json_data, raw_fallback, &decl_map);
+        assert_eq!(result, Some("$ ls -la /tmp".to_string()));
+    }
+
+    #[test]
+    fn emit_tool_call_with_template_sets_started_markdown() {
         let decl = make_decl_with_templates("bash_exec", Some("$ {{ args.command }}"), None);
         let mut decl_map = HashMap::new();
         decl_map.insert(decl.name.clone(), decl);
@@ -451,12 +490,12 @@ mod tests {
             let events = sink.events.lock().unwrap();
             assert_eq!(events.len(), 1, "expected one Started event");
             match &events[0] {
-                AgentEvent::Tool(ToolEvent::Started { title, name, .. }) => {
+                AgentEvent::Tool(ToolEvent::Started { markdown, name, .. }) => {
                     assert_eq!(name, "bash_exec");
                     assert_eq!(
-                        title.as_deref(),
+                        markdown.as_deref(),
                         Some("$ ls -la"),
-                        "template should be rendered into Started.title"
+                        "template should be rendered into Started.markdown"
                     );
                 }
                 other => panic!("expected Started event, got {other:?}"),
@@ -465,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_tool_call_without_template_leaves_title_none() {
+    fn emit_tool_call_without_template_leaves_markdown_none() {
         let decl = make_decl_with_templates("plain_tool", None, None);
         let mut decl_map = HashMap::new();
         decl_map.insert(decl.name.clone(), decl);
@@ -482,8 +521,8 @@ mod tests {
             let events = sink.events.lock().unwrap();
             assert_eq!(events.len(), 1);
             match &events[0] {
-                AgentEvent::Tool(ToolEvent::Started { title, .. }) => {
-                    assert!(title.is_none(), "no template => title must be None");
+                AgentEvent::Tool(ToolEvent::Started { markdown, .. }) => {
+                    assert!(markdown.is_none(), "no template => markdown must be None");
                 }
                 other => panic!("expected Started event, got {other:?}"),
             }
@@ -491,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_tool_result_with_template_sets_completed_title() {
+    fn emit_tool_result_with_template_sets_completed_markdown() {
         let decl =
             make_decl_with_templates("bash_exec", None, Some("OK: {{ result.content[0].text }}"));
         let mut decl_map = HashMap::new();
@@ -513,11 +552,11 @@ mod tests {
             let events = sink.events.lock().unwrap();
             assert_eq!(events.len(), 1, "expected one Completed event");
             match &events[0] {
-                AgentEvent::Tool(ToolEvent::Completed { title, .. }) => {
+                AgentEvent::Tool(ToolEvent::Completed { markdown, .. }) => {
                     assert_eq!(
-                        title.as_deref(),
+                        markdown.as_deref(),
                         Some("OK: hello"),
-                        "template should be rendered into Completed.title"
+                        "template should be rendered into Completed.markdown"
                     );
                 }
                 other => panic!("expected Completed event, got {other:?}"),
@@ -526,7 +565,23 @@ mod tests {
     }
 
     #[test]
-    fn emit_tool_result_without_template_leaves_title_none() {
+    fn render_result_for_display_returns_none_when_no_template() {
+        let decl = make_decl_with_templates("bash_exec", None, None);
+        let mut decl_map = HashMap::new();
+        decl_map.insert(decl.name.clone(), decl);
+        let call = ToolCall::new(
+            "bash_exec".to_string(),
+            json!({"command": "ls"}),
+            Some("call-1".to_string()),
+            None,
+        );
+        let result_val = json!({"output": "file.txt"});
+        let result = render_result_for_display(&call, &result_val, "raw fallback", &decl_map);
+        assert!(result.is_none(), "no result_template => should return None");
+    }
+
+    #[test]
+    fn emit_tool_result_without_template_leaves_markdown_none() {
         let decl = make_decl_with_templates("plain_tool", None, None);
         let mut decl_map = HashMap::new();
         decl_map.insert(decl.name.clone(), decl);
@@ -543,10 +598,10 @@ mod tests {
             let events = sink.events.lock().unwrap();
             assert_eq!(events.len(), 1);
             match &events[0] {
-                AgentEvent::Tool(ToolEvent::Completed { title, .. }) => {
+                AgentEvent::Tool(ToolEvent::Completed { markdown, .. }) => {
                     assert!(
-                        title.is_none(),
-                        "no template => title must be None (consumer falls back to output)"
+                        markdown.is_none(),
+                        "no template => markdown must be None (consumer falls back to output)"
                     );
                 }
                 other => panic!("expected Completed event, got {other:?}"),

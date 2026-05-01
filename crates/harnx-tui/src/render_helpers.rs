@@ -77,8 +77,8 @@ fn patch_spans<'a>(spans: Vec<Span<'a>>, base_style: Style) -> Vec<Span<'static>
         .collect()
 }
 
-pub(crate) fn render_status_line(title: Option<&str>, status: Option<&str>) -> Option<String> {
-    let line = [title, status]
+pub(crate) fn render_status_line(markdown: Option<&str>, status: Option<&str>) -> Option<String> {
+    let line = [markdown, status]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()

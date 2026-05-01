@@ -55,7 +55,7 @@ pub enum ToolEvent {
         id: String,
         name: String,
         kind: ToolKind,
-        title: Option<String>,
+        markdown: Option<String>,
         input: serde_json::Value,
         locations: Vec<ToolLocation>,
     },
@@ -65,7 +65,7 @@ pub enum ToolEvent {
     },
     Update {
         id: String,
-        title: Option<String>,
+        markdown: Option<String>,
         status: Option<ToolStatus>,
         content: Option<Vec<ContentBlock>>,
     },
@@ -76,8 +76,8 @@ pub enum ToolEvent {
         /// MCP `result_template` (or per-tool config override) has been
         /// rendered against `output`; `None` when no template applied,
         /// in which case consumers fall back to extracting text from
-        /// `output` themselves. Mirrors `title` on `Started`/`Update`.
-        title: Option<String>,
+        /// `output` themselves. Mirrors `markdown` on `Started`/`Update`.
+        markdown: Option<String>,
     },
     Failed {
         id: String,

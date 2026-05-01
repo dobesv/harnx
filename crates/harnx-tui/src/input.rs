@@ -84,14 +84,14 @@ fn render_attachment_preview(path: &Path) -> Option<String> {
 }
 
 /// Build the body for a `TranscriptItem::ToolCall` from a `Started`
-/// event's `title` and `input`. A non-empty rendered template `title`
+/// event's `markdown` and `input`. A non-empty rendered template `markdown`
 /// becomes `ToolCallBody::Markdown`; otherwise the raw input is YAML-
 /// formatted (or omitted entirely when input is `null`).
 fn tool_call_body(
-    title: Option<&str>,
+    markdown: Option<&str>,
     input: &serde_json::Value,
 ) -> Option<crate::types::ToolCallBody> {
-    match title.map(str::trim).filter(|t| !t.is_empty()) {
+    match markdown.map(str::trim).filter(|t| !t.is_empty()) {
         Some(t) => Some(crate::types::ToolCallBody::Markdown(t.to_string())),
         None => match input {
             serde_json::Value::Null => None,
@@ -100,7 +100,7 @@ fn tool_call_body(
     }
 }
 
-/// Convert a `Completed` event's `output` + `title` into transcript items.
+/// Convert a `Completed` event's `output` + `markdown` into transcript items.
 /// The whole multi-line text is wrapped in a single `ToolResultMarkdown`
 /// item so `markdown_lines` can parse block-level constructs — fenced
 /// code (e.g. the ```diff blocks emitted by harnx-mcp-fs / harnx-mcp-bash
@@ -110,13 +110,13 @@ fn tool_call_body(
 /// cleanly.
 fn tool_completed_to_transcript_items(
     output: &serde_json::Value,
-    title: Option<&str>,
+    markdown: Option<&str>,
 ) -> Vec<TranscriptItem> {
     let raw = match output {
         serde_json::Value::String(s) => serde_json::Value::String(strip_ansi(s)),
         _ => output.clone(),
     };
-    let text = crate::agent_event_sink::render_tool_result_text(&raw, title);
+    let text = crate::agent_event_sink::render_tool_result_text(&raw, markdown);
     let clean = strip_ansi(&text).trim_end_matches('\n').to_string();
     if clean.is_empty() {
         return vec![];
@@ -639,9 +639,9 @@ impl Tui {
                     vec![TranscriptItem::SystemText(clean)]
                 }
             }
-            AgentEvent::Tool(ToolEvent::Completed { output, title, .. }) => {
-                tool_completed_to_transcript_items(&output, title.as_deref())
-            }
+            AgentEvent::Tool(ToolEvent::Completed {
+                output, markdown, ..
+            }) => tool_completed_to_transcript_items(&output, markdown.as_deref()),
             AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
                 let text = concat_text_blocks(&blocks);
                 if text.is_empty() {
@@ -756,9 +756,11 @@ impl Tui {
                     vec![]
                 }
             }
-            AgentEvent::Tool(ToolEvent::Update { title, status, .. }) => {
+            AgentEvent::Tool(ToolEvent::Update {
+                markdown, status, ..
+            }) => {
                 let status_str = status.map(|s| format!("{s:?}").to_lowercase());
-                if let Some(text) = render_status_line(title.as_deref(), status_str.as_deref()) {
+                if let Some(text) = render_status_line(markdown.as_deref(), status_str.as_deref()) {
                     vec![TranscriptItem::StatusLine(text)]
                 } else {
                     vec![]
@@ -789,11 +791,14 @@ impl Tui {
                 }
             }
             AgentEvent::Tool(ToolEvent::Started {
-                name, title, input, ..
+                name,
+                markdown,
+                input,
+                ..
             }) => {
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
-                    body: tool_call_body(title.as_deref(), &input),
+                    body: tool_call_body(markdown.as_deref(), &input),
                 }]
             }
             // Not rendered by the TUI: Turn, Session, Status, Tool::Progress,

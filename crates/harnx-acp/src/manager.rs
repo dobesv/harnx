@@ -748,6 +748,78 @@ enabled: false
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_acp_chunks_passes_tool_completed_and_update_events() {
+        use harnx_core::event::{AgentEvent, AgentEventSink, AgentSource, ToolEvent, ToolStatus};
+        use std::sync::Mutex;
+
+        let _guard = SINK_LOCK.lock().await;
+
+        struct CollectingSink {
+            events: Mutex<Vec<(AgentEvent, Option<AgentSource>)>>,
+        }
+        impl AgentEventSink for CollectingSink {
+            fn emit(&self, event: AgentEvent, source: Option<AgentSource>) {
+                self.events.lock().unwrap().push((event, source));
+            }
+        }
+
+        let sink = std::sync::Arc::new(CollectingSink {
+            events: Mutex::new(Vec::new()),
+        });
+        harnx_core::sink::clear_agent_event_sink();
+        harnx_core::sink::install_agent_event_sink(sink.clone());
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(NestedAcpEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Completed {
+                id: "call-1".to_string(),
+                output: json!({"text": "done"}),
+                markdown: None,
+            }),
+            Some(AgentSource {
+                agent: "sub-agent".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        ))
+        .expect("send tool completed event");
+        tx.send(NestedAcpEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Update {
+                id: "call-1".to_string(),
+                markdown: None,
+                status: Some(ToolStatus::InProgress),
+                content: None,
+            }),
+            Some(AgentSource {
+                agent: "sub-agent".to_string(),
+                session_id: Some("session-1".to_string()),
+            }),
+        ))
+        .expect("send tool update event");
+        drop(tx);
+
+        forward_acp_chunks(rx, None, "test".to_string()).await;
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            (AgentEvent::Tool(ToolEvent::Completed { id, output, .. }), Some(source)) => {
+                assert_eq!(id, "call-1");
+                assert_eq!(output, &json!({"text": "done"}));
+                assert_eq!(source.agent, "sub-agent");
+            }
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        match &events[1] {
+            (AgentEvent::Tool(ToolEvent::Update { id, status, .. }), Some(source)) => {
+                assert_eq!(id, "call-1");
+                assert!(matches!(status, Some(ToolStatus::InProgress)));
+                assert_eq!(source.agent, "sub-agent");
+            }
+            other => panic!("unexpected second event: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forward_acp_chunks_preserves_structured_nested_events() {
         use harnx_core::event::{
             AgentEvent, AgentEventSink, AgentSource, NoticeEvent, ToolEvent, ToolKind,
@@ -778,7 +850,7 @@ enabled: false
                 id: String::new(),
                 name: "read_file".to_string(),
                 kind: ToolKind::Other,
-                title: None,
+                markdown: None,
                 input: serde_json::json!({"path": "/tmp/x.txt"}),
                 locations: vec![],
             }),

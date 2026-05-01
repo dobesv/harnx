@@ -36,6 +36,21 @@ enum AcpForward {
         id: String,
         name: String,
         input: serde_json::Value,
+        markdown: Option<String>,
+        source: Option<AgentSource>,
+    },
+    /// Sub-agent tool status/progress update for `SessionUpdate::ToolCallUpdate`.
+    ToolUpdate {
+        id: String,
+        markdown: Option<String>,
+        status: Option<harnx_core::event::ToolStatus>,
+        source: Option<AgentSource>,
+    },
+    /// Sub-agent tool completion for `SessionUpdate::ToolCallUpdate` with status=completed.
+    ToolCompleted {
+        id: String,
+        output: serde_json::Value,
+        markdown: Option<String>,
         source: Option<AgentSource>,
     },
 }
@@ -75,12 +90,43 @@ impl harnx_core::event::AgentEventSink for AcpChunkSink {
                 let _ = self.tx.send(AcpForward::Text(output, source));
             }
             AgentEvent::Tool(ToolEvent::Started {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                markdown,
+                ..
             }) => {
                 let _ = self.tx.send(AcpForward::ToolCall {
                     id,
                     name,
                     input,
+                    markdown,
+                    source,
+                });
+            }
+            AgentEvent::Tool(ToolEvent::Update {
+                id,
+                markdown,
+                status,
+                ..
+            }) => {
+                let _ = self.tx.send(AcpForward::ToolUpdate {
+                    id,
+                    markdown,
+                    status,
+                    source,
+                });
+            }
+            AgentEvent::Tool(ToolEvent::Completed {
+                id,
+                output,
+                markdown,
+                ..
+            }) => {
+                let _ = self.tx.send(AcpForward::ToolCompleted {
+                    id,
+                    output,
+                    markdown,
                     source,
                 });
             }
@@ -319,6 +365,7 @@ impl acp::Agent for HarnxAgent {
             id: String,
             name: String,
             input: serde_json::Value,
+            markdown: Option<String>,
             source: Option<AgentSource>,
         ) {
             if let Some(conn) = conn.clone() {
@@ -326,14 +373,93 @@ impl acp::Agent for HarnxAgent {
                 tokio::task::spawn_local(async move {
                     let tool_call_id = if id.is_empty() { name.clone() } else { id };
                     let mut tc = acp::ToolCall::new(tool_call_id, name).raw_input(input);
+                    let mut meta_map: Option<serde_json::Map<String, serde_json::Value>> = None;
                     if let Some(source) = source.as_ref() {
-                        if let Some(meta) = meta_from_source(source) {
-                            tc = tc.meta(meta);
-                        }
+                        meta_map = meta_from_source(source);
+                    }
+                    if let Some(md) = markdown.filter(|t| !t.is_empty()) {
+                        let map = meta_map.get_or_insert_with(serde_json::Map::new);
+                        map.insert("harnx:markdown".to_string(), serde_json::Value::String(md));
+                    }
+                    if let Some(map) = meta_map {
+                        tc = tc.meta(map);
                     }
                     let notification = acp::SessionNotification::new(
                         acp::SessionId::new(sid),
                         acp::SessionUpdate::ToolCall(tc),
+                    );
+                    let _ = conn.session_notification(notification).await;
+                });
+            }
+        }
+
+        fn spawn_notify_tool_update(
+            conn: &Option<Rc<acp::AgentSideConnection>>,
+            session_key: &str,
+            id: String,
+            markdown: Option<String>,
+            status: Option<harnx_core::event::ToolStatus>,
+            source: Option<AgentSource>,
+        ) {
+            if let Some(conn) = conn.clone() {
+                let sid = session_key.to_string();
+                tokio::task::spawn_local(async move {
+                    let acp_status = status.map(|s| match s {
+                        harnx_core::event::ToolStatus::Pending => acp::ToolCallStatus::Pending,
+                        harnx_core::event::ToolStatus::InProgress => {
+                            acp::ToolCallStatus::InProgress
+                        }
+                        harnx_core::event::ToolStatus::Completed => acp::ToolCallStatus::Completed,
+                        harnx_core::event::ToolStatus::Failed => acp::ToolCallStatus::Failed,
+                    });
+                    let mut fields = acp::ToolCallUpdateFields::new();
+                    if let Some(s) = acp_status {
+                        fields = fields.status(s);
+                    }
+                    if let Some(md) = markdown.filter(|t| !t.is_empty()) {
+                        fields = fields.title(md);
+                    }
+                    let mut tcu = acp::ToolCallUpdate::new(id, fields);
+                    if let Some(source) = source.as_ref() {
+                        if let Some(meta) = meta_from_source(source) {
+                            tcu = tcu.meta(meta);
+                        }
+                    }
+                    let notification = acp::SessionNotification::new(
+                        acp::SessionId::new(sid),
+                        acp::SessionUpdate::ToolCallUpdate(tcu),
+                    );
+                    let _ = conn.session_notification(notification).await;
+                });
+            }
+        }
+
+        fn spawn_notify_tool_completed(
+            conn: &Option<Rc<acp::AgentSideConnection>>,
+            session_key: &str,
+            id: String,
+            output: serde_json::Value,
+            markdown: Option<String>,
+            source: Option<AgentSource>,
+        ) {
+            if let Some(conn) = conn.clone() {
+                let sid = session_key.to_string();
+                tokio::task::spawn_local(async move {
+                    let mut fields = acp::ToolCallUpdateFields::new()
+                        .status(acp::ToolCallStatus::Completed)
+                        .raw_output(output);
+                    if let Some(md) = markdown.filter(|t| !t.is_empty()) {
+                        fields = fields.title(md);
+                    }
+                    let mut tcu = acp::ToolCallUpdate::new(id, fields);
+                    if let Some(source) = source.as_ref() {
+                        if let Some(meta) = meta_from_source(source) {
+                            tcu = tcu.meta(meta);
+                        }
+                    }
+                    let notification = acp::SessionNotification::new(
+                        acp::SessionId::new(sid),
+                        acp::SessionUpdate::ToolCallUpdate(tcu),
                     );
                     let _ = conn.session_notification(notification).await;
                 });
@@ -353,8 +479,21 @@ impl acp::Agent for HarnxAgent {
                     id,
                     name,
                     input,
+                    markdown,
                     source,
-                } => spawn_notify_tool_call(conn, session_key, id, name, input, source),
+                } => spawn_notify_tool_call(conn, session_key, id, name, input, markdown, source),
+                AcpForward::ToolUpdate {
+                    id,
+                    markdown,
+                    status,
+                    source,
+                } => spawn_notify_tool_update(conn, session_key, id, markdown, status, source),
+                AcpForward::ToolCompleted {
+                    id,
+                    output,
+                    markdown,
+                    source,
+                } => spawn_notify_tool_completed(conn, session_key, id, output, markdown, source),
             }
         }
 
@@ -570,6 +709,58 @@ mod tests {
             .expect("build ACP server test runtime");
         let local_set = LocalSet::new();
         local_set.block_on(&rt, future)
+    }
+
+    #[test]
+    fn acp_chunk_sink_forwards_tool_completed_and_update_to_channel() {
+        use harnx_core::event::{AgentEvent, AgentEventSink, ToolEvent, ToolStatus};
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, mut rx) = unbounded_channel::<AcpForward>();
+        let sink = AcpChunkSink { tx };
+
+        sink.emit(
+            AgentEvent::Tool(ToolEvent::Completed {
+                id: "call-1".to_string(),
+                output: serde_json::json!({"text": "result"}),
+                markdown: Some("**result**".to_string()),
+            }),
+            None,
+        );
+
+        sink.emit(
+            AgentEvent::Tool(ToolEvent::Update {
+                id: "call-1".to_string(),
+                markdown: None,
+                status: Some(ToolStatus::InProgress),
+                content: None,
+            }),
+            None,
+        );
+
+        let completed = rx.try_recv().expect("should have ToolCompleted");
+        let update = rx.try_recv().expect("should have ToolUpdate");
+
+        match completed {
+            AcpForward::ToolCompleted {
+                id,
+                output,
+                markdown,
+                ..
+            } => {
+                assert_eq!(id, "call-1");
+                assert_eq!(output, serde_json::json!({"text": "result"}));
+                assert_eq!(markdown.as_deref(), Some("**result**"));
+            }
+            _ => panic!("expected ToolCompleted"),
+        }
+        match update {
+            AcpForward::ToolUpdate { id, status, .. } => {
+                assert_eq!(id, "call-1");
+                assert!(matches!(status, Some(ToolStatus::InProgress)));
+            }
+            _ => panic!("expected ToolUpdate"),
+        }
     }
 
     fn test_config() -> GlobalConfig {
