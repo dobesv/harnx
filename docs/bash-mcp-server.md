@@ -97,6 +97,25 @@ On Linux and macOS, `harnx-mcp-bash` uses [birdcage](https://github.com/phylum-d
   - The path in the `$TMPDIR` environment variable, if set.
 - **Readable/Executable**:
   - Standard system directories required for bash and common utilities (e.g., `/usr/bin`, `/bin`, `/lib`).
+  - Tool installation directories under `$HOME`: `~/.local/bin`, `~/.local/lib`, `~/.bun`, `~/.asdf`, `~/go/bin`.
+- **Readable**:
+  - System C/C++ header directories needed by `cc`, `bindgen`, and crates with native build scripts (Linux: `/usr/include`, `/usr/include/x86_64-linux-gnu`).
+  - Common config files under `$HOME`: `~/.gitconfig`, `~/.gitignore`, `~/.gitignore_global`, `~/.tool-versions`, `~/.local`.
+- **Read+Write**:
+  - Cache and module directories under `$HOME`: `~/.cache`, `~/go/pkg`.
+- **Read+Write+Execute**:
+  - Package-manager and version-manager directories under `$HOME`: `~/.npm`, `~/.yarn`, `~/.nvm`, `~/.cargo`, `~/.mono`, `~/.bun/install/cache`, `~/.pyenv`, `~/.rye`.
+
+These `$HOME`-relative defaults exist regardless of whether the directory is present on the host (sandbox-run silently skips non-existent paths).
+
+Toolchain-locating environment variables are honoured automatically when set:
+
+| Variable | Effect on sandbox |
+|----------|-------------------|
+| `CARGO_HOME` | `$CARGO_HOME/bin` added as executable. |
+| `GOROOT` | `$GOROOT` added as executable (Go install). |
+| `GOPATH` | `$GOPATH/bin` added as executable; `$GOPATH/pkg` added as read+write. |
+| `GOBIN` | `$GOBIN` added as executable. |
 
 ### Configuration Options
 
