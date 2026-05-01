@@ -76,11 +76,31 @@ impl AcpManager {
         (rx, subscription_id)
     }
 
+    /// Subscribe to chunk notifications from a single specific client.
+    /// Use this instead of [`subscribe_chunks`] when a tool call targets a
+    /// known client so that parallel concurrent calls to different agents do
+    /// not cross-register and duplicate each other's events.
+    pub async fn subscribe_chunks_for_client(
+        &self,
+        client: &AcpClient,
+    ) -> (mpsc::UnboundedReceiver<NestedAcpEvent>, u64) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let subscription_id = self.next_subscription_id.fetch_add(1, Ordering::Relaxed);
+        client.set_chunk_forwarder(subscription_id, tx).await;
+        (rx, subscription_id)
+    }
+
     pub async fn unsubscribe_chunks(&self, subscription_id: u64) {
         let clients: Vec<_> = self.clients.read().values().cloned().collect();
         for client in clients {
             client.clear_chunk_forwarder(subscription_id).await;
         }
+    }
+
+    /// Unsubscribe from a single specific client.  Matches
+    /// [`subscribe_chunks_for_client`].
+    pub async fn unsubscribe_chunks_for_client(&self, client: &AcpClient, subscription_id: u64) {
+        client.clear_chunk_forwarder(subscription_id).await;
     }
 
     pub fn get_all_tools_blocking(&self) -> Vec<ToolDeclaration> {
@@ -442,7 +462,20 @@ impl ToolProvider for AcpManager {
         // output it triggers.
         tokio::task::yield_now().await;
 
-        let (chunk_rx, subscription_id) = self.subscribe_chunks().await;
+        // Subscribe only to the specific client that will handle this call.
+        // Subscribing to ALL clients (the old `subscribe_chunks()` approach)
+        // causes duplicate output when N tool calls run concurrently: each
+        // call's subscription would receive events from every other
+        // concurrently-active client, producing N-fold duplication.
+        // If the client cannot be found we fall back to the old broad
+        // subscribe so that the error path still surfaces a useful message.
+        let target_client = self
+            .find_client_for_tool(tool_name)
+            .map(|(client, _)| client);
+        let (chunk_rx, subscription_id) = match &target_client {
+            Some(client) => self.subscribe_chunks_for_client(client).await,
+            None => self.subscribe_chunks().await,
+        };
 
         // Spawn a spinner only in non-TUI terminal mode.
         let spinner = if is_terminal {
@@ -478,7 +511,15 @@ impl ToolProvider for AcpManager {
         // chunk arriving just before its session_prompt response), which
         // showed up as flaky standalone activity rendering in the
         // nested-sub-agent transcript.
-        self.unsubscribe_chunks(subscription_id).await;
+        match &target_client {
+            Some(client) => {
+                self.unsubscribe_chunks_for_client(client, subscription_id)
+                    .await;
+            }
+            None => {
+                self.unsubscribe_chunks(subscription_id).await;
+            }
+        }
         let _ = forward_handle.await;
 
         if let Some(s) = spinner {
@@ -953,5 +994,158 @@ enabled: false
 
         drop(events);
         harnx_core::sink::clear_agent_event_sink();
+    }
+
+    /// Regression test for issue #420: parallel concurrent calls to different
+    /// ACP agents must not duplicate each other's events.
+    ///
+    /// When N tool calls are in-flight simultaneously (parallel tool dispatch),
+    /// `subscribe_chunks_for_client` scopes each subscription to a single
+    /// client.  Proof: inject an event through alpha's forwarder map and assert
+    /// (a) alpha's scoped receiver gets it, (b) beta's scoped receiver stays empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_chunks_for_client_no_cross_contamination() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("alpha"), test_config("beta")]);
+
+        let alpha_client = manager
+            .get_client("alpha")
+            .expect("alpha client should exist");
+        let beta_client = manager
+            .get_client("beta")
+            .expect("beta client should exist");
+
+        // Two parallel calls — each scoped to its own client.
+        // Discard the default receiver for alpha; we'll install a fresh pair below
+        // so we control both sides of the forwarder.
+        let (_old_alpha_rx, alpha_sub) = manager.subscribe_chunks_for_client(&alpha_client).await;
+        let (mut beta_rx, beta_sub) = manager.subscribe_chunks_for_client(&beta_client).await;
+
+        // Replace alpha's forwarder entry with a known tx/rx pair so we can
+        // inject an event through it (simulates forward_agent_event from the
+        // alpha subprocess).
+        let (send_tx, mut alpha_rx) = tokio::sync::mpsc::unbounded_channel::<NestedAcpEvent>();
+        alpha_client
+            .set_chunk_forwarder(alpha_sub, send_tx.clone())
+            .await;
+
+        // Send one event through alpha's forwarder.
+        let event = NestedAcpEvent::Agent(
+            harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
+                "from alpha".to_string(),
+            )),
+            None,
+        );
+        send_tx
+            .send(event)
+            .expect("send event into alpha forwarder");
+        drop(send_tx); // close so recv() terminates
+
+        // Assert 1: alpha's receiver gets the event.
+        let received = alpha_rx
+            .recv()
+            .await
+            .expect("alpha_rx must receive the injected event");
+        match received {
+            NestedAcpEvent::Agent(
+                harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
+                    ref msg,
+                )),
+                None,
+            ) => assert_eq!(msg, "from alpha"),
+            other => panic!("unexpected event in alpha_rx: {other:?}"),
+        }
+
+        // Assert 2: beta's receiver is empty — alpha's event never crossed to beta.
+        // alpha_sub was registered only on alpha_client; beta_client holds NO entry
+        // for alpha_sub, so beta_rx can never receive anything from alpha's path.
+        assert!(
+            beta_rx.try_recv().is_err(),
+            "beta_rx must be empty — alpha events must not bleed into beta subscription (issue #420)"
+        );
+
+        manager
+            .unsubscribe_chunks_for_client(&alpha_client, alpha_sub)
+            .await;
+        manager
+            .unsubscribe_chunks_for_client(&beta_client, beta_sub)
+            .await;
+    }
+
+    /// Contrast test: `subscribe_chunks` (broad path) registers on ALL clients.
+    /// We verify this by subscribing broadly, then injecting an event through
+    /// each client's forwarder entry and confirming the broad receiver sees both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_chunks_broad_registers_on_all_clients() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("alpha"), test_config("beta")]);
+
+        let alpha_client = manager
+            .get_client("alpha")
+            .expect("alpha client should exist");
+        let beta_client = manager
+            .get_client("beta")
+            .expect("beta client should exist");
+
+        // Broad subscribe — registers the same underlying sender on BOTH clients.
+        let (_broad_rx, broad_sub) = manager.subscribe_chunks().await;
+
+        // Replace alpha's entry with a known tx/rx pair and inject an event.
+        let (alpha_send, mut alpha_rx) = tokio::sync::mpsc::unbounded_channel::<NestedAcpEvent>();
+        alpha_client
+            .set_chunk_forwarder(broad_sub, alpha_send.clone())
+            .await;
+        alpha_send
+            .send(NestedAcpEvent::Agent(
+                harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
+                    "from alpha-broad".to_string(),
+                )),
+                None,
+            ))
+            .expect("send alpha broad event");
+        drop(alpha_send);
+
+        match alpha_rx
+            .recv()
+            .await
+            .expect("alpha entry must deliver event")
+        {
+            NestedAcpEvent::Agent(
+                harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
+                    ref msg,
+                )),
+                None,
+            ) => assert_eq!(msg, "from alpha-broad"),
+            other => panic!("unexpected alpha-broad event: {other:?}"),
+        }
+
+        // Replace beta's entry with a known tx/rx pair and inject an event.
+        let (beta_send, mut beta_rx) = tokio::sync::mpsc::unbounded_channel::<NestedAcpEvent>();
+        beta_client
+            .set_chunk_forwarder(broad_sub, beta_send.clone())
+            .await;
+        beta_send
+            .send(NestedAcpEvent::Agent(
+                harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
+                    "from beta-broad".to_string(),
+                )),
+                None,
+            ))
+            .expect("send beta broad event");
+        drop(beta_send);
+
+        match beta_rx.recv().await.expect("beta entry must deliver event") {
+            NestedAcpEvent::Agent(
+                harnx_core::event::AgentEvent::Notice(harnx_core::event::NoticeEvent::Info(
+                    ref msg,
+                )),
+                None,
+            ) => assert_eq!(msg, "from beta-broad"),
+            other => panic!("unexpected beta-broad event: {other:?}"),
+        }
+
+        // Both per-client forwarder entries existed and delivered events —
+        // the broad-subscribe contract holds.
+        manager.unsubscribe_chunks(broad_sub).await;
     }
 }
