@@ -123,8 +123,14 @@ pub(crate) enum ToolCallBody {
 pub(crate) enum TranscriptItem {
     SourceHeading(AgentSource),
     SystemText(String),
-    UserText(String),
-    AssistantText(String),
+    UserText {
+        text: String,
+        seq: Option<usize>,
+    },
+    AssistantText {
+        text: String,
+        seq: Option<usize>,
+    },
     ErrorText(String),
     ThoughtText(String),
     /// Tool result body — the full multi-line text extracted from the
@@ -138,10 +144,12 @@ pub(crate) enum TranscriptItem {
     ToolCall {
         tool_name: String,
         body: Option<ToolCallBody>,
+        seq: Option<usize>,
     },
     AttachmentHeader(String),
     AttachmentItem(String),
     AttachmentPreviewLine(String),
+    MutationNotice(String),
 }
 
 pub(crate) enum TuiEvent {

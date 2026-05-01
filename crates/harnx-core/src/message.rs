@@ -12,6 +12,12 @@ use crate::tool::ToolResult;
 pub struct Message {
     pub role: MessageRole,
     pub content: MessageContent,
+    /// 0-based index of the YAML document in the session log that produced
+    /// this message. Set during log replay; `None` for messages created
+    /// during a live session (before they are persisted and reloaded).
+    /// Never serialised — not sent to the LLM.
+    #[serde(skip)]
+    pub log_seq: Option<usize>,
 }
 
 impl Default for Message {
@@ -19,13 +25,23 @@ impl Default for Message {
         Self {
             role: MessageRole::User,
             content: MessageContent::Text(String::new()),
+            log_seq: None,
         }
     }
 }
 
 impl Message {
     pub fn new(role: MessageRole, content: MessageContent) -> Self {
-        Self { role, content }
+        Self {
+            role,
+            content,
+            log_seq: None,
+        }
+    }
+
+    pub fn with_log_seq(mut self, seq: usize) -> Self {
+        self.log_seq = Some(seq);
+        self
     }
 
     pub fn merge_system(&mut self, system: MessageContent) {

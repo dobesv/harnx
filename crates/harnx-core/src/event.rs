@@ -127,6 +127,12 @@ pub enum SessionEvent {
     Generic {
         text: String,
     },
+    /// Emitted after a message or tool-calls entry has been written to the
+    /// session log. The TUI uses this to patch the `seq` field on the
+    /// most-recently-pushed `AssistantText` or `ToolCall` transcript item.
+    LogSeqAssigned {
+        seq: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -292,7 +292,7 @@ pub fn claude_build_chat_completions_body(
         .into_iter()
         .enumerate()
         .flat_map(|(i, message)| {
-            let Message { role, content } = message;
+            let Message { role, content, .. } = message;
             match content {
                 MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
                     vec![json!({ "role": role, "content": strip_think_tag(&text) })]

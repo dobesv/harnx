@@ -1,6 +1,6 @@
 use crate::test_utils::TuiTestHarness;
 use crate::types::Tui;
-use crate::types::{TranscriptItem, TuiEvent};
+use crate::types::{ToolCallBody, TranscriptItem, TuiEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, PlanEntry, ToolEvent, ToolKind,
@@ -140,7 +140,7 @@ async fn shift_enter_inserts_newline_without_submitting() {
         .app
         .transcript
         .iter()
-        .all(|entry| !matches!(entry, TranscriptItem::UserText(_))));
+        .all(|entry| !matches!(entry, TranscriptItem::UserText { text: _, .. })));
 }
 
 #[tokio::test]
@@ -163,11 +163,10 @@ async fn pending_message_is_auto_sent_after_finish() {
 
     assert!(tui.app.llm_busy);
     assert!(tui.app.pending_message.is_none());
-    let has_user_entry = tui
-        .app
-        .transcript
-        .iter()
-        .any(|entry| matches!(entry, TranscriptItem::UserText(text) if text == "follow up"));
+    let has_user_entry =
+        tui.app.transcript.iter().any(
+            |entry| matches!(entry, TranscriptItem::UserText { text, .. } if text == "follow up"),
+        );
     assert!(has_user_entry);
 }
 
@@ -240,10 +239,9 @@ async fn pending_message_consumed_clears_pending_and_shows_in_transcript() {
     // Input field should be cleared.
     assert!(tui.app.input.lines().join("").is_empty());
     // The consumed text should appear in the transcript as a UserText entry.
-    let has_user_entry =
-        tui.app.transcript.iter().any(
-            |entry| matches!(entry, TranscriptItem::UserText(text) if text == "interject here"),
-        );
+    let has_user_entry = tui.app.transcript.iter().any(
+        |entry| matches!(entry, TranscriptItem::UserText { text, .. } if text == "interject here"),
+    );
     assert!(has_user_entry);
 }
 
@@ -285,7 +283,9 @@ async fn pending_message_not_double_submitted_after_consumed() {
         .app
         .transcript
         .iter()
-        .filter(|entry| matches!(entry, TranscriptItem::UserText(text) if text == "once only"))
+        .filter(
+            |entry| matches!(entry, TranscriptItem::UserText { text, .. } if text == "once only"),
+        )
         .count();
     assert_eq!(user_text_count, 1);
 }
@@ -391,7 +391,7 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
         .transcript
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptItem::AssistantText(text) => Some(text.as_str()),
+            TranscriptItem::AssistantText { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -1286,7 +1286,7 @@ async fn acp_message_chunks_coalesce_like_direct_llm_streaming() {
         .transcript
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptItem::AssistantText(text) => Some(text.as_str()),
+            TranscriptItem::AssistantText { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -1338,8 +1338,8 @@ async fn submitting_message_with_attachments_renders_attachment_list_and_preview
         .collect();
 
     assert!(matches!(
-        tui.app.transcript.iter().find(|entry| matches!(entry, TranscriptItem::UserText(_))),
-        Some(TranscriptItem::UserText(text)) if text == "hello with files"
+        tui.app.transcript.iter().find(|entry| matches!(entry, TranscriptItem::UserText { text: _, .. })),
+        Some(TranscriptItem::UserText { text, .. }) if text == "hello with files"
     ));
     assert!(system_entries.contains(&"Attachments (1):".to_string()));
     assert!(system_entries.contains(&"  - notes.txt".to_string()));
@@ -1426,11 +1426,10 @@ async fn test_basic_message_and_streaming_response() {
         "harness config should not have a session before prompt starts"
     );
     harness.tui().clear_transcript();
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::UserText("Test message".to_string()));
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Test message".to_string(),
+        seq: None,
+    });
     harness
         .tui()
         .start_prompt(crate::types::PendingMessage {
@@ -1477,22 +1476,86 @@ async fn test_basic_message_and_streaming_response() {
         .transcript
         .iter()
         .filter_map(|entry| match entry {
-            TranscriptItem::AssistantText(text) => Some(text.clone()),
+            TranscriptItem::AssistantText { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect();
     assert_eq!(assistant_entries, vec!["Hello from the mock client!"]);
-    assert!(harness
-        .tui()
-        .app
-        .transcript
-        .iter()
-        .any(|entry| matches!(entry, TranscriptItem::UserText(text) if text == "Test message")));
+    assert!(harness.tui().app.transcript.iter().any(
+        |entry| matches!(entry, TranscriptItem::UserText { text, .. } if text == "Test message")
+    ));
 
     let rendered = normalize_screen(&harness.screen_contents());
     insta::assert_snapshot!("basic_message_and_streaming_response", rendered);
 
     harness.drain_and_settle().await.unwrap();
+}
+
+/// Verifies that `[n]` sequence number labels propagate from a saved
+/// session log through `messages_to_transcript_items` onto `UserText` and
+/// `AssistantText` items.  This is the path used when a session is
+/// resumed from disk (e.g. `harnx -a foo -s existing-session`).
+///
+/// Live-event seq propagation (assigning seqs to messages as they stream
+/// in during an active turn, before a session reload) is intentionally
+/// deferred — the streaming render path interacts subtly with the agent
+/// banner and per-chunk AssistantText updates.  Resumed sessions exercise
+/// the full data flow without those complications.
+#[test]
+fn seq_numbers_appear_after_session_reload() {
+    use harnx_core::message::{Message, MessageContent, MessageRole};
+    use harnx_runtime::tool::ToolDeclaration;
+    use std::collections::HashMap;
+
+    // Build a Vec<Message> the way replay_log_entries would, with log_seq
+    // populated for each.  This bypasses the file I/O of full session
+    // load while exercising the same TUI conversion logic.
+    let messages = vec![
+        Message::new(
+            MessageRole::User,
+            MessageContent::Text("user message 1".to_string()),
+        )
+        .with_log_seq(2),
+        Message::new(
+            MessageRole::Assistant,
+            MessageContent::Text("assistant reply 1".to_string()),
+        )
+        .with_log_seq(3),
+        Message::new(
+            MessageRole::User,
+            MessageContent::Text("user message 2".to_string()),
+        )
+        .with_log_seq(4),
+        Message::new(
+            MessageRole::Assistant,
+            MessageContent::Text("assistant reply 2".to_string()),
+        )
+        .with_log_seq(5),
+    ];
+
+    let decl_map: HashMap<String, ToolDeclaration> = HashMap::new();
+    let items = crate::lifecycle::messages_to_transcript_items(&messages, &decl_map);
+
+    // Verify each TranscriptItem carries the correct seq.
+    let pairs: Vec<(&'static str, Option<usize>)> = items
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::UserText { seq, .. } => Some(("user", *seq)),
+            TranscriptItem::AssistantText { seq, .. } => Some(("assistant", *seq)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        pairs,
+        vec![
+            ("user", Some(2)),
+            ("assistant", Some(3)),
+            ("user", Some(4)),
+            ("assistant", Some(5)),
+        ],
+        "seq numbers should propagate from Message.log_seq into TranscriptItem.seq",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1523,11 +1586,10 @@ async fn test_streaming_with_tool_calls() {
 
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().clear_transcript();
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::UserText("What is the answer?".to_string()));
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "What is the answer?".to_string(),
+        seq: None,
+    });
     harness
         .tui()
         .start_prompt(crate::types::PendingMessage {
@@ -1599,8 +1661,8 @@ async fn test_sub_agent_delegation_tool_appears() {
                     .add_tool_call(
                         "specialist_session_handoff",
                         serde_json::json!({
-                            "prompt": "Please help with this task",
-                            "session_id": "handoff-session-1"
+                            "session_id": "handoff-session-1",
+                            "prompt": "Please help with this task"
                         }),
                     )
                     .build(),
@@ -1612,11 +1674,10 @@ async fn test_sub_agent_delegation_tool_appears() {
 
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().clear_transcript();
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::UserText("Help me".to_string()));
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Help me".to_string(),
+        seq: None,
+    });
     harness
         .tui()
         .start_prompt(crate::types::PendingMessage {
@@ -1769,11 +1830,10 @@ async fn test_screen_overflow_and_word_wrap() {
 
     let mut harness = TuiTestHarness::with_size(40, 10);
     harness.tui().clear_transcript();
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::UserText(user_message.to_string()));
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: user_message.to_string(),
+        seq: None,
+    });
     harness
         .tui()
         .start_prompt(crate::types::PendingMessage {
@@ -1888,9 +1948,10 @@ async fn test_submitted_message_with_text_attachment_snapshot() {
     // would create: UserText, then AttachmentHeader + AttachmentItem +
     // AttachmentPreviewLines.
     let tui = harness.tui();
-    tui.app
-        .transcript
-        .push(TranscriptItem::UserText("check this file".to_string()));
+    tui.app.transcript.push(TranscriptItem::UserText {
+        text: "check this file".to_string(),
+        seq: None,
+    });
     tui.app.transcript.push(TranscriptItem::AttachmentHeader(
         "Attachments (1)".to_string(),
     ));
@@ -1907,9 +1968,10 @@ async fn test_submitted_message_with_text_attachment_snapshot() {
         .push(TranscriptItem::AttachmentPreviewLine(
             "Line 2 of notes".to_string(),
         ));
-    tui.app
-        .transcript
-        .push(TranscriptItem::AssistantText("Got it, thanks!".to_string()));
+    tui.app.transcript.push(TranscriptItem::AssistantText {
+        text: "Got it, thanks!".to_string(),
+        seq: None,
+    });
 
     harness.render();
     let rendered = normalize_screen(&harness.screen_contents());
@@ -1982,11 +2044,10 @@ async fn test_ctrl_c_cancels_streaming() {
 
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().clear_transcript();
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::UserText("Long request".to_string()));
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Long request".to_string(),
+        seq: None,
+    });
     harness
         .tui()
         .start_prompt(crate::types::PendingMessage {
@@ -2071,11 +2132,10 @@ async fn test_streaming_error_shows_in_transcript() {
 
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().clear_transcript();
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::UserText("Error test".to_string()));
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Error test".to_string(),
+        seq: None,
+    });
 
     // The error should propagate through start_prompt
     let result = harness
@@ -2246,11 +2306,10 @@ async fn test_cancel_during_tool_execution() {
 
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().clear_transcript();
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::UserText("Search test".to_string()));
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Search test".to_string(),
+        seq: None,
+    });
     harness
         .tui()
         .start_prompt(crate::types::PendingMessage {
@@ -2343,7 +2402,7 @@ async fn paste_multiline_creates_temp_attachment() {
         .app
         .transcript
         .iter()
-        .filter(|entry| matches!(entry, TranscriptItem::UserText(_)))
+        .filter(|entry| matches!(entry, TranscriptItem::UserText { text: _, .. }))
         .collect();
     assert!(
         user_entries.is_empty(),
@@ -2526,7 +2585,7 @@ async fn attach_command_adds_attachment() {
         .app
         .transcript
         .iter()
-        .filter(|e| matches!(e, TranscriptItem::UserText(_)))
+        .filter(|e| matches!(e, TranscriptItem::UserText { text: _, .. }))
         .collect();
     assert!(user_entries.is_empty());
 
@@ -2553,7 +2612,7 @@ async fn attach_command_preserves_draft_text() {
         .app
         .transcript
         .iter()
-        .filter(|e| matches!(e, TranscriptItem::UserText(_)))
+        .filter(|e| matches!(e, TranscriptItem::UserText { text: _, .. }))
         .collect();
     assert!(user_entries.is_empty());
 
@@ -2584,7 +2643,7 @@ async fn direct_submit_with_attachments_renders_attachment_entries_in_transcript
         .transcript
         .iter()
         .position(
-            |item| matches!(item, TranscriptItem::UserText(text) if text == "check attachment"),
+            |item| matches!(item, TranscriptItem::UserText { text, .. } if text == "check attachment"),
         )
         .expect("expected submitted user text in transcript");
 
@@ -2622,7 +2681,7 @@ async fn dot_command_with_attachments_renders_attachment_entries_in_transcript()
         .transcript
         .iter()
         .position(
-            |item| matches!(item, TranscriptItem::UserText(text) if text == ".info attachments"),
+            |item| matches!(item, TranscriptItem::UserText { text, .. } if text == ".info attachments"),
         )
         .expect("expected dot-command user text in transcript");
 
@@ -2874,11 +2933,10 @@ async fn test_recovery_after_cancellation() {
     harness.tui().clear_transcript();
 
     // Send first message
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::UserText("First request".to_string()));
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "First request".to_string(),
+        seq: None,
+    });
     harness
         .tui()
         .start_prompt(crate::types::PendingMessage {
@@ -2939,11 +2997,10 @@ async fn test_recovery_after_cancellation() {
 
     // User can send a new message
     harness.tui().clear_transcript();
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::UserText("Second request".to_string()));
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Second request".to_string(),
+        seq: None,
+    });
     harness
         .tui()
         .start_prompt(crate::types::PendingMessage {
@@ -3529,11 +3586,10 @@ async fn test_ctrl_c_interrupts_in_flight_streaming() {
     let _guard = TestStateGuard::new(Some(mock_client)).await;
 
     let mut harness = TuiTestHarness::with_config(config.clone());
-    harness
-        .tui()
-        .app
-        .transcript
-        .push(TranscriptItem::UserText("Long request".to_string()));
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Long request".to_string(),
+        seq: None,
+    });
     harness
         .tui()
         .start_prompt(crate::types::PendingMessage {
@@ -3886,7 +3942,10 @@ async fn test_tall_item_scroll_shows_correct_portion_and_no_dead_zone() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::AssistantText(tall_text.clone()));
+        .push(TranscriptItem::AssistantText {
+            text: tall_text.clone(),
+            seq: None,
+        });
     // Pin to bottom (follow=true) — the default on new content
     harness.tui().pin_transcript_to_bottom();
 
@@ -3997,7 +4056,10 @@ async fn test_tall_item_scroll_window_moves_in_correct_direction() {
         .tui()
         .app
         .transcript
-        .push(TranscriptItem::AssistantText(tall_text));
+        .push(TranscriptItem::AssistantText {
+            text: tall_text,
+            seq: None,
+        });
     harness.tui().pin_transcript_to_bottom();
 
     // Helper: assert the visible portion of the transcript shows exactly
@@ -4492,9 +4554,10 @@ async fn tui_assistant_text_renders_inline_markdown() {
     .unwrap();
     tui.app
         .transcript
-        .push(crate::types::TranscriptItem::AssistantText(
-            "Here's some **bold** and `code`.".to_string(),
-        ));
+        .push(crate::types::TranscriptItem::AssistantText {
+            text: "Here's some **bold** and `code`.".to_string(),
+            seq: None,
+        });
 
     use ratatui::style::Modifier;
     let lines = rendered_lines(&tui);
@@ -4530,9 +4593,10 @@ async fn tui_assistant_text_preserves_line_breaks() {
     .unwrap();
     tui.app
         .transcript
-        .push(crate::types::TranscriptItem::AssistantText(
-            "first line\nsecond line\nthird line".to_string(),
-        ));
+        .push(crate::types::TranscriptItem::AssistantText {
+            text: "first line\nsecond line\nthird line".to_string(),
+            seq: None,
+        });
 
     let rendered: Vec<ratatui::text::Line<'static>> = tui
         .app
@@ -4560,4 +4624,94 @@ async fn tui_assistant_text_preserves_line_breaks() {
             .any(|t| t.contains("first line") && t.contains("second line")),
         "lines were collapsed instead of preserved: {line_texts:?}"
     );
+}
+
+#[tokio::test]
+async fn tool_call_display_format() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        tool_name: "exec".to_string(),
+        body: Some(ToolCallBody::Yaml(
+            "command: ls -la\nworking_dir: /tmp\n".to_string(),
+        )),
+        seq: None,
+    });
+    harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        tool_name: "write_file".to_string(),
+        body: Some(ToolCallBody::Markdown(
+            "write **hello.txt** with 3 lines".to_string(),
+        )),
+        seq: None,
+    });
+    harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        tool_name: "think".to_string(),
+        body: None,
+        seq: None,
+    });
+    harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        tool_name: "search".to_string(),
+        body: Some(ToolCallBody::Yaml(
+            "query: rust async patterns\nmax_results: 10\ninclude_code: true\n".to_string(),
+        )),
+        seq: None,
+    });
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("tool_call_display_format", rendered);
+}
+
+#[tokio::test]
+async fn tool_call_with_seq_number() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        tool_name: "read".to_string(),
+        body: Some(ToolCallBody::Yaml("path: /tmp/foo.txt\n".to_string())),
+        seq: Some(7),
+    });
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("tool_call_with_seq_number", rendered);
+}
+
+#[tokio::test]
+async fn user_text_with_seq_number() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "hello world".to_string(),
+        seq: Some(3),
+    });
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("user_text_with_seq_number", rendered);
+}
+
+#[tokio::test]
+async fn assistant_text_with_seq_number() {
+    let mut harness = TuiTestHarness::new();
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "hello back".to_string(),
+            seq: Some(5),
+        });
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("assistant_text_with_seq_number", rendered);
+}
+
+#[tokio::test]
+async fn mutation_notice_renders_with_yellow_dim_style() {
+    let mut harness = TuiTestHarness::new();
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::MutationNotice(
+            "✎ Edited entries 3-5".to_string(),
+        ));
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("mutation_notice_renders_with_yellow_dim_style", rendered);
 }

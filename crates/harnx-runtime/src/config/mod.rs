@@ -15,6 +15,7 @@ pub use harnx_core::working_mode::WorkingMode;
 
 use harnx_core::config_data::ConfigData;
 use harnx_core::config_paths as paths;
+use harnx_core::session::SessionLogEntry;
 
 use crate::client::{
     create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
@@ -81,6 +82,117 @@ __INPUT__
 static EDITOR: OnceLock<Option<String>> = OnceLock::new();
 
 use harnx_core::agent_config::{normalize_toolset_value, split_tool_selectors, ToolsetValue};
+
+fn split_session_log_documents(raw_log: &str) -> Vec<String> {
+    raw_log
+        .split("\n---\n")
+        .filter_map(|document| {
+            let document = document.trim();
+            let document = document.strip_prefix("---\n").unwrap_or(document).trim();
+            if document.is_empty() {
+                None
+            } else {
+                Some(document.to_string())
+            }
+        })
+        .collect()
+}
+
+fn validate_edited_session_documents(content: &str) -> Result<Vec<String>> {
+    let documents = split_session_log_documents(content);
+    for document in &documents {
+        serde_yaml::from_str::<SessionLogEntry>(document).with_context(|| {
+            format!(
+                "Invalid session log entry YAML:
+{document}"
+            )
+        })?;
+    }
+    Ok(documents)
+}
+
+/// Adjust `[from, to]` so that `ToolCalls`/`ToolResults` pairs are never
+/// split across the range boundary, then return the (possibly expanded) range.
+///
+/// Rules:
+/// - If `from` points at a `ToolResults` entry (i.e. the pair's `ToolCalls` is
+///   at `from - 1`, outside the range), that is an error: we can't silently
+///   expand backward because the caller's intent is unclear.
+/// - If `to` points at a `ToolCalls` entry and `to + 1` is its paired
+///   `ToolResults`, auto-expand `to` by one.
+///
+/// Returns `(adjusted_from, adjusted_to)`.
+fn adjust_range_for_tool_pairs(
+    from: usize,
+    to: usize,
+    documents: &[String],
+) -> Result<(usize, usize)> {
+    // Parse only the entries we need: the one just before `from` (to check if
+    // `from` is a dangling ToolResults) and up through `to + 1` (to check if
+    // `to` is a ToolCalls that needs its partner).
+    let parse = |idx: usize| -> Option<SessionLogEntry> {
+        documents
+            .get(idx)
+            .and_then(|raw| serde_yaml::from_str::<SessionLogEntry>(raw).ok())
+    };
+
+    // Reject: range starts on a ToolResults whose ToolCalls is outside the range.
+    if matches!(parse(from), Some(SessionLogEntry::ToolResults { .. })) {
+        // Check if the immediately preceding entry is a ToolCalls — if so,
+        // this is definitely a dangling-results situation.
+        bail!(
+            "Sequence {from} is a tool-results entry; its paired tool-calls entry ({}) \
+             would be outside the range. Expand your range to include it.",
+            from.saturating_sub(1)
+        );
+    }
+
+    // Auto-expand: range ends on a ToolCalls whose ToolResults is just outside.
+    let mut adjusted_to = to;
+    if matches!(parse(to), Some(SessionLogEntry::ToolCalls { .. }))
+        && to + 1 < documents.len()
+        && matches!(parse(to + 1), Some(SessionLogEntry::ToolResults { .. }))
+    {
+        adjusted_to = to + 1;
+    }
+
+    Ok((from, adjusted_to))
+}
+
+fn validate_tool_pair_integrity(start_seq: usize, documents: &[String]) -> Result<()> {
+    if documents.len() < 2 {
+        return Ok(());
+    }
+
+    let entries = documents
+        .iter()
+        .map(|document| serde_yaml::from_str::<SessionLogEntry>(document))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    for index in 0..entries.len() - 1 {
+        let (SessionLogEntry::ToolCalls { calls, .. }, SessionLogEntry::ToolResults { results }) =
+            (&entries[index], &entries[index + 1])
+        else {
+            continue;
+        };
+
+        let call_ids = calls
+            .iter()
+            .map(|call| call.id.as_deref())
+            .collect::<Vec<_>>();
+        let result_ids = results
+            .iter()
+            .map(|result| result.id.as_deref())
+            .collect::<Vec<_>>();
+        if call_ids != result_ids {
+            let call_seq = start_seq + index;
+            let result_seq = start_seq + index + 1;
+            bail!("Edited tool call/result IDs do not match for entries {call_seq}-{result_seq}");
+        }
+    }
+
+    Ok(())
+}
 
 fn parse_toolsets_json(value: &str) -> serde_json::Result<IndexMap<String, Vec<String>>> {
     let values = serde_json::from_str::<IndexMap<String, ToolsetValue>>(value)?;
@@ -170,6 +282,10 @@ pub struct Config {
     pub agent: Option<Agent>,
     pub tui_before_editor: Option<Box<dyn FnMut() + Send + Sync>>,
     pub tui_after_editor: Option<Box<dyn FnMut() + Send + Sync>>,
+
+    /// Override the sessions directory — used in tests to redirect session
+    /// log writes to a temp directory without touching real user data.
+    pub sessions_dir_override: Option<std::path::PathBuf>,
 }
 
 impl std::ops::Deref for Config {
@@ -232,6 +348,7 @@ impl Clone for Config {
             agent: self.agent.clone(),
             tui_before_editor: None,
             tui_after_editor: None,
+            sessions_dir_override: self.sessions_dir_override.clone(),
         }
     }
 }
@@ -263,6 +380,7 @@ impl Default for Config {
             agent: None,
             tui_before_editor: None,
             tui_after_editor: None,
+            sessions_dir_override: None,
         }
     }
 }
@@ -374,6 +492,9 @@ impl Config {
     }
 
     pub fn sessions_dir(&self) -> PathBuf {
+        if let Some(ref override_dir) = self.sessions_dir_override {
+            return override_dir.clone();
+        }
         paths::sessions_dir(self.agent.as_ref().map(|a| a.name()))
     }
 
@@ -382,7 +503,10 @@ impl Config {
     }
 
     pub fn session_file(&self, name: &str) -> PathBuf {
-        paths::session_file(self.agent.as_ref().map(|a| a.name()), name)
+        match name.split_once('/') {
+            Some((sub, leaf)) => self.sessions_dir().join(sub).join(format!("{leaf}.yaml")),
+            None => self.sessions_dir().join(format!("{name}.yaml")),
+        }
     }
 
     pub fn rag_file(&self, name: &str) -> PathBuf {
@@ -1255,6 +1379,147 @@ impl Config {
             after();
         }
         result
+    }
+
+    pub fn edit_message_range(&mut self, from: usize, to: usize) -> Result<()> {
+        let name = match &self.session {
+            Some(session) => session.name().to_string(),
+            None => bail!("No session"),
+        };
+        let session_path = self.session_file(&name);
+
+        let raw_log = std::fs::read_to_string(&session_path)
+            .with_context(|| format!("Failed to read '{}'", session_path.display()))?;
+        let documents = split_session_log_documents(&raw_log);
+        if from == 0 {
+            bail!("Cannot edit or delete the session header (sequence 0)");
+        }
+        if to >= documents.len() {
+            bail!("Sequence numbers out of range");
+        }
+        let (from, to) = adjust_range_for_tool_pairs(from, to, &documents)?;
+        if from > to || to >= documents.len() {
+            bail!("Sequence numbers out of range");
+        }
+
+        let selected_documents = documents[from..=to].to_vec();
+        let temp_file = temp_file("message-edit", ".yaml");
+        std::fs::write(&temp_file, selected_documents.join("\n---\n"))
+            .with_context(|| format!("Failed to write to '{}'", temp_file.display()))?;
+
+        let edit_result = self.edit_with_tui_hooks(|this| {
+            let editor = this.editor()?;
+            edit_file(&editor, &temp_file).with_context(|| {
+                format!("Failed to edit '{}' with '{}'", temp_file.display(), editor)
+            })
+        });
+        let edited_content = std::fs::read_to_string(&temp_file)
+            .with_context(|| format!("Failed to read '{}'", temp_file.display()));
+        let _ = std::fs::remove_file(&temp_file);
+        edit_result?;
+        let edited_content = edited_content?;
+
+        let edited_documents = validate_edited_session_documents(&edited_content)?;
+        validate_tool_pair_integrity(from, &edited_documents)?;
+
+        let edit_entry = SessionLogEntry::EditEntries {
+            from,
+            to,
+            replacements: edited_documents,
+        };
+        let session = self.session.as_mut().context("No session")?;
+        if !crate::config::session::append_event(session, &edit_entry) {
+            bail!("Failed to append session edit entry")
+        }
+        self.session = Some(self::session::load(self, &name, &session_path)?);
+        self.discontinuous_last_message();
+        Ok(())
+    }
+
+    pub fn delete_message_range(&mut self, from: usize, to: usize) -> Result<()> {
+        let name = match &self.session {
+            Some(session) => session.name().to_string(),
+            None => bail!("No session"),
+        };
+        let session_path = self.session_file(&name);
+
+        let raw_log = std::fs::read_to_string(&session_path)
+            .with_context(|| format!("Failed to read '{}'", session_path.display()))?;
+        let documents = split_session_log_documents(&raw_log);
+        if from == 0 {
+            bail!("Cannot edit or delete the session header (sequence 0)");
+        }
+        if to >= documents.len() {
+            bail!("Sequence numbers out of range");
+        }
+        let (from, to) = adjust_range_for_tool_pairs(from, to, &documents)?;
+        if from > to || to >= documents.len() {
+            bail!("Sequence numbers out of range");
+        }
+
+        let edit_entry = SessionLogEntry::EditEntries {
+            from,
+            to,
+            replacements: vec![],
+        };
+        let session = self.session.as_mut().context("No session")?;
+        if !crate::config::session::append_event(session, &edit_entry) {
+            bail!("Failed to append session delete entry")
+        }
+        self.session = Some(self::session::load(self, &name, &session_path)?);
+        self.discontinuous_last_message();
+        Ok(())
+    }
+
+    pub fn rewind_session(&mut self, after_seq: usize) -> Result<()> {
+        let name = match &self.session {
+            Some(session) => session.name().to_string(),
+            None => bail!("No session"),
+        };
+        let session_path = self.session_file(&name);
+
+        let session = self.session.as_ref().context("No session")?;
+        if after_seq >= session.log_entry_count {
+            bail!(
+                "Sequence number {} is out of range (log has {} entries)",
+                after_seq,
+                session.log_entry_count
+            );
+        }
+
+        // Reject a cut point that splits a ToolCalls/ToolResults pair.
+        let raw_log = std::fs::read_to_string(&session_path)
+            .with_context(|| format!("Failed to read '{}'", session_path.display()))?;
+        let documents = split_session_log_documents(&raw_log);
+        let parse = |idx: usize| -> Option<SessionLogEntry> {
+            documents
+                .get(idx)
+                .and_then(|raw| serde_yaml::from_str::<SessionLogEntry>(raw).ok())
+        };
+        if matches!(parse(after_seq), Some(SessionLogEntry::ToolCalls { .. }))
+            && matches!(
+                parse(after_seq + 1),
+                Some(SessionLogEntry::ToolResults { .. })
+            )
+        {
+            bail!(
+                "Sequence {after_seq} is a tool-calls entry paired with tool-results at {}; \
+                 rewinding here would orphan the tool calls. \
+                 Use {} to keep the pair or {} to exclude it.",
+                after_seq + 1,
+                after_seq + 1,
+                after_seq.saturating_sub(1),
+            );
+        }
+
+        let rewind_entry = SessionLogEntry::Rewind { after_seq };
+        let session = self.session.as_mut().context("No session")?;
+        if !crate::config::session::append_event(session, &rewind_entry) {
+            bail!("Failed to append session rewind entry")
+        }
+        self.session = Some(self::session::load(self, &name, &session_path)?);
+        self.discontinuous_last_message();
+        Ok(())
     }
 
     pub fn edit_session(&mut self) -> Result<()> {
@@ -3230,6 +3495,228 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harnx_core::{
+        message::{MessageContent, MessageRole},
+        session::ToolOutput,
+        tool::ToolCall,
+    };
+
+    fn tool_calls_yaml(call_ids: &[&str]) -> String {
+        serde_yaml::to_string(&SessionLogEntry::ToolCalls {
+            text: String::new(),
+            thought: None,
+            calls: call_ids
+                .iter()
+                .map(|id| ToolCall {
+                    name: "bash_exec".to_string(),
+                    arguments: serde_json::json!({"cmd": "echo hi"}),
+                    id: Some((*id).to_string()),
+                    thought_signature: None,
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    fn tool_results_yaml(result_ids: &[&str]) -> String {
+        serde_yaml::to_string(&SessionLogEntry::ToolResults {
+            results: result_ids
+                .iter()
+                .map(|id| ToolOutput {
+                    id: Some((*id).to_string()),
+                    name: "bash_exec".to_string(),
+                    output: serde_json::json!({"ok": true}),
+                    switch_agent: None,
+                })
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    fn user_yaml(text: &str) -> String {
+        serde_yaml::to_string(&SessionLogEntry::Message {
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn validate_edited_session_documents_accepts_valid_yaml_documents() {
+        let content = format!("{}---\n{}", user_yaml("hi"), user_yaml("there"));
+
+        let documents = validate_edited_session_documents(&content).unwrap();
+
+        assert_eq!(documents.len(), 2);
+    }
+
+    #[test]
+    fn validate_edited_session_documents_rejects_invalid_yaml_documents() {
+        let err = validate_edited_session_documents("---\ntype: user\ntext: [")
+            .expect_err("invalid yaml should fail");
+
+        assert!(err.to_string().contains("Invalid session log entry YAML"));
+    }
+
+    #[test]
+    fn validate_tool_pair_integrity_accepts_matching_ids() {
+        let documents = vec![
+            tool_calls_yaml(&["call-1", "call-2"]),
+            tool_results_yaml(&["call-1", "call-2"]),
+        ];
+
+        validate_tool_pair_integrity(5, &documents).unwrap();
+    }
+
+    #[test]
+    fn validate_tool_pair_integrity_rejects_mismatched_ids() {
+        let documents = vec![tool_calls_yaml(&["call-1"]), tool_results_yaml(&["call-2"])];
+
+        let err =
+            validate_tool_pair_integrity(7, &documents).expect_err("mismatched ids should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Edited tool call/result IDs do not match for entries 7-8"
+        );
+    }
+
+    #[test]
+    fn validate_tool_pair_integrity_allows_orphan_tool_calls_as_advisory() {
+        let documents = vec![tool_calls_yaml(&["call-1"])];
+
+        validate_tool_pair_integrity(3, &documents).unwrap();
+    }
+
+    #[test]
+    fn validate_tool_pair_integrity_ignores_single_non_tool_document() {
+        let documents = vec![user_yaml("plain message")];
+
+        validate_tool_pair_integrity(2, &documents).unwrap();
+    }
+
+    // --- adjust_range_for_tool_pairs ---
+
+    fn make_docs(entries: &[SessionLogEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| serde_yaml::to_string(e).unwrap().trim().to_string())
+            .collect()
+    }
+
+    fn tool_calls_entry(id: &str) -> SessionLogEntry {
+        SessionLogEntry::ToolCalls {
+            text: String::new(),
+            thought: None,
+            calls: vec![ToolCall {
+                name: "bash_exec".to_string(),
+                arguments: serde_json::json!({}),
+                id: Some(id.to_string()),
+                thought_signature: None,
+            }],
+        }
+    }
+
+    fn tool_results_entry(id: &str) -> SessionLogEntry {
+        SessionLogEntry::ToolResults {
+            results: vec![ToolOutput {
+                id: Some(id.to_string()),
+                name: "bash_exec".to_string(),
+                output: serde_json::json!("ok"),
+                switch_agent: None,
+            }],
+        }
+    }
+
+    fn user_entry(text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+        }
+    }
+
+    #[test]
+    fn adjust_range_no_tool_pairs_unchanged() {
+        // [0:header, 1:user, 2:user] — no pairs, range stays as-is
+        let docs = make_docs(&[user_entry("a"), user_entry("b"), user_entry("c")]);
+        assert_eq!(adjust_range_for_tool_pairs(1, 2, &docs).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn adjust_range_expands_to_include_paired_results() {
+        // [0:user, 1:tool_calls, 2:tool_results, 3:user]
+        // Requesting range [1,1] (calls only) → auto-expands to [1,2]
+        let docs = make_docs(&[
+            user_entry("before"),
+            tool_calls_entry("c1"),
+            tool_results_entry("c1"),
+            user_entry("after"),
+        ]);
+        assert_eq!(adjust_range_for_tool_pairs(1, 1, &docs).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn adjust_range_pair_already_fully_included_unchanged() {
+        // [0:user, 1:tool_calls, 2:tool_results, 3:user]
+        // Range [1,2] already covers both — no change
+        let docs = make_docs(&[
+            user_entry("before"),
+            tool_calls_entry("c1"),
+            tool_results_entry("c1"),
+            user_entry("after"),
+        ]);
+        assert_eq!(adjust_range_for_tool_pairs(1, 2, &docs).unwrap(), (1, 2));
+    }
+
+    #[test]
+    fn adjust_range_rejects_range_starting_on_tool_results() {
+        // [0:user, 1:tool_calls, 2:tool_results, 3:user]
+        // Range starting at 2 (results only) → error
+        let docs = make_docs(&[
+            user_entry("before"),
+            tool_calls_entry("c1"),
+            tool_results_entry("c1"),
+            user_entry("after"),
+        ]);
+        let err = adjust_range_for_tool_pairs(2, 2, &docs)
+            .expect_err("starting on tool-results should fail");
+        assert!(err.to_string().contains("tool-results entry"));
+    }
+
+    #[test]
+    fn adjust_range_tool_calls_at_end_of_log_no_expansion() {
+        // [0:user, 1:tool_calls] — ToolCalls is the last doc, no results follow
+        // → no expansion (orphan ToolCalls is the user's problem after editing)
+        let docs = make_docs(&[user_entry("before"), tool_calls_entry("c1")]);
+        assert_eq!(adjust_range_for_tool_pairs(1, 1, &docs).unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn adjust_range_rewind_orphan_rejected() {
+        // Simulate rewind check: after_seq=1 lands on ToolCalls paired with results at 2
+        // [0:user, 1:tool_calls, 2:tool_results, 3:user]
+        let docs = make_docs(&[
+            user_entry("before"),
+            tool_calls_entry("c1"),
+            tool_results_entry("c1"),
+            user_entry("after"),
+        ]);
+        // after_seq=1 means entries 0..=1 kept, entry 2 (results) excluded → orphan calls
+        // Verify the guard logic that rewind_session uses
+        let parse = |idx: usize| -> Option<SessionLogEntry> {
+            docs.get(idx)
+                .and_then(|raw| serde_yaml::from_str::<SessionLogEntry>(raw).ok())
+        };
+        assert!(matches!(parse(1), Some(SessionLogEntry::ToolCalls { .. })));
+        assert!(matches!(
+            parse(2),
+            Some(SessionLogEntry::ToolResults { .. })
+        ));
+        // The condition that rewind_session checks:
+        let would_orphan = matches!(parse(1), Some(SessionLogEntry::ToolCalls { .. }))
+            && matches!(parse(2), Some(SessionLogEntry::ToolResults { .. }));
+        assert!(would_orphan);
+    }
 
     #[test]
     fn test_split_tool_selectors_simple() {
@@ -3390,8 +3877,6 @@ mod tests {
     }
 
     // ── compact_session tests ────────────────────────────────────────────────
-
-    use crate::client::{MessageContent, MessageRole};
 
     /// Helper: create a GlobalConfig with a session that already has one user
     /// message in it, suitable for compaction tests.

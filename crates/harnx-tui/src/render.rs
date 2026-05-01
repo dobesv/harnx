@@ -72,17 +72,24 @@ impl Tui {
 
     /// Render a `ToolCall` transcript item: `→ tool_name` header followed
     /// by the body lines. Body rendering depends on its origin —
-    /// `Yaml` is shown verbatim (raw arguments), `Markdown` is rendered
-    /// inline (templated `call_template` output).
-    fn render_tool_call(tool_name: &str, body: Option<&ToolCallBody>) -> Vec<Line<'static>> {
-        // Use the plain rightwards arrow `→` (U+2192). The previous glyph
-        // was `->` followed by VS16 (U+FE0F) which requested an emoji-style
-        // presentation and produced unicode-width vs. terminal-rendered-
-        // width disagreement, leaving stray glyphs in subsequent frames.
+    /// `Markdown` (from a `call_template`) is rendered inline; `Yaml`
+    /// (raw args, no template) is displayed verbatim, each line indented.
+    fn render_tool_call(
+        tool_name: &str,
+        body: Option<&ToolCallBody>,
+        seq: Option<usize>,
+    ) -> Vec<Line<'static>> {
         let dim_gray = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
-        let mut lines = Self::render_text_entry("", &format!("→ {tool_name}"), dim_gray, false);
+
+        let header_text = if let Some(n) = seq {
+            format!("→ {tool_name}  [{n}]")
+        } else {
+            format!("→ {tool_name}")
+        };
+
+        let mut lines = Self::render_text_entry("", &header_text, dim_gray, false);
         match body {
             Some(ToolCallBody::Yaml(yaml)) => {
                 for line in yaml.lines() {
@@ -117,15 +124,36 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
                 false,
             ),
-            TranscriptItem::UserText(text) => Self::render_text_entry(
-                "> ",
+            TranscriptItem::MutationNotice(text) => Self::render_text_entry(
+                "",
                 text,
                 Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-                true,
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+                false,
             ),
-            TranscriptItem::AssistantText(text) => {
+            TranscriptItem::UserText { text, seq } => {
+                let mut lines = Self::render_text_entry(
+                    "> ",
+                    text,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    true,
+                );
+                if let Some(n) = seq {
+                    if let Some(first_line) = lines.first_mut() {
+                        first_line.spans.push(Span::styled(
+                            format!("  [{n}]"),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        ));
+                    }
+                }
+                lines
+            }
+            TranscriptItem::AssistantText { text, seq } => {
                 // Render assistant messages as markdown so headings, lists,
                 // code fences, and inline emphasis show their styling.
                 // Streaming chunks rebuild this entry on every render — an
@@ -133,6 +161,19 @@ impl Tui {
                 // asterisks for the moment, then upgrades to bold once the
                 // closing `**` arrives in a later chunk.
                 let mut lines = crate::render_helpers::markdown_lines(text, Style::default());
+                if let Some(n) = seq {
+                    if lines.is_empty() {
+                        lines.push(Line::from(""));
+                    }
+                    if let Some(first_line) = lines.first_mut() {
+                        first_line.spans.push(Span::styled(
+                            format!("  [{n}]"),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        ));
+                    }
+                }
                 // Match the prior trailing-spacing rule: pad after a
                 // single-line message (so the next entry has breathing
                 // room) but skip the pad when the text already contains
@@ -194,9 +235,11 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
                 false,
             ),
-            TranscriptItem::ToolCall { tool_name, body } => {
-                Self::render_tool_call(tool_name, body.as_ref())
-            }
+            TranscriptItem::ToolCall {
+                tool_name,
+                body,
+                seq,
+            } => Self::render_tool_call(tool_name, body.as_ref(), *seq),
             TranscriptItem::AttachmentHeader(text) => Self::render_text_entry(
                 "",
                 &format!("{text}:"),
@@ -426,7 +469,7 @@ impl Tui {
         while !remainder.is_empty() {
             if let Some(idx) = self.app.streaming_assistant_idx {
                 match self.app.transcript.get_mut(idx) {
-                    Some(TranscriptItem::AssistantText(existing)) => {
+                    Some(TranscriptItem::AssistantText { text: existing, .. }) => {
                         if existing.is_empty() {
                             if let Some(split_at) = remainder.find('\n') {
                                 let (segment, rest) = remainder.split_at(split_at + 1);
@@ -463,9 +506,10 @@ impl Tui {
                     _ => self.app.streaming_assistant_idx = None,
                 }
             } else {
-                self.app
-                    .transcript
-                    .push(TranscriptItem::AssistantText(String::new()));
+                self.app.transcript.push(TranscriptItem::AssistantText {
+                    text: String::new(),
+                    seq: None,
+                });
                 self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
             }
         }

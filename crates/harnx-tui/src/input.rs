@@ -218,9 +218,10 @@ impl Tui {
                     } else if text.trim_start().starts_with('.') {
                         // Dot-command: route through command handler
                         let attachments_snapshot = self.app.attachments.clone();
-                        self.app
-                            .transcript
-                            .push(TranscriptItem::UserText(text.clone()));
+                        self.app.transcript.push(TranscriptItem::UserText {
+                            text: text.clone(),
+                            seq: None,
+                        });
                         self.render_submitted_attachments(&attachments_snapshot);
                         self.pin_transcript_to_bottom();
                         self.app.input = Self::new_input();
@@ -228,9 +229,10 @@ impl Tui {
                         self.refresh_input_chrome();
                     } else {
                         let attachments_snapshot = self.app.attachments.clone();
-                        self.app
-                            .transcript
-                            .push(TranscriptItem::UserText(text.clone()));
+                        self.app.transcript.push(TranscriptItem::UserText {
+                            text: text.clone(),
+                            seq: None,
+                        });
                         self.render_submitted_attachments(&attachments_snapshot);
                         self.pin_transcript_to_bottom();
                         self.app.input = Self::new_input();
@@ -487,9 +489,10 @@ impl Tui {
                 // transcript.
                 self.app.pending_message = None;
                 self.app.input = Self::new_input();
-                self.app
-                    .transcript
-                    .push(TranscriptItem::UserText(pending.text.clone()));
+                self.app.transcript.push(TranscriptItem::UserText {
+                    text: pending.text.clone(),
+                    seq: None,
+                });
                 self.render_submitted_attachments(&pending.attachments);
                 self.pin_transcript_to_bottom();
                 self.refresh_input_chrome();
@@ -519,9 +522,10 @@ impl Tui {
         pending: crate::types::PendingMessage,
     ) -> Result<()> {
         self.app.input = Self::new_input();
-        self.app
-            .transcript
-            .push(TranscriptItem::UserText(pending.text.clone()));
+        self.app.transcript.push(TranscriptItem::UserText {
+            text: pending.text.clone(),
+            seq: None,
+        });
         self.render_submitted_attachments(&pending.attachments);
         self.pin_transcript_to_bottom();
         if pending.text.trim_start().starts_with('.') {
@@ -586,7 +590,7 @@ impl Tui {
     }
 
     async fn render_agent_event(&mut self, event: AgentEvent, source: Option<AgentSource>) {
-        use harnx_core::event::{ModelEvent, NoticeEvent, ToolEvent};
+        use harnx_core::event::{ModelEvent, NoticeEvent, SessionEvent, ToolEvent};
 
         let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
         let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
@@ -611,6 +615,26 @@ impl Tui {
             self.flush_pending_thought();
         }
         self.render_ui_output_heading(source.as_ref(), is_usage);
+
+        // LogSeqAssigned patches the seq on the next unassigned sequenceable
+        // item (UserText, AssistantText, or ToolCall) AFTER the last item
+        // that already has a seq.  Searching after the last-assigned position
+        // forward lets multiple LogSeqAssigned events in a turn target
+        // distinct items in source order, while skipping pre-existing
+        // unassigned items like the agent banner that pre-date any real
+        // log entries.
+        // LogSeqAssigned events are emitted by the engine after each log
+        // append so that future TUI work can show seq numbers on live
+        // messages.  For now the TUI only displays seq numbers on messages
+        // loaded from a saved session log (via messages_to_transcript_items).
+        // Live-event seq propagation across the streaming model is more
+        // intricate than a simple retroactive patch and is deferred.
+        if matches!(
+            event,
+            AgentEvent::Session(SessionEvent::LogSeqAssigned { .. })
+        ) {
+            return;
+        }
 
         let rendered_entries = match event {
             AgentEvent::Notice(NoticeEvent::Info(text)) => {
@@ -673,7 +697,7 @@ impl Tui {
                 if !output.is_empty() {
                     if let Some(idx) = self.app.streaming_assistant_idx {
                         match self.app.transcript.get_mut(idx) {
-                            Some(TranscriptItem::AssistantText(existing))
+                            Some(TranscriptItem::AssistantText { text: existing, .. })
                                 if !existing.is_empty() =>
                             {
                                 if existing != &output {
@@ -681,17 +705,19 @@ impl Tui {
                                 }
                             }
                             _ => {
-                                self.app
-                                    .transcript
-                                    .push(TranscriptItem::AssistantText(output));
+                                self.app.transcript.push(TranscriptItem::AssistantText {
+                                    text: output,
+                                    seq: None,
+                                });
                                 self.app.streaming_assistant_idx =
                                     Some(self.app.transcript.len() - 1);
                             }
                         }
                     } else {
-                        self.app
-                            .transcript
-                            .push(TranscriptItem::AssistantText(output));
+                        self.app.transcript.push(TranscriptItem::AssistantText {
+                            text: output,
+                            seq: None,
+                        });
                         self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
                     }
                     self.pin_transcript_to_bottom();
@@ -799,6 +825,7 @@ impl Tui {
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
                     body: tool_call_body(markdown.as_deref(), &input),
+                    seq: None,
                 }]
             }
             // Not rendered by the TUI: Turn, Session, Status, Tool::Progress,
@@ -1258,7 +1285,10 @@ impl Tui {
             || command_was.starts_with(".reset session")
             || command_was.starts_with(".reset repl")
             || command_was.starts_with(".compact session")
-            || command_was.starts_with(".edit session");
+            || command_was.starts_with(".edit session")
+            || command_was.starts_with(".edit message ")
+            || command_was.starts_with(".delete message ")
+            || command_was.starts_with(".rewind ");
 
         if !needs_reconcile {
             return;
@@ -1266,6 +1296,9 @@ impl Tui {
 
         self.app.transcript.clear();
         self.app.streaming_assistant_idx = None;
+        // Reset scroll state so the widget doesn't subtract-overflow when
+        // the rebuilt transcript is shorter than the previous one.
+        self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
         self.app.transcript = Self::build_initial_transcript(&self.config);
         self.pin_transcript_to_bottom();
     }
@@ -1309,10 +1342,10 @@ impl Tui {
         };
 
         let clean = strip_ansi(&captured).trim_end_matches('\n').to_string();
-        if !clean.is_empty() {
-            self.app.transcript.push(TranscriptItem::SystemText(clean));
-            self.pin_transcript_to_bottom();
-        }
+        let line_cmd = line.trim_start();
+        let is_mutation_command = line_cmd.starts_with(".edit message ")
+            || line_cmd.starts_with(".delete message ")
+            || line_cmd.starts_with(".rewind ");
 
         match result {
             Ok(outcome) => {
@@ -1328,6 +1361,18 @@ impl Tui {
                     pending_message,
                 );
                 self.reconcile_transcript_after_command(prev_session, prev_agent, line);
+                if !clean.is_empty() {
+                    if is_mutation_command {
+                        self.app
+                            .transcript
+                            .push(TranscriptItem::MutationNotice(clean.clone()));
+                    } else {
+                        self.app
+                            .transcript
+                            .push(TranscriptItem::SystemText(clean.clone()));
+                    }
+                    self.pin_transcript_to_bottom();
+                }
             }
             Err(err) => {
                 self.app

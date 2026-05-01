@@ -79,6 +79,22 @@ pub enum SessionLogEntry {
     Compress { prompt: String },
     #[serde(rename = "clear")]
     Clear,
+    #[serde(rename = "edit_entries")]
+    EditEntries {
+        /// Inclusive range of entry sequence numbers being replaced.
+        from: usize,
+        to: usize,
+        /// Replacement YAML documents (raw strings, one per replaced entry).
+        /// Empty vec = deletion.
+        replacements: Vec<String>,
+    },
+    #[serde(rename = "rewind")]
+    Rewind {
+        /// All entries with seq > after_seq are excluded from context on replay.
+        after_seq: usize,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 /// A single tool-call result as persisted in the session log. Matches
@@ -151,6 +167,8 @@ pub struct Session {
     #[serde(skip)]
     pub resolved_save_name: Option<(PathBuf, String)>,
     #[serde(skip)]
+    pub log_entry_count: usize,
+    #[serde(skip)]
     pub tokens: usize,
     #[serde(skip)]
     pub completion_usage: CompletionTokenUsage,
@@ -206,6 +224,12 @@ impl Session {
 
     pub fn tokens(&self) -> usize {
         self.tokens
+    }
+
+    /// Returns sequence number that next appended entry will receive.
+    /// This is equal to number of YAML documents currently in log file.
+    pub fn next_seq(&self) -> usize {
+        self.log_entry_count
     }
 
     pub fn update_tokens(&mut self) {
@@ -540,6 +564,79 @@ mod tests {
             }
             _ => panic!("expected header entry"),
         }
+    }
+
+    #[test]
+    fn session_log_entry_edit_entries_serde_round_trip() {
+        let entry = SessionLogEntry::EditEntries {
+            from: 3,
+            to: 5,
+            replacements: vec![
+                "type: message
+role: user
+content: replacement one
+"
+                .to_string(),
+                "type: message
+role: assistant
+content: replacement two
+"
+                .to_string(),
+            ],
+        };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        match round_tripped {
+            SessionLogEntry::EditEntries {
+                from,
+                to,
+                replacements,
+            } => {
+                assert_eq!(from, 3);
+                assert_eq!(to, 5);
+                assert_eq!(
+                    replacements,
+                    vec![
+                        "type: message
+role: user
+content: replacement one
+"
+                        .to_string(),
+                        "type: message
+role: assistant
+content: replacement two
+"
+                        .to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected edit_entries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_log_entry_rewind_serde_round_trip() {
+        let entry = SessionLogEntry::Rewind { after_seq: 7 };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        match round_tripped {
+            SessionLogEntry::Rewind { after_seq } => assert_eq!(after_seq, 7),
+            other => panic!("expected rewind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_log_entry_unknown_type_deserializes_to_unknown() {
+        let yaml = "type: future_variant
+field: value
+";
+        let entry: SessionLogEntry = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(matches!(entry, SessionLogEntry::Unknown));
     }
 
     #[test]

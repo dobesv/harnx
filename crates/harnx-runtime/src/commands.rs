@@ -22,7 +22,7 @@ pub enum CommandOutcome {
     Exit,
 }
 
-pub static COMMANDS: LazyLock<[Command; 40]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 45]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -50,6 +50,11 @@ pub static COMMANDS: LazyLock<[Command; 40]> = LazyLock::new(|| {
         ),
         Command::new(".info session", "Show session info"),
         Command::new(".edit session", "Modify current session"),
+        Command::new(".edit message <n>", "Edit a log entry by sequence number"),
+        Command::new(
+            ".edit message <n>-<m>",
+            "Edit a range of log entries by sequence number",
+        ),
         Command::new(".save session", "Save current session to file"),
         Command::new(".exit session", "Exit active session"),
         Command::new(".agent", "Use an agent"),
@@ -75,6 +80,15 @@ pub static COMMANDS: LazyLock<[Command; 40]> = LazyLock::new(|| {
         Command::new(".copy", "Copy last response"),
         Command::new(".set", "Modify runtime settings"),
         Command::new(".delete", "Delete agents, sessions, RAGs, or macros"),
+        Command::new(
+            ".delete message <n>",
+            "Delete a log entry by sequence number",
+        ),
+        Command::new(".delete message <n>-<m>", "Delete a range of log entries"),
+        Command::new(
+            ".rewind <n>",
+            "Rewind session context to entry N (all later entries excluded)",
+        ),
         Command::new(".exit", "Exit the interactive session"),
     ]
 });
@@ -295,7 +309,11 @@ pub async fn run_command_with_output(
                     Some("rag-docs") => {
                         Config::edit_rag_docs(config, abort_signal.clone()).await?;
                     }
-                    _ => writeln!(output, r#"Usage: .edit <config|agent|session|rag-docs>"#)?,
+                    Some(args) if args.starts_with("message ") => {
+                        let (from, to) = parse_message_range(&args[8..])?;
+                        config.write().edit_message_range(from, to)?;
+                    }
+                    _ => writeln!(output, r#"Usage: .edit <config|agent|session|rag-docs|message <n>|message <n>-<m>>"#)?,
                 }
             }
             ".compact" => match args {
@@ -599,14 +617,28 @@ Commands:
                 _ => writeln!(output, "Usage: .set <key> <value>...")?,
             },
             ".delete" => match args {
+                Some(args) if args.starts_with("message ") => {
+                    let (from, to) = parse_message_range(&args[8..])?;
+                    config.write().delete_message_range(from, to)?;
+                    writeln!(output, "Deleted entries {from}-{to}.")?;
+                }
                 Some(args) => {
                     Config::delete(config, args)?;
                 }
                 _ => writeln!(
                     output,
-                    "Usage: .delete <agent|session|rag|macro|agent-data>"
+                    "Usage: .delete <agent|session|rag|macro|agent-data|message <n>|message <n>-<m>>"
                 )?,
             },
+            ".rewind" => {
+                let n = args
+                    .ok_or_else(|| anyhow!("Usage: .rewind <n>"))?
+                    .trim()
+                    .parse::<usize>()
+                    .context("Invalid sequence number")?;
+                config.write().rewind_session(n)?;
+                writeln!(output, "↩ Rewound session to entry {n}.")?;
+            }
             ".copy" => {
                 let output = match config
                     .read()
@@ -795,6 +827,27 @@ Press Ctrl+C to cancel the response, Ctrl+D to exit."###,
     Ok(())
 }
 
+fn parse_message_range(s: &str) -> Result<(usize, usize)> {
+    let s = s.trim();
+    if let Some((from, to)) = s.split_once('-') {
+        let from = from
+            .trim()
+            .parse::<usize>()
+            .context("Invalid starting sequence number")?;
+        let to = to
+            .trim()
+            .parse::<usize>()
+            .context("Invalid ending sequence number")?;
+        if from > to {
+            bail!("Invalid range: start is greater than end");
+        }
+        Ok((from, to))
+    } else {
+        let n = s.parse::<usize>().context("Invalid sequence number")?;
+        Ok((n, n))
+    }
+}
+
 fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {
     match COMMAND_RE.captures(line) {
         Ok(Some(captures)) => {
@@ -907,6 +960,17 @@ mod tests {
             parse_command(".prompt \nabc\n"),
             Some((".prompt", Some("abc")))
         );
+    }
+
+    #[test]
+    fn test_parse_message_range() {
+        assert_eq!(parse_message_range("5").unwrap(), (5, 5));
+        assert_eq!(parse_message_range("3-7").unwrap(), (3, 7));
+        assert_eq!(parse_message_range(" 9 - 12 ").unwrap(), (9, 12));
+        assert!(parse_message_range("").is_err());
+        assert!(parse_message_range("abc").is_err());
+        assert!(parse_message_range("7-3").is_err());
+        assert!(parse_message_range("1-2-3").is_err());
     }
 
     #[test]

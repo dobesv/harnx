@@ -1,0 +1,45 @@
+---
+source: crates/harnx/tests/tmux_e2e.rs
+expression: s
+---
+Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
+> first message  [2]
+
+FIRST_RESPONSE_SENTINEL  [3]
+
+🤖 mutation-test-agent ▸ mutation-e2e-session
+↩ Rewound session to entry 3.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+* 🤖 mutation-test-agent ▸ mutation-e2e-session   Context: 27(0%)
+
+
+# snap: 3-after-rewind

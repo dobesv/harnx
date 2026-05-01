@@ -50,6 +50,146 @@ pub fn load(config: &Config, name: &str, path: &Path) -> Result<Session> {
 }
 
 fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Result<Session> {
+    let raw_entries = collect_raw_log_entries(content, name)?;
+    let mut session = replay_log_entries(&raw_entries, name)?;
+    session.log_entry_count = raw_entries.len();
+
+    session.model =
+        crate::client::retrieve_model(&config.clients, &session.model_id, ModelType::Chat)?;
+    apply_name_and_path(&mut session, name, path, config)?;
+    session.update_tokens();
+    Ok(session)
+}
+
+struct PendingToolCalls {
+    seq: usize,
+    text: String,
+    thought: Option<String>,
+    calls: Vec<crate::tool::ToolCall>,
+}
+
+fn collect_raw_log_entries(content: &str, name: &str) -> Result<Vec<(usize, SessionLogEntry)>> {
+    serde_yaml::Deserializer::from_str(content)
+        .enumerate()
+        .map(|(seq, document)| {
+            let entry = SessionLogEntry::deserialize(document)
+                .with_context(|| format!("Invalid log entry #{seq} in session {name}"))?;
+            Ok((seq, entry))
+        })
+        .collect()
+}
+
+fn build_effective_log_entries(
+    raw_entries: &[(usize, SessionLogEntry)],
+    name: &str,
+) -> Vec<(usize, SessionLogEntry)> {
+    let mut effective_entries = Vec::new();
+
+    for (seq, entry) in raw_entries {
+        match entry {
+            SessionLogEntry::Rewind { after_seq } => {
+                if *after_seq >= *seq {
+                    log::warn!(
+                        "Skipping rewind entry #{seq} in session {name}: after_seq {after_seq} must be less than current seq"
+                    );
+                    continue;
+                }
+                if !effective_entries
+                    .iter()
+                    .any(|(existing_seq, _)| existing_seq == after_seq)
+                {
+                    log::warn!(
+                        "Skipping rewind entry #{seq} in session {name}: after_seq {after_seq} not present in replay state"
+                    );
+                    continue;
+                }
+                effective_entries.retain(|(existing_seq, _)| *existing_seq <= *after_seq);
+            }
+            SessionLogEntry::EditEntries {
+                from,
+                to,
+                replacements,
+            } => {
+                if from > to {
+                    log::warn!(
+                        "Skipping edit_entries entry #{seq} in session {name}: invalid range [{from}, {to}]"
+                    );
+                    continue;
+                }
+                if *to >= *seq {
+                    log::warn!(
+                        "Skipping edit_entries entry #{seq} in session {name}: range [{from}, {to}] must reference earlier entries only"
+                    );
+                    continue;
+                }
+
+                let Some(start_idx) = effective_entries
+                    .iter()
+                    .position(|(existing_seq, _)| existing_seq == from)
+                else {
+                    log::warn!(
+                        "Skipping edit_entries entry #{seq} in session {name}: from seq {from} not present in replay state"
+                    );
+                    continue;
+                };
+                let Some(end_idx) = effective_entries
+                    .iter()
+                    .position(|(existing_seq, _)| existing_seq == to)
+                else {
+                    log::warn!(
+                        "Skipping edit_entries entry #{seq} in session {name}: to seq {to} not present in replay state"
+                    );
+                    continue;
+                };
+                if start_idx > end_idx {
+                    log::warn!(
+                        "Skipping edit_entries entry #{seq} in session {name}: range [{from}, {to}] not in replay order"
+                    );
+                    continue;
+                }
+                if effective_entries[start_idx..=end_idx]
+                    .iter()
+                    .any(|(existing_seq, _)| *existing_seq < *from || *existing_seq > *to)
+                {
+                    log::warn!(
+                        "Skipping edit_entries entry #{seq} in session {name}: range [{from}, {to}] is not contiguous in replay state"
+                    );
+                    continue;
+                }
+
+                let parsed_replacements: Vec<_> = replacements
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(replacement_idx, replacement)| {
+                        match serde_yaml::from_str::<SessionLogEntry>(replacement) {
+                            Ok(parsed) => {
+                                // Replacements inherit EditEntries seq because originals are
+                                // logically removed from effective stream. Future rewind/edit
+                                // operations must target mutation seq, not replaced seqs.
+                                Some((*seq, parsed))
+                            },
+                            Err(err) => {
+                                log::warn!(
+                                    "Skipping replacement #{replacement_idx} in edit_entries entry #{seq} for session {name}: {err}"
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+
+                effective_entries.splice(start_idx..=end_idx, parsed_replacements);
+            }
+            SessionLogEntry::Unknown => {}
+            _ => effective_entries.push((*seq, entry.clone())),
+        }
+    }
+
+    effective_entries
+}
+
+fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> Result<Session> {
+    let effective_entries = build_effective_log_entries(raw_entries, name);
     let mut session = Session::default();
 
     // Pending ToolCalls entry awaiting a matching ToolResults entry.
@@ -59,9 +199,7 @@ fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Res
     // mid-log corruption would be an invariant violation.
     let mut pending: Option<PendingToolCalls> = None;
 
-    for document in serde_yaml::Deserializer::from_str(content) {
-        let entry = SessionLogEntry::deserialize(document)
-            .with_context(|| format!("Invalid log entry in session {name}"))?;
+    for (seq, entry) in effective_entries {
         match entry {
             SessionLogEntry::Header {
                 model_id,
@@ -95,12 +233,13 @@ fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Res
                         .push(repair_orphan_tool_calls(pending, name)?);
                 }
                 if role == MessageRole::Tool {
-                    bail!(
-                        "Invalid log entry in session {name}: Tool-role Message entries are \
-                         no longer supported; use tool_calls/tool_results entries"
+                    anyhow::bail!(
+                        "Invalid log entry in session {name}: Tool-role Message entries are                          no longer supported; use tool_calls/tool_results entries"
                     );
                 }
-                session.messages.push(Message::new(role, content));
+                session
+                    .messages
+                    .push(Message::new(role, content).with_log_seq(seq));
             }
             SessionLogEntry::ToolCalls {
                 text,
@@ -113,6 +252,7 @@ fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Res
                         .push(repair_orphan_tool_calls(pending, name)?);
                 }
                 pending = Some(PendingToolCalls {
+                    seq,
                     text,
                     thought,
                     calls,
@@ -120,19 +260,19 @@ fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Res
             }
             SessionLogEntry::ToolResults { results } => {
                 let Some(PendingToolCalls {
+                    seq,
                     text,
                     thought,
                     calls,
                 }) = pending.take()
                 else {
-                    bail!(
-                        "Invalid log entry in session {name}: tool_results without a \
-                         preceding tool_calls entry"
+                    anyhow::bail!(
+                        "Invalid log entry in session {name}: tool_results without a                          preceding tool_calls entry"
                     );
                 };
                 session
                     .messages
-                    .push(assemble_tool_message(text, thought, calls, results));
+                    .push(assemble_tool_message(text, thought, calls, results).with_log_seq(seq));
             }
             SessionLogEntry::DataUrls { urls } => {
                 session.data_urls.extend(urls);
@@ -155,104 +295,36 @@ fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Res
                 session.compressed_messages.clear();
                 session.data_urls.clear();
             }
+            SessionLogEntry::EditEntries { .. }
+            | SessionLogEntry::Rewind { .. }
+            | SessionLogEntry::Unknown => {}
         }
     }
 
-    // EOF with an orphan ToolCalls: the process was interrupted
-    // between dispatching tools and persisting their results. Repair
-    // so we can still replay a valid alternating user/assistant
-    // sequence to the model.
     if let Some(pending) = pending.take() {
         session
             .messages
             .push(repair_orphan_tool_calls(pending, name)?);
     }
 
-    session.model =
-        crate::client::retrieve_model(&config.clients, &session.model_id, ModelType::Chat)?;
-    apply_name_and_path(&mut session, name, path, config)?;
-    session.update_tokens();
     Ok(session)
 }
 
-struct PendingToolCalls {
-    text: String,
-    thought: Option<String>,
-    calls: Vec<crate::tool::ToolCall>,
-}
-
-/// Test-only log parser — runs the full load pipeline (including the
-/// orphan-ToolCalls repair pass) but skips the model-catalog lookup
-/// that `super::load` performs, so it works against the minimal
-/// `Config::default` used in unit tests.
+/// Test-only log parser — runs full load pipeline (including replay and
+/// orphan-ToolCalls repair) but skips model-catalog lookup that
+/// `super::load` performs, so it works against minimal `Config::default`
+/// used in unit tests.
 #[cfg(test)]
 fn load_from_log_for_test(content: &str) -> Session {
-    let mut session = Session::default();
-    let mut pending: Option<PendingToolCalls> = None;
-    for document in serde_yaml::Deserializer::from_str(content) {
-        let entry = SessionLogEntry::deserialize(document).expect("valid log entry");
-        match entry {
-            SessionLogEntry::Header { .. } => {}
-            SessionLogEntry::Message { role, content } => {
-                if let Some(pending) = pending.take() {
-                    session
-                        .messages
-                        .push(repair_orphan_tool_calls(pending, "test").unwrap());
-                }
-                assert_ne!(role, MessageRole::Tool, "legacy Tool Message unsupported");
-                session.messages.push(Message::new(role, content));
-            }
-            SessionLogEntry::ToolCalls {
-                text,
-                thought,
-                calls,
-            } => {
-                if let Some(pending) = pending.take() {
-                    session
-                        .messages
-                        .push(repair_orphan_tool_calls(pending, "test").unwrap());
-                }
-                pending = Some(PendingToolCalls {
-                    text,
-                    thought,
-                    calls,
-                });
-            }
-            SessionLogEntry::ToolResults { results } => {
-                let pending = pending.take().expect("tool_results must follow tool_calls");
-                session.messages.push(assemble_tool_message(
-                    pending.text,
-                    pending.thought,
-                    pending.calls,
-                    results,
-                ));
-            }
-            SessionLogEntry::DataUrls { urls } => session.data_urls.extend(urls),
-            SessionLogEntry::Compress { prompt } => {
-                session.compressed_messages.append(&mut session.messages);
-                session.messages.push(Message::new(
-                    MessageRole::System,
-                    MessageContent::Text(prompt),
-                ));
-            }
-            SessionLogEntry::Clear => {
-                pending = None;
-                session.messages.clear();
-                session.compressed_messages.clear();
-                session.data_urls.clear();
-            }
-        }
-    }
-    if let Some(pending) = pending.take() {
-        session
-            .messages
-            .push(repair_orphan_tool_calls(pending, "test").unwrap());
-    }
+    let raw_entries = collect_raw_log_entries(content, "test").expect("valid log entries");
+    let mut session = replay_log_entries(&raw_entries, "test").expect("replay should succeed");
+    session.log_entry_count = raw_entries.len();
     session
 }
 
 fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Message> {
     let PendingToolCalls {
+        seq,
         text,
         thought,
         calls,
@@ -274,7 +346,7 @@ fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Me
             ..lost.clone()
         })
         .collect();
-    Ok(assemble_tool_message(text, thought, calls, results))
+    Ok(assemble_tool_message(text, thought, calls, results).with_log_seq(seq))
 }
 
 fn assemble_tool_message(
@@ -402,6 +474,7 @@ pub fn ensure_log_file(session: &mut Session) {
     };
     if write(&session_path, &content).is_ok() {
         session.path = Some(session_path.display().to_string());
+        session.log_entry_count = 1;
     }
 }
 
@@ -422,7 +495,12 @@ pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
     let Ok(mut file) = OpenOptions::new().append(true).open(path) else {
         return false;
     };
-    file.write_all(data.as_bytes()).is_ok()
+    if file.write_all(data.as_bytes()).is_ok() {
+        session.log_entry_count += 1;
+        true
+    } else {
+        false
+    }
 }
 
 pub fn resolve_save_path(session: &mut Session, session_dir: &Path) -> (PathBuf, String) {
@@ -647,7 +725,7 @@ pub fn save(
         );
     }
 
-    write(session_path, content).with_context(|| {
+    write(session_path, &content).with_context(|| {
         format!(
             "Failed to write session '{}' to '{}'",
             session.name,
@@ -666,6 +744,7 @@ pub fn save(
         session.name = session_name.to_string()
     }
 
+    session.log_entry_count = serde_yaml::Deserializer::from_str(&content).count();
     session.dirty = false;
 
     Ok(())
@@ -732,7 +811,8 @@ pub fn add_assistant_text(
             Some(v) => MessageContent::Text(format!("<think>\n{v}\n</think>\n{output}")),
             _ => MessageContent::Text(output.to_string()),
         };
-        let assistant_msg = Message::new(MessageRole::Assistant, content);
+        let seq = session.next_seq();
+        let assistant_msg = Message::new(MessageRole::Assistant, content).with_log_seq(seq);
         all_appended &= append_event(
             session,
             &SessionLogEntry::Message {
@@ -768,6 +848,7 @@ pub fn add_tool_calls(
     // log (issue: multiple results with the same id sent to the LLM).
     let calls = crate::tool::ToolCall::dedup(calls.to_vec());
     let mut all_appended = begin_turn(session, input, output)?;
+    let tool_calls_seq = session.next_seq();
     all_appended &= append_event(
         session,
         &SessionLogEntry::ToolCalls {
@@ -799,7 +880,7 @@ pub fn add_tool_calls(
     ));
     session
         .messages
-        .push(Message::new(MessageRole::Tool, content));
+        .push(Message::new(MessageRole::Tool, content).with_log_seq(tool_calls_seq));
     session.dirty = !all_appended;
     session.update_tokens();
     Ok(())
@@ -893,7 +974,8 @@ fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool
             session.autoname = Some(AutoName::new_from_chat_history(chat_history));
         }
         let agent_messages = input.agent().build_messages(input)?;
-        for msg in &agent_messages {
+        for msg in agent_messages {
+            let seq = session.next_seq();
             all_appended &= append_event(
                 session,
                 &SessionLogEntry::Message {
@@ -901,10 +983,11 @@ fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool
                     content: msg.content.clone(),
                 },
             );
+            session.messages.push(msg.with_log_seq(seq));
         }
-        session.messages.extend(agent_messages);
     } else if !is_continuation {
-        let user_msg = Message::new(MessageRole::User, input.message_content());
+        let seq = session.next_seq();
+        let user_msg = Message::new(MessageRole::User, input.message_content()).with_log_seq(seq);
         all_appended &= append_event(
             session,
             &SessionLogEntry::Message {
@@ -925,10 +1008,12 @@ fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool
     }
     session.data_urls.extend(new_data_urls);
     if let Some(injected) = input.injected_user_text() {
+        let seq = session.next_seq();
         let injected_msg = Message::new(
             MessageRole::User,
             MessageContent::Text(injected.to_string()),
-        );
+        )
+        .with_log_seq(seq);
         all_appended &= append_event(
             session,
             &SessionLogEntry::Message {
@@ -1017,6 +1102,57 @@ mod tests {
 
     fn test_session() -> Session {
         new(&Config::default(), "test").unwrap()
+    }
+
+    #[test]
+    fn load_from_log_enumerates_document_sequence_numbers() {
+        let content = r#"---
+type: header
+model: openai:gpt-4o
+---
+type: message
+role: user
+content: first
+---
+type: rewind
+after_seq: 1
+---
+type: edit_entries
+from: 1
+to: 1
+replacements: []
+---
+type: message
+role: assistant
+content: second
+"#;
+
+        let seqs: Vec<_> = serde_yaml::Deserializer::from_str(content)
+            .enumerate()
+            .map(|(seq, document)| {
+                let entry = SessionLogEntry::deserialize(document).expect("valid entry");
+                (seq, entry)
+            })
+            .collect();
+
+        assert_eq!(seqs.len(), 5);
+        assert!(matches!(seqs[0], (0, SessionLogEntry::Header { .. })));
+        assert!(matches!(seqs[1], (1, SessionLogEntry::Message { .. })));
+        assert!(matches!(
+            seqs[2],
+            (2, SessionLogEntry::Rewind { after_seq: 1 })
+        ));
+        assert!(matches!(
+            seqs[3],
+            (3, SessionLogEntry::EditEntries { from: 1, to: 1, .. })
+        ));
+        assert!(matches!(seqs[4], (4, SessionLogEntry::Message { .. })));
+
+        let session = super::load_from_log_for_test(content);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content.to_text(), "second");
+        assert_eq!(session.log_entry_count, 5);
+        assert_eq!(session.next_seq(), 5);
     }
 
     #[test]
@@ -1518,6 +1654,238 @@ mod tests {
             json!({"results": ["a", "b"]}),
             "reloaded tool output should match what we wrote"
         );
+    }
+
+    #[test]
+    fn load_replays_rewind_entries() {
+        let content = r#"type: header
+model: test
+---
+type: message
+role: user
+content: zero
+---
+type: message
+role: assistant
+content: one
+---
+type: message
+role: user
+content: two
+---
+type: message
+role: assistant
+content: three
+---
+type: message
+role: user
+content: four
+---
+type: rewind
+after_seq: 2
+"#;
+
+        let session = super::load_from_log_for_test(content);
+        let texts: Vec<_> = session
+            .messages
+            .iter()
+            .map(|m| m.content.to_text())
+            .collect();
+
+        assert_eq!(texts, vec!["zero", "one"]);
+    }
+
+    #[test]
+    fn load_replays_edit_entries_replace() {
+        let content = r#"type: header
+model: test
+---
+type: message
+role: user
+content: before
+---
+type: message
+role: assistant
+content: replace me
+---
+type: message
+role: user
+content: after
+---
+type: edit_entries
+from: 2
+to: 2
+replacements:
+  - |
+    type: message
+    role: assistant
+    content: replaced
+"#;
+
+        let session = super::load_from_log_for_test(content);
+        let texts: Vec<_> = session
+            .messages
+            .iter()
+            .map(|m| m.content.to_text())
+            .collect();
+
+        assert_eq!(texts, vec!["before", "replaced", "after"]);
+    }
+
+    #[test]
+    fn load_replays_edit_entries_delete() {
+        let content = r#"type: header
+model: test
+---
+type: message
+role: user
+content: keep one
+---
+type: message
+role: assistant
+content: delete me
+---
+type: message
+role: user
+content: keep two
+---
+type: edit_entries
+from: 2
+to: 2
+replacements: []
+"#;
+
+        let session = super::load_from_log_for_test(content);
+        let texts: Vec<_> = session
+            .messages
+            .iter()
+            .map(|m| m.content.to_text())
+            .collect();
+
+        assert_eq!(texts, vec!["keep one", "keep two"]);
+    }
+
+    #[test]
+    fn load_replays_stacked_mutations_edit_then_rewind() {
+        let content = r#"type: header
+model: test
+---
+type: message
+role: user
+content: zero
+---
+type: message
+role: assistant
+content: one
+---
+type: message
+role: user
+content: two
+---
+type: edit_entries
+from: 2
+to: 2
+replacements:
+  - |
+    type: message
+    role: assistant
+    content: one edited
+---
+type: rewind
+after_seq: 3
+"#;
+
+        let session = super::load_from_log_for_test(content);
+        let texts: Vec<_> = session
+            .messages
+            .iter()
+            .map(|m| m.content.to_text())
+            .collect();
+
+        assert_eq!(texts, vec!["zero", "two"]);
+    }
+
+    #[test]
+    fn load_replays_stacked_mutations_rewind_then_edit() {
+        let content = r#"type: header
+model: test
+---
+type: message
+role: user
+content: zero
+---
+type: message
+role: assistant
+content: one
+---
+type: message
+role: user
+content: two
+---
+type: message
+role: assistant
+content: three
+---
+type: rewind
+after_seq: 2
+---
+type: edit_entries
+from: 1
+to: 1
+replacements:
+  - |
+    type: message
+    role: user
+    content: zero edited
+"#;
+
+        let session = super::load_from_log_for_test(content);
+        let texts: Vec<_> = session
+            .messages
+            .iter()
+            .map(|m| m.content.to_text())
+            .collect();
+
+        assert_eq!(texts, vec!["zero edited", "one"]);
+    }
+
+    #[test]
+    fn load_tracks_log_entry_count_and_append_event_increments_next_seq() {
+        use tempfile::TempDir;
+
+        let content = r#"type: header
+model: test
+---
+type: message
+role: user
+content: first
+---
+type: message
+role: assistant
+content: second
+"#;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.yaml");
+        std::fs::write(&path, content).unwrap();
+
+        let mut session = super::load_from_log_for_test(content);
+        session.path = Some(path.display().to_string());
+
+        assert_eq!(session.log_entry_count, 3);
+        assert_eq!(session.next_seq(), 3);
+
+        let appended = super::append_event(
+            &mut session,
+            &SessionLogEntry::Message {
+                role: MessageRole::User,
+                content: MessageContent::Text("third".to_string()),
+            },
+        );
+
+        assert!(appended);
+        assert_eq!(session.log_entry_count, 4);
+        assert_eq!(session.next_seq(), 4);
     }
 
     #[test]
