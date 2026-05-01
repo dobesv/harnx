@@ -20,6 +20,7 @@ use std::sync::Arc;
 pub use harnx_core::sink::{has_agent_event_sink, install_agent_event_sink};
 
 use crate::cli_event_sink::CliAgentEventSink;
+use harnx_core::abort::AbortSignal;
 use harnx_render::RenderOptions;
 
 /// Install the stderr-backed `CliAgentEventSink`. Used by the CLI
@@ -27,8 +28,18 @@ use harnx_render::RenderOptions;
 /// and `RenderOptions` snapshot so the sink can render streaming
 /// Model::MessageChunk / ThoughtChunk events directly to stdout (with
 /// markdown rendering + raw-mode cursor manipulation on terminals).
-pub fn install_cli_agent_event_sink(highlight: bool, render_options: RenderOptions) {
-    install_agent_event_sink(Arc::new(CliAgentEventSink::new(highlight, render_options)));
+/// The `abort_signal` is used to forward Ctrl-C / Ctrl-D key events
+/// captured during crossterm raw mode back to the running command.
+pub fn install_cli_agent_event_sink(
+    highlight: bool,
+    render_options: RenderOptions,
+    abort_signal: AbortSignal,
+) {
+    install_agent_event_sink(Arc::new(CliAgentEventSink::new(
+        highlight,
+        render_options,
+        abort_signal,
+    )));
     debug_assert!(
         has_agent_event_sink(),
         "CLI AgentEventSink must be installed after startup call"

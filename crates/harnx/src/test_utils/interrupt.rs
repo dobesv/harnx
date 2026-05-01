@@ -248,6 +248,65 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Starts tmux + bash, exports `HARNX_CONFIG_DIR`, and launches harnx in
+/// one-shot (Cmd) mode with `prompt` as the argument.  Returns the harness
+/// immediately; the harnx process runs inside the pane and the exit code will
+/// appear as `HARNX_EXIT:<code>` when it finishes.
+///
+/// Use [`wait_for_cmd_exit`] to block until harnx exits and retrieve whether
+/// the exit was non-zero.
+///
+/// `repo_root` is used as the working directory for the tmux session; pass
+/// `PathBuf::from(env!("CARGO_MANIFEST_DIR"))` from the test.
+pub fn spawn_oneshot_in_tmux(
+    paths: &ConfigPaths,
+    harnx_bin: &Path,
+    prompt: &str,
+    repo_root: &Path,
+) -> Result<TmuxHarness> {
+    let tmux = TmuxHarness::new(repo_root, 120, 35).context("failed to create tmux session")?;
+    tmux.send_text(&format!(
+        "export HARNX_CONFIG_DIR={}\n",
+        shell_escape(&paths.harnx_config_dir.to_string_lossy())
+    ))?;
+    // "|| echo HARNX_EXIT:$?" prints a detectable sentinel when harnx exits
+    // non-zero (interrupted), making exit detection possible from pane capture.
+    tmux.send_text(&format!(
+        "{} {} || echo HARNX_EXIT:$?\n",
+        shell_escape(&harnx_bin.to_string_lossy()),
+        shell_escape(prompt),
+    ))?;
+    Ok(tmux)
+}
+
+/// Waits until `HARNX_EXIT:` appears in the tmux pane (indicating the harnx
+/// one-shot command has finished) and returns whether the exit was non-zero.
+/// Returns `Err` if the budget elapses without seeing the sentinel.
+pub fn wait_for_cmd_exit(tmux: &TmuxHarness, budget: Duration) -> Result<bool> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let screen = tmux.capture_pane()?;
+        if let Some(line) = screen.lines().find(|l| l.contains("HARNX_EXIT:")) {
+            // "HARNX_EXIT:1" -> non-zero (interrupted); "HARNX_EXIT:0" -> success
+            let nonzero = line
+                .split("HARNX_EXIT:")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .map(|code| code != "0")
+                .unwrap_or(true);
+            return Ok(nonzero);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "HARNX_EXIT not seen in tmux pane after {:?}; last screen:\n{}",
+                budget,
+                screen
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A mock-LLM response that emits one short text chunk and immediately
 /// issues a `<agent_name>_session_prompt` tool call to delegate to a
 /// sub-agent via ACP.

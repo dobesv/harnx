@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use crossterm::{cursor, queue, style, terminal};
 use textwrap::core::display_width;
 
+use harnx_core::abort::AbortSignal;
 use harnx_core::event::{
     AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, ToolEvent,
     TurnEvent,
@@ -44,12 +45,17 @@ struct CliSinkState {
     buffer_rows: u16,
     columns: u16,
     raw_mode_active: bool,
+    /// Background task that polls raw-mode key events and wires Ctrl-C/Ctrl-D
+    /// to `abort_signal`.  Started when raw mode is enabled; stopped on cleanup.
+    key_watcher: Option<harnx_spinner::RawModeKeyWatcher>,
     highlight: bool,
     render_options: RenderOptions,
+    /// Propagates Ctrl-C / Ctrl-D key events from raw mode to the caller.
+    abort_signal: AbortSignal,
 }
 
 impl CliAgentEventSink {
-    pub fn new(highlight: bool, render_options: RenderOptions) -> Self {
+    pub fn new(highlight: bool, render_options: RenderOptions, abort_signal: AbortSignal) -> Self {
         Self {
             state: Arc::new(Mutex::new(CliSinkState {
                 spinner: None,
@@ -58,8 +64,10 @@ impl CliAgentEventSink {
                 buffer_rows: 1,
                 columns: 0,
                 raw_mode_active: false,
+                key_watcher: None,
                 highlight,
                 render_options,
+                abort_signal,
             })),
         }
     }
@@ -96,10 +104,26 @@ impl CliSinkState {
         if !self.raw_mode_active {
             crossterm::terminal::enable_raw_mode()?;
             self.raw_mode_active = true;
+            // In raw mode, Ctrl-C does not deliver SIGINT and Ctrl-D does not
+            // deliver EOF — both become raw key events.  Start a watcher that
+            // reads those key events and forwards them to the abort signal.
+            // The watcher is scoped to the raw-mode window and aborted in
+            // cleanup() when raw mode is disabled.
+            self.key_watcher = harnx_spinner::spawn_raw_mode_key_watcher(self.abort_signal.clone());
         }
         if self.render.is_none() {
-            self.render = Some(MarkdownRender::init(self.render_options.clone())?);
-            self.columns = crossterm::terminal::size()?.0;
+            // Any failure here happens after enable_raw_mode() — clean up raw
+            // mode (and the key watcher) before propagating the error so the
+            // terminal is not left in a corrupted state.
+            let init_result = (|| -> anyhow::Result<()> {
+                self.render = Some(MarkdownRender::init(self.render_options.clone())?);
+                self.columns = crossterm::terminal::size()?.0;
+                Ok(())
+            })();
+            if let Err(e) = init_result {
+                let _ = self.cleanup();
+                return Err(e);
+            }
         }
 
         let mut writer = stdout();
@@ -172,6 +196,12 @@ impl CliSinkState {
             spinner.stop();
         }
         if self.raw_mode_active {
+            // Signal the raw-mode key watcher to stop.  The watcher thread
+            // exits within one 25 ms poll slice after seeing the stop flag or
+            // a crossterm error from the now-cooked terminal.
+            if let Some(watcher) = self.key_watcher.take() {
+                watcher.stop();
+            }
             crossterm::terminal::disable_raw_mode()?;
             self.raw_mode_active = false;
         }
@@ -458,7 +488,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn emit_handles_each_top_level_variant_without_panic() {
-        let sink = CliAgentEventSink::new(false, RenderOptions::default());
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
 
         sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
         sink.emit(
@@ -491,7 +525,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn status_event_starts_spinner_without_panic() {
-        let sink = CliAgentEventSink::new(false, RenderOptions::default());
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
         sink.emit(
             AgentEvent::Status(StatusLine {
                 text: "[test-model] generating".into(),
@@ -509,7 +547,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn status_event_updates_existing_spinner() {
-        let sink = CliAgentEventSink::new(false, RenderOptions::default());
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
         sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
         sink.emit(
             AgentEvent::Status(StatusLine {
@@ -623,8 +665,10 @@ mod tests {
             buffer_rows: 1,
             columns: 0,
             raw_mode_active: false,
+            key_watcher: None,
             highlight,
             render_options: RenderOptions::default(),
+            abort_signal: harnx_core::abort::create_abort_signal(),
         }
     }
 
