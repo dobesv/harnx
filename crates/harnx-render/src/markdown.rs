@@ -280,7 +280,13 @@ fn blend_fg_color(fg: SyntectColor, bg: SyntectColor) -> SyntectColor {
 }
 
 fn detect_code_block(line: &str) -> Option<String> {
-    let line = line.trim_start();
+    // Per CommonMark spec, a fenced code block may be indented by 0–3 spaces.
+    // Four or more spaces of indentation means this is NOT a code fence.
+    let indent = line.chars().take_while(|c| *c == ' ').count();
+    if indent >= 4 {
+        return None;
+    }
+    let line = &line[indent..];
     if !line.starts_with("```") {
         return None;
     }
@@ -387,7 +393,37 @@ std::error::Error>> {
         assert_eq!(detect_code_block("```rust"), Some("rust".into()));
         assert_eq!(detect_code_block("```c++"), Some("c++".into()));
         assert_eq!(detect_code_block("  ```rust"), Some("rust".into()));
+        assert_eq!(detect_code_block("   ```rust"), Some("rust".into()));
         assert_eq!(detect_code_block("```"), Some("".into()));
         assert_eq!(detect_code_block("``rust"), None);
+        // 4+ spaces of indentation must NOT be treated as a code fence (CommonMark spec).
+        // This is the regression test for issue #403: bash command text containing
+        // indented lines with triple backticks was incorrectly toggling code-block state.
+        assert_eq!(detect_code_block("    ```"), None);
+        assert_eq!(detect_code_block("    ```python"), None);
+        assert_eq!(detect_code_block("        ```"), None);
+    }
+
+    /// Regression test for issue #403: bash output containing indented triple-backtick
+    /// sequences (e.g. from a Python heredoc) must not toggle code-block rendering state.
+    #[test]
+    fn indented_backticks_not_treated_as_code_fence() {
+        // Simulate the bash command display that triggered the bug: a multi-line Python
+        // snippet where some lines happen to start with 4-space-indented triple backticks.
+        let input = "Here is some text\n\
+                     \n\
+                     ```python\n\
+                     for block in blocks:\n\
+                         items = re.findall(r'```', block)\n\
+                         print(items)\n\
+                     ```\n\
+                     \n\
+                     After code.\n";
+
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let output = render.render(input);
+        // The output must be identical to the input when there is no theme (no ANSI escapes).
+        assert_eq!(output, input);
     }
 }
