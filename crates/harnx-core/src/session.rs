@@ -42,6 +42,16 @@ pub enum SessionLogEntry {
         compress_threshold: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         agent_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_remote: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
         agent_variables: AgentVariables,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -208,6 +218,11 @@ impl Session {
             save_session: self.save_session,
             compress_threshold: self.compress_threshold,
             agent_name: self.agent_name.clone(),
+            session_id: None,
+            working_dir: None,
+            git_branch: None,
+            git_remote: None,
+            terminal_session_id: None,
             agent_variables: self.agent_variables.clone(),
             agent_instructions: self.agent_instructions.clone(),
             model_fallbacks: self.model_fallbacks.clone(),

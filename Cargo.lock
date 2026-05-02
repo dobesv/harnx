@@ -3015,6 +3015,7 @@ dependencies = [
  "indexmap",
  "inquire",
  "is-terminal",
+ "libc",
  "log",
  "nu-ansi-term",
  "os_info",

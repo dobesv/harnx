@@ -66,6 +66,7 @@ which = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arboard = { workspace = true, features = ["wayland-data-control"] }
+libc = { workspace = true }
 
 [target.'cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))'.dependencies]
 arboard = { workspace = true }
