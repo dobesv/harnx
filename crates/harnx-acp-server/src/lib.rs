@@ -204,7 +204,7 @@ impl acp::Agent for HarnxAgent {
         &self,
         _args: acp::NewSessionRequest,
     ) -> acp::Result<acp::NewSessionResponse> {
-        let session_id = Uuid::new_v4().to_string();
+        let session_id = Uuid::now_v7().to_string();
         {
             let mut config = self.config.write();
             if config.session.is_some() {

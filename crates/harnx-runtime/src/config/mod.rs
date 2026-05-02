@@ -1,11 +1,15 @@
 pub mod agent;
 pub mod input;
 pub mod session;
+pub mod session_meta;
 
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentConfig, AgentVariables};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
+pub use self::session_meta::{
+    build_picker_context, parse_session_meta, sort_sessions_for_picker, PickerContext, SessionMeta,
+};
 pub use harnx_core::last_message::LastMessage;
 #[allow(unused_imports)]
 pub use harnx_core::macros::{Macro, MacroVariable};
@@ -48,6 +52,7 @@ use std::{
 };
 use syntect::highlighting::ThemeSet;
 use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
+use uuid::Uuid;
 
 pub use harnx_rag::TEMP_RAG_NAME;
 pub const TEMP_SESSION_NAME: &str = "temp";
@@ -84,7 +89,14 @@ static EDITOR: OnceLock<Option<String>> = OnceLock::new();
 use harnx_core::agent_config::{normalize_toolset_value, split_tool_selectors, ToolsetValue};
 
 fn split_session_log_documents(raw_log: &str) -> Vec<String> {
-    raw_log
+    // Normalize Windows line endings before splitting so that session files
+    // transferred between platforms are handled correctly.
+    let normalized = if raw_log.contains("\r\n") {
+        std::borrow::Cow::Owned(raw_log.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(raw_log)
+    };
+    normalized
         .split("\n---\n")
         .filter_map(|document| {
             let document = document.trim();
@@ -1320,7 +1332,11 @@ impl Config {
         }
         let mut session;
         match session_name {
-            None | Some(TEMP_SESSION_NAME) => {
+            None => {
+                let uuid_name = Uuid::now_v7().to_string();
+                session = Some(self::session::new(self, &uuid_name)?);
+            }
+            Some(TEMP_SESSION_NAME) => {
                 let session_file = self.session_file(TEMP_SESSION_NAME);
                 if session_file.exists() {
                     remove_file(session_file).with_context(|| {
@@ -1699,8 +1715,24 @@ impl Config {
         list_file_names(self.sessions_dir(), ".yaml")
     }
 
-    pub fn list_autoname_sessions(&self) -> Vec<String> {
-        list_file_names(self.sessions_dir().join("_"), ".yaml")
+    pub fn list_sessions_with_meta(&self) -> Vec<SessionMeta> {
+        let Ok(entries) = std::fs::read_dir(self.sessions_dir()) else {
+            return Vec::new();
+        };
+
+        let mut sessions = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_stem()?.to_str()?;
+                (path.extension().and_then(|ext| ext.to_str()) == Some("yaml"))
+                    .then(|| parse_session_meta(name, &path))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+
+        sessions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        sessions
     }
 
     pub fn maybe_compact_session(config: GlobalConfig) {
@@ -2366,19 +2398,7 @@ impl Config {
                     .into_iter()
                     .map(|v| (v.id(), Some(v.description())))
                     .collect(),
-                ".session" => {
-                    if args[0].starts_with("_/") {
-                        map_completion_values(
-                            self.list_autoname_sessions()
-                                .iter()
-                                .rev()
-                                .map(|v| format!("_/{v}"))
-                                .collect::<Vec<String>>(),
-                        )
-                    } else {
-                        map_completion_values(self.list_sessions())
-                    }
-                }
+                ".session" => map_completion_values(self.list_sessions()),
                 ".rag" => map_completion_values(Self::list_rags()),
                 ".agent" => map_completion_values(list_agents()),
                 ".macro" => map_completion_values(Self::list_macros()),
@@ -4039,6 +4059,37 @@ mod tests {
     /// with an existing name (simulating the handoff path with session_id).
     /// This is the unit-level guarantee behind the #291 fix: after handoff the
     /// new agent starts with a blank session even when a session_id was provided.
+    #[test]
+    fn test_new_session_has_session_id() {
+        let config = Config::default();
+        let session = self::session::new(&config, "metadata-check").unwrap();
+
+        assert!(session.session_id.is_some());
+    }
+
+    #[test]
+    fn test_new_session_has_uuid7_filename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            sessions_dir_override: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        config.use_session(None).unwrap();
+
+        let session = config.session.as_ref().unwrap();
+        let parsed = Uuid::parse_str(&session.name).expect("session name should be valid UUID");
+        assert_eq!(parsed.get_version_num(), 7);
+        assert_eq!(
+            session
+                .sessions_dir
+                .as_ref()
+                .unwrap()
+                .join(format!("{}.yaml", session.name)),
+            tmp.path().join(format!("{}.yaml", session.name))
+        );
+    }
+
     #[test]
     fn empty_session_clears_named_session_with_messages() {
         let mut config = Config::default();

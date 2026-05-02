@@ -1,9 +1,11 @@
 mod clipboard;
 mod command;
 pub mod session_name;
+pub mod terminal_session;
 
 pub use self::clipboard::set_text;
 pub use self::command::*;
+pub use self::terminal_session::terminal_session_id;
 pub use harnx_core::abort::{
     create_abort_signal, wait_abort_signal, AbortSignal, AbortSignalInner,
 };

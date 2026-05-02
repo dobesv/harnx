@@ -1,6 +1,7 @@
 use harnx_core::event::{AgentSource, PlanEntry};
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::config::GlobalConfig;
+use harnx_runtime::config::SessionMeta;
 use harnx_runtime::utils::AbortSignal;
 
 use chrono::{DateTime, Utc};
@@ -149,6 +150,16 @@ pub(super) enum ModalState {
     ConfirmRewind {
         seq: usize,
         user_text: Option<String>,
+    },
+    /// Agent selection
+    AgentPicker {
+        agents: Vec<String>,
+        selected: usize,
+    },
+    /// Session selection
+    SessionPicker {
+        sessions: Vec<SessionMeta>,
+        selected: usize,
     },
 }
 

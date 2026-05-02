@@ -14,20 +14,42 @@ use harnx_render::MarkdownRender;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use fancy_regex::Regex;
 use serde::Deserialize;
 use std::fs::{read_to_string, write, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
-use std::sync::LazyLock;
+use uuid::Uuid;
 
-static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
+use crate::utils::{
+    session_name::{git_branch, git_remote},
+    terminal_session_id,
+};
+
+// RE_AUTONAME_PREFIX removed - no longer needed. Anonymous sessions now use UUIDv7.
 
 pub fn new(config: &Config, name: &str) -> Result<Session> {
     let agent = config.extract_agent();
+    let session_id = match Uuid::parse_str(name) {
+        Ok(uuid) if uuid.get_version_num() == 7 => name.to_string(),
+        _ => Uuid::now_v7().to_string(),
+    };
     let mut session = Session {
         name: name.to_string(),
         save_session: config.save_session,
+        session_id: Some(session_id),
+        working_dir: std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
+        git_branch: {
+            let b = git_branch();
+            if b.is_empty() {
+                None
+            } else {
+                Some(b)
+            }
+        },
+        git_remote: git_remote(),
+        terminal_session_id: terminal_session_id(),
         ..Default::default()
     };
     session.set_agent(&agent)?;
@@ -206,6 +228,11 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                 save_session,
                 compress_threshold,
                 agent_name,
+                session_id,
+                working_dir,
+                git_branch,
+                git_remote,
+                terminal_session_id,
                 agent_variables,
                 agent_instructions,
                 model_fallbacks,
@@ -218,6 +245,11 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                 session.save_session = save_session;
                 session.compress_threshold = compress_threshold;
                 session.agent_name = agent_name;
+                session.session_id = session_id;
+                session.working_dir = working_dir;
+                session.git_branch = git_branch;
+                session.git_remote = git_remote;
+                session.terminal_session_id = terminal_session_id;
                 session.agent_variables = agent_variables;
                 session.agent_instructions = agent_instructions;
                 session.model_fallbacks = model_fallbacks;
@@ -421,16 +453,16 @@ fn apply_name_and_path(
     path: &Path,
     config: &Config,
 ) -> Result<()> {
-    if let Some(autoname) = name.strip_prefix("_/") {
-        session.name = TEMP_SESSION_NAME.to_string();
-        session.path = Some(path.display().to_string());
-        if let Ok(true) = RE_AUTONAME_PREFIX.is_match(autoname) {
-            session.autoname = Some(AutoName::new(autoname[16..].to_string()));
-        }
+    // Legacy "_/" prefix handling removed - anonymous sessions now use UUIDv7 filenames
+    // Existing sessions with "_/timestamp-name" format can still be loaded but won't be
+    // created going forward.
+    session.name = if name.starts_with("_/") {
+        // Strip legacy prefix if present
+        name.strip_prefix("_/").unwrap_or(name).to_string()
     } else {
-        session.name = name.to_string();
-        session.path = Some(path.display().to_string());
-    }
+        name.to_string()
+    };
+    session.path = Some(path.display().to_string());
 
     session.agent_prompt = session.agent_instructions.clone();
     if let Some(agent_name) = &session.agent_name {
