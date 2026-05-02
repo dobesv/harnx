@@ -1706,3 +1706,40 @@ impl Tui {
         self.app.modal = Some(crate::types::ModalState::ConfirmRewind { seq, user_text });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::tool_completed_to_transcript_items;
+    use crate::types::TranscriptItem;
+    use serde_json::json;
+
+    #[test]
+    fn tool_completed_preserves_fenced_diff_in_transcript() {
+        let output = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Applied patch successfully"
+                },
+                {
+                    "type": "text",
+                    "text": "```diff\n-old line\n+new line\n```"
+                }
+            ],
+            "isError": false
+        });
+
+        let items = tool_completed_to_transcript_items(&output, None);
+
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            TranscriptItem::ToolResultMarkdown(text) => {
+                assert!(text.contains("Applied patch successfully"));
+                assert!(text.contains("```diff"));
+                assert!(text.contains("-old line"));
+                assert!(text.contains("+new line"));
+            }
+            other => panic!("unexpected transcript item: {other:?}"),
+        }
+    }
+}

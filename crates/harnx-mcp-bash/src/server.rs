@@ -2031,7 +2031,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<ExecCommandParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**$** `{{ args.command }}`{% if args.working_dir %} *(in {{ args.working_dir }})*{% endif %}",
+                    "call_template": "`$ {{ args.command }}`{% if args.working_dir %} ({{ args.working_dir }}){% endif %}{% if args.timeout_secs %} [{{ args.timeout_secs }}s]{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "read_exec_log",
@@ -2040,7 +2040,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<ReadExecLogParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**read log** `{{ args.execution_id }}/{{ args.stream }}`",
+                    "call_template": "log {{ args.execution_id }}/{{ args.stream }}{% if args.grep %} grep={{ args.grep }}{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "spawn",
@@ -2049,7 +2049,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<SpawnCommandParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**spawn** `{{ args.command }}`{% if args.working_dir %} *(in {{ args.working_dir }})*{% endif %}",
+                    "call_template": "`> {{ args.command }}`{% if args.working_dir %} ({{ args.working_dir }}){% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "wait",
@@ -2058,7 +2058,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<WaitParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**wait** for {{ args.execution_id }}",
+                    "call_template": "wait {{ args.execution_id }}{% if args.timeout_secs %} [{{ args.timeout_secs }}s]{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "terminate",
@@ -2067,7 +2067,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<TerminateParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**terminate** {{ args.execution_id }}{% if args.signal %} ({{ args.signal }}){% endif %}",
+                    "call_template": "kill {{ args.execution_id }}{% if args.signal %} ({{ args.signal }}){% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "rollback_file",
@@ -2076,7 +2076,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<RollbackParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**rollback_file** to `{{ args.commit_id | truncate(8, end='') }}`",
+                    "call_template": "rollback {{ args.commit_id | truncate(8, end='') }}",
                 }).as_object().unwrap().clone())),
             ],
             next_cursor: None,

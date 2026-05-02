@@ -3,9 +3,9 @@ source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
 Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
-→ read  [7]
+  [7]
+→ read
    path: /tmp/foo.txt
-
 
 
 

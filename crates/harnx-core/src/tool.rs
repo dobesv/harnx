@@ -102,6 +102,20 @@ pub struct ToolDeclaration {
 fn make_template_env<'a>() -> Environment<'a> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Lenient);
+    // `truncate` is not a minijinja built-in; register it so templates can do
+    // `{{ args.message | truncate(60) }}` or `{{ args.id | truncate(8, end='') }}`.
+    env.add_filter(
+        "truncate",
+        |value: &str, length: usize, end: Option<&str>| -> String {
+            let ellipsis = end.unwrap_or("...");
+            if value.len() <= length {
+                value.to_string()
+            } else {
+                let cut = length.saturating_sub(ellipsis.len());
+                format!("{}{}", &value[..cut], ellipsis)
+            }
+        },
+    );
     env
 }
 

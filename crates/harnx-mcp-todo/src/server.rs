@@ -964,7 +964,7 @@ impl ServerHandler for TodoServer {
                 )
                 .with_input_schema::<TodoListParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**list todos**",
+                    "call_template": "todos{% if args.filter %} [{{ args.filter }}]{% endif %}{% if args.plan %} plan={{ args.plan }}{% endif %}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -974,7 +974,7 @@ impl ServerHandler for TodoServer {
                 )
                 .with_input_schema::<TodoGetParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**get todo** {{ args.id }}",
+                    "call_template": "todo {{ args.id }}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -984,7 +984,7 @@ impl ServerHandler for TodoServer {
                 )
                 .with_input_schema::<TodoCreateParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**create todo** {{ args.title }}",
+                    "call_template": "+ todo {{ args.title }}{% if args.plan %} ({{ args.plan }}){% endif %}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -994,7 +994,7 @@ impl ServerHandler for TodoServer {
                 )
                 .with_input_schema::<TodoUpdateParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**update todo** {{ args.id }}",
+                    "call_template": "* todo {{ args.id }}{% if args.title %} \"{{ args.title }}\"{% endif %}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -1004,19 +1004,19 @@ impl ServerHandler for TodoServer {
                 )
                 .with_input_schema::<TodoAppendParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**append** to {{ args.id }}",
+                    "call_template": ">> todo {{ args.id }}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new("todo_delete", "Delete todo by ID.", Map::new())
                     .with_input_schema::<TodoDeleteParams>()
                     .with_meta(Meta(json!({
-                        "call_template": "**delete todo** {{ args.id }}",
+                        "call_template": "- todo {{ args.id }}",
                         "result_template": "{{ result.content[0].text | default('') }}"
                     }).as_object().unwrap().clone())),
                 Tool::new("read_plan", "Read plan markdown file.", Map::new())
                     .with_input_schema::<PlanReadParams>()
                     .with_meta(Meta(json!({
-                        "call_template": "**read plan** {{ args.name }}",
+                        "call_template": "plan {{ args.name }}",
                         "result_template": "{{ result.content[0].text | default('') }}"
                     }).as_object().unwrap().clone())),
                 Tool::new(
@@ -1026,7 +1026,7 @@ impl ServerHandler for TodoServer {
                 )
                 .with_input_schema::<PlanWriteParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**write plan** {{ args.name }}",
+                    "call_template": "+ plan {{ args.name }}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -1036,7 +1036,7 @@ impl ServerHandler for TodoServer {
                 )
                 .with_input_schema::<PlanAddNoteParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**plan add note** {{ args.name }}",
+                    "call_template": ">> plan {{ args.name }}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
                 Tool::new(
@@ -1046,7 +1046,7 @@ impl ServerHandler for TodoServer {
                 )
                 .with_input_schema::<PlanGetTodoParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "**plan get todo** {{ args.plan }} {{ args.key }}",
+                    "call_template": "plan {{ args.plan }} / {{ args.key }}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
             ],
