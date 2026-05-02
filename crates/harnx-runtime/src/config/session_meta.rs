@@ -124,14 +124,26 @@ fn read_session_header_bytes(path: &Path) -> Option<String> {
     let read_len = file.read(&mut buffer).ok()?;
     let bytes = &buffer[..read_len];
 
+    // Skip an optional leading `---\n` or `---\r\n` document-start marker.
+    // Standard YAML multi-doc files often omit it, but hand-edited files may include it.
+    let content_start = if bytes.starts_with(b"---\n") {
+        4
+    } else if bytes.starts_with(b"---\r\n") {
+        5
+    } else {
+        0
+    };
+    let content = &bytes[content_start..];
+
+    // Find the next document separator — this marks the end of the header document.
     // Accept both Unix (`---\n`) and Windows (`---\r\n`) line endings.
-    let boundary = bytes
+    let boundary = content
         .windows(4)
         .position(|w| w == b"---\n")
-        .or_else(|| bytes.windows(5).position(|w| w == b"---\r\n"))
-        .unwrap_or(bytes.len());
+        .or_else(|| content.windows(5).position(|w| w == b"---\r\n"))
+        .unwrap_or(content.len());
 
-    String::from_utf8(bytes[..boundary].to_vec()).ok()
+    String::from_utf8(content[..boundary].to_vec()).ok()
 }
 
 pub fn parse_session_meta(name: &str, path: &Path) -> Option<SessionMeta> {
@@ -373,3 +385,7 @@ mod tests {
         let _ = build_picker_context();
     }
 }
+
+#[cfg(test)]
+#[path = "session_meta_test_extra.rs"]
+mod tests_extra;
