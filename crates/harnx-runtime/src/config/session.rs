@@ -14,12 +14,10 @@ use harnx_render::MarkdownRender;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use fancy_regex::Regex;
 use serde::Deserialize;
 use std::fs::{read_to_string, write, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
-use std::sync::LazyLock;
 use uuid::Uuid;
 
 use crate::utils::{
@@ -27,7 +25,7 @@ use crate::utils::{
     terminal_session_id,
 };
 
-static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
+// RE_AUTONAME_PREFIX removed - no longer needed. Anonymous sessions now use UUIDv7.
 
 pub fn new(config: &Config, name: &str) -> Result<Session> {
     let agent = config.extract_agent();
@@ -448,16 +446,16 @@ fn apply_name_and_path(
     path: &Path,
     config: &Config,
 ) -> Result<()> {
-    if let Some(autoname) = name.strip_prefix("_/") {
-        session.name = TEMP_SESSION_NAME.to_string();
-        session.path = Some(path.display().to_string());
-        if let Ok(true) = RE_AUTONAME_PREFIX.is_match(autoname) {
-            session.autoname = Some(AutoName::new(autoname[16..].to_string()));
-        }
+    // Legacy "_/" prefix handling removed - anonymous sessions now use UUIDv7 filenames
+    // Existing sessions with "_/timestamp-name" format can still be loaded but won't be
+    // created going forward.
+    session.name = if name.starts_with("_/") {
+        // Strip legacy prefix if present
+        name.strip_prefix("_/").unwrap_or(name).to_string()
     } else {
-        session.name = name.to_string();
-        session.path = Some(path.display().to_string());
-    }
+        name.to_string()
+    };
+    session.path = Some(path.display().to_string());
 
     session.agent_prompt = session.agent_instructions.clone();
     if let Some(agent_name) = &session.agent_name {

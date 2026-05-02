@@ -1729,10 +1729,6 @@ impl Config {
         sessions
     }
 
-    pub fn list_autoname_sessions(&self) -> Vec<String> {
-        list_file_names(self.sessions_dir().join("_"), ".yaml")
-    }
-
     pub fn maybe_compact_session(config: GlobalConfig) {
         let mut need_compact = false;
         {
@@ -2396,19 +2392,7 @@ impl Config {
                     .into_iter()
                     .map(|v| (v.id(), Some(v.description())))
                     .collect(),
-                ".session" => {
-                    if args[0].starts_with("_/") {
-                        map_completion_values(
-                            self.list_autoname_sessions()
-                                .iter()
-                                .rev()
-                                .map(|v| format!("_/{v}"))
-                                .collect::<Vec<String>>(),
-                        )
-                    } else {
-                        map_completion_values(self.list_sessions())
-                    }
-                }
+                ".session" => map_completion_values(self.list_sessions()),
                 ".rag" => map_completion_values(Self::list_rags()),
                 ".agent" => map_completion_values(list_agents()),
                 ".macro" => map_completion_values(Self::list_macros()),
@@ -4075,6 +4059,25 @@ mod tests {
         let session = self::session::new(&config, "metadata-check").unwrap();
 
         assert!(session.session_id.is_some());
+    }
+
+    #[test]
+    fn test_new_session_has_uuid7_filename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            sessions_dir_override: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        config.use_session(None).unwrap();
+
+        let session = config.session.as_ref().unwrap();
+        let parsed = Uuid::parse_str(&session.name).expect("session name should be valid UUID");
+        assert_eq!(parsed.get_version_num(), 7);
+        assert_eq!(
+            session.sessions_dir.as_ref().unwrap().join(format!("{}.yaml", session.name)),
+            tmp.path().join(format!("{}.yaml", session.name))
+        );
     }
 
     #[test]

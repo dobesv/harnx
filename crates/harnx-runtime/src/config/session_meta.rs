@@ -200,6 +200,34 @@ mod tests {
     }
 
     #[test]
+    fn test_session_meta_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("test-session.yaml");
+        fs::write(
+            &path,
+            "type: header\nmodel: gpt-4o\nsession_id: \"01234567-89ab-cdef-0123-456789abcdef\"\nworking_dir: \"/tmp/test\"\ngit_branch: \"main\"\ngit_remote: \"https://github.com/test/repo\"\nterminal_session_id: \"TERM_SESSION_ID:abc123\"\n",
+        )
+        .unwrap();
+
+        let meta = parse_session_meta("test-session", &path).unwrap();
+        assert_eq!(meta.name, "test-session");
+        assert_eq!(
+            meta.session_id.as_deref(),
+            Some("01234567-89ab-cdef-0123-456789abcdef")
+        );
+        assert_eq!(meta.working_dir.as_deref(), Some("/tmp/test"));
+        assert_eq!(meta.git_branch.as_deref(), Some("main"));
+        assert_eq!(
+            meta.git_remote.as_deref(),
+            Some("https://github.com/test/repo")
+        );
+        assert_eq!(
+            meta.terminal_session_id.as_deref(),
+            Some("TERM_SESSION_ID:abc123")
+        );
+    }
+
+    #[test]
     fn parse_session_meta_stops_at_next_yaml_doc() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("multi.yaml");
