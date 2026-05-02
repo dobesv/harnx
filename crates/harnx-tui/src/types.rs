@@ -99,6 +99,8 @@ pub(super) struct App {
     pub(super) modal: Option<ModalState>,
     /// true when the Enter-triggered action menu is visible.
     pub(super) action_menu_open: bool,
+    pub(super) detail_view_scroll: ratatui_widget_scrolling::ScrollState,
+    pub(super) detail_view_open: bool,
     /// When true, render timestamps in UTC instead of local time.
     /// Always false in production; set to true in tests so snapshot
     /// output is timezone-independent.
@@ -208,6 +210,16 @@ impl TranscriptItem {
             TranscriptItem::ToolCall { seq, .. } => *seq,
             _ => None,
         }
+    }
+}
+
+impl App {
+    /// Returns the (min, max) indices of the current transcript selection.
+    /// Used by render_detail_view to determine which entries to display.
+    pub(super) fn selected_transcript_range(&self) -> (usize, usize) {
+        let f = self.transcript_focus.unwrap_or(0);
+        let a = self.transcript_selection_anchor.unwrap_or(f);
+        (f.min(a), f.max(a))
     }
 }
 

@@ -522,9 +522,10 @@ impl Tui {
             frame.render_widget(popup, popup_area);
         }
 
-        // Render action menu if open
-        if self.app.action_menu_open && self.app.transcript_focus.is_some() {
-            self.render_action_menu(frame, size);
+        // Render detail view if open (exclusive — returns early)
+        if self.app.detail_view_open {
+            self.render_detail_view(frame, size);
+            return;
         }
 
         // Render confirmation modal on top of everything else
@@ -890,5 +891,84 @@ impl Tui {
         );
 
         frame.render_widget(modal, modal_area);
+    }
+
+    /// Render the detail view overlay for the selected transcript range.
+    /// Called from draw() when self.app.detail_view_open is true.
+    pub(super) fn render_detail_view(&mut self, frame: &mut Frame<'_>, size: ratatui::layout::Rect) {
+        // Clear the full area first
+        frame.render_widget(ratatui::widgets::Clear, size);
+
+        // Split vertically: content area + footer
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(size);
+
+        // Read display settings
+        let show_seq = self.app.show_sequence_numbers;
+        let show_ts = self.app.show_timestamps;
+        let use_utc = self.app.use_utc_timestamps;
+
+        // Compute selected range
+        let (from, to) = self.app.selected_transcript_range();
+
+        // Build entries for the selected range
+        let entries_as_vec: Vec<Vec<Line<'static>>> = {
+            let mut entries = Vec::new();
+            for i in from..=to {
+                if i < self.app.transcript.len() {
+                    let entry = &self.app.transcript[i];
+                    entries.push(Self::render_entry(entry, show_seq, show_ts, use_utc));
+                    // Add blank line separator between entries (but not after the last one)
+                    if i < to {
+                        entries.push(vec![Line::from("")]);
+                    }
+                }
+            }
+            entries
+        };
+
+        // Build title based on single vs multi-item range
+        let title = if from == to {
+            "Detail".to_string()
+        } else {
+            format!("Detail ({from}–{to})")
+        };
+
+        // Create block with border and title
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title.as_str());
+
+        // Get inner area for content
+        let inner_area = block.inner(chunks[0]);
+
+        // Render the block into the content chunk
+        frame.render_widget(block, chunks[0]);
+
+        // Render the scrollable content
+        self.app.detail_view_scroll.render(
+            frame,
+            inner_area,
+            &entries_as_vec,
+            |lines| {
+                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+                let height = paragraph.line_count(inner_area.width);
+                (height, paragraph)
+            },
+        );
+
+        // Clamp position to the freshly-updated last_max_position
+        self.app.detail_view_scroll.position = self
+            .app
+            .detail_view_scroll
+            .position
+            .min(self.app.detail_view_scroll.last_max_position);
+
+        // Render footer
+        let footer = Paragraph::new(" ↑↓/scroll — ESC to close")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(footer, chunks[1]);
     }
 }

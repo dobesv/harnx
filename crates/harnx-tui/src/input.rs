@@ -132,6 +132,35 @@ impl Tui {
             return self.handle_modal_key(key).await;
         }
 
+        // While the detail view is open, only navigation / close keys are
+        // handled.  All other keys are silently consumed so they cannot bleed
+        // into the hidden background input field or trigger background actions.
+        if self.app.detail_view_open {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, KeyModifiers::NONE) => {
+                    self.app.detail_view_open = false;
+                }
+                (KeyCode::Up, KeyModifiers::NONE) => {
+                    self.app.detail_view_scroll.scroll_up();
+                }
+                (KeyCode::Down, KeyModifiers::NONE) => {
+                    self.app.detail_view_scroll.scroll_down();
+                }
+                (KeyCode::PageUp, KeyModifiers::NONE) => {
+                    for _ in 0..10 {
+                        self.app.detail_view_scroll.scroll_up();
+                    }
+                }
+                (KeyCode::PageDown, KeyModifiers::NONE) => {
+                    for _ in 0..10 {
+                        self.app.detail_view_scroll.scroll_down();
+                    }
+                }
+                _ => {} // all other keys silently consumed
+            }
+            return Ok(());
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 self.abort_signal.set_ctrld();
@@ -179,11 +208,23 @@ impl Tui {
                 self.handle_down_key_shift();
             }
             (KeyCode::PageUp, KeyModifiers::NONE) => {
+                if self.app.detail_view_open {
+                    for _ in 0..10 {
+                        self.app.detail_view_scroll.scroll_up();
+                    }
+                    return Ok(());
+                }
                 for _ in 0..10 {
                     self.app.scroll_state.scroll_up();
                 }
             }
             (KeyCode::PageDown, KeyModifiers::NONE) => {
+                if self.app.detail_view_open {
+                    for _ in 0..10 {
+                        self.app.detail_view_scroll.scroll_down();
+                    }
+                    return Ok(());
+                }
                 for _ in 0..10 {
                     self.app.scroll_state.scroll_down();
                 }
@@ -195,7 +236,9 @@ impl Tui {
                 self.handle_tab(true).await;
             }
             (KeyCode::Esc, KeyModifiers::NONE) => {
-                if self.app.transcript_focus.is_some() {
+                if self.app.detail_view_open {
+                    self.app.detail_view_open = false;
+                } else if self.app.transcript_focus.is_some() {
                     self.app.transcript_focus = None;
                     self.app.transcript_selection_anchor = None;
                 } else if !self.app.completions.is_empty() {
@@ -203,25 +246,35 @@ impl Tui {
                 }
             }
             // D4: Keyboard actions on selected transcript item(s)
-            (KeyCode::Char('e'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+            // All mutation shortcuts are blocked while the detail view is open.
+            (KeyCode::Char('e'), KeyModifiers::NONE)
+                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
+            {
                 self.handle_transcript_edit().await?;
             }
             (KeyCode::Delete, KeyModifiers::NONE) | (KeyCode::Char('d'), KeyModifiers::NONE)
-                if self.app.transcript_focus.is_some() =>
+                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
             {
                 self.handle_transcript_delete();
             }
-            (KeyCode::Char('i'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+            (KeyCode::Char('i'), KeyModifiers::NONE)
+                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
+            {
                 self.handle_transcript_insert();
             }
-            (KeyCode::Char('c'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+            (KeyCode::Char('c'), KeyModifiers::NONE)
+                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
+            {
                 self.handle_transcript_copy();
             }
-            (KeyCode::Char('r'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+            (KeyCode::Char('r'), KeyModifiers::NONE)
+                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
+            {
                 self.handle_transcript_rewind();
             }
             (KeyCode::Enter, KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
-                self.app.action_menu_open = true;
+                self.app.detail_view_scroll = ratatui_widget_scrolling::ScrollState::new();
+                self.app.detail_view_open = true;
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 if self.try_handle_attach_command().await {
@@ -435,6 +488,10 @@ impl Tui {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
+        // Ignore paste while the detail view is open — same isolation policy as handle_key.
+        if self.app.detail_view_open {
+            return;
+        }
         if let Some(pending) = self.app.pending_message.take() {
             self.app.attachments = pending.attachments;
             self.app.attachment_dir = pending.attachment_dir;
@@ -489,11 +546,23 @@ impl Tui {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
+                if self.app.detail_view_open {
+                    for _ in 0..3 {
+                        self.app.detail_view_scroll.scroll_up();
+                    }
+                    return;
+                }
                 for _ in 0..3 {
                     self.app.scroll_state.scroll_up();
                 }
             }
             MouseEventKind::ScrollDown => {
+                if self.app.detail_view_open {
+                    for _ in 0..3 {
+                        self.app.detail_view_scroll.scroll_down();
+                    }
+                    return;
+                }
                 for _ in 0..3 {
                     self.app.scroll_state.scroll_down();
                 }
@@ -1052,6 +1121,11 @@ impl Tui {
     }
 
     fn handle_up_key(&mut self, key: KeyEvent) {
+        if self.app.detail_view_open {
+            self.app.detail_view_scroll.scroll_up();
+            return;
+        }
+
         if !self.app.completions.is_empty() {
             self.app.scroll_state.scroll_up();
         } else if let Some(focus) = self.app.transcript_focus {
@@ -1089,6 +1163,11 @@ impl Tui {
     }
 
     fn handle_down_key(&mut self, key: KeyEvent) {
+        if self.app.detail_view_open {
+            self.app.detail_view_scroll.scroll_down();
+            return;
+        }
+
         if !self.app.completions.is_empty() {
             self.app.scroll_state.scroll_down();
         } else if let Some(focus) = self.app.transcript_focus {

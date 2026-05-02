@@ -97,6 +97,8 @@ impl Tui {
             transcript_selection_anchor: None,
             modal: None,
             action_menu_open: false,
+            detail_view_scroll: ratatui_widget_scrolling::ScrollState::new(),
+            detail_view_open: false,
             use_utc_timestamps: false,
         };
 
