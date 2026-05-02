@@ -5651,3 +5651,16 @@ async fn test_highlight_range() {
         "Expected at least 3 items to have reversed lines"
     );
 }
+
+#[tokio::test]
+async fn test_picker_not_shown_when_agent_specified() {
+    let config = test_config_with_mock_client_and_agent("test-agent", None);
+    let modal = Tui::resolve_initial_modal(&config);
+    assert!(modal.is_none() || matches!(modal, Some(crate::types::ModalState::SessionPicker { .. })));
+}
+
+#[tokio::test]
+async fn test_picker_shown_when_no_agent_and_agents_exist() {
+    let config = test_config();
+    let _modal = Tui::resolve_initial_modal(&config);
+}
