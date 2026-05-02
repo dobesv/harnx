@@ -36,7 +36,7 @@ use tokio::sync::Mutex;
 /// ```
 pub struct TuiTestHarness {
     tui: Tui,
-    terminal: Terminal<TestBackend>,
+    pub(crate) terminal: Terminal<TestBackend>,
     sync: SyncHarness,
 }
 

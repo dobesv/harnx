@@ -3,8 +3,8 @@ use crate::types::Tui;
 use crate::types::{ToolCallBody, TranscriptItem, TuiEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_core::event::{
-    AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, PlanEntry, ToolEvent, ToolKind,
-    ToolStatus,
+    AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, PlanEntry, SessionEvent,
+    ToolEvent, ToolKind, ToolStatus,
 };
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::client::{Client, ClientConfig, TestStateGuard};
@@ -440,7 +440,7 @@ async fn ui_output_inserts_heading_when_source_changes() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -519,7 +519,7 @@ async fn info_commands_render_into_tui_transcript() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -772,7 +772,7 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -851,7 +851,7 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -1080,7 +1080,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -1161,7 +1161,7 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -1220,7 +1220,7 @@ async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() 
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -1326,7 +1326,7 @@ async fn submitting_message_with_attachments_renders_attachment_list_and_preview
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -1429,6 +1429,7 @@ async fn test_basic_message_and_streaming_response() {
     harness.tui().app.transcript.push(TranscriptItem::UserText {
         text: "Test message".to_string(),
         seq: None,
+        timestamp: None,
     });
     harness
         .tui()
@@ -1558,6 +1559,62 @@ fn seq_numbers_appear_after_session_reload() {
     );
 }
 
+#[tokio::test]
+async fn live_log_seq_assignment_patches_latest_unsequenced_transcript_items() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    tui.app.show_sequence_numbers = true;
+
+    tui.app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
+        text: "older user".to_string(),
+        seq: Some(1),
+    });
+    tui.app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
+        text: "live user".to_string(),
+        seq: None,
+    });
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 2 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    tui.app.transcript.push(TranscriptItem::AssistantText {
+        timestamp: None,
+        text: "live assistant".to_string(),
+        seq: None,
+    });
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 3 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let pairs: Vec<(&'static str, Option<usize>)> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::UserText { text, seq, .. } if text == "live user" => {
+                Some(("user", *seq))
+            }
+            TranscriptItem::AssistantText { text, seq, .. } if text == "live assistant" => {
+                Some(("assistant", *seq))
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(pairs, vec![("user", Some(2)), ("assistant", Some(3))]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_streaming_with_tool_calls() {
     let config =
@@ -1587,6 +1644,7 @@ async fn test_streaming_with_tool_calls() {
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
         text: "What is the answer?".to_string(),
         seq: None,
     });
@@ -1675,6 +1733,7 @@ async fn test_sub_agent_delegation_tool_appears() {
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
         text: "Help me".to_string(),
         seq: None,
     });
@@ -1831,6 +1890,7 @@ async fn test_screen_overflow_and_word_wrap() {
     let mut harness = TuiTestHarness::with_size(40, 10);
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
         text: user_message.to_string(),
         seq: None,
     });
@@ -1949,6 +2009,7 @@ async fn test_submitted_message_with_text_attachment_snapshot() {
     // AttachmentPreviewLines.
     let tui = harness.tui();
     tui.app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
         text: "check this file".to_string(),
         seq: None,
     });
@@ -1969,6 +2030,7 @@ async fn test_submitted_message_with_text_attachment_snapshot() {
             "Line 2 of notes".to_string(),
         ));
     tui.app.transcript.push(TranscriptItem::AssistantText {
+        timestamp: None,
         text: "Got it, thanks!".to_string(),
         seq: None,
     });
@@ -2045,6 +2107,7 @@ async fn test_ctrl_c_cancels_streaming() {
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
         text: "Long request".to_string(),
         seq: None,
     });
@@ -2133,6 +2196,7 @@ async fn test_streaming_error_shows_in_transcript() {
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
         text: "Error test".to_string(),
         seq: None,
     });
@@ -2307,6 +2371,7 @@ async fn test_cancel_during_tool_execution() {
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
         text: "Search test".to_string(),
         seq: None,
     });
@@ -2934,6 +2999,7 @@ async fn test_recovery_after_cancellation() {
 
     // Send first message
     harness.tui().app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
         text: "First request".to_string(),
         seq: None,
     });
@@ -2998,6 +3064,7 @@ async fn test_recovery_after_cancellation() {
     // User can send a new message
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
         text: "Second request".to_string(),
         seq: None,
     });
@@ -3288,7 +3355,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -3356,6 +3423,7 @@ fn make_tui_with_history(entries: &[&str]) -> (crate::types::Tui, GlobalConfig) 
 #[tokio::test]
 async fn history_up_on_blank_enters_preview() {
     let (mut tui, _config) = make_tui_with_history(&["first message", "second message"]);
+    tui.app.transcript.clear();
 
     tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
         .await
@@ -3370,10 +3438,236 @@ async fn history_up_on_blank_enters_preview() {
     );
 }
 
+#[tokio::test]
+async fn transcript_up_on_blank_input_enters_transcript_navigation() {
+    let mut harness = TuiTestHarness::with_size(40, 12);
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 0".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Line 1".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.transcript_focus, Some(2));
+    assert_eq!(harness.tui().app.transcript_selection_anchor, None);
+    assert!(!harness.tui().app.history_preview);
+}
+
+#[tokio::test]
+async fn transcript_up_moves_focus_and_clears_anchor() {
+    let mut harness = TuiTestHarness::with_size(40, 12);
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 0".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Line 1".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 2".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(2);
+    harness.tui().app.transcript_selection_anchor = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.transcript_focus, Some(1));
+    assert_eq!(harness.tui().app.transcript_selection_anchor, None);
+}
+
+#[tokio::test]
+async fn transcript_down_from_last_returns_focus_to_input() {
+    let mut harness = TuiTestHarness::with_size(40, 12);
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 0".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Line 1".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript_focus = Some(harness.tui().app.transcript.len() - 1);
+    harness.tui().app.transcript_selection_anchor = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.transcript_focus, None);
+    assert_eq!(harness.tui().app.transcript_selection_anchor, None);
+}
+
+#[tokio::test]
+async fn transcript_shift_up_sets_anchor_and_moves_focus() {
+    let mut harness = TuiTestHarness::with_size(40, 12);
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 0".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Line 1".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 2".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(2);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.transcript_focus, Some(1));
+    assert_eq!(harness.tui().app.transcript_selection_anchor, Some(2));
+}
+
+#[tokio::test]
+async fn transcript_shift_down_sets_anchor_and_moves_focus() {
+    let mut harness = TuiTestHarness::with_size(40, 12);
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 0".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Line 1".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 2".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Line 3".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript_focus = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.transcript_selection_anchor, Some(0));
+    assert_eq!(harness.tui().app.transcript_focus, Some(1));
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.transcript_selection_anchor, Some(0));
+    assert_eq!(harness.tui().app.transcript_focus, Some(2));
+}
+
+#[tokio::test]
+async fn transcript_esc_clears_focus_and_anchor() {
+    let mut harness = TuiTestHarness::with_size(40, 12);
+    harness.tui().app.transcript_focus = Some(1);
+    harness.tui().app.transcript_selection_anchor = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.transcript_focus, None);
+    assert_eq!(harness.tui().app.transcript_selection_anchor, None);
+}
+
 /// Blank input + Up with empty history → no preview mode, no-op.
+#[tokio::test]
+async fn history_up_from_transcript_top_enters_history_preview() {
+    let (mut tui, _config) = make_tui_with_history(&["first message", "second message"]);
+    tui.app.transcript.clear();
+    tui.app.transcript.push(TranscriptItem::UserText {
+        text: "Line 0".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    tui.app.transcript.push(TranscriptItem::AssistantText {
+        text: "Line 1".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    tui.app.transcript_focus = Some(0);
+    tui.app.transcript_selection_anchor = Some(1);
+
+    tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(tui.app.transcript_focus, None);
+    assert_eq!(tui.app.transcript_selection_anchor, None);
+    assert!(tui.app.history_preview, "should enter preview mode");
+    assert_eq!(tui.app.history_index, Some(0));
+    assert_eq!(tui.app.input.lines().join("\n"), "first message");
+}
+
 #[tokio::test]
 async fn history_up_on_blank_empty_history_no_preview() {
     let (mut tui, _config) = make_tui_with_history(&[]);
+    tui.app.transcript.clear();
 
     tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
         .await
@@ -3391,6 +3685,7 @@ async fn history_up_on_blank_empty_history_no_preview() {
 #[tokio::test]
 async fn history_up_up_navigates_older() {
     let (mut tui, _config) = make_tui_with_history(&["first message", "second message"]);
+    tui.app.transcript.clear();
 
     tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
         .await
@@ -3412,6 +3707,7 @@ async fn history_up_up_navigates_older() {
 #[tokio::test]
 async fn history_down_returns_to_draft() {
     let (mut tui, _config) = make_tui_with_history(&["first message"]);
+    tui.app.transcript.clear();
 
     // Start with blank input and press Up to enter preview mode.
     // history_prev() saves the current input ("") into history_draft.
@@ -3442,6 +3738,7 @@ async fn history_down_returns_to_draft() {
 #[tokio::test]
 async fn history_typing_exits_preview() {
     let (mut tui, _config) = make_tui_with_history(&["hello"]);
+    tui.app.transcript.clear();
 
     // Enter preview
     tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
@@ -3516,6 +3813,7 @@ async fn history_down_not_preview_moves_cursor() {
 #[tokio::test]
 async fn history_paste_exits_preview() {
     let (mut tui, _config) = make_tui_with_history(&["hello"]);
+    tui.app.transcript.clear();
 
     // Enter preview
     tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
@@ -3587,6 +3885,7 @@ async fn test_ctrl_c_interrupts_in_flight_streaming() {
 
     let mut harness = TuiTestHarness::with_config(config.clone());
     harness.tui().app.transcript.push(TranscriptItem::UserText {
+        timestamp: None,
         text: "Long request".to_string(),
         seq: None,
     });
@@ -3943,6 +4242,7 @@ async fn test_tall_item_scroll_shows_correct_portion_and_no_dead_zone() {
         .app
         .transcript
         .push(TranscriptItem::AssistantText {
+            timestamp: None,
             text: tall_text.clone(),
             seq: None,
         });
@@ -4057,6 +4357,7 @@ async fn test_tall_item_scroll_window_moves_in_correct_direction() {
         .app
         .transcript
         .push(TranscriptItem::AssistantText {
+            timestamp: None,
             text: tall_text,
             seq: None,
         });
@@ -4144,7 +4445,7 @@ async fn tui_renders_started_title_when_template_provides_it() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .map(|line| line_to_plain(&line))
         .collect();
 
@@ -4188,7 +4489,7 @@ async fn tui_falls_back_to_yaml_when_no_template_title() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .map(|line| line_to_plain(&line))
         .collect();
     let joined = lines.join("\n");
@@ -4231,7 +4532,7 @@ async fn tui_renders_completed_template_title_when_provided() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .map(|line| line_to_plain(&line))
         .collect();
     let joined = lines.join("\n");
@@ -4280,7 +4581,7 @@ async fn tui_renders_fenced_diff_tool_result_with_per_line_syntect_styling() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .collect();
     let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
     let joined = plain.join("\n");
@@ -4353,7 +4654,7 @@ async fn tui_falls_back_to_output_when_no_template_title() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .map(|line| line_to_plain(&line))
         .collect();
     let joined = lines.join("\n");
@@ -4387,7 +4688,7 @@ fn rendered_lines(tui: &Tui) -> Vec<ratatui::text::Line<'static>> {
     tui.app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .collect()
 }
 
@@ -4477,7 +4778,7 @@ async fn tui_started_no_template_keeps_yaml_unstyled() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .collect();
     let plain = rendered
         .iter()
@@ -4555,6 +4856,7 @@ async fn tui_assistant_text_renders_inline_markdown() {
     tui.app
         .transcript
         .push(crate::types::TranscriptItem::AssistantText {
+            timestamp: None,
             text: "Here's some **bold** and `code`.".to_string(),
             seq: None,
         });
@@ -4594,6 +4896,7 @@ async fn tui_assistant_text_preserves_line_breaks() {
     tui.app
         .transcript
         .push(crate::types::TranscriptItem::AssistantText {
+            timestamp: None,
             text: "first line\nsecond line\nthird line".to_string(),
             seq: None,
         });
@@ -4602,7 +4905,7 @@ async fn tui_assistant_text_preserves_line_breaks() {
         .app
         .transcript
         .iter()
-        .flat_map(Tui::render_entry)
+        .flat_map(|entry| Tui::render_entry(entry, true, false))
         .collect();
     let line_texts: Vec<String> = rendered
         .iter()
@@ -4635,6 +4938,7 @@ async fn tool_call_display_format() {
             "command: ls -la\nworking_dir: /tmp\n".to_string(),
         )),
         seq: None,
+        timestamp: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
         tool_name: "write_file".to_string(),
@@ -4642,11 +4946,13 @@ async fn tool_call_display_format() {
             "write **hello.txt** with 3 lines".to_string(),
         )),
         seq: None,
+        timestamp: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
         tool_name: "think".to_string(),
         body: None,
         seq: None,
+        timestamp: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
         tool_name: "search".to_string(),
@@ -4654,6 +4960,7 @@ async fn tool_call_display_format() {
             "query: rust async patterns\nmax_results: 10\ninclude_code: true\n".to_string(),
         )),
         seq: None,
+        timestamp: None,
     });
     harness.render();
     let rendered = normalize_screen(&harness.screen_contents());
@@ -4663,10 +4970,12 @@ async fn tool_call_display_format() {
 #[tokio::test]
 async fn tool_call_with_seq_number() {
     let mut harness = TuiTestHarness::new();
+    harness.tui().app.show_sequence_numbers = true;
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
         tool_name: "read".to_string(),
         body: Some(ToolCallBody::Yaml("path: /tmp/foo.txt\n".to_string())),
         seq: Some(7),
+        timestamp: None,
     });
     harness.render();
     let rendered = normalize_screen(&harness.screen_contents());
@@ -4676,9 +4985,11 @@ async fn tool_call_with_seq_number() {
 #[tokio::test]
 async fn user_text_with_seq_number() {
     let mut harness = TuiTestHarness::new();
+    harness.tui().app.show_sequence_numbers = true;
     harness.tui().app.transcript.push(TranscriptItem::UserText {
         text: "hello world".to_string(),
         seq: Some(3),
+        timestamp: None,
     });
     harness.render();
     let rendered = normalize_screen(&harness.screen_contents());
@@ -4688,6 +4999,7 @@ async fn user_text_with_seq_number() {
 #[tokio::test]
 async fn assistant_text_with_seq_number() {
     let mut harness = TuiTestHarness::new();
+    harness.tui().app.show_sequence_numbers = true;
     harness
         .tui()
         .app
@@ -4695,6 +5007,7 @@ async fn assistant_text_with_seq_number() {
         .push(TranscriptItem::AssistantText {
             text: "hello back".to_string(),
             seq: Some(5),
+            timestamp: None,
         });
     harness.render();
     let rendered = normalize_screen(&harness.screen_contents());
@@ -4714,4 +5027,558 @@ async fn mutation_notice_renders_with_yellow_dim_style() {
     harness.render();
     let rendered = normalize_screen(&harness.screen_contents());
     insta::assert_snapshot!("mutation_notice_renders_with_yellow_dim_style", rendered);
+}
+
+#[tokio::test]
+async fn meta_suffix_combinations() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "hello".to_string(),
+        seq: Some(1),
+        timestamp: Some(
+            chrono::DateTime::parse_from_rfc3339("2026-05-02T12:34:56Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        ),
+    });
+
+    // Both on
+    harness.tui().app.show_sequence_numbers = true;
+    harness.tui().app.show_timestamps = true;
+    harness.render();
+    let r1 = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("meta_suffix_both_on", r1);
+
+    // Sequence only
+    harness.tui().app.show_sequence_numbers = true;
+    harness.tui().app.show_timestamps = false;
+    harness.render();
+    let r2 = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("meta_suffix_seq_only", r2);
+
+    // Timestamp only
+    harness.tui().app.show_sequence_numbers = false;
+    harness.tui().app.show_timestamps = true;
+    harness.render();
+    let r3 = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("meta_suffix_ts_only", r3);
+
+    // Both off
+    harness.tui().app.show_sequence_numbers = false;
+    harness.tui().app.show_timestamps = false;
+    harness.render();
+    let r4 = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("meta_suffix_both_off", r4);
+}
+
+// =============================================================================
+// D5: Modal confirmation tests
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_d5_modal_confirm_delete_single_entry() {
+    let mut harness = TuiTestHarness::with_size(60, 12);
+
+    // Open delete modal for single entry
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3 });
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(
+        rendered.contains("Delete entry 3?"),
+        "Expected modal text 'Delete entry 3?', got: {}",
+        rendered
+    );
+    assert!(
+        rendered.contains("[y/N]"),
+        "Expected prompt '[y/N]', got: {}",
+        rendered
+    );
+
+    insta::assert_snapshot!("modal_confirm_delete_single", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_d5_modal_confirm_delete_range() {
+    let mut harness = TuiTestHarness::with_size(60, 12);
+
+    // Open delete modal for range
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 5 });
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(
+        rendered.contains("Delete entries 3–5?"),
+        "Expected modal text 'Delete entries 3–5?', got: {}",
+        rendered
+    );
+
+    insta::assert_snapshot!("modal_confirm_delete_range", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_d5_modal_confirm_rewind() {
+    let mut harness = TuiTestHarness::with_size(60, 12);
+
+    // Open rewind modal
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmRewind {
+        seq: 7,
+        user_text: None,
+    });
+    harness.render();
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    assert!(
+        rendered.contains("Rewind to entry 7?"),
+        "Expected modal text 'Rewind to entry 7?', got: {}",
+        rendered
+    );
+
+    insta::assert_snapshot!("modal_confirm_rewind", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_d5_modal_y_confirms_n_cancels() {
+    let mut harness = TuiTestHarness::with_size(60, 12);
+
+    // Test 'n' cancels the modal
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 1, to: 1 });
+    let _ = harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+        .await;
+    assert!(
+        harness.tui().app.modal.is_none(),
+        "Expected modal to be cleared after 'n'"
+    );
+
+    // Test 'y' clears the modal (actual delete requires session context)
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 1, to: 1 });
+    // Note: Confirming will try to run .delete command, which will fail without session
+    // The test verifies that modal is taken and processed
+    let _ = harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        .await;
+    // Modal should be cleared
+    assert!(
+        harness.tui().app.modal.is_none(),
+        "Expected modal to be cleared after 'y'"
+    );
+
+    // Test Esc cancels
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmRewind {
+        seq: 1,
+        user_text: None,
+    });
+    let _ = harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await;
+    assert!(
+        harness.tui().app.modal.is_none(),
+        "Expected modal to be cleared after Esc"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_d5_modal_consumes_other_keys() {
+    let mut harness = TuiTestHarness::with_size(60, 12);
+
+    // Open modal
+    harness.tui().app.modal = Some(crate::types::ModalState::ConfirmDelete { from: 1, to: 1 });
+
+    // Press various keys that should be consumed
+    let _ = harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        .await;
+    let _ = harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await;
+    let _ = harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await;
+    let _ = harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .await;
+
+    // Modal should still be open (keys were consumed)
+    assert!(
+        harness.tui().app.modal.is_some(),
+        "Expected modal to remain open after other keys were consumed"
+    );
+}
+
+#[tokio::test]
+async fn test_d4_key_d_opens_delete_modal_single() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Delete me".to_string(),
+        seq: Some(3),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.modal,
+        Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 3 })
+    );
+}
+
+#[tokio::test]
+async fn test_d4_delete_key_opens_delete_modal() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Delete me".to_string(),
+        seq: Some(7),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.modal,
+        Some(crate::types::ModalState::ConfirmDelete { from: 7, to: 7 })
+    );
+}
+
+#[tokio::test]
+async fn test_d4_key_d_opens_delete_modal_range() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "One".to_string(),
+        seq: Some(3),
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Two".to_string(),
+            seq: Some(4),
+            timestamp: None,
+        });
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Three".to_string(),
+        seq: Some(5),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(2);
+    harness.tui().app.transcript_selection_anchor = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.modal,
+        Some(crate::types::ModalState::ConfirmDelete { from: 3, to: 5 })
+    );
+}
+
+#[tokio::test]
+async fn test_d4_key_i_copies_text_to_input() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Hello from transcript".to_string(),
+        seq: Some(1),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.input.lines(), ["Hello from transcript"]);
+    assert_eq!(harness.tui().app.transcript_focus, None);
+    assert_eq!(harness.tui().app.transcript_selection_anchor, None);
+}
+
+#[tokio::test]
+async fn test_d4_key_i_copies_assistant_text() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Assistant reply".to_string(),
+            seq: Some(2),
+            timestamp: None,
+        });
+    harness.tui().app.transcript_focus = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.input.lines(), ["Assistant reply"]);
+}
+
+#[tokio::test]
+async fn test_d4_key_i_copies_tool_call() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        tool_name: "search".to_string(),
+        body: Some(crate::types::ToolCallBody::Yaml("query: rust".to_string())),
+        seq: Some(9),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.input.lines(), ["search(query: rust)"]);
+}
+
+#[tokio::test]
+async fn test_d4_key_r_opens_rewind_modal_user_text() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Original prompt".to_string(),
+        seq: Some(11),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.modal,
+        Some(crate::types::ModalState::ConfirmRewind {
+            seq: 11,
+            user_text: Some("Original prompt".to_string()),
+        })
+    );
+}
+
+#[tokio::test]
+async fn test_d4_key_r_opens_rewind_modal_assistant_text() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Assistant response".to_string(),
+            seq: Some(12),
+            timestamp: None,
+        });
+    harness.tui().app.transcript_focus = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.modal,
+        Some(crate::types::ModalState::ConfirmRewind {
+            seq: 12,
+            user_text: None,
+        })
+    );
+}
+
+#[tokio::test]
+async fn test_d4_enter_opens_action_menu() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Selected".to_string(),
+        seq: Some(4),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(harness.tui().app.action_menu_open);
+}
+
+#[tokio::test]
+async fn test_d4_skips_delete_when_selected_items_have_no_seq() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "First".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Second".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript_focus = Some(1);
+    harness.tui().app.transcript_selection_anchor = Some(0);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(harness.tui().app.modal, None);
+}
+
+#[tokio::test]
+async fn test_highlight_single_item() {
+    let mut harness = TuiTestHarness::with_size(40, 15);
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 0".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Line 1".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 2".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(2);
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("highlight_single_item", rendered);
+
+    // Line 2 should have Modifier::REVERSED
+    let buffer = harness.terminal.backend().buffer();
+    let mut found_reversed = false;
+    let mut lines_with_reversed = vec![];
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            if cell
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+                && cell.symbol() != " "
+                && cell.symbol() != ""
+            {
+                found_reversed = true;
+                lines_with_reversed.push(cell.symbol().to_string());
+            }
+        }
+    }
+    assert!(
+        found_reversed,
+        "Expected to find a reversed cell for Line 2. Found chars: {:?}",
+        lines_with_reversed
+    );
+}
+
+#[tokio::test]
+async fn test_highlight_range() {
+    let mut harness = TuiTestHarness::with_size(40, 15);
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 0".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Line 1".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Line 2".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Line 3".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript_focus = Some(2);
+    harness.tui().app.transcript_selection_anchor = Some(0);
+    harness.render();
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("highlight_range", rendered);
+
+    let buffer = harness.terminal.backend().buffer();
+    let mut num_reversed_starts = 0;
+    for y in 0..buffer.area.height {
+        let mut x = 0;
+        while x < buffer.area.width {
+            let cell = &buffer[(x, y)];
+            if (cell.symbol() == ">" || cell.symbol() == "L")
+                && cell
+                    .style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            {
+                num_reversed_starts += 1;
+            }
+            x += 1;
+        }
+    }
+    assert!(
+        num_reversed_starts >= 3,
+        "Expected at least 3 items to have reversed lines"
+    );
 }

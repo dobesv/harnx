@@ -1,10 +1,7 @@
 ---
 source: crates/harnx-tui/src/tests.rs
-assertion_line: 1366
 expression: rendered
 ---
-.sources rag             Show citation sources used in last query
-.info rag                Show RAG info
 .exit rag                Leave RAG
 .attach                  Attach a file to the next message
 .detach                  Remove attached files
@@ -15,6 +12,8 @@ expression: rendered
 .regenerate              Regenerate last response
 .copy                    Copy last response
 .set                     Modify runtime settings
+.set show_sequence_numbers Toggle [n] prefix in transcript (on/off)
+.set show_timestamps     Toggle timestamp in transcript (on/off)
 .delete                  Delete agents, sessions, RAGs, or macros
 .delete message <n>      Delete a log entry by sequence number
 .delete message <n>-<m>  Delete a range of log entries

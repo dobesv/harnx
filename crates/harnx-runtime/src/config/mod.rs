@@ -160,34 +160,62 @@ fn adjust_range_for_tool_pairs(
 }
 
 fn validate_tool_pair_integrity(start_seq: usize, documents: &[String]) -> Result<()> {
-    if documents.len() < 2 {
-        return Ok(());
-    }
-
     let entries = documents
         .iter()
-        .map(|document| serde_yaml::from_str::<SessionLogEntry>(document))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .map(|document| {
+            serde_yaml::from_str::<SessionLogEntry>(document).with_context(|| {
+                format!(
+                    "Invalid session log entry YAML:
+{document}"
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    for index in 0..entries.len() - 1 {
-        let (SessionLogEntry::ToolCalls { calls, .. }, SessionLogEntry::ToolResults { results }) =
-            (&entries[index], &entries[index + 1])
-        else {
+    for (index, entry) in entries.iter().enumerate() {
+        let SessionLogEntry::ToolCalls { calls, .. } = entry else {
             continue;
         };
 
-        let call_ids = calls
-            .iter()
-            .map(|call| call.id.as_deref())
-            .collect::<Vec<_>>();
-        let result_ids = results
-            .iter()
-            .map(|result| result.id.as_deref())
-            .collect::<Vec<_>>();
-        if call_ids != result_ids {
+        let Some(SessionLogEntry::ToolResults { results, .. }) = entries.get(index + 1) else {
             let call_seq = start_seq + index;
-            let result_seq = start_seq + index + 1;
-            bail!("Edited tool call/result IDs do not match for entries {call_seq}-{result_seq}");
+            bail!(
+                "Edited tool call entry at {call_seq} must be followed immediately by matching tool results"
+            );
+        };
+
+        let call_ids: HashSet<_> = calls.iter().filter_map(|call| call.id.as_deref()).collect();
+        let result_seq = start_seq + index + 1;
+        let missing_result_ids = results
+            .iter()
+            .filter(|result| result.id.as_deref().is_none_or(str::is_empty))
+            .count();
+
+        if missing_result_ids == results.len() {
+            if results.len() != calls.len() {
+                bail!(
+                    "Edited tool result at {result_seq} is missing tool_call_id for positional matching and count {} does not match tool calls count {}",
+                    results.len(),
+                    calls.len()
+                );
+            }
+            continue;
+        }
+
+        if missing_result_ids > 0 {
+            bail!(
+                "Edited tool result at {result_seq} mixes tool_call_id values with missing tool_call_id entries"
+            );
+        }
+
+        for result in results {
+            let call_id = result.id.as_deref().filter(|id| !id.is_empty()).unwrap();
+            if !call_ids.contains(call_id) {
+                let expected_ids = call_ids.iter().copied().collect::<Vec<_>>().join(", ");
+                bail!(
+                    "Edited tool result at {result_seq} references unknown tool_call_id '{call_id}' (expected one of: {expected_ids})"
+                );
+            }
         }
     }
 
@@ -267,6 +295,8 @@ pub struct Config {
     pub model_cooldowns: std::sync::Arc<parking_lot::Mutex<crate::client::retry::ModelCooldownMap>>,
     pub macro_flag: bool,
     pub info_flag: bool,
+    pub show_sequence_numbers: bool,
+    pub show_timestamps: bool,
     pub agent_variables: Option<AgentVariables>,
     pub mcp_root: Vec<String>,
 
@@ -335,6 +365,8 @@ impl Clone for Config {
             model_cooldowns: self.model_cooldowns.clone(),
             macro_flag: self.macro_flag,
             info_flag: self.info_flag,
+            show_sequence_numbers: self.show_sequence_numbers,
+            show_timestamps: self.show_timestamps,
             agent_variables: self.agent_variables.clone(),
             mcp_root: self.mcp_root.clone(),
             model: self.model.clone(),
@@ -365,6 +397,8 @@ impl Default for Config {
             model_cooldowns: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
             macro_flag: false,
             info_flag: false,
+            show_sequence_numbers: false,
+            show_timestamps: false,
             agent_variables: None,
             mcp_root: vec![],
 
@@ -802,6 +836,14 @@ impl Config {
             "dry_run" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
                 config.write().dry_run = value;
+            }
+            "show_sequence_numbers" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                config.write().show_sequence_numbers = value;
+            }
+            "show_timestamps" => {
+                let value = value.parse().with_context(|| "Invalid value")?;
+                config.write().show_timestamps = value;
             }
             "tool_use" => {
                 let value = value.parse().with_context(|| "Invalid value")?;
@@ -1402,8 +1444,12 @@ impl Config {
             bail!("Sequence numbers out of range");
         }
 
+        // Replacement list order becomes new order for edited range. Reordering
+        // plain message entries in editor is supported as long as edited YAML still
+        // passes structural validation (including tool-call/result pairing).
         let selected_documents = documents[from..=to].to_vec();
         let temp_file = temp_file("message-edit", ".yaml");
+
         std::fs::write(&temp_file, selected_documents.join("\n---\n"))
             .with_context(|| format!("Failed to write to '{}'", temp_file.display()))?;
 
@@ -1415,12 +1461,13 @@ impl Config {
         });
         let edited_content = std::fs::read_to_string(&temp_file)
             .with_context(|| format!("Failed to read '{}'", temp_file.display()));
-        let _ = std::fs::remove_file(&temp_file);
         edit_result?;
         let edited_content = edited_content?;
 
         let edited_documents = validate_edited_session_documents(&edited_content)?;
         validate_tool_pair_integrity(from, &edited_documents)?;
+
+        let _ = std::fs::remove_file(&temp_file);
 
         let edit_entry = SessionLogEntry::EditEntries {
             from,
@@ -3503,6 +3550,7 @@ mod tests {
 
     fn tool_calls_yaml(call_ids: &[&str]) -> String {
         serde_yaml::to_string(&SessionLogEntry::ToolCalls {
+            timestamp: None,
             text: String::new(),
             thought: None,
             calls: call_ids
@@ -3519,11 +3567,21 @@ mod tests {
     }
 
     fn tool_results_yaml(result_ids: &[&str]) -> String {
+        tool_results_yaml_with_optional_ids(
+            &result_ids
+                .iter()
+                .map(|id| Some((*id).to_string()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn tool_results_yaml_with_optional_ids(result_ids: &[Option<String>]) -> String {
         serde_yaml::to_string(&SessionLogEntry::ToolResults {
+            timestamp: None,
             results: result_ids
                 .iter()
                 .map(|id| ToolOutput {
-                    id: Some((*id).to_string()),
+                    id: id.clone(),
                     name: "bash_exec".to_string(),
                     output: serde_json::json!({"ok": true}),
                     switch_agent: None,
@@ -3535,7 +3593,17 @@ mod tests {
 
     fn user_yaml(text: &str) -> String {
         serde_yaml::to_string(&SessionLogEntry::Message {
+            timestamp: None,
             role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+        })
+        .unwrap()
+    }
+
+    fn assistant_yaml(text: &str) -> String {
+        serde_yaml::to_string(&SessionLogEntry::Message {
+            timestamp: None,
+            role: MessageRole::Assistant,
             content: MessageContent::Text(text.to_string()),
         })
         .unwrap()
@@ -3577,15 +3645,66 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Edited tool call/result IDs do not match for entries 7-8"
+            "Edited tool result at 8 references unknown tool_call_id 'call-2' (expected one of: call-1)"
         );
     }
 
     #[test]
-    fn validate_tool_pair_integrity_allows_orphan_tool_calls_as_advisory() {
-        let documents = vec![tool_calls_yaml(&["call-1"])];
+    fn validate_tool_pair_integrity_rejects_missing_immediate_tool_results() {
+        let documents = vec![
+            tool_calls_yaml(&["call-1"]),
+            user_yaml("intervening message"),
+        ];
 
-        validate_tool_pair_integrity(3, &documents).unwrap();
+        let err = validate_tool_pair_integrity(3, &documents)
+            .expect_err("tool calls without immediate tool results should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Edited tool call entry at 3 must be followed immediately by matching tool results"
+        );
+    }
+
+    #[test]
+    fn validate_tool_pair_integrity_accepts_positional_tool_results_without_ids() {
+        let documents = vec![
+            tool_calls_yaml(&["call-1", "call-2"]),
+            tool_results_yaml_with_optional_ids(&[None, None]),
+        ];
+
+        validate_tool_pair_integrity(4, &documents).unwrap();
+    }
+
+    #[test]
+    fn validate_tool_pair_integrity_rejects_positional_tool_results_when_counts_differ() {
+        let documents = vec![
+            tool_calls_yaml(&["call-1", "call-2"]),
+            tool_results_yaml_with_optional_ids(&[None]),
+        ];
+
+        let err = validate_tool_pair_integrity(10, &documents)
+            .expect_err("count mismatch should fail positional matching");
+
+        assert_eq!(
+            err.to_string(),
+            "Edited tool result at 11 is missing tool_call_id for positional matching and count 1 does not match tool calls count 2"
+        );
+    }
+
+    #[test]
+    fn validate_tool_pair_integrity_rejects_mixed_present_and_missing_result_ids() {
+        let documents = vec![
+            tool_calls_yaml(&["call-1", "call-2"]),
+            tool_results_yaml_with_optional_ids(&[Some("call-1".to_string()), None]),
+        ];
+
+        let err = validate_tool_pair_integrity(12, &documents)
+            .expect_err("mixed id presence should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "Edited tool result at 13 mixes tool_call_id values with missing tool_call_id entries"
+        );
     }
 
     #[test]
@@ -3593,6 +3712,104 @@ mod tests {
         let documents = vec![user_yaml("plain message")];
 
         validate_tool_pair_integrity(2, &documents).unwrap();
+    }
+
+    #[test]
+    fn validate_tool_pair_integrity_allows_reordered_non_tool_documents() {
+        let documents = vec![assistant_yaml("second"), user_yaml("first")];
+
+        validate_tool_pair_integrity(1, &documents).unwrap();
+    }
+
+    #[test]
+    fn edit_message_range_supports_reordering_plain_messages() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let original_editor = std::env::var_os("EDITOR");
+        std::env::set_var("EDITOR", "true");
+
+        let result = (|| -> Result<()> {
+            let mut config = Config {
+                sessions_dir_override: Some(tmp.path().to_path_buf()),
+                working_mode: WorkingMode::Cmd,
+                ..Config::default()
+            };
+            config
+                .clients
+                .push(harnx_client::ClientConfig::OpenAICompatibleConfig(
+                    harnx_core::provider_config::openai_compatible::OpenAICompatibleConfig {
+                        name: Some("test".to_string()),
+                        api_base: None,
+                        api_key: None,
+                        models: vec![],
+                        patch: None,
+                        extra: None,
+                        system_prompt_prefix: None,
+                    },
+                ));
+            config.model = harnx_client::Model::new("test", "model");
+            config.model_id = "test:model".to_string();
+            config.use_session(Some("reorder"))?;
+
+            let session = config.session.as_mut().context("No session")?;
+            assert!(crate::config::session::append_event(
+                session,
+                &SessionLogEntry::Message {
+                    timestamp: None,
+                    role: MessageRole::User,
+                    content: MessageContent::Text("first".to_string()),
+                },
+            ));
+            assert!(crate::config::session::append_event(
+                session,
+                &SessionLogEntry::Message {
+                    timestamp: None,
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text("second".to_string()),
+                },
+            ));
+
+            let replacement_yaml = assistant_yaml("second") + "\n---\n" + &user_yaml("first");
+            config.set_tui_editor_hooks(
+                None,
+                Some(Box::new(move || {
+                    let temp_path = std::fs::read_dir(std::env::temp_dir())
+                        .unwrap()
+                        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                        .filter(|path| {
+                            path.extension().and_then(|ext| ext.to_str()) == Some("yaml")
+                        })
+                        .filter_map(|path| {
+                            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+                            Some((modified, path))
+                        })
+                        .max_by_key(|(modified, _)| *modified)
+                        .map(|(_, path)| path)
+                        .expect("message edit temp file");
+                    std::fs::write(&temp_path, &replacement_yaml).unwrap();
+                })),
+            );
+
+            config.edit_message_range(1, 2)?;
+
+            let reloaded = config.session.as_ref().context("No session after reload")?;
+            let texts: Vec<_> = reloaded
+                .messages
+                .iter()
+                .map(|msg| msg.content.to_text())
+                .collect();
+            assert_eq!(texts, vec!["second", "first"]);
+
+            Ok(())
+        })();
+
+        match original_editor {
+            Some(value) => std::env::set_var("EDITOR", value),
+            None => std::env::remove_var("EDITOR"),
+        }
+
+        result.unwrap();
     }
 
     // --- adjust_range_for_tool_pairs ---
@@ -3606,6 +3823,7 @@ mod tests {
 
     fn tool_calls_entry(id: &str) -> SessionLogEntry {
         SessionLogEntry::ToolCalls {
+            timestamp: None,
             text: String::new(),
             thought: None,
             calls: vec![ToolCall {
@@ -3619,6 +3837,7 @@ mod tests {
 
     fn tool_results_entry(id: &str) -> SessionLogEntry {
         SessionLogEntry::ToolResults {
+            timestamp: None,
             results: vec![ToolOutput {
                 id: Some(id.to_string()),
                 name: "bash_exec".to_string(),
@@ -3630,6 +3849,7 @@ mod tests {
 
     fn user_entry(text: &str) -> SessionLogEntry {
         SessionLogEntry::Message {
+            timestamp: None,
             role: MessageRole::User,
             content: MessageContent::Text(text.to_string()),
         }

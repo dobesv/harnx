@@ -12,6 +12,7 @@ use crate::model::Model;
 use crate::tool::{SwitchAgentData, ToolCall};
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -54,6 +55,8 @@ pub enum SessionLogEntry {
     Message {
         role: MessageRole,
         content: MessageContent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<DateTime<Utc>>,
     },
     /// Assistant turn that issued tool calls. The text/thought are the
     /// LLM's prose preceding the calls. This entry is written
@@ -69,10 +72,16 @@ pub enum SessionLogEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thought: Option<String>,
         calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<DateTime<Utc>>,
     },
     /// Results for the immediately preceding `ToolCalls` entry.
     #[serde(rename = "tool_results")]
-    ToolResults { results: Vec<ToolOutput> },
+    ToolResults {
+        results: Vec<ToolOutput>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<DateTime<Utc>>,
+    },
     #[serde(rename = "data_urls")]
     DataUrls { urls: HashMap<String, String> },
     #[serde(rename = "compress")]
@@ -541,6 +550,100 @@ impl AutoName {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_log_entry_message_timestamp_serde_round_trip() {
+        let entry = SessionLogEntry::Message {
+            role: MessageRole::User,
+            content: MessageContent::Text("hello".to_string()),
+            timestamp: Some(Utc::now()),
+        };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        // Verify timestamp is serialized
+        assert!(yaml.contains("timestamp:"));
+
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        match round_tripped {
+            SessionLogEntry::Message {
+                role,
+                content,
+                timestamp,
+            } => {
+                assert_eq!(role, MessageRole::User);
+                assert!(timestamp.is_some());
+                match content {
+                    MessageContent::Text(text) => assert_eq!(text, "hello"),
+                    _ => panic!("expected text content"),
+                }
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_log_entry_message_without_timestamp_deserializes() {
+        // Old logs without timestamp field should deserialize successfully
+        let yaml = "type: message\nrole: user\ncontent: hello\n";
+        let entry: SessionLogEntry = serde_yaml::from_str(yaml).unwrap();
+
+        match entry {
+            SessionLogEntry::Message {
+                role,
+                content,
+                timestamp,
+            } => {
+                assert_eq!(role, MessageRole::User);
+                assert!(timestamp.is_none());
+                match content {
+                    MessageContent::Text(text) => assert_eq!(text, "hello"),
+                    _ => panic!("expected text content"),
+                }
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_log_entry_tool_calls_timestamp_serde_round_trip() {
+        let entry = SessionLogEntry::ToolCalls {
+            text: "doing work".to_string(),
+            thought: None,
+            calls: vec![],
+            timestamp: Some(Utc::now()),
+        };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        assert!(yaml.contains("timestamp:"));
+
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+        match round_tripped {
+            SessionLogEntry::ToolCalls { timestamp, .. } => {
+                assert!(timestamp.is_some());
+            }
+            other => panic!("expected tool_calls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_log_entry_tool_results_timestamp_serde_round_trip() {
+        let entry = SessionLogEntry::ToolResults {
+            results: vec![],
+            timestamp: Some(Utc::now()),
+        };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        assert!(yaml.contains("timestamp:"));
+
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+        match round_tripped {
+            SessionLogEntry::ToolResults { timestamp, .. } => {
+                assert!(timestamp.is_some());
+            }
+            other => panic!("expected tool_results, got {other:?}"),
+        }
+    }
 
     #[test]
     fn session_header_serde_round_trip_preserves_model_fallbacks() {

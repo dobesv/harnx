@@ -22,7 +22,7 @@ pub enum CommandOutcome {
     Exit,
 }
 
-pub static COMMANDS: LazyLock<[Command; 45]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 47]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -50,7 +50,10 @@ pub static COMMANDS: LazyLock<[Command; 45]> = LazyLock::new(|| {
         ),
         Command::new(".info session", "Show session info"),
         Command::new(".edit session", "Modify current session"),
-        Command::new(".edit message <n>", "Edit a log entry by sequence number"),
+        Command::new(
+            ".edit message <n>",
+            "Edit a single log entry by sequence number",
+        ),
         Command::new(
             ".edit message <n>-<m>",
             "Edit a range of log entries by sequence number",
@@ -79,6 +82,14 @@ pub static COMMANDS: LazyLock<[Command; 45]> = LazyLock::new(|| {
         Command::new(".regenerate", "Regenerate last response"),
         Command::new(".copy", "Copy last response"),
         Command::new(".set", "Modify runtime settings"),
+        Command::new(
+            ".set show_sequence_numbers",
+            "Toggle [n] prefix in transcript (on/off)",
+        ),
+        Command::new(
+            ".set show_timestamps",
+            "Toggle timestamp in transcript (on/off)",
+        ),
         Command::new(".delete", "Delete agents, sessions, RAGs, or macros"),
         Command::new(
             ".delete message <n>",

@@ -99,6 +99,12 @@ impl Tui {
                 attachment_dir: None,
                 paste_count: 0,
                 last_known_input_width: 1,
+                show_sequence_numbers: config.read().show_sequence_numbers,
+                show_timestamps: config.read().show_timestamps,
+                transcript_focus: None,
+                transcript_selection_anchor: None,
+                modal: None,
+                action_menu_open: false,
             },
             event_tx,
             event_rx,
@@ -127,6 +133,7 @@ impl Tui {
                         entries.push(TranscriptItem::AssistantText {
                             text: banner,
                             seq: None,
+                            timestamp: None, // Banner has no timestamp
                         });
                     }
                 }
@@ -216,6 +223,11 @@ impl Tui {
 
             if last_tick.elapsed() >= TICK_RATE {
                 self.app.spinner_index = (self.app.spinner_index + 1) % SPINNER_FRAMES.len();
+                {
+                    let cfg = self.config.read();
+                    self.app.show_sequence_numbers = cfg.show_sequence_numbers;
+                    self.app.show_timestamps = cfg.show_timestamps;
+                }
                 self.refresh_input_chrome();
                 last_tick = Instant::now();
 
@@ -301,6 +313,7 @@ pub(crate) fn messages_to_transcript_items(
                     items.push(TranscriptItem::UserText {
                         text,
                         seq: msg.log_seq,
+                        timestamp: msg.log_timestamp,
                     });
                 }
             }
@@ -310,6 +323,7 @@ pub(crate) fn messages_to_transcript_items(
                     items.push(TranscriptItem::AssistantText {
                         text,
                         seq: msg.log_seq,
+                        timestamp: msg.log_timestamp,
                     });
                 }
             }
@@ -324,6 +338,7 @@ pub(crate) fn messages_to_transcript_items(
                         items.push(TranscriptItem::AssistantText {
                             text: tc.text.clone(),
                             seq: msg.log_seq,
+                            timestamp: msg.log_timestamp,
                         });
                     }
                     for r in &tc.tool_results {
@@ -350,6 +365,7 @@ pub(crate) fn messages_to_transcript_items(
                             tool_name: r.call.name.clone(),
                             body,
                             seq: msg.log_seq,
+                            timestamp: msg.log_timestamp,
                         });
                         let raw_result_fallback = harnx_core::tool::extract_user_display_text(
                             &r.output,
@@ -437,6 +453,7 @@ mod tests {
             role: MessageRole::Tool,
             content: MessageContent::ToolCalls(tc),
             log_seq: None,
+            log_timestamp: None,
         }];
 
         let items = messages_to_transcript_items(&messages, &decl_map);
@@ -490,6 +507,7 @@ mod tests {
             role: MessageRole::Tool,
             content: MessageContent::ToolCalls(tc),
             log_seq: None,
+            log_timestamp: None,
         }];
 
         let items = messages_to_transcript_items(&messages, &decl_map);

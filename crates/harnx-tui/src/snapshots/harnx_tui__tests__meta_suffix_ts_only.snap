@@ -1,0 +1,27 @@
+---
+source: crates/harnx-tui/src/tests.rs
+assertion_line: 4774
+expression: r3
+---
+Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
+> hello  05:34:56
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• Input

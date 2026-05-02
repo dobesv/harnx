@@ -73,6 +73,7 @@ pub fn patch_messages(messages: &mut Vec<Message>, model: &Model) {
                     role: MessageRole::System,
                     content: prefix_content,
                     log_seq: None,
+                    log_timestamp: None,
                 },
             );
         }

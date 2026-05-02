@@ -1,0 +1,26 @@
+---
+source: crates/harnx-tui/src/tests.rs
+expression: rendered
+---
+Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
+> hello  [1]
+
+
+
+
+
+
+
+
+                    ┌Actions───────────────────────────────┐
+                    │[e] Edit     [d] Delete   [i] Insert  │
+                    │[c] Copy     [r] Rewind   [Esc] Cancel│
+                    └──────────────────────────────────────┘
+
+
+
+
+
+
+
+• Input

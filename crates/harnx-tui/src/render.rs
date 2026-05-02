@@ -1,6 +1,7 @@
 use crate::types::Tui;
 use crate::types::{
-    App, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT, SPINNER_FRAMES,
+    App, ModalState, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT,
+    SPINNER_FRAMES,
 };
 use harnx_runtime::config::GlobalConfig;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -78,18 +79,21 @@ impl Tui {
         tool_name: &str,
         body: Option<&ToolCallBody>,
         seq: Option<usize>,
+        timestamp: Option<chrono::DateTime<chrono::Utc>>,
+        show_seq: bool,
+        show_ts: bool,
     ) -> Vec<Line<'static>> {
         let dim_gray = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
 
-        let header_text = if let Some(n) = seq {
-            format!("→ {tool_name}  [{n}]")
-        } else {
-            format!("→ {tool_name}")
-        };
-
+        let header_text = format!("→ {tool_name}");
         let mut lines = Self::render_text_entry("", &header_text, dim_gray, false);
+        if let Some(suffix) = Self::render_meta_suffix(seq, timestamp, show_seq, show_ts) {
+            if let Some(first_line) = lines.first_mut() {
+                first_line.spans.push(suffix);
+            }
+        }
         match body {
             Some(ToolCallBody::Yaml(yaml)) => {
                 for line in yaml.lines() {
@@ -106,7 +110,40 @@ impl Tui {
         lines
     }
 
-    pub(super) fn render_entry(entry: &TranscriptItem) -> Vec<Line<'static>> {
+    fn render_meta_suffix(
+        seq: Option<usize>,
+        timestamp: Option<chrono::DateTime<chrono::Utc>>,
+        show_seq: bool,
+        show_ts: bool,
+    ) -> Option<Span<'static>> {
+        let mut parts = vec![];
+        if show_seq {
+            if let Some(n) = seq {
+                parts.push(format!("[{n}]"));
+            }
+        }
+        if show_ts {
+            if let Some(ts) = timestamp {
+                let local = ts.with_timezone(&chrono::Local);
+                parts.push(local.format("%H:%M:%S").to_string());
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(Span::styled(
+            format!("  {}", parts.join(" ")),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ))
+    }
+
+    pub(super) fn render_entry(
+        entry: &TranscriptItem,
+        show_seq: bool,
+        show_ts: bool,
+    ) -> Vec<Line<'static>> {
         match entry {
             TranscriptItem::SourceHeading(source) => Self::render_text_entry(
                 "",
@@ -132,7 +169,11 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
                 false,
             ),
-            TranscriptItem::UserText { text, seq } => {
+            TranscriptItem::UserText {
+                text,
+                seq,
+                timestamp,
+            } => {
                 let mut lines = Self::render_text_entry(
                     "> ",
                     text,
@@ -141,19 +182,19 @@ impl Tui {
                         .add_modifier(Modifier::BOLD),
                     true,
                 );
-                if let Some(n) = seq {
+                if let Some(suffix) = Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts)
+                {
                     if let Some(first_line) = lines.first_mut() {
-                        first_line.spans.push(Span::styled(
-                            format!("  [{n}]"),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM),
-                        ));
+                        first_line.spans.push(suffix);
                     }
                 }
                 lines
             }
-            TranscriptItem::AssistantText { text, seq } => {
+            TranscriptItem::AssistantText {
+                text,
+                seq,
+                timestamp,
+            } => {
                 // Render assistant messages as markdown so headings, lists,
                 // code fences, and inline emphasis show their styling.
                 // Streaming chunks rebuild this entry on every render — an
@@ -161,17 +202,13 @@ impl Tui {
                 // asterisks for the moment, then upgrades to bold once the
                 // closing `**` arrives in a later chunk.
                 let mut lines = crate::render_helpers::markdown_lines(text, Style::default());
-                if let Some(n) = seq {
+                if let Some(suffix) = Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts)
+                {
                     if lines.is_empty() {
                         lines.push(Line::from(""));
                     }
                     if let Some(first_line) = lines.first_mut() {
-                        first_line.spans.push(Span::styled(
-                            format!("  [{n}]"),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM),
-                        ));
+                        first_line.spans.push(suffix);
                     }
                 }
                 // Match the prior trailing-spacing rule: pad after a
@@ -239,7 +276,15 @@ impl Tui {
                 tool_name,
                 body,
                 seq,
-            } => Self::render_tool_call(tool_name, body.as_ref(), *seq),
+                timestamp,
+            } => Self::render_tool_call(
+                tool_name,
+                body.as_ref(),
+                *seq,
+                *timestamp,
+                show_seq,
+                show_ts,
+            ),
             TranscriptItem::AttachmentHeader(text) => Self::render_text_entry(
                 "",
                 &format!("{text}:"),
@@ -286,10 +331,39 @@ impl Tui {
             ])
             .split(size);
 
+        let show_seq = self.app.show_sequence_numbers;
+        let show_ts = self.app.show_timestamps;
+        let selected_range = if let Some(f) = self.app.transcript_focus {
+            let start = self.app.transcript_selection_anchor.unwrap_or(f).min(f);
+            let end = self.app.transcript_selection_anchor.unwrap_or(f).max(f);
+            Some(start..=end)
+        } else {
+            None
+        };
+
         let transcript_entries: Vec<Vec<Line<'static>>> = if self.app.transcript.is_empty() {
             vec![vec![Line::from(Span::raw(""))]]
         } else {
-            self.app.transcript.iter().map(Self::render_entry).collect()
+            self.app
+                .transcript
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let mut lines = Self::render_entry(entry, show_seq, show_ts);
+                    if let Some(range) = &selected_range {
+                        if range.contains(&i) {
+                            if let Some(first_line) = lines.first_mut() {
+                                first_line.style =
+                                    first_line.style.add_modifier(Modifier::REVERSED);
+                                for span in &mut first_line.spans {
+                                    span.style = span.style.add_modifier(Modifier::REVERSED);
+                                }
+                            }
+                        }
+                    }
+                    lines
+                })
+                .collect()
         };
 
         self.app
@@ -441,6 +515,16 @@ impl Tui {
             frame.render_widget(ratatui::widgets::Clear, popup_area);
             frame.render_widget(popup, popup_area);
         }
+
+        // Render action menu if open
+        if self.app.action_menu_open && self.app.transcript_focus.is_some() {
+            self.render_action_menu(frame, size);
+        }
+
+        // Render confirmation modal on top of everything else
+        if let Some(modal) = &self.app.modal {
+            self.render_modal(frame, size, modal);
+        }
     }
 
     pub(super) fn input_height(&self, available_width: u16) -> u16 {
@@ -509,6 +593,7 @@ impl Tui {
                 self.app.transcript.push(TranscriptItem::AssistantText {
                     text: String::new(),
                     seq: None,
+                    timestamp: Some(chrono::Utc::now()),
                 });
                 self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
             }
@@ -618,5 +703,95 @@ impl Tui {
         };
         app.input.set_style(input_style);
         app.input.set_cursor_style(cursor_style);
+    }
+
+    /// Render a centered action menu overlay.
+    fn render_action_menu(&self, frame: &mut Frame<'_>, screen_size: ratatui::layout::Rect) {
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("[e] ", Style::default().fg(Color::Yellow)),
+                Span::raw("Edit     "),
+                Span::styled("[d] ", Style::default().fg(Color::Yellow)),
+                Span::raw("Delete   "),
+                Span::styled("[i] ", Style::default().fg(Color::Yellow)),
+                Span::raw("Insert"),
+            ]),
+            Line::from(vec![
+                Span::styled("[c] ", Style::default().fg(Color::Yellow)),
+                Span::raw("Copy     "),
+                Span::styled("[r] ", Style::default().fg(Color::Yellow)),
+                Span::raw("Rewind   "),
+                Span::styled("[Esc] ", Style::default().fg(Color::Yellow)),
+                Span::raw("Cancel"),
+            ]),
+        ];
+
+        let modal_width = 40;
+        let modal_height = 4; // 2 lines of text + borders
+
+        // Center the modal
+        let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
+        let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
+        let modal_area = ratatui::layout::Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+        // Clear the area behind the modal
+        frame.render_widget(ratatui::widgets::Clear, modal_area);
+
+        // Render the modal box
+        let modal = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Actions")
+                .border_style(Style::default().fg(Color::Reset)),
+        );
+
+        frame.render_widget(modal, modal_area);
+    }
+
+    /// Render a centered confirmation modal overlay.
+    fn render_modal(
+        &self,
+        frame: &mut Frame<'_>,
+        screen_size: ratatui::layout::Rect,
+        modal: &ModalState,
+    ) {
+        let prompt_text = match modal {
+            ModalState::ConfirmDelete { from, to } => {
+                if from == to {
+                    format!("Delete entry {}? [y/N]", from)
+                } else {
+                    format!("Delete entries {}–{}? [y/N]", from, to)
+                }
+            }
+            ModalState::ConfirmRewind { seq, .. } => {
+                format!("Rewind to entry {}? [y/N]", seq)
+            }
+        };
+
+        // Calculate modal size based on content
+        let prompt_len = prompt_text.len() as u16;
+        let modal_width = (prompt_len + 6).min(screen_size.width.saturating_sub(4));
+        let modal_height = 3u16; // Single line of text + borders
+
+        // Center the modal
+        let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
+        let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
+        let modal_area = ratatui::layout::Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+        // Clear the area behind the modal
+        frame.render_widget(ratatui::widgets::Clear, modal_area);
+
+        // Render the modal box
+        let modal = Paragraph::new(Line::from(Span::styled(
+            prompt_text,
+            Style::default().fg(Color::Reset),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Reset)),
+        );
+
+        frame.render_widget(modal, modal_area);
     }
 }

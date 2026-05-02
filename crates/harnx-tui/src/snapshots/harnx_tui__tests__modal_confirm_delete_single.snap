@@ -1,0 +1,14 @@
+---
+source: crates/harnx-tui/src/tests.rs
+expression: rendered
+---
+Welcome to harnx 0.30.0  •  Type .help for commands, Tab to
+complete.
+
+
+                ┌─────────────────────────┐
+                │Delete entry 3? [y/N]    │
+                └─────────────────────────┘
+
+
+• Input

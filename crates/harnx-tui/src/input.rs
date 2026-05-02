@@ -126,6 +126,11 @@ fn tool_completed_to_transcript_items(
 
 impl Tui {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        // If a modal is open, intercept all keys and route to modal handler
+        if self.app.modal.is_some() {
+            return self.handle_modal_key(key).await;
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 self.abort_signal.set_ctrld();
@@ -163,8 +168,14 @@ impl Tui {
             (KeyCode::Up, KeyModifiers::NONE) => {
                 self.handle_up_key(key);
             }
+            (KeyCode::Up, KeyModifiers::SHIFT) => {
+                self.handle_up_key_shift();
+            }
             (KeyCode::Down, KeyModifiers::NONE) => {
                 self.handle_down_key(key);
+            }
+            (KeyCode::Down, KeyModifiers::SHIFT) => {
+                self.handle_down_key_shift();
             }
             (KeyCode::PageUp, KeyModifiers::NONE) => {
                 for _ in 0..10 {
@@ -183,9 +194,33 @@ impl Tui {
                 self.handle_tab(true).await;
             }
             (KeyCode::Esc, KeyModifiers::NONE) => {
-                if !self.app.completions.is_empty() {
+                if self.app.transcript_focus.is_some() {
+                    self.app.transcript_focus = None;
+                    self.app.transcript_selection_anchor = None;
+                } else if !self.app.completions.is_empty() {
                     self.app.completions.clear();
                 }
+            }
+            // D4: Keyboard actions on selected transcript item(s)
+            (KeyCode::Char('e'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+                self.handle_transcript_edit().await?;
+            }
+            (KeyCode::Delete, KeyModifiers::NONE) | (KeyCode::Char('d'), KeyModifiers::NONE)
+                if self.app.transcript_focus.is_some() =>
+            {
+                self.handle_transcript_delete();
+            }
+            (KeyCode::Char('i'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+                self.handle_transcript_insert();
+            }
+            (KeyCode::Char('c'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+                self.handle_transcript_copy();
+            }
+            (KeyCode::Char('r'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+                self.handle_transcript_rewind();
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+                self.app.action_menu_open = true;
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 if self.try_handle_attach_command().await {
@@ -221,6 +256,7 @@ impl Tui {
                         self.app.transcript.push(TranscriptItem::UserText {
                             text: text.clone(),
                             seq: None,
+                            timestamp: Some(chrono::Utc::now()),
                         });
                         self.render_submitted_attachments(&attachments_snapshot);
                         self.pin_transcript_to_bottom();
@@ -232,6 +268,7 @@ impl Tui {
                         self.app.transcript.push(TranscriptItem::UserText {
                             text: text.clone(),
                             seq: None,
+                            timestamp: Some(chrono::Utc::now()),
                         });
                         self.render_submitted_attachments(&attachments_snapshot);
                         self.pin_transcript_to_bottom();
@@ -492,6 +529,7 @@ impl Tui {
                 self.app.transcript.push(TranscriptItem::UserText {
                     text: pending.text.clone(),
                     seq: None,
+                    timestamp: Some(chrono::Utc::now()),
                 });
                 self.render_submitted_attachments(&pending.attachments);
                 self.pin_transcript_to_bottom();
@@ -525,6 +563,7 @@ impl Tui {
         self.app.transcript.push(TranscriptItem::UserText {
             text: pending.text.clone(),
             seq: None,
+            timestamp: Some(chrono::Utc::now()),
         });
         self.render_submitted_attachments(&pending.attachments);
         self.pin_transcript_to_bottom();
@@ -616,23 +655,27 @@ impl Tui {
         }
         self.render_ui_output_heading(source.as_ref(), is_usage);
 
-        // LogSeqAssigned patches the seq on the next unassigned sequenceable
-        // item (UserText, AssistantText, or ToolCall) AFTER the last item
-        // that already has a seq.  Searching after the last-assigned position
-        // forward lets multiple LogSeqAssigned events in a turn target
-        // distinct items in source order, while skipping pre-existing
-        // unassigned items like the agent banner that pre-date any real
-        // log entries.
-        // LogSeqAssigned events are emitted by the engine after each log
-        // append so that future TUI work can show seq numbers on live
-        // messages.  For now the TUI only displays seq numbers on messages
-        // loaded from a saved session log (via messages_to_transcript_items).
-        // Live-event seq propagation across the streaming model is more
-        // intricate than a simple retroactive patch and is deferred.
-        if matches!(
-            event,
-            AgentEvent::Session(SessionEvent::LogSeqAssigned { .. })
-        ) {
+        if let AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }) = event {
+            for item in self.app.transcript.iter_mut().rev() {
+                match item {
+                    TranscriptItem::UserText {
+                        seq: item_seq @ None,
+                        ..
+                    }
+                    | TranscriptItem::AssistantText {
+                        seq: item_seq @ None,
+                        ..
+                    }
+                    | TranscriptItem::ToolCall {
+                        seq: item_seq @ None,
+                        ..
+                    } => {
+                        *item_seq = Some(seq);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
             return;
         }
 
@@ -708,6 +751,7 @@ impl Tui {
                                 self.app.transcript.push(TranscriptItem::AssistantText {
                                     text: output,
                                     seq: None,
+                                    timestamp: Some(chrono::Utc::now()),
                                 });
                                 self.app.streaming_assistant_idx =
                                     Some(self.app.transcript.len() - 1);
@@ -717,6 +761,7 @@ impl Tui {
                         self.app.transcript.push(TranscriptItem::AssistantText {
                             text: output,
                             seq: None,
+                            timestamp: Some(chrono::Utc::now()),
                         });
                         self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
                     }
@@ -826,6 +871,7 @@ impl Tui {
                     tool_name: name,
                     body: tool_call_body(markdown.as_deref(), &input),
                     seq: None,
+                    timestamp: Some(chrono::Utc::now()),
                 }]
             }
             // Not rendered by the TUI: Turn, Session, Status, Tool::Progress,
@@ -1002,6 +1048,26 @@ impl Tui {
     fn handle_up_key(&mut self, key: KeyEvent) {
         if !self.app.completions.is_empty() {
             self.app.scroll_state.scroll_up();
+        } else if let Some(focus) = self.app.transcript_focus {
+            if focus > 0 {
+                self.app.transcript_focus = Some(focus - 1);
+                self.app.transcript_selection_anchor = None;
+            } else {
+                self.app.transcript_focus = None;
+                self.app.transcript_selection_anchor = None;
+
+                let before = self.app.history_index;
+                self.history_prev();
+                let moved = self.app.history_index.is_some()
+                    && (self.app.history_index != before || self.app.history_preview);
+                if moved {
+                    self.app.history_preview = true;
+                    self.refresh_input_chrome();
+                }
+            }
+        } else if self.input_is_blank() && !self.app.transcript.is_empty() {
+            self.app.transcript_focus = Some(self.app.transcript.len() - 1);
+            self.app.transcript_selection_anchor = None;
         } else if self.app.history_preview || self.input_is_blank() {
             let before = self.app.history_index;
             self.history_prev();
@@ -1019,6 +1085,15 @@ impl Tui {
     fn handle_down_key(&mut self, key: KeyEvent) {
         if !self.app.completions.is_empty() {
             self.app.scroll_state.scroll_down();
+        } else if let Some(focus) = self.app.transcript_focus {
+            let next = focus + 1;
+            if next < self.app.transcript.len() {
+                self.app.transcript_focus = Some(next);
+                self.app.transcript_selection_anchor = None;
+            } else {
+                self.app.transcript_focus = None;
+                self.app.transcript_selection_anchor = None;
+            }
         } else if self.app.history_preview {
             self.history_next();
             if self.app.history_index.is_none() {
@@ -1027,6 +1102,29 @@ impl Tui {
             self.refresh_input_chrome();
         } else {
             self.app.input.input(TextInput::from(key));
+        }
+    }
+
+    fn handle_up_key_shift(&mut self) {
+        if let Some(focus) = self.app.transcript_focus {
+            if self.app.transcript_selection_anchor.is_none() {
+                self.app.transcript_selection_anchor = Some(focus);
+            }
+            if focus > 0 {
+                self.app.transcript_focus = Some(focus - 1);
+            }
+        }
+    }
+
+    fn handle_down_key_shift(&mut self) {
+        if let Some(focus) = self.app.transcript_focus {
+            if self.app.transcript_selection_anchor.is_none() {
+                self.app.transcript_selection_anchor = Some(focus);
+            }
+            let next = focus + 1;
+            if next < self.app.transcript.len() {
+                self.app.transcript_focus = Some(next);
+            }
         }
     }
 
@@ -1410,5 +1508,190 @@ fn format_usage(usage: &harnx_core::api_types::CompletionTokenUsage) -> String {
         String::new()
     } else {
         format!("{usage}")
+    }
+}
+
+impl Tui {
+    /// Handle keystrokes while a confirmation modal is open.
+    ///
+    /// - `y` or `Enter` → confirm action, clear modal, execute the action.
+    /// - `n` or `Esc` → cancel, clear modal.
+    /// - All other keys are consumed (no action).
+    pub(super) async fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            // Confirm with 'y' or Enter
+            (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
+                self.confirm_modal_action().await?;
+            }
+            // Cancel with 'n' or Esc
+            (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.app.modal = None;
+            }
+            // All other keys are consumed by the modal (no action)
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Execute the action associated with the current modal and clear it.
+    async fn confirm_modal_action(&mut self) -> Result<()> {
+        let modal = self.app.modal.take();
+        if let Some(modal) = modal {
+            match modal {
+                crate::types::ModalState::ConfirmDelete { from, to } => {
+                    // Execute delete via dot-command
+                    let cmd = if from == to {
+                        format!(".delete message {}", from)
+                    } else {
+                        format!(".delete message {}-{}", from, to)
+                    };
+                    self.run_command(&cmd).await?;
+                }
+                crate::types::ModalState::ConfirmRewind { seq, user_text } => {
+                    // Execute rewind via dot-command
+                    let cmd = format!(".rewind {}", seq);
+                    self.run_command(&cmd).await?;
+                    // If user_text was saved, restore it to the input
+                    if let Some(text) = user_text {
+                        self.app.input = Self::new_input();
+                        for c in text.chars() {
+                            self.app.input.input(ratatui_textarea::Input {
+                                key: if c == '\n' {
+                                    ratatui_textarea::Key::Enter
+                                } else {
+                                    ratatui_textarea::Key::Char(c)
+                                },
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // =========================================================================
+    // D4: Keyboard actions on selected transcript item(s)
+    // =========================================================================
+
+    /// Compute selected transcript index range [min, max] from focus+anchor.
+    fn get_selected_index_range(&self) -> (usize, usize) {
+        let focus = self
+            .app
+            .transcript_focus
+            .expect("transcript_focus required");
+        let anchor = self.app.transcript_selection_anchor.unwrap_or(focus);
+        (focus.min(anchor), focus.max(anchor))
+    }
+
+    /// Get seq range (from_seq, to_seq) for selected items.
+    /// Returns None when selected items do not have sequence numbers.
+    fn selected_seq_range(&self) -> Option<(usize, usize)> {
+        let (start_idx, end_idx) = self.get_selected_index_range();
+        let from = self
+            .app
+            .transcript
+            .get(start_idx)
+            .and_then(|item| item.seq());
+        let to = self.app.transcript.get(end_idx).and_then(|item| item.seq());
+        match (from, to) {
+            (Some(from), Some(to)) => Some((from.min(to), from.max(to))),
+            _ => None,
+        }
+    }
+
+    /// Get text content from transcript item for copy/insert operations.
+    fn get_transcript_item_text(item: &TranscriptItem) -> Option<String> {
+        match item {
+            TranscriptItem::UserText { text, .. } => Some(text.clone()),
+            TranscriptItem::AssistantText { text, .. } => Some(text.clone()),
+            TranscriptItem::ToolCall {
+                tool_name,
+                body: Some(crate::types::ToolCallBody::Yaml(body)),
+                ..
+            }
+            | TranscriptItem::ToolCall {
+                tool_name,
+                body: Some(crate::types::ToolCallBody::Markdown(body)),
+                ..
+            } => Some(format!("{}({})", tool_name, body)),
+            TranscriptItem::ToolCall { tool_name, .. } => Some(format!("{}()", tool_name)),
+            _ => None,
+        }
+    }
+
+    /// Handle 'e' key: open edit command for selected item(s).
+    async fn handle_transcript_edit(&mut self) -> Result<()> {
+        let Some((from, to)) = self.selected_seq_range() else {
+            return Ok(());
+        };
+        let cmd = if from == to {
+            format!(".edit message {}", from)
+        } else {
+            format!(".edit message {}-{}", from, to)
+        };
+        self.run_command(&cmd).await?;
+        self.app.transcript_focus = None;
+        self.app.transcript_selection_anchor = None;
+        Ok(())
+    }
+
+    /// Handle 'd' or Delete key: open delete confirmation modal.
+    fn handle_transcript_delete(&mut self) {
+        let Some((from, to)) = self.selected_seq_range() else {
+            return;
+        };
+        self.app.modal = Some(crate::types::ModalState::ConfirmDelete { from, to });
+    }
+
+    /// Handle 'i' key: copy item text into input field, clear focus.
+    fn handle_transcript_insert(&mut self) {
+        let focus = match self.app.transcript_focus {
+            Some(f) => f,
+            None => return,
+        };
+        let item = match self.app.transcript.get(focus) {
+            Some(item) => item.clone(),
+            None => return,
+        };
+        if let Some(text) = Self::get_transcript_item_text(&item) {
+            self.set_input_text(&text);
+        }
+        self.app.transcript_focus = None;
+        self.app.transcript_selection_anchor = None;
+    }
+
+    /// Handle 'c' key: copy item text to clipboard.
+    fn handle_transcript_copy(&mut self) {
+        if let Some(text) = self
+            .app
+            .transcript_focus
+            .and_then(|focus| self.app.transcript.get(focus))
+            .and_then(Self::get_transcript_item_text)
+        {
+            let _ = harnx_runtime::utils::set_text(&text);
+        }
+    }
+
+    /// Handle 'r' key: open rewind confirmation modal.
+    fn handle_transcript_rewind(&mut self) {
+        let focus = self.app.transcript_selection_anchor.unwrap_or_else(|| {
+            self.app
+                .transcript_focus
+                .expect("transcript_focus required")
+        });
+        let item = match self.app.transcript.get(focus) {
+            Some(item) => item,
+            None => return,
+        };
+        let Some(seq) = item.seq() else {
+            return;
+        };
+        let user_text = match item {
+            TranscriptItem::UserText { text, .. } => Some(text.clone()),
+            _ => None,
+        };
+        self.app.modal = Some(crate::types::ModalState::ConfirmRewind { seq, user_text });
     }
 }

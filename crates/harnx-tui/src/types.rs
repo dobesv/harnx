@@ -3,6 +3,7 @@ use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::utils::AbortSignal;
 
+use chrono::{DateTime, Utc};
 use ratatui_textarea::TextArea;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -83,6 +84,20 @@ pub(super) struct App {
     pub(super) attachment_dir: Option<PathBuf>,
     pub(super) paste_count: usize,
     pub(super) last_known_input_width: u16,
+    pub(super) show_sequence_numbers: bool,
+    pub(super) show_timestamps: bool,
+    /// Index of the cursor item in the transcript (None = input focused).
+    /// Used by D2 for Up/Down navigation within transcript.
+    #[allow(dead_code)]
+    pub(super) transcript_focus: Option<usize>,
+    /// Anchor index for shift-select range.
+    /// Used by D2 for extending selection with Shift+Up/Down.
+    #[allow(dead_code)]
+    pub(super) transcript_selection_anchor: Option<usize>,
+    /// Modal dialog state for destructive action confirmations.
+    pub(super) modal: Option<ModalState>,
+    /// true when the Enter-triggered action menu is visible.
+    pub(super) action_menu_open: bool,
 }
 
 /// Create a unique temporary attachment directory in the system temp area.
@@ -119,6 +134,20 @@ pub(crate) enum ToolCallBody {
     Markdown(String),
 }
 
+/// Modal dialog state for destructive action confirmations.
+/// Used by D5 for delete/rewind confirmations.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(super) enum ModalState {
+    /// Confirmation for deleting one or more transcript entries.
+    ConfirmDelete { from: usize, to: usize },
+    /// Confirmation for rewinding session to a specific entry.
+    ConfirmRewind {
+        seq: usize,
+        user_text: Option<String>,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TranscriptItem {
     SourceHeading(AgentSource),
@@ -126,10 +155,12 @@ pub(crate) enum TranscriptItem {
     UserText {
         text: String,
         seq: Option<usize>,
+        timestamp: Option<DateTime<Utc>>,
     },
     AssistantText {
         text: String,
         seq: Option<usize>,
+        timestamp: Option<DateTime<Utc>>,
     },
     ErrorText(String),
     ThoughtText(String),
@@ -145,11 +176,24 @@ pub(crate) enum TranscriptItem {
         tool_name: String,
         body: Option<ToolCallBody>,
         seq: Option<usize>,
+        timestamp: Option<DateTime<Utc>>,
     },
     AttachmentHeader(String),
     AttachmentItem(String),
     AttachmentPreviewLine(String),
     MutationNotice(String),
+}
+
+impl TranscriptItem {
+    /// Get the seq number of this transcript item, if available.
+    pub(crate) fn seq(&self) -> Option<usize> {
+        match self {
+            TranscriptItem::UserText { seq, .. } => *seq,
+            TranscriptItem::AssistantText { seq, .. } => *seq,
+            TranscriptItem::ToolCall { seq, .. } => *seq,
+            _ => None,
+        }
+    }
 }
 
 pub(crate) enum TuiEvent {

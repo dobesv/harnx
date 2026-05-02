@@ -6,9 +6,14 @@ pub use harnx_core::session::{AutoName, Session, SessionLogEntry};
 use crate::client::{
     render_message_input, CompletionTokenUsage, Message, MessageContent, MessageRole,
 };
+use harnx_core::{
+    event::{AgentEvent, SessionEvent},
+    sink::emit_agent_event,
+};
 use harnx_render::MarkdownRender;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use fancy_regex::Regex;
 use serde::Deserialize;
 use std::fs::{read_to_string, write, OpenOptions};
@@ -66,6 +71,7 @@ struct PendingToolCalls {
     text: String,
     thought: Option<String>,
     calls: Vec<crate::tool::ToolCall>,
+    timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn collect_raw_log_entries(content: &str, name: &str) -> Result<Vec<(usize, SessionLogEntry)>> {
@@ -134,7 +140,7 @@ fn build_effective_log_entries(
                 };
                 let Some(end_idx) = effective_entries
                     .iter()
-                    .position(|(existing_seq, _)| existing_seq == to)
+                    .rposition(|(existing_seq, _)| existing_seq == to)
                 else {
                     log::warn!(
                         "Skipping edit_entries entry #{seq} in session {name}: to seq {to} not present in replay state"
@@ -144,15 +150,6 @@ fn build_effective_log_entries(
                 if start_idx > end_idx {
                     log::warn!(
                         "Skipping edit_entries entry #{seq} in session {name}: range [{from}, {to}] not in replay order"
-                    );
-                    continue;
-                }
-                if effective_entries[start_idx..=end_idx]
-                    .iter()
-                    .any(|(existing_seq, _)| *existing_seq < *from || *existing_seq > *to)
-                {
-                    log::warn!(
-                        "Skipping edit_entries entry #{seq} in session {name}: range [{from}, {to}] is not contiguous in replay state"
                     );
                     continue;
                 }
@@ -226,7 +223,11 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                 session.model_fallbacks = model_fallbacks;
                 session.compaction_agent = compaction_agent;
             }
-            SessionLogEntry::Message { role, content } => {
+            SessionLogEntry::Message {
+                role,
+                content,
+                timestamp,
+            } => {
                 if let Some(pending) = pending.take() {
                     session
                         .messages
@@ -237,14 +238,17 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                         "Invalid log entry in session {name}: Tool-role Message entries are                          no longer supported; use tool_calls/tool_results entries"
                     );
                 }
-                session
-                    .messages
-                    .push(Message::new(role, content).with_log_seq(seq));
+                let mut message = Message::new(role, content).with_log_seq(seq);
+                if let Some(timestamp) = timestamp {
+                    message = message.with_log_timestamp(timestamp);
+                }
+                session.messages.push(message);
             }
             SessionLogEntry::ToolCalls {
                 text,
                 thought,
                 calls,
+                timestamp,
             } => {
                 if let Some(pending) = pending.take() {
                     session
@@ -256,23 +260,28 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                     text,
                     thought,
                     calls,
+                    timestamp,
                 });
             }
-            SessionLogEntry::ToolResults { results } => {
+            SessionLogEntry::ToolResults { results, .. } => {
                 let Some(PendingToolCalls {
                     seq,
                     text,
                     thought,
                     calls,
+                    timestamp,
                 }) = pending.take()
                 else {
                     anyhow::bail!(
                         "Invalid log entry in session {name}: tool_results without a                          preceding tool_calls entry"
                     );
                 };
-                session
-                    .messages
-                    .push(assemble_tool_message(text, thought, calls, results).with_log_seq(seq));
+                let mut message =
+                    assemble_tool_message(text, thought, calls, results).with_log_seq(seq);
+                if let Some(timestamp) = timestamp {
+                    message = message.with_log_timestamp(timestamp);
+                }
+                session.messages.push(message);
             }
             SessionLogEntry::DataUrls { urls } => {
                 session.data_urls.extend(urls);
@@ -328,6 +337,7 @@ fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Me
         text,
         thought,
         calls,
+        timestamp,
     } = pending;
     let lost = harnx_core::session::ToolOutput {
         id: None,
@@ -346,7 +356,11 @@ fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Me
             ..lost.clone()
         })
         .collect();
-    Ok(assemble_tool_message(text, thought, calls, results).with_log_seq(seq))
+    let mut message = assemble_tool_message(text, thought, calls, results).with_log_seq(seq);
+    if let Some(timestamp) = timestamp {
+        message = message.with_log_timestamp(timestamp);
+    }
+    Ok(message)
 }
 
 fn assemble_tool_message(
@@ -657,6 +671,7 @@ pub fn save(
         .with_context(|| format!("Failed to serialize session header for '{}'", session.name))?;
     for msg in &session.compressed_messages {
         let entry = SessionLogEntry::Message {
+            timestamp: None,
             role: msg.role,
             content: msg.content.clone(),
         };
@@ -692,6 +707,7 @@ pub fn save(
             let entry = SessionLogEntry::Message {
                 role: msg.role,
                 content: msg.content.clone(),
+                timestamp: None, // Session save rewrites all entries; timestamps are from live events
             };
             content.push_str("---\n");
             content.push_str(
@@ -705,6 +721,7 @@ pub fn save(
             let entry = SessionLogEntry::Message {
                 role: msg.role,
                 content: msg.content.clone(),
+                timestamp: None, // Session save rewrites all entries; timestamps are from live events
             };
             content.push_str("---\n");
             content.push_str(
@@ -812,15 +829,20 @@ pub fn add_assistant_text(
             _ => MessageContent::Text(output.to_string()),
         };
         let seq = session.next_seq();
-        let assistant_msg = Message::new(MessageRole::Assistant, content).with_log_seq(seq);
+        let timestamp = Utc::now();
+        let assistant_msg = Message::new(MessageRole::Assistant, content)
+            .with_log_seq(seq)
+            .with_log_timestamp(timestamp);
         all_appended &= append_event(
             session,
             &SessionLogEntry::Message {
                 role: assistant_msg.role,
                 content: assistant_msg.content.clone(),
+                timestamp: Some(timestamp),
             },
         );
         session.messages.push(assistant_msg);
+        emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
         session.dirty = !all_appended;
     }
     session.update_tokens();
@@ -855,8 +877,12 @@ pub fn add_tool_calls(
             text: output.to_string(),
             thought: thought.map(str::to_string),
             calls: calls.clone(),
+            timestamp: Some(Utc::now()),
         },
     );
+    emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned {
+        seq: tool_calls_seq,
+    }));
     // Push a pending Tool message.  Outputs are filled in by
     // add_tool_results; synthetic error placeholders mean that if the
     // pending message ever leaks (e.g. a mid-round abort without a
@@ -937,6 +963,7 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
         session,
         &SessionLogEntry::ToolResults {
             results: log_results,
+            timestamp: Some(Utc::now()),
         },
     );
     if !appended {
@@ -981,6 +1008,7 @@ fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool
                 &SessionLogEntry::Message {
                     role: msg.role,
                     content: msg.content.clone(),
+                    timestamp: Some(Utc::now()),
                 },
             );
             session.messages.push(msg.with_log_seq(seq));
@@ -993,9 +1021,11 @@ fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool
             &SessionLogEntry::Message {
                 role: user_msg.role,
                 content: user_msg.content.clone(),
+                timestamp: Some(Utc::now()),
             },
         );
         session.messages.push(user_msg);
+        emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
     }
     let new_data_urls = input.data_urls();
     if !new_data_urls.is_empty() {
@@ -1019,9 +1049,11 @@ fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool
             &SessionLogEntry::Message {
                 role: injected_msg.role,
                 content: injected_msg.content.clone(),
+                timestamp: Some(Utc::now()),
             },
         );
         session.messages.push(injected_msg);
+        emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
     }
     Ok(all_appended)
 }
@@ -1137,7 +1169,16 @@ content: second
 
         assert_eq!(seqs.len(), 5);
         assert!(matches!(seqs[0], (0, SessionLogEntry::Header { .. })));
-        assert!(matches!(seqs[1], (1, SessionLogEntry::Message { .. })));
+        assert!(matches!(
+            seqs[1],
+            (
+                1,
+                SessionLogEntry::Message {
+                    timestamp: None,
+                    ..
+                }
+            )
+        ));
         assert!(matches!(
             seqs[2],
             (2, SessionLogEntry::Rewind { after_seq: 1 })
@@ -1146,7 +1187,16 @@ content: second
             seqs[3],
             (3, SessionLogEntry::EditEntries { from: 1, to: 1, .. })
         ));
-        assert!(matches!(seqs[4], (4, SessionLogEntry::Message { .. })));
+        assert!(matches!(
+            seqs[4],
+            (
+                4,
+                SessionLogEntry::Message {
+                    timestamp: None,
+                    ..
+                }
+            )
+        ));
 
         let session = super::load_from_log_for_test(content);
         assert_eq!(session.messages.len(), 1);
@@ -1185,6 +1235,50 @@ content: second
         assert!(output.contains("model_fallbacks:"));
         assert!(output.contains("- anthropic:claude"));
         assert!(output.contains("- google:gemini"));
+    }
+
+    /// Test that timestamps are persisted to log entries and survive reload.
+    #[test]
+    fn timestamp_persists_across_session_reload() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+        let input = crate::config::input::from_str(&global_config, "hello", Some(agent.clone()));
+
+        // Add a user message
+        super::begin_turn(&mut session, &input, "response").unwrap();
+
+        // Verify the log file contains the timestamp field
+        let path = session.path.clone().unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("timestamp:"),
+            "log should contain timestamp field"
+        );
+
+        // Parse the log entries directly
+        let entries: Vec<(usize, SessionLogEntry)> = serde_yaml::Deserializer::from_str(&content)
+            .enumerate()
+            .map(|(seq, doc)| {
+                let entry = SessionLogEntry::deserialize(doc).expect("valid entry");
+                (seq, entry)
+            })
+            .collect();
+
+        // Find a Message entry and verify it has a timestamp
+        for (_, entry) in &entries {
+            if let SessionLogEntry::Message { timestamp, .. } = entry {
+                assert!(timestamp.is_some(), "message entry should have a timestamp");
+                return;
+            }
+        }
+        panic!("no Message entry found in session log");
     }
 
     /// The tool round splits into two independent log entries: a
@@ -1593,6 +1687,32 @@ content: second
     /// reload it through `load_from_log`.  Verify the in-memory
     /// messages are reconstructed correctly.
     #[test]
+    fn append_message_persists_timestamp_and_reloads() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+        let input = crate::config::input::from_str(&global_config, "hello", Some(agent));
+
+        super::add_assistant_text(&mut session, &input, "world", None).unwrap();
+
+        let content = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(content.contains("timestamp:"));
+
+        let reloaded = super::load_from_log_for_test(&content);
+        let last = reloaded
+            .messages
+            .last()
+            .expect("assistant message reloaded");
+        assert!(last.log_timestamp.is_some());
+    }
+
+    #[test]
     fn session_round_trips_through_load() {
         use crate::tool::{ToolCall, ToolResult};
         use serde_json::json;
@@ -1850,6 +1970,98 @@ replacements:
     }
 
     #[test]
+    fn load_replays_stacked_mutations_edit_one_to_many_then_edit_later_entry() {
+        let content = r#"type: header
+model: test
+---
+type: message
+role: user
+content: original 1
+---
+type: message
+role: assistant
+content: original 2
+---
+type: edit_entries
+from: 1
+to: 1
+replacements:
+  - |
+    type: message
+    role: user
+    content: 1a
+  - |
+    type: message
+    role: assistant
+    content: 1b
+---
+type: edit_entries
+from: 2
+to: 2
+replacements:
+  - |
+    type: message
+    role: assistant
+    content: 2x
+"#;
+
+        let session = super::load_from_log_for_test(content);
+        let texts: Vec<_> = session
+            .messages
+            .iter()
+            .map(|m| m.content.to_text())
+            .collect();
+
+        assert_eq!(texts, vec!["1a", "1b", "2x"]);
+    }
+
+    #[test]
+    fn load_replays_stacked_mutations_reedit_expanded_mutation_seq() {
+        let content = r#"type: header
+model: test
+---
+type: message
+role: user
+content: msg1
+---
+type: message
+role: assistant
+content: msg2
+---
+type: edit_entries
+from: 1
+to: 1
+replacements:
+  - |
+    type: message
+    role: user
+    content: expanded_a
+  - |
+    type: message
+    role: assistant
+    content: expanded_b
+---
+type: edit_entries
+from: 3
+to: 3
+replacements:
+  - |
+    type: message
+    role: user
+    content: re-edited
+"#;
+
+        let session = super::load_from_log_for_test(content);
+        let texts: Vec<_> = session
+            .messages
+            .iter()
+            .map(|m| m.content.to_text())
+            .collect();
+
+        assert_eq!(texts, vec!["re-edited", "msg2"]);
+    }
+
+    #[test]
     fn load_tracks_log_entry_count_and_append_event_increments_next_seq() {
         use tempfile::TempDir;
 
@@ -1878,6 +2090,7 @@ content: second
         let appended = super::append_event(
             &mut session,
             &SessionLogEntry::Message {
+                timestamp: None,
                 role: MessageRole::User,
                 content: MessageContent::Text("third".to_string()),
             },
