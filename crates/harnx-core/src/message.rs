@@ -18,6 +18,10 @@ pub struct Message {
     /// Never serialised — not sent to the LLM.
     #[serde(skip)]
     pub log_seq: Option<usize>,
+    /// Stored log timestamp for message-like entries. Seq is positional-only;
+    /// timestamp is persisted in YAML and propagated for transcript rendering.
+    #[serde(skip)]
+    pub log_timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Default for Message {
@@ -26,6 +30,7 @@ impl Default for Message {
             role: MessageRole::User,
             content: MessageContent::Text(String::new()),
             log_seq: None,
+            log_timestamp: None,
         }
     }
 }
@@ -36,11 +41,17 @@ impl Message {
             role,
             content,
             log_seq: None,
+            log_timestamp: None,
         }
     }
 
     pub fn with_log_seq(mut self, seq: usize) -> Self {
         self.log_seq = Some(seq);
+        self
+    }
+
+    pub fn with_log_timestamp(mut self, timestamp: chrono::DateTime<chrono::Utc>) -> Self {
+        self.log_timestamp = Some(timestamp);
         self
     }
 

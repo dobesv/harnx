@@ -1,0 +1,17 @@
+---
+source: crates/harnx-tui/src/tests.rs
+expression: rendered
+---
+Welcome to harnx 0.30.0  •  Type .help
+for commands, Tab to complete.
+> Line 0
+
+Line 1
+
+> Line 2
+
+
+
+
+
+• Input

@@ -1,6 +1,7 @@
 ---
 title: "Non-destructive session mutation with two-pass log replay"
 date: 2026-05-01
+last_updated: 2026-05-01
 category: "logic-errors"
 problem_type: logic_error
 component: "harnx-session-log"
@@ -190,6 +191,51 @@ if !clean.is_empty() {
 
 4. **Replacement seq assignment**: All replacements from an `EditEntries` get the seq of the mutation entry itself, not their original positions. This makes replacements addressable as a block for further edits.
 
+### Stacked Mutation rposition Fix (Phase 2)
+
+When a 1→N edit creates multiple replacements, they all share the mutation's seq number. A subsequent edit targeting that seq must replace ALL entries with that seq. Using `position()` found only the first match; changed to `rposition()` for the `to` bound:
+
+```rust
+// In build_effective_log_entries:
+let Some(start_idx) = effective_entries
+    .iter()
+    .position(|(existing_seq, _)| existing_seq == from)  // first occurrence
+else { ... };
+let Some(end_idx) = effective_entries
+    .iter()
+    .rposition(|(existing_seq, _)| existing_seq == to)   // last occurrence!
+else { ... };
+```
+
+This asymmetry is critical: `from` needs the first matching entry (forward scan), `to` needs the last matching entry (backward scan). Without `rposition`, stacked edits would splice only part of the duplicated-seq block.
+
+See [stacked-mutation-replay-rposition-2026-05-01.md](stacked-mutation-replay-rposition-2026-05-01.md) for full details.
+
+### Tool Result Validation for No-ID Positional Matching (Phase 2)
+
+Some LLM providers omit `tool_call_id` in results, relying on positional correspondence. Validation now supports three cases:
+
+1. **All results have IDs** → validate by ID matching
+2. **All results lack IDs** → validate by count matching (positional)
+3. **Mixed presence** → reject as ambiguous
+
+```rust
+if missing_result_ids == results.len() {
+    // All absent: positional matching
+    if results.len() != calls.len() {
+        bail!("count mismatch for positional matching");
+    }
+    continue;
+}
+if missing_result_ids > 0 {
+    // Mixed: ambiguous
+    bail!("mixes IDs with missing IDs");
+}
+// All present: ID matching
+```
+
+See [tool-result-validation-no-id-positional-2026-05-01.md](tool-result-validation-no-id-positional-2026-05-01.md) for full details.
+
 ## Why This Works
 
 **Append-only guarantees audit trail**: Every mutation is recorded. The original entries exist in the log forever. History can be reconstructed at any point.
@@ -224,3 +270,6 @@ if !clean.is_empty() {
 - **Jira:** #342 — Non-destructive session editing
 - **Jira:** #396 — Sequence numbers for transcript items
 - **PR:** [harnx-event-tagging-tui-redesign] — Full implementation of mutation commands
+- **Phase 2 fixes:**
+  - [stacked-mutation-replay-rposition-2026-05-01.md](stacked-mutation-replay-rposition-2026-05-01.md) — rposition for stacked mutations
+  - [tool-result-validation-no-id-positional-2026-05-01.md](tool-result-validation-no-id-positional-2026-05-01.md) — No-ID positional matching
