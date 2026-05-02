@@ -6,7 +6,10 @@ pub mod session_meta;
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentConfig, AgentVariables};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
-pub use self::session_meta::{parse_session_meta, SessionMeta};
+pub use self::session_meta::{
+    build_picker_context, parse_session_meta, sort_sessions_for_picker, PickerContext,
+    SessionMeta,
+};
 use self::session::Session;
 pub use harnx_core::last_message::LastMessage;
 #[allow(unused_imports)]
