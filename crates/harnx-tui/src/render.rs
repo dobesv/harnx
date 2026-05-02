@@ -772,6 +772,9 @@ impl Tui {
             ModalState::ConfirmRewind { seq, .. } => {
                 format!("Rewind to entry {}? [y/N]", seq)
             }
+            ModalState::AgentPicker { .. } | ModalState::SessionPicker { .. } => {
+                String::new()
+            }
         };
 
         // Calculate modal size based on content
