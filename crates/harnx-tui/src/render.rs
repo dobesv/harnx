@@ -788,10 +788,8 @@ impl Tui {
                     .map(|s| {
                         let branch = s.git_branch.as_deref().unwrap_or("");
                         let cwd = s.working_dir.as_deref().unwrap_or("");
-                        let parts: Vec<&str> = cwd
-                            .split(['/', '\\'])
-                            .filter(|s| !s.is_empty())
-                            .collect();
+                        let parts: Vec<&str> =
+                            cwd.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
                         let cwd_tail = if parts.len() >= 2 {
                             format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
                         } else if parts.len() == 1 {

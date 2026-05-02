@@ -6,11 +6,10 @@ pub mod session_meta;
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentConfig, AgentVariables};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
-pub use self::session_meta::{
-    build_picker_context, parse_session_meta, sort_sessions_for_picker, PickerContext,
-    SessionMeta,
-};
 use self::session::Session;
+pub use self::session_meta::{
+    build_picker_context, parse_session_meta, sort_sessions_for_picker, PickerContext, SessionMeta,
+};
 pub use harnx_core::last_message::LastMessage;
 #[allow(unused_imports)]
 pub use harnx_core::macros::{Macro, MacroVariable};
@@ -90,7 +89,14 @@ static EDITOR: OnceLock<Option<String>> = OnceLock::new();
 use harnx_core::agent_config::{normalize_toolset_value, split_tool_selectors, ToolsetValue};
 
 fn split_session_log_documents(raw_log: &str) -> Vec<String> {
-    raw_log
+    // Normalize Windows line endings before splitting so that session files
+    // transferred between platforms are handled correctly.
+    let normalized = if raw_log.contains("\r\n") {
+        std::borrow::Cow::Owned(raw_log.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(raw_log)
+    };
+    normalized
         .split("\n---\n")
         .filter_map(|document| {
             let document = document.trim();
@@ -4075,7 +4081,11 @@ mod tests {
         let parsed = Uuid::parse_str(&session.name).expect("session name should be valid UUID");
         assert_eq!(parsed.get_version_num(), 7);
         assert_eq!(
-            session.sessions_dir.as_ref().unwrap().join(format!("{}.yaml", session.name)),
+            session
+                .sessions_dir
+                .as_ref()
+                .unwrap()
+                .join(format!("{}.yaml", session.name)),
             tmp.path().join(format!("{}.yaml", session.name))
         );
     }

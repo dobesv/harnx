@@ -212,10 +212,16 @@ mod tests {
         use std::env;
 
         // Clear all terminal env vars so we fall through to the Linux fallback.
-        let saved: Vec<(_, _)> = ["TERM_SESSION_ID", "WT_SESSION", "KITTY_WINDOW_ID", "TMUX_PANE", "STY"]
-            .iter()
-            .map(|k| (*k, env::var_os(k)))
-            .collect();
+        let saved: Vec<(_, _)> = [
+            "TERM_SESSION_ID",
+            "WT_SESSION",
+            "KITTY_WINDOW_ID",
+            "TMUX_PANE",
+            "STY",
+        ]
+        .iter()
+        .map(|k| (*k, env::var_os(k)))
+        .collect();
         for (k, _) in &saved {
             env::remove_var(k);
         }

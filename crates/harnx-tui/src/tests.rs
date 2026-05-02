@@ -5677,5 +5677,8 @@ async fn test_picker_shown_when_no_agent_and_agents_exist() {
     let is_valid = modal.is_none()
         || matches!(modal, Some(crate::types::ModalState::AgentPicker { .. }))
         || matches!(modal, Some(crate::types::ModalState::SessionPicker { .. }));
-    assert!(is_valid, "resolve_initial_modal must return a valid modal state");
+    assert!(
+        is_valid,
+        "resolve_initial_modal must return a valid modal state"
+    );
 }

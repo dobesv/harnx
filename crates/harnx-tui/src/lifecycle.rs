@@ -14,8 +14,8 @@ use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterA
 use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
 use harnx_hooks::{drain_async_results, AsyncHookManager, PersistentHookManager};
-use harnx_runtime::config::{build_picker_context, list_agents, sort_sessions_for_picker};
 use harnx_runtime::config::GlobalConfig;
+use harnx_runtime::config::{build_picker_context, list_agents, sort_sessions_for_picker};
 use harnx_runtime::tool::ToolDeclaration;
 use harnx_runtime::utils::create_abort_signal;
 use ratatui::Terminal;
@@ -122,18 +122,27 @@ impl Tui {
     pub(crate) fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState> {
         let agents = list_agents();
         if config.read().agent.is_none() && !agents.is_empty() {
-            return Some(ModalState::AgentPicker { agents, selected: 0 });
+            return Some(ModalState::AgentPicker {
+                agents,
+                selected: 0,
+            });
         } else if config.read().session.is_none() {
             let sessions = config.read().list_sessions_with_meta();
             let sessions: Vec<_> = if let Some(agent) = config.read().agent.as_ref() {
-                sessions.into_iter().filter(|s| s.agent_name.as_deref() == Some(agent.name())).collect()
+                sessions
+                    .into_iter()
+                    .filter(|s| s.agent_name.as_deref() == Some(agent.name()))
+                    .collect()
             } else {
                 sessions
             };
             if !sessions.is_empty() {
                 let ctx = build_picker_context();
                 let sorted = sort_sessions_for_picker(sessions, &ctx);
-                return Some(ModalState::SessionPicker { sessions: sorted, selected: 0 });
+                return Some(ModalState::SessionPicker {
+                    sessions: sorted,
+                    selected: 0,
+                });
             }
         }
         None

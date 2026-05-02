@@ -40,7 +40,14 @@ pub fn new(config: &Config, name: &str) -> Result<Session> {
         working_dir: std::env::current_dir()
             .ok()
             .map(|path| path.to_string_lossy().into_owned()),
-        git_branch: { let b = git_branch(); if b.is_empty() { None } else { Some(b) } },
+        git_branch: {
+            let b = git_branch();
+            if b.is_empty() {
+                None
+            } else {
+                Some(b)
+            }
+        },
         git_remote: git_remote(),
         terminal_session_id: terminal_session_id(),
         ..Default::default()
