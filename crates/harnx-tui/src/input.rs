@@ -437,6 +437,8 @@ impl Tui {
         if let Some(pending) = self.app.pending_message.take() {
             self.app.attachments = pending.attachments;
             self.app.attachment_dir = pending.attachment_dir;
+            self.app.paste_count = pending.paste_count;
+            self.clear_shared_pending_message().await;
             self.refresh_input_chrome();
         }
         // Exit history preview on paste — keep current content as new draft
@@ -650,11 +652,9 @@ impl Tui {
         if is_turn_boundary {
             self.app.streaming_assistant_idx = None;
         }
-        if !is_thought {
-            self.flush_pending_thought();
-        }
-        self.render_ui_output_heading(source.as_ref(), is_usage);
-
+        // Handle LogSeqAssigned before any heading/thought side-effects — it
+        // is a pure seq-assignment event and should not create stray headings
+        // or flush pending thoughts.
         if let AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }) = event {
             for item in self.app.transcript.iter_mut().rev() {
                 match item {
@@ -678,6 +678,11 @@ impl Tui {
             }
             return;
         }
+
+        if !is_thought {
+            self.flush_pending_thought();
+        }
+        self.render_ui_output_heading(source.as_ref(), is_usage);
 
         let rendered_entries = match event {
             AgentEvent::Notice(NoticeEvent::Info(text)) => {
@@ -1675,12 +1680,15 @@ impl Tui {
     }
 
     /// Handle 'r' key: open rewind confirmation modal.
+    ///
+    /// Always rewinds to the *earliest* selected item regardless of selection
+    /// direction, so Shift+selecting up vs down yields the same target.
     fn handle_transcript_rewind(&mut self) {
-        let focus = self.app.transcript_selection_anchor.unwrap_or_else(|| {
-            self.app
-                .transcript_focus
-                .expect("transcript_focus required")
-        });
+        let focus = self.app.transcript_focus.expect("transcript_focus required");
+        let focus = match self.app.transcript_selection_anchor {
+            Some(anchor) => focus.min(anchor),
+            None => focus,
+        };
         let item = match self.app.transcript.get(focus) {
             Some(item) => item,
             None => return,

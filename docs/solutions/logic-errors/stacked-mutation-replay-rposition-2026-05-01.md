@@ -43,7 +43,7 @@ After a 1-to-N edit (single entry replaced by multiple entries), all replacement
 - `to` seq (end of range): Use `rposition()` — last occurrence needed when multiple entries share `to` seq
 
 When edit_entries with `from: 1, to: 1` creates two replacements, both get the mutation's seq (say, 3). The raw log becomes:
-```
+```yaml
 seq 0: header
 seq 1: user message      ← edited away
 seq 2: assistant message
@@ -51,7 +51,7 @@ seq 3: edit_entries { from: 1, to: 1, replacements: [user-a, user-b] }
 ```
 
 After replay, effective_entries has:
-```
+```text
 (3, Message "user-a")
 (3, Message "user-b")   ← same seq!
 (2, Message "assistant")

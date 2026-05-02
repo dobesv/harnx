@@ -208,8 +208,30 @@ fn validate_tool_pair_integrity(start_seq: usize, documents: &[String]) -> Resul
             );
         }
 
-        for result in results {
-            let call_id = result.id.as_deref().filter(|id| !id.is_empty()).unwrap();
+        // All results have IDs: enforce strict 1:1 mapping.
+        // Collect in order so duplicate detection and count check work together.
+        let result_ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.id.as_deref().filter(|id| !id.is_empty()).unwrap())
+            .collect();
+
+        if result_ids.len() != calls.len() {
+            let expected_ids = call_ids.iter().copied().collect::<Vec<_>>().join(", ");
+            bail!(
+                "Edited tool result at {result_seq} has {} result(s) but {} call(s) (expected ids: {expected_ids})",
+                result_ids.len(),
+                calls.len()
+            );
+        }
+
+        let result_id_set: HashSet<&str> = result_ids.iter().copied().collect();
+        if result_id_set.len() != result_ids.len() {
+            bail!(
+                "Edited tool result at {result_seq} contains duplicate tool_call_id values"
+            );
+        }
+
+        for call_id in &result_ids {
             if !call_ids.contains(call_id) {
                 let expected_ids = call_ids.iter().copied().collect::<Vec<_>>().join(", ");
                 bail!(
@@ -316,6 +338,10 @@ pub struct Config {
     /// Override the sessions directory — used in tests to redirect session
     /// log writes to a temp directory without touching real user data.
     pub sessions_dir_override: Option<std::path::PathBuf>,
+    /// Override the directory used for editor temp files — used in tests so
+    /// the after-hook closure can find the file without scanning the global
+    /// temp directory. Never set in production.
+    pub temp_dir_override: Option<std::path::PathBuf>,
 }
 
 impl std::ops::Deref for Config {
@@ -381,6 +407,7 @@ impl Clone for Config {
             tui_before_editor: None,
             tui_after_editor: None,
             sessions_dir_override: self.sessions_dir_override.clone(),
+            temp_dir_override: self.temp_dir_override.clone(),
         }
     }
 }
@@ -415,6 +442,7 @@ impl Default for Config {
             tui_before_editor: None,
             tui_after_editor: None,
             sessions_dir_override: None,
+            temp_dir_override: None,
         }
     }
 }
@@ -1448,7 +1476,14 @@ impl Config {
         // plain message entries in editor is supported as long as edited YAML still
         // passes structural validation (including tool-call/result pairing).
         let selected_documents = documents[from..=to].to_vec();
-        let temp_file = temp_file("message-edit", ".yaml");
+        let temp_file = if let Some(ref dir) = self.temp_dir_override {
+            dir.join(format!(
+                "message-edit-{}.yaml",
+                uuid::Uuid::new_v4()
+            ))
+        } else {
+            temp_file("message-edit", ".yaml")
+        };
 
         std::fs::write(&temp_file, selected_documents.join("\n---\n"))
             .with_context(|| format!("Failed to write to '{}'", temp_file.display()))?;
@@ -3771,21 +3806,20 @@ mod tests {
             ));
 
             let replacement_yaml = assistant_yaml("second") + "\n---\n" + &user_yaml("first");
+
+            // Use an isolated temp dir so the after-hook can find the single
+            // .yaml file without scanning the global temp directory.
+            let editor_tmp = TempDir::new().unwrap();
+            let editor_tmp_path = editor_tmp.path().to_path_buf();
+            config.temp_dir_override = Some(editor_tmp_path.clone());
+
             config.set_tui_editor_hooks(
                 None,
                 Some(Box::new(move || {
-                    let temp_path = std::fs::read_dir(std::env::temp_dir())
+                    let temp_path = std::fs::read_dir(&editor_tmp_path)
                         .unwrap()
-                        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                        .filter(|path| {
-                            path.extension().and_then(|ext| ext.to_str()) == Some("yaml")
-                        })
-                        .filter_map(|path| {
-                            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
-                            Some((modified, path))
-                        })
-                        .max_by_key(|(modified, _)| *modified)
-                        .map(|(_, path)| path)
+                        .filter_map(|e| e.ok().map(|e| e.path()))
+                        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
                         .expect("message edit temp file");
                     std::fs::write(&temp_path, &replacement_yaml).unwrap();
                 })),

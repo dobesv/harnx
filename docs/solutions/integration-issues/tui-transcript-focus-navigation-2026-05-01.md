@@ -32,7 +32,7 @@ TUI needed arrow-key navigation within the transcript for selecting entries to e
 1. Reviewed `handle_up_key` and `handle_down_key` in `input.rs`
 2. Found `transcript_focus: Option<usize>` field on App for tracking cursor position
 3. Identified the need for explicit entry/exit conditions
-4. Designed bidirectional exit: Up at top of transcript returns to history, Down at bottom stays
+4. Designed bidirectional exit: Up at top of transcript returns to history, Down at bottom: exit to input (sets transcript_focus = None)
 5. Implemented Shift+Up/Down for range selection extension
 
 ## Root Cause
