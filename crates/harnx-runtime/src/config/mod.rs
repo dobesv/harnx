@@ -1,10 +1,12 @@
 pub mod agent;
 pub mod input;
 pub mod session;
+pub mod session_meta;
 
 pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentConfig, AgentVariables};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
+pub use self::session_meta::{parse_session_meta, SessionMeta};
 use self::session::Session;
 pub use harnx_core::last_message::LastMessage;
 #[allow(unused_imports)]
@@ -1702,6 +1704,26 @@ impl Config {
 
     pub fn list_sessions(&self) -> Vec<String> {
         list_file_names(self.sessions_dir(), ".yaml")
+    }
+
+    pub fn list_sessions_with_meta(&self) -> Vec<SessionMeta> {
+        let Ok(entries) = std::fs::read_dir(self.sessions_dir()) else {
+            return Vec::new();
+        };
+
+        let mut sessions = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_stem()?.to_str()?;
+                (path.extension().and_then(|ext| ext.to_str()) == Some("yaml"))
+                    .then(|| parse_session_meta(name, &path))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+
+        sessions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        sessions
     }
 
     pub fn list_autoname_sessions(&self) -> Vec<String> {
