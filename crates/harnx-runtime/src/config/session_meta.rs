@@ -114,15 +114,21 @@ pub fn sort_sessions_for_picker(
     sessions
 }
 
+// Maximum bytes to read when looking for the YAML document boundary.
+// 64KB is generous enough to accommodate headers with long agent instructions.
+const MAX_HEADER_BYTES: usize = 65536;
+
 fn read_session_header_bytes(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
-    let mut buffer = [0_u8; 4096];
+    let mut buffer = vec![0_u8; MAX_HEADER_BYTES];
     let read_len = file.read(&mut buffer).ok()?;
     let bytes = &buffer[..read_len];
 
+    // Accept both Unix (`---\n`) and Windows (`---\r\n`) line endings.
     let boundary = bytes
         .windows(4)
-        .position(|window| window == b"---\n")
+        .position(|w| w == b"---\n")
+        .or_else(|| bytes.windows(5).position(|w| w == b"---\r\n"))
         .unwrap_or(bytes.len());
 
     String::from_utf8(bytes[..boundary].to_vec()).ok()
@@ -316,6 +322,50 @@ mod tests {
 
         let sorted = sort_sessions_for_picker(vec![older, newer.clone()], &context);
         assert_eq!(sorted[0].name, newer.name);
+    }
+
+    #[test]
+    fn test_sort_cwd_match_third() {
+        // Neither terminal nor branch match; CWD match should win.
+        let mut matching = session_meta("33333333-3333-7333-8000-000000000001");
+        matching.working_dir = Some("/home/user/projects/foo".to_string());
+        matching.modified = Some(UNIX_EPOCH + Duration::from_secs(1));
+
+        let mut other = session_meta("33333333-3333-7333-8000-000000000002");
+        other.working_dir = Some("/home/user/projects/bar".to_string());
+        other.modified = Some(UNIX_EPOCH + Duration::from_secs(2));
+
+        let context = PickerContext {
+            current_terminal_id: Some("term-x".to_string()),
+            current_branch: Some("other-branch".to_string()),
+            current_dir: "/home/user/projects/foo".to_string(),
+            current_remote: None,
+        };
+
+        let sorted = sort_sessions_for_picker(vec![other, matching.clone()], &context);
+        assert_eq!(sorted[0].name, matching.name, "CWD match should sort first");
+    }
+
+    #[test]
+    fn test_sort_remote_match_fourth() {
+        // Neither terminal, branch, nor cwd match; remote match should win.
+        let mut matching = session_meta("44444444-4444-7444-8000-000000000001");
+        matching.git_remote = Some("https://github.com/org/repo".to_string());
+        matching.modified = Some(UNIX_EPOCH + Duration::from_secs(1));
+
+        let mut other = session_meta("44444444-4444-7444-8000-000000000002");
+        other.git_remote = Some("https://github.com/org/other".to_string());
+        other.modified = Some(UNIX_EPOCH + Duration::from_secs(2));
+
+        let context = PickerContext {
+            current_terminal_id: Some("term-x".to_string()),
+            current_branch: Some("other-branch".to_string()),
+            current_dir: "/tmp/unrelated".to_string(),
+            current_remote: Some("https://github.com/org/repo".to_string()),
+        };
+
+        let sorted = sort_sessions_for_picker(vec![other, matching.clone()], &context);
+        assert_eq!(sorted[0].name, matching.name, "Remote match should sort first");
     }
 
     #[test]

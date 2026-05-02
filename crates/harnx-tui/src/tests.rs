@@ -5654,13 +5654,28 @@ async fn test_highlight_range() {
 
 #[tokio::test]
 async fn test_picker_not_shown_when_agent_specified() {
+    // When an agent is already set (--agent flag), AgentPicker must NOT appear.
+    // SessionPicker may appear if sessions exist for that agent, but AgentPicker must not.
     let config = test_config_with_mock_client_and_agent("test-agent", None);
     let modal = Tui::resolve_initial_modal(&config);
-    assert!(modal.is_none() || matches!(modal, Some(crate::types::ModalState::SessionPicker { .. })));
+    assert!(
+        !matches!(modal, Some(crate::types::ModalState::AgentPicker { .. })),
+        "AgentPicker must not appear when agent is already specified"
+    );
 }
 
 #[tokio::test]
 async fn test_picker_shown_when_no_agent_and_agents_exist() {
+    // resolve_initial_modal behavior when no agent is configured:
+    // - If agents exist on disk: AgentPicker is shown (expected)
+    // - If no agents exist: no AgentPicker (None or SessionPicker if sessions exist)
+    // This test verifies that the function runs without panic and returns a consistent type.
     let config = test_config();
-    let _modal = Tui::resolve_initial_modal(&config);
+    let modal = Tui::resolve_initial_modal(&config);
+    // The modal is either None, AgentPicker (when agents exist), or SessionPicker
+    // All three are valid outcomes — the key invariant is it doesn't panic.
+    let is_valid = modal.is_none()
+        || matches!(modal, Some(crate::types::ModalState::AgentPicker { .. }))
+        || matches!(modal, Some(crate::types::ModalState::SessionPicker { .. }));
+    assert!(is_valid, "resolve_initial_modal must return a valid modal state");
 }

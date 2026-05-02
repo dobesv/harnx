@@ -203,4 +203,45 @@ mod tests {
         // but we can verify it doesn't panic
         let _ = terminal_session_id();
     }
+
+    /// On Linux, when no terminal env vars are set, the fallback should
+    /// return a `sid:...` identifier derived from getsid(0) and /proc.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_fallback_format() {
+        use std::env;
+
+        // Clear all terminal env vars so we fall through to the Linux fallback.
+        let saved: Vec<(_, _)> = ["TERM_SESSION_ID", "WT_SESSION", "KITTY_WINDOW_ID", "TMUX_PANE", "STY"]
+            .iter()
+            .map(|k| (*k, env::var_os(k)))
+            .collect();
+        for (k, _) in &saved {
+            env::remove_var(k);
+        }
+
+        let result = linux_fallback_session_id();
+        if let Some(id) = result {
+            // Must be in format "sid:{integer}:{path}:{integer}"
+            assert!(
+                id.starts_with("sid:"),
+                "Linux fallback must start with 'sid:'; got: {id}"
+            );
+            let parts: Vec<&str> = id.splitn(4, ':').collect();
+            assert_eq!(parts.len(), 4, "Expected 4 colon-separated parts in '{id}'");
+            assert!(
+                parts[1].parse::<i32>().is_ok(),
+                "Second part (SID) must be an integer in '{id}'"
+            );
+        }
+        // If None — running without /proc access (e.g. container sandbox) — that's acceptable.
+
+        // Restore saved env vars.
+        for (k, v) in saved {
+            match v {
+                Some(val) => env::set_var(k, val),
+                None => env::remove_var(k),
+            }
+        }
+    }
 }

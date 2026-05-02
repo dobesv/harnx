@@ -6,9 +6,9 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
+use harnx_runtime::config::{build_picker_context, sort_sessions_for_picker};
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
-use std::cmp::Reverse;
 use std::path::Path;
 
 const ATTACHMENT_PREVIEW_MAX_CHARS: usize = 800;
@@ -1589,7 +1589,7 @@ impl Tui {
 
                             self.config.write().use_agent_by_name(&agent_name)?;
 
-                            let mut sessions: Vec<_> = self
+                            let sessions: Vec<_> = self
                                 .config
                                 .read()
                                 .list_sessions_with_meta()
@@ -1597,7 +1597,8 @@ impl Tui {
                                 .filter(|s| s.agent_name.as_deref() == Some(agent_name.as_str()))
                                 .collect();
                             if !sessions.is_empty() {
-                                sessions.sort_by_key(|s| Reverse(s.modified));
+                                let ctx = build_picker_context();
+                                let sessions = sort_sessions_for_picker(sessions, &ctx);
                                 self.app.modal = Some(crate::types::ModalState::SessionPicker {
                                     sessions,
                                     selected: 0,
