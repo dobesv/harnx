@@ -94,8 +94,6 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
         "sub-agent not listed in --list-agents output:\n{agents_screen}"
     );
 
-    let delegate_tool_name = format!("{}_session_prompt", TEST_SUB_AGENT_NAME);
-
     // Step 5: Start interactive TUI session
     tmux.send_text(&format!(
         "{} -a {} || echo HARNX_EXIT:$?",
@@ -113,7 +111,7 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
     })?;
 
     assert_eq!(
-        count_occurrences(&screen, &format!("→ {delegate_tool_name}")),
+        count_occurrences(&screen, &format!("@ {}", TEST_SUB_AGENT_NAME)),
         1,
         "expected exactly one top-level delegation marker, got screen:\n{screen}"
     );
@@ -1186,15 +1184,13 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
         |screen| screen.contains("Nested task complete"),
     )?;
 
-    let delegate_tool_name = format!("{}_session_prompt", NESTED_SUB_AGENT);
-    let nested_delegate_tool_name = format!("{}_session_prompt", NESTED_SUB_SUB_AGENT);
     assert_eq!(
-        count_occurrences(&screen, &format!("→ {delegate_tool_name}")),
+        count_occurrences(&screen, &format!("@ {}", NESTED_SUB_AGENT)),
         1,
         "expected exactly one parent→sub-agent marker:\n{screen}"
     );
     assert_eq!(
-        count_occurrences(&screen, &format!("→ {nested_delegate_tool_name}")),
+        count_occurrences(&screen, &format!("@ {}", NESTED_SUB_SUB_AGENT)),
         1,
         "expected exactly one sub-agent→sub-sub-agent marker:\n{screen}"
     );

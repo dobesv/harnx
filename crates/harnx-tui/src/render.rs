@@ -75,26 +75,18 @@ impl Tui {
     /// by the body lines. Body rendering depends on its origin —
     /// `Markdown` (from a `call_template`) is rendered inline; `Yaml`
     /// (raw args, no template) is displayed verbatim, each line indented.
-    fn render_tool_call(
-        tool_name: &str,
-        body: Option<&ToolCallBody>,
-        seq: Option<usize>,
-        timestamp: Option<chrono::DateTime<chrono::Utc>>,
-        show_seq: bool,
-        show_ts: bool,
-        use_utc: bool,
-    ) -> Vec<Line<'static>> {
+    fn render_tool_call(tool_name: &str, body: Option<&ToolCallBody>) -> Vec<Line<'static>> {
         let dim_gray = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
 
-        let header_text = format!("→ {tool_name}");
-        let mut lines = Self::render_text_entry("", &header_text, dim_gray, false);
-        if let Some(suffix) = Self::render_meta_suffix(seq, timestamp, show_seq, show_ts, use_utc) {
-            if let Some(first_line) = lines.first_mut() {
-                first_line.spans.push(suffix);
+        let mut lines = match body {
+            Some(ToolCallBody::Markdown(_)) => Vec::new(),
+            _ => {
+                let header_text = format!("→ {tool_name}");
+                Self::render_text_entry("", &header_text, dim_gray, false)
             }
-        }
+        };
         match body {
             Some(ToolCallBody::Yaml(yaml)) => {
                 for line in yaml.lines() {
@@ -288,15 +280,16 @@ impl Tui {
                 body,
                 seq,
                 timestamp,
-            } => Self::render_tool_call(
-                tool_name,
-                body.as_ref(),
-                *seq,
-                *timestamp,
-                show_seq,
-                show_ts,
-                use_utc,
-            ),
+            } => {
+                let mut lines = vec![];
+                if let Some(suffix) =
+                    Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
+                {
+                    lines.push(Line::from(suffix));
+                }
+                lines.extend(Self::render_tool_call(tool_name, body.as_ref()));
+                lines
+            }
             TranscriptItem::AttachmentHeader(text) => Self::render_text_entry(
                 "",
                 &format!("{text}:"),

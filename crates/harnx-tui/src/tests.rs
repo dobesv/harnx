@@ -4967,6 +4967,72 @@ async fn tool_call_display_format() {
     insta::assert_snapshot!("tool_call_display_format", rendered);
 }
 
+#[test]
+fn render_tool_call_markdown_body_suppresses_header() {
+    let lines = Tui::render_entry(
+        &TranscriptItem::ToolCall {
+            tool_name: "write_file".to_string(),
+            body: Some(ToolCallBody::Markdown(
+                "write **hello.txt** with 3 lines".to_string(),
+            )),
+            seq: None,
+            timestamp: None,
+        },
+        false,
+        false,
+        false,
+    );
+
+    let plain = lines.iter().map(line_to_plain).collect::<Vec<_>>();
+    assert_eq!(plain, vec!["   write hello.txt with 3 lines".to_string()]);
+    assert!(plain.iter().all(|line| !line.contains("→")));
+}
+
+#[test]
+fn render_tool_call_yaml_body_keeps_header() {
+    let lines = Tui::render_entry(
+        &TranscriptItem::ToolCall {
+            tool_name: "read".to_string(),
+            body: Some(ToolCallBody::Yaml("path: /tmp/foo.txt\n".to_string())),
+            seq: None,
+            timestamp: None,
+        },
+        false,
+        false,
+        false,
+    );
+
+    let plain = lines.iter().map(line_to_plain).collect::<Vec<_>>();
+    assert_eq!(plain.first().map(String::as_str), Some("→ read"));
+}
+
+#[test]
+fn render_tool_call_meta_line_precedes_markdown_body() {
+    let timestamp = chrono::DateTime::parse_from_rfc3339("2026-05-02T14:23:01Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let lines = Tui::render_entry(
+        &TranscriptItem::ToolCall {
+            tool_name: "write_file".to_string(),
+            body: Some(ToolCallBody::Markdown("write hello.txt".to_string())),
+            seq: Some(3),
+            timestamp: Some(timestamp),
+        },
+        true,
+        true,
+        true,
+    );
+
+    let plain = lines.iter().map(line_to_plain).collect::<Vec<_>>();
+    assert_eq!(
+        plain,
+        vec![
+            "  [3] 14:23:01".to_string(),
+            "   write hello.txt".to_string()
+        ]
+    );
+}
+
 #[tokio::test]
 async fn tool_call_with_seq_number() {
     let mut harness = TuiTestHarness::new();

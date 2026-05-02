@@ -185,17 +185,29 @@ impl CliSinkState {
         Ok(())
     }
 
-    /// Stderr render for `ToolEvent::Started`: dim "[tool] {name}", and
-    /// when the producer rendered an MCP `call_template` into `markdown`,
-    /// append the markdown-styled rendering after it.
+    /// Stderr render for `ToolEvent::Started`: when the producer rendered an
+    /// MCP `call_template` into `markdown`, print only the markdown-styled
+    /// line (no `[tool] name` prefix). When no markdown is present, fall back
+    /// to the dim `[tool] {name}` prefix.
     fn print_tool_started(&mut self, name: &str, markdown: Option<&str>) {
-        let prefix = dimmed_text(&format!("[tool] {name}"));
-        match markdown.map(str::trim).filter(|t| !t.is_empty()) {
-            Some(t) => {
-                let rendered = self.render_markdown_line(t);
-                eprintln!("{prefix} {rendered}");
+        let rendered = Self::format_tool_started(name, markdown, |text| {
+            if text.contains('\n') {
+                self.render_markdown_block(text)
+            } else {
+                self.render_markdown_line(text)
             }
-            None => eprintln!("{prefix}"),
+        });
+        eprintln!("{rendered}");
+    }
+
+    fn format_tool_started(
+        name: &str,
+        markdown: Option<&str>,
+        mut render_markdown: impl FnMut(&str) -> String,
+    ) -> String {
+        match markdown.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => render_markdown(t),
+            None => dimmed_text(&format!("[tool] {name}")),
         }
     }
 
@@ -412,6 +424,17 @@ mod tests {
     use super::*;
     use harnx_core::event::{ContentBlock, StatusLine};
 
+    fn make_state(highlight: bool) -> CliSinkState {
+        CliSinkState {
+            spinner: None,
+            render: None,
+            buffer: String::new(),
+            last_ui_output_source: None,
+            highlight,
+            render_options: RenderOptions::default(),
+        }
+    }
+
     // The sink writes to stdout (Info notices, streaming chunks) and stderr
     // (Warning/Error notices, status lines), which is hard to capture in a
     // unit test without subprocess machinery. We verify here only that
@@ -522,6 +545,41 @@ mod tests {
     // future tweak to the rendering rules updates a single test surface.
 
     #[test]
+    fn print_tool_started_with_markdown_omits_tool_prefix() {
+        let mut state = make_state(false);
+        let rendered =
+            CliSinkState::format_tool_started("bash_exec", Some("` $ cargo build`"), |text| {
+                state.render_markdown_line(text)
+            });
+
+        assert!(
+            !rendered.contains("[tool]"),
+            "unexpected tool prefix in output: {rendered}"
+        );
+        assert!(
+            rendered.contains("cargo build"),
+            "expected markdown text in output: {rendered}"
+        );
+    }
+
+    #[test]
+    fn print_tool_started_without_markdown_shows_tool_prefix() {
+        let mut state = make_state(false);
+        let rendered = CliSinkState::format_tool_started("bash_exec", None, |text| {
+            state.render_markdown_line(text)
+        });
+
+        assert!(
+            rendered.contains("[tool]"),
+            "expected tool prefix in output: {rendered}"
+        );
+        assert!(
+            rendered.contains("bash_exec"),
+            "expected tool name in output: {rendered}"
+        );
+    }
+
+    #[test]
     fn completed_uses_template_markdown_when_present() {
         // With a template-rendered markdown, prefer it over the raw output.
         let raw_output = serde_json::json!({
@@ -589,17 +647,6 @@ mod tests {
     // the renderer can't initialize, otherwise it produces ANSI-styled
     // output via syntect.
     // ----------------------------------------------------------------
-
-    fn make_state(highlight: bool) -> CliSinkState {
-        CliSinkState {
-            spinner: None,
-            render: None,
-            buffer: String::new(),
-            last_ui_output_source: None,
-            highlight,
-            render_options: RenderOptions::default(),
-        }
-    }
 
     #[test]
     fn render_markdown_line_passthrough_when_highlight_disabled() {

@@ -272,7 +272,7 @@ impl ServerHandler for TimeServer {
             )
             .annotate(read_only.clone())
             .with_meta(Meta(json!({
-                "call_template": "**get time**{% if args.timezone %} ({{ args.timezone }}){% endif %}",
+                "call_template": "time{% if args.timezone %} ({{ args.timezone }}){% endif %}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
             Tool::new(
@@ -335,7 +335,7 @@ impl ServerHandler for TimeServer {
             )
             .annotate(read_only.clone())
             .with_meta(Meta(json!({
-                "call_template": "**convert time**{% if args.isoTimestamp %} from {{ args.isoTimestamp }}{% endif %}",
+                "call_template": "convert time{% if args.isoTimestamp %} {{ args.isoTimestamp }}{% endif %}{% if args.unixTimestamp %} unix={{ args.unixTimestamp }}{% endif %}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
             Tool::new(
@@ -358,7 +358,7 @@ impl ServerHandler for TimeServer {
                     .open_world(false),
             )
             .with_meta(Meta(json!({
-                "call_template": "**wait** {{ args.seconds }}s",
+                "call_template": "wait {{ args.seconds }}s",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
             Tool::new(
@@ -390,7 +390,7 @@ impl ServerHandler for TimeServer {
                     .open_world(false),
             )
             .with_meta(Meta(json!({
-                "call_template": "**wait until** {{ args.time }}",
+                "call_template": "wait until {{ args.time }}{% if args.timezone %} ({{ args.timezone }}){% endif %}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
         ];

@@ -209,6 +209,18 @@ impl Default for AcpManager {
 }
 
 fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
+    let session_new_call_template = format!("@ {} new session", server_name);
+    let session_prompt_call_template =
+        format!("@ {} {{{{ args.message | truncate(60) }}}}", server_name);
+    let session_load_call_template = format!(
+        "@ {} load {{{{ args.session_id | truncate(8, end='') }}}}",
+        server_name
+    );
+    let session_cancel_call_template = format!(
+        "@ {} cancel {{{{ args.session_id | truncate(8, end='') }}}}",
+        server_name
+    );
+
     vec![
         ToolDeclaration {
             name: format!("{server_name}_session_new"),
@@ -219,7 +231,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                 ..Default::default()
             },
             mcp_tool_name: Some("session_new".to_string()),
-            call_template: None,
+            call_template: Some(session_new_call_template),
             result_template: None,
         },
         ToolDeclaration {
@@ -255,7 +267,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                 ..Default::default()
             },
             mcp_tool_name: Some("session_prompt".to_string()),
-            call_template: None,
+            call_template: Some(session_prompt_call_template),
             result_template: None,
         },
         ToolDeclaration {
@@ -279,7 +291,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                 ..Default::default()
             },
             mcp_tool_name: Some("session_load".to_string()),
-            call_template: None,
+            call_template: Some(session_load_call_template),
             result_template: None,
         },
         ToolDeclaration {
@@ -303,7 +315,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                 ..Default::default()
             },
             mcp_tool_name: Some("session_cancel".to_string()),
-            call_template: None,
+            call_template: Some(session_cancel_call_template),
             result_template: None,
         },
     ]
