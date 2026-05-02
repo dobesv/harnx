@@ -150,6 +150,16 @@ pub struct Session {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub agent_variables: AgentVariables,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -218,11 +228,11 @@ impl Session {
             save_session: self.save_session,
             compress_threshold: self.compress_threshold,
             agent_name: self.agent_name.clone(),
-            session_id: None,
-            working_dir: None,
-            git_branch: None,
-            git_remote: None,
-            terminal_session_id: None,
+            session_id: self.session_id.clone(),
+            working_dir: self.working_dir.clone(),
+            git_branch: self.git_branch.clone(),
+            git_remote: self.git_remote.clone(),
+            terminal_session_id: self.terminal_session_id.clone(),
             agent_variables: self.agent_variables.clone(),
             agent_instructions: self.agent_instructions.clone(),
             model_fallbacks: self.model_fallbacks.clone(),

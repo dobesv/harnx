@@ -206,11 +206,11 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                 save_session,
                 compress_threshold,
                 agent_name,
-                session_id: _,
-                working_dir: _,
-                git_branch: _,
-                git_remote: _,
-                terminal_session_id: _,
+                session_id,
+                working_dir,
+                git_branch,
+                git_remote,
+                terminal_session_id,
                 agent_variables,
                 agent_instructions,
                 model_fallbacks,
@@ -223,6 +223,11 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                 session.save_session = save_session;
                 session.compress_threshold = compress_threshold;
                 session.agent_name = agent_name;
+                session.session_id = session_id;
+                session.working_dir = working_dir;
+                session.git_branch = git_branch;
+                session.git_remote = git_remote;
+                session.terminal_session_id = terminal_session_id;
                 session.agent_variables = agent_variables;
                 session.agent_instructions = agent_instructions;
                 session.model_fallbacks = model_fallbacks;

@@ -118,9 +118,7 @@ fn read_tty_link() -> Option<String> {
 
     if (mode & S_IFMT) == S_IFCHR {
         // Extract just the device name (e.g., "/dev/pts/0" -> "pts/0")
-        let name = tty_str
-            .strip_prefix("/dev/")
-            .unwrap_or(&tty_str);
+        let name = tty_str.strip_prefix("/dev/").unwrap_or(&tty_str);
         Some(name.to_string())
     } else {
         None
