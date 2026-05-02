@@ -20,14 +20,31 @@ use std::fs::{read_to_string, write, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::LazyLock;
+use uuid::Uuid;
+
+use crate::utils::{
+    session_name::{git_branch, git_remote},
+    terminal_session_id,
+};
 
 static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
 
 pub fn new(config: &Config, name: &str) -> Result<Session> {
     let agent = config.extract_agent();
+    let session_id = match Uuid::parse_str(name) {
+        Ok(uuid) if uuid.get_version_num() == 7 => name.to_string(),
+        _ => Uuid::now_v7().to_string(),
+    };
     let mut session = Session {
         name: name.to_string(),
         save_session: config.save_session,
+        session_id: Some(session_id),
+        working_dir: std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
+        git_branch: { let b = git_branch(); if b.is_empty() { None } else { Some(b) } },
+        git_remote: git_remote(),
+        terminal_session_id: terminal_session_id(),
         ..Default::default()
     };
     session.set_agent(&agent)?;

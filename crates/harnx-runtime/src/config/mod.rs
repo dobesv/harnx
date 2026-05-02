@@ -48,6 +48,7 @@ use std::{
 };
 use syntect::highlighting::ThemeSet;
 use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
+use uuid::Uuid;
 
 pub use harnx_rag::TEMP_RAG_NAME;
 pub const TEMP_SESSION_NAME: &str = "temp";
@@ -1320,7 +1321,11 @@ impl Config {
         }
         let mut session;
         match session_name {
-            None | Some(TEMP_SESSION_NAME) => {
+            None => {
+                let uuid_name = Uuid::now_v7().to_string();
+                session = Some(self::session::new(self, &uuid_name)?);
+            }
+            Some(TEMP_SESSION_NAME) => {
                 let session_file = self.session_file(TEMP_SESSION_NAME);
                 if session_file.exists() {
                     remove_file(session_file).with_context(|| {
@@ -4039,6 +4044,14 @@ mod tests {
     /// with an existing name (simulating the handoff path with session_id).
     /// This is the unit-level guarantee behind the #291 fix: after handoff the
     /// new agent starts with a blank session even when a session_id was provided.
+    #[test]
+    fn test_new_session_has_session_id() {
+        let config = Config::default();
+        let session = self::session::new(&config, "metadata-check").unwrap();
+
+        assert!(session.session_id.is_some());
+    }
+
     #[test]
     fn empty_session_clears_named_session_with_messages() {
         let mut config = Config::default();
