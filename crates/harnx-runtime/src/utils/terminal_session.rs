@@ -182,21 +182,17 @@ mod tests {
             Some(val) => env::set_var("TERM_SESSION_ID", val),
             None => env::remove_var("TERM_SESSION_ID"),
         }
-        match wt_original {
-            Some(val) => env::set_var("WT_SESSION", val),
-            None => (),
+        if let Some(val) = wt_original {
+            env::set_var("WT_SESSION", val);
         }
-        match kitty_original {
-            Some(val) => env::set_var("KITTY_WINDOW_ID", val),
-            None => (),
+        if let Some(val) = kitty_original {
+            env::set_var("KITTY_WINDOW_ID", val);
         }
-        match tmux_original {
-            Some(val) => env::set_var("TMUX_PANE", val),
-            None => (),
+        if let Some(val) = tmux_original {
+            env::set_var("TMUX_PANE", val);
         }
-        match sty_original {
-            Some(val) => env::set_var("STY", val),
-            None => (),
+        if let Some(val) = sty_original {
+            env::set_var("STY", val);
         }
     }
 

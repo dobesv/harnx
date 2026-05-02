@@ -8,6 +8,7 @@ use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
+use std::cmp::Reverse;
 use std::path::Path;
 
 const ATTACHMENT_PREVIEW_MAX_CHARS: usize = 800;
@@ -1523,16 +1524,168 @@ impl Tui {
     /// - `n` or `Esc` → cancel, clear modal.
     /// - All other keys are consumed (no action).
     pub(super) async fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
-        match (key.code, key.modifiers) {
-            // Confirm with 'y' or Enter
-            (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
-                self.confirm_modal_action().await?;
+        match self.app.modal.as_ref() {
+            Some(crate::types::ModalState::AgentPicker { .. })
+            | Some(crate::types::ModalState::SessionPicker { .. }) => {
+                self.handle_picker_key(key).await?;
             }
-            // Cancel with 'n' or Esc
-            (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, KeyModifiers::NONE) => {
-                self.app.modal = None;
+            Some(_) => match (key.code, key.modifiers) {
+                (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
+                    self.confirm_modal_action().await?;
+                }
+                (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, KeyModifiers::NONE) => {
+                    self.app.modal = None;
+                }
+                _ => {}
+            },
+            None => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(crate::types::ModalState::AgentPicker { selected, .. })
+                | Some(crate::types::ModalState::SessionPicker { selected, .. }) =
+                    self.app.modal.as_mut()
+                {
+                    *selected = selected.saturating_sub(1);
+                }
             }
-            // All other keys are consumed by the modal (no action)
+            KeyCode::Down => {
+                if let Some(crate::types::ModalState::AgentPicker { selected, agents }) =
+                    self.app.modal.as_mut()
+                {
+                    if *selected + 1 < agents.len() {
+                        *selected += 1;
+                    }
+                } else if let Some(crate::types::ModalState::SessionPicker { selected, sessions }) =
+                    self.app.modal.as_mut()
+                {
+                    if *selected + 1 < sessions.len() {
+                        *selected += 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let modal = self.app.modal.take();
+                match modal {
+                    Some(crate::types::ModalState::AgentPicker { agents, selected }) => {
+                        if selected < agents.len() {
+                            let agent_name = agents[selected].clone();
+                            let prev_session = self
+                                .config
+                                .read()
+                                .session
+                                .as_ref()
+                                .map(|s| s.name().to_string());
+                            let prev_agent = self
+                                .config
+                                .read()
+                                .agent
+                                .as_ref()
+                                .map(|a| a.name().to_string());
+
+                            self.config.write().use_agent_by_name(&agent_name)?;
+
+                            let mut sessions: Vec<_> = self
+                                .config
+                                .read()
+                                .list_sessions_with_meta()
+                                .into_iter()
+                                .filter(|s| s.agent_name.as_deref() == Some(agent_name.as_str()))
+                                .collect();
+                            if !sessions.is_empty() {
+                                sessions.sort_by_key(|s| Reverse(s.modified));
+                                self.app.modal = Some(crate::types::ModalState::SessionPicker {
+                                    sessions,
+                                    selected: 0,
+                                });
+                            } else {
+                                self.config.write().use_session(None)?;
+                                let llm_busy = self.app.llm_busy;
+                                let pending = self.app.pending_message.is_some();
+                                Self::refresh_input_chrome_from_state(
+                                    &self.config,
+                                    &mut self.app,
+                                    llm_busy,
+                                    pending,
+                                );
+                                self.reconcile_transcript_after_command(
+                                    prev_session,
+                                    prev_agent,
+                                    ".agent",
+                                );
+                            }
+                        }
+                    }
+                    Some(crate::types::ModalState::SessionPicker { sessions, selected }) => {
+                        if selected < sessions.len() {
+                            let session_name = sessions[selected].name.clone();
+                            let prev_session = self
+                                .config
+                                .read()
+                                .session
+                                .as_ref()
+                                .map(|s| s.name().to_string());
+                            let prev_agent = self
+                                .config
+                                .read()
+                                .agent
+                                .as_ref()
+                                .map(|a| a.name().to_string());
+
+                            self.config.write().use_session(Some(&session_name))?;
+
+                            let llm_busy = self.app.llm_busy;
+                            let pending = self.app.pending_message.is_some();
+                            Self::refresh_input_chrome_from_state(
+                                &self.config,
+                                &mut self.app,
+                                llm_busy,
+                                pending,
+                            );
+                            self.reconcile_transcript_after_command(
+                                prev_session,
+                                prev_agent,
+                                ".session",
+                            );
+                        }
+                    }
+                    _ => {
+                        self.app.modal = modal;
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                let modal = self.app.modal.take();
+                if let Some(crate::types::ModalState::SessionPicker { .. }) = modal {
+                    let prev_session = self
+                        .config
+                        .read()
+                        .session
+                        .as_ref()
+                        .map(|s| s.name().to_string());
+                    let prev_agent = self
+                        .config
+                        .read()
+                        .agent
+                        .as_ref()
+                        .map(|a| a.name().to_string());
+                    self.config.write().use_session(None)?;
+
+                    let llm_busy = self.app.llm_busy;
+                    let pending = self.app.pending_message.is_some();
+                    Self::refresh_input_chrome_from_state(
+                        &self.config,
+                        &mut self.app,
+                        llm_busy,
+                        pending,
+                    );
+                    self.reconcile_transcript_after_command(prev_session, prev_agent, ".session");
+                }
+            }
             _ => {}
         }
         Ok(())

@@ -23,6 +23,10 @@ use std::path::PathBuf;
 ///
 /// Session files use multi-document YAML (separated by `---`).
 /// The first document is always a `Header`; subsequent documents are events.
+// The Header variant is intentionally large — it holds all session-level metadata
+// fields. Boxing would require pervasive refactoring; the allocation cost is acceptable
+// since Headers are only created/read at session boundaries.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum SessionLogEntry {
