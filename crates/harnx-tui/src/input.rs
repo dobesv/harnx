@@ -1684,7 +1684,10 @@ impl Tui {
     /// Always rewinds to the *earliest* selected item regardless of selection
     /// direction, so Shift+selecting up vs down yields the same target.
     fn handle_transcript_rewind(&mut self) {
-        let focus = self.app.transcript_focus.expect("transcript_focus required");
+        let focus = self
+            .app
+            .transcript_focus
+            .expect("transcript_focus required");
         let focus = match self.app.transcript_selection_anchor {
             Some(anchor) => focus.min(anchor),
             None => focus,

@@ -226,9 +226,7 @@ fn validate_tool_pair_integrity(start_seq: usize, documents: &[String]) -> Resul
 
         let result_id_set: HashSet<&str> = result_ids.iter().copied().collect();
         if result_id_set.len() != result_ids.len() {
-            bail!(
-                "Edited tool result at {result_seq} contains duplicate tool_call_id values"
-            );
+            bail!("Edited tool result at {result_seq} contains duplicate tool_call_id values");
         }
 
         for call_id in &result_ids {
@@ -1477,10 +1475,7 @@ impl Config {
         // passes structural validation (including tool-call/result pairing).
         let selected_documents = documents[from..=to].to_vec();
         let temp_file = if let Some(ref dir) = self.temp_dir_override {
-            dir.join(format!(
-                "message-edit-{}.yaml",
-                uuid::Uuid::new_v4()
-            ))
+            dir.join(format!("message-edit-{}.yaml", uuid::Uuid::new_v4()))
         } else {
             temp_file("message-edit", ".yaml")
         };
