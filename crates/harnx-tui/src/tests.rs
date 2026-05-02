@@ -440,7 +440,7 @@ async fn ui_output_inserts_heading_when_source_changes() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -519,7 +519,7 @@ async fn info_commands_render_into_tui_transcript() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -772,7 +772,7 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -851,7 +851,7 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -1080,7 +1080,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -1161,7 +1161,7 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -1220,7 +1220,7 @@ async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() 
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -1326,7 +1326,7 @@ async fn submitting_message_with_attachments_renders_attachment_list_and_preview
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -3355,7 +3355,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .filter_map(|line| {
             let text = line
                 .spans
@@ -4445,7 +4445,7 @@ async fn tui_renders_started_title_when_template_provides_it() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .map(|line| line_to_plain(&line))
         .collect();
 
@@ -4489,7 +4489,7 @@ async fn tui_falls_back_to_yaml_when_no_template_title() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .map(|line| line_to_plain(&line))
         .collect();
     let joined = lines.join("\n");
@@ -4532,7 +4532,7 @@ async fn tui_renders_completed_template_title_when_provided() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .map(|line| line_to_plain(&line))
         .collect();
     let joined = lines.join("\n");
@@ -4581,7 +4581,7 @@ async fn tui_renders_fenced_diff_tool_result_with_per_line_syntect_styling() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .collect();
     let plain: Vec<String> = lines.iter().map(line_to_plain).collect();
     let joined = plain.join("\n");
@@ -4654,7 +4654,7 @@ async fn tui_falls_back_to_output_when_no_template_title() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .map(|line| line_to_plain(&line))
         .collect();
     let joined = lines.join("\n");
@@ -4688,7 +4688,7 @@ fn rendered_lines(tui: &Tui) -> Vec<ratatui::text::Line<'static>> {
     tui.app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .collect()
 }
 
@@ -4778,7 +4778,7 @@ async fn tui_started_no_template_keeps_yaml_unstyled() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .collect();
     let plain = rendered
         .iter()
@@ -4905,7 +4905,7 @@ async fn tui_assistant_text_preserves_line_breaks() {
         .app
         .transcript
         .iter()
-        .flat_map(|entry| Tui::render_entry(entry, true, false))
+        .flat_map(|entry| Tui::render_entry(entry, true, false, false))
         .collect();
     let line_texts: Vec<String> = rendered
         .iter()
@@ -5041,6 +5041,9 @@ async fn meta_suffix_combinations() {
                 .with_timezone(&chrono::Utc),
         ),
     });
+
+    // Use UTC so snapshot output is timezone-independent
+    harness.tui().app.use_utc_timestamps = true;
 
     // Both on
     harness.tui().app.show_sequence_numbers = true;

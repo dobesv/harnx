@@ -105,6 +105,7 @@ impl Tui {
                 transcript_selection_anchor: None,
                 modal: None,
                 action_menu_open: false,
+                use_utc_timestamps: false,
             },
             event_tx,
             event_rx,

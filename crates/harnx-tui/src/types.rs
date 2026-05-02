@@ -98,6 +98,10 @@ pub(super) struct App {
     pub(super) modal: Option<ModalState>,
     /// true when the Enter-triggered action menu is visible.
     pub(super) action_menu_open: bool,
+    /// When true, render timestamps in UTC instead of local time.
+    /// Always false in production; set to true in tests so snapshot
+    /// output is timezone-independent.
+    pub(super) use_utc_timestamps: bool,
 }
 
 /// Create a unique temporary attachment directory in the system temp area.

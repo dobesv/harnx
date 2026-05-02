@@ -82,6 +82,7 @@ impl Tui {
         timestamp: Option<chrono::DateTime<chrono::Utc>>,
         show_seq: bool,
         show_ts: bool,
+        use_utc: bool,
     ) -> Vec<Line<'static>> {
         let dim_gray = Style::default()
             .fg(Color::DarkGray)
@@ -89,7 +90,7 @@ impl Tui {
 
         let header_text = format!("→ {tool_name}");
         let mut lines = Self::render_text_entry("", &header_text, dim_gray, false);
-        if let Some(suffix) = Self::render_meta_suffix(seq, timestamp, show_seq, show_ts) {
+        if let Some(suffix) = Self::render_meta_suffix(seq, timestamp, show_seq, show_ts, use_utc) {
             if let Some(first_line) = lines.first_mut() {
                 first_line.spans.push(suffix);
             }
@@ -115,6 +116,7 @@ impl Tui {
         timestamp: Option<chrono::DateTime<chrono::Utc>>,
         show_seq: bool,
         show_ts: bool,
+        use_utc: bool,
     ) -> Option<Span<'static>> {
         let mut parts = vec![];
         if show_seq {
@@ -124,8 +126,14 @@ impl Tui {
         }
         if show_ts {
             if let Some(ts) = timestamp {
-                let local = ts.with_timezone(&chrono::Local);
-                parts.push(local.format("%H:%M:%S").to_string());
+                let formatted = if use_utc {
+                    ts.format("%H:%M:%S").to_string()
+                } else {
+                    ts.with_timezone(&chrono::Local)
+                        .format("%H:%M:%S")
+                        .to_string()
+                };
+                parts.push(formatted);
             }
         }
         if parts.is_empty() {
@@ -143,6 +151,7 @@ impl Tui {
         entry: &TranscriptItem,
         show_seq: bool,
         show_ts: bool,
+        use_utc: bool,
     ) -> Vec<Line<'static>> {
         match entry {
             TranscriptItem::SourceHeading(source) => Self::render_text_entry(
@@ -182,7 +191,8 @@ impl Tui {
                         .add_modifier(Modifier::BOLD),
                     true,
                 );
-                if let Some(suffix) = Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts)
+                if let Some(suffix) =
+                    Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
                     if let Some(first_line) = lines.first_mut() {
                         first_line.spans.push(suffix);
@@ -202,7 +212,8 @@ impl Tui {
                 // asterisks for the moment, then upgrades to bold once the
                 // closing `**` arrives in a later chunk.
                 let mut lines = crate::render_helpers::markdown_lines(text, Style::default());
-                if let Some(suffix) = Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts)
+                if let Some(suffix) =
+                    Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
                     if lines.is_empty() {
                         lines.push(Line::from(""));
@@ -284,6 +295,7 @@ impl Tui {
                 *timestamp,
                 show_seq,
                 show_ts,
+                use_utc,
             ),
             TranscriptItem::AttachmentHeader(text) => Self::render_text_entry(
                 "",
@@ -333,6 +345,7 @@ impl Tui {
 
         let show_seq = self.app.show_sequence_numbers;
         let show_ts = self.app.show_timestamps;
+        let use_utc = self.app.use_utc_timestamps;
         let selected_range = if let Some(f) = self.app.transcript_focus {
             let start = self.app.transcript_selection_anchor.unwrap_or(f).min(f);
             let end = self.app.transcript_selection_anchor.unwrap_or(f).max(f);
@@ -349,7 +362,7 @@ impl Tui {
                 .iter()
                 .enumerate()
                 .map(|(i, entry)| {
-                    let mut lines = Self::render_entry(entry, show_seq, show_ts);
+                    let mut lines = Self::render_entry(entry, show_seq, show_ts, use_utc);
                     if let Some(range) = &selected_range {
                         if range.contains(&i) {
                             if let Some(first_line) = lines.first_mut() {
