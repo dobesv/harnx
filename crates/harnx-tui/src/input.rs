@@ -132,6 +132,35 @@ impl Tui {
             return self.handle_modal_key(key).await;
         }
 
+        // While the detail view is open, only navigation / close keys are
+        // handled.  All other keys are silently consumed so they cannot bleed
+        // into the hidden background input field or trigger background actions.
+        if self.app.detail_view_open {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, KeyModifiers::NONE) => {
+                    self.app.detail_view_open = false;
+                }
+                (KeyCode::Up, KeyModifiers::NONE) => {
+                    self.app.detail_view_scroll.scroll_up();
+                }
+                (KeyCode::Down, KeyModifiers::NONE) => {
+                    self.app.detail_view_scroll.scroll_down();
+                }
+                (KeyCode::PageUp, KeyModifiers::NONE) => {
+                    for _ in 0..10 {
+                        self.app.detail_view_scroll.scroll_up();
+                    }
+                }
+                (KeyCode::PageDown, KeyModifiers::NONE) => {
+                    for _ in 0..10 {
+                        self.app.detail_view_scroll.scroll_down();
+                    }
+                }
+                _ => {} // all other keys silently consumed
+            }
+            return Ok(());
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                 self.abort_signal.set_ctrld();
@@ -179,11 +208,23 @@ impl Tui {
                 self.handle_down_key_shift();
             }
             (KeyCode::PageUp, KeyModifiers::NONE) => {
+                if self.app.detail_view_open {
+                    for _ in 0..10 {
+                        self.app.detail_view_scroll.scroll_up();
+                    }
+                    return Ok(());
+                }
                 for _ in 0..10 {
                     self.app.scroll_state.scroll_up();
                 }
             }
             (KeyCode::PageDown, KeyModifiers::NONE) => {
+                if self.app.detail_view_open {
+                    for _ in 0..10 {
+                        self.app.detail_view_scroll.scroll_down();
+                    }
+                    return Ok(());
+                }
                 for _ in 0..10 {
                     self.app.scroll_state.scroll_down();
                 }
@@ -195,33 +236,50 @@ impl Tui {
                 self.handle_tab(true).await;
             }
             (KeyCode::Esc, KeyModifiers::NONE) => {
-                if self.app.transcript_focus.is_some() {
+                if self.app.detail_view_open {
+                    self.app.detail_view_open = false;
+                } else if self.app.transcript_focus.is_some() {
                     self.app.transcript_focus = None;
                     self.app.transcript_selection_anchor = None;
+                    self.app.scroll_state.follow = true;
                 } else if !self.app.completions.is_empty() {
                     self.app.completions.clear();
                 }
             }
             // D4: Keyboard actions on selected transcript item(s)
-            (KeyCode::Char('e'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+            // All mutation shortcuts are blocked while the detail view is open.
+            (KeyCode::Char('e'), KeyModifiers::NONE)
+                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
+            {
                 self.handle_transcript_edit().await?;
             }
             (KeyCode::Delete, KeyModifiers::NONE) | (KeyCode::Char('d'), KeyModifiers::NONE)
-                if self.app.transcript_focus.is_some() =>
+                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
             {
                 self.handle_transcript_delete();
             }
-            (KeyCode::Char('i'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+            (KeyCode::Char('i'), KeyModifiers::NONE)
+                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
+            {
                 self.handle_transcript_insert();
             }
-            (KeyCode::Char('c'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+            (KeyCode::Char('c'), KeyModifiers::NONE)
+                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
+            {
                 self.handle_transcript_copy();
             }
-            (KeyCode::Char('r'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
+            (KeyCode::Char('r'), KeyModifiers::NONE)
+                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
+            {
                 self.handle_transcript_rewind();
             }
             (KeyCode::Enter, KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
-                self.app.action_menu_open = true;
+                self.app.detail_view_scroll = ratatui_widget_scrolling::ScrollState::new();
+                // Pre-load raw session YAML (same content .edit message would open).
+                self.app.detail_view_raw_yaml = self
+                    .selected_seq_range()
+                    .and_then(|(from, to)| self.config.read().get_message_range_yaml(from, to));
+                self.app.detail_view_open = true;
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 if self.try_handle_attach_command().await {
@@ -299,6 +357,13 @@ impl Tui {
                 });
             }
             _ => {
+                // While a transcript item is focused all unhandled keys are
+                // silently consumed — they must not leak into the input widget.
+                // (The specific action keys e/d/i/c/r are handled above; anything
+                // else is irrelevant when focus is on a history item.)
+                if self.app.transcript_focus.is_some() {
+                    return Ok(());
+                }
                 // Exit history preview on any editing key — keep current content as new draft
                 if self.app.history_preview {
                     self.app.history_index = None;
@@ -435,6 +500,10 @@ impl Tui {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
+        // Ignore paste while the detail view is open — same isolation policy as handle_key.
+        if self.app.detail_view_open {
+            return;
+        }
         if let Some(pending) = self.app.pending_message.take() {
             self.app.attachments = pending.attachments;
             self.app.attachment_dir = pending.attachment_dir;
@@ -489,11 +558,23 @@ impl Tui {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
+                if self.app.detail_view_open {
+                    for _ in 0..3 {
+                        self.app.detail_view_scroll.scroll_up();
+                    }
+                    return;
+                }
                 for _ in 0..3 {
                     self.app.scroll_state.scroll_up();
                 }
             }
             MouseEventKind::ScrollDown => {
+                if self.app.detail_view_open {
+                    for _ in 0..3 {
+                        self.app.detail_view_scroll.scroll_down();
+                    }
+                    return;
+                }
                 for _ in 0..3 {
                     self.app.scroll_state.scroll_down();
                 }
@@ -1051,16 +1132,47 @@ impl Tui {
         self.app.input.lines().join("\n").is_empty()
     }
 
+    fn find_prev_navigable(&self, start: usize) -> Option<usize> {
+        let mut focus = start;
+        while focus > 0 {
+            focus -= 1;
+            if self.app.transcript[focus].is_navigable() {
+                return Some(focus);
+            }
+        }
+        None
+    }
+
+    fn find_next_navigable(&self, mut focus: usize) -> Option<usize> {
+        while focus + 1 < self.app.transcript.len() {
+            focus += 1;
+            if self.app.transcript[focus].is_navigable() {
+                return Some(focus);
+            }
+        }
+        None
+    }
+
     fn handle_up_key(&mut self, key: KeyEvent) {
+        if self.app.detail_view_open {
+            self.app.detail_view_scroll.scroll_up();
+            return;
+        }
+
         if !self.app.completions.is_empty() {
             self.app.scroll_state.scroll_up();
         } else if let Some(focus) = self.app.transcript_focus {
-            if focus > 0 {
-                self.app.transcript_focus = Some(focus - 1);
+            if let Some(prev) = self.find_prev_navigable(focus) {
+                self.app.transcript_focus = Some(prev);
+                self.app.scroll_state.follow = false;
+                self.app.scroll_to_focused_item = true;
                 self.app.transcript_selection_anchor = None;
             } else {
                 self.app.transcript_focus = None;
                 self.app.transcript_selection_anchor = None;
+                // Do NOT restore follow here — user is entering history preview
+                // and the transcript position should stay where it is.
+                // follow is restored by Esc or when a new message is submitted.
 
                 let before = self.app.history_index;
                 self.history_prev();
@@ -1072,8 +1184,21 @@ impl Tui {
                 }
             }
         } else if self.input_is_blank() && !self.app.transcript.is_empty() {
-            self.app.transcript_focus = Some(self.app.transcript.len() - 1);
-            self.app.transcript_selection_anchor = None;
+            if let Some(prev) = self.find_prev_navigable(self.app.transcript.len()) {
+                self.app.transcript_focus = Some(prev);
+                self.app.scroll_state.follow = false;
+                self.app.scroll_to_focused_item = true;
+                self.app.transcript_selection_anchor = None;
+            } else {
+                let before = self.app.history_index;
+                self.history_prev();
+                let moved = self.app.history_index.is_some()
+                    && (self.app.history_index != before || self.app.history_preview);
+                if moved {
+                    self.app.history_preview = true;
+                    self.refresh_input_chrome();
+                }
+            }
         } else if self.app.history_preview || self.input_is_blank() {
             let before = self.app.history_index;
             self.history_prev();
@@ -1089,16 +1214,23 @@ impl Tui {
     }
 
     fn handle_down_key(&mut self, key: KeyEvent) {
+        if self.app.detail_view_open {
+            self.app.detail_view_scroll.scroll_down();
+            return;
+        }
+
         if !self.app.completions.is_empty() {
             self.app.scroll_state.scroll_down();
         } else if let Some(focus) = self.app.transcript_focus {
-            let next = focus + 1;
-            if next < self.app.transcript.len() {
+            if let Some(next) = self.find_next_navigable(focus) {
                 self.app.transcript_focus = Some(next);
+                self.app.scroll_state.follow = false;
+                self.app.scroll_to_focused_item = true;
                 self.app.transcript_selection_anchor = None;
             } else {
                 self.app.transcript_focus = None;
                 self.app.transcript_selection_anchor = None;
+                self.app.scroll_state.follow = true;
             }
         } else if self.app.history_preview {
             self.history_next();
@@ -1112,25 +1244,42 @@ impl Tui {
     }
 
     fn handle_up_key_shift(&mut self) {
-        if let Some(focus) = self.app.transcript_focus {
-            if self.app.transcript_selection_anchor.is_none() {
-                self.app.transcript_selection_anchor = Some(focus);
+        // If no focus yet, initialize it at the last navigable item (same as plain Up)
+        let focus = if let Some(f) = self.app.transcript_focus {
+            f
+        } else if self.input_is_blank() && !self.app.transcript.is_empty() {
+            if let Some(last) = self.find_prev_navigable(self.app.transcript.len()) {
+                self.app.transcript_focus = Some(last);
+                self.app.scroll_state.follow = false;
+                self.app.scroll_to_focused_item = true;
+                last
+            } else {
+                return;
             }
-            if focus > 0 {
-                self.app.transcript_focus = Some(focus - 1);
-            }
+        } else {
+            return;
+        };
+        if self.app.transcript_selection_anchor.is_none() {
+            self.app.transcript_selection_anchor = Some(focus);
+        }
+        if let Some(prev) = self.find_prev_navigable(focus) {
+            self.app.transcript_focus = Some(prev);
+            self.app.scroll_state.follow = false;
+            self.app.scroll_to_focused_item = true;
         }
     }
 
     fn handle_down_key_shift(&mut self) {
-        if let Some(focus) = self.app.transcript_focus {
-            if self.app.transcript_selection_anchor.is_none() {
-                self.app.transcript_selection_anchor = Some(focus);
-            }
-            let next = focus + 1;
-            if next < self.app.transcript.len() {
-                self.app.transcript_focus = Some(next);
-            }
+        let Some(focus) = self.app.transcript_focus else {
+            return; // Shift+Down has no effect without an active focus
+        };
+        if self.app.transcript_selection_anchor.is_none() {
+            self.app.transcript_selection_anchor = Some(focus);
+        }
+        if let Some(next) = self.find_next_navigable(focus) {
+            self.app.transcript_focus = Some(next);
+            self.app.scroll_state.follow = false;
+            self.app.scroll_to_focused_item = true;
         }
     }
 
@@ -1861,6 +2010,7 @@ impl Tui {
                 ..
             } => Some(format!("{}({})", tool_name, body)),
             TranscriptItem::ToolCall { tool_name, .. } => Some(format!("{}()", tool_name)),
+            TranscriptItem::ToolResultMarkdown(text) => Some(text.clone()),
             _ => None,
         }
     }
@@ -1878,6 +2028,7 @@ impl Tui {
         self.run_command(&cmd).await?;
         self.app.transcript_focus = None;
         self.app.transcript_selection_anchor = None;
+        self.app.scroll_state.follow = true;
         Ok(())
     }
 
@@ -1904,6 +2055,7 @@ impl Tui {
         }
         self.app.transcript_focus = None;
         self.app.transcript_selection_anchor = None;
+        self.app.scroll_state.follow = true;
     }
 
     /// Handle 'c' key: copy item text to clipboard.

@@ -1529,6 +1529,26 @@ impl Config {
         Ok(())
     }
 
+    /// Return the raw YAML documents for sequence numbers `from_seq..=to_seq`
+    /// exactly as `.edit message` would open them in the editor, including
+    /// auto-expansion for tool-call/result pairs.  Returns `None` when there is
+    /// no active session, the session file cannot be read, or the range is
+    /// invalid.  Documents are joined with `\n---\n`.
+    pub fn get_message_range_yaml(&self, from_seq: usize, to_seq: usize) -> Option<String> {
+        let session = self.session.as_ref()?;
+        let session_path = self.session_file(session.id());
+        let raw_log = std::fs::read_to_string(&session_path).ok()?;
+        let documents = split_session_log_documents(&raw_log);
+        if from_seq == 0 || to_seq >= documents.len() {
+            return None;
+        }
+        let (from, to) = adjust_range_for_tool_pairs(from_seq, to_seq, &documents).ok()?;
+        if from > to || to >= documents.len() {
+            return None;
+        }
+        Some(documents[from..=to].join("\n---\n"))
+    }
+
     pub fn delete_message_range(&mut self, from: usize, to: usize) -> Result<()> {
         let name = match &self.session {
             Some(session) => session.id().to_string(),

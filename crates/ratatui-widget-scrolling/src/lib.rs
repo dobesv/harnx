@@ -88,6 +88,42 @@ impl ScrollState {
         list
     }
 
+    /// Computes the `position` needed to scroll such that `item_index` is visible.
+    /// Uses the height cache for `viewport_width`. If cache is empty or incomplete
+    /// for this width, it returns a best-effort position.
+    pub fn scroll_position_to_show_item(
+        &mut self,
+        item_index: usize,
+        viewport_width: u16,
+        viewport_height: usize,
+        num_elements: usize,
+    ) -> usize {
+        let height_log = self.get_height_log_from_cache_for_width(viewport_width, num_elements);
+
+        let top_offset: usize = height_log.iter().take(item_index).sum();
+        let item_height = height_log.get(item_index).copied().unwrap_or(1);
+
+        let max_scroll_offset = height_log
+            .iter()
+            .sum::<usize>()
+            .saturating_sub(viewport_height);
+        if max_scroll_offset == 0 {
+            return 0; // Everything fits
+        }
+
+        // `position` in this widget = distance from top (0 = top, max_scroll_offset = bottom/follow).
+        // The render loop converts: scroll_offset = max_scroll_offset - position.
+        // So position = desired_scroll_offset (lines of content above the viewport top).
+        //
+        // We want the item centred, or top-aligned if it is taller than the viewport.
+        if item_height >= viewport_height {
+            top_offset // align top of item with top of viewport
+        } else {
+            top_offset.saturating_sub((viewport_height - item_height) / 2) // centre
+        }
+        .min(max_scroll_offset)
+    }
+
     fn render_scrollbar(
         frame: &mut Frame,
         area: Rect,

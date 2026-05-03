@@ -19,6 +19,10 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 
 pub struct Tui {
     pub(super) config: GlobalConfig,
+    /// Set to `true` by the after-editor hook so the main loop can call
+    /// `terminal.clear()` before the next draw, forcing a full repaint after
+    /// the external editor exits and the TUI re-enters the alternate screen.
+    pub(super) needs_full_redraw: Arc<std::sync::atomic::AtomicBool>,
     /// Tui-level abort signal used for Ctrl-D quitting and dot-command
     /// interruption. Each running prompt task gets its OWN abort signal
     /// (see `current_prompt_abort` below) so that resetting the Tui-level
@@ -97,8 +101,15 @@ pub(super) struct App {
     pub(super) transcript_selection_anchor: Option<usize>,
     /// Modal dialog state for destructive action confirmations.
     pub(super) modal: Option<ModalState>,
-    /// true when the Enter-triggered action menu is visible.
-    pub(super) action_menu_open: bool,
+    pub(super) detail_view_scroll: ratatui_widget_scrolling::ScrollState,
+    pub(super) detail_view_open: bool,
+    /// Raw YAML from the session log for the focused entry, populated when
+    /// detail_view_open is set.  None when no session is active or the item
+    /// has no sequence number.
+    pub(super) detail_view_raw_yaml: Option<String>,
+    /// Set to true whenever transcript_focus changes so draw() scrolls once
+    /// to keep the newly focused item visible, then clears it.
+    pub(super) scroll_to_focused_item: bool,
     /// When true, render timestamps in UTC instead of local time.
     /// Always false in production; set to true in tests so snapshot
     /// output is timezone-independent.
@@ -232,6 +243,31 @@ impl TranscriptItem {
             TranscriptItem::ToolCall { seq, .. } => *seq,
             _ => None,
         }
+    }
+
+    /// Whether this item can be focused with arrow keys.
+    pub(crate) fn is_navigable(&self) -> bool {
+        // ToolResultMarkdown is intentionally excluded: a tool result is always
+        // paired with its preceding ToolCall.  Focusing the ToolCall is sufficient
+        // — get_message_range_yaml auto-expands to include the paired result via
+        // adjust_range_for_tool_pairs.  Allowing focus on a bare ToolResultMarkdown
+        // would show an incomplete view and break navigation semantics.
+        matches!(
+            self,
+            TranscriptItem::UserText { .. }
+                | TranscriptItem::AssistantText { .. }
+                | TranscriptItem::ToolCall { .. }
+        )
+    }
+}
+
+impl App {
+    /// Returns the (min, max) indices of the current transcript selection.
+    /// Used by render_detail_view to determine which entries to display.
+    pub(super) fn selected_transcript_range(&self) -> (usize, usize) {
+        let f = self.transcript_focus.unwrap_or(0);
+        let a = self.transcript_selection_anchor.unwrap_or(f);
+        (f.min(a), f.max(a))
     }
 }
 

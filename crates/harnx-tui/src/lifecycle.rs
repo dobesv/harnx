@@ -96,7 +96,10 @@ impl Tui {
             transcript_focus: None,
             transcript_selection_anchor: None,
             modal: None,
-            action_menu_open: false,
+            detail_view_scroll: ratatui_widget_scrolling::ScrollState::new(),
+            detail_view_open: false,
+            detail_view_raw_yaml: None,
+            scroll_to_focused_item: false,
             use_utc_timestamps: false,
         };
 
@@ -113,6 +116,7 @@ impl Tui {
             shared_pending_message: Arc::new(Mutex::new(None)),
             current_prompt_abort: None,
             current_prompt_handle: None,
+            needs_full_redraw: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             app,
             event_tx,
             event_rx,
@@ -231,6 +235,14 @@ impl Tui {
         self.install_external_editor_bridge();
         let mut last_tick = Instant::now();
         loop {
+            // After an external editor exits, the terminal buffer is stale.
+            // Clear it to force ratatui to repaint every cell from scratch.
+            if self
+                .needs_full_redraw
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                let _ = terminal.clear();
+            }
             terminal.draw(|frame| self.draw(frame))?;
 
             if self.app.should_quit || self.abort_signal.aborted_ctrld() {
@@ -280,9 +292,10 @@ impl Tui {
     }
 
     fn install_external_editor_bridge(&self) {
+        let needs_full_redraw = self.needs_full_redraw.clone();
         self.config.write().set_tui_editor_hooks(
             Some(Box::new(cleanup_terminal_state)),
-            Some(Box::new(|| {
+            Some(Box::new(move || {
                 let _ = enable_raw_mode();
                 let mut stdout = io::stdout();
                 let _ = stdout.execute(EnterAlternateScreen);
@@ -295,6 +308,9 @@ impl Tui {
                 let _ = stdout.execute(EnableMouseCapture);
                 let _ = stdout.execute(EnableBracketedPaste);
                 let _ = stdout.flush();
+                // Signal the main loop to clear the terminal's diff buffer so
+                // the next draw() repaints every cell from scratch.
+                needs_full_redraw.store(true, std::sync::atomic::Ordering::Release);
             })),
         );
     }

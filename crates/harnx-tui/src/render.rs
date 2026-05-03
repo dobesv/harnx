@@ -357,6 +357,19 @@ impl Tui {
             None
         };
 
+        if self.app.scroll_to_focused_item {
+            if let Some(focus) = self.app.transcript_focus {
+                let position = self.app.scroll_state.scroll_position_to_show_item(
+                    focus,
+                    chunks[0].width,
+                    chunks[0].height as usize,
+                    self.app.transcript.len(),
+                );
+                self.app.scroll_state.position = position;
+            }
+            self.app.scroll_to_focused_item = false;
+        }
+
         let transcript_entries: Vec<Vec<Line<'static>>> = if self.app.transcript.is_empty() {
             vec![vec![Line::from(Span::raw(""))]]
         } else {
@@ -368,10 +381,9 @@ impl Tui {
                     let mut lines = Self::render_entry(entry, show_seq, show_ts, use_utc);
                     if let Some(range) = &selected_range {
                         if range.contains(&i) {
-                            if let Some(first_line) = lines.first_mut() {
-                                first_line.style =
-                                    first_line.style.add_modifier(Modifier::REVERSED);
-                                for span in &mut first_line.spans {
+                            for line in &mut lines {
+                                line.style = line.style.add_modifier(Modifier::REVERSED);
+                                for span in &mut line.spans {
                                     span.style = span.style.add_modifier(Modifier::REVERSED);
                                 }
                             }
@@ -532,9 +544,10 @@ impl Tui {
             frame.render_widget(popup, popup_area);
         }
 
-        // Render action menu if open
-        if self.app.action_menu_open && self.app.transcript_focus.is_some() {
-            self.render_action_menu(frame, size);
+        // Render detail view if open (exclusive — returns early)
+        if self.app.detail_view_open {
+            self.render_detail_view(frame, size);
+            return;
         }
 
         // Render confirmation modal on top of everything else
@@ -704,6 +717,14 @@ impl Tui {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD | Modifier::REVERSED),
             )
+        } else if app.transcript_focus.is_some() {
+            // Transcript item is focused — input is inactive; hide the cursor.
+            (
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+                Style::default(), // no REVERSED = invisible cursor
+            )
         } else if app.history_preview {
             (
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
@@ -719,49 +740,6 @@ impl Tui {
         };
         app.input.set_style(input_style);
         app.input.set_cursor_style(cursor_style);
-    }
-
-    /// Render a centered action menu overlay.
-    fn render_action_menu(&self, frame: &mut Frame<'_>, screen_size: ratatui::layout::Rect) {
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("[e] ", Style::default().fg(Color::Yellow)),
-                Span::raw("Edit     "),
-                Span::styled("[d] ", Style::default().fg(Color::Yellow)),
-                Span::raw("Delete   "),
-                Span::styled("[i] ", Style::default().fg(Color::Yellow)),
-                Span::raw("Insert"),
-            ]),
-            Line::from(vec![
-                Span::styled("[c] ", Style::default().fg(Color::Yellow)),
-                Span::raw("Copy     "),
-                Span::styled("[r] ", Style::default().fg(Color::Yellow)),
-                Span::raw("Rewind   "),
-                Span::styled("[Esc] ", Style::default().fg(Color::Yellow)),
-                Span::raw("Cancel"),
-            ]),
-        ];
-
-        let modal_width = 40;
-        let modal_height = 4; // 2 lines of text + borders
-
-        // Center the modal
-        let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
-        let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
-        let modal_area = ratatui::layout::Rect::new(modal_x, modal_y, modal_width, modal_height);
-
-        // Clear the area behind the modal
-        frame.render_widget(ratatui::widgets::Clear, modal_area);
-
-        // Render the modal box
-        let modal = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Actions")
-                .border_style(Style::default().fg(Color::Reset)),
-        );
-
-        frame.render_widget(modal, modal_area);
     }
 
     /// Render a centered confirmation modal overlay.
@@ -952,5 +930,245 @@ impl Tui {
         );
 
         frame.render_widget(modal, modal_area);
+    }
+
+    /// Render the detail view overlay for the selected transcript range.
+    /// Called from draw() when self.app.detail_view_open is true.
+    pub(super) fn render_entry_detail(entry: &TranscriptItem) -> Vec<Line<'static>> {
+        let label_style = Style::default().fg(Color::DarkGray);
+        let mut lines = Vec::new();
+
+        macro_rules! push_field {
+            ($key:expr, $value:expr) => {
+                if $value.contains('\n') {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("{}:", $key),
+                        label_style,
+                    )]));
+                    for line in $value.lines() {
+                        lines.push(Line::from(Span::raw(line.to_string())));
+                    }
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{}: ", $key), label_style),
+                        Span::raw($value.to_string()),
+                    ]));
+                }
+            };
+        }
+
+        match entry {
+            TranscriptItem::ToolCall {
+                tool_name,
+                body,
+                seq,
+                timestamp,
+            } => {
+                lines.push(Line::from(Span::styled("── tool call ──", label_style)));
+                if let Some(s) = seq {
+                    push_field!("seq", &s.to_string());
+                }
+                if let Some(ts) = timestamp {
+                    push_field!("timestamp", &ts.to_rfc3339());
+                }
+                push_field!("tool_name", tool_name);
+                if let Some(b) = body {
+                    match b {
+                        crate::types::ToolCallBody::Yaml(y) => push_field!("body (yaml)", y),
+                        crate::types::ToolCallBody::Markdown(m) => {
+                            push_field!("body (markdown)", m)
+                        }
+                    }
+                }
+            }
+            TranscriptItem::UserText {
+                text,
+                seq,
+                timestamp,
+            } => {
+                lines.push(Line::from(Span::styled("── user ──", label_style)));
+                if let Some(s) = seq {
+                    push_field!("seq", &s.to_string());
+                }
+                if let Some(ts) = timestamp {
+                    push_field!("timestamp", &ts.to_rfc3339());
+                }
+                push_field!("text", text);
+            }
+            TranscriptItem::AssistantText {
+                text,
+                seq,
+                timestamp,
+            } => {
+                lines.push(Line::from(Span::styled("── assistant ──", label_style)));
+                if let Some(s) = seq {
+                    push_field!("seq", &s.to_string());
+                }
+                if let Some(ts) = timestamp {
+                    push_field!("timestamp", &ts.to_rfc3339());
+                }
+                push_field!("text", text);
+            }
+            TranscriptItem::ToolResultMarkdown(text) => {
+                lines.push(Line::from(Span::styled("── tool result ──", label_style)));
+                push_field!("result", text);
+            }
+            TranscriptItem::SourceHeading(source) => {
+                lines.push(Line::from(Span::styled("── source ──", label_style)));
+                push_field!("source", &crate::render_helpers::source_heading(source));
+            }
+            TranscriptItem::SystemText(text) => {
+                lines.push(Line::from(Span::styled("── system ──", label_style)));
+                push_field!("text", text);
+            }
+            TranscriptItem::ErrorText(text) => {
+                lines.push(Line::from(Span::styled("── error ──", label_style)));
+                push_field!("error", text);
+            }
+            TranscriptItem::ThoughtText(text) => {
+                lines.push(Line::from(Span::styled("── thinking ──", label_style)));
+                push_field!("thought", text);
+            }
+            TranscriptItem::StatusLine(text) => {
+                lines.push(Line::from(Span::styled("── status ──", label_style)));
+                push_field!("status", text);
+            }
+            TranscriptItem::UsageLine(text) => {
+                lines.push(Line::from(Span::styled("── usage ──", label_style)));
+                push_field!("usage", text);
+            }
+            TranscriptItem::Plan(plan) => {
+                lines.push(Line::from(Span::styled("── plan ──", label_style)));
+                for (i, p) in plan.iter().enumerate() {
+                    push_field!(
+                        &format!("entry[{}]", i),
+                        &format!("{} [{}]", p.content, p.status)
+                    );
+                }
+            }
+            TranscriptItem::AttachmentHeader(text) => {
+                lines.push(Line::from(Span::styled("── attachment ──", label_style)));
+                push_field!("text", text);
+            }
+            TranscriptItem::AttachmentItem(text) => {
+                lines.push(Line::from(Span::styled(
+                    "── attachment item ──",
+                    label_style,
+                )));
+                push_field!("text", text);
+            }
+            TranscriptItem::AttachmentPreviewLine(text) => {
+                lines.push(Line::from(Span::styled(
+                    "── attachment preview ──",
+                    label_style,
+                )));
+                push_field!("text", text);
+            }
+            TranscriptItem::MutationNotice(text) => {
+                lines.push(Line::from(Span::styled("── notice ──", label_style)));
+                push_field!("text", text);
+            }
+        }
+        lines
+    }
+
+    pub(super) fn render_detail_view(
+        &mut self,
+        frame: &mut Frame<'_>,
+        size: ratatui::layout::Rect,
+    ) {
+        // Clear the full area first
+        frame.render_widget(ratatui::widgets::Clear, size);
+
+        // Split vertically: content area + footer
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(size);
+
+        // Build display content.
+        //
+        // Primary: raw session-log YAML (same text .edit message would open in
+        // the editor) — one Vec<Line> per YAML document, separated by a "---"
+        // divider line.
+        //
+        // Fallback: render_entry_detail() for items that have no seq number or
+        // when no session is active.
+        let (entries_as_vec, title): (Vec<Vec<Line<'static>>>, String) =
+            if let Some(yaml) = &self.app.detail_view_raw_yaml {
+                // Split on the same separator edit_message_range joins with.
+                let docs: Vec<&str> = yaml.split("\n---\n").collect();
+                let doc_count = docs.len();
+                let mut entries: Vec<Vec<Line<'static>>> = Vec::new();
+                for (i, doc) in docs.into_iter().enumerate() {
+                    let doc_lines: Vec<Line<'static>> = doc
+                        .lines()
+                        .map(|l| Line::from(Span::raw(l.to_string())))
+                        .collect();
+                    entries.push(doc_lines);
+                    if i + 1 < doc_count {
+                        // Visual separator between documents
+                        entries.push(vec![Line::from(Span::styled(
+                            "---",
+                            Style::default().fg(Color::DarkGray),
+                        ))]);
+                    }
+                }
+                let title = if doc_count == 1 {
+                    "Detail".to_string()
+                } else {
+                    format!("Detail ({doc_count} entries)")
+                };
+                (entries, title)
+            } else {
+                // Fallback: no session / no seq — render TUI fields verbatim
+                let (from, to) = self.app.selected_transcript_range();
+                let mut entries = Vec::new();
+                for i in from..=to {
+                    if i < self.app.transcript.len() {
+                        let entry = &self.app.transcript[i];
+                        entries.push(Self::render_entry_detail(entry));
+                        if i < to {
+                            entries.push(vec![Line::from("")]);
+                        }
+                    }
+                }
+                let title = if from == to {
+                    "Detail".to_string()
+                } else {
+                    format!("Detail ({from}–{to})")
+                };
+                (entries, title)
+            };
+
+        // Create block with border and title
+        let block = Block::default().borders(Borders::ALL).title(title.as_str());
+
+        // Get inner area for content
+        let inner_area = block.inner(chunks[0]);
+
+        // Render the block into the content chunk
+        frame.render_widget(block, chunks[0]);
+
+        // Render the scrollable content
+        self.app
+            .detail_view_scroll
+            .render(frame, inner_area, &entries_as_vec, |lines| {
+                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+                let height = paragraph.line_count(inner_area.width);
+                (height, paragraph)
+            });
+
+        // Clamp position to the freshly-updated last_max_position
+        self.app.detail_view_scroll.position = self
+            .app
+            .detail_view_scroll
+            .position
+            .min(self.app.detail_view_scroll.last_max_position);
+
+        // Render footer
+        let footer =
+            Paragraph::new(" ↑↓/scroll — ESC to close").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(footer, chunks[1]);
     }
 }

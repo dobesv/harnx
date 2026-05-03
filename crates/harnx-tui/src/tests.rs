@@ -5490,7 +5490,7 @@ async fn test_d4_key_r_opens_rewind_modal_assistant_text() {
 }
 
 #[tokio::test]
-async fn test_d4_enter_opens_action_menu() {
+async fn test_d4_enter_opens_detail_view() {
     let mut harness = TuiTestHarness::new();
     harness.tui().app.transcript.clear();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
@@ -5506,7 +5506,7 @@ async fn test_d4_enter_opens_action_menu() {
         .await
         .unwrap();
 
-    assert!(harness.tui().app.action_menu_open);
+    assert!(harness.tui().app.detail_view_open);
 }
 
 #[tokio::test]
@@ -5649,6 +5649,125 @@ async fn test_highlight_range() {
     assert!(
         num_reversed_starts >= 3,
         "Expected at least 3 items to have reversed lines"
+    );
+}
+
+#[tokio::test]
+async fn test_detail_view_esc_closes_view_and_preserves_focus() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Item".to_string(),
+        seq: Some(1),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().app.detail_view_open = true;
+
+    // Esc should close the detail view without clearing transcript_focus.
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        !harness.tui().app.detail_view_open,
+        "detail view should be closed after Esc"
+    );
+    assert_eq!(
+        harness.tui().app.transcript_focus,
+        Some(0),
+        "transcript focus should be preserved after closing detail view"
+    );
+}
+
+#[tokio::test]
+async fn test_detail_view_blocks_mutation_shortcuts() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Item".to_string(),
+        seq: Some(1),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().app.detail_view_open = true;
+    let initial_len = harness.tui().app.transcript.len();
+
+    // 'd' delete shortcut must be blocked while detail view is open.
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        harness.tui().app.detail_view_open,
+        "detail view should still be open"
+    );
+    assert_eq!(
+        harness.tui().app.transcript.len(),
+        initial_len,
+        "transcript must not be mutated while detail view is open"
+    );
+}
+
+#[tokio::test]
+async fn test_detail_view_scroll_keys_update_scroll_state() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Item".to_string(),
+        seq: Some(1),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().app.detail_view_open = true;
+
+    // Simulate enough scroll_down calls to move off position 0.
+    // We call scroll_down directly so we don't rely on last_max_position being
+    // set (which requires a render pass). Position starts at 0 and each
+    // scroll_down increments up to last_max_position (0 by default), so we
+    // just verify the key is consumed without crashing and the view stays open.
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        harness.tui().app.detail_view_open,
+        "detail view should still be open after scroll"
+    );
+}
+
+#[tokio::test]
+async fn test_detail_view_blocks_paste() {
+    let mut harness = TuiTestHarness::new();
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Item".to_string(),
+        seq: Some(1),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().app.detail_view_open = true;
+    let initial_input = harness.tui().app.input.lines().join("");
+
+    harness
+        .tui()
+        .handle_paste("should not appear".to_string())
+        .await;
+
+    assert!(
+        harness.tui().app.detail_view_open,
+        "detail view should still be open after paste"
+    );
+    assert_eq!(
+        harness.tui().app.input.lines().join(""),
+        initial_input,
+        "input field must not be mutated by paste while detail view is open"
     );
 }
 
