@@ -409,7 +409,11 @@ impl_json_schema!(
     "PlanReadNoteParams",
     |gen: &mut SchemaGenerator| vec![
         ("plan", "Plan name or ID", gen.subschema_for::<String>()),
-        ("note_id", "Note ID (8-hex string or note-<id> prefix)", gen.subschema_for::<String>()),
+        (
+            "note_id",
+            "Note ID (8-hex string or note-<id> prefix)",
+            gen.subschema_for::<String>()
+        ),
     ],
     &["plan", "note_id"]
 );
@@ -985,7 +989,10 @@ impl TodoServer {
         ))
     }
 
-    fn handle_plan_read_note(&self, params: PlanReadNoteParams) -> Result<CallToolResult, ErrorData> {
+    fn handle_plan_read_note(
+        &self,
+        params: PlanReadNoteParams,
+    ) -> Result<CallToolResult, ErrorData> {
         let plan = normalize_plan_name(&params.plan)
             .map_err(|err| ErrorData::invalid_params(err, None))?;
         let raw_id = params.note_id.trim();
@@ -997,7 +1004,10 @@ impl TodoServer {
         let content = std::fs::read_to_string(&path).map_err(|_| {
             ErrorData::invalid_params(format!("note '{id}' not found in plan '{plan}'"), None)
         })?;
-        Ok(result_text(content, format!("Read note {id} in plan {plan}")))
+        Ok(result_text(
+            content,
+            format!("Read note {id} in plan {plan}"),
+        ))
     }
 }
 
@@ -1783,11 +1793,7 @@ mod tests {
             })
             .unwrap();
         let note_summary = extract_text(note_result);
-        let note_id = note_summary
-            .split_whitespace()
-            .nth(2)
-            .unwrap()
-            .to_string();
+        let note_id = note_summary.split_whitespace().nth(2).unwrap().to_string();
 
         let todo_result = server
             .handle_create(TodoCreateParams {
