@@ -47,38 +47,13 @@ impl Tui {
         lines
     }
 
-    /// 3-space indent + a single line of inline-markdown body, used by
-    /// templated tool result/call lines so `**bold**` / `` `code` `` add
-    /// styling on top of the dim base without losing visual subordination.
-    fn render_indented_markdown_line(text: &str) -> Line<'static> {
-        let dim_gray = Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM);
-        let body_base = Style::default().add_modifier(Modifier::DIM);
-        let mut spans = vec![Span::styled("   ".to_string(), dim_gray)];
-        let parsed = crate::render_helpers::markdown_line_spans(text, body_base);
-        spans.extend(parsed.spans);
-        Line::from(spans)
-    }
-
-    /// 3-space indent + multi-line markdown body, used for tool results
-    /// where block-level constructs like fenced ```diff need the
-    /// whole-document parser to see them. Each parsed ratatui line gets
-    /// the indent prefixed and the dim base style patched under each
-    /// span so plain text still reads as dim.
-    fn render_indented_markdown_block(text: &str) -> Vec<Line<'static>> {
-        let dim_gray = Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM);
+    /// Multi-line markdown body renderer — used for tool call bodies and
+    /// tool results. Block-level constructs like fenced ```diff are handled
+    /// by the whole-document parser. The dim base style is patched under
+    /// each span so plain text still reads as dim.
+    fn render_markdown_block(text: &str) -> Vec<Line<'static>> {
         let body_base = Style::default().add_modifier(Modifier::DIM);
         crate::render_helpers::markdown_lines(text, body_base)
-            .into_iter()
-            .map(|line| {
-                let mut spans = vec![Span::styled("   ".to_string(), dim_gray)];
-                spans.extend(line.spans);
-                Line::from(spans)
-            })
-            .collect()
     }
 
     /// Render a `ToolCall` transcript item: `→ tool_name` header followed
@@ -100,13 +75,11 @@ impl Tui {
         match body {
             Some(ToolCallBody::Yaml(yaml)) => {
                 for line in yaml.lines() {
-                    lines.extend(Self::render_text_entry("   ", line, dim_gray, false));
+                    lines.extend(Self::render_text_entry("", line, dim_gray, false));
                 }
             }
             Some(ToolCallBody::Markdown(md)) => {
-                for line_text in md.lines() {
-                    lines.push(Self::render_indented_markdown_line(line_text));
-                }
+                lines.extend(Self::render_markdown_block(md));
             }
             None => {}
         }
@@ -247,7 +220,7 @@ impl Tui {
                     .add_modifier(Modifier::DIM),
                 false,
             ),
-            TranscriptItem::ToolResultMarkdown(text) => Self::render_indented_markdown_block(text),
+            TranscriptItem::ToolResultMarkdown(text) => Self::render_markdown_block(text),
             TranscriptItem::StatusLine(text) => Self::render_text_entry(
                 "",
                 text,

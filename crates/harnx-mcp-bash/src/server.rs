@@ -2031,7 +2031,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<ExecCommandParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "`$ {{ args.command }}`{% if args.working_dir %} ({{ args.working_dir }}){% endif %}{% if args.timeout_secs %} [{{ args.timeout_secs }}s]{% endif %}",
+                    "call_template": "```sh\n$ {{ args.command }}\n```{% if args.working_dir or args.timeout_secs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.timeout_secs %}[{{ args.timeout_secs }}s]{% endif %}{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "read_exec_log",
@@ -2049,7 +2049,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<SpawnCommandParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "`> {{ args.command }}`{% if args.working_dir %} ({{ args.working_dir }}){% endif %}",
+                    "call_template": "```sh\n> {{ args.command }}\n```{% if args.working_dir %}\n({{ args.working_dir }}){% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "wait",

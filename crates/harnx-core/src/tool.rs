@@ -552,4 +552,70 @@ mod tests {
         );
         assert_eq!(rendered.unwrap(), "ERROR: boom");
     }
+
+    /// Issue #434: the bash exec call_template must always close its code
+    /// fence on its own line regardless of which optional args are present,
+    /// so `is_fence_marker_line` in the TUI can reliably strip it.
+    #[test]
+    fn test_bash_exec_call_template_fence_closes_on_own_line() {
+        // This is the actual template used by the bash exec tool.
+        let template = "```sh\n$ {{ args.command }}\n```{% if args.working_dir or args.timeout_secs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.timeout_secs %}[{{ args.timeout_secs }}s]{% endif %}{% endif %}";
+
+        // No extras — bare fence, closing ``` is the last line.
+        let out =
+            render_tool_call_template(template, &serde_json::json!({"command": "ls"}), "").unwrap();
+        assert!(
+            out.lines().any(|l| l == "```"),
+            "closing fence must be on own line (no extras): {out:?}"
+        );
+
+        // timeout_secs only — ``` must still appear alone on its line.
+        let out = render_tool_call_template(
+            template,
+            &serde_json::json!({"command": "ls", "timeout_secs": 30}),
+            "",
+        )
+        .unwrap();
+        assert!(
+            out.lines().any(|l| l == "```"),
+            "closing fence must be on own line (timeout only): {out:?}"
+        );
+        assert!(
+            out.contains("[30s]"),
+            "timeout must appear in output: {out:?}"
+        );
+
+        // working_dir only.
+        let out = render_tool_call_template(
+            template,
+            &serde_json::json!({"command": "ls", "working_dir": "/tmp"}),
+            "",
+        )
+        .unwrap();
+        assert!(
+            out.lines().any(|l| l == "```"),
+            "closing fence must be on own line (working_dir only): {out:?}"
+        );
+        assert!(
+            out.contains("(/tmp)"),
+            "working_dir must appear in output: {out:?}"
+        );
+
+        // Both args present.
+        let out = render_tool_call_template(
+            template,
+            &serde_json::json!({"command": "ls", "working_dir": "/tmp", "timeout_secs": 10}),
+            "",
+        )
+        .unwrap();
+        assert!(
+            out.lines().any(|l| l == "```"),
+            "closing fence must be on own line (both args): {out:?}"
+        );
+        assert!(
+            out.contains("(/tmp)"),
+            "working_dir in combined output: {out:?}"
+        );
+        assert!(out.contains("[10s]"), "timeout in combined output: {out:?}");
+    }
 }
