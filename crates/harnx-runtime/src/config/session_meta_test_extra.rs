@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    use std::fs;
+    use anyhow::{anyhow, Result};
     use std::time::{Duration, UNIX_EPOCH};
     use tempfile::TempDir;
 
@@ -37,22 +37,28 @@ mod tests {
         assert_eq!(sorted[0].id, "new-session");
     }
 
-    #[test]
-    fn test_read_header_large_but_within_64kb() {
-        let tmp = TempDir::new().unwrap();
+    #[tokio::test]
+    async fn test_read_header_large_but_within_64kb() -> Result<()> {
+        let tmp = TempDir::new()?;
         let path = tmp.path().join("large.yaml");
 
-        // Build a valid header with a long agent_instructions field (but total < 64KB).
-        let long_instructions: String = "x".repeat(5000);
-        let content = format!(
-            "type: header\nmodel: gpt-4o\nagent_name: large-agent\nagent_instructions: {}\n---\nnext doc\n",
-            long_instructions
-        );
+        let header_prefix = "type: header
+model: gpt-4o
+agent_name: large-agent
+agent_instructions: ";
+        let header_suffix = "
+---
+next doc
+";
+        let repeat_count = 63 * 1024 - header_prefix.len() - header_suffix.len();
+        let long_instructions: String = "x".repeat(repeat_count);
+        let content = format!("{header_prefix}{long_instructions}{header_suffix}");
 
-        fs::write(&path, &content).unwrap();
+        tokio::fs::write(&path, &content).await?;
 
-        // Should successfully parse despite having a long field
-        let meta = parse_session_meta("large", &path).unwrap();
+        let meta = parse_session_meta("large", &path)
+            .ok_or_else(|| anyhow!("parse_session_meta returned None"))?;
         assert_eq!(meta.agent_name.as_deref(), Some("large-agent"));
+        Ok(())
     }
 }

@@ -200,7 +200,7 @@ pub(crate) fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState>
 
 ## Related Issues
 
-- **GitHub:** [Issue #422](https://github.com/example/harnx/issues/422) — Session handling revamp
+- **GitHub:** [Issue #422](https://github.com/dobesv/harnx/issues/422) — Session handling revamp
 - **Files Changed:**
   - `crates/harnx-core/src/session.rs` — Header metadata fields
   - `crates/harnx-runtime/src/config/session_meta.rs` — Header parsing, multi-tier sort

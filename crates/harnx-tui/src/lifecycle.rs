@@ -121,7 +121,7 @@ impl Tui {
 
     pub(crate) fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState> {
         let agents = list_agents();
-        if config.read().agent.is_none() && !agents.is_empty() {
+        if config.read().agent.is_none() && config.read().session.is_none() && !agents.is_empty() {
             return Some(ModalState::AgentPicker {
                 agents,
                 selected: 0,

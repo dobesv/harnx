@@ -1600,7 +1600,6 @@ impl Tui {
                                 .read()
                                 .list_sessions_with_meta()
                                 .into_iter()
-                                .filter(|s| s.agent_name.as_deref() == Some(agent_name.as_str()))
                                 .collect();
                             if !sessions.is_empty() {
                                 let ctx = build_picker_context();

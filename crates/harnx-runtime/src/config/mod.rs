@@ -1716,23 +1716,35 @@ impl Config {
     }
 
     pub fn list_sessions_with_meta(&self) -> Vec<SessionMeta> {
-        let Ok(entries) = std::fs::read_dir(self.sessions_dir()) else {
-            return Vec::new();
-        };
-
-        let mut sessions = entries
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                let name = path.file_stem()?.to_str()?;
-                (path.extension().and_then(|ext| ext.to_str()) == Some("yaml"))
-                    .then(|| parse_session_meta(name, &path))
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
-
+        let sessions_dir = self.sessions_dir();
+        let mut sessions = Vec::new();
+        Self::collect_session_metas(&sessions_dir, &sessions_dir, &mut sessions);
         sessions.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         sessions
+    }
+
+    fn collect_session_metas(sessions_dir: &Path, dir: &Path, out: &mut Vec<SessionMeta>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::collect_session_metas(sessions_dir, &path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+                if let Ok(rel) = path.strip_prefix(sessions_dir) {
+                    let id_path = rel.with_extension("");
+                    let id = id_path
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    if let Some(meta) = parse_session_meta(&id, &path) {
+                        out.push(meta);
+                    }
+                }
+            }
+        }
     }
 
     pub fn maybe_compact_session(config: GlobalConfig) {

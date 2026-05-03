@@ -143,6 +143,7 @@ pub fn git_remote() -> Option<String> {
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .and_then(|s| if s.is_empty() { None } else { Some(s) })
 }
 
 fn git_path() -> String {

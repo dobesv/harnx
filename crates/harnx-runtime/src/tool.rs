@@ -118,7 +118,7 @@ pub fn build_tool_eval_context(
     // Capture owned state for the dispatch callback so the
     // returned future is `'static` and `Send`.
     let hooks_entries = hooks.entries.clone();
-    let session_id = "cmd".to_string();
+    let session_id = session_name.clone().unwrap_or_else(|| "cmd".to_string());
     let cwd = std::env::current_dir().unwrap_or_default();
     let dispatch_hook_fn: Arc<DispatchHookFn> = Arc::new(move |event: HookEvent| {
         let hooks_entries = hooks_entries.clone();

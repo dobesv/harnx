@@ -8,11 +8,11 @@ use std::env;
 /// Returns a unique identifier for the current terminal session, if determinable.
 ///
 /// Checks environment variables in order:
-/// 1. `TERM_SESSION_ID` → `TERM_SESSION_ID:{val}`
-/// 2. `WT_SESSION` → `WT_SESSION:{val}`
-/// 3. `KITTY_WINDOW_ID` → `KITTY_WINDOW_ID:{val}`
-/// 4. `TMUX_PANE` → `tmux:{val}`
-/// 5. `STY` → `screen:{val}`
+/// 1. `TMUX_PANE` → `tmux:{val}`
+/// 2. `STY` → `screen:{val}`
+/// 3. `TERM_SESSION_ID` → `TERM_SESSION_ID:{val}`
+/// 4. `WT_SESSION` → `WT_SESSION:{val}`
+/// 5. `KITTY_WINDOW_ID` → `KITTY_WINDOW_ID:{val}`
 ///
 /// On Linux, falls back to session ID + TTY + process start time:
 /// `sid:{sid}:{tty}:{starttime}`
@@ -22,6 +22,23 @@ use std::env;
 /// This function never panics.
 pub fn terminal_session_id() -> Option<String> {
     // Check environment variables in priority order
+    // Multiplexers first (tmux, screen), then emulators
+    if let Some(val) = env::var_os("TMUX_PANE") {
+        if let Some(s) = val.to_str() {
+            if !s.is_empty() {
+                return Some(format!("tmux:{s}"));
+            }
+        }
+    }
+
+    if let Some(val) = env::var_os("STY") {
+        if let Some(s) = val.to_str() {
+            if !s.is_empty() {
+                return Some(format!("screen:{s}"));
+            }
+        }
+    }
+
     if let Some(val) = env::var_os("TERM_SESSION_ID") {
         if let Some(s) = val.to_str() {
             if !s.is_empty() {
@@ -42,22 +59,6 @@ pub fn terminal_session_id() -> Option<String> {
         if let Some(s) = val.to_str() {
             if !s.is_empty() {
                 return Some(format!("KITTY_WINDOW_ID:{s}"));
-            }
-        }
-    }
-
-    if let Some(val) = env::var_os("TMUX_PANE") {
-        if let Some(s) = val.to_str() {
-            if !s.is_empty() {
-                return Some(format!("tmux:{s}"));
-            }
-        }
-    }
-
-    if let Some(val) = env::var_os("STY") {
-        if let Some(s) = val.to_str() {
-            if !s.is_empty() {
-                return Some(format!("screen:{s}"));
             }
         }
     }
@@ -156,19 +157,48 @@ fn read_proc_starttime(sid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Mutex to serialize tests that mutate process-global environment variables.
+    static TEST_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that restores environment variables on drop.
+    struct EnvRestore {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn new(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|&k| (k, env::var_os(k))).collect();
+            EnvRestore { saved }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => env::set_var(k, val),
+                    None => env::remove_var(k),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_with_term_session_id() {
-        // Save original value if any
-        let original = env::var_os("TERM_SESSION_ID");
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _restore = EnvRestore::new(&[
+            "TERM_SESSION_ID",
+            "WT_SESSION",
+            "KITTY_WINDOW_ID",
+            "TMUX_PANE",
+            "STY",
+        ]);
 
         env::set_var("TERM_SESSION_ID", "test123");
 
         // Clear other session vars to ensure TERM_SESSION_ID wins
-        let wt_original = env::var_os("WT_SESSION");
-        let kitty_original = env::var_os("KITTY_WINDOW_ID");
-        let tmux_original = env::var_os("TMUX_PANE");
-        let sty_original = env::var_os("STY");
         env::remove_var("WT_SESSION");
         env::remove_var("KITTY_WINDOW_ID");
         env::remove_var("TMUX_PANE");
@@ -176,24 +206,6 @@ mod tests {
 
         let result = terminal_session_id();
         assert_eq!(result, Some("TERM_SESSION_ID:test123".to_string()));
-
-        // Restore original values
-        match original {
-            Some(val) => env::set_var("TERM_SESSION_ID", val),
-            None => env::remove_var("TERM_SESSION_ID"),
-        }
-        if let Some(val) = wt_original {
-            env::set_var("WT_SESSION", val);
-        }
-        if let Some(val) = kitty_original {
-            env::set_var("KITTY_WINDOW_ID", val);
-        }
-        if let Some(val) = tmux_original {
-            env::set_var("TMUX_PANE", val);
-        }
-        if let Some(val) = sty_original {
-            env::set_var("STY", val);
-        }
     }
 
     #[test]
@@ -209,20 +221,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_linux_fallback_format() {
-        use std::env;
-
-        // Clear all terminal env vars so we fall through to the Linux fallback.
-        let saved: Vec<(_, _)> = [
+        let _guard = TEST_ENV_MUTEX.lock().unwrap();
+        let _restore = EnvRestore::new(&[
             "TERM_SESSION_ID",
             "WT_SESSION",
             "KITTY_WINDOW_ID",
             "TMUX_PANE",
             "STY",
-        ]
-        .iter()
-        .map(|k| (*k, env::var_os(k)))
-        .collect();
-        for (k, _) in &saved {
+        ]);
+
+        // Clear all terminal env vars so we fall through to the Linux fallback.
+        for k in &[
+            "TERM_SESSION_ID",
+            "WT_SESSION",
+            "KITTY_WINDOW_ID",
+            "TMUX_PANE",
+            "STY",
+        ] {
             env::remove_var(k);
         }
 
@@ -241,13 +256,5 @@ mod tests {
             );
         }
         // If None — running without /proc access (e.g. container sandbox) — that's acceptable.
-
-        // Restore saved env vars.
-        for (k, v) in saved {
-            match v {
-                Some(val) => env::set_var(k, val),
-                None => env::remove_var(k),
-            }
-        }
     }
 }
