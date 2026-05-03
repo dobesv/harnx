@@ -2,10 +2,10 @@
 source: crates/harnx/tests/tmux_e2e.rs
 expression: s
 ---
+Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
+> first message
 
-
-
-
+FIRST_RESPONSE_SENTINEL
 
 > fifth message
 
@@ -39,7 +39,7 @@ EDITED_RESPONSE_SENTINEL
 
 
 
-
+* 🤖 mutation-test-agent ▸ mutation-e2e-session   Context: 42(0%)
 
 
 # snap: 4-after-edit
