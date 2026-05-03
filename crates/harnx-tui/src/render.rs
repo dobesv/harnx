@@ -10,6 +10,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+/// Options for `render_list_modal` — bundles the three metadata strings so the
+/// function stays within clippy's `too_many_arguments` limit.
+struct ListModalOpts<'a> {
+    title: &'a str,
+    footer: &'a str,
+    /// Optional live-filter query. When `Some`, renders a `🔍 <query>█` search
+    /// row above the list and a "No matches" placeholder when the list is empty.
+    query: Option<&'a str>,
+}
+
 impl Tui {
     fn render_text_entry(
         prefix: &str,
@@ -774,11 +784,25 @@ impl Tui {
                 let prompt_text = format!("Rewind to entry {}? [y/N]", seq);
                 self.render_simple_modal(frame, screen_size, &prompt_text);
             }
-            ModalState::AgentPicker { agents, selected } => {
+            ModalState::AgentPicker {
+                agents,
+                selected,
+                query,
+            } => {
                 let title = "Select Agent";
-                let footer = "↑↓ navigate  Enter select  Esc cancel";
-                let items: Vec<String> = agents.clone();
-                self.render_list_modal(frame, screen_size, title, footer, &items, *selected);
+                let footer = "type to filter  ↑↓ navigate  Enter select  Esc cancel";
+                let items = ModalState::filtered_agents(agents, query);
+                self.render_list_modal(
+                    frame,
+                    screen_size,
+                    &items,
+                    *selected,
+                    ListModalOpts {
+                        title,
+                        footer,
+                        query: Some(query),
+                    },
+                );
             }
             ModalState::SessionPicker {
                 sessions, selected, ..
@@ -802,7 +826,17 @@ impl Tui {
                         format!("{}  {}  {}", s.id, branch, cwd_tail)
                     })
                     .collect();
-                self.render_list_modal(frame, screen_size, title, footer, &items, *selected);
+                self.render_list_modal(
+                    frame,
+                    screen_size,
+                    &items,
+                    *selected,
+                    ListModalOpts {
+                        title,
+                        footer,
+                        query: None,
+                    },
+                );
             }
         }
     }
@@ -840,19 +874,28 @@ impl Tui {
         &self,
         frame: &mut Frame<'_>,
         screen_size: ratatui::layout::Rect,
-        title: &str,
-        footer: &str,
         items: &[String],
         selected: usize,
+        opts: ListModalOpts<'_>,
     ) {
+        let ListModalOpts {
+            title,
+            footer,
+            query,
+        } = opts;
         let max_item_len = items.iter().map(|s| s.len()).max().unwrap_or(0);
+        // Search row looks like "🔍 <query>█"; ensure minimum comfortable width.
+        let query_row_width: u16 = query.map(|q| (q.len() as u16 + 4).max(24)).unwrap_or(0);
         let modal_width = (max_item_len as u16 + 6)
             .max(title.len() as u16 + 4)
             .max(footer.len() as u16 + 4)
+            .max(query_row_width)
             .min(screen_size.width.saturating_sub(4));
 
         let visible_count = items.len().min(10);
-        let modal_height = (visible_count as u16 + 4).min(screen_size.height.saturating_sub(4));
+        let search_rows: u16 = if query.is_some() { 2 } else { 0 };
+        let list_rows = visible_count.max(usize::from(query.is_some() && items.is_empty())) as u16;
+        let modal_height = (list_rows + 4 + search_rows).min(screen_size.height.saturating_sub(4));
 
         let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
         let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
@@ -862,17 +905,34 @@ impl Tui {
 
         let mut lines = Vec::new();
 
-        let mut start = selected.saturating_sub(4);
-        let end = (start + 10).min(items.len());
-        start = end.saturating_sub(10);
+        // Search input row with magnifying-glass icon and simulated cursor.
+        if let Some(q) = query {
+            lines.push(Line::from(vec![
+                Span::styled("🔍 ", Style::default().fg(Color::Yellow)),
+                Span::styled(q.to_string(), Style::default().fg(Color::Reset)),
+                Span::styled("█", Style::default().fg(Color::Yellow)),
+            ]));
+            lines.push(Line::from(""));
+        }
 
-        for (i, item) in items.iter().enumerate().skip(start).take(10) {
-            let style = if i == selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            lines.push(Line::from(Span::styled(item.clone(), style)));
+        if items.is_empty() && query.is_some() {
+            lines.push(Line::from(Span::styled(
+                "No matches",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            let mut start = selected.saturating_sub(4);
+            let end = (start + 10).min(items.len());
+            start = end.saturating_sub(10);
+
+            for (i, item) in items.iter().enumerate().skip(start).take(10) {
+                let style = if i == selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(item.clone(), style)));
+            }
         }
 
         // Empty line

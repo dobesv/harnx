@@ -155,18 +155,36 @@ pub(super) enum ModalState {
     AgentPicker {
         agents: Vec<String>,
         selected: usize,
+        /// Live filter string typed by the user; empty means show all.
+        query: String,
     },
     /// Session selection.
-    /// `pending_agent` carries the agent name chosen in the preceding AgentPicker
-    /// so the agent mutation is deferred until the session is confirmed (or a new
-    /// session is started), keeping state clean if the user cancels.
+    /// The agent is always activated before this picker is shown.
+    /// `origin_agent` / `origin_session` carry the pre-activation agent and
+    /// session names so that `reconcile_transcript_after_command` can detect
+    /// the full agent+session transition when the picker is eventually confirmed
+    /// or dismissed via Esc.
     SessionPicker {
         sessions: Vec<SessionMeta>,
         selected: usize,
-        /// Agent to activate when the session is confirmed. None when the session
-        /// picker was opened directly (agent already set or not applicable).
-        pending_agent: Option<String>,
+        /// Agent name *before* the picker flow started (pre-activation).
+        origin_agent: Option<String>,
+        /// Session id *before* the picker flow started (pre-activation).
+        origin_session: Option<String>,
     },
+}
+
+impl ModalState {
+    /// Return the subset of agents matching the current query (case-insensitive
+    /// substring). Returns all agents when the query is empty.
+    pub(super) fn filtered_agents(agents: &[String], query: &str) -> Vec<String> {
+        let q = query.to_lowercase();
+        agents
+            .iter()
+            .filter(|a| q.is_empty() || a.to_lowercase().contains(&q))
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

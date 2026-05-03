@@ -1554,10 +1554,15 @@ impl Tui {
                 }
             }
             KeyCode::Down => {
-                if let Some(crate::types::ModalState::AgentPicker { selected, agents }) =
-                    self.app.modal.as_mut()
+                if let Some(crate::types::ModalState::AgentPicker {
+                    selected,
+                    agents,
+                    query,
+                }) = self.app.modal.as_mut()
                 {
-                    if *selected + 1 < agents.len() {
+                    let filtered_len =
+                        crate::types::ModalState::filtered_agents(agents, query).len();
+                    if *selected + 1 < filtered_len {
                         *selected += 1;
                     }
                 } else if let Some(crate::types::ModalState::SessionPicker {
@@ -1574,48 +1579,72 @@ impl Tui {
             KeyCode::Enter => {
                 let modal = self.app.modal.take();
                 match modal {
-                    Some(crate::types::ModalState::AgentPicker { agents, selected }) => {
-                        if selected < agents.len() {
-                            let agent_name = agents[selected].clone();
+                    Some(crate::types::ModalState::AgentPicker {
+                        agents,
+                        selected,
+                        query,
+                    }) => {
+                        // Resolve the selected index against the filtered list.
+                        let filtered = crate::types::ModalState::filtered_agents(&agents, &query);
+                        let filtered: Vec<&str> = filtered.iter().map(|a| a.as_str()).collect();
+                        if selected >= filtered.len() {
+                            // Nothing valid selected (e.g. filter yields empty list) —
+                            // keep the picker open so the user can adjust the query.
+                            self.app.modal = Some(crate::types::ModalState::AgentPicker {
+                                agents,
+                                selected,
+                                query,
+                            });
+                        } else {
+                            let agent_name = filtered[selected].to_string();
 
-                            let sessions: Vec<_> = self
+                            let prev_session = self
                                 .config
                                 .read()
-                                .list_sessions_with_meta()
-                                .into_iter()
-                                .collect();
+                                .session
+                                .as_ref()
+                                .map(|s| s.id().to_string());
+                            let prev_agent = self
+                                .config
+                                .read()
+                                .agent
+                                .as_ref()
+                                .map(|a| a.name().to_string());
+
+                            // Activate the agent immediately so sessions_dir() is
+                            // already scoped to the correct per-agent directory.
+                            if let Err(e) = self.config.write().use_agent_by_name(&agent_name) {
+                                self.app.modal = Some(crate::types::ModalState::AgentPicker {
+                                    agents,
+                                    selected,
+                                    query,
+                                });
+                                return Err(e);
+                            }
+
+                            let sessions = self.config.read().list_sessions_with_meta();
                             if !sessions.is_empty() {
-                                // Defer use_agent_by_name until the session is confirmed so
-                                // that cancelling the session picker leaves state unchanged.
                                 let ctx = build_picker_context();
                                 let sessions = sort_sessions_for_picker(sessions, &ctx);
+                                // Carry the pre-activation origin state into SessionPicker so
+                                // reconcile_transcript_after_command sees the full transition.
                                 self.app.modal = Some(crate::types::ModalState::SessionPicker {
                                     sessions,
                                     selected: 0,
-                                    pending_agent: Some(agent_name),
+                                    origin_agent: prev_agent,
+                                    origin_session: prev_session,
                                 });
                             } else {
-                                // No sessions — commit the agent immediately and start fresh.
-                                let prev_session = self
-                                    .config
-                                    .read()
-                                    .session
-                                    .as_ref()
-                                    .map(|s| s.id().to_string());
-                                let prev_agent = self
-                                    .config
-                                    .read()
-                                    .agent
-                                    .as_ref()
-                                    .map(|a| a.name().to_string());
-                                if let Err(e) = self.config.write().use_agent_by_name(&agent_name) {
+                                // No sessions — start a fresh one right away.
+                                if let Err(e) = self.config.write().use_session(None) {
+                                    // Restore AgentPicker so the user can try again.
                                     self.app.modal = Some(crate::types::ModalState::AgentPicker {
                                         agents,
                                         selected,
+                                        query,
                                     });
                                     return Err(e);
                                 }
-                                self.config.write().use_session(None)?;
                                 let llm_busy = self.app.llm_busy;
                                 let pending = self.app.pending_message.is_some();
                                 Self::refresh_input_chrome_from_state(
@@ -1635,41 +1664,26 @@ impl Tui {
                     Some(crate::types::ModalState::SessionPicker {
                         sessions,
                         selected,
-                        pending_agent,
+                        origin_agent,
+                        origin_session,
                     }) => {
-                        if selected < sessions.len() {
+                        if selected >= sessions.len() {
+                            // Index out of range — keep picker open.
+                            self.app.modal = Some(crate::types::ModalState::SessionPicker {
+                                sessions,
+                                selected,
+                                origin_agent,
+                                origin_session,
+                            });
+                        } else {
                             let session_name = sessions[selected].id.clone();
-                            let prev_session = self
-                                .config
-                                .read()
-                                .session
-                                .as_ref()
-                                .map(|s| s.id().to_string());
-                            let prev_agent = self
-                                .config
-                                .read()
-                                .agent
-                                .as_ref()
-                                .map(|a| a.name().to_string());
-
-                            // Apply deferred agent selection before loading session.
-                            if let Some(ref agent_name) = pending_agent {
-                                if let Err(e) = self.config.write().use_agent_by_name(agent_name) {
-                                    self.app.modal =
-                                        Some(crate::types::ModalState::SessionPicker {
-                                            sessions,
-                                            selected,
-                                            pending_agent,
-                                        });
-                                    return Err(e);
-                                }
-                            }
 
                             if let Err(e) = self.config.write().use_session(Some(&session_name)) {
                                 self.app.modal = Some(crate::types::ModalState::SessionPicker {
                                     sessions,
                                     selected,
-                                    pending_agent,
+                                    origin_agent,
+                                    origin_session,
                                 });
                                 return Err(e);
                             }
@@ -1682,9 +1696,11 @@ impl Tui {
                                 llm_busy,
                                 pending,
                             );
+                            // Use origin_* to reflect the full transition from the start
+                            // of the picker flow (not just the session half of the switch).
                             self.reconcile_transcript_after_command(
-                                prev_session,
-                                prev_agent,
+                                origin_session,
+                                origin_agent,
                                 ".session",
                             );
                         }
@@ -1695,9 +1711,64 @@ impl Tui {
                 }
             }
             KeyCode::Esc => {
-                // Simply dismiss the picker — do not create a new session.
-                // A new anonymous session will be created on first message if needed.
-                self.app.modal = None;
+                // ESC on the SessionPicker starts a new session (agent is already
+                // active at this point).  ESC on the AgentPicker just cancels.
+                if let Some(crate::types::ModalState::SessionPicker {
+                    origin_agent,
+                    origin_session,
+                    ..
+                }) = self.app.modal.take()
+                {
+                    // Dismiss modal only after use_session succeeds, so a failure
+                    // does not leave the UI without any active modal or session.
+                    if let Err(e) = self.config.write().use_session(None) {
+                        // Restore a minimal SessionPicker so the user can try again.
+                        self.app.modal = Some(crate::types::ModalState::SessionPicker {
+                            sessions: vec![],
+                            selected: 0,
+                            origin_agent,
+                            origin_session,
+                        });
+                        return Err(e);
+                    }
+                    let llm_busy = self.app.llm_busy;
+                    let pending = self.app.pending_message.is_some();
+                    Self::refresh_input_chrome_from_state(
+                        &self.config,
+                        &mut self.app,
+                        llm_busy,
+                        pending,
+                    );
+                    self.reconcile_transcript_after_command(
+                        origin_session,
+                        origin_agent,
+                        ".session",
+                    );
+                } else {
+                    self.app.modal = None;
+                }
+            }
+
+            // Typing characters filters the AgentPicker list.
+            KeyCode::Char(c)
+                if key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                if let Some(crate::types::ModalState::AgentPicker {
+                    query, selected, ..
+                }) = self.app.modal.as_mut()
+                {
+                    query.push(c);
+                    *selected = 0; // reset to top of filtered list
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(crate::types::ModalState::AgentPicker {
+                    query, selected, ..
+                }) = self.app.modal.as_mut()
+                {
+                    query.pop();
+                    *selected = 0;
+                }
             }
 
             _ => {}

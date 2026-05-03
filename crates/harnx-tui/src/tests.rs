@@ -5682,3 +5682,632 @@ async fn test_picker_shown_when_no_agent_and_agents_exist() {
         "resolve_initial_modal must return a valid modal state"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Picker tests — AgentPicker filtering, SessionPicker ESC, agent activation
+// ---------------------------------------------------------------------------
+
+/// Process-wide async mutex that serialises tests which mutate `HARNX_CONFIG_DIR`.
+/// Env vars are process-global, so concurrent tests that each set their own
+/// temp dir would race.  Using `tokio::sync::Mutex` lets the guard be held
+/// safely across `.await` points (unlike `std::sync::Mutex`).
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// RAII guard that sets an env var for the duration of the test and restores
+/// the original value (or removes it) on drop.  Callers must hold `ENV_LOCK`
+/// for the duration the guard is alive.
+struct EnvGuard {
+    key: &'static str,
+    prior: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prior = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, prior }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prior {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+/// Build a minimal config for picker tests (alias for `test_config`).
+fn picker_test_config() -> GlobalConfig {
+    test_config()
+}
+
+/// Create agent .md stub files and return a list of agent names.
+fn create_agent_stubs(agents_dir: &std::path::Path, names: &[&str]) {
+    std::fs::create_dir_all(agents_dir).unwrap();
+    for name in names {
+        let f = agents_dir.join(format!("{name}.md"));
+        std::fs::write(f, format!("# {name}")).unwrap();
+    }
+}
+
+/// Create a minimal session .yaml stub for the given agent.
+/// The file must begin with a `type: header` YAML document so that
+/// `parse_session_meta` recognises it as a valid session header.
+fn create_session_stub(config_dir: &std::path::Path, agent_name: &str, session_id: &str) {
+    let dir = config_dir.join("agents").join(agent_name).join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let content = format!(
+        "type: header\nmodel: test-model\nagent_name: {agent_name}\nworking_dir: /tmp\ngit_branch: main\n"
+    );
+    std::fs::write(dir.join(format!("{session_id}.yaml")), content).unwrap();
+}
+
+// --- AgentPicker filtering ---------------------------------------------------
+
+#[tokio::test]
+async fn agent_picker_typing_filters_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+    create_agent_stubs(&tmp.path().join("agents"), &["apollo", "argus", "hermes"]);
+
+    let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // Manually set up AgentPicker with all three agents.
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["apollo".into(), "argus".into(), "hermes".into()],
+        selected: 0,
+        query: String::new(),
+    });
+
+    // Type "a" — should filter to ["apollo", "argus"].
+    tui.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    match &tui.app.modal {
+        Some(crate::types::ModalState::AgentPicker {
+            query, selected, ..
+        }) => {
+            assert_eq!(query, "a");
+            assert_eq!(*selected, 0, "selection resets to 0 on filter change");
+        }
+        other => panic!("expected AgentPicker, got {other:?}"),
+    }
+
+    // Verify the filtered list via the helper.
+    let agents = vec![
+        "apollo".to_string(),
+        "argus".to_string(),
+        "hermes".to_string(),
+    ];
+    let filtered = crate::types::ModalState::filtered_agents(&agents, "a");
+    assert_eq!(filtered, vec!["apollo", "argus"]);
+}
+
+#[tokio::test]
+async fn agent_picker_filter_is_case_insensitive() {
+    let agents = vec![
+        "Apollo".to_string(),
+        "ARGUS".to_string(),
+        "hermes".to_string(),
+    ];
+    let filtered = crate::types::ModalState::filtered_agents(&agents, "ap");
+    assert_eq!(filtered, vec!["Apollo"]);
+
+    let filtered_upper = crate::types::ModalState::filtered_agents(&agents, "AP");
+    assert_eq!(filtered_upper, vec!["Apollo"]);
+}
+
+#[tokio::test]
+async fn agent_picker_empty_query_shows_all() {
+    let agents = vec![
+        "apollo".to_string(),
+        "argus".to_string(),
+        "hermes".to_string(),
+    ];
+    let filtered = crate::types::ModalState::filtered_agents(&agents, "");
+    assert_eq!(filtered.len(), 3);
+}
+
+#[tokio::test]
+async fn agent_picker_no_match_query_returns_empty() {
+    let agents = vec!["apollo".to_string(), "hermes".to_string()];
+    let filtered = crate::types::ModalState::filtered_agents(&agents, "zzz");
+    assert!(filtered.is_empty());
+}
+
+#[tokio::test]
+async fn agent_picker_backspace_removes_char_and_resets_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["apollo".into(), "argus".into()],
+        selected: 1,
+        query: "ar".into(),
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    match &tui.app.modal {
+        Some(crate::types::ModalState::AgentPicker {
+            query, selected, ..
+        }) => {
+            assert_eq!(query, "a");
+            assert_eq!(*selected, 0);
+        }
+        other => panic!("expected AgentPicker, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn agent_picker_down_bounded_by_filtered_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // query "a" filters to ["apollo","argus"] — 2 items.
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["apollo".into(), "argus".into(), "hermes".into()],
+        selected: 0,
+        query: "a".into(),
+    });
+
+    // Down once → index 1 (last in filtered list).
+    tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let sel1 = match &tui.app.modal {
+        Some(crate::types::ModalState::AgentPicker { selected, .. }) => *selected,
+        _ => panic!("expected AgentPicker"),
+    };
+    assert_eq!(sel1, 1);
+
+    // Down again → should NOT advance past filtered count.
+    tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let sel2 = match &tui.app.modal {
+        Some(crate::types::ModalState::AgentPicker { selected, .. }) => *selected,
+        _ => panic!("expected AgentPicker"),
+    };
+    assert_eq!(sel2, 1, "should not advance past end of filtered list");
+}
+
+#[tokio::test]
+async fn agent_picker_enter_on_empty_filter_does_nothing() {
+    // When the filter yields no matches, Enter should be a no-op (modal stays open).
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["apollo".into()],
+        selected: 0,
+        query: "zzz".into(), // no matches
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // Modal must stay open — pressing Enter with no filtered matches should be a no-op,
+    // not close the picker and leave the user stranded.
+    assert!(
+        matches!(
+            tui.app.modal,
+            Some(crate::types::ModalState::AgentPicker { .. })
+        ),
+        "AgentPicker should remain open when Enter is pressed with no matching items, got {:?}",
+        tui.app.modal
+    );
+}
+
+// --- AgentPicker → immediate agent activation --------------------------------
+
+#[tokio::test]
+async fn agent_picker_enter_activates_agent_immediately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    // Create a real agent .md file so use_agent_by_name succeeds.
+    let agents_dir = tmp.path().join("agents");
+    create_agent_stubs(&agents_dir, &["hermes"]);
+
+    let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["hermes".into()],
+        selected: 0,
+        query: String::new(),
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // Agent should be activated immediately on config.
+    let agent_name = config.read().agent.as_ref().map(|a| a.name().to_string());
+    assert_eq!(
+        agent_name.as_deref(),
+        Some("hermes"),
+        "agent must be set immediately on Enter"
+    );
+}
+
+#[tokio::test]
+async fn agent_picker_enter_with_no_sessions_starts_new_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    create_agent_stubs(&tmp.path().join("agents"), &["hermes"]);
+    // No session files created → no sessions for this agent.
+
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        guard.sessions_dir_override =
+            Some(tmp.path().join("agents").join("hermes").join("sessions"));
+    }
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["hermes".into()],
+        selected: 0,
+        query: String::new(),
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // Modal dismissed, agent set, and a new session created.
+    assert!(tui.app.modal.is_none(), "modal should be dismissed");
+    assert!(
+        config.read().session.is_some(),
+        "a new session should have been created"
+    );
+}
+
+#[tokio::test]
+async fn agent_picker_enter_with_sessions_shows_session_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    create_agent_stubs(&tmp.path().join("agents"), &["hermes"]);
+    create_session_stub(tmp.path(), "hermes", "session-001");
+
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        // Override sessions dir to the hermes-specific path.
+        guard.sessions_dir_override =
+            Some(tmp.path().join("agents").join("hermes").join("sessions"));
+    }
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["hermes".into()],
+        selected: 0,
+        query: String::new(),
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // Agent activated, SessionPicker should now be open.
+    let agent_name = config.read().agent.as_ref().map(|a| a.name().to_string());
+    assert_eq!(agent_name.as_deref(), Some("hermes"));
+    assert!(
+        matches!(
+            tui.app.modal,
+            Some(crate::types::ModalState::SessionPicker { .. })
+        ),
+        "expected SessionPicker after AgentPicker Enter with existing sessions, got {:?}",
+        tui.app.modal
+    );
+}
+
+// --- SessionPicker ESC creates new session -----------------------------------
+
+#[tokio::test]
+async fn session_picker_esc_creates_new_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        guard.sessions_dir_override = Some(tmp.path().join("sessions"));
+        // Give config a minimal agent so use_session doesn't fail on agent checks.
+        let model = MockClient::builder().build().model().clone();
+        let mut agent =
+            harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
+        agent.set_name("hermes");
+        agent.set_model(model);
+        guard.agent = Some(agent);
+    }
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![],
+        selected: 0,
+        origin_agent: None,
+        origin_session: None,
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        tui.app.modal.is_none(),
+        "modal should be dismissed after Esc"
+    );
+    assert!(
+        config.read().session.is_some(),
+        "Esc on SessionPicker must create a new session"
+    );
+}
+
+#[tokio::test]
+async fn agent_picker_esc_does_not_create_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["apollo".into()],
+        selected: 0,
+        query: String::new(),
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        tui.app.modal.is_none(),
+        "AgentPicker Esc should dismiss modal"
+    );
+    assert!(
+        config.read().session.is_none(),
+        "AgentPicker Esc must NOT create a session"
+    );
+}
+
+// --- SessionPicker Enter picks session ---------------------------------------
+
+#[tokio::test]
+async fn session_picker_enter_loads_selected_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let sessions_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    // Use old (non-log) format so session::load takes the "old format" path
+    // and doesn't try to validate the model name against registered clients.
+    // All we need here is for the file to exist so use_session picks it up.
+    std::fs::write(sessions_dir.join("my-session.yaml"), "# old format stub\n").unwrap();
+
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        guard.sessions_dir_override = Some(sessions_dir.clone());
+        let model = MockClient::builder().build().model().clone();
+        let mut agent =
+            harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
+        agent.set_name("hermes");
+        agent.set_model(model);
+        guard.agent = Some(agent);
+    }
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    let meta = harnx_runtime::config::SessionMeta {
+        id: "my-session".into(),
+        agent_name: Some("hermes".into()),
+        working_dir: Some("/tmp".into()),
+        git_branch: Some("main".into()),
+        git_remote: None,
+        session_id: None,
+        terminal_session_id: None,
+        modified: None,
+    };
+
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![meta],
+        selected: 0,
+        origin_agent: None,
+        origin_session: None,
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        tui.app.modal.is_none(),
+        "modal should be dismissed after Enter"
+    );
+    let session_id = config.read().session.as_ref().map(|s| s.id().to_string());
+    assert_eq!(
+        session_id.as_deref(),
+        Some("my-session"),
+        "selected session should be loaded"
+    );
+}
+
+// --- Reconciliation: origin_* baseline is used, not post-activation state ---
+
+#[tokio::test]
+async fn session_picker_enter_reconciles_from_origin_not_current_agent() {
+    // This test verifies the transcript reconciliation fix: when the user goes
+    // through AgentPicker → SessionPicker, the reconciliation must compare
+    // against the state *before* agent activation (origin_*), not against the
+    // already-mutated post-activation state.
+    //
+    // Setup: config already has agent "hermes" active (simulates post-activation).
+    //        SessionPicker carries origin_agent = Some("apollo") (different agent).
+    //        Selecting a session should trigger reconciliation (transcript clear)
+    //        because origin_agent ("apollo") != current_agent ("hermes").
+    //
+    //        If reconciliation used the post-activation agent (hermes == hermes),
+    //        it would be a no-op and the transcript would NOT be cleared — the bug.
+
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    // Create a session file for hermes.
+    let sessions_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    std::fs::write(sessions_dir.join("sess-1.yaml"), "# old format stub\n").unwrap();
+
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        guard.sessions_dir_override = Some(sessions_dir.clone());
+        let model = MockClient::builder().build().model().clone();
+        let mut agent =
+            harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
+        agent.set_name("hermes");
+        agent.set_model(model);
+        guard.agent = Some(agent);
+    }
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // Seed the transcript with a sentinel item so we can detect if it was cleared.
+    tui.app.transcript.push(TranscriptItem::SystemText(
+        "sentinel-pre-reconcile".to_string(),
+    ));
+    assert!(
+        tui.app
+            .transcript
+            .iter()
+            .any(|t| matches!(t, TranscriptItem::SystemText(s) if s == "sentinel-pre-reconcile")),
+        "sentinel should be present before picker action"
+    );
+
+    let meta = harnx_runtime::config::SessionMeta {
+        id: "sess-1".into(),
+        agent_name: Some("hermes".into()),
+        working_dir: Some("/tmp".into()),
+        git_branch: Some("main".into()),
+        git_remote: None,
+        session_id: None,
+        terminal_session_id: None,
+        modified: None,
+    };
+
+    // origin_agent = Some("apollo") simulates "user was on apollo before entering picker".
+    // Current config has "hermes" active (post-activation).
+    // Reconciliation should detect origin("apollo") != current("hermes") → clear transcript.
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![meta],
+        selected: 0,
+        origin_agent: Some("apollo".to_string()),
+        origin_session: None,
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.modal.is_none(), "modal should be dismissed");
+    // Transcript should have been cleared by reconciliation (sentinel gone).
+    assert!(
+        !tui.app
+            .transcript
+            .iter()
+            .any(|t| matches!(t, TranscriptItem::SystemText(s) if s == "sentinel-pre-reconcile")),
+        "transcript should be cleared by reconciliation when origin_agent differs from current agent"
+    );
+}
+
+#[tokio::test]
+async fn session_picker_esc_reconciles_from_origin_not_current_agent() {
+    // Same scenario as above but via Esc (new session) rather than Enter (select session).
+
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let sessions_dir = tmp.path().join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        guard.sessions_dir_override = Some(sessions_dir.clone());
+        let model = MockClient::builder().build().model().clone();
+        let mut agent =
+            harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
+        agent.set_name("hermes");
+        agent.set_model(model);
+        guard.agent = Some(agent);
+    }
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.transcript.push(TranscriptItem::SystemText(
+        "sentinel-esc-reconcile".to_string(),
+    ));
+
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![],
+        selected: 0,
+        origin_agent: Some("apollo".to_string()),
+        origin_session: None,
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(tui.app.modal.is_none(), "modal dismissed after Esc");
+    assert!(config.read().session.is_some(), "new session created");
+    assert!(
+        !tui.app
+            .transcript
+            .iter()
+            .any(|t| matches!(t, TranscriptItem::SystemText(s) if s == "sentinel-esc-reconcile")),
+        "transcript should be cleared by reconciliation when origin_agent differs from current agent"
+    );
+}
