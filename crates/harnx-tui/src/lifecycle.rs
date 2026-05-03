@@ -2,7 +2,7 @@ use crate::agent_event_sink::install_tui_agent_event_sink;
 use crate::event_source::{CrosstermEventSource, EventSource};
 use crate::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
 use crate::types::Tui;
-use crate::types::{App, PendingMessage, TranscriptItem, SPINNER_FRAMES, TICK_RATE};
+use crate::types::{App, ModalState, PendingMessage, TranscriptItem, SPINNER_FRAMES, TICK_RATE};
 use anyhow::Result;
 #[cfg(test)]
 use crossterm::event::KeyEvent;
@@ -15,6 +15,7 @@ use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
 use harnx_hooks::{drain_async_results, AsyncHookManager, PersistentHookManager};
 use harnx_runtime::config::GlobalConfig;
+use harnx_runtime::config::{build_picker_context, list_agents, sort_sessions_for_picker};
 use harnx_runtime::tool::ToolDeclaration;
 use harnx_runtime::utils::create_abort_signal;
 use ratatui::Terminal;
@@ -64,6 +65,45 @@ impl Tui {
         // Build the initial transcript: welcome + banner (if agent)
         let initial_transcript = Self::build_initial_transcript(config);
 
+        let mut app = App {
+            transcript: initial_transcript,
+            input: Self::new_input(),
+            spinner_index: 0,
+            should_quit: false,
+            llm_busy: false,
+            scroll_state: ratatui_widget_scrolling::ScrollState::new(),
+            streaming_assistant_idx: None,
+            last_ui_output_source: None,
+            last_usage_source: None,
+            last_usage_transcript_idx: None,
+            pending_thought_source: None,
+            pending_thought_text: String::new(),
+            pending_message: None,
+            completions: vec![],
+            completion_index: 0,
+            completion_prefix: String::new(),
+            completion_suffix: String::new(),
+            history: vec![],
+            history_index: None,
+            history_draft: String::new(),
+            history_preview: false,
+            attachments: vec![],
+            attachment_dir: None,
+            paste_count: 0,
+            last_known_input_width: 1,
+            show_sequence_numbers: config.read().show_sequence_numbers,
+            show_timestamps: config.read().show_timestamps,
+            transcript_focus: None,
+            transcript_selection_anchor: None,
+            modal: None,
+            action_menu_open: false,
+            use_utc_timestamps: false,
+        };
+
+        if !cfg!(test) {
+            app.modal = Self::resolve_initial_modal(config);
+        }
+
         Ok(Self {
             config: config.clone(),
             abort_signal: create_abort_signal(),
@@ -73,43 +113,40 @@ impl Tui {
             shared_pending_message: Arc::new(Mutex::new(None)),
             current_prompt_abort: None,
             current_prompt_handle: None,
-            app: App {
-                transcript: initial_transcript,
-                input: Self::new_input(),
-                spinner_index: 0,
-                should_quit: false,
-                llm_busy: false,
-                scroll_state: ratatui_widget_scrolling::ScrollState::new(),
-                streaming_assistant_idx: None,
-                last_ui_output_source: None,
-                last_usage_source: None,
-                last_usage_transcript_idx: None,
-                pending_thought_source: None,
-                pending_thought_text: String::new(),
-                pending_message: None,
-                completions: vec![],
-                completion_index: 0,
-                completion_prefix: String::new(),
-                completion_suffix: String::new(),
-                history: vec![],
-                history_index: None,
-                history_draft: String::new(),
-                history_preview: false,
-                attachments: vec![],
-                attachment_dir: None,
-                paste_count: 0,
-                last_known_input_width: 1,
-                show_sequence_numbers: config.read().show_sequence_numbers,
-                show_timestamps: config.read().show_timestamps,
-                transcript_focus: None,
-                transcript_selection_anchor: None,
-                modal: None,
-                action_menu_open: false,
-                use_utc_timestamps: false,
-            },
+            app,
             event_tx,
             event_rx,
         })
+    }
+
+    pub(crate) fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState> {
+        let agents = list_agents();
+        if config.read().agent.is_none() && config.read().session.is_none() && !agents.is_empty() {
+            return Some(ModalState::AgentPicker {
+                agents,
+                selected: 0,
+            });
+        } else if config.read().session.is_none() {
+            let sessions = config.read().list_sessions_with_meta();
+            let sessions: Vec<_> = if let Some(agent) = config.read().agent.as_ref() {
+                sessions
+                    .into_iter()
+                    .filter(|s| s.agent_name.as_deref() == Some(agent.name()))
+                    .collect()
+            } else {
+                sessions
+            };
+            if !sessions.is_empty() {
+                let ctx = build_picker_context();
+                let sorted = sort_sessions_for_picker(sessions, &ctx);
+                return Some(ModalState::SessionPicker {
+                    sessions: sorted,
+                    selected: 0,
+                    pending_agent: None,
+                });
+            }
+        }
+        None
     }
 
     pub(crate) fn build_initial_transcript(config: &GlobalConfig) -> Vec<TranscriptItem> {

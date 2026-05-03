@@ -761,39 +761,132 @@ impl Tui {
         screen_size: ratatui::layout::Rect,
         modal: &ModalState,
     ) {
-        let prompt_text = match modal {
+        match modal {
             ModalState::ConfirmDelete { from, to } => {
-                if from == to {
+                let prompt_text = if from == to {
                     format!("Delete entry {}? [y/N]", from)
                 } else {
                     format!("Delete entries {}–{}? [y/N]", from, to)
-                }
+                };
+                self.render_simple_modal(frame, screen_size, &prompt_text);
             }
             ModalState::ConfirmRewind { seq, .. } => {
-                format!("Rewind to entry {}? [y/N]", seq)
+                let prompt_text = format!("Rewind to entry {}? [y/N]", seq);
+                self.render_simple_modal(frame, screen_size, &prompt_text);
             }
-        };
+            ModalState::AgentPicker { agents, selected } => {
+                let title = "Select Agent";
+                let footer = "↑↓ navigate  Enter select  Esc cancel";
+                let items: Vec<String> = agents.clone();
+                self.render_list_modal(frame, screen_size, title, footer, &items, *selected);
+            }
+            ModalState::SessionPicker {
+                sessions, selected, ..
+            } => {
+                let title = "Select Session";
+                let footer = "↑↓ navigate  Enter select  Esc new session";
+                let items: Vec<String> = sessions
+                    .iter()
+                    .map(|s| {
+                        let branch = s.git_branch.as_deref().unwrap_or("");
+                        let cwd = s.working_dir.as_deref().unwrap_or("");
+                        let parts: Vec<&str> =
+                            cwd.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+                        let cwd_tail = if parts.len() >= 2 {
+                            format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+                        } else if parts.len() == 1 {
+                            parts[0].to_string()
+                        } else {
+                            String::new()
+                        };
+                        format!("{}  {}  {}", s.id, branch, cwd_tail)
+                    })
+                    .collect();
+                self.render_list_modal(frame, screen_size, title, footer, &items, *selected);
+            }
+        }
+    }
 
-        // Calculate modal size based on content
+    fn render_simple_modal(
+        &self,
+        frame: &mut Frame<'_>,
+        screen_size: ratatui::layout::Rect,
+        prompt_text: &str,
+    ) {
         let prompt_len = prompt_text.len() as u16;
         let modal_width = (prompt_len + 6).min(screen_size.width.saturating_sub(4));
-        let modal_height = 3u16; // Single line of text + borders
+        let modal_height = 3u16;
 
-        // Center the modal
         let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
         let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
         let modal_area = ratatui::layout::Rect::new(modal_x, modal_y, modal_width, modal_height);
 
-        // Clear the area behind the modal
         frame.render_widget(ratatui::widgets::Clear, modal_area);
 
-        // Render the modal box
         let modal = Paragraph::new(Line::from(Span::styled(
             prompt_text,
             Style::default().fg(Color::Reset),
         )))
         .block(
             Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Reset)),
+        );
+
+        frame.render_widget(modal, modal_area);
+    }
+
+    fn render_list_modal(
+        &self,
+        frame: &mut Frame<'_>,
+        screen_size: ratatui::layout::Rect,
+        title: &str,
+        footer: &str,
+        items: &[String],
+        selected: usize,
+    ) {
+        let max_item_len = items.iter().map(|s| s.len()).max().unwrap_or(0);
+        let modal_width = (max_item_len as u16 + 6)
+            .max(title.len() as u16 + 4)
+            .max(footer.len() as u16 + 4)
+            .min(screen_size.width.saturating_sub(4));
+
+        let visible_count = items.len().min(10);
+        let modal_height = (visible_count as u16 + 4).min(screen_size.height.saturating_sub(4));
+
+        let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
+        let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
+        let modal_area = ratatui::layout::Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+        frame.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let mut lines = Vec::new();
+
+        let mut start = selected.saturating_sub(4);
+        let end = (start + 10).min(items.len());
+        start = end.saturating_sub(10);
+
+        for (i, item) in items.iter().enumerate().skip(start).take(10) {
+            let style = if i == selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(item.clone(), style)));
+        }
+
+        // Empty line
+        lines.push(Line::from(""));
+
+        // Footer hint
+        lines.push(Line::from(Span::styled(
+            footer,
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let modal = Paragraph::new(lines).block(
+            Block::default()
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Reset)),
         );

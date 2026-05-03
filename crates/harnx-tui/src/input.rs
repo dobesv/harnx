@@ -6,6 +6,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
+use harnx_runtime::config::{build_picker_context, sort_sessions_for_picker};
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
@@ -1377,7 +1378,7 @@ impl Tui {
     ) {
         let (curr_session, curr_agent) = {
             let cfg = self.config.read();
-            let s = cfg.session.as_ref().map(|s| s.name().to_string());
+            let s = cfg.session.as_ref().map(|s| s.id().to_string());
             let a = cfg.agent.as_ref().map(|a| a.name().to_string());
             (s, a)
         };
@@ -1412,7 +1413,7 @@ impl Tui {
             .read()
             .session
             .as_ref()
-            .map(|s| s.name().to_string());
+            .map(|s| s.id().to_string());
         let prev_agent = self
             .config
             .read()
@@ -1523,16 +1524,182 @@ impl Tui {
     /// - `n` or `Esc` → cancel, clear modal.
     /// - All other keys are consumed (no action).
     pub(super) async fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
-        match (key.code, key.modifiers) {
-            // Confirm with 'y' or Enter
-            (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
-                self.confirm_modal_action().await?;
+        match self.app.modal.as_ref() {
+            Some(crate::types::ModalState::AgentPicker { .. })
+            | Some(crate::types::ModalState::SessionPicker { .. }) => {
+                self.handle_picker_key(key).await?;
             }
-            // Cancel with 'n' or Esc
-            (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, KeyModifiers::NONE) => {
+            Some(_) => match (key.code, key.modifiers) {
+                (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {
+                    self.confirm_modal_action().await?;
+                }
+                (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, KeyModifiers::NONE) => {
+                    self.app.modal = None;
+                }
+                _ => {}
+            },
+            None => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Up => {
+                if let Some(crate::types::ModalState::AgentPicker { selected, .. })
+                | Some(crate::types::ModalState::SessionPicker { selected, .. }) =
+                    self.app.modal.as_mut()
+                {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(crate::types::ModalState::AgentPicker { selected, agents }) =
+                    self.app.modal.as_mut()
+                {
+                    if *selected + 1 < agents.len() {
+                        *selected += 1;
+                    }
+                } else if let Some(crate::types::ModalState::SessionPicker {
+                    selected,
+                    sessions,
+                    ..
+                }) = self.app.modal.as_mut()
+                {
+                    if *selected + 1 < sessions.len() {
+                        *selected += 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let modal = self.app.modal.take();
+                match modal {
+                    Some(crate::types::ModalState::AgentPicker { agents, selected }) => {
+                        if selected < agents.len() {
+                            let agent_name = agents[selected].clone();
+
+                            let sessions: Vec<_> = self
+                                .config
+                                .read()
+                                .list_sessions_with_meta()
+                                .into_iter()
+                                .collect();
+                            if !sessions.is_empty() {
+                                // Defer use_agent_by_name until the session is confirmed so
+                                // that cancelling the session picker leaves state unchanged.
+                                let ctx = build_picker_context();
+                                let sessions = sort_sessions_for_picker(sessions, &ctx);
+                                self.app.modal = Some(crate::types::ModalState::SessionPicker {
+                                    sessions,
+                                    selected: 0,
+                                    pending_agent: Some(agent_name),
+                                });
+                            } else {
+                                // No sessions — commit the agent immediately and start fresh.
+                                let prev_session = self
+                                    .config
+                                    .read()
+                                    .session
+                                    .as_ref()
+                                    .map(|s| s.id().to_string());
+                                let prev_agent = self
+                                    .config
+                                    .read()
+                                    .agent
+                                    .as_ref()
+                                    .map(|a| a.name().to_string());
+                                if let Err(e) = self.config.write().use_agent_by_name(&agent_name) {
+                                    self.app.modal = Some(crate::types::ModalState::AgentPicker {
+                                        agents,
+                                        selected,
+                                    });
+                                    return Err(e);
+                                }
+                                self.config.write().use_session(None)?;
+                                let llm_busy = self.app.llm_busy;
+                                let pending = self.app.pending_message.is_some();
+                                Self::refresh_input_chrome_from_state(
+                                    &self.config,
+                                    &mut self.app,
+                                    llm_busy,
+                                    pending,
+                                );
+                                self.reconcile_transcript_after_command(
+                                    prev_session,
+                                    prev_agent,
+                                    ".agent",
+                                );
+                            }
+                        }
+                    }
+                    Some(crate::types::ModalState::SessionPicker {
+                        sessions,
+                        selected,
+                        pending_agent,
+                    }) => {
+                        if selected < sessions.len() {
+                            let session_name = sessions[selected].id.clone();
+                            let prev_session = self
+                                .config
+                                .read()
+                                .session
+                                .as_ref()
+                                .map(|s| s.id().to_string());
+                            let prev_agent = self
+                                .config
+                                .read()
+                                .agent
+                                .as_ref()
+                                .map(|a| a.name().to_string());
+
+                            // Apply deferred agent selection before loading session.
+                            if let Some(ref agent_name) = pending_agent {
+                                if let Err(e) = self.config.write().use_agent_by_name(agent_name) {
+                                    self.app.modal =
+                                        Some(crate::types::ModalState::SessionPicker {
+                                            sessions,
+                                            selected,
+                                            pending_agent,
+                                        });
+                                    return Err(e);
+                                }
+                            }
+
+                            if let Err(e) = self.config.write().use_session(Some(&session_name)) {
+                                self.app.modal = Some(crate::types::ModalState::SessionPicker {
+                                    sessions,
+                                    selected,
+                                    pending_agent,
+                                });
+                                return Err(e);
+                            }
+
+                            let llm_busy = self.app.llm_busy;
+                            let pending = self.app.pending_message.is_some();
+                            Self::refresh_input_chrome_from_state(
+                                &self.config,
+                                &mut self.app,
+                                llm_busy,
+                                pending,
+                            );
+                            self.reconcile_transcript_after_command(
+                                prev_session,
+                                prev_agent,
+                                ".session",
+                            );
+                        }
+                    }
+                    _ => {
+                        self.app.modal = modal;
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                // Simply dismiss the picker — do not create a new session.
+                // A new anonymous session will be created on first message if needed.
                 self.app.modal = None;
             }
-            // All other keys are consumed by the modal (no action)
+
             _ => {}
         }
         Ok(())
@@ -1571,6 +1738,7 @@ impl Tui {
                         }
                     }
                 }
+                _ => {}
             }
         }
         Ok(())

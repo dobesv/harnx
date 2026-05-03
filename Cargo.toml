@@ -91,7 +91,7 @@ bitflags = "2.5.0"
 path-absolutize = "3.1.1"
 hnsw_rs = "0.3.0"
 rayon = "1.10.0"
-uuid = { version = "1.9.1", features = ["v4"] }
+uuid = { version = "1.9.1", features = ["v4", "v7"] }
 scraper = { version = "0.26.0", default-features = false, features = ["deterministic"] }
 sys-locale = "0.3.1"
 html_to_markdown = "0.1.0"

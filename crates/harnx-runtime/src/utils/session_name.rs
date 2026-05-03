@@ -126,7 +126,7 @@ fn resolve_variable(name: &str, extra_vars: &HashMap<&str, &str>) -> String {
     }
 }
 
-fn git_branch() -> String {
+pub fn git_branch() -> String {
     Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
@@ -134,6 +134,16 @@ fn git_branch() -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
+}
+
+pub fn git_remote() -> Option<String> {
+    Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .and_then(|s| if s.is_empty() { None } else { Some(s) })
 }
 
 fn git_path() -> String {

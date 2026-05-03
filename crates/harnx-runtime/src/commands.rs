@@ -698,7 +698,7 @@ Commands:
                     config
                         .session
                         .as_ref()
-                        .map(|session| session.name())
+                        .map(|session| session.id())
                         .unwrap_or("default")
                         .to_string(),
                 )

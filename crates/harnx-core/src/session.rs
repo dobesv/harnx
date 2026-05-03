@@ -23,6 +23,10 @@ use std::path::PathBuf;
 ///
 /// Session files use multi-document YAML (separated by `---`).
 /// The first document is always a `Header`; subsequent documents are events.
+// The Header variant is intentionally large — it holds all session-level metadata
+// fields. Boxing would require pervasive refactoring; the allocation cost is acceptable
+// since Headers are only created/read at session boundaries.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum SessionLogEntry {
@@ -42,6 +46,16 @@ pub enum SessionLogEntry {
         compress_threshold: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         agent_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_remote: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
         agent_variables: AgentVariables,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -140,6 +154,16 @@ pub struct Session {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub agent_variables: AgentVariables,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -160,7 +184,7 @@ pub struct Session {
     #[serde(skip)]
     pub agent_prompt: String,
     #[serde(skip)]
-    pub name: String,
+    pub id: String,
     #[serde(skip)]
     pub path: Option<String>,
     #[serde(skip)]
@@ -208,6 +232,11 @@ impl Session {
             save_session: self.save_session,
             compress_threshold: self.compress_threshold,
             agent_name: self.agent_name.clone(),
+            session_id: self.session_id.clone(),
+            working_dir: self.working_dir.clone(),
+            git_branch: self.git_branch.clone(),
+            git_remote: self.git_remote.clone(),
+            terminal_session_id: self.terminal_session_id.clone(),
             agent_variables: self.agent_variables.clone(),
             agent_instructions: self.agent_instructions.clone(),
             model_fallbacks: self.model_fallbacks.clone(),
@@ -219,8 +248,8 @@ impl Session {
         self.messages.is_empty() && self.compressed_messages.is_empty()
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     pub fn agent_name(&self) -> Option<&str> {
@@ -299,7 +328,7 @@ impl Session {
         data["messages"] = json!(self.messages);
 
         let output = serde_yaml::to_string(&data)
-            .with_context(|| format!("Unable to show info about session '{}'", &self.name))?;
+            .with_context(|| format!("Unable to show info about session '{}'", &self.id))?;
         Ok(output)
     }
 

@@ -14,20 +14,42 @@ use harnx_render::MarkdownRender;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use fancy_regex::Regex;
 use serde::Deserialize;
 use std::fs::{read_to_string, write, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
-use std::sync::LazyLock;
+use uuid::Uuid;
 
-static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
+use crate::utils::{
+    session_name::{git_branch, git_remote},
+    terminal_session_id,
+};
+
+// RE_AUTONAME_PREFIX removed - no longer needed. Anonymous sessions now use UUIDv7.
 
 pub fn new(config: &Config, name: &str) -> Result<Session> {
     let agent = config.extract_agent();
+    let session_id = match Uuid::parse_str(name) {
+        Ok(uuid) if uuid.get_version_num() == 7 => name.to_string(),
+        _ => Uuid::now_v7().to_string(),
+    };
     let mut session = Session {
-        name: name.to_string(),
+        id: name.to_string(),
         save_session: config.save_session,
+        session_id: Some(session_id),
+        working_dir: std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
+        git_branch: {
+            let b = git_branch();
+            if b.is_empty() {
+                None
+            } else {
+                Some(b)
+            }
+        },
+        git_remote: git_remote(),
+        terminal_session_id: terminal_session_id(),
         ..Default::default()
     };
     session.set_agent(&agent)?;
@@ -206,6 +228,11 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                 save_session,
                 compress_threshold,
                 agent_name,
+                session_id,
+                working_dir,
+                git_branch,
+                git_remote,
+                terminal_session_id,
                 agent_variables,
                 agent_instructions,
                 model_fallbacks,
@@ -218,6 +245,11 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                 session.save_session = save_session;
                 session.compress_threshold = compress_threshold;
                 session.agent_name = agent_name;
+                session.session_id = session_id;
+                session.working_dir = working_dir;
+                session.git_branch = git_branch;
+                session.git_remote = git_remote;
+                session.terminal_session_id = terminal_session_id;
                 session.agent_variables = agent_variables;
                 session.agent_instructions = agent_instructions;
                 session.model_fallbacks = model_fallbacks;
@@ -421,16 +453,8 @@ fn apply_name_and_path(
     path: &Path,
     config: &Config,
 ) -> Result<()> {
-    if let Some(autoname) = name.strip_prefix("_/") {
-        session.name = TEMP_SESSION_NAME.to_string();
-        session.path = Some(path.display().to_string());
-        if let Ok(true) = RE_AUTONAME_PREFIX.is_match(autoname) {
-            session.autoname = Some(AutoName::new(autoname[16..].to_string()));
-        }
-    } else {
-        session.name = name.to_string();
-        session.path = Some(path.display().to_string());
-    }
+    session.id = name.to_string();
+    session.path = Some(path.display().to_string());
 
     session.agent_prompt = session.agent_instructions.clone();
     if let Some(agent_name) = &session.agent_name {
@@ -521,7 +545,7 @@ pub fn resolve_save_path(session: &mut Session, session_dir: &Path) -> (PathBuf,
     if let Some((dir, name)) = session.resolved_save_name.clone() {
         // Update the cached name with autoname if it arrived since
         // the first resolution.
-        if session.name == TEMP_SESSION_NAME && !name.contains('-') {
+        if session.id == TEMP_SESSION_NAME && !name.contains('-') {
             if let Some(autoname) = session.autoname() {
                 let name = format!("{name}-{autoname}");
                 session.resolved_save_name = Some((dir.clone(), name.clone()));
@@ -531,7 +555,7 @@ pub fn resolve_save_path(session: &mut Session, session_dir: &Path) -> (PathBuf,
         return (dir, name);
     }
     let mut dir = session_dir.to_path_buf();
-    let mut name = session.name.clone();
+    let mut name = session.id.clone();
     if name == TEMP_SESSION_NAME {
         dir = dir.join("_");
         let now = chrono::Local::now();
@@ -668,7 +692,7 @@ pub fn save(
 
     // Write in the new log format.
     let mut content = serde_yaml::to_string(&session.build_header_entry())
-        .with_context(|| format!("Failed to serialize session header for '{}'", session.name))?;
+        .with_context(|| format!("Failed to serialize session header for '{}'", session.id))?;
     for msg in &session.compressed_messages {
         let entry = SessionLogEntry::Message {
             timestamp: None,
@@ -678,7 +702,7 @@ pub fn save(
         content.push_str("---\n");
         content.push_str(
             &serde_yaml::to_string(&entry)
-                .with_context(|| format!("Failed to serialize message in '{}'", session.name))?,
+                .with_context(|| format!("Failed to serialize message in '{}'", session.id))?,
         );
     }
     if !session.compressed_messages.is_empty() {
@@ -692,7 +716,7 @@ pub fn save(
                 };
                 content.push_str("---\n");
                 content.push_str(&serde_yaml::to_string(&compress_entry).with_context(|| {
-                    format!("Failed to serialize compress entry in '{}'", session.name)
+                    format!("Failed to serialize compress entry in '{}'", session.id)
                 })?);
                 true
             } else {
@@ -711,9 +735,8 @@ pub fn save(
             };
             content.push_str("---\n");
             content.push_str(
-                &serde_yaml::to_string(&entry).with_context(|| {
-                    format!("Failed to serialize message in '{}'", session.name)
-                })?,
+                &serde_yaml::to_string(&entry)
+                    .with_context(|| format!("Failed to serialize message in '{}'", session.id))?,
             );
         }
     } else {
@@ -725,9 +748,8 @@ pub fn save(
             };
             content.push_str("---\n");
             content.push_str(
-                &serde_yaml::to_string(&entry).with_context(|| {
-                    format!("Failed to serialize message in '{}'", session.name)
-                })?,
+                &serde_yaml::to_string(&entry)
+                    .with_context(|| format!("Failed to serialize message in '{}'", session.id))?,
             );
         }
     }
@@ -738,14 +760,14 @@ pub fn save(
         content.push_str("---\n");
         content.push_str(
             &serde_yaml::to_string(&entry)
-                .with_context(|| format!("Failed to serialize data_urls in '{}'", session.name))?,
+                .with_context(|| format!("Failed to serialize data_urls in '{}'", session.id))?,
         );
     }
 
     write(session_path, &content).with_context(|| {
         format!(
             "Failed to write session '{}' to '{}'",
-            session.name,
+            session.id,
             session_path.display()
         )
     })?;
@@ -757,8 +779,8 @@ pub fn save(
         ));
     }
 
-    if session.name() != session_name {
-        session.name = session_name.to_string()
+    if session.id() != session_name {
+        session.id = session_name.to_string()
     }
 
     session.log_entry_count = serde_yaml::Deserializer::from_str(&content).count();
@@ -995,7 +1017,7 @@ fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool
     let mut all_appended = true;
     let is_continuation = is_tool_continuation(input, &session.messages);
     if session.messages.is_empty() {
-        if session.name == TEMP_SESSION_NAME && session.save_session != Some(false) {
+        if session.id == TEMP_SESSION_NAME && session.save_session != Some(false) {
             let raw_input = input.raw();
             let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
             session.autoname = Some(AutoName::new_from_chat_history(chat_history));

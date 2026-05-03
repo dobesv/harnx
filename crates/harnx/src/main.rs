@@ -256,7 +256,7 @@ fn hook_dispatch_context(config: &GlobalConfig) -> (harnx_hooks::HooksConfig, St
         config
             .session
             .as_ref()
-            .map(|session| session.name())
+            .map(|session| session.id())
             .unwrap_or("default")
             .to_string(),
         env::current_dir().unwrap_or_default(),
