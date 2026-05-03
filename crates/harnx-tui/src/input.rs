@@ -1560,8 +1560,11 @@ impl Tui {
                     if *selected + 1 < agents.len() {
                         *selected += 1;
                     }
-                } else if let Some(crate::types::ModalState::SessionPicker { selected, sessions }) =
-                    self.app.modal.as_mut()
+                } else if let Some(crate::types::ModalState::SessionPicker {
+                    selected,
+                    sessions,
+                    ..
+                }) = self.app.modal.as_mut()
                 {
                     if *selected + 1 < sessions.len() {
                         *selected += 1;
@@ -1574,26 +1577,6 @@ impl Tui {
                     Some(crate::types::ModalState::AgentPicker { agents, selected }) => {
                         if selected < agents.len() {
                             let agent_name = agents[selected].clone();
-                            let prev_session = self
-                                .config
-                                .read()
-                                .session
-                                .as_ref()
-                                .map(|s| s.id().to_string());
-                            let prev_agent = self
-                                .config
-                                .read()
-                                .agent
-                                .as_ref()
-                                .map(|a| a.name().to_string());
-
-                            if let Err(e) = self.config.write().use_agent_by_name(&agent_name) {
-                                self.app.modal = Some(crate::types::ModalState::AgentPicker {
-                                    agents,
-                                    selected,
-                                });
-                                return Err(e);
-                            }
 
                             let sessions: Vec<_> = self
                                 .config
@@ -1602,13 +1585,36 @@ impl Tui {
                                 .into_iter()
                                 .collect();
                             if !sessions.is_empty() {
+                                // Defer use_agent_by_name until the session is confirmed so
+                                // that cancelling the session picker leaves state unchanged.
                                 let ctx = build_picker_context();
                                 let sessions = sort_sessions_for_picker(sessions, &ctx);
                                 self.app.modal = Some(crate::types::ModalState::SessionPicker {
                                     sessions,
                                     selected: 0,
+                                    pending_agent: Some(agent_name),
                                 });
                             } else {
+                                // No sessions — commit the agent immediately and start fresh.
+                                let prev_session = self
+                                    .config
+                                    .read()
+                                    .session
+                                    .as_ref()
+                                    .map(|s| s.id().to_string());
+                                let prev_agent = self
+                                    .config
+                                    .read()
+                                    .agent
+                                    .as_ref()
+                                    .map(|a| a.name().to_string());
+                                if let Err(e) = self.config.write().use_agent_by_name(&agent_name) {
+                                    self.app.modal = Some(crate::types::ModalState::AgentPicker {
+                                        agents,
+                                        selected,
+                                    });
+                                    return Err(e);
+                                }
                                 self.config.write().use_session(None)?;
                                 let llm_busy = self.app.llm_busy;
                                 let pending = self.app.pending_message.is_some();
@@ -1626,7 +1632,11 @@ impl Tui {
                             }
                         }
                     }
-                    Some(crate::types::ModalState::SessionPicker { sessions, selected }) => {
+                    Some(crate::types::ModalState::SessionPicker {
+                        sessions,
+                        selected,
+                        pending_agent,
+                    }) => {
                         if selected < sessions.len() {
                             let session_name = sessions[selected].id.clone();
                             let prev_session = self
@@ -1642,10 +1652,24 @@ impl Tui {
                                 .as_ref()
                                 .map(|a| a.name().to_string());
 
+                            // Apply deferred agent selection before loading session.
+                            if let Some(ref agent_name) = pending_agent {
+                                if let Err(e) = self.config.write().use_agent_by_name(agent_name) {
+                                    self.app.modal =
+                                        Some(crate::types::ModalState::SessionPicker {
+                                            sessions,
+                                            selected,
+                                            pending_agent,
+                                        });
+                                    return Err(e);
+                                }
+                            }
+
                             if let Err(e) = self.config.write().use_session(Some(&session_name)) {
                                 self.app.modal = Some(crate::types::ModalState::SessionPicker {
                                     sessions,
                                     selected,
+                                    pending_agent,
                                 });
                                 return Err(e);
                             }

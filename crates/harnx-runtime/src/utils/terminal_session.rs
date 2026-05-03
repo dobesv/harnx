@@ -148,10 +148,10 @@ fn read_proc_starttime(sid: i32) -> Option<String> {
     // Now fields are space-separated starting from field 3 (state)
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
 
-    // starttime is at index 18 (field 22 - 2 since we skipped pid and comm)
+    // starttime is at index 19 (field 22 - 2 since we skipped pid and comm fields 1 and 2)
     // Fields after ): state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice num_threads itrealvalue starttime
-    // Index:           0    1     2     3       4      5     6      7      8      9      10     11    12    13    14    15        16   17          18
-    fields.get(18).map(|s| s.to_string())
+    // Index:           0    1     2     3       4      5     6      7      8      9      10     11    12    13    14    15        16   17          18          19
+    fields.get(19).map(|s| s.to_string())
 }
 
 #[cfg(test)]

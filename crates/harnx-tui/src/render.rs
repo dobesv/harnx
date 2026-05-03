@@ -780,7 +780,9 @@ impl Tui {
                 let items: Vec<String> = agents.clone();
                 self.render_list_modal(frame, screen_size, title, footer, &items, *selected);
             }
-            ModalState::SessionPicker { sessions, selected } => {
+            ModalState::SessionPicker {
+                sessions, selected, ..
+            } => {
                 let title = "Select Session";
                 let footer = "↑↓ navigate  Enter select  Esc new session";
                 let items: Vec<String> = sessions

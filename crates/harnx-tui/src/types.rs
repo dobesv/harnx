@@ -156,10 +156,16 @@ pub(super) enum ModalState {
         agents: Vec<String>,
         selected: usize,
     },
-    /// Session selection
+    /// Session selection.
+    /// `pending_agent` carries the agent name chosen in the preceding AgentPicker
+    /// so the agent mutation is deferred until the session is confirmed (or a new
+    /// session is started), keeping state clean if the user cancels.
     SessionPicker {
         sessions: Vec<SessionMeta>,
         selected: usize,
+        /// Agent to activate when the session is confirmed. None when the session
+        /// picker was opened directly (agent already set or not applicable).
+        pending_agent: Option<String>,
     },
 }
 

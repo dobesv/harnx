@@ -142,6 +142,7 @@ impl Tui {
                 return Some(ModalState::SessionPicker {
                     sessions: sorted,
                     selected: 0,
+                    pending_agent: None,
                 });
             }
         }

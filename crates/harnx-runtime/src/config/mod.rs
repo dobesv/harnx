@@ -1729,7 +1729,13 @@ impl Config {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // Use entry.file_type() (symlink-aware, does not follow symlinks) to
+            // avoid infinite recursion through symlinked directories.
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
                 Self::collect_session_metas(sessions_dir, &path, out);
             } else if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
                 if let Ok(rel) = path.strip_prefix(sessions_dir) {
