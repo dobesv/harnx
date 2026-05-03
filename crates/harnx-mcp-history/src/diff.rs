@@ -46,6 +46,15 @@ pub fn diff_commits_blocking(
     }
 
     let mut body = String::from_utf8(output.stdout).context("git diff output not utf-8")?;
+
+    // Nothing changed between the two snapshots — don't emit any output.
+    // The caller already guards on `!diff.is_empty()`, so returning an
+    // empty string suppresses the blank ```diff\n``` fence that would
+    // otherwise appear in the transcript (issue #444).
+    if body.is_empty() {
+        return Ok(String::new());
+    }
+
     // Reserve room for the markdown fence so the truncation marker still
     // fits inside it. Underscoring the byte budget against MAX_DIFF_BYTES
     // is approximate — the header and fence add a few hundred bytes — but
@@ -153,6 +162,68 @@ mod tests {
         assert!(
             fenced_body.contains("-before") && fenced_body.contains("+after"),
             "diff content lives inside the fence: {fenced_body}"
+        );
+    }
+
+    /// When nothing changes between two snapshots the function must return
+    /// an empty string so the caller's `!diff.is_empty()` guard suppresses
+    /// the blank ```diff\n``` block that would otherwise appear in the
+    /// transcript (issue #444).
+    #[test]
+    fn test_diff_commits_no_changes_returns_empty() {
+        let temp = tempdir().expect("tempdir");
+        init_git_repo(temp.path());
+
+        let file = temp.path().join("stable.txt");
+        fs::write(&file, "unchanged\n").expect("write file");
+        run_git(temp.path(), &["add", "."]);
+        run_git(temp.path(), &["commit", "-m", "first"]);
+        let first = output_git(temp.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned();
+
+        // Make a second commit that touches a *different* file so the two
+        // commits have different SHAs but `stable.txt` is identical.
+        let other = temp.path().join("other.txt");
+        fs::write(&other, "something\n").expect("write other");
+        run_git(temp.path(), &["add", "."]);
+        run_git(temp.path(), &["commit", "-m", "second"]);
+        let second = output_git(temp.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned();
+
+        let repo = gix::open(temp.path()).expect("open repo");
+
+        // Diff of the same commit against itself — guaranteed empty.
+        let same = diff_commits_blocking(
+            &repo,
+            gix::ObjectId::from_hex(first.as_bytes()).expect("first oid"),
+            gix::ObjectId::from_hex(first.as_bytes()).expect("first oid (again)"),
+        )
+        .expect("diff same-same");
+        assert!(
+            same.is_empty(),
+            "same-commit diff must be empty, got: {same:?}"
+        );
+
+        // Diff of two commits where only an unrelated file changed — also
+        // produces a non-empty git diff, but the `stable.txt` path is not
+        // part of it.  This confirms we only suppress output when the diff
+        // body itself is empty (git diff exits 0 with no output), not when
+        // there's output about unrelated files.
+        let between = diff_commits_blocking(
+            &repo,
+            gix::ObjectId::from_hex(first.as_bytes()).expect("first oid"),
+            gix::ObjectId::from_hex(second.as_bytes()).expect("second oid"),
+        )
+        .expect("diff between");
+        assert!(
+            !between.is_empty(),
+            "diff with unrelated change must not be empty"
+        );
+        assert!(
+            between.contains("other.txt"),
+            "diff should mention the changed file"
         );
     }
 }
