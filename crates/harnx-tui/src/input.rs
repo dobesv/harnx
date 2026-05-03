@@ -1378,7 +1378,7 @@ impl Tui {
     ) {
         let (curr_session, curr_agent) = {
             let cfg = self.config.read();
-            let s = cfg.session.as_ref().map(|s| s.name().to_string());
+            let s = cfg.session.as_ref().map(|s| s.id().to_string());
             let a = cfg.agent.as_ref().map(|a| a.name().to_string());
             (s, a)
         };
@@ -1413,7 +1413,7 @@ impl Tui {
             .read()
             .session
             .as_ref()
-            .map(|s| s.name().to_string());
+            .map(|s| s.id().to_string());
         let prev_agent = self
             .config
             .read()
@@ -1579,7 +1579,7 @@ impl Tui {
                                 .read()
                                 .session
                                 .as_ref()
-                                .map(|s| s.name().to_string());
+                                .map(|s| s.id().to_string());
                             let prev_agent = self
                                 .config
                                 .read()
@@ -1588,7 +1588,10 @@ impl Tui {
                                 .map(|a| a.name().to_string());
 
                             if let Err(e) = self.config.write().use_agent_by_name(&agent_name) {
-                                self.app.modal = Some(crate::types::ModalState::AgentPicker { agents, selected });
+                                self.app.modal = Some(crate::types::ModalState::AgentPicker {
+                                    agents,
+                                    selected,
+                                });
                                 return Err(e);
                             }
 
@@ -1626,13 +1629,13 @@ impl Tui {
                     }
                     Some(crate::types::ModalState::SessionPicker { sessions, selected }) => {
                         if selected < sessions.len() {
-                            let session_name = sessions[selected].name.clone();
+                            let session_name = sessions[selected].id.clone();
                             let prev_session = self
                                 .config
                                 .read()
                                 .session
                                 .as_ref()
-                                .map(|s| s.name().to_string());
+                                .map(|s| s.id().to_string());
                             let prev_agent = self
                                 .config
                                 .read()
@@ -1641,7 +1644,10 @@ impl Tui {
                                 .map(|a| a.name().to_string());
 
                             if let Err(e) = self.config.write().use_session(Some(&session_name)) {
-                                self.app.modal = Some(crate::types::ModalState::SessionPicker { sessions, selected });
+                                self.app.modal = Some(crate::types::ModalState::SessionPicker {
+                                    sessions,
+                                    selected,
+                                });
                                 return Err(e);
                             }
 

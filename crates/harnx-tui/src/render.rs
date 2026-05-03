@@ -797,7 +797,7 @@ impl Tui {
                         } else {
                             String::new()
                         };
-                        format!("{}  {}  {}", s.name, branch, cwd_tail)
+                        format!("{}  {}  {}", s.id, branch, cwd_tail)
                     })
                     .collect();
                 self.render_list_modal(frame, screen_size, title, footer, &items, *selected);

@@ -34,7 +34,7 @@ pub fn new(config: &Config, name: &str) -> Result<Session> {
         _ => Uuid::now_v7().to_string(),
     };
     let mut session = Session {
-        name: name.to_string(),
+        id: name.to_string(),
         save_session: config.save_session,
         session_id: Some(session_id),
         working_dir: std::env::current_dir()
@@ -453,15 +453,7 @@ fn apply_name_and_path(
     path: &Path,
     config: &Config,
 ) -> Result<()> {
-    // Legacy "_/" prefix handling removed - anonymous sessions now use UUIDv7 filenames
-    // Existing sessions with "_/timestamp-name" format can still be loaded but won't be
-    // created going forward.
-    session.name = if name.starts_with("_/") {
-        // Strip legacy prefix if present
-        name.strip_prefix("_/").unwrap_or(name).to_string()
-    } else {
-        name.to_string()
-    };
+    session.id = name.to_string();
     session.path = Some(path.display().to_string());
 
     session.agent_prompt = session.agent_instructions.clone();
@@ -553,7 +545,7 @@ pub fn resolve_save_path(session: &mut Session, session_dir: &Path) -> (PathBuf,
     if let Some((dir, name)) = session.resolved_save_name.clone() {
         // Update the cached name with autoname if it arrived since
         // the first resolution.
-        if session.name == TEMP_SESSION_NAME && !name.contains('-') {
+        if session.id == TEMP_SESSION_NAME && !name.contains('-') {
             if let Some(autoname) = session.autoname() {
                 let name = format!("{name}-{autoname}");
                 session.resolved_save_name = Some((dir.clone(), name.clone()));
@@ -563,7 +555,7 @@ pub fn resolve_save_path(session: &mut Session, session_dir: &Path) -> (PathBuf,
         return (dir, name);
     }
     let mut dir = session_dir.to_path_buf();
-    let mut name = session.name.clone();
+    let mut name = session.id.clone();
     if name == TEMP_SESSION_NAME {
         dir = dir.join("_");
         let now = chrono::Local::now();
@@ -700,7 +692,7 @@ pub fn save(
 
     // Write in the new log format.
     let mut content = serde_yaml::to_string(&session.build_header_entry())
-        .with_context(|| format!("Failed to serialize session header for '{}'", session.name))?;
+        .with_context(|| format!("Failed to serialize session header for '{}'", session.id))?;
     for msg in &session.compressed_messages {
         let entry = SessionLogEntry::Message {
             timestamp: None,
@@ -710,7 +702,7 @@ pub fn save(
         content.push_str("---\n");
         content.push_str(
             &serde_yaml::to_string(&entry)
-                .with_context(|| format!("Failed to serialize message in '{}'", session.name))?,
+                .with_context(|| format!("Failed to serialize message in '{}'", session.id))?,
         );
     }
     if !session.compressed_messages.is_empty() {
@@ -724,7 +716,7 @@ pub fn save(
                 };
                 content.push_str("---\n");
                 content.push_str(&serde_yaml::to_string(&compress_entry).with_context(|| {
-                    format!("Failed to serialize compress entry in '{}'", session.name)
+                    format!("Failed to serialize compress entry in '{}'", session.id)
                 })?);
                 true
             } else {
@@ -743,9 +735,8 @@ pub fn save(
             };
             content.push_str("---\n");
             content.push_str(
-                &serde_yaml::to_string(&entry).with_context(|| {
-                    format!("Failed to serialize message in '{}'", session.name)
-                })?,
+                &serde_yaml::to_string(&entry)
+                    .with_context(|| format!("Failed to serialize message in '{}'", session.id))?,
             );
         }
     } else {
@@ -757,9 +748,8 @@ pub fn save(
             };
             content.push_str("---\n");
             content.push_str(
-                &serde_yaml::to_string(&entry).with_context(|| {
-                    format!("Failed to serialize message in '{}'", session.name)
-                })?,
+                &serde_yaml::to_string(&entry)
+                    .with_context(|| format!("Failed to serialize message in '{}'", session.id))?,
             );
         }
     }
@@ -770,14 +760,14 @@ pub fn save(
         content.push_str("---\n");
         content.push_str(
             &serde_yaml::to_string(&entry)
-                .with_context(|| format!("Failed to serialize data_urls in '{}'", session.name))?,
+                .with_context(|| format!("Failed to serialize data_urls in '{}'", session.id))?,
         );
     }
 
     write(session_path, &content).with_context(|| {
         format!(
             "Failed to write session '{}' to '{}'",
-            session.name,
+            session.id,
             session_path.display()
         )
     })?;
@@ -789,8 +779,8 @@ pub fn save(
         ));
     }
 
-    if session.name() != session_name {
-        session.name = session_name.to_string()
+    if session.id() != session_name {
+        session.id = session_name.to_string()
     }
 
     session.log_entry_count = serde_yaml::Deserializer::from_str(&content).count();
@@ -1027,7 +1017,7 @@ fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool
     let mut all_appended = true;
     let is_continuation = is_tool_continuation(input, &session.messages);
     if session.messages.is_empty() {
-        if session.name == TEMP_SESSION_NAME && session.save_session != Some(false) {
+        if session.id == TEMP_SESSION_NAME && session.save_session != Some(false) {
             let raw_input = input.raw();
             let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
             session.autoname = Some(AutoName::new_from_chat_history(chat_history));

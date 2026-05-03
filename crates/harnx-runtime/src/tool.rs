@@ -101,7 +101,7 @@ pub fn build_tool_eval_context(
     let session_name = guard
         .session
         .as_ref()
-        .map(|session| session.name().to_string());
+        .map(|session| session.id().to_string());
     drop(guard);
 
     // Build the provider list in ACP-first order so ACP sub-agent

@@ -5,7 +5,7 @@ use std::{fs::File, io::Read};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionMeta {
-    pub name: String,
+    pub id: String,
     pub session_id: Option<String>,
     pub working_dir: Option<String>,
     pub git_branch: Option<String>,
@@ -38,7 +38,7 @@ pub fn build_picker_context() -> PickerContext {
 }
 
 fn session_recency_key(session: &SessionMeta) -> u128 {
-    if let Ok(uuid) = uuid::Uuid::parse_str(&session.name) {
+    if let Ok(uuid) = uuid::Uuid::parse_str(&session.id) {
         if uuid.get_version_num() == 7 {
             if let Some(timestamp) = uuid.get_timestamp() {
                 let (seconds, nanos) = timestamp.to_unix();
@@ -88,11 +88,12 @@ pub fn sort_sessions_for_picker(
             1
         };
 
-        let dir_match_score = if session.working_dir.as_deref() == Some(context.current_dir.as_str()) {
-            0
-        } else {
-            1
-        };
+        let dir_match_score =
+            if session.working_dir.as_deref() == Some(context.current_dir.as_str()) {
+                0
+            } else {
+                1
+            };
 
         let remote_match_score = if session.git_remote.is_some()
             && context.current_remote.is_some()
@@ -144,11 +145,13 @@ fn read_session_header_bytes(path: &Path) -> Option<String> {
             .position(|w| w == b"\n---\n")
             .map(|pos| pos + 1)
             .or_else(|| {
-                content.windows(6).position(|w| w == b"\n---\r\n").map(|pos| pos + 1)
+                content
+                    .windows(6)
+                    .position(|w| w == b"\n---\r\n")
+                    .map(|pos| pos + 1)
             })
             .unwrap_or(content.len())
     };
-
 
     String::from_utf8(content[..boundary].to_vec()).ok()
 }
@@ -167,7 +170,7 @@ pub fn parse_session_meta(name: &str, path: &Path) -> Option<SessionMeta> {
             agent_name,
             ..
         } => Some(SessionMeta {
-            name: name.to_string(),
+            id: name.to_string(),
             session_id,
             working_dir,
             git_branch,
@@ -192,7 +195,7 @@ mod tests {
 
     fn session_meta(name: &str) -> SessionMeta {
         SessionMeta {
-            name: name.to_string(),
+            id: name.to_string(),
             session_id: None,
             working_dir: None,
             git_branch: None,
@@ -214,7 +217,7 @@ mod tests {
         .unwrap();
 
         let meta = parse_session_meta("session", &path).unwrap();
-        assert_eq!(meta.name, "session");
+        assert_eq!(meta.id, "session");
         assert_eq!(meta.session_id.as_deref(), Some("sess-123"));
         assert_eq!(meta.working_dir.as_deref(), Some("/tmp/work"));
         assert_eq!(meta.git_branch.as_deref(), Some("main"));
@@ -235,7 +238,7 @@ mod tests {
         .unwrap();
 
         let meta = parse_session_meta("test-session", &path).unwrap();
-        assert_eq!(meta.name, "test-session");
+        assert_eq!(meta.id, "test-session");
         assert_eq!(
             meta.session_id.as_deref(),
             Some("01234567-89ab-cdef-0123-456789abcdef")
@@ -263,7 +266,7 @@ mod tests {
         .unwrap();
 
         let meta = parse_session_meta("multi", &path).unwrap();
-        assert_eq!(meta.name, "multi");
+        assert_eq!(meta.id, "multi");
         assert_eq!(meta.session_id.as_deref(), Some("sess-456"));
         assert_eq!(meta.working_dir.as_deref(), Some("/repo"));
         assert_eq!(meta.git_branch, None);
@@ -304,7 +307,7 @@ mod tests {
         };
 
         let sorted = sort_sessions_for_picker(vec![other, matching.clone()], &context);
-        assert_eq!(sorted[0].name, matching.name);
+        assert_eq!(sorted[0].id, matching.id);
     }
 
     #[test]
@@ -325,7 +328,7 @@ mod tests {
         };
 
         let sorted = sort_sessions_for_picker(vec![other, matching.clone()], &context);
-        assert_eq!(sorted[0].name, matching.name);
+        assert_eq!(sorted[0].id, matching.id);
     }
 
     #[test]
@@ -340,7 +343,7 @@ mod tests {
         };
 
         let sorted = sort_sessions_for_picker(vec![older, newer.clone()], &context);
-        assert_eq!(sorted[0].name, newer.name);
+        assert_eq!(sorted[0].id, newer.id);
     }
 
     #[test]
@@ -362,7 +365,7 @@ mod tests {
         };
 
         let sorted = sort_sessions_for_picker(vec![other, matching.clone()], &context);
-        assert_eq!(sorted[0].name, matching.name, "CWD match should sort first");
+        assert_eq!(sorted[0].id, matching.id, "CWD match should sort first");
     }
 
     #[test]
@@ -384,9 +387,8 @@ mod tests {
         };
 
         let sorted = sort_sessions_for_picker(vec![other, matching.clone()], &context);
-        assert_eq!(sorted[0].name, matching.name, "Remote match should sort first");
+        assert_eq!(sorted[0].id, matching.id, "Remote match should sort first");
     }
-
 
     #[test]
     fn test_parse_session_meta_multiline_yaml_separator() {
@@ -406,7 +408,7 @@ agent_instructions: |
 ---
 Some other content here"#;
         file.write_all(yaml_content.as_bytes()).unwrap();
-        
+
         let meta = super::parse_session_meta("test_session", &file_path).expect("Failed to parse");
         assert_eq!(meta.session_id.as_deref(), Some("test-session-123"));
     }

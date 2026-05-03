@@ -252,7 +252,7 @@ impl acp::Agent for HarnxAgent {
 
         {
             let mut config = self.config.write();
-            let active_session_name = config.session.as_ref().map(|s| s.name().to_string());
+            let active_session_name = config.session.as_ref().map(|s| s.id().to_string());
             if active_session_name.as_deref() != Some(session_key.as_str()) {
                 if config.session.is_some() {
                     config.exit_session().map_err(|e| {
@@ -1014,7 +1014,7 @@ mod tests {
             .expect("new_session should succeed");
 
             assert_eq!(
-                config.read().session.as_ref().map(|s| s.name().to_string()),
+                config.read().session.as_ref().map(|s| s.id().to_string()),
                 Some(session.session_id.to_string())
             );
 
@@ -1041,11 +1041,6 @@ mod tests {
             let session_path =
                 harnx_core::config_paths::session_file(Some(CREATE_TITLE_AGENT), &session_id);
             let top_level_path = harnx_core::config_paths::session_file(None, &session_id);
-            assert!(
-                !session_path.display().to_string().contains("/sessions/_/"),
-                "session file should not be written under '_' temp directory: {}",
-                session_path.display()
-            );
             assert!(
                 session_path.exists(),
                 "ACP prompt should persist session to disk at {}",

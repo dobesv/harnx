@@ -1425,7 +1425,7 @@ impl Config {
                 Some(v) => v.to_string(),
                 None => session
                     .autoname()
-                    .unwrap_or_else(|| session.name())
+                    .unwrap_or_else(|| session.id())
                     .to_string(),
             },
             None => bail!("No session"),
@@ -1467,7 +1467,7 @@ impl Config {
 
     pub fn edit_message_range(&mut self, from: usize, to: usize) -> Result<()> {
         let name = match &self.session {
-            Some(session) => session.name().to_string(),
+            Some(session) => session.id().to_string(),
             None => bail!("No session"),
         };
         let session_path = self.session_file(&name);
@@ -1531,7 +1531,7 @@ impl Config {
 
     pub fn delete_message_range(&mut self, from: usize, to: usize) -> Result<()> {
         let name = match &self.session {
-            Some(session) => session.name().to_string(),
+            Some(session) => session.id().to_string(),
             None => bail!("No session"),
         };
         let session_path = self.session_file(&name);
@@ -1566,7 +1566,7 @@ impl Config {
 
     pub fn rewind_session(&mut self, after_seq: usize) -> Result<()> {
         let name = match &self.session {
-            Some(session) => session.name().to_string(),
+            Some(session) => session.id().to_string(),
             None => bail!("No session"),
         };
         let session_path = self.session_file(&name);
@@ -1617,7 +1617,7 @@ impl Config {
 
     pub fn edit_session(&mut self) -> Result<()> {
         let name = match &self.session {
-            Some(session) => session.name().to_string(),
+            Some(session) => session.id().to_string(),
             None => bail!("No session"),
         };
         let session_path = self.session_file(&name);
@@ -1655,7 +1655,7 @@ impl Config {
 
     pub fn reset_session(&mut self) -> Result<()> {
         // Capture current session name before exiting
-        let old_session_name = self.session.as_ref().map(|s| s.name().to_string());
+        let old_session_name = self.session.as_ref().map(|s| s.id().to_string());
 
         // Discard the current session without saving
         if let Some(session) = self.session.take() {
@@ -1731,7 +1731,7 @@ impl Config {
             })
             .collect::<Vec<_>>();
 
-        sessions.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        sessions.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         sessions
     }
 
@@ -2639,7 +2639,7 @@ impl Config {
                 None
             }
         };
-        let session_name = self.session.as_ref().map(|s| s.name().to_string());
+        let session_name = self.session.as_ref().map(|s| s.id().to_string());
         match (agent_name, session_name, use_icons) {
             (Some(agent), Some(session), true) => format!("🤖 {} ▸ {}", agent, session),
             (Some(agent), Some(session), false) => format!("{} ▸ {}", agent, session),
@@ -4078,15 +4078,15 @@ mod tests {
         config.use_session(None).unwrap();
 
         let session = config.session.as_ref().unwrap();
-        let parsed = Uuid::parse_str(&session.name).expect("session name should be valid UUID");
+        let parsed = Uuid::parse_str(&session.id).expect("session name should be valid UUID");
         assert_eq!(parsed.get_version_num(), 7);
         assert_eq!(
             session
                 .sessions_dir
                 .as_ref()
                 .unwrap()
-                .join(format!("{}.yaml", session.name)),
-            tmp.path().join(format!("{}.yaml", session.name))
+                .join(format!("{}.yaml", session.id)),
+            tmp.path().join(format!("{}.yaml", session.id))
         );
     }
 

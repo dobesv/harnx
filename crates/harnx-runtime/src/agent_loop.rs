@@ -168,7 +168,7 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
                 cfg.resolved_hooks(),
                 cfg.session
                     .as_ref()
-                    .map(|s| s.name().to_string())
+                    .map(|s| s.id().to_string())
                     .unwrap_or_else(|| "default".to_string()),
                 std::env::current_dir().unwrap_or_default(),
             )

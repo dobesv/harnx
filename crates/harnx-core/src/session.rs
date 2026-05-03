@@ -184,7 +184,7 @@ pub struct Session {
     #[serde(skip)]
     pub agent_prompt: String,
     #[serde(skip)]
-    pub name: String,
+    pub id: String,
     #[serde(skip)]
     pub path: Option<String>,
     #[serde(skip)]
@@ -248,8 +248,8 @@ impl Session {
         self.messages.is_empty() && self.compressed_messages.is_empty()
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     pub fn agent_name(&self) -> Option<&str> {
@@ -328,7 +328,7 @@ impl Session {
         data["messages"] = json!(self.messages);
 
         let output = serde_yaml::to_string(&data)
-            .with_context(|| format!("Unable to show info about session '{}'", &self.name))?;
+            .with_context(|| format!("Unable to show info about session '{}'", &self.id))?;
         Ok(output)
     }
 
