@@ -1639,6 +1639,50 @@ mod tests {
         assert!(result.content[1].audience().is_none(), "diff audience");
     }
 
+    /// Production launch path: harnx-mcp-fs starts with empty
+    /// `initial_roots` (no `--root` CLI args) and only learns its roots
+    /// later via the MCP `roots/list` protocol. `HistoryManager` was
+    /// constructed with the empty initial roots and never refreshed, so
+    /// it never tracked any repos and silently dropped the diff content
+    /// block on every edit. This guards the lazy-discovery fallback in
+    /// `HistoryManager::snapshot_file`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_file_emits_diff_when_roots_only_set_via_protocol() {
+        let temp_dir = TestDir::new();
+        let dir = temp_dir.path();
+        if !seed_committed_file(dir, "tracked.txt", "old value\n") {
+            return;
+        }
+
+        // Mimic the production launch: empty initial_roots.
+        let server = FsServer::new(vec![]);
+        // Mimic `refresh_roots` populating roots after the MCP handshake.
+        *server.roots.write().await = vec![dir.to_path_buf()];
+
+        let result = server
+            .edit_file_impl(EditFileParams {
+                path: dir.join("tracked.txt").to_string_lossy().into_owned(),
+                old_text: "old value".into(),
+                new_text: "new value".into(),
+                replace_all: None,
+            })
+            .await
+            .expect("edit succeeds");
+
+        let texts: Vec<&str> = result
+            .content
+            .iter()
+            .filter_map(|c| c.raw.as_text().map(|t| t.text.as_str()))
+            .collect();
+        assert!(
+            texts.len() >= 2,
+            "expected summary + diff content blocks, got {}: {texts:?}",
+            texts.len()
+        );
+        assert!(texts[1].contains("-old value"), "diff missing: {texts:?}");
+    }
+
     #[tokio::test]
     async fn test_read_file_with_offset_limit() {
         let temp_dir = TestDir::new();
