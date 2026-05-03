@@ -5,7 +5,7 @@ expression: rendered
 Welcome to harnx 0.30.0  •  Type .help for commands, Tab to complete.
   [7]
 → read
-   path: /tmp/foo.txt
+path: /tmp/foo.txt
 
 
 

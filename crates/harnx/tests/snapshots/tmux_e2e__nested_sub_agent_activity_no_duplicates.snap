@@ -1,6 +1,5 @@
 ---
 source: crates/harnx/tests/tmux_e2e.rs
-assertion_line: 1212
 expression: normalized
 ---
 Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
@@ -10,21 +9,21 @@ Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
 
 Parent delegating to researcher.
 
-   @ nested-researcher Research this deeply and delegate analysis.
+@ nested-researcher Research this deeply and delegate analysis.
 > nested-researcher ▸ [UUID]
 Researcher delegating to analyst.
 
-   @ nested-analyst Analyze data and report back.
+@ nested-analyst Analyze data and report back.
 > nested-analyst ▸ [UUID]
 Analyst complete
 
 > nested-researcher ▸ [UUID]
-   session_id: [UUID]
-   response: Analyst complete
+session_id: [UUID]
+response: Analyst complete
 Researcher complete
 
-   session_id: [UUID]
-   response: Researcher delegating to analyst.Analyst completeResearcher complete
+session_id: [UUID]
+response: Researcher delegating to analyst.Analyst completeResearcher complete
 Nested task complete
 
 

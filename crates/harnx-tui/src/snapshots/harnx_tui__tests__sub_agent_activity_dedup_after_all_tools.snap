@@ -5,16 +5,16 @@ expression: rendered_mid2
 I'll look into that for you. Delegating now.
 
 → researcher_session_prompt
-   message: investigate the data
+message: investigate the data
 > researcher ▸ research-session-1
 <think>Let me analyze the situation carefully.</think>
 → bash
-   command: find /data -name '*.csv'
+command: find /data -name '*.csv'
 → read_file
-   path: /data/results.csv
+path: /data/results.csv
 <think>Now I see the pattern in the data.</think>
 → write_file
-   path: /data/summary.md
+path: /data/summary.md
 
 
 

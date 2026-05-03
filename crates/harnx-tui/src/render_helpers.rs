@@ -2,7 +2,7 @@ use harnx_core::event::AgentSource;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-/// Render one line of MCP tool template text into ratatui spans, applying
+/// Render one line of inline markdown into ratatui spans, applying
 /// `base_style` as the foreground/modifier base. Delegates to the
 /// `tui-markdown` crate (which wraps `pulldown-cmark` + `syntect` +
 /// `ansi-to-tui` internally), so we get the same inline emphasis handling
@@ -12,6 +12,10 @@ use ratatui::text::{Line, Span};
 /// On render failure (empty result), returns the input as a single plain
 /// span so the user still sees the text — markdown styling is a
 /// presentation nicety, not a correctness requirement.
+///
+/// Currently only used in tests; production rendering uses
+/// `markdown_lines` for full block parsing.
+#[cfg(test)]
 pub(crate) fn markdown_line_spans(text: &str, base_style: Style) -> Line<'static> {
     let plain_fallback = || Line::from(Span::styled(text.to_string(), base_style));
 
@@ -55,8 +59,28 @@ pub(crate) fn markdown_lines(text: &str, base_style: Style) -> Vec<Line<'static>
     parsed
         .lines
         .into_iter()
+        .filter(|line| !is_fence_marker_line(line))
         .map(|line| Line::from(patch_spans(line.spans, base_style)))
         .collect()
+}
+
+/// Return true if `line` is a bare code-fence marker emitted by `tui-markdown`
+/// (e.g. `` ```sh `` or `` ``` ``). These lines have a single unstyled span
+/// whose trimmed content consists entirely of backticks with an optional
+/// ASCII-lowercase language hint — they carry no information the user needs
+/// to see once the code block content is already rendered.
+fn is_fence_marker_line(line: &ratatui::text::Line<'_>) -> bool {
+    if line.spans.len() != 1 {
+        return false;
+    }
+    let span = &line.spans[0];
+    // Must be unstyled (no fg/bg override set by tui-markdown).
+    if span.style.fg.is_some() || span.style.bg.is_some() {
+        return false;
+    }
+    let content = span.content.trim();
+    // Match ``` optionally followed by an ASCII-lowercase language hint.
+    content.starts_with("```") && content[3..].chars().all(|c| c.is_ascii_lowercase())
 }
 
 /// Patch `base_style` under each parsed span so caller context (e.g. dim
@@ -215,9 +239,9 @@ mod markdown_tests {
 
     #[test]
     fn bash_template_example_renders_bold_and_code() {
-        // Mirror the actual built-in bash exec template:
-        //   "**$** `{{ args.command }}`"
-        // After Jinja rendering this becomes "**$** `ls -la /tmp`"
+        // Test inline code span rendering (used by older single-line templates
+        // and any template that produces inline backtick markup).
+        // "**$** `ls -la /tmp`" exercises both bold and inline code styling.
         let line = markdown_line_spans("**$** `ls -la /tmp`", Style::default());
         assert_eq!(span_text(&line), "$ ls -la /tmp");
         let bold = line
@@ -347,5 +371,33 @@ mod markdown_tests {
             .unwrap();
         assert!(bold.style.add_modifier.contains(Modifier::BOLD));
         assert!(bold.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn markdown_lines_filters_out_fence_markers() {
+        // Issue #434: code fence marker lines (```sh, ```) emitted by
+        // tui_markdown must be stripped so they don't appear as literal text.
+        let input = "```rust\nfn main() {}\n```";
+        let lines = markdown_lines(input, Style::default());
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Code block content must appear.
+        assert!(
+            texts.iter().any(|t| t.contains("fn main()")),
+            "code content missing: {texts:?}"
+        );
+        // Fence markers must not appear.
+        assert!(
+            !texts.iter().any(|t| t.trim().starts_with("```")),
+            "fence markers leaked: {texts:?}"
+        );
     }
 }

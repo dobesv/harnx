@@ -792,7 +792,7 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
         vec![
             "<think>thinking before tool</think>",
             "→ argus_session_prompt",
-            "   message: delegate",
+            "message: delegate",
             "<think>thinking after tool</think>",
         ]
     );
@@ -872,7 +872,7 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
             "> argus ▸ session-1",
             "<think>thinking before tool</think>",
             "→ argus_session_prompt",
-            "   message: delegate",
+            "message: delegate",
             "<think>thinking after tool</think>",
         ]
     );
@@ -1093,16 +1093,16 @@ async fn structured_ui_output_variants_render_in_transcript() {
 
     assert!(system_entries.contains(&"> argus ▸ session-1".to_string()));
     assert!(system_entries.contains(&"→ argus_session_prompt".to_string()));
-    assert!(system_entries.contains(&"   message: hello".to_string()));
+    assert!(system_entries.contains(&"message: hello".to_string()));
     assert!(system_entries.contains(&"<think>thinking hard</think>".to_string()));
     assert!(system_entries.contains(&"-> argus_session_prompt completed".to_string()));
     assert!(system_entries.contains(&"Plan:".to_string()));
     assert!(system_entries.contains(&"  [in_progress] Refactor ACP formatting".to_string()));
     assert!(system_entries.contains(&"> argus ▸ session-1   in 12   out 34   cache 5".to_string()));
     assert!(system_entries.contains(&"→ bash".to_string()));
-    assert!(system_entries.contains(&"   command: ls".to_string()));
-    assert!(system_entries.contains(&"   line one".to_string()));
-    assert!(system_entries.contains(&"   line two".to_string()));
+    assert!(system_entries.contains(&"command: ls".to_string()));
+    assert!(system_entries.contains(&"line one".to_string()));
+    assert!(system_entries.contains(&"line two".to_string()));
 }
 
 #[tokio::test]
@@ -1175,7 +1175,7 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
     assert!(rendered.contains(&"→ pytheas_session_prompt".to_string()));
     assert!(rendered.contains(&"> pytheas ▸ session-nested".to_string()));
     assert!(rendered.contains(&"→ bash".to_string()));
-    assert!(rendered.contains(&"   command: ls -1 /tmp | wc -l".to_string()));
+    assert!(rendered.contains(&"command: ls -1 /tmp | wc -l".to_string()));
     assert!(
         rendered.contains(&"> pytheas ▸ session-nested   in 10   out 20".to_string()),
         "rendered transcript missing nested usage line: {rendered:?}"
@@ -4424,7 +4424,7 @@ async fn tui_renders_started_title_when_template_provides_it() {
     .unwrap();
 
     // Producer-side render result: a `call_template` like
-    // `**$** \`{{ args.command }}\`` produces this `title`. The raw
+    // "```sh\n$ {{ args.command }}\n```" produces this `markdown`. The raw
     // `input` JSON is also kept on the event for transcript serialization,
     // but the user-facing rendering must prefer the rendered title.
     tui.handle_tui_event(TuiEvent::Agent(
@@ -4432,7 +4432,7 @@ async fn tui_renders_started_title_when_template_provides_it() {
             id: "call-1".into(),
             name: "bash_exec".into(),
             kind: ToolKind::Other,
-            markdown: Some("**$** `ls -la /tmp`".into()),
+            markdown: Some("```sh\n$ ls -la /tmp\n```".into()),
             input: yaml_to_json("command: ls -la /tmp"),
             locations: vec![],
         }),
@@ -4701,13 +4701,13 @@ async fn tui_started_template_strips_markers_and_styles_spans() {
     )
     .unwrap();
 
-    // Producer-side render of `**$** \`{{ args.command }}\``.
+    // Producer-side render of "```sh\n$ {{ args.command }}\n```".
     tui.handle_tui_event(TuiEvent::Agent(
         AgentEvent::Tool(ToolEvent::Started {
             id: "call-1".into(),
             name: "bash_exec".into(),
             kind: ToolKind::Other,
-            markdown: Some("**$** `ls -la /tmp`".into()),
+            markdown: Some("```sh\n$ ls -la /tmp\n```".into()),
             input: yaml_to_json("command: ls -la /tmp"),
             locations: vec![],
         }),
@@ -4716,7 +4716,6 @@ async fn tui_started_template_strips_markers_and_styles_spans() {
     .await
     .unwrap();
 
-    use ratatui::style::Modifier;
     let lines = rendered_lines(&tui);
     let plain = lines
         .iter()
@@ -4724,28 +4723,70 @@ async fn tui_started_template_strips_markers_and_styles_spans() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Markers should be consumed and stripped text should appear.
-    assert!(!plain.contains("**$**"), "markers leaked: {plain}");
-    assert!(
-        !plain.contains("`ls -la /tmp`"),
-        "backticks leaked: {plain}"
-    );
+    // Fence markers should be consumed and command text should appear.
+    assert!(!plain.contains("```"), "fence markers leaked: {plain}");
     assert!(
         plain.contains("$ ls -la /tmp"),
-        "stripped text missing: {plain}"
+        "command text missing: {plain}"
     );
 
-    // `**$**` → BOLD; `` `ls -la /tmp` `` → visually distinct (fg or bg).
+    // The command line should be rendered by the code-block highlighter —
+    // at least one span on the line containing the command must have an fg
+    // color set (syntect applies per-token colors inside code fences).
+    let cmd_line = lines
+        .iter()
+        .find(|l| line_to_plain(l).contains("$ ls -la /tmp"));
     assert!(
-        rendered_span_matches(&lines, "$", |s| s.add_modifier.contains(Modifier::BOLD)),
-        "expected a BOLD span for `$`"
+        cmd_line.is_some_and(|l| l.spans.iter().any(|s| s.style.fg.is_some())),
+        "expected at least one fg-colored span on the command line"
     );
-    assert!(
-        rendered_span_matches(&lines, "ls -la /tmp", |s| {
-            s.fg.is_some() || s.bg.is_some()
+}
+
+#[tokio::test]
+async fn tui_started_multiline_command_renders_without_fence_markers() {
+    // Regression test for issue #434: multi-line commands in the bash exec
+    // call_template ("```sh\n$ ...\n```") must render with the command text
+    // visible and fence markers consumed, not shown as literal text.
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+
+    let multiline_cmd = "cat <<EOF\nline1\nEOF";
+    let markdown = format!("```sh\n$ {multiline_cmd}\n```");
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "call-1".into(),
+            name: "bash_exec".into(),
+            kind: ToolKind::Other,
+            markdown: Some(markdown),
+            input: yaml_to_json(&format!("command: '{multiline_cmd}'")),
+            locations: vec![],
         }),
-        "expected a visually distinct span for `ls -la /tmp`"
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let lines = rendered_lines(&tui);
+    let plain = lines
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Fence markers must not appear as literal text.
+    assert!(!plain.contains("```"), "fence markers leaked: {plain}");
+
+    // Each line of the command must appear in the output.
+    assert!(
+        plain.contains("cat <<EOF"),
+        "first command line missing: {plain}"
     );
+    assert!(plain.contains("line1"), "heredoc body missing: {plain}");
+    assert!(plain.contains("EOF"), "heredoc close missing: {plain}");
 }
 
 #[tokio::test]
@@ -4984,7 +5025,7 @@ fn render_tool_call_markdown_body_suppresses_header() {
     );
 
     let plain = lines.iter().map(line_to_plain).collect::<Vec<_>>();
-    assert_eq!(plain, vec!["   write hello.txt with 3 lines".to_string()]);
+    assert_eq!(plain, vec!["write hello.txt with 3 lines".to_string()]);
     assert!(plain.iter().all(|line| !line.contains("→")));
 }
 
@@ -5026,10 +5067,7 @@ fn render_tool_call_meta_line_precedes_markdown_body() {
     let plain = lines.iter().map(line_to_plain).collect::<Vec<_>>();
     assert_eq!(
         plain,
-        vec![
-            "  [3] 14:23:01".to_string(),
-            "   write hello.txt".to_string()
-        ]
+        vec!["  [3] 14:23:01".to_string(), "write hello.txt".to_string()]
     );
 }
 
