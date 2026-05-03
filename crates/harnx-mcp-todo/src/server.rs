@@ -1,7 +1,7 @@
 //! Todo MCP server implementation.
 //!
 //! Stores todos under per-plan directories using YAML front matter + markdown body.
-//! Layout: `<data-dir>/<plan>/plan.md` and `<data-dir>/<plan>/todo-<8-hex-id>.md`.
+//! Layout: `<data-dir>/<plan>/plan.md`, `<data-dir>/<plan>/todo-<8-hex-id>.md`, and `<data-dir>/<plan>/note-<8-hex-id>.md`.
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
@@ -168,6 +168,12 @@ struct PlanAddNoteParams {
 struct PlanGetTodoParams {
     plan: String,
     key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanReadNoteParams {
+    plan: String,
+    note_id: String,
 }
 
 macro_rules! impl_json_schema {
@@ -398,6 +404,20 @@ impl_json_schema!(
     &["plan", "key"]
 );
 
+impl_json_schema!(
+    PlanReadNoteParams,
+    "PlanReadNoteParams",
+    |gen: &mut SchemaGenerator| vec![
+        ("plan", "Plan name or ID", gen.subschema_for::<String>()),
+        (
+            "note_id",
+            "Note ID (8-hex string or note-<id> prefix)",
+            gen.subschema_for::<String>()
+        ),
+    ],
+    &["plan", "note_id"]
+);
+
 fn plan_dir(dir: &Path, plan_name: &str) -> PathBuf {
     dir.join(plan_name)
 }
@@ -408,6 +428,10 @@ fn todo_file_path(dir: &Path, plan_name: &str, id: &str) -> PathBuf {
 
 fn plan_file_path(dir: &Path, plan_name: &str) -> PathBuf {
     plan_dir(dir, plan_name).join("plan.md")
+}
+
+fn note_file_path(dir: &Path, plan_name: &str, id: &str) -> PathBuf {
+    plan_dir(dir, plan_name).join(format!("note-{}.md", id))
 }
 
 fn parse_yaml_frontmatter(content: &str) -> Result<(TodoFrontMatter, String), String> {
@@ -778,14 +802,65 @@ impl TodoServer {
         ))
     }
 
-    fn handle_plan_read(&self, params: PlanReadParams) -> Result<CallToolResult, ErrorData> {
+    async fn handle_plan_read(&self, params: PlanReadParams) -> Result<CallToolResult, ErrorData> {
         let name = normalize_plan_name(&params.name)
             .map_err(|err| ErrorData::invalid_params(err, None))?;
         let path = plan_file_path(&self.dir, &name);
-        let content = std::fs::read_to_string(&path).map_err(|err| {
-            ErrorData::invalid_params(format!("failed to read {}: {err}", path.display()), None)
+        let dir = plan_dir(&self.dir, &name);
+        if !dir.is_dir() {
+            return Err(ErrorData::invalid_params(
+                format!("plan '{name}' not found"),
+                None,
+            ));
+        }
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(ErrorData::internal_error(
+                    format!("failed to read {}: {err}", path.display()),
+                    None,
+                ))
+            }
+        };
+        let mut note_ids = Vec::new();
+        let mut todo_ids = Vec::new();
+
+        let mut entries = tokio::fs::read_dir(&dir).await.map_err(|e| {
+            ErrorData::internal_error(format!("failed to read dir {}: {e}", dir.display()), None)
         })?;
-        Ok(result_text(content, format!("Read plan {name}")))
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            ErrorData::internal_error(
+                format!("failed to read dir entry in {}: {e}", dir.display()),
+                None,
+            )
+        })? {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(note_id) = file_name
+                .strip_prefix("note-")
+                .and_then(|name| name.strip_suffix(".md"))
+            {
+                note_ids.push(note_id.to_string());
+            } else if let Some(todo_id) = file_name
+                .strip_prefix("todo-")
+                .and_then(|name| name.strip_suffix(".md"))
+            {
+                todo_ids.push(todo_id.to_string());
+            }
+        }
+
+        note_ids.sort();
+        todo_ids.sort();
+
+        Ok(result_json(
+            json!({
+                "plan": name,
+                "content": content,
+                "note_ids": note_ids,
+                "todo_ids": todo_ids,
+            }),
+            format!("Read plan {name}"),
+        ))
     }
 
     fn handle_plan_write(&self, params: PlanWriteParams) -> Result<CallToolResult, ErrorData> {
@@ -874,36 +949,24 @@ impl TodoServer {
         ))
     }
 
-    fn handle_plan_add_note(&self, params: PlanAddNoteParams) -> Result<CallToolResult, ErrorData> {
+    async fn handle_plan_add_note(
+        &self,
+        params: PlanAddNoteParams,
+    ) -> Result<CallToolResult, ErrorData> {
         let name = normalize_plan_name(&params.name)
             .map_err(|err| ErrorData::invalid_params(err, None))?;
+        let id = generate_id();
         let dir = plan_dir(&self.dir, &name);
-        std::fs::create_dir_all(&dir).map_err(|err| {
+        tokio::fs::create_dir_all(&dir).await.map_err(|err| {
             ErrorData::internal_error(format!("failed to create {}: {err}", dir.display()), None)
         })?;
-        let path = plan_file_path(&self.dir, &name);
-        let mut content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(err) => {
-                return Err(ErrorData::internal_error(
-                    format!("failed to read {}: {err}", path.display()),
-                    None,
-                ))
-            }
-        };
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str("\n### Note\n\n");
-        content.push_str(&params.text);
-        content.push('\n');
-        std::fs::write(&path, content).map_err(|err| {
+        let path = note_file_path(&self.dir, &name, &id);
+        tokio::fs::write(&path, &params.text).await.map_err(|err| {
             ErrorData::internal_error(format!("failed to write {}: {err}", path.display()), None)
         })?;
         Ok(result_text(
-            format!("Added note to plan {name}"),
-            format!("Added note to plan {name}"),
+            format!("Created note {id} in plan {name}"),
+            format!("Created note {id} in plan {name}"),
         ))
     }
 
@@ -932,6 +995,40 @@ impl TodoServer {
         Ok(result_json(
             todo_to_json(todo),
             format!("Found {}: {}", display_id(&todo.front.id), todo.front.title),
+        ))
+    }
+
+    async fn handle_plan_read_note(
+        &self,
+        params: PlanReadNoteParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let plan = normalize_plan_name(&params.plan)
+            .map_err(|err| ErrorData::invalid_params(err, None))?;
+        // Strip "note-" case-insensitively: lowercase first, then strip the prefix.
+        let lowered = params.note_id.trim().to_ascii_lowercase();
+        let id = lowered
+            .strip_prefix("note-")
+            .unwrap_or(&lowered)
+            .to_string();
+        let path = note_file_path(&self.dir, &plan, &id);
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ErrorData::invalid_params(
+                    format!("note '{id}' not found in plan '{plan}'"),
+                    None,
+                ))
+            }
+            Err(e) => {
+                return Err(ErrorData::internal_error(
+                    format!("failed to read {}: {e}", path.display()),
+                    None,
+                ))
+            }
+        };
+        Ok(result_text(
+            content,
+            format!("Read note {id} in plan {plan}"),
         ))
     }
 }
@@ -1013,7 +1110,7 @@ impl ServerHandler for TodoServer {
                         "call_template": "- todo {{ args.id }}",
                         "result_template": "{{ result.content[0].text | default('') }}"
                     }).as_object().unwrap().clone())),
-                Tool::new("read_plan", "Read plan markdown file.", Map::new())
+                Tool::new("read_plan", "Read plan markdown file and list available note and todo IDs.", Map::new())
                     .with_input_schema::<PlanReadParams>()
                     .with_meta(Meta(json!({
                         "call_template": "plan {{ args.name }}",
@@ -1031,7 +1128,7 @@ impl ServerHandler for TodoServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "plan_add_note",
-                    "Append note section to plan markdown.",
+                    "Append note section to plan markdown as a dedicated note file.",
                     Map::new(),
                 )
                 .with_input_schema::<PlanAddNoteParams>()
@@ -1047,6 +1144,16 @@ impl ServerHandler for TodoServer {
                 .with_input_schema::<PlanGetTodoParams>()
                 .with_meta(Meta(json!({
                     "call_template": "plan {{ args.plan }} / {{ args.key }}",
+                    "result_template": "{{ result.content[0].text | default('') }}"
+                }).as_object().unwrap().clone())),
+                Tool::new(
+                    "plan_read_note",
+                    "Read a note file in a plan by note ID.",
+                    Map::new(),
+                )
+                .with_input_schema::<PlanReadNoteParams>()
+                .with_meta(Meta(json!({
+                    "call_template": "note {{ args.plan }}/{{ args.note_id }}",
                     "result_template": "{{ result.content[0].text | default('') }}"
                 }).as_object().unwrap().clone())),
             ],
@@ -1085,7 +1192,7 @@ impl ServerHandler for TodoServer {
             }
             "read_plan" => {
                 let params = parse_arguments::<PlanReadParams>(request.arguments)?;
-                self.handle_plan_read(params)
+                self.handle_plan_read(params).await
             }
             "write_plan" => {
                 let params = parse_arguments::<PlanWriteParams>(request.arguments)?;
@@ -1093,11 +1200,15 @@ impl ServerHandler for TodoServer {
             }
             "plan_add_note" => {
                 let params = parse_arguments::<PlanAddNoteParams>(request.arguments)?;
-                self.handle_plan_add_note(params)
+                self.handle_plan_add_note(params).await
             }
             "plan_get_todo" => {
                 let params = parse_arguments::<PlanGetTodoParams>(request.arguments)?;
                 self.handle_plan_get_todo(params)
+            }
+            "plan_read_note" => {
+                let params = parse_arguments::<PlanReadNoteParams>(request.arguments)?;
+                self.handle_plan_read_note(params).await
             }
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
@@ -1191,11 +1302,15 @@ mod tests {
     fn temp_test_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         let unique = format!(
-            "harnx-mcp-todo-{name}-{}-{}",
+            "harnx-mcp-todo-{name}-{}-{}-{}",
             std::process::id(),
-            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+            unique_iso()
         );
         path.push(unique);
+        if path.exists() {
+            fs::remove_dir_all(&path).unwrap();
+        }
         fs::create_dir_all(&path).unwrap();
         path
     }
@@ -1556,8 +1671,8 @@ mod tests {
         assert_eq!(todos.len(), 2);
     }
 
-    #[test]
-    fn plan_add_note_creates_missing_plan_file() {
+    #[tokio::test]
+    async fn plan_add_note_creates_missing_plan_file() {
         let dir = temp_test_dir("plan-add-note-not-found");
         let server = TodoServer::new(dir.clone());
 
@@ -1566,13 +1681,25 @@ mod tests {
                 name: "plan-a".to_string(),
                 text: "hello note".to_string(),
             })
+            .await
             .unwrap();
         let summary = extract_text(result);
-        assert!(summary.contains("Added note to plan plan-a"));
+        assert!(summary.contains("Created note"));
+        assert!(summary.contains("plan-a"));
 
-        let content = fs::read_to_string(dir.join("plan-a").join("plan.md")).unwrap();
-        assert!(content.contains("### Note"));
+        let note_id = summary
+            .split("note ")
+            .nth(1)
+            .unwrap()
+            .split(" in plan")
+            .next()
+            .unwrap();
+        let note_path = dir.join("plan-a").join(format!("note-{note_id}.md"));
+        assert!(note_path.exists());
+
+        let content = fs::read_to_string(&note_path).unwrap();
         assert!(content.contains("hello note"));
+        assert!(!dir.join("plan-a").join("plan.md").exists());
     }
 
     #[test]
@@ -1633,5 +1760,202 @@ mod tests {
         let open_todos: Vec<Value> = serde_json::from_str(&extract_text(open)).unwrap();
         assert_eq!(open_todos.len(), 1);
         assert_eq!(open_todos[0]["status"], "open");
+    }
+
+    #[tokio::test]
+    async fn plan_add_note_multiple_notes_create_separate_files() {
+        let dir = temp_test_dir("plan-add-note-multi");
+        let server = TodoServer::new(dir.clone());
+
+        let r1 = server
+            .handle_plan_add_note(PlanAddNoteParams {
+                name: "plan-a".to_string(),
+                text: "note one".to_string(),
+            })
+            .await
+            .unwrap();
+        let r2 = server
+            .handle_plan_add_note(PlanAddNoteParams {
+                name: "plan-a".to_string(),
+                text: "note two".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let s1 = extract_text(r1);
+        let s2 = extract_text(r2);
+        assert!(s1.contains("Created note"));
+        assert!(s2.contains("Created note"));
+        assert_ne!(s1, s2);
+
+        let plan_dir = dir.join("plan-a");
+        let note_files: Vec<_> = fs::read_dir(&plan_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("note-"))
+            .collect();
+        assert_eq!(note_files.len(), 2);
+        assert!(!plan_dir.join("plan.md").exists());
+    }
+
+    #[tokio::test]
+    async fn read_plan_returns_json_with_note_and_todo_ids() {
+        let dir = temp_test_dir("read-plan-json");
+        let server = TodoServer::new(dir.clone());
+
+        server
+            .handle_plan_write(PlanWriteParams {
+                name: "my-plan".to_string(),
+                content: "# My Plan\n".to_string(),
+                todos: None,
+            })
+            .unwrap();
+
+        let note_result = server
+            .handle_plan_add_note(PlanAddNoteParams {
+                name: "my-plan".to_string(),
+                text: "some note".to_string(),
+            })
+            .await
+            .unwrap();
+        let note_summary = extract_text(note_result);
+        let note_id = note_summary.split_whitespace().nth(2).unwrap().to_string();
+
+        let todo_result = server
+            .handle_create(TodoCreateParams {
+                title: "task one".to_string(),
+                tags: vec![],
+                plan: "my-plan".to_string(),
+                status: None,
+                body: None,
+                key: None,
+                dependencies: vec![],
+            })
+            .unwrap();
+        let todo_json: Value = serde_json::from_str(&extract_text(todo_result)).unwrap();
+        let todo_id = todo_json["id"].as_str().unwrap().to_string();
+
+        let read_result = server
+            .handle_plan_read(PlanReadParams {
+                name: "my-plan".to_string(),
+            })
+            .await
+            .unwrap();
+        let overview: Value = serde_json::from_str(&extract_text(read_result)).unwrap();
+
+        assert_eq!(overview["plan"], "my-plan");
+        assert!(overview["content"].as_str().unwrap().contains("# My Plan"));
+
+        let note_ids: Vec<String> = serde_json::from_value(overview["note_ids"].clone()).unwrap();
+        let todo_ids: Vec<String> = serde_json::from_value(overview["todo_ids"].clone()).unwrap();
+
+        assert_eq!(note_ids.len(), 1);
+        assert!(note_ids.contains(&note_id));
+
+        assert_eq!(todo_ids.len(), 1);
+        assert!(todo_ids.contains(&todo_id));
+    }
+
+    #[tokio::test]
+    async fn plan_read_note_returns_content() {
+        let dir = temp_test_dir("plan-read-note-content");
+        let server = TodoServer::new(dir.clone());
+
+        let add_result = server
+            .handle_plan_add_note(PlanAddNoteParams {
+                name: "plan-a".to_string(),
+                text: "my important note".to_string(),
+            })
+            .await
+            .unwrap();
+        let summary = extract_text(add_result);
+        let note_id = summary.split_whitespace().nth(2).unwrap().to_string();
+
+        let read_result = server
+            .handle_plan_read_note(PlanReadNoteParams {
+                plan: "plan-a".to_string(),
+                note_id: note_id.clone(),
+            })
+            .await
+            .unwrap();
+        let content = extract_text(read_result);
+        assert!(content.contains("my important note"));
+    }
+
+    #[tokio::test]
+    async fn plan_read_note_returns_error_for_missing_note() {
+        let dir = temp_test_dir("plan-read-note-missing");
+        let server = TodoServer::new(dir.clone());
+
+        fs::create_dir_all(dir.join("plan-a")).unwrap();
+
+        let result = server
+            .handle_plan_read_note(PlanReadNoteParams {
+                plan: "plan-a".to_string(),
+                note_id: "deadbeef".to_string(),
+            })
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn plan_read_note_normalizes_note_id_variants() {
+        let dir = temp_test_dir("plan-read-note-normalizes");
+        let server = TodoServer::new(dir.clone());
+
+        let add_result = server
+            .handle_plan_add_note(PlanAddNoteParams {
+                name: "plan-a".to_string(),
+                text: "normalized note text".to_string(),
+            })
+            .await
+            .unwrap();
+        let summary = extract_text(add_result);
+        let note_id = summary.split_whitespace().nth(2).unwrap().to_string();
+
+        for variant in [
+            format!("note-{note_id}"),
+            note_id.to_uppercase(),
+            format!(" {note_id} "),
+        ] {
+            let read_result = server
+                .handle_plan_read_note(PlanReadNoteParams {
+                    plan: "plan-a".to_string(),
+                    note_id: variant,
+                })
+                .await
+                .unwrap();
+            let content = extract_text(read_result);
+            assert!(content.contains("normalized note text"));
+        }
+    }
+
+    #[tokio::test]
+    async fn read_plan_returns_json_for_note_only_plan() {
+        let dir = temp_test_dir("read-plan-note-only");
+        let server = TodoServer::new(dir.clone());
+
+        server
+            .handle_plan_add_note(PlanAddNoteParams {
+                name: "note-only-plan".to_string(),
+                text: "orphan note".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let read_result = server
+            .handle_plan_read(PlanReadParams {
+                name: "note-only-plan".to_string(),
+            })
+            .await
+            .unwrap();
+        let overview: Value = serde_json::from_str(&extract_text(read_result)).unwrap();
+
+        let note_ids: Vec<String> = serde_json::from_value(overview["note_ids"].clone()).unwrap();
+        let todo_ids: Vec<String> = serde_json::from_value(overview["todo_ids"].clone()).unwrap();
+
+        assert_eq!(note_ids.len(), 1);
+        assert_eq!(todo_ids.len(), 0);
+        assert_eq!(overview["content"], "");
     }
 }
