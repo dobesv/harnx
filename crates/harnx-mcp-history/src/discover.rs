@@ -12,7 +12,15 @@ fn discover_repo(path: &Path) -> Option<gix::Repository> {
 
 pub fn find_repo_for_path(path: &Path) -> Option<PathBuf> {
     let repo = discover_repo(path)?;
-    repo.workdir().map(Path::to_path_buf)
+    let workdir = repo.workdir()?;
+    // Canonicalize so the path matches the canonical keys
+    // `find_repos_under_roots` and `HistoryManager::ensure_repo_for_path`
+    // store in the tracked-repo map.
+    Some(
+        workdir
+            .canonicalize()
+            .unwrap_or_else(|_| workdir.to_path_buf()),
+    )
 }
 
 pub fn find_repos_under_roots(roots: &[PathBuf]) -> Vec<PathBuf> {

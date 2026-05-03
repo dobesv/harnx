@@ -83,10 +83,66 @@ impl HistoryManager {
         }
     }
 
+    /// Ensure a tracked repo exists for `file_path`, discovering and
+    /// inserting one if necessary. Returns silently when the path lies
+    /// outside any git repo — the caller's existing "no tracked repo"
+    /// branch then handles the miss.
+    async fn ensure_repo_for_path(&self, file_path: &Path) {
+        {
+            let repos = self.inner.repos.lock().await;
+            if repos
+                .iter()
+                .any(|(workdir, _)| file_path.starts_with(workdir.as_path()))
+            {
+                return;
+            }
+        }
+        let Some(workdir) = crate::discover::find_repo_for_path(file_path) else {
+            return;
+        };
+        let Ok(repo) = gix::open(&workdir) else {
+            return;
+        };
+        let mut repos = self.inner.repos.lock().await;
+        repos.entry(workdir).or_insert_with(|| RepoSession {
+            repo: repo.into_sync(),
+            last_commit_id: None,
+        });
+    }
+
+    /// Ensure tracked repos exist for any git workdirs found under
+    /// `working_dir`. Mirrors `find_repos_under_roots`, but runs at
+    /// snapshot time rather than at construction time so repos that
+    /// arrive via the MCP `roots/list` protocol are picked up.
+    async fn ensure_repos_under(&self, working_dir: &Path) {
+        let discovered = crate::discover::find_repos_under_roots(&[working_dir.to_path_buf()]);
+        if discovered.is_empty() {
+            return;
+        }
+        let mut repos = self.inner.repos.lock().await;
+        for workdir in discovered {
+            if repos.contains_key(&workdir) {
+                continue;
+            }
+            let Ok(repo) = gix::open(&workdir) else {
+                continue;
+            };
+            repos.insert(
+                workdir,
+                RepoSession {
+                    repo: repo.into_sync(),
+                    last_commit_id: None,
+                },
+            );
+        }
+    }
+
     pub async fn snapshot(&self, paths: &[PathBuf], label: &str) -> Result<gix::ObjectId> {
         let path = paths
             .first()
             .context("snapshot requires at least one path")?;
+        // Same lazy-discovery rationale as `snapshot_file`.
+        self.ensure_repo_for_path(path).await;
         let (repo_workdir, ts_repo, parent) = {
             let repos = self.inner.repos.lock().await;
             // Pick the longest matching workdir so an inner repo wins over an
@@ -124,6 +180,15 @@ impl HistoryManager {
     }
 
     pub async fn snapshot_file(&self, file_path: &Path, label: &str) -> Result<gix::ObjectId> {
+        // Lazily discover and track a repo covering this file path. This is
+        // load-bearing in production: harnx-mcp-fs / harnx-mcp-bash launch
+        // with empty `--root` args and only learn their roots later via the
+        // MCP `roots/list` protocol, so `HistoryManager::new(&[])` finds no
+        // repos at construction. Without this fallback every snapshot would
+        // silently fail with "no tracked repo" and edit_file would omit its
+        // diff content block.
+        self.ensure_repo_for_path(file_path).await;
+
         let (repo_workdir, ts_repo, parent) = {
             let repos = self.inner.repos.lock().await;
             let (workdir, session) = repos
@@ -170,6 +235,8 @@ impl HistoryManager {
         working_dir: &Path,
         label: &str,
     ) -> Result<Vec<(PathBuf, gix::ObjectId)>> {
+        // Lazy discovery — same rationale as `snapshot_file`.
+        self.ensure_repos_under(working_dir).await;
         let candidates = {
             let repos = self.inner.repos.lock().await;
             repos
@@ -216,6 +283,7 @@ impl HistoryManager {
         files: &[PathBuf],
         label: &str,
     ) -> Result<Vec<(PathBuf, gix::ObjectId)>> {
+        self.ensure_repos_under(working_dir).await;
         let candidates = {
             let repos = self.inner.repos.lock().await;
             repos
@@ -263,10 +331,17 @@ impl HistoryManager {
         before_id: gix::ObjectId,
         after_id: gix::ObjectId,
     ) -> Result<String> {
+        // Tracked repos are stored under their canonical workdir; canonicalize
+        // the caller's path so lookups still succeed when they came from a
+        // non-canonical source like `gix::Repository::workdir()`.
+        let canonical = repo_workdir
+            .canonicalize()
+            .unwrap_or_else(|_| repo_workdir.to_path_buf());
         let ts_repo = {
             let repos = self.inner.repos.lock().await;
             repos
-                .get(repo_workdir)
+                .get(&canonical)
+                .or_else(|| repos.get(repo_workdir))
                 .map(|session| session.repo.clone())
                 .context("repo not tracked for diff")?
         };
@@ -776,5 +851,44 @@ mod tests {
             .filter_map(|name| std::str::from_utf8(name).ok())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["kept.txt"], "tree should contain only kept.txt");
+    }
+
+    /// When `HistoryManager` is constructed with empty initial roots (the
+    /// production launch path for harnx-mcp-fs and harnx-mcp-bash, which
+    /// receive their roots later via the MCP `roots/list` protocol),
+    /// `snapshot_file` must still discover and track the git repo
+    /// containing the file rather than silently failing with "no tracked
+    /// repo found for file path".
+    #[tokio::test]
+    async fn snapshot_file_lazy_discovers_repo_with_empty_initial_roots() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo_dir = temp_dir.path().canonicalize().expect("canonicalize");
+        init_git_repo(&repo_dir);
+        add_file_to_git(&repo_dir, "tracked.txt", b"old\n");
+        commit_git(&repo_dir);
+
+        let history = HistoryManager::new(&[]);
+        let file_path = repo_dir.join("tracked.txt");
+        let before = history
+            .snapshot_file(&file_path, "before edit")
+            .await
+            .expect("snapshot succeeds via lazy discovery");
+
+        // Subsequent edit + snapshot + diff must all succeed against the
+        // lazily-tracked repo so end-to-end edit_file diff generation works.
+        std::fs::write(&file_path, b"new\n").expect("rewrite tracked.txt");
+        let after = history
+            .snapshot_file(&file_path, "after edit")
+            .await
+            .expect("second snapshot succeeds");
+        let diff = history
+            .diff_commits(&repo_dir, before, after)
+            .await
+            .expect("diff between snapshots");
+        assert!(diff.contains("-old"), "diff should include removal: {diff}");
+        assert!(
+            diff.contains("+new"),
+            "diff should include addition: {diff}"
+        );
     }
 }
