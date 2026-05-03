@@ -14,7 +14,7 @@ tags:
   - uuidv7
   - terminal-fingerprinting
 plan_ref: "issue-422-session-handling-revamp"
----
+last_updated: 2026-05-03
 
 ## Problem
 
@@ -201,6 +201,7 @@ pub(crate) fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState>
 ## Related Issues
 
 - **GitHub:** [Issue #422](https://github.com/dobesv/harnx/issues/422) — Session handling revamp
+- **Follow-up:** [logic-errors/picker-flow-state-continuity-2026-05-03.md](../logic-errors/picker-flow-state-continuity-2026-05-03.md) — Bug fixes for picker flow: filter UI, ESC behavior, modal restoration, origin tracking for transcript reconciliation
 - **Files Changed:**
   - `crates/harnx-core/src/session.rs` — Header metadata fields
   - `crates/harnx-runtime/src/config/session_meta.rs` — Header parsing, multi-tier sort

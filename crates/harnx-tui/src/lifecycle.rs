@@ -125,24 +125,25 @@ impl Tui {
             return Some(ModalState::AgentPicker {
                 agents,
                 selected: 0,
+                query: String::new(),
             });
         } else if config.read().session.is_none() {
+            // sessions_dir() is already scoped to the active agent, so no
+            // extra agent_name filter is needed here.
             let sessions = config.read().list_sessions_with_meta();
-            let sessions: Vec<_> = if let Some(agent) = config.read().agent.as_ref() {
-                sessions
-                    .into_iter()
-                    .filter(|s| s.agent_name.as_deref() == Some(agent.name()))
-                    .collect()
-            } else {
-                sessions
-            };
             if !sessions.is_empty() {
                 let ctx = build_picker_context();
                 let sorted = sort_sessions_for_picker(sessions, &ctx);
+                // Opened directly (agent already configured, no picker transition).
+                // origin_* reflect current state so reconciliation sees the correct
+                // before/after diff when a session is selected or Esc is pressed.
+                let origin_agent = config.read().agent.as_ref().map(|a| a.name().to_string());
+                let origin_session = config.read().session.as_ref().map(|s| s.id().to_string());
                 return Some(ModalState::SessionPicker {
                     sessions: sorted,
                     selected: 0,
-                    pending_agent: None,
+                    origin_agent,
+                    origin_session,
                 });
             }
         }
