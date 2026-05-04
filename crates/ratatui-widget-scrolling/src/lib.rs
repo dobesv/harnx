@@ -1029,4 +1029,127 @@ mod tests {
             );
         }
     }
+
+    // ========================================
+    // Tests for scroll_position_to_show_item
+    // ========================================
+
+    /// Helper to create a ScrollState with a pre-populated height cache.
+    fn scroll_state_with_heights(width: u16, heights: Vec<usize>) -> ScrollState {
+        let mut state = ScrollState::new();
+        state.render_height_cache.insert(width, heights);
+        state
+    }
+
+    /// Test 1: Everything fits in viewport — returns 0
+    #[test]
+    fn scroll_position_to_show_item_everything_fits() {
+        let mut state = scroll_state_with_heights(80, vec![2, 3, 2]); // total = 7
+        let viewport_height = 10;
+
+        // Request any item — should return 0 since all fit
+        let pos = state.scroll_position_to_show_item(1, 80, viewport_height, 3);
+        assert_eq!(pos, 0, "all items fit, position should be 0");
+    }
+
+    /// Test 2: Item at top (first item) with content taller than viewport — returns 0
+    #[test]
+    fn scroll_position_to_show_item_first_item_returns_zero() {
+        let mut state = scroll_state_with_heights(80, vec![5, 5, 5, 5]); // total = 20
+        let viewport_height = 10;
+
+        let pos = state.scroll_position_to_show_item(0, 80, viewport_height, 4);
+        assert_eq!(pos, 0, "first item should be at position 0");
+    }
+
+    /// Test 3: Item in middle — returns offset that centers the item
+    #[test]
+    fn scroll_position_to_show_item_middle_item_centered() {
+        // heights: [3, 3, 3, 3, 3] = 15 total
+        // viewport_height = 10, so max_scroll_offset = 15 - 10 = 5
+        // item_index = 2, top_offset = 3 + 3 = 6
+        // centering: 6 - (10 - 3) / 2 = 6 - 3 = 3, clamped to max_scroll_offset = 5
+        let mut state = scroll_state_with_heights(80, vec![3, 3, 3, 3, 3]);
+        let viewport_height = 10;
+
+        // Item at index 2: top_offset = items[0] + items[1] = 6
+        // Centered: 6 - (10-3)/2 = 6 - 3 = 3
+        let pos = state.scroll_position_to_show_item(2, 80, viewport_height, 5);
+        assert_eq!(pos, 3, "middle item should be centered");
+    }
+
+    /// Test 4: Item at bottom (last item) — returns max_scroll_offset
+    #[test]
+    fn scroll_position_to_show_item_last_item_returns_max() {
+        // heights: [2, 3, 4, 6] = 15 total
+        // viewport_height = 10, max_scroll_offset = 5
+        // item_index = 3, top_offset = 2 + 3 + 4 = 9
+        // item_height = 6, centering: 9 - (10-6)/2 = 9 - 2 = 7, clamped to 5
+        let mut state = scroll_state_with_heights(80, vec![2, 3, 4, 6]);
+        let viewport_height = 10;
+
+        let pos = state.scroll_position_to_show_item(3, 80, viewport_height, 4);
+        assert_eq!(pos, 5, "last item should be at max_scroll_offset");
+    }
+
+    /// Test 5: Item taller than viewport — top-aligns (returns top_offset, clamped to max)
+    #[test]
+    fn scroll_position_to_show_item_taller_than_viewport_top_aligned() {
+        // heights: [3, 15, 3] = 21 total
+        // viewport_height = 10, max_scroll_offset = 11
+        // item_index = 1, top_offset = 3, item_height = 15 >= viewport_height
+        // Since item is taller, top-align: return 3
+        let mut state = scroll_state_with_heights(80, vec![3, 15, 3]);
+        let viewport_height = 10;
+
+        let pos = state.scroll_position_to_show_item(1, 80, viewport_height, 3);
+        assert_eq!(pos, 3, "tall item should be top-aligned at its top_offset");
+    }
+
+    /// Test 5b: Item taller than viewport at bottom — clamped to max_scroll_offset
+    #[test]
+    fn scroll_position_to_show_item_taller_than_viewport_clamped() {
+        // heights: [5, 20] = 25 total
+        // viewport_height = 10, max_scroll_offset = 15
+        // item_index = 1, top_offset = 5, item_height = 20 >= viewport_height
+        // Top-align would be 5, but it's already within bounds
+        let mut state = scroll_state_with_heights(80, vec![5, 20]);
+        let viewport_height = 10;
+
+        let pos = state.scroll_position_to_show_item(1, 80, viewport_height, 2);
+        assert_eq!(pos, 5, "tall item at bottom should be at its top_offset");
+    }
+
+    /// Test 6: Empty/no cache — returns best-effort (doesn't panic)
+    #[test]
+    fn scroll_position_to_show_item_empty_cache_no_panic() {
+        let mut state = ScrollState::new(); // No cache populated
+        let viewport_height = 10;
+
+        // Without cache, get_height_log_from_cache_for_width creates vec![1; n]
+        // For 5 elements: heights = [1, 1, 1, 1, 1], total = 5 < viewport_height
+        // So max_scroll_offset = 0, returns 0
+        let pos = state.scroll_position_to_show_item(2, 80, viewport_height, 5);
+        assert_eq!(
+            pos, 0,
+            "empty cache creates default heights, everything fits"
+        );
+    }
+
+    /// Test 6b: Empty cache with more elements than viewport height
+    #[test]
+    fn scroll_position_to_show_item_empty_cache_with_many_elements() {
+        let mut state = ScrollState::new();
+        let viewport_height = 5;
+
+        // 10 elements with default height 1 each = 10 total
+        // max_scroll_offset = 10 - 5 = 5
+        // item_index = 5, top_offset = 5, item_height = 1
+        // centering: 5 - (5-1)/2 = 5 - 2 = 3
+        let pos = state.scroll_position_to_show_item(5, 80, viewport_height, 10);
+        assert_eq!(
+            pos, 3,
+            "empty cache with many elements should center the item"
+        );
+    }
 }

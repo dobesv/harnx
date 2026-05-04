@@ -520,6 +520,18 @@ impl Tui {
         // Render detail view if open (exclusive — returns early)
         if self.app.detail_view_open {
             self.render_detail_view(frame, size);
+            // Render modal ON TOP of detail view if active (e.g. delete/rewind confirm)
+            if let Some(modal) = &self.app.modal.clone() {
+                self.render_modal(frame, size, modal);
+            }
+            return;
+        }
+
+        if self.app.transcript_browsing {
+            self.render_browsing_view(frame, size);
+            if let Some(modal) = &self.app.modal.clone() {
+                self.render_modal(frame, size, modal);
+            }
             return;
         }
 
@@ -1138,8 +1150,97 @@ impl Tui {
             .min(self.app.detail_view_scroll.last_max_position);
 
         // Render footer
-        let footer =
-            Paragraph::new(" ↑↓/scroll — ESC to close").style(Style::default().fg(Color::DarkGray));
+        let footer_text = if self
+            .app
+            .copy_notice_until
+            .map(|t| std::time::Instant::now() < t)
+            .unwrap_or(false)
+        {
+            " ✓ Copied to clipboard".to_string()
+        } else {
+            " ↑↓/scroll  e/edit  d/delete  r/rewind  c/copy  ESC/back".to_string()
+        };
+        let footer = Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(footer, chunks[1]);
+    }
+
+    pub(super) fn render_browsing_view(
+        &mut self,
+        frame: &mut Frame<'_>,
+        size: ratatui::layout::Rect,
+    ) {
+        // Clear the full area first
+        frame.render_widget(ratatui::widgets::Clear, size);
+
+        // Split vertically: content area + footer (2 rows)
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(size);
+
+        // Count navigable items and find display index
+        let mut navigable_count = 0;
+        let mut display_idx = 0;
+
+        let mut content_lines = Vec::new();
+
+        for (i, item) in self.app.transcript.iter().enumerate() {
+            if item.is_navigable() {
+                navigable_count += 1;
+                if Some(i) == self.app.transcript_focus {
+                    display_idx = navigable_count;
+                    content_lines = Self::render_entry_detail(item);
+                }
+            }
+        }
+
+        let entries_as_vec = if content_lines.is_empty() {
+            vec![]
+        } else {
+            vec![content_lines]
+        };
+
+        // Create block with border and title
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("History Browser");
+
+        // Get inner area for content
+        let inner_area = block.inner(chunks[0]);
+
+        // Render the block into the content chunk
+        frame.render_widget(block, chunks[0]);
+
+        // Render the scrollable content
+        self.app
+            .browsing_view_scroll
+            .render(frame, inner_area, &entries_as_vec, |lines| {
+                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+                let height = paragraph.line_count(inner_area.width);
+                (height, paragraph)
+            });
+
+        // Clamp position to the freshly-updated last_max_position
+        self.app.browsing_view_scroll.position = self
+            .app
+            .browsing_view_scroll
+            .position
+            .min(self.app.browsing_view_scroll.last_max_position);
+
+        // Split footer into two rows
+        let footer_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(chunks[1]);
+
+        let counter_text = format!(" Item {} of {} (navigable)", display_idx, navigable_count);
+        let counter_para = Paragraph::new(counter_text).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(counter_para, footer_chunks[0]);
+
+        let shortcuts_text =
+            " ↑↓/browse  ENTER/view raw  e/edit  d/delete  r/rewind  c/copy  ESC/close";
+        let shortcuts_para =
+            Paragraph::new(shortcuts_text).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(shortcuts_para, footer_chunks[1]);
     }
 }

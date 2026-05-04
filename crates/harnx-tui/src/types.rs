@@ -107,6 +107,14 @@ pub(super) struct App {
     /// detail_view_open is set.  None when no session is active or the item
     /// has no sequence number.
     pub(super) detail_view_raw_yaml: Option<String>,
+    /// True when the user is browsing history in fullscreen mode.
+    /// Distinct from detail_view_open which shows raw YAML.
+    pub(super) transcript_browsing: bool,
+    /// Scroll state for the browsing view (used when transcript_browsing is true).
+    /// Reset to follow=false, position=0 when focused item changes.
+    pub(super) browsing_view_scroll: ratatui_widget_scrolling::ScrollState,
+    /// When set, detail view footer shows "Copied to clipboard ✓" until this instant.
+    pub(super) copy_notice_until: Option<std::time::Instant>,
     /// Set to true whenever transcript_focus changes so draw() scrolls once
     /// to keep the newly focused item visible, then clears it.
     pub(super) scroll_to_focused_item: bool,
