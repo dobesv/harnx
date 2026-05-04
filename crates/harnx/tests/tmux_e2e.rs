@@ -217,6 +217,51 @@ fn is_uuid_at(chars: &[char], i: usize) -> bool {
     true
 }
 
+/// Replace variable context-token counts in the TUI status bar (e.g.
+/// `Context: 72(0%)`) with a stable placeholder so snapshots are
+/// deterministic across runs where mock timing varies.
+fn normalize_context_counts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(pos) = remaining.find("Context: ") {
+        out.push_str(&remaining[..pos]);
+        let after = &remaining[pos + "Context: ".len()..];
+        // Consume digits, then literal "(0%)"
+        let digit_end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        if after[digit_end..].starts_with("(0%)") {
+            out.push_str("Context: [N](0%)");
+            remaining = &after[digit_end + "(0%)".len()..];
+        } else {
+            out.push_str("Context: ");
+            remaining = after;
+        }
+    }
+    out.push_str(remaining);
+    out
+}
+
+/// Normalize `response:` lines in sub-agent tool-result output so that
+/// timing-dependent trailing chunks don't cause snapshot flakiness.  The TUI
+/// may or may not have received the last streaming chunk by the time the screen
+/// is captured, making the concatenated response non-deterministic.
+fn normalize_response_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("response: ") {
+                // Keep only up to and including the first complete sentence
+                // boundary to drop timing-dependent trailing chunks.
+                let trimmed = rest.split_inclusive(['.', '!']).next().unwrap_or(rest);
+                format!("response: {trimmed}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Replace 6-char base64url session IDs (e.g. `afgkKA`) with `[SID]` so
 /// snapshots are deterministic across runs.  A valid short session ID consists
 /// of exactly 6 characters from the URL-safe base64 alphabet `[A-Za-z0-9_-]`.
@@ -1266,9 +1311,10 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
         "expected exactly one parent final message:\n{screen}"
     );
 
-    let normalized = normalize_short_session_ids(&normalize_spinner_chars(&normalize_uuids(
-        &normalize_screen(&screen),
-    )));
+    let normalized =
+        normalize_response_lines(&normalize_context_counts(&normalize_short_session_ids(
+            &normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen))),
+        )));
     assert_snapshot!("nested_sub_agent_activity_no_duplicates", normalized);
 
     drop(tmux);
