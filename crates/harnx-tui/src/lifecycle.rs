@@ -96,9 +96,20 @@ impl Tui {
             transcript_focus: None,
             transcript_selection_anchor: None,
             modal: None,
-            detail_view_scroll: ratatui_widget_scrolling::ScrollState::new(),
+            detail_view_scroll: {
+                let mut s = ratatui_widget_scrolling::ScrollState::new();
+                s.follow = false;
+                s
+            },
             detail_view_open: false,
             detail_view_raw_yaml: None,
+            transcript_browsing: false,
+            browsing_view_scroll: {
+                let mut s = ratatui_widget_scrolling::ScrollState::new();
+                s.follow = false;
+                s
+            },
+            copy_notice_until: None,
             scroll_to_focused_item: false,
             use_utc_timestamps: false,
         };

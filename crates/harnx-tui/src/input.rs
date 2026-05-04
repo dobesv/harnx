@@ -126,39 +126,138 @@ fn tool_completed_to_transcript_items(
 }
 
 impl Tui {
+    async fn handle_detail_view_key(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.app.detail_view_open = false;
+                // Return to browsing view (transcript_browsing stays true)
+            }
+            (KeyCode::Up, KeyModifiers::NONE) => {
+                self.app.detail_view_scroll.scroll_up();
+            }
+            (KeyCode::Down, KeyModifiers::NONE) => {
+                self.app.detail_view_scroll.scroll_down();
+            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => {
+                for _ in 0..10 {
+                    self.app.detail_view_scroll.scroll_up();
+                }
+            }
+            (KeyCode::PageDown, KeyModifiers::NONE) => {
+                for _ in 0..10 {
+                    self.app.detail_view_scroll.scroll_down();
+                }
+            }
+            (KeyCode::Char('e'), KeyModifiers::NONE) => {
+                // Edit: close detail, run edit, then reopen detail with updated content.
+                // Save focus and browsing state before editing since handle_transcript_edit
+                // clears both.
+                let had_focus = self.app.transcript_focus;
+                let prior_browsing = self.app.transcript_browsing;
+                self.app.detail_view_open = false;
+                self.handle_transcript_edit().await?;
+                // After edit, if we had a valid focused item, try to reopen detail view.
+                // Note: transcript may have changed, so restore focus tentatively.
+                if let Some(focus_idx) = had_focus {
+                    // Check that the focus index still exists in the (possibly reloaded) transcript
+                    if focus_idx < self.app.transcript.len() {
+                        self.app.transcript_focus = Some(focus_idx);
+                        self.app.transcript_selection_anchor = None;
+                        self.app.transcript_browsing = prior_browsing;
+                        self.app.detail_view_scroll = {
+                            let mut s = ratatui_widget_scrolling::ScrollState::new();
+                            s.follow = false;
+                            s
+                        };
+                        self.app.detail_view_raw_yaml =
+                            self.selected_seq_range().and_then(|(from, to)| {
+                                self.config.read().get_message_range_yaml(from, to)
+                            });
+                        self.app.detail_view_open = true;
+                    }
+                }
+            }
+            (KeyCode::Delete, KeyModifiers::NONE) | (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                // Delete: show confirm modal ON TOP of detail view (do NOT close detail_view_open)
+                self.handle_transcript_delete();
+            }
+            (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                // Rewind: show confirm modal ON TOP of detail view
+                self.handle_transcript_rewind();
+            }
+            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                self.handle_transcript_copy();
+                // Show clipboard notice for 2 seconds
+                self.app.copy_notice_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+            }
+            _ => {} // all other keys silently consumed
+        }
+        Ok(())
+    }
+
+    async fn handle_browsing_key(&mut self, key: KeyEvent) -> Result<()> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.app.transcript_browsing = false;
+                self.app.transcript_focus = None;
+                self.app.transcript_selection_anchor = None;
+                self.app.scroll_state.follow = true;
+            }
+            (KeyCode::Up, KeyModifiers::NONE) => {
+                self.handle_up_key(key);
+            }
+            (KeyCode::Down, KeyModifiers::NONE) => {
+                self.handle_down_key(key);
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                // Open detail view for current focused item
+                self.app.detail_view_scroll = {
+                    let mut s = ratatui_widget_scrolling::ScrollState::new();
+                    s.follow = false;
+                    s
+                };
+                self.app.detail_view_raw_yaml = self
+                    .selected_seq_range()
+                    .and_then(|(from, to)| self.config.read().get_message_range_yaml(from, to));
+                self.app.detail_view_open = true;
+            }
+            (KeyCode::Char('e'), KeyModifiers::NONE) => {
+                self.handle_transcript_edit().await?;
+            }
+            (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                self.handle_transcript_insert();
+            }
+            (KeyCode::Delete, KeyModifiers::NONE) | (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                self.handle_transcript_delete();
+            }
+            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                self.handle_transcript_copy();
+            }
+            (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                self.handle_transcript_rewind();
+            }
+            _ => {} // consume all other keys to prevent bleed to input
+        }
+        Ok(())
+    }
+
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // If a modal is open, intercept all keys and route to modal handler
         if self.app.modal.is_some() {
             return self.handle_modal_key(key).await;
         }
 
-        // While the detail view is open, only navigation / close keys are
-        // handled.  All other keys are silently consumed so they cannot bleed
-        // into the hidden background input field or trigger background actions.
+        // While the detail view is open, handle navigation + mutation keys.
+        // All other keys are silently consumed so they cannot bleed into the
+        // hidden background input field or trigger background actions.
         if self.app.detail_view_open {
-            match (key.code, key.modifiers) {
-                (KeyCode::Esc, KeyModifiers::NONE) => {
-                    self.app.detail_view_open = false;
-                }
-                (KeyCode::Up, KeyModifiers::NONE) => {
-                    self.app.detail_view_scroll.scroll_up();
-                }
-                (KeyCode::Down, KeyModifiers::NONE) => {
-                    self.app.detail_view_scroll.scroll_down();
-                }
-                (KeyCode::PageUp, KeyModifiers::NONE) => {
-                    for _ in 0..10 {
-                        self.app.detail_view_scroll.scroll_up();
-                    }
-                }
-                (KeyCode::PageDown, KeyModifiers::NONE) => {
-                    for _ in 0..10 {
-                        self.app.detail_view_scroll.scroll_down();
-                    }
-                }
-                _ => {} // all other keys silently consumed
-            }
-            return Ok(());
+            return self.handle_detail_view_key(key).await;
+        }
+
+        // Browsing mode guard: when user is navigating history fullscreen
+        if self.app.transcript_browsing {
+            return self.handle_browsing_key(key).await;
         }
 
         match (key.code, key.modifiers) {
@@ -238,9 +337,11 @@ impl Tui {
             (KeyCode::Esc, KeyModifiers::NONE) => {
                 if self.app.detail_view_open {
                     self.app.detail_view_open = false;
+                    // Return to browsing view (transcript_browsing stays true if it was true)
                 } else if self.app.transcript_focus.is_some() {
                     self.app.transcript_focus = None;
                     self.app.transcript_selection_anchor = None;
+                    self.app.transcript_browsing = false;
                     self.app.scroll_state.follow = true;
                 } else if !self.app.completions.is_empty() {
                     self.app.completions.clear();
@@ -248,33 +349,29 @@ impl Tui {
             }
             // D4: Keyboard actions on selected transcript item(s)
             // All mutation shortcuts are blocked while the detail view is open.
-            (KeyCode::Char('e'), KeyModifiers::NONE)
-                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
-            {
+            (KeyCode::Char('e'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
                 self.handle_transcript_edit().await?;
             }
             (KeyCode::Delete, KeyModifiers::NONE) | (KeyCode::Char('d'), KeyModifiers::NONE)
-                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
+                if self.app.transcript_focus.is_some() =>
             {
                 self.handle_transcript_delete();
             }
-            (KeyCode::Char('i'), KeyModifiers::NONE)
-                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
-            {
+            (KeyCode::Char('i'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
                 self.handle_transcript_insert();
             }
-            (KeyCode::Char('c'), KeyModifiers::NONE)
-                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
-            {
+            (KeyCode::Char('c'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
                 self.handle_transcript_copy();
             }
-            (KeyCode::Char('r'), KeyModifiers::NONE)
-                if self.app.transcript_focus.is_some() && !self.app.detail_view_open =>
-            {
+            (KeyCode::Char('r'), KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
                 self.handle_transcript_rewind();
             }
             (KeyCode::Enter, KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
-                self.app.detail_view_scroll = ratatui_widget_scrolling::ScrollState::new();
+                self.app.detail_view_scroll = {
+                    let mut s = ratatui_widget_scrolling::ScrollState::new();
+                    s.follow = false;
+                    s
+                };
                 // Pre-load raw session YAML (same content .edit message would open).
                 self.app.detail_view_raw_yaml = self
                     .selected_seq_range()
@@ -500,8 +597,9 @@ impl Tui {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
-        // Ignore paste while the detail view is open — same isolation policy as handle_key.
-        if self.app.detail_view_open {
+        // Ignore paste while the detail view or browsing view is open — same isolation
+        // policy as handle_key: these overlays hide the input field.
+        if self.app.detail_view_open || self.app.transcript_browsing {
             return;
         }
         if let Some(pending) = self.app.pending_message.take() {
@@ -564,6 +662,12 @@ impl Tui {
                     }
                     return;
                 }
+                if self.app.transcript_browsing {
+                    for _ in 0..3 {
+                        self.app.browsing_view_scroll.scroll_up();
+                    }
+                    return;
+                }
                 for _ in 0..3 {
                     self.app.scroll_state.scroll_up();
                 }
@@ -572,6 +676,12 @@ impl Tui {
                 if self.app.detail_view_open {
                     for _ in 0..3 {
                         self.app.detail_view_scroll.scroll_down();
+                    }
+                    return;
+                }
+                if self.app.transcript_browsing {
+                    for _ in 0..3 {
+                        self.app.browsing_view_scroll.scroll_down();
                     }
                     return;
                 }
@@ -1164,12 +1274,19 @@ impl Tui {
         } else if let Some(focus) = self.app.transcript_focus {
             if let Some(prev) = self.find_prev_navigable(focus) {
                 self.app.transcript_focus = Some(prev);
+                self.app.transcript_browsing = true;
+                self.app.browsing_view_scroll = {
+                    let mut s = ratatui_widget_scrolling::ScrollState::new();
+                    s.follow = false;
+                    s
+                };
                 self.app.scroll_state.follow = false;
                 self.app.scroll_to_focused_item = true;
                 self.app.transcript_selection_anchor = None;
             } else {
                 self.app.transcript_focus = None;
                 self.app.transcript_selection_anchor = None;
+                self.app.transcript_browsing = false;
                 // Do NOT restore follow here — user is entering history preview
                 // and the transcript position should stay where it is.
                 // follow is restored by Esc or when a new message is submitted.
@@ -1186,6 +1303,12 @@ impl Tui {
         } else if self.input_is_blank() && !self.app.transcript.is_empty() {
             if let Some(prev) = self.find_prev_navigable(self.app.transcript.len()) {
                 self.app.transcript_focus = Some(prev);
+                self.app.transcript_browsing = true;
+                self.app.browsing_view_scroll = {
+                    let mut s = ratatui_widget_scrolling::ScrollState::new();
+                    s.follow = false;
+                    s
+                };
                 self.app.scroll_state.follow = false;
                 self.app.scroll_to_focused_item = true;
                 self.app.transcript_selection_anchor = None;
@@ -1224,12 +1347,19 @@ impl Tui {
         } else if let Some(focus) = self.app.transcript_focus {
             if let Some(next) = self.find_next_navigable(focus) {
                 self.app.transcript_focus = Some(next);
+                self.app.transcript_browsing = true;
+                self.app.browsing_view_scroll = {
+                    let mut s = ratatui_widget_scrolling::ScrollState::new();
+                    s.follow = false;
+                    s
+                };
                 self.app.scroll_state.follow = false;
                 self.app.scroll_to_focused_item = true;
                 self.app.transcript_selection_anchor = None;
             } else {
                 self.app.transcript_focus = None;
                 self.app.transcript_selection_anchor = None;
+                self.app.transcript_browsing = false;
                 self.app.scroll_state.follow = true;
             }
         } else if self.app.history_preview {
@@ -1956,6 +2086,11 @@ impl Tui {
                         format!(".delete message {}-{}", from, to)
                     };
                     self.run_command(&cmd).await?;
+                    self.app.detail_view_open = false;
+                    self.app.detail_view_raw_yaml = None;
+                    self.app.transcript_browsing = false;
+                    self.app.transcript_focus = None;
+                    self.app.transcript_selection_anchor = None;
                 }
                 crate::types::ModalState::ConfirmRewind { seq, user_text } => {
                     // Execute rewind via dot-command
@@ -1975,6 +2110,11 @@ impl Tui {
                             });
                         }
                     }
+                    self.app.detail_view_open = false;
+                    self.app.detail_view_raw_yaml = None;
+                    self.app.transcript_browsing = false;
+                    self.app.transcript_focus = None;
+                    self.app.transcript_selection_anchor = None;
                 }
                 _ => {}
             }
@@ -2046,6 +2186,7 @@ impl Tui {
         self.run_command(&cmd).await?;
         self.app.transcript_focus = None;
         self.app.transcript_selection_anchor = None;
+        self.app.transcript_browsing = false;
         self.app.scroll_state.follow = true;
         Ok(())
     }
@@ -2073,6 +2214,7 @@ impl Tui {
         }
         self.app.transcript_focus = None;
         self.app.transcript_selection_anchor = None;
+        self.app.transcript_browsing = false;
         self.app.scroll_state.follow = true;
     }
 

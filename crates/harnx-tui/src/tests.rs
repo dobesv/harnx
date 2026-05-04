@@ -5721,7 +5721,7 @@ async fn test_detail_view_esc_closes_view_and_preserves_focus() {
 }
 
 #[tokio::test]
-async fn test_detail_view_blocks_mutation_shortcuts() {
+async fn test_detail_view_mutation_shortcuts_work() {
     let mut harness = TuiTestHarness::new();
     harness.tui().app.transcript.clear();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
@@ -5731,9 +5731,7 @@ async fn test_detail_view_blocks_mutation_shortcuts() {
     });
     harness.tui().app.transcript_focus = Some(0);
     harness.tui().app.detail_view_open = true;
-    let initial_len = harness.tui().app.transcript.len();
 
-    // 'd' delete shortcut must be blocked while detail view is open.
     harness
         .tui()
         .handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
@@ -5742,12 +5740,14 @@ async fn test_detail_view_blocks_mutation_shortcuts() {
 
     assert!(
         harness.tui().app.detail_view_open,
-        "detail view should still be open"
+        "detail view should remain open while delete confirm modal is shown"
     );
-    assert_eq!(
-        harness.tui().app.transcript.len(),
-        initial_len,
-        "transcript must not be mutated while detail view is open"
+    assert!(
+        matches!(
+            harness.tui().app.modal,
+            Some(crate::types::ModalState::ConfirmDelete { from: 1, to: 1 })
+        ),
+        "delete shortcut in detail view should open confirm delete modal"
     );
 }
 
