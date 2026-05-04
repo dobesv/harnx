@@ -1720,7 +1720,9 @@ impl Tui {
                     ..
                 }) = self.app.modal.as_mut()
                 {
-                    if *selected + 1 < sessions.len() {
+                    // Total items = 1 ("New session") + sessions.len(), so max
+                    // valid index is sessions.len().
+                    if *selected < sessions.len() {
                         *selected += 1;
                     }
                 }
@@ -1772,42 +1774,18 @@ impl Tui {
                             }
 
                             let sessions = self.config.read().list_sessions_with_meta();
-                            if !sessions.is_empty() {
-                                let ctx = build_picker_context();
-                                let sessions = sort_sessions_for_picker(sessions, &ctx);
-                                // Carry the pre-activation origin state into SessionPicker so
-                                // reconcile_transcript_after_command sees the full transition.
-                                self.app.modal = Some(crate::types::ModalState::SessionPicker {
-                                    sessions,
-                                    selected: 0,
-                                    origin_agent: prev_agent,
-                                    origin_session: prev_session,
-                                });
-                            } else {
-                                // No sessions — start a fresh one right away.
-                                if let Err(e) = self.config.write().use_session(None) {
-                                    // Restore AgentPicker so the user can try again.
-                                    self.app.modal = Some(crate::types::ModalState::AgentPicker {
-                                        agents,
-                                        selected,
-                                        query,
-                                    });
-                                    return Err(e);
-                                }
-                                let llm_busy = self.app.llm_busy;
-                                let pending = self.app.pending_message.is_some();
-                                Self::refresh_input_chrome_from_state(
-                                    &self.config,
-                                    &mut self.app,
-                                    llm_busy,
-                                    pending,
-                                );
-                                self.reconcile_transcript_after_command(
-                                    prev_session,
-                                    prev_agent,
-                                    ".agent",
-                                );
-                            }
+                            let ctx = build_picker_context();
+                            let sessions = sort_sessions_for_picker(sessions, &ctx);
+                            // Always show SessionPicker so the user can pick "New session"
+                            // (index 0) or an existing session. Carry the pre-activation
+                            // origin state so reconcile_transcript_after_command sees the
+                            // full transition.
+                            self.app.modal = Some(crate::types::ModalState::SessionPicker {
+                                sessions,
+                                selected: 0,
+                                origin_agent: prev_agent,
+                                origin_session: prev_session,
+                            });
                         }
                     }
                     Some(crate::types::ModalState::SessionPicker {
@@ -1816,7 +1794,32 @@ impl Tui {
                         origin_agent,
                         origin_session,
                     }) => {
-                        if selected >= sessions.len() {
+                        // Index 0 = "New session"; index N (1‥) = sessions[N-1].
+                        if selected == 0 {
+                            // Create a new session.
+                            if let Err(e) = self.config.write().use_session(None) {
+                                self.app.modal = Some(crate::types::ModalState::SessionPicker {
+                                    sessions,
+                                    selected,
+                                    origin_agent,
+                                    origin_session,
+                                });
+                                return Err(e);
+                            }
+                            let llm_busy = self.app.llm_busy;
+                            let pending = self.app.pending_message.is_some();
+                            Self::refresh_input_chrome_from_state(
+                                &self.config,
+                                &mut self.app,
+                                llm_busy,
+                                pending,
+                            );
+                            self.reconcile_transcript_after_command(
+                                origin_session,
+                                origin_agent,
+                                ".session",
+                            );
+                        } else if selected > sessions.len() {
                             // Index out of range — keep picker open.
                             self.app.modal = Some(crate::types::ModalState::SessionPicker {
                                 sessions,
@@ -1825,7 +1828,8 @@ impl Tui {
                                 origin_session,
                             });
                         } else {
-                            let session_name = sessions[selected].id.clone();
+                            // Existing session at sessions[selected - 1].
+                            let session_name = sessions[selected - 1].id.clone();
 
                             if let Err(e) = self.config.write().use_session(Some(&session_name)) {
                                 self.app.modal = Some(crate::types::ModalState::SessionPicker {
@@ -1860,41 +1864,55 @@ impl Tui {
                 }
             }
             KeyCode::Esc => {
-                // ESC on the SessionPicker starts a new session (agent is already
-                // active at this point).  ESC on the AgentPicker just cancels.
-                if let Some(crate::types::ModalState::SessionPicker {
-                    origin_agent,
-                    origin_session,
-                    ..
-                }) = self.app.modal.take()
+                // ESC on the SessionPicker restores the original state if there was a
+                // prior session. If there was no prior session, ESC does nothing (must
+                // select a session).
+                // ESC on the AgentPicker cancels only if an agent is already active
+                // (mid-session switch). If no agent is active (startup), ESC does
+                // nothing — selection is mandatory per #451.
+                let mut should_restore_origin = false;
+                if let Some(crate::types::ModalState::SessionPicker { origin_session, .. }) =
+                    self.app.modal.as_ref()
                 {
-                    // Dismiss modal only after use_session succeeds, so a failure
-                    // does not leave the UI without any active modal or session.
-                    if let Err(e) = self.config.write().use_session(None) {
-                        // Restore a minimal SessionPicker so the user can try again.
-                        self.app.modal = Some(crate::types::ModalState::SessionPicker {
-                            sessions: vec![],
-                            selected: 0,
-                            origin_agent,
-                            origin_session,
-                        });
-                        return Err(e);
+                    if origin_session.is_some() {
+                        should_restore_origin = true;
                     }
-                    let llm_busy = self.app.llm_busy;
-                    let pending = self.app.pending_message.is_some();
-                    Self::refresh_input_chrome_from_state(
-                        &self.config,
-                        &mut self.app,
-                        llm_busy,
-                        pending,
-                    );
-                    self.reconcile_transcript_after_command(
-                        origin_session,
-                        origin_agent,
-                        ".session",
-                    );
-                } else {
+                } else if matches!(
+                    self.app.modal,
+                    Some(crate::types::ModalState::AgentPicker { .. })
+                ) {
+                    // Only dismiss the AgentPicker if an agent is already active;
+                    // otherwise the picker is mandatory and must not be dismissed.
+                    if self.config.read().agent.is_some() {
+                        self.app.modal = None;
+                    }
+                } else if self.app.modal.is_some() {
                     self.app.modal = None;
+                }
+
+                if should_restore_origin {
+                    if let Some(crate::types::ModalState::SessionPicker {
+                        origin_agent,
+                        origin_session,
+                        ..
+                    }) = self.app.modal.take()
+                    {
+                        if let Some(agent) = origin_agent {
+                            let _ = self.config.write().use_agent_by_name(&agent);
+                        }
+                        if let Some(session) = origin_session {
+                            let _ = self.config.write().use_session(Some(&session));
+                        }
+
+                        let llm_busy = self.app.llm_busy;
+                        let pending = self.app.pending_message.is_some();
+                        Self::refresh_input_chrome_from_state(
+                            &self.config,
+                            &mut self.app,
+                            llm_busy,
+                            pending,
+                        );
+                    }
                 }
             }
 

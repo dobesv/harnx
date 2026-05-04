@@ -4,7 +4,7 @@ expression: normalized
 ---
 Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
 # nested-parent v
-🤖 nested-parent
+🤖 nested-parent ▸ temp
 > do nested delegation
 
 Parent delegating to researcher.
@@ -26,6 +26,8 @@ session_id: [UUID]
 response: Researcher delegating to analyst.Analyst completeResearcher complete
 Nested task complete
 
+📢 Autonaming the session.
+No more scripted responses.
 
 
 
@@ -77,6 +79,4 @@ Nested task complete
 
 
 
-
-
-* 🤖 nested-parent
+* 🤖 nested-parent ▸ temp   Context: 77(0%)

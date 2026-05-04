@@ -125,31 +125,32 @@ impl Tui {
 
     pub(crate) fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState> {
         let agents = list_agents();
-        if config.read().agent.is_none() && config.read().session.is_none() && !agents.is_empty() {
+        if config.read().agent.is_none() {
+            if agents.is_empty() {
+                return None;
+            }
             return Some(ModalState::AgentPicker {
                 agents,
                 selected: 0,
                 query: String::new(),
             });
-        } else if config.read().session.is_none() {
+        }
+        if config.read().session.is_none() {
             // sessions_dir() is already scoped to the active agent, so no
             // extra agent_name filter is needed here.
             let sessions = config.read().list_sessions_with_meta();
-            if !sessions.is_empty() {
-                let ctx = build_picker_context();
-                let sorted = sort_sessions_for_picker(sessions, &ctx);
-                // Opened directly (agent already configured, no picker transition).
-                // origin_* reflect current state so reconciliation sees the correct
-                // before/after diff when a session is selected or Esc is pressed.
-                let origin_agent = config.read().agent.as_ref().map(|a| a.name().to_string());
-                let origin_session = config.read().session.as_ref().map(|s| s.id().to_string());
-                return Some(ModalState::SessionPicker {
-                    sessions: sorted,
-                    selected: 0,
-                    origin_agent,
-                    origin_session,
-                });
-            }
+            let ctx = build_picker_context();
+            let sorted = sort_sessions_for_picker(sessions, &ctx);
+            // Always show picker when agent active but no session — even empty list
+            // because picker now always has a "New session" first item
+            let origin_agent = config.read().agent.as_ref().map(|a| a.name().to_string());
+            let origin_session = config.read().session.as_ref().map(|s| s.id().to_string());
+            return Some(ModalState::SessionPicker {
+                sessions: sorted,
+                selected: 0,
+                origin_agent,
+                origin_session,
+            });
         }
         None
     }

@@ -38,6 +38,10 @@ pub fn build_picker_context() -> PickerContext {
 }
 
 fn session_recency_key(session: &SessionMeta) -> u128 {
+    if let Some(seconds) = crate::utils::session_name::decode_timestamp_session_id(&session.id) {
+        return u128::MAX - (seconds as u128 * 1_000);
+    }
+
     if let Ok(uuid) = uuid::Uuid::parse_str(&session.id) {
         if uuid.get_version_num() == 7 {
             if let Some(timestamp) = uuid.get_timestamp() {

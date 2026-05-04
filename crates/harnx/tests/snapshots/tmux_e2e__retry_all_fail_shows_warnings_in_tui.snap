@@ -4,7 +4,7 @@ expression: normalized
 ---
 Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
 # retry-agent v
-🤖 retry-agent
+🤖 retry-agent ▸ temp
 > hello
 
 ⚠ Retryable error (status 500, Internal Server Error (type: server_error)), attempt 1/3. Retrying in 10ms...
@@ -49,4 +49,4 @@ Caused by:
 
 
 
-* 🤖 retry-agent
+* 🤖 retry-agent ▸ temp   Context: 19(0%)
