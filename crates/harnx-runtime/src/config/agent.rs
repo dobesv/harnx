@@ -113,7 +113,7 @@ pub fn resolve_file_defaults(agent: &mut Agent) -> Result<()> {
     let agent_dir = agent_file_path
         .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(Config::agents_data_dir);
+        .unwrap_or_else(Config::agents_config_dir);
     resolve_file_backed_variables(agent.config.variables_mut(), &agent_dir)
 }
 
@@ -177,7 +177,7 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
     let agent_dir = agent_file_path
         .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(Config::agents_data_dir);
+        .unwrap_or_else(Config::agents_config_dir);
 
     resolve_file_backed_variables(agent.config.variables_mut(), &agent_dir)?;
 
@@ -316,7 +316,7 @@ pub fn init_agent_variables(
 }
 
 pub fn list_agents() -> Vec<String> {
-    let mut output: Vec<String> = match read_dir(Config::agents_data_dir()) {
+    let mut output: Vec<String> = match read_dir(Config::agents_config_dir()) {
         Ok(entries) => entries
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| {
@@ -338,7 +338,7 @@ pub fn list_agents() -> Vec<String> {
 }
 
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
-    let markdown_path = Config::agents_data_dir().join(format!("{agent_name}.md"));
+    let markdown_path = Config::agents_config_dir().join(format!("{agent_name}.md"));
     if markdown_path.exists() {
         if let Ok(agent) = load(&markdown_path) {
             return agent
@@ -387,17 +387,33 @@ mod tests {
     fn with_test_config_dir<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
         let _guard = TEST_CONFIG_DIR_LOCK.lock().unwrap();
         let config_dir = unique_test_config_dir();
+        let data_dir = config_dir.with_file_name(format!(
+            "{}-data",
+            config_dir.file_name().unwrap().to_string_lossy()
+        ));
+        let state_dir = config_dir.with_file_name(format!(
+            "{}-state",
+            config_dir.file_name().unwrap().to_string_lossy()
+        ));
         let agents_dir = config_dir.join("agents");
         fs::create_dir_all(&agents_dir)?;
+        fs::create_dir_all(&data_dir)?;
+        fs::create_dir_all(&state_dir)?;
 
         unsafe {
             std::env::set_var("HARNX_CONFIG_DIR", &config_dir);
+            std::env::set_var("HARNX_DATA_DIR", &data_dir);
+            std::env::set_var("HARNX_STATE_DIR", &state_dir);
         }
         let result = f(&config_dir);
         unsafe {
             std::env::remove_var("HARNX_CONFIG_DIR");
+            std::env::remove_var("HARNX_DATA_DIR");
+            std::env::remove_var("HARNX_STATE_DIR");
         }
 
+        let _ = fs::remove_dir_all(&data_dir);
+        let _ = fs::remove_dir_all(&state_dir);
         let cleanup_result = fs::remove_dir_all(&config_dir);
         match (result, cleanup_result) {
             (Ok(value), Ok(())) => Ok(value),

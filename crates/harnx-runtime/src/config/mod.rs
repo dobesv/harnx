@@ -589,6 +589,11 @@ impl Config {
         paths::agents_data_dir()
     }
 
+    /// Root dir for per-agent instruction files (.md) — lives in config dir.
+    pub fn agents_config_dir() -> PathBuf {
+        paths::agents_config_dir()
+    }
+
     pub fn agent_data_dir(name: &str) -> PathBuf {
         paths::agent_data_dir(name)
     }
@@ -648,10 +653,10 @@ impl Config {
             return Ok((log_level, None));
         }
         let log_path = match env::var(get_env_name("log_path")) {
-            Ok(v) => Some(PathBuf::from(v)),
-            Err(_) => match is_serve {
+            Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
+            _ => match is_serve {
                 true => None,
-                false => Some(Config::local_path(&format!(
+                false => Some(paths::state_path(&format!(
                     "{}.log",
                     env!("CARGO_CRATE_NAME")
                 ))),
@@ -914,7 +919,7 @@ impl Config {
 
     pub fn delete(config: &GlobalConfig, kind: &str) -> Result<()> {
         let (dir, file_ext) = match kind {
-            "agent" => (Self::agents_data_dir(), Some(".md")),
+            "agent" => (Self::agents_config_dir(), Some(".md")),
             "session" => (config.read().sessions_dir(), Some(".yaml")),
             "rag" => (Self::rags_dir(), Some(".yaml")),
             "macro" => (Self::macros_dir(), Some(".yaml")),
