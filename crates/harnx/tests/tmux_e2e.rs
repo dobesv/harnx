@@ -54,10 +54,12 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
     };
     tmux.send_keys(&["C-l"])?;
 
-    // Step 1: Export HARNX_CONFIG_DIR
+    // Step 1: Export HARNX_CONFIG_DIR, HARNX_DATA_DIR, HARNX_STATE_DIR
     tmux.send_text(&format!(
-        "export HARNX_CONFIG_DIR={}",
-        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref())
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}",
+        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
 
@@ -235,6 +237,8 @@ fn repo_root() -> Result<PathBuf> {
 
 struct TestPaths {
     harnx_config_dir: PathBuf,
+    harnx_data_dir: PathBuf,
+    harnx_state_dir: PathBuf,
     config_path: PathBuf,
     agents_dir: PathBuf,
     port: u16,
@@ -243,11 +247,17 @@ struct TestPaths {
 impl TestPaths {
     fn new(temp_root: &Path, port: u16) -> Result<Self> {
         let harnx_config_dir = temp_root.join("harnx");
+        let harnx_data_dir = temp_root.join("harnx-data");
+        let harnx_state_dir = temp_root.join("harnx-state");
         let config_path = harnx_config_dir.join("config.yaml");
         let agents_dir = harnx_config_dir.join("agents");
         std::fs::create_dir_all(&agents_dir)?;
+        std::fs::create_dir_all(&harnx_data_dir)?;
+        std::fs::create_dir_all(&harnx_state_dir)?;
         Ok(Self {
             harnx_config_dir,
+            harnx_data_dir,
+            harnx_state_dir,
             config_path,
             agents_dir,
             port,
@@ -826,8 +836,10 @@ fn setup_handoff_tmux_session_with_script(
     tmux.send_keys(&["C-l"])?;
 
     tmux.send_text(&format!(
-        "export HARNX_CONFIG_DIR={}",
-        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref())
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}",
+        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
 
@@ -1148,10 +1160,12 @@ fn nested_sub_agent_activity_no_duplicates() -> Result<()> {
     };
     tmux.send_keys(&["C-l"])?;
 
-    // Export HARNX_CONFIG_DIR
+    // Export HARNX_CONFIG_DIR, HARNX_DATA_DIR, HARNX_STATE_DIR
     tmux.send_text(&format!(
-        "export HARNX_CONFIG_DIR={}",
-        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref())
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}",
+        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
 
@@ -1452,8 +1466,10 @@ models:
     tmux.send_keys(&["C-l"])?;
 
     tmux.send_text(&format!(
-        "export HARNX_CONFIG_DIR={}",
-        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref())
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}",
+        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref())
     ))?;
     tmux.send_keys(&["Enter"])?;
 
@@ -1946,8 +1962,10 @@ fn session_mutation_edit_delete_rewind_persists_across_sessions() -> Result<()> 
     let setup_env = |tmux: &TmuxHarness, marker: &str| -> Result<()> {
         tmux.send_keys(&["C-l"])?;
         tmux.send_text(&format!(
-            "export HARNX_CONFIG_DIR={} PATH={} && cd {}; printf '{marker}\\n'",
+            "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={} PATH={} && cd {}; printf '{marker}\\n'",
             shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
+            shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
+            shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref()),
             shell_escape(&path_env),
             shell_escape(root.to_string_lossy().as_ref()),
         ))?;
@@ -2019,7 +2037,7 @@ fn session_mutation_edit_delete_rewind_persists_across_sessions() -> Result<()> 
     }
 
     let session_log_path = paths
-        .harnx_config_dir
+        .harnx_data_dir
         .join("agents")
         .join(MUTATION_AGENT_NAME)
         .join("sessions")
@@ -2111,7 +2129,7 @@ fn session_mutation_edit_delete_rewind_persists_across_sessions() -> Result<()> 
     // Calculate the actual last seq by counting YAML documents in the session log.
     // The last entry (assistant response to fifth message) is at seq = doc_count - 1.
     let session_log_path = paths
-        .harnx_config_dir
+        .harnx_data_dir
         .join("agents")
         .join(MUTATION_AGENT_NAME)
         .join("sessions")

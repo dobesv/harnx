@@ -108,14 +108,22 @@ pub fn script_streaming_with_sentinel() -> MockOpenAiScript {
 pub struct ConfigPaths {
     pub dir: PathBuf,
     pub harnx_config_dir: PathBuf,
+    pub harnx_data_dir: PathBuf,
+    pub harnx_state_dir: PathBuf,
 }
 
 /// Writes a minimal HARNX_CONFIG_DIR at `<dir>/harnx-config` targeting
 /// the given mock OpenAI base URL (e.g. `http://127.0.0.1:<port>/v1`).
 pub fn write_minimal_config(dir: &Path, mock_base_url: &str) -> Result<ConfigPaths> {
     let harnx_config_dir = dir.join("harnx-config");
+    let harnx_data_dir = dir.join("harnx-data");
+    let harnx_state_dir = dir.join("harnx-state");
+
     std::fs::create_dir_all(harnx_config_dir.join("clients"))
         .context("failed to create harnx config dir")?;
+    std::fs::create_dir_all(&harnx_data_dir).context("failed to create harnx data dir")?;
+    std::fs::create_dir_all(&harnx_state_dir).context("failed to create harnx state dir")?;
+
     std::fs::write(
         harnx_config_dir.join("config.yaml"),
         "save: false\nclient: mock-llm\nmodel: mock-llm:test\ntool_use: true\nuse_tools: '*'\n",
@@ -131,6 +139,8 @@ pub fn write_minimal_config(dir: &Path, mock_base_url: &str) -> Result<ConfigPat
     Ok(ConfigPaths {
         dir: dir.to_path_buf(),
         harnx_config_dir,
+        harnx_data_dir,
+        harnx_state_dir,
     })
 }
 
@@ -230,8 +240,10 @@ pub fn write_with_blocking_hook(
 pub fn spawn_tui(paths: &ConfigPaths, harnx_bin: &Path, repo_root: &Path) -> Result<TmuxHarness> {
     let tmux = TmuxHarness::new(repo_root, 120, 35).context("failed to create tmux session")?;
     tmux.send_text(&format!(
-        "export HARNX_CONFIG_DIR={}\n",
-        shell_escape(&paths.harnx_config_dir.to_string_lossy())
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}\n",
+        shell_escape(&paths.harnx_config_dir.to_string_lossy()),
+        shell_escape(&paths.harnx_data_dir.to_string_lossy()),
+        shell_escape(&paths.harnx_state_dir.to_string_lossy())
     ))?;
     tmux.send_text(&format!(
         "{} || echo HARNX_EXIT:$?\n",
@@ -266,8 +278,10 @@ pub fn spawn_oneshot_in_tmux(
 ) -> Result<TmuxHarness> {
     let tmux = TmuxHarness::new(repo_root, 120, 35).context("failed to create tmux session")?;
     tmux.send_text(&format!(
-        "export HARNX_CONFIG_DIR={}\n",
-        shell_escape(&paths.harnx_config_dir.to_string_lossy())
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}\n",
+        shell_escape(&paths.harnx_config_dir.to_string_lossy()),
+        shell_escape(&paths.harnx_data_dir.to_string_lossy()),
+        shell_escape(&paths.harnx_state_dir.to_string_lossy())
     ))?;
     // "|| echo HARNX_EXIT:$?" prints a detectable sentinel when harnx exits
     // non-zero (interrupted), making exit detection possible from pane capture.
@@ -364,6 +378,14 @@ pub fn write_with_sub_agent(
         "HARNX_CONFIG_DIR".to_string(),
         child_paths.harnx_config_dir.to_string_lossy().into_owned(),
     );
+    env.insert(
+        "HARNX_DATA_DIR".to_string(),
+        child_paths.harnx_data_dir.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "HARNX_STATE_DIR".to_string(),
+        child_paths.harnx_state_dir.to_string_lossy().into_owned(),
+    );
     let acp_server = AcpServerConfig {
         name: "child".to_string(),
         command: harnx_bin.to_string_lossy().into_owned(),
@@ -416,6 +438,8 @@ pub fn spawn_oneshot(
     Command::new(harnx_bin)
         .arg(prompt)
         .env("HARNX_CONFIG_DIR", &paths.harnx_config_dir)
+        .env("HARNX_DATA_DIR", &paths.harnx_data_dir)
+        .env("HARNX_STATE_DIR", &paths.harnx_state_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -462,6 +486,14 @@ pub async fn spawn_acp_client(
     env.insert(
         "HARNX_CONFIG_DIR".to_string(),
         paths.harnx_config_dir.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "HARNX_DATA_DIR".to_string(),
+        paths.harnx_data_dir.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        "HARNX_STATE_DIR".to_string(),
+        paths.harnx_state_dir.to_string_lossy().into_owned(),
     );
     let config = AcpServerConfig {
         name: format!("test-{agent}"),

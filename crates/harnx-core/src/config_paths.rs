@@ -65,13 +65,17 @@ pub fn normalize_env_name(value: &str) -> String {
 /// Panics if the OS has no default user config dir AND no overrides.
 pub fn config_dir() -> PathBuf {
     if let Ok(v) = env::var(get_env_name("config_dir")) {
-        PathBuf::from(v)
-    } else if let Ok(v) = env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(v).join(HARNX_NAME)
-    } else {
-        let dir = dirs::config_dir().expect("No user's config directory");
-        dir.join(HARNX_NAME)
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
     }
+    if let Ok(v) = env::var("XDG_CONFIG_HOME") {
+        if !v.is_empty() {
+            return PathBuf::from(v).join(HARNX_NAME);
+        }
+    }
+    let dir = dirs::config_dir().expect("No user's config directory");
+    dir.join(HARNX_NAME)
 }
 
 /// Join `name` under `config_dir()`. Convenience for leaf files/dirs.
@@ -79,19 +83,71 @@ pub fn local_path(name: &str) -> PathBuf {
     config_dir().join(name)
 }
 
+/// Root data directory. Resolution order:
+/// 1. `HARNX_DATA_DIR` env var (literal path).
+/// 2. `XDG_DATA_HOME/harnx` (XDG override).
+/// 3. OS default (`dirs::data_dir()/harnx`).
+///
+/// Panics if the OS has no default user data dir AND no overrides.
+pub fn data_dir() -> PathBuf {
+    if let Ok(v) = env::var(get_env_name("data_dir")) {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    if let Ok(v) = env::var("XDG_DATA_HOME") {
+        if !v.is_empty() {
+            return PathBuf::from(v).join(HARNX_NAME);
+        }
+    }
+    let dir = dirs::data_dir().expect("No user data dir");
+    dir.join(HARNX_NAME)
+}
+
+/// Join `name` under `data_dir()`. Convenience for leaf files/dirs.
+pub fn data_path(name: &str) -> PathBuf {
+    data_dir().join(name)
+}
+
+/// Root state directory. Resolution order:
+/// 1. `HARNX_STATE_DIR` env var (literal path).
+/// 2. `XDG_STATE_HOME/harnx` (XDG override).
+/// 3. OS default (`dirs::state_dir().unwrap_or_else(|| dirs::data_dir().expect("No user data dir"))/harnx`).
+///
+/// Panics if the OS has no default user state dir, no default user data dir, AND no overrides.
+pub fn state_dir() -> PathBuf {
+    if let Ok(v) = env::var(get_env_name("state_dir")) {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    if let Ok(v) = env::var("XDG_STATE_HOME") {
+        if !v.is_empty() {
+            return PathBuf::from(v).join(HARNX_NAME);
+        }
+    }
+    let dir = dirs::state_dir().unwrap_or_else(|| dirs::data_dir().expect("No user data dir"));
+    dir.join(HARNX_NAME)
+}
+
+/// Join `name` under `state_dir()`. Convenience for leaf files/dirs.
+pub fn state_path(name: &str) -> PathBuf {
+    state_dir().join(name)
+}
+
 /// Path to the main config file. Overridable via `HARNX_CONFIG_FILE`.
 pub fn config_file() -> PathBuf {
     match env::var(get_env_name("config_file")) {
-        Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(CONFIG_FILE_NAME),
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => local_path(CONFIG_FILE_NAME),
     }
 }
 
 /// Directory holding macro YAML files. Overridable via `HARNX_MACROS_DIR`.
 pub fn macros_dir() -> PathBuf {
     match env::var(get_env_name("macros_dir")) {
-        Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(MACROS_DIR_NAME),
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => local_path(MACROS_DIR_NAME),
     }
 }
 
@@ -128,30 +184,30 @@ pub fn macro_file(name: &str) -> PathBuf {
 /// Path to the `.env` file loaded at startup. Overridable via `HARNX_ENV_FILE`.
 pub fn env_file() -> PathBuf {
     match env::var(get_env_name("env_file")) {
-        Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(ENV_FILE_NAME),
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => local_path(ENV_FILE_NAME),
     }
 }
 
 /// Top-level RAG manifests dir (not per-agent). Overridable via `HARNX_RAGS_DIR`.
 pub fn rags_dir() -> PathBuf {
     match env::var(get_env_name("rags_dir")) {
-        Ok(value) => PathBuf::from(value),
-        Err(_) => local_path(RAGS_DIR_NAME),
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => data_path(RAGS_DIR_NAME),
     }
 }
 
 /// Root dir for per-agent data subdirectories.
 pub fn agents_data_dir() -> PathBuf {
-    local_path(AGENTS_DIR_NAME)
+    data_path(AGENTS_DIR_NAME)
 }
 
 /// Per-agent data dir. Each agent may override its own location via
 /// `<AGENT_NAME>_DATA_DIR` (dashes become underscores, uppercased).
 pub fn agent_data_dir(name: &str) -> PathBuf {
     match env::var(format!("{}_DATA_DIR", normalize_env_name(name))) {
-        Ok(value) => PathBuf::from(value),
-        Err(_) => agents_data_dir().join(name),
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => agents_data_dir().join(name),
     }
 }
 
@@ -160,9 +216,18 @@ pub fn agent_rag_file(agent_name: &str, rag_name: &str) -> PathBuf {
     agent_data_dir(agent_name).join(format!("{rag_name}.yaml"))
 }
 
-/// Per-agent instruction file: `<agents_data_dir>/<name>.md`.
+/// Root dir for per-agent instruction files (.md) — lives in config dir.
+///
+/// Resolves relative to `config_dir_path()` (i.e. the parent of the active
+/// config file) so that `HARNX_CONFIG_FILE` redirections are honoured, exactly
+/// as `clients_dir()`, `mcp_servers_dir()`, and `acp_servers_dir()` do.
+pub fn agents_config_dir() -> PathBuf {
+    config_dir_path().join(AGENTS_DIR_NAME)
+}
+
+/// Per-agent instruction file: `<config_dir>/agents/<name>.md`.
 pub fn agent_file(name: &str) -> PathBuf {
-    agents_data_dir().join(format!("{name}.md"))
+    agents_config_dir().join(format!("{name}.md"))
 }
 
 /// Optional models-override YAML file; if present, overrides models.yaml entries.
@@ -175,8 +240,8 @@ pub fn models_override_file() -> PathBuf {
 pub fn messages_file(agent_name: Option<&str>) -> PathBuf {
     match agent_name {
         None => match env::var(get_env_name("messages_file")) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => local_path(MESSAGES_FILE_NAME),
+            Ok(value) if !value.is_empty() => PathBuf::from(value),
+            _ => state_path(MESSAGES_FILE_NAME),
         },
         Some(agent) => agent_data_dir(agent).join(MESSAGES_FILE_NAME),
     }
@@ -187,8 +252,8 @@ pub fn messages_file(agent_name: Option<&str>) -> PathBuf {
 pub fn sessions_dir(agent_name: Option<&str>) -> PathBuf {
     match agent_name {
         None => match env::var(get_env_name("sessions_dir")) {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => local_path(SESSIONS_DIR_NAME),
+            Ok(value) if !value.is_empty() => PathBuf::from(value),
+            _ => state_path(SESSIONS_DIR_NAME),
         },
         Some(agent) => agent_data_dir(agent).join(SESSIONS_DIR_NAME),
     }
@@ -219,6 +284,64 @@ pub fn rag_file(agent_name: Option<&str>, name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mutex that serialises all tests which mutate process-global env vars.
+    ///
+    /// `cargo nextest` runs tests in separate processes by default, but
+    /// `cargo test` runs them in parallel threads within the same process.
+    /// Any test that calls `env::set_var` / `env::remove_var` must hold this
+    /// lock for the duration of the set → call → restore sequence.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Temporarily set an env var, invoke `f`, then restore the previous value
+    /// (or remove the var if it was absent before).  Holds `ENV_MUTEX` for the
+    /// entire duration so env-sensitive tests cannot race.
+    fn with_env<F, R>(key: &str, value: &str, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = env::var_os(key);
+        env::set_var(key, value);
+        let result = f();
+        match prior {
+            Some(v) => env::set_var(key, v),
+            None => env::remove_var(key),
+        }
+        result
+    }
+
+    /// Apply multiple env-var overrides (`Some(value)` = set, `None` = remove),
+    /// invoke `f`, then restore every var to its prior state.  Holds `ENV_MUTEX`
+    /// for the whole sequence so the entire multi-var mutation is atomic w.r.t.
+    /// other env-sensitive tests.
+    fn with_envs<F, R>(pairs: &[(&str, Option<&str>)], f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Save prior values and apply requested overrides.
+        let priors: Vec<_> = pairs
+            .iter()
+            .map(|(key, new_val)| {
+                let prior = env::var_os(key);
+                match new_val {
+                    Some(v) => env::set_var(key, v),
+                    None => env::remove_var(key),
+                }
+                (key, prior)
+            })
+            .collect();
+        let result = f();
+        // Restore in reverse order for cleanliness.
+        for (key, prior) in priors.into_iter().rev() {
+            match prior {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
+        result
+    }
 
     #[test]
     fn get_env_name_produces_harnx_prefix() {
@@ -377,5 +500,126 @@ mod tests {
                 agent.to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn data_dir_uses_harnx_data_dir_env_override() {
+        let test_path = "/tmp/harnx_data_test_8a3f";
+        let got = with_env("HARNX_DATA_DIR", test_path, data_dir);
+        assert_eq!(got, PathBuf::from(test_path));
+    }
+
+    #[test]
+    fn state_dir_uses_harnx_state_dir_env_override() {
+        let test_path = "/tmp/harnx_state_test_7b2e";
+        let got = with_env("HARNX_STATE_DIR", test_path, state_dir);
+        assert_eq!(got, PathBuf::from(test_path));
+    }
+
+    #[test]
+    fn rags_dir_is_under_data_dir() {
+        let test_data_dir = "/tmp/harnx_data_rags_3c9b";
+        // Hold both HARNX_DATA_DIR and HARNX_RAGS_DIR under one lock acquire so
+        // another test cannot slip in between and see a half-set state.
+        let got = with_envs(
+            &[
+                ("HARNX_DATA_DIR", Some(test_data_dir)),
+                ("HARNX_RAGS_DIR", None), // ensure fallback path fires
+            ],
+            rags_dir,
+        );
+        assert!(
+            got.starts_with(test_data_dir),
+            "rags_dir should be under data_dir"
+        );
+        assert!(
+            got.ends_with(RAGS_DIR_NAME),
+            "rags_dir should end with 'rags'"
+        );
+    }
+
+    #[test]
+    fn sessions_dir_none_is_under_state_dir() {
+        let test_state_dir = "/tmp/harnx_state_sessions_5d1a";
+        let got = with_envs(
+            &[
+                ("HARNX_STATE_DIR", Some(test_state_dir)),
+                ("HARNX_SESSIONS_DIR", None), // ensure fallback path fires
+            ],
+            || sessions_dir(None),
+        );
+        assert!(
+            got.starts_with(test_state_dir),
+            "sessions_dir(None) should be under state_dir"
+        );
+        assert!(
+            got.ends_with(SESSIONS_DIR_NAME),
+            "sessions_dir(None) should end with 'sessions'"
+        );
+    }
+
+    #[test]
+    fn sessions_dir_with_agent_is_under_data_dir() {
+        let test_data_dir = "/tmp/harnx_data_agent_sessions_9e2f";
+        // Use an unlikely agent name to avoid <AGENT>_DATA_DIR env collisions.
+        let agent = "ztest_agent_for_sdir_5e1c";
+        let got = with_env("HARNX_DATA_DIR", test_data_dir, || {
+            sessions_dir(Some(agent))
+        });
+        assert!(
+            got.starts_with(test_data_dir),
+            "sessions_dir(Some(agent)) should be under data_dir"
+        );
+        assert!(
+            got.ends_with(SESSIONS_DIR_NAME),
+            "sessions_dir(Some(agent)) should end with 'sessions'"
+        );
+    }
+
+    #[test]
+    fn messages_file_none_is_under_state_dir() {
+        let test_state_dir = "/tmp/harnx_state_messages_4f8b";
+        let got = with_envs(
+            &[
+                ("HARNX_STATE_DIR", Some(test_state_dir)),
+                ("HARNX_MESSAGES_FILE", None), // ensure fallback path fires
+            ],
+            || messages_file(None),
+        );
+        assert!(
+            got.starts_with(test_state_dir),
+            "messages_file(None) should be under state_dir"
+        );
+        assert!(
+            got.ends_with(MESSAGES_FILE_NAME),
+            "messages_file(None) should end with 'messages.md'"
+        );
+    }
+
+    #[test]
+    fn data_dir_uses_xdg_data_home_env() {
+        let test_path = "/tmp/xdg_data_test_9b2c";
+        // Clear HARNX_DATA_DIR so the XDG_DATA_HOME branch fires, and restore
+        // both vars afterwards.
+        let got = with_envs(
+            &[("HARNX_DATA_DIR", None), ("XDG_DATA_HOME", Some(test_path))],
+            data_dir,
+        );
+        assert_eq!(got, PathBuf::from(test_path).join(HARNX_NAME));
+    }
+
+    #[test]
+    fn state_dir_uses_xdg_state_home_env() {
+        let test_path = "/tmp/xdg_state_test_3d7e";
+        // Clear HARNX_STATE_DIR so the XDG_STATE_HOME branch fires, and restore
+        // both vars afterwards.
+        let got = with_envs(
+            &[
+                ("HARNX_STATE_DIR", None),
+                ("XDG_STATE_HOME", Some(test_path)),
+            ],
+            state_dir,
+        );
+        assert_eq!(got, PathBuf::from(test_path).join(HARNX_NAME));
     }
 }
