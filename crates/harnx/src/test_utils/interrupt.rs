@@ -136,6 +136,16 @@ pub fn write_minimal_config(dir: &Path, mock_base_url: &str) -> Result<ConfigPat
         ),
     )
     .context("failed to write clients/mock-llm.yaml")?;
+    // Write a default agent so TUI tests can launch with --agent default
+    // and bypass the agent/session pickers (required since both must be set
+    // before chat activity is allowed).
+    std::fs::create_dir_all(harnx_config_dir.join("agents"))
+        .context("failed to create agents dir")?;
+    std::fs::write(
+        harnx_config_dir.join("agents/default.md"),
+        "---\nclient: mock-llm\nmodel: mock-llm:test\ntool_use: true\nuse_tools: '*'\n---\nDefault test agent.\n",
+    )
+    .context("failed to write agents/default.md")?;
     Ok(ConfigPaths {
         dir: dir.to_path_buf(),
         harnx_config_dir,
@@ -245,14 +255,24 @@ pub fn spawn_tui(paths: &ConfigPaths, harnx_bin: &Path, repo_root: &Path) -> Res
         shell_escape(&paths.harnx_data_dir.to_string_lossy()),
         shell_escape(&paths.harnx_state_dir.to_string_lossy())
     ))?;
+    // Pass --agent default --session so the TUI starts with both an agent
+    // and a session already active, bypassing the agent/session pickers.
+    // The "default" agent is written by write_minimal_config.
     tmux.send_text(&format!(
-        "{} || echo HARNX_EXIT:$?\n",
+        "{} --agent default --session || echo HARNX_EXIT:$?\n",
         shell_escape(&harnx_bin.to_string_lossy())
     ))?;
-    // Wait for the TUI to paint its input area. The "• Input" header (or
-    // the spinner-frame variant) appears as soon as the TUI starts.
-    tmux.wait_for(Duration::from_secs(15), |screen| screen.contains("Input"))
-        .context("TUI did not start (no Input header after 15s)")?;
+    // Wait for the TUI to paint its input area. When no status info is
+    // available the input title reads "Input"; when an agent/session is
+    // active the title shows the session status line instead.  Both paths
+    // render a "•" (idle spinner) or a spinner frame before the title, so
+    // we look for the common idle indicator OR the "Input" fallback string.
+    tmux.wait_for(Duration::from_secs(15), |screen| {
+        screen.contains("Input")
+            || screen.contains("• 🤖")
+            || SPINNER_FRAMES.iter().any(|f| screen.contains(*f))
+    })
+    .context("TUI did not start (no Input header after 15s)")?;
     Ok(tmux)
 }
 
@@ -285,8 +305,9 @@ pub fn spawn_oneshot_in_tmux(
     ))?;
     // "|| echo HARNX_EXIT:$?" prints a detectable sentinel when harnx exits
     // non-zero (interrupted), making exit detection possible from pane capture.
+    // --agent default is required since chat activity needs an active agent.
     tmux.send_text(&format!(
-        "{} {} || echo HARNX_EXIT:$?\n",
+        "{} --agent default {} || echo HARNX_EXIT:$?\n",
         shell_escape(&harnx_bin.to_string_lossy()),
         shell_escape(prompt),
     ))?;
@@ -435,8 +456,10 @@ pub fn spawn_oneshot(
     prompt: &str,
 ) -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
+    // --agent default is required since chat activity needs an active agent.
+    // The "default" agent is written by write_minimal_config.
     Command::new(harnx_bin)
-        .arg(prompt)
+        .args(["--agent", "default", prompt])
         .env("HARNX_CONFIG_DIR", &paths.harnx_config_dir)
         .env("HARNX_DATA_DIR", &paths.harnx_data_dir)
         .env("HARNX_STATE_DIR", &paths.harnx_state_dir)

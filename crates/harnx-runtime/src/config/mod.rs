@@ -692,10 +692,15 @@ impl Config {
     }
 
     pub fn extract_agent(&self) -> Agent {
-        if let Some(session) = self.session.as_ref() {
-            self::session::to_agent(session)
-        } else if let Some(agent) = self.agent.as_ref() {
+        // When an explicit agent is active, prefer it over the session-derived
+        // agent. The in-memory agent has the full configuration from the agent
+        // file (including retry settings, hooks, etc.) that may not be stored
+        // in the session log.  The session-derived agent is used only when
+        // loading a standalone session from disk with no agent in context.
+        if let Some(agent) = self.agent.as_ref() {
             agent.clone()
+        } else if let Some(session) = self.session.as_ref() {
+            self::session::to_agent(session)
         } else {
             let mut agent = Agent::new(AgentConfig::from_prompt(""));
             agent.set_model(self.model.clone());

@@ -6143,6 +6143,18 @@ async fn agent_picker_enter_with_no_sessions_starts_new_session() {
         .await
         .unwrap();
 
+    assert!(
+        matches!(
+            tui.app.modal,
+            Some(crate::types::ModalState::SessionPicker { .. })
+        ),
+        "should transition to session picker"
+    );
+
+    tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
     // Modal dismissed, agent set, and a new session created.
     assert!(tui.app.modal.is_none(), "modal should be dismissed");
     assert!(
@@ -6193,10 +6205,10 @@ async fn agent_picker_enter_with_sessions_shows_session_picker() {
     );
 }
 
-// --- SessionPicker ESC creates new session -----------------------------------
+// --- SessionPicker ESC behavior -----------------------------------
 
 #[tokio::test]
-async fn session_picker_esc_creates_new_session() {
+async fn session_picker_esc_without_prior_session_keeps_picker_open() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
@@ -6228,22 +6240,65 @@ async fn session_picker_esc_creates_new_session() {
         .unwrap();
 
     assert!(
-        tui.app.modal.is_none(),
-        "modal should be dismissed after Esc"
+        tui.app.modal.is_some(),
+        "modal should not be dismissed after Esc if no prior session"
     );
     assert!(
-        config.read().session.is_some(),
-        "Esc on SessionPicker must create a new session"
+        config.read().session.is_none(),
+        "Esc on SessionPicker must not create a new session"
     );
 }
 
 #[tokio::test]
-async fn agent_picker_esc_does_not_create_session() {
+async fn agent_picker_esc_does_not_dismiss_without_active_agent() {
+    // When no agent is active (startup case), ESC on AgentPicker must NOT
+    // dismiss the picker — selection is mandatory per #451.
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
 
     let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    // No active agent in config.
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["apollo".into()],
+        selected: 0,
+        query: String::new(),
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        tui.app.modal.is_some(),
+        "AgentPicker Esc must NOT dismiss modal when no agent is active"
+    );
+    assert!(
+        config.read().session.is_none(),
+        "AgentPicker Esc must NOT create a session"
+    );
+}
+
+#[tokio::test]
+async fn agent_picker_esc_dismisses_when_agent_already_active() {
+    // When an agent is already active (mid-session switch), ESC on the
+    // AgentPicker cancels the switch and dismisses the picker.
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        let model = MockClient::builder().build().model().clone();
+        let mut agent =
+            harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
+        agent.set_model(model);
+        guard.agent = Some(agent);
+    }
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
@@ -6259,11 +6314,7 @@ async fn agent_picker_esc_does_not_create_session() {
 
     assert!(
         tui.app.modal.is_none(),
-        "AgentPicker Esc should dismiss modal"
-    );
-    assert!(
-        config.read().session.is_none(),
-        "AgentPicker Esc must NOT create a session"
+        "AgentPicker Esc should dismiss modal when agent is already active"
     );
 }
 
@@ -6309,7 +6360,7 @@ async fn session_picker_enter_loads_selected_session() {
 
     tui.app.modal = Some(crate::types::ModalState::SessionPicker {
         sessions: vec![meta],
-        selected: 0,
+        selected: 1,
         origin_agent: None,
         origin_session: None,
     });
@@ -6419,20 +6470,22 @@ async fn session_picker_enter_reconciles_from_origin_not_current_agent() {
 }
 
 #[tokio::test]
-async fn session_picker_esc_reconciles_from_origin_not_current_agent() {
-    // Same scenario as above but via Esc (new session) rather than Enter (select session).
-
+async fn session_picker_esc_restores_origin() {
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
 
-    let sessions_dir = tmp.path().join("sessions");
+    // Setup an agent to restore
+    create_agent_stubs(&tmp.path().join("agents"), &["apollo", "hermes"]);
+
+    let sessions_dir = tmp.path().join("agents").join("apollo").join("sessions");
     std::fs::create_dir_all(&sessions_dir).unwrap();
+    // create a fake session file
+    std::fs::write(sessions_dir.join("old-session.json"), "{}").unwrap();
 
     let config = picker_test_config();
     {
         let mut guard = config.write();
-        guard.sessions_dir_override = Some(sessions_dir.clone());
         let model = MockClient::builder().build().model().clone();
         let mut agent =
             harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
@@ -6443,15 +6496,12 @@ async fn session_picker_esc_reconciles_from_origin_not_current_agent() {
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
-    tui.app.transcript.push(TranscriptItem::SystemText(
-        "sentinel-esc-reconcile".to_string(),
-    ));
-
+    // Start in SessionPicker with origin set to apollo + old-session
     tui.app.modal = Some(crate::types::ModalState::SessionPicker {
         sessions: vec![],
         selected: 0,
         origin_agent: Some("apollo".to_string()),
-        origin_session: None,
+        origin_session: Some("old-session".to_string()),
     });
 
     tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -6459,12 +6509,17 @@ async fn session_picker_esc_reconciles_from_origin_not_current_agent() {
         .unwrap();
 
     assert!(tui.app.modal.is_none(), "modal dismissed after Esc");
-    assert!(config.read().session.is_some(), "new session created");
-    assert!(
-        !tui.app
-            .transcript
-            .iter()
-            .any(|t| matches!(t, TranscriptItem::SystemText(s) if s == "sentinel-esc-reconcile")),
-        "transcript should be cleared by reconciliation when origin_agent differs from current agent"
+    let agent_name = config.read().agent.as_ref().map(|a| a.name().to_string());
+    let session_id = config.read().session.as_ref().map(|s| s.id().to_string());
+
+    assert_eq!(
+        agent_name.as_deref(),
+        Some("apollo"),
+        "should restore origin agent"
+    );
+    assert_eq!(
+        session_id.as_deref(),
+        Some("old-session"),
+        "should restore origin session"
     );
 }

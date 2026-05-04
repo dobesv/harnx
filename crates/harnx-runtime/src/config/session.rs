@@ -18,10 +18,9 @@ use serde::Deserialize;
 use std::fs::{read_to_string, write, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
-use uuid::Uuid;
 
 use crate::utils::{
-    session_name::{git_branch, git_remote},
+    session_name::{decode_timestamp_session_id, generate_session_id, git_branch, git_remote},
     terminal_session_id,
 };
 
@@ -29,9 +28,14 @@ use crate::utils::{
 
 pub fn new(config: &Config, name: &str) -> Result<Session> {
     let agent = config.extract_agent();
-    let session_id = match Uuid::parse_str(name) {
-        Ok(uuid) if uuid.get_version_num() == 7 => name.to_string(),
-        _ => Uuid::now_v7().to_string(),
+    let session_id = if uuid::Uuid::parse_str(name)
+        .ok()
+        .is_some_and(|uuid| uuid.get_version_num() == 7)
+        || decode_timestamp_session_id(name).is_some()
+    {
+        name.to_string()
+    } else {
+        generate_session_id(|candidate| config.session_file(candidate).exists())
     };
     let mut session = Session {
         id: name.to_string(),

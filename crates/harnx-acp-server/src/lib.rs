@@ -16,7 +16,6 @@ mod test_regression_issue_68;
 use agent_client_protocol::{self as acp, Client as AcpClientTrait};
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
-use uuid::Uuid;
 
 use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, ToolEvent};
 use harnx_runtime::config::GlobalConfig;
@@ -204,7 +203,7 @@ impl acp::Agent for HarnxAgent {
         &self,
         _args: acp::NewSessionRequest,
     ) -> acp::Result<acp::NewSessionResponse> {
-        let session_id = Uuid::now_v7().to_string();
+        let session_id;
         {
             let mut config = self.config.write();
             if config.session.is_some() {
@@ -216,8 +215,14 @@ impl acp::Agent for HarnxAgent {
                 .use_agent_by_name(&self.agent_name)
                 .map_err(|e| acp::Error::new(-32603, format!("Failed to set agent: {e}")))?;
             config
-                .use_session(Some(&session_id))
+                .use_session(None)
                 .map_err(|e| acp::Error::new(-32603, format!("Failed to create session: {e}")))?;
+            session_id = config
+                .session
+                .as_ref()
+                .expect("session must exist after use_session(None)")
+                .id
+                .clone();
         }
         let session = HarnxSession {
             id: session_id.clone(),

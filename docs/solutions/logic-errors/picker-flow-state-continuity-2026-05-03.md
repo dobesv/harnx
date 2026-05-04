@@ -14,14 +14,16 @@ tags:
   - error-handling
   - picker
 plan_ref: "picker-bugs-435"
+last_updated: 2026-05-03
 ---
 
 ## Problem
 
-Three bugs in the agent/session picker flow caused incorrect behavior:
+Four bugs in the agent/session picker flow caused incorrect behavior:
 1. AgentPicker lacked text filter — users couldn't narrow long agent lists
 2. SessionPicker ESC didn't create a new session — dismiss behavior was inconsistent
 3. SessionPicker showed wrong sessions — `list_sessions_with_meta()` was called before agent activation, returning sessions from the previous agent's directory
+4. AgentPicker ESC dismissed picker when no agent was active — mandatory picker enforcement broken
 
 Underlying issue: multi-step picker flow (AgentPicker → SessionPicker) lost the initial agent/session state, causing transcript reconciliation to see `prev_agent == curr_agent` after an agent switch and fail to clear stale messages.
 
@@ -31,6 +33,7 @@ Underlying issue: multi-step picker flow (AgentPicker → SessionPicker) lost th
 - **ESC bug**: Pressing ESC in SessionPicker did nothing (expected to start fresh session)
 - **Wrong sessions bug**: Switching from agent A to agent B showed agent A's sessions in SessionPicker
 - **Transcript bug**: Switching agents via picker left stale transcript messages from the previous agent
+- **Mandatory picker bug**: Pressing ESC in AgentPicker when no agent was active dismissed the picker, leaving the app in an unusable state with no agent selected
 
 Error patterns from code review:
 ```rust
@@ -195,12 +198,38 @@ Key test coverage:
 - [ ] Are fallible operations called before clearing modal state?
 - [ ] Does multi-step state machine preserve origin values for final reconciliation?
 - [ ] Are session YAML stubs using old format (comments, not `retrieve_model` calls) to avoid validation failures?
+- [ ] For mandatory pickers: does ESC check `config.read().agent.is_some()` before dismissing?
 
 **Key Learnings:**
 - `sessions_dir()` is agent-scoped; must activate agent before listing sessions
 - `unwrap_or_else(|e| e.into_inner())` recovers from mutex poison in tests
 - Multi-step flows need origin tracking for correct before/after comparison
 - Redesigned semantics (ESC = new session) can make previous defensive patterns (deferred activation) into bugs
+- **Mandatory picker enforcement**: For pickers shown at startup (no agent), ESC must NOT dismiss the picker. Check `config.read().agent.is_some()` before setting `self.app.modal = None`
+
+### Mandatory Picker ESC Handling
+
+When agent+session are mandatory, ESC on AgentPicker must be blocked if no agent is active:
+
+```rust
+// crates/harnx-tui/src/input.rs
+KeyCode::Esc => {
+    // ESC on SessionPicker creates new session (agent already active)
+    if let Some(ModalState::SessionPicker { .. }) = self.app.modal.take() {
+        self.config.write().use_session(None)?;
+        // ... reconcile transcript
+    } else if let Some(ModalState::AgentPicker { .. }) = self.app.modal.take() {
+        // Only dismiss AgentPicker if an agent is already active (user is switching)
+        // If no agent active, picker is mandatory — ignore ESC
+        if self.config.read().agent.is_some() {
+            self.app.modal = None;
+        } else {
+            // Restore picker — user must select an agent
+            self.app.modal = Some(ModalState::AgentPicker { ... });
+        }
+    }
+}
+```
 
 ## Related Issues
 
