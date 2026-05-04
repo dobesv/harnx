@@ -24,8 +24,6 @@ use crate::utils::{
     terminal_session_id,
 };
 
-// RE_AUTONAME_PREFIX removed - no longer needed. Anonymous sessions now use UUIDv7.
-
 pub fn new(config: &Config, name: &str) -> Result<Session> {
     let agent = config.extract_agent();
     let session_id = if uuid::Uuid::parse_str(name)

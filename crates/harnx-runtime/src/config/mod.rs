@@ -52,7 +52,6 @@ use std::{
 };
 use syntect::highlighting::ThemeSet;
 use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
-use uuid::Uuid;
 
 pub use harnx_rag::TEMP_RAG_NAME;
 pub const TEMP_SESSION_NAME: &str = "temp";
@@ -578,6 +577,41 @@ impl Config {
         match name.split_once('/') {
             Some((sub, leaf)) => self.sessions_dir().join(sub).join(format!("{leaf}.yaml")),
             None => self.sessions_dir().join(format!("{name}.yaml")),
+        }
+    }
+
+    /// Atomically claim a short session ID by creating its stub file with
+    /// `create_new(true)`. Returns `Ok(true)` if the claim succeeded, `Ok(false)`
+    /// if another process already claimed the same ID (caller should retry with a
+    /// different ID), or `Err` for unexpected I/O failures.
+    fn claim_session_file(&self, id: &str) -> Result<bool> {
+        let path = self.session_file(id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create sessions dir at {}", parent.display())
+            })?;
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e)
+                .with_context(|| format!("Failed to claim session ID file at {}", path.display())),
+        }
+    }
+
+    /// Generate a unique short session ID and atomically claim it on disk.
+    /// Retries with the next second's timestamp if the claim loses a race.
+    fn new_anonymous_session_id(&self) -> Result<String> {
+        loop {
+            let candidate =
+                crate::utils::session_name::generate_session_id(|c| self.session_file(c).exists());
+            if self.claim_session_file(&candidate)? {
+                return Ok(candidate);
+            }
         }
     }
 
@@ -1343,8 +1377,8 @@ impl Config {
         let mut session;
         match session_name {
             None => {
-                let uuid_name = Uuid::now_v7().to_string();
-                session = Some(self::session::new(self, &uuid_name)?);
+                let short_id = self.new_anonymous_session_id()?;
+                session = Some(self::session::new(self, &short_id)?);
             }
             Some(TEMP_SESSION_NAME) => {
                 let session_file = self.session_file(TEMP_SESSION_NAME);
@@ -4116,7 +4150,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_session_has_uuid7_filename() {
+    fn test_new_session_has_short_id_filename() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = Config {
             sessions_dir_override: Some(tmp.path().to_path_buf()),
@@ -4126,8 +4160,15 @@ mod tests {
         config.use_session(None).unwrap();
 
         let session = config.session.as_ref().unwrap();
-        let parsed = Uuid::parse_str(&session.id).expect("session name should be valid UUID");
-        assert_eq!(parsed.get_version_num(), 7);
+        assert_eq!(
+            session.id.len(),
+            6,
+            "anonymous session ID should be 6-char short ID"
+        );
+        assert!(
+            crate::utils::session_name::decode_timestamp_session_id(&session.id).is_some(),
+            "anonymous session ID should be a valid base64url timestamp short ID"
+        );
         assert_eq!(
             session
                 .sessions_dir
@@ -4136,6 +4177,36 @@ mod tests {
                 .join(format!("{}.yaml", session.id)),
             tmp.path().join(format!("{}.yaml", session.id))
         );
+        // Claim stub file must exist immediately after use_session returns
+        assert!(
+            tmp.path().join(format!("{}.yaml", session.id)).exists(),
+            "claim stub file should exist on disk immediately after use_session(None)"
+        );
+    }
+
+    #[test]
+    fn test_anonymous_session_id_collision_retries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config1 = Config {
+            sessions_dir_override: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let mut config2 = Config {
+            sessions_dir_override: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        config1.use_session(None).unwrap();
+        config2.use_session(None).unwrap();
+
+        let id1 = config1.session.as_ref().unwrap().id.clone();
+        let id2 = config2.session.as_ref().unwrap().id.clone();
+        assert_ne!(
+            id1, id2,
+            "concurrent anonymous sessions must get unique IDs"
+        );
+        assert_eq!(id1.len(), 6);
+        assert_eq!(id2.len(), 6);
     }
 
     #[test]

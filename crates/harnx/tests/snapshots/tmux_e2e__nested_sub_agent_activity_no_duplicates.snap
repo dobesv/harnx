@@ -10,20 +10,20 @@ Welcome to harnx 0.30.0  *  Type .help for commands, Tab to complete.
 Parent delegating to researcher.
 
 @ nested-researcher Research this deeply and delegate analysis.
-> nested-researcher ▸ [UUID]
+> nested-researcher ▸ [SID]
 Researcher delegating to analyst.
 
 @ nested-analyst Analyze data and report back.
-> nested-analyst ▸ [UUID]
+> nested-analyst ▸ [SID]
 Analyst complete
 
-> nested-researcher ▸ [UUID]
-session_id: [UUID]
+> nested-researcher ▸ [SID]
+session_id: [SID]
 response: Analyst complete
 Researcher complete
 
-session_id: [UUID]
-response: Researcher delegating to analyst.Analyst completeResearcher complete
+session_id: [SID]
+response: Researcher delegating to analyst.
 Nested task complete
 
 📢 Autonaming the session.
@@ -79,4 +79,4 @@ No more scripted responses.
 
 
 
-* 🤖 nested-parent ▸ temp   Context: 77(0%)
+* 🤖 nested-parent ▸ temp   Context: [N](0%)
