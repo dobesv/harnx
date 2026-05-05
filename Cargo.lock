@@ -2913,6 +2913,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-mcp-plans"
+version = "0.30.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
 name = "harnx-mcp-time"
 version = "0.30.0"
 dependencies = [
@@ -2924,20 +2938,6 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "harnx-mcp-todo"
-version = "0.30.0"
-dependencies = [
- "anyhow",
- "chrono",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "serde_yaml",
  "tokio",
 ]
 

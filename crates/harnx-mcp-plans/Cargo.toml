@@ -1,11 +1,11 @@
 [package]
-name = "harnx-mcp-todo"
+name = "harnx-mcp-plans"
 version = "0.30.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "MCP server that exposes a file-based todo list"
+description = "MCP server that exposes a file-based plan/task/note management system"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -18,5 +18,5 @@ tokio = { workspace = true, features = ["fs"] }
 schemars = { workspace = true }
 
 [[bin]]
-name = "harnx-mcp-todo"
+name = "harnx-mcp-plans"
 path = "src/main.rs"

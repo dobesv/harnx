@@ -140,8 +140,8 @@ Harnx ships with several built-in MCP servers ready to enable in your config. Se
     *   Process group management (kill-on-drop) and background `spawn` + `wait` pattern.
     *   Path validation and history snapshots around mutating commands.
 *   **`harnx-mcp-time`** — Time and timezone utilities (`get_current_time`, `convert_time`, `wait`).
-*   **`harnx-mcp-todo`** — File-based todo and plan tracking (`todo_list`, `todo_get`, `todo_update`, etc.)
-    *   Plain-markdown storage for plan and scoped todos for multi-step agent work.
+*   **`harnx-mcp-plans`** — File-based plan/task/note management (`list_plans`, `add_task`, `get_task`, etc.)
+    *   YAML front-matter markdown storage for plans, tasks, and notes with rich metadata.
 
 #### AI Agents (CLI version of OpenAI GPTs)
 
