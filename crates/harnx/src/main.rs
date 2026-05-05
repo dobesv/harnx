@@ -292,11 +292,44 @@ async fn dispatch_session_start(
     .await;
 }
 
+fn session_resume_command(config: &GlobalConfig) -> Option<String> {
+    let config_read = config.read();
+    let session = config_read.session.as_ref()?;
+    if session.is_empty() {
+        return None;
+    }
+
+    let save_session = session.save_session;
+    let save_session_this_time = session.save_session_this_time;
+    if save_session == Some(false) && !save_session_this_time {
+        return None;
+    }
+
+    let session_name = session
+        .resolved_save_name
+        .as_ref()
+        .map(|(_, name)| name.as_str())
+        .unwrap_or_else(|| session.id());
+
+    let agent_name = config_read.agent.as_ref().map(|a| a.name());
+
+    let mut args = vec!["harnx".to_string()];
+    if let Some(agent) = agent_name {
+        args.push("-a".to_string());
+        args.push(agent.to_string());
+    }
+    args.push("-s".to_string());
+    args.push(session_name.to_string());
+
+    Some(shell_words::join(args))
+}
+
 async fn exit_session_with_hook(
     config: &GlobalConfig,
     async_manager: &AsyncHookManager,
     persistent_manager: &Arc<tokio::sync::Mutex<PersistentHookManager>>,
 ) -> Result<()> {
+    let resume_cmd = session_resume_command(config);
     let (hooks, session_id, cwd) = hook_dispatch_context(config);
     config.write().exit_session()?;
     let event = HookEvent::SessionEnd {
@@ -314,6 +347,15 @@ async fn exit_session_with_hook(
         ),
     )
     .await;
+
+    if let Some(cmd) = resume_cmd {
+        eprintln!(
+            "\n{}\n  {}",
+            dimmed_text("Resume this session by running:"),
+            cmd
+        );
+    }
+
     Ok(())
 }
 
@@ -625,3 +667,117 @@ async fn create_input(
 }
 
 use harnx_runtime::bootstrap::setup_logger;
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use harnx_runtime::config::session::Session;
+
+    fn make_config(session: Option<Session>) -> GlobalConfig {
+        let config = Config {
+            session,
+            ..Default::default()
+        };
+        Arc::new(RwLock::new(config))
+    }
+
+    fn session_with_message(id: &str) -> Session {
+        let mut session = Session {
+            id: id.to_string(),
+            ..Default::default()
+        };
+        session.messages.push(crate::client::Message::default());
+        session
+    }
+
+    #[test]
+    fn returns_none_when_no_session() {
+        let config = make_config(None);
+        assert!(session_resume_command(&config).is_none());
+    }
+
+    #[test]
+    fn returns_none_for_empty_session() {
+        let config = make_config(Some(Session {
+            id: "test".to_string(),
+            ..Default::default()
+        }));
+        assert!(session_resume_command(&config).is_none());
+    }
+
+    #[test]
+    fn returns_none_when_save_session_false() {
+        let mut session = session_with_message("test");
+        session.save_session = Some(false);
+        let config = make_config(Some(session));
+        assert!(session_resume_command(&config).is_none());
+    }
+
+    #[test]
+    fn returns_command_when_save_session_false_but_save_this_time() {
+        let mut session = session_with_message("test");
+        session.save_session = Some(false);
+        session.save_session_this_time = true;
+        let config = make_config(Some(session));
+        assert_eq!(session_resume_command(&config).unwrap(), "harnx -s test");
+    }
+
+    #[test]
+    fn returns_command_for_plain_named_session() {
+        let session = session_with_message("my-session");
+        let config = make_config(Some(session));
+        assert_eq!(
+            session_resume_command(&config).unwrap(),
+            "harnx -s my-session"
+        );
+    }
+
+    #[test]
+    fn includes_agent_when_set_in_session() {
+        let session = session_with_message("my-session");
+        let mut agent = crate::config::Agent::default();
+        agent.set_name("my-agent");
+
+        let config = Config {
+            agent: Some(agent),
+            session: Some(session),
+            ..Default::default()
+        };
+        let config = Arc::new(RwLock::new(config));
+
+        assert_eq!(
+            session_resume_command(&config).unwrap(),
+            "harnx -a my-agent -s my-session"
+        );
+    }
+
+    #[test]
+    fn shell_quotes_names_with_spaces() {
+        let session = session_with_message("my session");
+        let mut agent = crate::config::Agent::default();
+        agent.set_name("my agent");
+
+        let config = Config {
+            agent: Some(agent),
+            session: Some(session),
+            ..Default::default()
+        };
+        let config = Arc::new(RwLock::new(config));
+
+        assert_eq!(
+            session_resume_command(&config).unwrap(),
+            "harnx -a 'my agent' -s 'my session'"
+        );
+    }
+
+    #[test]
+    fn uses_resolved_save_name_when_available() {
+        let mut session = session_with_message("temp");
+        session.resolved_save_name = Some((PathBuf::from("_"), "20240505-resolved".to_string()));
+        let config = make_config(Some(session));
+        assert_eq!(
+            session_resume_command(&config).unwrap(),
+            "harnx -s 20240505-resolved"
+        );
+    }
+}
