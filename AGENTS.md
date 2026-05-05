@@ -46,7 +46,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 │   │       ├── hooks/          # Event hook system
 │   │       ├── utils/          # Shared utilities
 │   │       └── bin/            # Bins that share harnx library code (mcp-bash, mcp-fs)
-│   ├── harnx-mcp-todo/         # MCP server: file-based todo list (standalone crate)
+│   ├── harnx-mcp-plans/        # MCP server: file-based plan and todo management (standalone crate)
 │   ├── harnx-mcp-time/         # MCP server: time/timezone utilities (standalone crate)
 │   └── harnx-test-bins/        # Internal dev/test binaries: mock-llm, acp-test, repro249, test-ratatui (publish = false)
 ├── example_config/             # Example user configuration
@@ -94,7 +94,7 @@ Common types:
 
 Examples from the project history:
 ```
-feat: add harnx-mcp-todo as a file-based todo management MCP server
+feat: add harnx-mcp-plans as a file-based plan and todo management MCP server
 fix(acp): resolve ACP server hang and MCP transport death on Ctrl+C
 chore(deps): update rust crate syntect to v5.3.0
 ```
