@@ -6523,3 +6523,204 @@ async fn session_picker_esc_restores_origin() {
         "should restore origin session"
     );
 }
+
+// =============================================================================
+// Browsing Mode Rendering Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_browsing_mode_shows_full_transcript() {
+    let mut harness = TuiTestHarness::with_size(60, 20);
+
+    // Clear the initial welcome message
+    harness.tui().app.transcript.clear();
+
+    // Add 3 transcript items
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "User message".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Assistant reply".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Second user msg".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+
+    // Enable browsing mode
+    harness.tui().app.transcript_browsing = true;
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().app.scroll_to_focused_item = true;
+
+    harness.render();
+    let screen = harness.screen_contents();
+
+    // All three items should be visible
+    assert!(
+        screen.contains("User message"),
+        "Screen should contain 'User message', got:\n{screen}"
+    );
+    assert!(
+        screen.contains("Assistant reply"),
+        "Screen should contain 'Assistant reply', got:\n{screen}"
+    );
+    assert!(
+        screen.contains("Second user msg"),
+        "Screen should contain 'Second user msg', got:\n{screen}"
+    );
+
+    // Old bordered panel title should NOT appear (the browsing view is now full-screen)
+    assert!(
+        !screen.contains("History Browser"),
+        "Screen should NOT contain 'History Browser', got:\n{screen}"
+    );
+}
+
+#[tokio::test]
+async fn test_browsing_mode_focused_item_has_reversed_style() {
+    let mut harness = TuiTestHarness::with_size(60, 20);
+
+    // Clear the initial welcome message
+    harness.tui().app.transcript.clear();
+
+    // Add 3 transcript items
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Alpha".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "Beta".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "Gamma".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+
+    // Enable browsing mode, focus on first item (Alpha at index 0)
+    harness.tui().app.transcript_browsing = true;
+    harness.tui().app.transcript_focus = Some(0); // Alpha is at index 0
+    harness.tui().app.scroll_to_focused_item = true;
+
+    harness.render();
+
+    // Check the buffer for styles
+    let buffer = harness.terminal.backend().buffer();
+
+    // Collect full text of each row and track which rows have REVERSED cells
+    let mut reversed_rows: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut row_texts: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+
+    for y in 0..buffer.area.height {
+        let mut row_text = String::new();
+        let mut row_has_reversed = false;
+
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            row_text.push_str(cell.symbol());
+            if cell.style().add_modifier.contains(Modifier::REVERSED) {
+                row_has_reversed = true;
+            }
+        }
+
+        row_texts.insert(y, row_text);
+        if row_has_reversed {
+            reversed_rows.insert(y);
+        }
+    }
+
+    // Check: rows with "Alpha" should have REVERSED (it's focused at index 0)
+    let alpha_rows: Vec<(&u16, &String)> = row_texts
+        .iter()
+        .filter(|(_, text)| text.contains("Alpha"))
+        .collect();
+    let alpha_rows_reversed: Vec<_> = alpha_rows
+        .iter()
+        .filter(|(y, _)| reversed_rows.contains(*y))
+        .collect();
+
+    assert!(
+        !alpha_rows_reversed.is_empty(),
+        "Rows containing 'Alpha' should have REVERSED style. Got {} rows with Alpha, {} of those reversed. Screen:\n{:?}",
+        alpha_rows.len(),
+        alpha_rows_reversed.len(),
+        row_texts
+    );
+
+    // Check: rows with "Beta" or "Gamma" should NOT have REVERSED (not focused)
+    for (y, text) in &row_texts {
+        if text.contains("Beta") || text.contains("Gamma") {
+            assert!(
+                !reversed_rows.contains(y),
+                "Non-focused item row should NOT have REVERSED style. Row {}: '{}'",
+                y,
+                text.trim()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_browsing_mode_non_navigable_items_visible_not_focusable() {
+    let mut harness = TuiTestHarness::with_size(60, 20);
+
+    // Clear the initial welcome message
+    harness.tui().app.transcript.clear();
+
+    // Add transcript items: UserText (navigable), ToolResultMarkdown (non-navigable), AssistantText (navigable)
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "User turn".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    // ToolResultMarkdown is non-navigable per is_navigable() implementation
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::ToolResultMarkdown(
+            "thinking...".to_string(),
+        ));
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "AI response".to_string(),
+            seq: None,
+            timestamp: None,
+        });
+
+    // Enable browsing mode, focus on first item (index 0)
+    harness.tui().app.transcript_browsing = true;
+    harness.tui().app.transcript_focus = Some(0);
+
+    // Press Down - should skip ToolResultMarkdown at index 1 and jump to AssistantText at index 2
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.transcript_focus,
+        Some(2),
+        "Down should skip non-navigable ToolResultMarkdown at index 1 and focus AssistantText at index 2"
+    );
+}

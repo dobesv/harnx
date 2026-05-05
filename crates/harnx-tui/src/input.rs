@@ -1275,11 +1275,6 @@ impl Tui {
             if let Some(prev) = self.find_prev_navigable(focus) {
                 self.app.transcript_focus = Some(prev);
                 self.app.transcript_browsing = true;
-                self.app.browsing_view_scroll = {
-                    let mut s = ratatui_widget_scrolling::ScrollState::new();
-                    s.follow = false;
-                    s
-                };
                 self.app.scroll_state.follow = false;
                 self.app.scroll_to_focused_item = true;
                 self.app.transcript_selection_anchor = None;
@@ -1304,11 +1299,6 @@ impl Tui {
             if let Some(prev) = self.find_prev_navigable(self.app.transcript.len()) {
                 self.app.transcript_focus = Some(prev);
                 self.app.transcript_browsing = true;
-                self.app.browsing_view_scroll = {
-                    let mut s = ratatui_widget_scrolling::ScrollState::new();
-                    s.follow = false;
-                    s
-                };
                 self.app.scroll_state.follow = false;
                 self.app.scroll_to_focused_item = true;
                 self.app.transcript_selection_anchor = None;
@@ -1348,11 +1338,6 @@ impl Tui {
             if let Some(next) = self.find_next_navigable(focus) {
                 self.app.transcript_focus = Some(next);
                 self.app.transcript_browsing = true;
-                self.app.browsing_view_scroll = {
-                    let mut s = ratatui_widget_scrolling::ScrollState::new();
-                    s.follow = false;
-                    s
-                };
                 self.app.scroll_state.follow = false;
                 self.app.scroll_to_focused_item = true;
                 self.app.transcript_selection_anchor = None;

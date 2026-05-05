@@ -1178,45 +1178,59 @@ impl Tui {
             .constraints([Constraint::Min(1), Constraint::Length(2)])
             .split(size);
 
-        // Count navigable items and find display index
-        let mut navigable_count = 0;
-        let mut display_idx = 0;
-
-        let mut content_lines = Vec::new();
-
-        for (i, item) in self.app.transcript.iter().enumerate() {
-            if item.is_navigable() {
-                navigable_count += 1;
-                if Some(i) == self.app.transcript_focus {
-                    display_idx = navigable_count;
-                    content_lines = Self::render_entry_detail(item);
-                }
-            }
-        }
-
-        let entries_as_vec = if content_lines.is_empty() {
-            vec![]
+        let show_seq = self.app.show_sequence_numbers;
+        let show_ts = self.app.show_timestamps;
+        let use_utc = self.app.use_utc_timestamps;
+        let selected_range = if let Some(f) = self.app.transcript_focus {
+            let start = self.app.transcript_selection_anchor.unwrap_or(f).min(f);
+            let end = self.app.transcript_selection_anchor.unwrap_or(f).max(f);
+            Some(start..=end)
         } else {
-            vec![content_lines]
+            None
         };
 
-        // Create block with border and title
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title("History Browser");
+        if self.app.scroll_to_focused_item {
+            if let Some(focus) = self.app.transcript_focus {
+                let position = self.app.browsing_view_scroll.scroll_position_to_show_item(
+                    focus,
+                    chunks[0].width,
+                    chunks[0].height as usize,
+                    self.app.transcript.len(),
+                );
+                self.app.browsing_view_scroll.position = position;
+            }
+            self.app.scroll_to_focused_item = false;
+        }
 
-        // Get inner area for content
-        let inner_area = block.inner(chunks[0]);
+        let transcript_entries: Vec<Vec<Line<'static>>> = if self.app.transcript.is_empty() {
+            vec![vec![Line::from(Span::raw(""))]]
+        } else {
+            self.app
+                .transcript
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let mut lines = Self::render_entry(entry, show_seq, show_ts, use_utc);
+                    if let Some(range) = &selected_range {
+                        if range.contains(&i) {
+                            for line in &mut lines {
+                                line.style = line.style.add_modifier(Modifier::REVERSED);
+                                for span in &mut line.spans {
+                                    span.style = span.style.add_modifier(Modifier::REVERSED);
+                                }
+                            }
+                        }
+                    }
+                    lines
+                })
+                .collect()
+        };
 
-        // Render the block into the content chunk
-        frame.render_widget(block, chunks[0]);
-
-        // Render the scrollable content
         self.app
             .browsing_view_scroll
-            .render(frame, inner_area, &entries_as_vec, |lines| {
+            .render(frame, chunks[0], &transcript_entries, |lines| {
                 let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-                let height = paragraph.line_count(inner_area.width);
+                let height = paragraph.line_count(chunks[0].width);
                 (height, paragraph)
             });
 
@@ -1226,6 +1240,18 @@ impl Tui {
             .browsing_view_scroll
             .position
             .min(self.app.browsing_view_scroll.last_max_position);
+
+        // Count navigable items and find display index
+        let mut navigable_count = 0;
+        let mut display_idx = 0;
+        for (i, item) in self.app.transcript.iter().enumerate() {
+            if item.is_navigable() {
+                navigable_count += 1;
+                if Some(i) == self.app.transcript_focus {
+                    display_idx = navigable_count;
+                }
+            }
+        }
 
         // Split footer into two rows
         let footer_chunks = Layout::default()
