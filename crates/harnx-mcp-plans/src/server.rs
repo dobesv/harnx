@@ -37,8 +37,6 @@ struct TaskFrontMatter {
     created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    key: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     dependencies: Vec<String>,
 }
@@ -110,28 +108,25 @@ struct NoteRecord {
 
 #[derive(Debug, Default, Clone, Deserialize)]
 struct ListTasksParams {
+    plan: String,
     #[serde(default = "default_open_status")]
     filter: String,
     #[serde(default)]
     tag: Option<String>,
-    #[serde(default)]
-    plan: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 struct GetTaskParams {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    key: Option<String>,
-    #[serde(default)]
-    plan: Option<String>,
+    plan: String,
+    id: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 struct AddTaskParams {
     title: String,
     plan: String,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     summary: Option<String>,
     #[serde(default)]
@@ -147,18 +142,15 @@ struct AddTaskParams {
     #[serde(default)]
     body: Option<String>,
     #[serde(default)]
-    key: Option<String>,
-    #[serde(default)]
     dependencies: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 struct UpdateTaskParams {
+    plan: String,
     id: String,
     #[serde(default)]
     title: Option<String>,
-    #[serde(default)]
-    plan: Option<String>,
     #[serde(default)]
     summary: Option<String>,
     #[serde(default)]
@@ -174,19 +166,19 @@ struct UpdateTaskParams {
     #[serde(default)]
     body: Option<String>,
     #[serde(default)]
-    key: Option<String>,
-    #[serde(default)]
     dependencies: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 struct AppendTaskParams {
+    plan: String,
     id: String,
     text: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 struct DeleteTaskParams {
+    plan: String,
     id: String,
 }
 
@@ -254,6 +246,8 @@ struct ListNotesParams {
 #[derive(Debug, Default, Clone, Deserialize)]
 struct AddNoteParams {
     plan: String,
+    #[serde(default)]
+    id: Option<String>,
     body: String,
     #[serde(default)]
     summary: Option<String>,
@@ -277,6 +271,8 @@ struct DeleteNoteParams {
 struct TaskSpec {
     title: String,
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
     dependencies: Vec<String>,
@@ -284,8 +280,6 @@ struct TaskSpec {
     status: Option<String>,
     #[serde(default)]
     body: Option<String>,
-    #[serde(default)]
-    key: Option<String>,
     #[serde(default)]
     summary: Option<String>,
     #[serde(default)]
@@ -309,13 +303,15 @@ impl PlansServer {
         &self,
         params: ListTasksParams,
     ) -> Result<CallToolResult, ErrorData> {
+        let plan_name =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let status_filter = match params.filter.as_str() {
             "all" => None,
             other => Some(other),
         };
         let tasks = list_tasks(
             &self.dir,
-            params.plan.as_deref(),
+            Some(&plan_name),
             params.tag.as_deref(),
             status_filter,
         );
@@ -333,26 +329,10 @@ impl PlansServer {
     }
 
     async fn handle_get_task(&self, params: GetTaskParams) -> Result<CallToolResult, ErrorData> {
-        let task = if let Some(id) = params.id {
-            read_task_by_id(&self.dir, &id).map_err(|e| ErrorData::invalid_params(e, None))?
-        } else if let (Some(key), Some(plan)) = (params.key, params.plan) {
-            let plan_name = normalize_plan_name(&plan);
-            let tasks = list_tasks(&self.dir, Some(&plan_name), None, None);
-            tasks
-                .into_iter()
-                .find(|task| task.front.key.as_deref() == Some(key.as_str()))
-                .ok_or_else(|| {
-                    ErrorData::invalid_params(
-                        format!("task not found for key '{}' in plan '{}'", key, plan_name),
-                        None,
-                    )
-                })?
-        } else {
-            return Err(ErrorData::invalid_params(
-                "provide either 'id' or both 'key' and 'plan'".to_string(),
-                None,
-            ));
-        };
+        let plan_name =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
+        let task = read_task(&self.dir, &plan_name, &params.id)
+            .map_err(|e| ErrorData::invalid_params(e, None))?;
 
         result_json(
             serde_json::to_value(TaskWithBody {
@@ -364,26 +344,27 @@ impl PlansServer {
     }
 
     async fn handle_add_task(&self, params: AddTaskParams) -> Result<CallToolResult, ErrorData> {
-        let plan_name = normalize_plan_name(&params.plan);
+        let plan_name =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let plan_path = plan_dir(&self.dir, &plan_name);
         if !plan_path.exists() {
             std::fs::create_dir_all(&plan_path)
                 .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
         }
 
-        if let Some(key) = params.key.as_ref() {
-            let duplicate = list_tasks(&self.dir, Some(&plan_name), None, None)
-                .into_iter()
-                .any(|task| task.front.key.as_deref() == Some(key.as_str()));
-            if duplicate {
-                return Err(ErrorData::invalid_params(
-                    format!("key '{}' already exists in plan '{}'", key, plan_name),
-                    None,
-                ));
-            }
+        let id = params
+            .id
+            .as_deref()
+            .map(validate_id)
+            .transpose()
+            .map_err(|err| ErrorData::invalid_params(err, None))?
+            .unwrap_or_else(gen_id);
+        if task_file_path(&self.dir, &plan_name, &id).exists() {
+            return Err(ErrorData::invalid_params(
+                format!("task '{}' already exists in plan '{}'", id, plan_name),
+                None,
+            ));
         }
-
-        let id = gen_id();
         let now = now_iso();
         let task = TaskRecord {
             front: TaskFrontMatter {
@@ -398,7 +379,6 @@ impl PlansServer {
                 status: params.status.unwrap_or_else(default_open_status),
                 created_at: now,
                 updated_at: None,
-                key: params.key,
                 dependencies: params.dependencies,
             },
             body: params.body.unwrap_or_default(),
@@ -415,9 +395,9 @@ impl PlansServer {
         &self,
         params: UpdateTaskParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let (current_plan, current_path) = find_task_file(&self.dir, &params.id)
-            .map_err(|err| ErrorData::invalid_params(err, None))?;
-        let mut task = read_task(&self.dir, &current_plan, &params.id)
+        let plan_name =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
+        let mut task = read_task(&self.dir, &plan_name, &params.id)
             .map_err(|err| ErrorData::invalid_params(err, None))?;
 
         if let Some(title) = params.title {
@@ -444,42 +424,13 @@ impl PlansServer {
         if let Some(body) = params.body {
             task.body = body;
         }
-        if let Some(key) = params.key {
-            task.front.key = Some(key);
-        }
         if let Some(dependencies) = params.dependencies {
             task.front.dependencies = dependencies;
-        }
-
-        let new_plan = params
-            .plan
-            .as_deref()
-            .map(normalize_plan_name)
-            .unwrap_or_else(|| task.front.plan.clone());
-        task.front.plan = new_plan;
-
-        if let Some(key) = task.front.key.as_ref() {
-            let duplicate = list_tasks(&self.dir, Some(&task.front.plan), None, None)
-                .into_iter()
-                .any(|existing| {
-                    existing.front.key.as_deref() == Some(key.as_str())
-                        && existing.front.id != task.front.id
-                });
-            if duplicate {
-                return Err(ErrorData::invalid_params(
-                    format!("key '{}' already exists in plan '{}'", key, task.front.plan),
-                    None,
-                ));
-            }
         }
 
         task.front.updated_at = Some(now_iso());
 
         write_task(&self.dir, &task).map_err(|err| ErrorData::internal_error(err, None))?;
-        if current_path.exists() && current_plan != task.front.plan {
-            std::fs::remove_file(&current_path)
-                .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
-        }
         result_text(format!("updated task {}", display_id(&task.front.id)))
     }
 
@@ -487,7 +438,9 @@ impl PlansServer {
         &self,
         params: AppendTaskParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let mut task = read_task_by_id(&self.dir, &params.id)
+        let plan_name =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
+        let mut task = read_task(&self.dir, &plan_name, &params.id)
             .map_err(|err| ErrorData::invalid_params(err, None))?;
         if !task.body.is_empty() && !task.body.ends_with('\n') {
             task.body.push('\n');
@@ -502,8 +455,19 @@ impl PlansServer {
         &self,
         params: DeleteTaskParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let (_, path) = find_task_file(&self.dir, &params.id)
-            .map_err(|err| ErrorData::invalid_params(err, None))?;
+        let plan_name =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
+        let path = task_file_path(&self.dir, &plan_name, &params.id);
+        if !path.exists() {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "task {} not found in plan '{}'",
+                    display_id(&params.id),
+                    plan_name
+                ),
+                None,
+            ));
+        }
         std::fs::remove_file(&path)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
         result_text(format!("deleted task {}", display_id(&params.id)))
@@ -557,7 +521,8 @@ impl PlansServer {
     }
 
     async fn handle_add_plan(&self, params: AddPlanParams) -> Result<CallToolResult, ErrorData> {
-        let name = normalize_plan_name(&params.name);
+        let name =
+            validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
         let dir = plan_dir(&self.dir, &name);
         if dir.exists() {
             return Err(ErrorData::invalid_params(
@@ -591,7 +556,8 @@ impl PlansServer {
     }
 
     async fn handle_get_plan(&self, params: GetPlanParams) -> Result<CallToolResult, ErrorData> {
-        let name = normalize_plan_name(&params.name);
+        let name =
+            validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
         let path = plan_file_path(&self.dir, &name);
         let body = if path.exists() {
             std::fs::read_to_string(&path)
@@ -632,7 +598,8 @@ impl PlansServer {
         &self,
         params: UpdatePlanParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let name = normalize_plan_name(&params.name);
+        let name =
+            validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
         let dir = plan_dir(&self.dir, &name);
         std::fs::create_dir_all(&dir)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
@@ -672,23 +639,25 @@ impl PlansServer {
             body: params.content,
         };
 
-        // Validate task key uniqueness BEFORE writing anything
+        // Validate task id uniqueness BEFORE writing anything
         let task_specs = params.tasks;
         if let Some(ref tasks) = task_specs {
             let existing_tasks = list_tasks(&self.dir, Some(&name), None, None);
-            let mut seen_keys: Vec<String> = existing_tasks
+            let mut seen_ids: Vec<String> = existing_tasks
                 .iter()
-                .filter_map(|t| t.front.key.clone())
+                .map(|t| normalize_id(&t.front.id))
                 .collect();
             for spec in tasks {
-                if let Some(ref key) = spec.key {
-                    if seen_keys.iter().any(|k| k == key) {
+                if let Some(ref raw_id) = spec.id {
+                    let id =
+                        validate_id(raw_id).map_err(|err| ErrorData::invalid_params(err, None))?;
+                    if seen_ids.iter().any(|existing| existing == &id) {
                         return Err(ErrorData::invalid_params(
-                            format!("key '{}' already exists in plan '{}'", key, name),
+                            format!("task '{}' already exists in plan '{}'", id, name),
                             None,
                         ));
                     }
-                    seen_keys.push(key.clone());
+                    seen_ids.push(id);
                 }
             }
         }
@@ -697,7 +666,12 @@ impl PlansServer {
         let mut task_records = Vec::new();
         if let Some(tasks) = task_specs {
             for spec in tasks {
-                let id = gen_id();
+                let id = spec
+                    .id
+                    .map(|raw| validate_id(&raw))
+                    .transpose()
+                    .map_err(|err| ErrorData::invalid_params(err, None))?
+                    .unwrap_or_else(gen_id);
                 task_records.push(TaskRecord {
                     front: TaskFrontMatter {
                         id,
@@ -711,7 +685,6 @@ impl PlansServer {
                         status: spec.status.unwrap_or_else(default_open_status),
                         created_at: now_iso(),
                         updated_at: None,
-                        key: spec.key,
                         dependencies: spec.dependencies,
                     },
                     body: spec.body.unwrap_or_default(),
@@ -747,7 +720,8 @@ impl PlansServer {
         &self,
         params: DeletePlanParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let name = normalize_plan_name(&params.name);
+        let name =
+            validate_plan_name(&params.name).map_err(|err| ErrorData::invalid_params(err, None))?;
         let dir = plan_dir(&self.dir, &name);
         if !dir.exists() {
             return Err(ErrorData::invalid_params(
@@ -764,7 +738,8 @@ impl PlansServer {
         &self,
         params: ListNotesParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let plan = normalize_plan_name(&params.plan);
+        let plan =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let mut notes = Vec::new();
         let dir = notes_dir(&self.dir, &plan);
         if dir.exists() {
@@ -794,12 +769,26 @@ impl PlansServer {
     }
 
     async fn handle_add_note(&self, params: AddNoteParams) -> Result<CallToolResult, ErrorData> {
-        let plan = normalize_plan_name(&params.plan);
+        let plan =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         std::fs::create_dir_all(notes_dir(&self.dir, &plan))
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
+        let id = params
+            .id
+            .as_deref()
+            .map(validate_id)
+            .transpose()
+            .map_err(|err| ErrorData::invalid_params(err, None))?
+            .unwrap_or_else(gen_id);
+        if note_file_path(&self.dir, &plan, &id).exists() {
+            return Err(ErrorData::invalid_params(
+                format!("note '{}' already exists in plan '{}'", id, plan),
+                None,
+            ));
+        }
         let note = NoteRecord {
             front: NoteFrontMatter {
-                id: gen_id(),
+                id,
                 summary: params.summary,
                 author: params.author,
                 created_at: now_iso(),
@@ -816,7 +805,8 @@ impl PlansServer {
     }
 
     async fn handle_get_note(&self, params: GetNoteParams) -> Result<CallToolResult, ErrorData> {
-        let plan = normalize_plan_name(&params.plan);
+        let plan =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let path = note_file_path(&self.dir, &plan, &params.note_id);
         if !path.exists() {
             return Err(ErrorData::invalid_params(
@@ -846,7 +836,8 @@ impl PlansServer {
         &self,
         params: DeleteNoteParams,
     ) -> Result<CallToolResult, ErrorData> {
-        let plan = normalize_plan_name(&params.plan);
+        let plan =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
         let path = note_file_path(&self.dir, &plan, &params.note_id);
         if !path.exists() {
             return Err(ErrorData::invalid_params(
@@ -883,6 +874,20 @@ fn normalize_plan_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace(' ', "-")
 }
 
+fn validate_plan_name(name: &str) -> Result<String, String> {
+    let normalized = normalize_plan_name(name);
+    if normalized.is_empty() {
+        return Err("plan name must not be empty".to_string());
+    }
+    if normalized.contains('/') || normalized.contains('\\') || normalized.contains("..") {
+        return Err(format!(
+            "plan name '{}' must not contain path separators or '..'",
+            name
+        ));
+    }
+    Ok(normalized)
+}
+
 fn gen_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -894,6 +899,23 @@ fn gen_id() -> String {
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn validate_id(id: &str) -> Result<String, String> {
+    let normalized = normalize_id(id);
+    if normalized.is_empty()
+        || normalized.len() > 64
+        || !normalized
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Err(format!(
+            "ID '{}' must contain only alphanumeric, hyphen, or underscore characters (1-64 chars)",
+            id
+        ))
+    } else {
+        Ok(normalized)
+    }
 }
 
 fn display_id(id: &str) -> String {
@@ -972,6 +994,7 @@ impl_json_schema!(
     ListTasksParams,
     "ListTasksParams",
     |gen: &mut SchemaGenerator| vec![
+        ("plan", "Plan name", gen.subschema_for::<String>()),
         (
             "filter",
             "Filter by status: 'open' (default), 'closed', or 'all'",
@@ -982,32 +1005,18 @@ impl_json_schema!(
             "Optional tag filter",
             gen.subschema_for::<Option<String>>()
         ),
-        (
-            "plan",
-            "Optional plan filter; if omitted, list across all plans",
-            gen.subschema_for::<Option<String>>()
-        ),
     ],
-    &[]
+    &["plan"]
 );
 
 impl_json_schema!(
     GetTaskParams,
     "GetTaskParams",
     |gen: &mut SchemaGenerator| vec![
-        ("id", "Task ID", gen.subschema_for::<Option<String>>()),
-        (
-            "key",
-            "Task key within plan; requires plan when id omitted",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "plan",
-            "Plan name for key lookup",
-            gen.subschema_for::<Option<String>>()
-        ),
+        ("plan", "Plan name", gen.subschema_for::<String>()),
+        ("id", "Task ID", gen.subschema_for::<String>()),
     ],
-    &[]
+    &["plan", "id"]
 );
 
 impl_json_schema!(
@@ -1016,6 +1025,11 @@ impl_json_schema!(
     |gen: &mut SchemaGenerator| vec![
         ("title", "Short title", gen.subschema_for::<String>()),
         ("plan", "Plan name", gen.subschema_for::<String>()),
+        (
+            "id",
+            "Optional task ID",
+            gen.subschema_for::<Option<String>>()
+        ),
         (
             "summary",
             "Optional summary",
@@ -1048,11 +1062,6 @@ impl_json_schema!(
             gen.subschema_for::<Option<String>>()
         ),
         (
-            "key",
-            "Optional unique key within plan",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
             "dependencies",
             "List of dependency keys or IDs",
             gen.subschema_for::<Vec<String>>()
@@ -1065,15 +1074,11 @@ impl_json_schema!(
     UpdateTaskParams,
     "UpdateTaskParams",
     |gen: &mut SchemaGenerator| vec![
+        ("plan", "Plan name", gen.subschema_for::<String>()),
         ("id", "Task ID", gen.subschema_for::<String>()),
         (
             "title",
             "Optional title",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
-            "plan",
-            "Optional plan name",
             gen.subschema_for::<Option<String>>()
         ),
         (
@@ -1112,34 +1117,33 @@ impl_json_schema!(
             gen.subschema_for::<Option<String>>()
         ),
         (
-            "key",
-            "Optional task key",
-            gen.subschema_for::<Option<String>>()
-        ),
-        (
             "dependencies",
             "Replace dependencies with provided list",
             gen.subschema_for::<Option<Vec<String>>>()
         ),
     ],
-    &["id"]
+    &["plan", "id"]
 );
 
 impl_json_schema!(
     AppendTaskParams,
     "AppendTaskParams",
     |gen: &mut SchemaGenerator| vec![
+        ("plan", "Plan name", gen.subschema_for::<String>()),
         ("id", "Task ID", gen.subschema_for::<String>()),
         ("text", "Text to append", gen.subschema_for::<String>()),
     ],
-    &["id", "text"]
+    &["plan", "id", "text"]
 );
 
 impl_json_schema!(
     DeleteTaskParams,
     "DeleteTaskParams",
-    |gen: &mut SchemaGenerator| vec![("id", "Task ID", gen.subschema_for::<String>()),],
-    &["id"]
+    |gen: &mut SchemaGenerator| vec![
+        ("plan", "Plan name", gen.subschema_for::<String>()),
+        ("id", "Task ID", gen.subschema_for::<String>()),
+    ],
+    &["plan", "id"]
 );
 
 impl_json_schema!(
@@ -1278,6 +1282,11 @@ impl_json_schema!(
     "AddNoteParams",
     |gen: &mut SchemaGenerator| vec![
         ("plan", "Plan name", gen.subschema_for::<String>()),
+        (
+            "id",
+            "Optional note ID",
+            gen.subschema_for::<Option<String>>()
+        ),
         ("body", "Note markdown body", gen.subschema_for::<String>()),
         (
             "summary",
@@ -1318,6 +1327,11 @@ impl_json_schema!(
     "TaskSpec",
     |gen: &mut SchemaGenerator| vec![
         ("title", "Task title", gen.subschema_for::<String>()),
+        (
+            "id",
+            "Optional task ID",
+            gen.subschema_for::<Option<String>>()
+        ),
         ("tags", "Task tags", gen.subschema_for::<Vec<String>>()),
         (
             "dependencies",
@@ -1330,7 +1344,6 @@ impl_json_schema!(
             gen.subschema_for::<Option<String>>()
         ),
         ("body", "Task body", gen.subschema_for::<Option<String>>()),
-        ("key", "Task key", gen.subschema_for::<Option<String>>()),
         (
             "summary",
             "Task summary",
@@ -1467,29 +1480,17 @@ fn write_note(dir: &Path, plan_name: &str, note: &NoteRecord) -> Result<(), Stri
 }
 
 fn read_task(dir: &Path, plan_name: &str, id: &str) -> Result<TaskRecord, String> {
-    let content = std::fs::read_to_string(task_file_path(dir, plan_name, id))
-        .map_err(|err| err.to_string())?;
+    let path = task_file_path(dir, plan_name, id);
+    if !path.exists() {
+        return Err(format!(
+            "task {} not found in plan '{}'",
+            display_id(id),
+            plan_name
+        ));
+    }
+    let content = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
     let (front, body) = parse_task_frontmatter(&content)?;
     Ok(TaskRecord { front, body })
-}
-
-fn find_task_file(dir: &Path, id: &str) -> Result<(String, PathBuf), String> {
-    let normalized = normalize_id(id);
-    for plan in plan_dirs(dir) {
-        let Some(plan_name) = plan.file_name().and_then(OsStr::to_str) else {
-            continue;
-        };
-        let path = tasks_dir(dir, plan_name).join(format!("{}.md", normalized));
-        if path.exists() {
-            return Ok((plan_name.to_string(), path));
-        }
-    }
-    Err(format!("task {} not found", display_id(id)))
-}
-
-fn read_task_by_id(dir: &Path, id: &str) -> Result<TaskRecord, String> {
-    let (plan, _) = find_task_file(dir, id)?;
-    read_task(dir, &plan, id)
 }
 
 fn list_tasks(
@@ -1609,16 +1610,16 @@ impl ServerHandler for PlansServer {
                 Tool::new("delete_plan", "Delete an entire plan and all its tasks and notes.", Map::new())
                     .with_input_schema::<DeletePlanParams>()
                     .with_meta(Meta(json!({"call_template": "- plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
-                Tool::new("list_tasks", "List tasks across plans with optional filters.", Map::new())
+                Tool::new("list_tasks", "List tasks in a plan with optional filters.", Map::new())
                     .with_input_schema::<ListTasksParams>()
                     .with_meta(Meta(json!({"call_template": "tasks", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("add_task", "Create a task in a plan.", Map::new())
                     .with_input_schema::<AddTaskParams>()
                     .with_meta(Meta(json!({"call_template": "+ task {{ args.title }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
-                Tool::new("get_task", "Read a task by ID or by key within a plan.", Map::new())
+                Tool::new("get_task", "Read a task by ID within a plan.", Map::new())
                     .with_input_schema::<GetTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "task {{ args.id | default(args.key) }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
-                Tool::new("update_task", "Update a task and optionally move it to another plan.", Map::new())
+                    .with_meta(Meta(json!({"call_template": "task {{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                Tool::new("update_task", "Update a task within its plan.", Map::new())
                     .with_input_schema::<UpdateTaskParams>()
                     .with_meta(Meta(json!({"call_template": "~ task {{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("append_task", "Append markdown text to task body.", Map::new())
@@ -1758,7 +1759,7 @@ mod tests {
                 tags: vec!["rust".to_string()],
                 status: None,
                 body: Some("body".to_string()),
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
@@ -1767,9 +1768,8 @@ mod tests {
 
         let got = server
             .handle_get_task(GetTaskParams {
-                id: Some(id),
-                key: None,
-                plan: None,
+                plan: "plan-a".to_string(),
+                id,
             })
             .await
             .unwrap();
@@ -1780,13 +1780,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_task_by_key() {
-        let dir = temp_test_dir("get-task-by-key");
-        let server = PlansServer::new(dir);
+    async fn add_task_with_agent_id() {
+        let dir = temp_test_dir("add-task-agent-id");
+        let server = PlansServer::new(dir.clone());
 
-        server
+        let add = server
             .handle_add_task(AddTaskParams {
-                title: "Task key".to_string(),
+                title: "Agent ID Task".to_string(),
                 plan: "plan-a".to_string(),
                 summary: None,
                 author: None,
@@ -1795,23 +1795,204 @@ mod tests {
                 tags: vec![],
                 status: None,
                 body: None,
-                key: Some("ABC-1".to_string()),
+                id: Some("my-task-id".to_string()),
+                dependencies: vec![],
+            })
+            .await
+            .unwrap();
+        let returned_id = extract_id(&extract_text(add));
+        assert_eq!(returned_id, "my-task-id");
+
+        let path = dir.join("plan-a").join("tasks").join("my-task-id.md");
+        assert!(path.exists(), "task file should exist at my-task-id.md");
+    }
+
+    #[tokio::test]
+    async fn add_task_duplicate_id_error() {
+        let dir = temp_test_dir("add-task-dup-id");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_task(AddTaskParams {
+                title: "First".to_string(),
+                plan: "plan-a".to_string(),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: vec![],
+                status: None,
+                body: None,
+                id: Some("dup-id".to_string()),
                 dependencies: vec![],
             })
             .await
             .unwrap();
 
-        let got = server
-            .handle_get_task(GetTaskParams {
+        let err = server
+            .handle_add_task(AddTaskParams {
+                title: "Second".to_string(),
+                plan: "plan-a".to_string(),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: vec![],
+                status: None,
+                body: None,
+                id: Some("dup-id".to_string()),
+                dependencies: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("already exists"),
+            "expected 'already exists' in: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn add_task_invalid_id_rejected() {
+        let dir = temp_test_dir("add-task-invalid-id");
+        let server = PlansServer::new(dir);
+
+        // Slash in ID
+        let err = server
+            .handle_add_task(AddTaskParams {
+                title: "Bad ID".to_string(),
+                plan: "plan-a".to_string(),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: vec![],
+                status: None,
+                body: None,
+                id: Some("bad/id".to_string()),
+                dependencies: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("alphanumeric") || err.message.contains("1-64"),
+            "expected validation error, got: {}",
+            err.message
+        );
+
+        // Empty ID
+        let err2 = server
+            .handle_add_task(AddTaskParams {
+                title: "Empty ID".to_string(),
+                plan: "plan-a".to_string(),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: vec![],
+                status: None,
+                body: None,
+                id: Some("".to_string()),
+                dependencies: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err2.message.contains("alphanumeric") || err2.message.contains("1-64"),
+            "expected validation error, got: {}",
+            err2.message
+        );
+    }
+
+    #[tokio::test]
+    async fn add_task_auto_id_fallback() {
+        let dir = temp_test_dir("add-task-auto-id");
+        let server = PlansServer::new(dir);
+
+        let add = server
+            .handle_add_task(AddTaskParams {
+                title: "Auto ID".to_string(),
+                plan: "plan-a".to_string(),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: vec![],
+                status: None,
+                body: None,
                 id: None,
-                key: Some("ABC-1".to_string()),
-                plan: Some("plan-a".to_string()),
+                dependencies: vec![],
             })
             .await
             .unwrap();
-        let value: Value = serde_json::from_str(&extract_text(got)).unwrap();
-        assert_eq!(value["key"], "ABC-1");
-        assert_eq!(value["title"], "Task key");
+        let id = extract_id(&extract_text(add));
+        assert!(!id.is_empty(), "auto-generated ID should not be empty");
+    }
+
+    #[tokio::test]
+    async fn add_note_with_agent_id() {
+        let dir = temp_test_dir("add-note-agent-id");
+        let server = PlansServer::new(dir.clone());
+
+        let add = server
+            .handle_add_note(AddNoteParams {
+                plan: "plan-a".to_string(),
+                id: Some("my-note-id".to_string()),
+                body: "note body".to_string(),
+                summary: None,
+                author: None,
+            })
+            .await
+            .unwrap();
+        let text = extract_text(add);
+        assert!(
+            text.contains("my-note-id"),
+            "result should mention my-note-id, got: {}",
+            text
+        );
+
+        let path = dir.join("plan-a").join("notes").join("my-note-id.md");
+        assert!(path.exists(), "note file should exist at my-note-id.md");
+    }
+
+    #[tokio::test]
+    async fn add_note_invalid_id_rejected() {
+        let dir = temp_test_dir("add-note-invalid-id");
+        let server = PlansServer::new(dir);
+
+        let err = server
+            .handle_add_note(AddNoteParams {
+                plan: "plan-a".to_string(),
+                id: Some("bad/id".to_string()),
+                body: "note body".to_string(),
+                summary: None,
+                author: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("alphanumeric") || err.message.contains("1-64"),
+            "expected validation error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn validate_id_rejects_invalid() {
+        assert!(validate_id("").is_err(), "empty string should be rejected");
+        assert!(validate_id("bad/id").is_err(), "slash should be rejected");
+        assert!(validate_id("bad id").is_err(), "space should be rejected");
+        assert!(
+            validate_id(&"a".repeat(65)).is_err(),
+            "65-char id should be rejected"
+        );
+        assert!(validate_id("good-id").is_ok(), "good-id should be accepted");
+        assert!(validate_id("ABC_123").is_ok(), "ABC_123 should be accepted");
+        assert!(validate_id("a").is_ok(), "single char should be accepted");
+        assert!(
+            validate_id(&"a".repeat(64)).is_ok(),
+            "64-char id should be accepted"
+        );
     }
 
     #[tokio::test]
@@ -1830,7 +2011,7 @@ mod tests {
                 tags: vec![],
                 status: Some("open".to_string()),
                 body: Some("body".to_string()),
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
@@ -1839,9 +2020,9 @@ mod tests {
 
         server
             .handle_update_task(UpdateTaskParams {
+                plan: "plan-a".to_string(),
                 id: id.clone(),
                 title: Some("After".to_string()),
-                plan: None,
                 summary: Some("new summary".to_string()),
                 author: None,
                 assignee: Some("bob".to_string()),
@@ -1849,7 +2030,6 @@ mod tests {
                 tags: None,
                 status: Some("in_progress".to_string()),
                 body: None,
-                key: None,
                 dependencies: None,
             })
             .await
@@ -1857,9 +2037,8 @@ mod tests {
 
         let got = server
             .handle_get_task(GetTaskParams {
-                id: Some(id),
-                key: None,
-                plan: None,
+                plan: "plan-a".to_string(),
+                id,
             })
             .await
             .unwrap();
@@ -1886,7 +2065,7 @@ mod tests {
                 tags: vec![],
                 status: None,
                 body: Some("line1".to_string()),
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
@@ -1895,6 +2074,7 @@ mod tests {
 
         server
             .handle_append_task(AppendTaskParams {
+                plan: "plan-a".to_string(),
                 id: id.clone(),
                 text: "line2".to_string(),
             })
@@ -1903,9 +2083,8 @@ mod tests {
 
         let got = server
             .handle_get_task(GetTaskParams {
-                id: Some(id),
-                key: None,
-                plan: None,
+                plan: "plan-a".to_string(),
+                id,
             })
             .await
             .unwrap();
@@ -1929,7 +2108,7 @@ mod tests {
                 tags: vec![],
                 status: None,
                 body: None,
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
@@ -1937,15 +2116,17 @@ mod tests {
         let id = extract_id(&extract_text(add));
 
         server
-            .handle_delete_task(DeleteTaskParams { id: id.clone() })
+            .handle_delete_task(DeleteTaskParams {
+                plan: "plan-a".to_string(),
+                id: id.clone(),
+            })
             .await
             .unwrap();
 
         let err = server
             .handle_get_task(GetTaskParams {
-                id: Some(id),
-                key: None,
-                plan: None,
+                plan: "plan-a".to_string(),
+                id,
             })
             .await
             .unwrap_err();
@@ -1953,8 +2134,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_tasks_across_plans() {
-        let dir = temp_test_dir("list-tasks-across-plans");
+    async fn list_tasks_scoped_to_plan() {
+        // Tasks are plan-scoped; each plan's list shows only that plan's tasks
+        let dir = temp_test_dir("list-tasks-scoped");
         let server = PlansServer::new(dir);
 
         for plan in ["plan-a", "plan-b"] {
@@ -1969,30 +2151,38 @@ mod tests {
                     tags: vec![],
                     status: None,
                     body: None,
-                    key: None,
+                    id: None,
                     dependencies: vec![],
                 })
                 .await
                 .unwrap();
         }
 
-        let result = server
+        // Listing plan-a returns only plan-a's task
+        let result_a = server
             .handle_list_tasks(ListTasksParams {
+                plan: "plan-a".to_string(),
                 filter: "all".to_string(),
                 tag: None,
-                plan: None,
             })
             .await
             .unwrap();
-        let value: Value = serde_json::from_str(&extract_text(result)).unwrap();
-        let items = value.as_array().unwrap();
-        assert_eq!(items.len(), 2);
-        let plans = items
-            .iter()
-            .map(|item| item["plan"].as_str().unwrap())
-            .collect::<Vec<_>>();
-        assert!(plans.contains(&"plan-a"));
-        assert!(plans.contains(&"plan-b"));
+        let items_a: Value = serde_json::from_str(&extract_text(result_a)).unwrap();
+        assert_eq!(items_a.as_array().unwrap().len(), 1);
+        assert_eq!(items_a[0]["plan"], "plan-a");
+
+        // Listing plan-b returns only plan-b's task
+        let result_b = server
+            .handle_list_tasks(ListTasksParams {
+                plan: "plan-b".to_string(),
+                filter: "all".to_string(),
+                tag: None,
+            })
+            .await
+            .unwrap();
+        let items_b: Value = serde_json::from_str(&extract_text(result_b)).unwrap();
+        assert_eq!(items_b.as_array().unwrap().len(), 1);
+        assert_eq!(items_b[0]["plan"], "plan-b");
     }
 
     #[tokio::test]
@@ -2012,7 +2202,7 @@ mod tests {
                 tags: vec!["urgent".to_string()],
                 status: None,
                 body: None,
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
@@ -2030,7 +2220,7 @@ mod tests {
                 tags: vec!["normal".to_string()],
                 status: None,
                 body: None,
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
@@ -2040,7 +2230,7 @@ mod tests {
             .handle_list_tasks(ListTasksParams {
                 filter: "all".to_string(),
                 tag: Some("urgent".to_string()),
-                plan: None,
+                plan: "plan-a".to_string(),
             })
             .await
             .unwrap();
@@ -2052,12 +2242,13 @@ mod tests {
 
     #[tokio::test]
     async fn update_task_cross_plan_move() {
+        // Tasks are scoped to a plan — update stays within the plan
         let dir = temp_test_dir("update-task-cross-plan");
         let server = PlansServer::new(dir.clone());
 
         let add = server
             .handle_add_task(AddTaskParams {
-                title: "movable task".to_string(),
+                title: "task to update".to_string(),
                 plan: "plan-a".to_string(),
                 summary: None,
                 author: None,
@@ -2066,16 +2257,17 @@ mod tests {
                 tags: vec![],
                 status: None,
                 body: None,
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
             .unwrap();
         let id = extract_id(&extract_text(add));
 
-        // Move to plan-b
+        // Update the task status (stays in plan-a)
         server
             .handle_update_task(UpdateTaskParams {
+                plan: "plan-a".to_string(),
                 id: id.clone(),
                 title: None,
                 summary: None,
@@ -2083,101 +2275,32 @@ mod tests {
                 assignee: None,
                 executor: None,
                 tags: None,
-                plan: Some("plan-b".to_string()),
-                status: None,
+                status: Some("closed".to_string()),
                 body: None,
-                key: None,
                 dependencies: None,
             })
             .await
             .unwrap();
 
-        // File should be in plan-b/tasks/, not plan-a/tasks/
+        // File should still be in plan-a/tasks/
         assert!(
-            !dir.join("plan-a/tasks")
+            dir.join("plan-a/tasks")
                 .join(format!("{}.md", normalize_id(&id)))
                 .exists(),
-            "old task file should be deleted"
-        );
-        assert!(
-            dir.join("plan-b/tasks")
-                .join(format!("{}.md", normalize_id(&id)))
-                .exists(),
-            "task should exist in new plan"
+            "task file should remain in plan-a"
         );
 
-        // get_task should return plan-b
+        // get_task should return the updated status
         let got = server
             .handle_get_task(GetTaskParams {
-                id: Some(id),
-                key: None,
-                plan: None,
+                plan: "plan-a".to_string(),
+                id,
             })
             .await
             .unwrap();
         let value: Value = serde_json::from_str(&extract_text(got)).unwrap();
-        assert_eq!(value["plan"], "plan-b");
-    }
-
-    #[tokio::test]
-    async fn update_task_duplicate_key_rejected() {
-        let dir = temp_test_dir("update-task-dup-key");
-        let server = PlansServer::new(dir);
-
-        // Create two tasks in same plan
-        let add1 = server
-            .handle_add_task(AddTaskParams {
-                title: "task one".to_string(),
-                plan: "plan-a".to_string(),
-                summary: None,
-                author: None,
-                assignee: None,
-                executor: None,
-                tags: vec![],
-                status: None,
-                body: None,
-                key: Some("key-one".to_string()),
-                dependencies: vec![],
-            })
-            .await
-            .unwrap();
-        let id1 = extract_id(&extract_text(add1));
-
-        server
-            .handle_add_task(AddTaskParams {
-                title: "task two".to_string(),
-                plan: "plan-a".to_string(),
-                summary: None,
-                author: None,
-                assignee: None,
-                executor: None,
-                tags: vec![],
-                status: None,
-                body: None,
-                key: Some("key-two".to_string()),
-                dependencies: vec![],
-            })
-            .await
-            .unwrap();
-
-        // Try to update task-one's key to "key-two" — should fail
-        let result = server
-            .handle_update_task(UpdateTaskParams {
-                id: id1,
-                title: None,
-                summary: None,
-                author: None,
-                assignee: None,
-                executor: None,
-                tags: None,
-                plan: None,
-                status: None,
-                body: None,
-                key: Some("key-two".to_string()),
-                dependencies: None,
-            })
-            .await;
-        assert!(result.is_err());
+        assert_eq!(value["plan"], "plan-a");
+        assert_eq!(value["status"], "closed");
     }
 
     #[tokio::test]
@@ -2199,10 +2322,10 @@ mod tests {
                 tasks: Some(vec![
                     TaskSpec {
                         title: "batch task 1".to_string(),
+                        id: None,
                         tags: vec![],
                         status: None,
                         body: None,
-                        key: Some("bt1".to_string()),
                         dependencies: vec![],
                         summary: None,
                         author: None,
@@ -2211,10 +2334,10 @@ mod tests {
                     },
                     TaskSpec {
                         title: "batch task 2".to_string(),
+                        id: None,
                         tags: vec![],
                         status: None,
                         body: None,
-                        key: Some("bt2".to_string()),
                         dependencies: vec![],
                         summary: None,
                         author: None,
@@ -2237,11 +2360,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_plan_batch_rejects_duplicate_key() {
-        let dir = temp_test_dir("update-plan-batch-dup-key");
+    async fn update_plan_batch_rejects_duplicate_id() {
+        let dir = temp_test_dir("update-plan-batch-dup-id");
         let server = PlansServer::new(dir);
 
-        // Pre-create a task with key "existing-key"
+        // Pre-create a task with id "existing-id"
         server
             .handle_add_task(AddTaskParams {
                 title: "existing".to_string(),
@@ -2253,13 +2376,13 @@ mod tests {
                 tags: vec![],
                 status: None,
                 body: None,
-                key: Some("existing-key".to_string()),
+                id: Some("existing-id".to_string()),
                 dependencies: vec![],
             })
             .await
             .unwrap();
 
-        // Try to batch-create a task with the same key — should fail
+        // Try to batch-create a task with the same id — should fail
         let result = server
             .handle_update_plan(UpdatePlanParams {
                 name: "plan-a".to_string(),
@@ -2272,11 +2395,11 @@ mod tests {
                 git_branch: None,
                 github_owner_repo: None,
                 tasks: Some(vec![TaskSpec {
-                    title: "duplicate key task".to_string(),
+                    title: "duplicate id task".to_string(),
+                    id: Some("existing-id".to_string()),
                     tags: vec![],
                     status: None,
                     body: None,
-                    key: Some("existing-key".to_string()),
                     dependencies: vec![],
                     summary: None,
                     author: None,
@@ -2285,7 +2408,143 @@ mod tests {
                 }]),
             })
             .await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "batch with pre-existing id should fail");
+    }
+
+    #[tokio::test]
+    async fn update_plan_batch_rejects_intra_batch_duplicate_id() {
+        let dir = temp_test_dir("update-plan-batch-intra-dup-id");
+        let server = PlansServer::new(dir);
+
+        // Two TaskSpecs with the same id in the same batch — should fail
+        let result = server
+            .handle_update_plan(UpdatePlanParams {
+                name: "plan-a".to_string(),
+                content: "".to_string(),
+                title: None,
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                tasks: Some(vec![
+                    TaskSpec {
+                        title: "task one".to_string(),
+                        id: Some("shared-id".to_string()),
+                        tags: vec![],
+                        status: None,
+                        body: None,
+                        dependencies: vec![],
+                        summary: None,
+                        author: None,
+                        assignee: None,
+                        executor: None,
+                    },
+                    TaskSpec {
+                        title: "task two".to_string(),
+                        id: Some("shared-id".to_string()),
+                        tags: vec![],
+                        status: None,
+                        body: None,
+                        dependencies: vec![],
+                        summary: None,
+                        author: None,
+                        assignee: None,
+                        executor: None,
+                    },
+                ]),
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "intra-batch duplicate IDs should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_plan_batch_creates_tasks_with_ids() {
+        let dir = temp_test_dir("update-plan-batch-with-ids");
+        let server = PlansServer::new(dir.clone());
+
+        server
+            .handle_update_plan(UpdatePlanParams {
+                name: "plan-a".to_string(),
+                content: "plan body".to_string(),
+                title: None,
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                tasks: Some(vec![
+                    TaskSpec {
+                        title: "first task".to_string(),
+                        id: Some("alpha-task".to_string()),
+                        tags: vec![],
+                        status: None,
+                        body: None,
+                        dependencies: vec![],
+                        summary: None,
+                        author: None,
+                        assignee: None,
+                        executor: None,
+                    },
+                    TaskSpec {
+                        title: "second task".to_string(),
+                        id: Some("beta-task".to_string()),
+                        tags: vec![],
+                        status: None,
+                        body: None,
+                        dependencies: vec![],
+                        summary: None,
+                        author: None,
+                        assignee: None,
+                        executor: None,
+                    },
+                ]),
+            })
+            .await
+            .unwrap();
+
+        let alpha_path = dir.join("plan-a").join("tasks").join("alpha-task.md");
+        let beta_path = dir.join("plan-a").join("tasks").join("beta-task.md");
+        assert!(alpha_path.exists(), "alpha-task.md should exist");
+        assert!(beta_path.exists(), "beta-task.md should exist");
+    }
+
+    #[tokio::test]
+    async fn add_note_duplicate_id_error() {
+        let dir = temp_test_dir("add-note-dup-id");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_note(AddNoteParams {
+                plan: "plan-a".to_string(),
+                id: Some("dup-note-id".to_string()),
+                body: "first note".to_string(),
+                summary: None,
+                author: None,
+            })
+            .await
+            .unwrap();
+
+        let err = server
+            .handle_add_note(AddNoteParams {
+                plan: "plan-a".to_string(),
+                id: Some("dup-note-id".to_string()),
+                body: "second note".to_string(),
+                summary: None,
+                author: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("already exists"),
+            "expected 'already exists' in: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -2305,7 +2564,7 @@ mod tests {
                     tags: vec![],
                     status: None,
                     body: None,
-                    key: None,
+                    id: None,
                     dependencies: vec![],
                 })
                 .await
@@ -2316,7 +2575,7 @@ mod tests {
             .handle_list_tasks(ListTasksParams {
                 filter: "all".to_string(),
                 tag: None,
-                plan: Some("plan-a".to_string()),
+                plan: "plan-a".to_string(),
             })
             .await
             .unwrap();
@@ -2343,7 +2602,7 @@ mod tests {
                 tags: vec![],
                 status: None,
                 body: None,
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
@@ -2359,9 +2618,8 @@ mod tests {
 
         let err = server
             .handle_get_task(GetTaskParams {
-                id: Some("task-deadbeef".to_string()),
-                key: None,
-                plan: None,
+                plan: "plan-a".to_string(),
+                id: "task-deadbeef".to_string(),
             })
             .await
             .unwrap_err();
@@ -2577,7 +2835,7 @@ mod tests {
                     tags: vec![],
                     status: None,
                     body: None,
-                    key: None,
+                    id: None,
                     dependencies: vec![],
                 })
                 .await
@@ -2586,6 +2844,7 @@ mod tests {
         server
             .handle_add_note(AddNoteParams {
                 plan: "plan-a".to_string(),
+                id: None,
                 body: "note body".to_string(),
                 summary: None,
                 author: None,
@@ -2609,6 +2868,7 @@ mod tests {
         let add = server
             .handle_add_note(AddNoteParams {
                 plan: "plan-a".to_string(),
+                id: None,
                 body: "note body".to_string(),
                 summary: Some("sum".to_string()),
                 author: Some("author".to_string()),
@@ -2637,6 +2897,7 @@ mod tests {
         let add = server
             .handle_add_note(AddNoteParams {
                 plan: "plan-a".to_string(),
+                id: None,
                 body: "note body".to_string(),
                 summary: None,
                 author: None,
@@ -2672,6 +2933,7 @@ mod tests {
             server
                 .handle_add_note(AddNoteParams {
                     plan: "plan-a".to_string(),
+                    id: None,
                     body: format!("note {idx}"),
                     summary: Some(format!("summary {idx}")),
                     author: None,
@@ -2705,6 +2967,7 @@ mod tests {
         server
             .handle_add_note(AddNoteParams {
                 plan: "plan-a".to_string(),
+                id: None,
                 body: "note body".to_string(),
                 summary: None,
                 author: None,
@@ -2723,6 +2986,7 @@ mod tests {
         let add = server
             .handle_add_note(AddNoteParams {
                 plan: "plan-a".to_string(),
+                id: None,
                 body: "note body".to_string(),
                 summary: Some("test summary".to_string()),
                 author: Some("author".to_string()),
@@ -2770,6 +3034,7 @@ mod tests {
         let add = server
             .handle_add_note(AddNoteParams {
                 plan: "plan-a".to_string(),
+                id: None,
                 body: "note body".to_string(),
                 summary: None,
                 author: None,
@@ -2790,48 +3055,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_task_duplicate_key_error() {
-        let dir = temp_test_dir("add-task-duplicate-key-error");
-        let server = PlansServer::new(dir);
-
-        server
-            .handle_add_task(AddTaskParams {
-                title: "First".to_string(),
-                plan: "plan-a".to_string(),
-                summary: None,
-                author: None,
-                assignee: None,
-                executor: None,
-                tags: vec![],
-                status: None,
-                body: None,
-                key: Some("my-key".to_string()),
-                dependencies: vec![],
-            })
-            .await
-            .unwrap();
-
-        let err = server
-            .handle_add_task(AddTaskParams {
-                title: "Second".to_string(),
-                plan: "plan-a".to_string(),
-                summary: None,
-                author: None,
-                assignee: None,
-                executor: None,
-                tags: vec![],
-                status: None,
-                body: None,
-                key: Some("my-key".to_string()),
-                dependencies: vec![],
-            })
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.message, "key 'my-key' already exists in plan 'plan-a'");
-    }
-
-    #[tokio::test]
     async fn list_tasks_filter() {
         let dir = temp_test_dir("list-tasks-filter");
         let server = PlansServer::new(dir);
@@ -2847,7 +3070,7 @@ mod tests {
                 tags: vec![],
                 status: Some("open".to_string()),
                 body: None,
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
@@ -2863,7 +3086,7 @@ mod tests {
                 tags: vec![],
                 status: Some("closed".to_string()),
                 body: None,
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
@@ -2873,7 +3096,7 @@ mod tests {
             .handle_list_tasks(ListTasksParams {
                 filter: "open".to_string(),
                 tag: None,
-                plan: Some("plan-a".to_string()),
+                plan: "plan-a".to_string(),
             })
             .await
             .unwrap();
@@ -2898,7 +3121,7 @@ mod tests {
                 tags: vec![],
                 status: None,
                 body: None,
-                key: None,
+                id: None,
                 dependencies: vec![],
             })
             .await
@@ -2909,5 +3132,205 @@ mod tests {
             .join("tasks")
             .join(format!("{}.md", normalize_id(&id)));
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn get_task_wrong_plan_fails() {
+        let dir = temp_test_dir("get-task-wrong-plan");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_task(AddTaskParams {
+                title: "task".to_string(),
+                plan: "plan-a".to_string(),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: vec![],
+                status: None,
+                body: None,
+                id: Some("my-task".to_string()),
+                dependencies: vec![],
+            })
+            .await
+            .unwrap();
+
+        let err = server
+            .handle_get_task(GetTaskParams {
+                plan: "plan-b".to_string(),
+                id: "my-task".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("not found"),
+            "expected 'not found' in: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn update_task_wrong_plan_fails() {
+        let dir = temp_test_dir("update-task-wrong-plan");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_task(AddTaskParams {
+                title: "task".to_string(),
+                plan: "plan-a".to_string(),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: vec![],
+                status: None,
+                body: None,
+                id: Some("my-task".to_string()),
+                dependencies: vec![],
+            })
+            .await
+            .unwrap();
+
+        let err = server
+            .handle_update_task(UpdateTaskParams {
+                plan: "plan-b".to_string(),
+                id: "my-task".to_string(),
+                title: Some("new title".to_string()),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: None,
+                status: None,
+                body: None,
+                dependencies: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("not found"),
+            "expected 'not found' in: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn append_task_wrong_plan_fails() {
+        let dir = temp_test_dir("append-task-wrong-plan");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_task(AddTaskParams {
+                title: "task".to_string(),
+                plan: "plan-a".to_string(),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: vec![],
+                status: None,
+                body: Some("body".to_string()),
+                id: Some("my-task".to_string()),
+                dependencies: vec![],
+            })
+            .await
+            .unwrap();
+
+        let err = server
+            .handle_append_task(AppendTaskParams {
+                plan: "plan-b".to_string(),
+                id: "my-task".to_string(),
+                text: "appended".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("not found"),
+            "expected 'not found' in: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_task_wrong_plan_fails() {
+        let dir = temp_test_dir("delete-task-wrong-plan");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_task(AddTaskParams {
+                title: "task".to_string(),
+                plan: "plan-a".to_string(),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: vec![],
+                status: None,
+                body: None,
+                id: Some("my-task".to_string()),
+                dependencies: vec![],
+            })
+            .await
+            .unwrap();
+
+        let err = server
+            .handle_delete_task(DeleteTaskParams {
+                plan: "plan-b".to_string(),
+                id: "my-task".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("not found"),
+            "expected 'not found' in: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_note_wrong_plan_fails() {
+        let dir = temp_test_dir("delete-note-wrong-plan");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_note(AddNoteParams {
+                plan: "plan-a".to_string(),
+                id: Some("my-note".to_string()),
+                body: "body".to_string(),
+                summary: None,
+                author: None,
+            })
+            .await
+            .unwrap();
+
+        let err = server
+            .handle_delete_note(DeleteNoteParams {
+                plan: "plan-b".to_string(),
+                note_id: "my-note".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("not found"),
+            "expected 'not found' in: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn validate_plan_name_rejects_invalid() {
+        assert!(validate_plan_name("").is_err(), "empty string rejected");
+        assert!(validate_plan_name("   ").is_err(), "whitespace rejected");
+        assert!(validate_plan_name("a/b").is_err(), "slash rejected");
+        assert!(validate_plan_name("../etc").is_err(), "traversal rejected");
+        assert!(
+            validate_plan_name("my-plan").is_ok(),
+            "normal name accepted"
+        );
+        assert!(
+            validate_plan_name("plan a").is_ok(),
+            "space normalized to hyphen"
+        );
     }
 }
