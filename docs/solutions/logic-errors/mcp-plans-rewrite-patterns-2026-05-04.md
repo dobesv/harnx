@@ -1,6 +1,7 @@
 ---
 title: "MCP plans server rewrite patterns: file layout, atomic writes, write ordering, ID handling"
 date: 2026-05-04
+last_updated: 2026-05-05
 category: logic-errors
 problem_type: logic_error
 component: harnx-mcp-plans
@@ -14,6 +15,8 @@ tags:
   - write-ordering
   - id-normalization
   - legacy-parsing
+  - plan-scoping
+  - agent-provided-ids
 plan_ref: harnx-mcp-plans-revamp
 ---
 
@@ -259,7 +262,44 @@ async fn handle_get_task(&self, params: GetTaskParams) -> Result<CallToolResult,
 
 **ID normalization**: Callers can pass `task-abc123` or `NOTE-ABC123` and it works. Display shows bare IDs, so output is clean.
 
-**Dual lookup**: `get_task` absorbs both global ID lookup and scoped key lookup, replacing the old `plan_get_todo` pattern with a single tool.
+**Agent-provided IDs**: Tasks and notes accept optional `id` parameter. Agents can provide stable, meaningful identifiers for correlation and reference. Unavailable IDs trigger generation, maintaining backward compatibility.
+
+**Plan-scoped operations**: All task operations (`list_tasks`, `get_task`, `update_task`, `append_task`, `delete_task`) require a `plan` parameter. No global search. Wrong-plan access returns "task not found" error, preventing cross-plan data leakage.
+
+### 7. Validation Helpers (Added 2026-05-05)
+
+Two validation functions sanitize inputs at handler entry points:
+
+**ID Validation** (`validate_id`):
+```rust
+fn validate_id(id: &str) -> Result<String, String> {
+    let normalized = normalize_id(id);  // lowercases, strips task-/note- prefixes
+    if normalized.is_empty() || normalized.len() > 64 
+        || !normalized.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        Err(format!("ID '{}' must contain only alphanumeric, hyphen, or underscore (1-64 chars)", id))
+    } else {
+        Ok(normalized)
+    }
+}
+```
+
+**Plan Name Validation** (`validate_plan_name`):
+```rust
+fn validate_plan_name(name: &str) -> Result<String, String> {
+    let normalized = normalize_plan_name(name);  // trims, lowercases, replaces spaces
+    if normalized.is_empty() {
+        return Err("plan name must not be empty".to_string());
+    }
+    if normalized.contains('/') || normalized.contains('\\') || normalized.contains("..") {
+        return Err(format!("plan name '{}' must not contain path separators or '..'", name));
+    }
+    Ok(normalized)
+}
+```
+
+All 14 handlers call `validate_plan_name` at entry. `add_task`, `add_note`, and `update_plan` batch creation validate IDs.
+
+**Removed dead code**: `find_task_file` (global search) and `read_task_by_id` (global lookup) deleted. All paths now resolve via `task_file_path(dir, &plan_name, &id)`.
 
 ## Prevention Strategies
 
@@ -270,6 +310,12 @@ async fn handle_get_task(&self, params: GetTaskParams) -> Result<CallToolResult,
 - `list_tasks_by_tag`, `list_tasks_across_plans` — verify cross-plan enumeration
 - `parse_plan_frontmatter` legacy case — raw markdown returns default frontmatter
 - Atomic write recovery — kill process during write, verify no partial file
+- `list_tasks_scoped_to_plan` — verify each plan sees only its own tasks
+- `add_task_auto_id_fallback` — verify ID generation when agent omits ID
+- `add_task_with_agent_id` — verify agent-provided ID persists correctly
+- `add_task_invalid_id_rejected` — verify slashes, spaces, empty strings rejected
+- `get_task_wrong_plan_fails` — verify wrong-plan access returns "not found"
+- `validate_plan_name_rejects_path_traversal` — verify `../` and `/` rejected
 
 **Code Review Checklist:**
 
@@ -278,9 +324,14 @@ async fn handle_get_task(&self, params: GetTaskParams) -> Result<CallToolResult,
 - [ ] Does write function use temp-file + rename?
 - [ ] Does ID input normalization handle case and prefix variants?
 - [ ] Does legacy parsing return defaults for raw markdown?
+- [ ] Do all handler entry points validate plan name (path traversal protection)?
+- [ ] Are agent-provided IDs validated (alphanumeric/hyphen/underscore, 1-64 chars)?
+- [ ] Do task operations require plan parameter (no global search)?
+- [ ] Does wrong-plan access return "not found" rather than cross-plan leakage?
 
 ## Related Issues
 
 - **Plan:** harnx-mcp-plans-revamp
+- **Plan:** harnx-463-agent-provided-ids — agent-provided IDs and plan-scoped operations
 - **Prior Solution:** [logic-errors/mcp-todo-fs-restructure-2026-05-01.md](mcp-todo-fs-restructure-2026-05-01.md) — established `todo-<id>.md` pattern and YAML frontmatter for `harnx-mcp-todo`
 - **Prior Solution:** [integration-issues/plan-note-file-storage-2026-05-03.md](../integration-issues/plan-note-file-storage-2026-05-03.md) — established `note-<id>.md` files and JSON overview for `read_plan`
