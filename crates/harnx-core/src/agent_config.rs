@@ -140,6 +140,8 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_agent: Option<String>,
     #[serde(default)]
+    pub role: AgentRole,
+    #[serde(default)]
     prompt: String,
 
     #[serde(skip, default)]
@@ -186,6 +188,7 @@ impl AgentConfig {
             instructions: frontmatter.instructions,
             hooks: frontmatter.hooks,
             compaction_agent: frontmatter.compaction_agent,
+            role: frontmatter.role,
             prompt,
             ..Default::default()
         })
@@ -490,6 +493,16 @@ impl AgentConfig {
     }
 }
 
+/// Role of an agent — controls visibility in the agent picker and completions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    #[default]
+    Assistant,
+    Subagent,
+    Compaction,
+}
+
 // --- AgentFrontMatter (serialized shape of an agent.md front-matter block) ---
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -532,6 +545,8 @@ struct AgentFrontMatter {
     hooks: Option<HooksConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_agent: Option<String>,
+    #[serde(default)]
+    role: AgentRole,
 }
 
 impl AgentFrontMatter {
@@ -552,6 +567,7 @@ impl AgentFrontMatter {
             instructions: config.instructions.clone(),
             hooks: config.hooks.clone(),
             compaction_agent: config.compaction_agent.clone(),
+            role: config.role,
         }
     }
 
@@ -571,6 +587,7 @@ impl AgentFrontMatter {
             && self.instructions.is_none()
             && self.hooks.is_none()
             && self.compaction_agent.is_none()
+            && self.role == AgentRole::Assistant
     }
 }
 
@@ -663,6 +680,43 @@ mod tests {
             msg.contains("Template error"),
             "expected error message to contain 'Template error', got: {msg:?}"
         );
+    }
+
+    #[test]
+    fn test_agent_role_defaults_to_assistant() {
+        let content = "---\nmodel: openai:gpt-4o\n---\nYou are an agent.";
+        let agent = AgentConfig::from_markdown("my-agent", content).unwrap();
+        assert_eq!(agent.role, AgentRole::Assistant);
+    }
+
+    #[test]
+    fn test_agent_role_subagent_parsed() {
+        let content = "---\nrole: subagent\nmodel: openai:gpt-4o\n---\nYou are a sub-agent.";
+        let agent = AgentConfig::from_markdown("my-subagent", content).unwrap();
+        assert_eq!(agent.role, AgentRole::Subagent);
+    }
+
+    #[test]
+    fn test_agent_role_compaction_parsed() {
+        let content = "---\nrole: compaction\nmodel: openai:gpt-4o\n---\nSummarize.";
+        let agent = AgentConfig::from_markdown("my-compaction", content).unwrap();
+        assert_eq!(agent.role, AgentRole::Compaction);
+    }
+
+    #[test]
+    fn test_agent_role_subagent_roundtrip() {
+        let content = "---\nrole: subagent\nmodel: openai:gpt-4o\n---\nYou are a sub-agent.";
+        let agent = AgentConfig::from_markdown("my-subagent", content).unwrap();
+        let exported = agent.export().unwrap();
+        let reparsed = AgentConfig::from_markdown("my-subagent", &exported).unwrap();
+        assert_eq!(reparsed.role, AgentRole::Subagent);
+    }
+
+    #[test]
+    fn test_agent_no_role_field_is_assistant() {
+        // Completely empty frontmatter — AgentRole::Assistant is the serde default
+        let agent = AgentConfig::from_markdown("plain", "You are plain.").unwrap();
+        assert_eq!(agent.role, AgentRole::Assistant);
     }
 }
 

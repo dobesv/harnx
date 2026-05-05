@@ -73,13 +73,13 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
         } elseif ($flag -ceq "-s" -or $flag -eq "--session") {
             $completions = Get-HarnxValues "--list-sessions"
         } elseif ($flag -ceq "-a" -or $flag -eq "--agent") {
-            $completions = Get-HarnxValues "--list-agents"
+            $completions = Get-HarnxValues "--list-assistant-agents"
         } elseif ($flag -eq "--rag") {
             $completions = Get-HarnxValues "--list-rags"
         } elseif ($flag -eq "--macro") {
             $completions = Get-HarnxValues "--list-macros"
         } elseif ($flag -eq "--acp") {
-            $completions = Get-HarnxValues "--list-agents"
+            $completions = Get-HarnxValues "--list-assistant-agents"
         } elseif ($flag -ceq "-f" -or $flag -eq "--file") {
             $completions = @()
         } elseif ($flag -eq "--mcp-root") {

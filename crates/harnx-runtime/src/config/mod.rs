@@ -3,7 +3,10 @@ pub mod input;
 pub mod session;
 pub mod session_meta;
 
-pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentConfig, AgentVariables};
+pub use self::agent::{
+    complete_agent_variables, list_agents, list_assistant_agents, Agent, AgentConfig,
+    AgentVariables,
+};
 pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
@@ -2482,7 +2485,7 @@ impl Config {
                     .collect(),
                 ".session" => map_completion_values(self.list_sessions()),
                 ".rag" => map_completion_values(Self::list_rags()),
-                ".agent" => map_completion_values(list_agents()),
+                ".agent" => map_completion_values(list_assistant_agents()),
                 ".macro" => map_completion_values(Self::list_macros()),
                 ".info" => map_completion_values(vec!["session", "agent", "rag", "tools"]),
                 ".mcp" => map_completion_values(vec![

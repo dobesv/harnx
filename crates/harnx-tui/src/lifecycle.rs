@@ -15,7 +15,9 @@ use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
 use harnx_hooks::{drain_async_results, AsyncHookManager, PersistentHookManager};
 use harnx_runtime::config::GlobalConfig;
-use harnx_runtime::config::{build_picker_context, list_agents, sort_sessions_for_picker};
+use harnx_runtime::config::{
+    build_picker_context, list_assistant_agents, sort_sessions_for_picker,
+};
 use harnx_runtime::tool::ToolDeclaration;
 use harnx_runtime::utils::create_abort_signal;
 use ratatui::Terminal;
@@ -135,7 +137,7 @@ impl Tui {
     }
 
     pub(crate) fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState> {
-        let agents = list_agents();
+        let agents = list_assistant_agents();
         if config.read().agent.is_none() {
             if agents.is_empty() {
                 return None;

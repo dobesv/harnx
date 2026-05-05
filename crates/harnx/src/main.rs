@@ -17,8 +17,8 @@ pub use harnx_tui as tui;
 use crate::cli::Cli;
 use crate::client::{list_models, retry::call_with_retry_and_fallback, ModelType};
 use crate::config::{
-    list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input, WorkingMode,
-    TEMP_SESSION_NAME,
+    list_agents, list_assistant_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
+    WorkingMode, TEMP_SESSION_NAME,
 };
 use crate::tui::Tui;
 use harnx_hooks::{
@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
         || cli.sync_models
         || cli.list_models
         || cli.list_agents
+        || cli.list_assistant_agents
         || cli.list_rags
         || cli.list_macros
         || cli.list_sessions;
@@ -103,6 +104,11 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     }
     if cli.list_agents {
         let agents = list_agents().join("\n");
+        println!("{agents}");
+        return Ok(());
+    }
+    if cli.list_assistant_agents {
+        let agents = list_assistant_agents().join("\n");
         println!("{agents}");
         return Ok(());
     }
