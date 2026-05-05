@@ -17,7 +17,7 @@ _harnx() {
 
     case "${cmd}" in
         harnx)
-            opts="-m -s -a -f -S -t -h -V --model --prompt --session --empty-session --save-session --agent --agent-variable --rag --rebuild-rag --macro --serve --acp --file --no-stream --dry-run --info --sync-models --list-models --list-sessions --list-agents --list-rags --list-macros --mcp-root --tool --help --version"
+            opts="-m -s -a -f -S -t -h -V --model --prompt --session --empty-session --save-session --agent --agent-variable --rag --rebuild-rag --macro --serve --acp --file --no-stream --dry-run --info --sync-models --list-models --list-sessions --list-agents --list-assistant-agents --list-rags --list-macros --mcp-root --tool --help --version"
             if [[ ${cur} == -* || ${cword} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -39,7 +39,7 @@ _harnx() {
                     return 0
                     ;;
                 -a|--agent)
-                    COMPREPLY=($(compgen -W "$("$1" --list-agents)" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "$("$1" --list-assistant-agents)" -- "${cur}"))
                     __ltrim_colon_completions "$cur"
                     return 0
                     ;;
@@ -58,7 +58,7 @@ _harnx() {
                     return 0
                     ;;
                 --acp)
-                    COMPREPLY=($(compgen -W "$("$1" --list-agents)" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "$("$1" --list-assistant-agents)" -- "${cur}"))
                     __ltrim_colon_completions "$cur"
                     return 0
                     ;;

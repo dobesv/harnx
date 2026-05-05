@@ -17,7 +17,7 @@ module completions {
   }
 
   def "nu-complete harnx agent" [] {
-    ^harnx --list-agents |
+    ^harnx --list-assistant-agents |
     | lines 
     | parse "{value}" 
   }

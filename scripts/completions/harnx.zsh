@@ -56,11 +56,14 @@ _harnx() {
     _arguments "${_arguments_options[@]}" $common \
         && ret=0 
     case $state in
-        models|sessions|agents|rags|macros)
+        models|sessions|rags|macros)
             local -a values expl
             values=( ${(f)"$(_call_program values harnx --list-$state)"} )
-            _wanted values expl $state compadd -a values && ret=0
-            ;;
+            _wanted values expl $state compadd -a values && ret=0 ;;
+        agents)
+            local -a values expl
+            values=( ${(f)"$(_call_program values harnx --list-assistant-agents)"} )
+            _wanted values expl $state compadd -a values && ret=0 ;;
     esac
     return ret
 }

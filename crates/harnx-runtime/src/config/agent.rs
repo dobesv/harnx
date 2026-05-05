@@ -7,7 +7,9 @@ use std::{
     path::Path,
 };
 
-pub use harnx_core::agent_config::{AgentConfig, AgentVariable, AgentVariables, TEMP_AGENT_NAME};
+pub use harnx_core::agent_config::{
+    AgentConfig, AgentRole, AgentVariable, AgentVariables, TEMP_AGENT_NAME,
+};
 
 /// Built-in agent name: routes to the title-creation prompt.
 pub const CREATE_TITLE_AGENT: &str = harnx_core::agent_config::CREATE_TITLE_AGENT_NAME;
@@ -332,6 +334,36 @@ pub fn list_agents() -> Vec<String> {
             .collect(),
         Err(_) => vec![],
     };
+    output.sort();
+    output.dedup();
+    output
+}
+
+/// Returns names of agents whose role is [`AgentRole::Assistant`].
+/// Unlike [`list_agents`], this reads and parses each agent file.
+/// Silently skips files that fail to parse.
+pub fn list_assistant_agents() -> Vec<String> {
+    let agents_dir = Config::agents_config_dir();
+    let Ok(entries) = read_dir(&agents_dir) else {
+        return vec![];
+    };
+    let mut output: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                return None;
+            }
+            let name = path.file_stem()?.to_str()?.to_string();
+            let contents = read_to_string(&path).ok()?;
+            let config = AgentConfig::from_markdown(&name, &contents).ok()?;
+            if config.role == AgentRole::Assistant {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
     output.sort();
     output.dedup();
     output
@@ -859,5 +891,90 @@ You are a test agent.
             agent.defined_variables()[0].default.as_deref(),
             Some("Nested prompt")
         );
+    }
+
+    #[test]
+    fn test_list_assistant_agents_filters_by_role() {
+        with_test_config_dir(|config_dir| {
+            let agents_dir = config_dir.join("agents");
+            fs::write(
+                agents_dir.join("alpha.md"),
+                "---\nrole: assistant\nmodel: openai:gpt-4o\n---\nAssistant agent.",
+            )?;
+            fs::write(
+                agents_dir.join("beta.md"),
+                "---\nrole: subagent\nmodel: openai:gpt-4o\n---\nSub-agent.",
+            )?;
+            fs::write(
+                agents_dir.join("gamma.md"),
+                "---\nrole: compaction\nmodel: openai:gpt-4o\n---\nCompaction agent.",
+            )?;
+            let result = list_assistant_agents();
+            assert_eq!(result, vec!["alpha"]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_list_assistant_agents_includes_no_role_field() {
+        with_test_config_dir(|config_dir| {
+            let agents_dir = config_dir.join("agents");
+            fs::write(
+                agents_dir.join("no-role.md"),
+                "---\nmodel: openai:gpt-4o\n---\nNo role field.",
+            )?;
+            fs::write(
+                agents_dir.join("explicit-subagent.md"),
+                "---\nrole: subagent\n---\nSub-agent.",
+            )?;
+            let result = list_assistant_agents();
+            assert_eq!(result, vec!["no-role"]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_list_assistant_agents_empty_dir() {
+        with_test_config_dir(|_config_dir| {
+            let result = list_assistant_agents();
+            assert!(result.is_empty());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_list_assistant_agents_skips_malformed() {
+        with_test_config_dir(|config_dir| {
+            let agents_dir = config_dir.join("agents");
+            fs::write(
+                agents_dir.join("broken.md"),
+                "---\nmodel: [unclosed bracket\n---\nBroken agent.",
+            )?;
+            fs::write(
+                agents_dir.join("good.md"),
+                "---\nmodel: openai:gpt-4o\n---\nGood agent.",
+            )?;
+            let result = list_assistant_agents();
+            assert_eq!(result, vec!["good"]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_list_assistant_agents_sorted() {
+        with_test_config_dir(|config_dir| {
+            let agents_dir = config_dir.join("agents");
+            fs::write(agents_dir.join("zebra.md"), "You are zebra.")?;
+            fs::write(agents_dir.join("apple.md"), "You are apple.")?;
+            fs::write(agents_dir.join("mango.md"), "You are mango.")?;
+            let result = list_assistant_agents();
+            assert_eq!(result, vec!["apple", "mango", "zebra"]);
+            Ok(())
+        })
+        .unwrap();
     }
 }

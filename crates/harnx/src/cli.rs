@@ -66,6 +66,9 @@ pub struct Cli {
     /// List all agents
     #[clap(long)]
     pub list_agents: bool,
+    /// List agents available for direct interaction (excludes subagent and compaction roles)
+    #[clap(long)]
+    pub list_assistant_agents: bool,
     /// List all RAGs
     #[clap(long)]
     pub list_rags: bool,
