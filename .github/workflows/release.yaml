@@ -3,7 +3,11 @@ name: Release
 on:
   push:
     tags:
-    - v[0-9]+.[0-9]+.[0-9]+*
+    # Knope tags releases as `harnx/v<version>` (monorepo-style prefix from
+    # the [packages.harnx] config). Earlier `v<version>` tag pattern is kept
+    # for any manual tags that don't go through knope.
+    - 'harnx/v[0-9]+.[0-9]+.[0-9]+*'
+    - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
   release:
@@ -105,7 +109,8 @@ jobs:
       shell: bash
       run: |
         $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
-          -p harnx -p harnx-serve -p harnx-acp-server
+          -p harnx -p harnx-serve -p harnx-acp-server \
+          -p harnx-mcp-bash -p harnx-mcp-fs -p harnx-mcp-plans -p harnx-mcp-time
 
     - name: Build Archives
       shell: bash
@@ -119,18 +124,35 @@ jobs:
         dist_dir=`pwd`/dist
         mkdir $dist_dir
 
+        # Each entry is "archive-name:bin1[,bin2...]" — the archive's
+        # filename uses archive-name; staged contents are the listed bins.
+        # harnx-mcp-bash ships its sandbox helper alongside the main bin.
+        archive_specs=(
+          "harnx:harnx"
+          "harnx-serve:harnx-serve"
+          "harnx-acp-server:harnx-acp-server"
+          "harnx-mcp-bash:harnx-mcp-bash,harnx-mcp-bash-sandbox-run"
+          "harnx-mcp-fs:harnx-mcp-fs"
+          "harnx-mcp-plans:harnx-mcp-plans"
+          "harnx-mcp-time:harnx-mcp-time"
+        )
+
         archives=()
-        for bin in harnx harnx-serve harnx-acp-server; do
-          name=$bin-$version-$target
-          executable=target/$target/release/$bin
+        for spec in "${archive_specs[@]}"; do
+          archive_base="${spec%%:*}"
+          IFS=',' read -ra bins <<< "${spec#*:}"
 
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            executable=$executable.exe
-          fi
-
-          staging=$dist_dir/$bin-stage
+          name=$archive_base-$version-$target
+          staging=$dist_dir/$archive_base-stage
           mkdir $staging
-          cp $executable $staging/
+
+          for bin in "${bins[@]}"; do
+            executable=target/$target/release/$bin
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              executable=$executable.exe
+            fi
+            cp $executable $staging/
+          done
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
               archive=$dist_dir/$name.zip

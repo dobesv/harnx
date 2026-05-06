@@ -1,15 +1,16 @@
-[[packages]]
-name = "harnx"
-# All three shippable bins keep their literal `version = "0.30.0"` in sync
-# with each other. knope bumps them together as a single package unit so
-# the release artifacts (harnx-$ver, harnx-serve-$ver, harnx-acp-server-$ver)
-# always match.
-versioned_files = [
-    "crates/harnx/Cargo.toml",
-    "crates/harnx-serve/Cargo.toml",
-    "crates/harnx-acp-server/Cargo.toml",
-]
+# Multi-package syntax (`[packages.harnx]`) is used so existing changeset
+# files keep their `harnx: <level>` front matter. With single-package
+# `[package]` syntax, changesets would need to drop the package name.
+[packages.harnx]
+# All workspace crates (except ratatui-widget-scrolling) inherit `version`
+# from `[workspace.package]` in the root Cargo.toml. knope updates that one
+# field; running `cargo build --workspace` afterwards refreshes Cargo.lock.
+versioned_files = ["Cargo.toml"]
 changelog = "CHANGELOG.md"
+
+# With multi-package syntax knope prepends the package name to tags, so
+# tags look like `harnx/v0.30.1` (NOT `v0.30.1`). The release workflow
+# trigger pattern in `.github/workflows/release.yaml` matches accordingly.
 tag_prefix = "v"
 
 [[workflows]]
@@ -19,4 +20,20 @@ name = "release"
 type = "PrepareRelease"
 
 [[workflows.steps]]
+type = "Command"
+command = "cargo build --workspace"
+
+[[workflows.steps]]
+type = "Command"
+command = "git add Cargo.lock"
+
+[[workflows.steps]]
+type = "Command"
+command = "git commit -m \"chore: prepare release\""
+
+[[workflows.steps]]
 type = "Release"
+
+[[workflows.steps]]
+type = "Command"
+command = "git push --follow-tags"
