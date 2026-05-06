@@ -166,12 +166,6 @@ This directory includes:
 
 ## Other Settings
 
-### Default Session
-
-- **tui_default_session**: Session spec applied when entering TUI mode. (Accepted under the legacy alias `repl_default_session` for backward compatibility.)
-- **cmd_default_session**: Session spec applied when entering CMD mode.
-- **agent_default_session**: Session identifier used when starting an agent.
-
 ### RAG
 
 See the [RAG Guide](rag-guide.md) for detailed setup instructions.

@@ -211,7 +211,6 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         macro_execute(&config, name, text.as_deref(), abort_signal.clone()).await?;
         return Ok(());
     }
-    config.write().apply_default_session()?;
     match is_tui {
         false => {
             let (highlight, render_options) = {

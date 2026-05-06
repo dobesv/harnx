@@ -19,10 +19,6 @@ toolsets:
     - Write
     - Edit
 
-# ---- default sessions ----
-# cmd_default_session: $GIT_BRANCH-$GIT_PATH
-# agent_default_session: $GIT_BRANCH-$GIT_PATH
-
 # ---- hooks ----
 # hooks:
 #   entries:

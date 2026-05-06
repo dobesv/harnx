@@ -2001,7 +2001,7 @@ fn write_mutation_fixture_files(paths: &TestPaths, editor_path: &Path) -> Result
         paths.agents_dir.join(format!("{MUTATION_AGENT_NAME}.md")),
         format!(
             "---\nname: {MUTATION_AGENT_NAME}\nmodel: mock-llm:test\n\
-             agent_default_session: {MUTATION_SESSION_NAME}\n---\n\
+             ---\n\
              You are a test agent for mutation e2e testing.\n"
         ),
     )?;
