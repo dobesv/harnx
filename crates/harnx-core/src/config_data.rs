@@ -54,11 +54,6 @@ pub struct ConfigData {
     #[serde(default, deserialize_with = "deserialize_use_tools")]
     pub use_tools: Option<Vec<String>>,
 
-    #[serde(alias = "repl_default_session")]
-    pub tui_default_session: Option<String>,
-    pub cmd_default_session: Option<String>,
-    pub agent_default_session: Option<String>,
-
     pub save_session: Option<bool>,
     pub compress_threshold: usize,
 
@@ -102,10 +97,6 @@ impl Default for ConfigData {
             tool_use: true,
             toolsets: Default::default(),
             use_tools: None,
-
-            tui_default_session: None,
-            cmd_default_session: None,
-            agent_default_session: None,
 
             save_session: Some(true),
             compress_threshold: 180000,
@@ -191,13 +182,6 @@ hooks:
         assert_eq!(got.rag_top_k, 3);
         assert!(!got.highlight);
         assert!(got.hooks.is_some());
-    }
-
-    #[test]
-    fn repl_default_session_alias_still_works() {
-        let yaml = "repl_default_session: legacy_session\n";
-        let got: ConfigData = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(got.tui_default_session.as_deref(), Some("legacy_session"));
     }
 
     #[test]

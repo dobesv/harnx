@@ -131,8 +131,6 @@ pub struct AgentConfig {
     conversation_starters: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     documents: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_default_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,7 +182,6 @@ impl AgentConfig {
             variables: frontmatter.variables,
             conversation_starters: frontmatter.conversation_starters,
             documents: frontmatter.documents,
-            agent_default_session: frontmatter.agent_default_session,
             instructions: frontmatter.instructions,
             hooks: frontmatter.hooks,
             compaction_agent: frontmatter.compaction_agent,
@@ -356,10 +353,6 @@ impl AgentConfig {
     pub fn interpolated_instructions(&self) -> anyhow::Result<String> {
         let template = self.instructions.as_deref().unwrap_or(&self.prompt);
         render_template(template, self)
-    }
-
-    pub fn agent_default_session(&self) -> Option<&str> {
-        self.agent_default_session.as_deref()
     }
 
     pub fn variables(&self) -> &AgentVariables {
@@ -537,8 +530,6 @@ struct AgentFrontMatter {
     conversation_starters: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     documents: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_default_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -563,7 +554,6 @@ impl AgentFrontMatter {
             variables: config.variables.clone(),
             conversation_starters: config.conversation_starters.clone(),
             documents: config.documents.clone(),
-            agent_default_session: config.agent_default_session.clone(),
             instructions: config.instructions.clone(),
             hooks: config.hooks.clone(),
             compaction_agent: config.compaction_agent.clone(),
@@ -583,7 +573,6 @@ impl AgentFrontMatter {
             && self.variables.is_empty()
             && self.conversation_starters.is_empty()
             && self.documents.is_empty()
-            && self.agent_default_session.is_none()
             && self.instructions.is_none()
             && self.hooks.is_none()
             && self.compaction_agent.is_none()

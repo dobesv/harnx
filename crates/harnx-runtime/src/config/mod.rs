@@ -1733,37 +1733,18 @@ impl Config {
             agent.exit_session();
         }
 
-        // Re-create a session with freshly-expanded variables
-        let new_session_name = if let Some(agent) = &self.agent {
-            let extra_vars = std::collections::HashMap::from([("AGENT_NAME", agent.name())]);
-            // Per-agent front-matter first, then global config fallback
-            let template = agent
-                .agent_default_session()
-                .map(|s| s.to_string())
-                .or_else(|| self.agent_default_session.clone());
-            template
-                .map(|v| {
-                    session_name::sanitize_session_name(
-                        &session_name::expand_session_variables_with(&v, &extra_vars),
-                    )
-                })
-                .filter(|v| !v.is_empty())
-        } else {
-            let default_session = match self.working_mode {
-                WorkingMode::Tui => self.tui_default_session.as_ref(),
-                WorkingMode::Cmd => self.cmd_default_session.as_ref(),
-                WorkingMode::Serve | WorkingMode::Acp(_) => None,
-            };
-            default_session
-                .filter(|v| !v.is_empty())
-                .map(|v| {
-                    session_name::sanitize_session_name(&session_name::expand_session_variables(v))
-                })
-                .filter(|v| !v.is_empty())
-        };
-
-        let session_name = new_session_name.or(old_session_name);
+        // Re-create previous session after agent changes.
+        let session_name = old_session_name;
         if let Some(name) = session_name {
+            // Delete the persisted session file so use_session creates a fresh empty session
+            // instead of reloading the old transcript. This ensures only the session ID
+            // is preserved across agent changes, not the conversation history.
+            let session_path = self.session_file(&name);
+            if session_path.exists() {
+                remove_file(&session_path).with_context(|| {
+                    format!("Failed to remove session file '{}'", session_path.display())
+                })?;
+            }
             self.use_session(Some(&name))?;
         }
         Ok(())
@@ -2258,26 +2239,7 @@ impl Config {
             bail!("Already in a agent, please run '.exit agent' first to exit the current agent.");
         }
         let agent = self::agent::init(config, agent_name, abort_signal).await?;
-        let extra_vars = std::collections::HashMap::from([("AGENT_NAME", agent.name())]);
-        let global_agent_session = config.read().agent_default_session.clone();
-        let session = session_name.map(|v| v.to_string()).or_else(|| {
-            if config.read().macro_flag {
-                None
-            } else {
-                // Per-agent front-matter first, then global config fallback
-                let template = agent
-                    .agent_default_session()
-                    .map(|s| s.to_string())
-                    .or_else(|| global_agent_session.clone());
-                template
-                    .map(|v| {
-                        session_name::sanitize_session_name(
-                            &session_name::expand_session_variables_with(&v, &extra_vars),
-                        )
-                    })
-                    .filter(|v| !v.is_empty())
-            }
-        });
+        let session = session_name.map(|v| v.to_string());
         config.write().rag = agent.rag();
         config.write().agent = Some(agent);
         // Populate shared_variables from resolved file-backed defaults and
@@ -2286,7 +2248,7 @@ impl Config {
         // immediately, so this must happen before use_session().
         config.write().init_agent_shared_variables()?;
         if let Some(session) = session {
-            // Exit any existing session (e.g. from tui_default_session) before
+            // Exit any existing session before
             // switching to the agent's session.
             config.write().exit_session()?;
             config.write().use_session(Some(&session))?;
@@ -2363,34 +2325,6 @@ impl Config {
             })?;
         } else {
             bail!("No macro");
-        }
-        Ok(())
-    }
-
-    pub fn apply_default_session(&mut self) -> Result<()> {
-        if self.macro_flag || !self.state().is_empty() {
-            return Ok(());
-        }
-        let default_session = match self.working_mode {
-            WorkingMode::Tui => self.tui_default_session.as_ref(),
-            WorkingMode::Cmd => self.cmd_default_session.as_ref(),
-            WorkingMode::Serve => return Ok(()),
-            WorkingMode::Acp(_) => self.agent_default_session.as_ref(),
-        };
-        let default_session = match default_session {
-            Some(v) => {
-                if v.is_empty() {
-                    return Ok(());
-                }
-                v.to_string()
-            }
-            None => return Ok(()),
-        };
-        let session_name = session_name::sanitize_session_name(
-            &session_name::expand_session_variables(&default_session),
-        );
-        if !session_name.is_empty() {
-            self.use_session(Some(&session_name))?;
         }
         Ok(())
     }
@@ -3192,18 +3126,6 @@ impl Config {
                         .collect(),
                 );
             }
-        }
-
-        if let Some(v) = read_env_value::<String>(&get_env_name("tui_default_session"))
-            .or_else(|| read_env_value::<String>(&get_env_name("repl_default_session")))
-        {
-            self.tui_default_session = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("cmd_default_session")) {
-            self.cmd_default_session = v;
-        }
-        if let Some(v) = read_env_value::<String>(&get_env_name("agent_default_session")) {
-            self.agent_default_session = v;
         }
 
         if let Some(v) = read_env_bool(&get_env_name("save_session")) {

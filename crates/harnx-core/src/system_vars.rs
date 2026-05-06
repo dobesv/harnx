@@ -44,7 +44,6 @@ struct AgentContext<'a> {
     top_p: Option<f64>,
     use_tools: Option<Vec<String>>,
     documents: &'a [String],
-    agent_default_session: Option<&'a str>,
     compaction_agent: Option<&'a str>,
     conversation_starters: &'a [String],
 }
@@ -116,7 +115,6 @@ pub fn render_template(template: &str, agent: &AgentConfig) -> Result<String> {
         top_p: agent.top_p(),
         use_tools: agent.use_tools(),
         documents: agent.documents(),
-        agent_default_session: agent.agent_default_session(),
         compaction_agent: agent.compaction_agent(),
         conversation_starters: agent.conversation_staters(),
     };

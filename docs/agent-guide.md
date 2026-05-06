@@ -28,7 +28,6 @@ use_tools:
   - bash_exec
 description: A helpful coding assistant
 version: "1.0"
-agent_default_session: default
 instructions: null
 
 variables:
@@ -77,7 +76,6 @@ The current OS is {{__os__}} and the shell is {{__shell__}}.
 | `variables` | `list` | `[]` | Variables prompted on first use. See [Variables](#variables). |
 | `conversation_starters` | `list` | `[]` | Suggested prompts shown when starting the agent in TUI mode. |
 | `documents` | `list` | `[]` | Document paths for RAG integration. See [Documents](#documents-rag). |
-| `agent_default_session` | `string` | none | Session to auto-load when starting this agent (e.g. `temp`, `default`). |
 | `instructions` | `string` | none | If set, overrides the Markdown body as the system prompt. |
 | `hooks` | `object` | none | Per-agent hook configuration. See [Hooks](#hooks). |
 
