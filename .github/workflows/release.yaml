@@ -84,6 +84,15 @@ jobs:
       with:
         targets: ${{ matrix.target }}
 
+    # rust-toolchain.toml pins the active toolchain to a specific 1.x.y, so
+    # `cargo build` ignores the `stable` toolchain dtolnay set up. The target
+    # stdlib must be added to the pinned toolchain too. Skipped for cross
+    # builds — cross images carry the target stdlib themselves.
+    - name: Install Rust target for pinned toolchain
+      if: '!matrix.use-cross'
+      shell: bash
+      run: rustup target add ${{ matrix.target }}
+
     - name: Install cross
       if: matrix.use-cross
       uses: taiki-e/install-action@v2
