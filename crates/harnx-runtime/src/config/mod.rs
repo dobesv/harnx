@@ -1736,6 +1736,15 @@ impl Config {
         // Re-create previous session after agent changes.
         let session_name = old_session_name;
         if let Some(name) = session_name {
+            // Delete the persisted session file so use_session creates a fresh empty session
+            // instead of reloading the old transcript. This ensures only the session ID
+            // is preserved across agent changes, not the conversation history.
+            let session_path = self.session_file(&name);
+            if session_path.exists() {
+                remove_file(&session_path).with_context(|| {
+                    format!("Failed to remove session file '{}'", session_path.display())
+                })?;
+            }
             self.use_session(Some(&name))?;
         }
         Ok(())

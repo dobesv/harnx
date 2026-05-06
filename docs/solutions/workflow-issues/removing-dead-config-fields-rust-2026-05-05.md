@@ -24,7 +24,7 @@ Removing configuration fields from a Rust project is error-prone. Developers mis
 ## Symptoms
 
 - Config fields referenced in code, docs, and tests after removal attempts
-- Dead helper functions left behind (e.g., `expand_session_variables`, `sanitize_session_name`)
+- Dead helper functions left behind
 - User docs still mention removed config keys
 - Tests fail when exercising removed features
 
@@ -35,8 +35,7 @@ Removing configuration fields from a Rust project is error-prone. Developers mis
 3. Searched for `Default` impl initializers
 4. Grep'd for all accessor methods and call sites
 5. Identified runtime env-var reading (`HARNX_TUI_DEFAULT_SESSION`, etc.)
-6. Found helper functions used only by removed feature (session name expansion/sanitization)
-7. Verified docs grep for removed key names
+6. Verified docs grep for removed key names
 8. Checked example configs and agent frontmatter
 
 ## Root Cause
@@ -100,18 +99,17 @@ agent_default_session: Option<&'a str>,
 config.write().apply_default_session()?;
 ```
 
-**8. Dead helper functions (`session_name.rs`):**
-Removed entire module content:
-- `expand_session_variables()`
-- `expand_session_variables_with()`
-- `sanitize_session_name()`
-- All associated unit tests
+**8. Helper modules (`session_name.rs`):**
+Note: The `session_name.rs` module was created (not removed) as part of this PR to provide
+session ID generation functions (`generate_session_id`, `encode_timestamp_session_id`, etc.)
+that are still needed for core session functionality. The removal work focused on the
+`*_default_session` config fields and their associated logic, not on fundamental session
+ID utilities.
 
 **9. Documentation:**
-- Configuration guide: removed "Default Session" section
-- Agent guide: removed `agent_default_session` from frontmatter table
 - Example config: removed `*_default_session` keys
-- Example agent frontmatter: removed `agent_default_session`
+- Example agent frontmatter: removed `agent_default_session` references if present
+- No "Default Session" section existed to remove from configuration guide
 
 **10. Changeset:**
 Created `.changesets/474-remove-default-session.md` documenting migration path.
@@ -150,9 +148,8 @@ Complete removal prevents confusion from partial deprecation. Users get clear fe
 rg -i "default_session" crates/ docs/ example_config/
 rg -i "repl_default_session" crates/ docs/
 
-# Check for dead pub functions:
-rg "expand_session_variables" crates/
-rg "sanitize_session_name" crates/
+# Verify environment variable references are removed:
+rg "HARNX.*DEFAULT_SESSION" crates/
 ```
 
 **Code Review Checklist:**
