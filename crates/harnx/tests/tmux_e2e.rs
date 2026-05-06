@@ -149,11 +149,23 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
 
 // Normalizes screen output for snapshot tests.
 fn normalize_screen(screen: &str) -> String {
-    screen
+    let trimmed = screen
         .lines()
         .map(|line| line.trim_end())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    mask_harnx_version(&trimmed)
+}
+
+/// Replace the literal version in the welcome banner (and anywhere else
+/// `harnx <semver>` appears) with `[VERSION]` so snapshots survive
+/// version bumps without a regenerate step.
+fn mask_harnx_version(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<fancy_regex::Regex> = OnceLock::new();
+    let re =
+        RE.get_or_init(|| fancy_regex::Regex::new(r"harnx \d+\.\d+\.\d+(?:[-+][\w.-]*)?").unwrap());
+    re.replace_all(s, "harnx [VERSION]").into_owned()
 }
 
 /// Replace spinner glyphs (animated braille chars and the idle "•" bullet)

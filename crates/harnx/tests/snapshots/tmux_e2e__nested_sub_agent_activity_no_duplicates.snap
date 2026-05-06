@@ -2,7 +2,7 @@
 source: crates/harnx/tests/tmux_e2e.rs
 expression: normalized
 ---
-Welcome to harnx 0.30.1  *  Type .help for commands, Tab to complete.
+Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
 # nested-parent v
 🤖 nested-parent ▸ temp
 > do nested delegation
