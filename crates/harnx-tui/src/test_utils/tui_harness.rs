@@ -200,12 +200,15 @@ mod tests {
         let mut harness = TuiTestHarness::with_size(40, 10);
         harness.render();
         let contents = harness.screen_contents();
-        // Normalize the output by trimming trailing whitespace from each line
-        let normalized: String = contents
+        // Normalize: trim trailing whitespace and mask the harnx version so
+        // the snapshot stays stable across releases.
+        let trimmed: String = contents
             .lines()
             .map(|line| line.trim_end())
             .collect::<Vec<_>>()
             .join("\n");
+        let re = fancy_regex::Regex::new(r"harnx \d+\.\d+\.\d+(?:[-+][\w.-]*)?").unwrap();
+        let normalized = re.replace_all(&trimmed, "harnx [VERSION]").into_owned();
         insta::with_settings!({
             description => "Basic TUI render test"
         }, {

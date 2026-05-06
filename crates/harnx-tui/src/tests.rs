@@ -67,11 +67,23 @@ fn test_config_with_mock_client_and_agent(
 }
 
 fn normalize_screen(contents: &str) -> String {
-    contents
+    let trimmed = contents
         .lines()
         .map(|line| line.trim_end())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    mask_harnx_version(&trimmed)
+}
+
+/// Replace the literal version in the welcome banner (and anywhere else
+/// `harnx <semver>` appears) with `[VERSION]` so snapshots survive
+/// version bumps without a regenerate step.
+fn mask_harnx_version(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<fancy_regex::Regex> = OnceLock::new();
+    let re =
+        RE.get_or_init(|| fancy_regex::Regex::new(r"harnx \d+\.\d+\.\d+(?:[-+][\w.-]*)?").unwrap());
+    re.replace_all(s, "harnx [VERSION]").into_owned()
 }
 
 #[tokio::test]
