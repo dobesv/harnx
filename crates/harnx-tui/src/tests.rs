@@ -6208,10 +6208,16 @@ async fn agent_picker_enter_with_sessions_shows_session_picker() {
 // --- SessionPicker ESC behavior -----------------------------------
 
 #[tokio::test]
-async fn session_picker_esc_without_prior_session_keeps_picker_open() {
+async fn session_picker_esc_without_prior_session_goes_back_to_agent_picker() {
+    // When origin_agent is None and origin_session is None the user arrived here
+    // via `harnx` (no agent) → AgentPicker → picked an agent → SessionPicker.
+    // ESC must go BACK to the AgentPicker so the user can change their mind.
+    // It must NOT keep the SessionPicker open and must NOT create a session (#467).
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    create_agent_stubs(&tmp.path().join("agents"), &["hermes"]);
 
     let config = picker_test_config();
     {
@@ -6231,7 +6237,7 @@ async fn session_picker_esc_without_prior_session_keeps_picker_open() {
     tui.app.modal = Some(crate::types::ModalState::SessionPicker {
         sessions: vec![],
         selected: 0,
-        origin_agent: None,
+        origin_agent: None, // came from AgentPicker during startup
         origin_session: None,
     });
 
@@ -6240,19 +6246,66 @@ async fn session_picker_esc_without_prior_session_keeps_picker_open() {
         .unwrap();
 
     assert!(
-        tui.app.modal.is_some(),
-        "modal should not be dismissed after Esc if no prior session"
+        matches!(
+            tui.app.modal,
+            Some(crate::types::ModalState::AgentPicker { .. })
+        ),
+        "ESC on SessionPicker with no origin should go back to AgentPicker, got: {:?}",
+        tui.app.modal
     );
     assert!(
         config.read().session.is_none(),
         "Esc on SessionPicker must not create a new session"
     );
+    assert!(
+        !tui.app.should_quit,
+        "ESC should not set should_quit when going back to AgentPicker"
+    );
 }
 
 #[tokio::test]
-async fn agent_picker_esc_does_not_dismiss_without_active_agent() {
-    // When no agent is active (startup case), ESC on AgentPicker must NOT
-    // dismiss the picker — selection is mandatory per #451.
+async fn session_picker_esc_with_agent_origin_but_no_session_exits() {
+    // When origin_agent is Some but origin_session is None, the user started
+    // harnx with `-a <agent>` (no session). ESC must exit the process (#467).
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    {
+        let mut guard = config.write();
+        guard.sessions_dir_override = Some(tmp.path().join("sessions"));
+        let model = MockClient::builder().build().model().clone();
+        let mut agent =
+            harnx_runtime::config::Agent::new(harnx_runtime::config::AgentConfig::from_prompt(""));
+        agent.set_name("hermes");
+        agent.set_model(model);
+        guard.agent = Some(agent);
+    }
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![],
+        selected: 0,
+        origin_agent: Some("hermes".to_string()), // direct startup with -a hermes
+        origin_session: None,
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        tui.app.should_quit,
+        "ESC on SessionPicker with no prior session and agent origin should exit the process"
+    );
+}
+
+#[tokio::test]
+async fn agent_picker_esc_exits_when_no_agent_active() {
+    // When no agent is active (startup case), ESC on AgentPicker must exit the
+    // process (#467). Previously this did nothing (wrong behaviour from #451).
     let tmp = tempfile::tempdir().unwrap();
     let _lock = ENV_LOCK.lock().await;
     let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
@@ -6273,12 +6326,123 @@ async fn agent_picker_esc_does_not_dismiss_without_active_agent() {
         .unwrap();
 
     assert!(
-        tui.app.modal.is_some(),
-        "AgentPicker Esc must NOT dismiss modal when no agent is active"
+        tui.app.should_quit,
+        "ESC on AgentPicker with no active agent must set should_quit (exit process)"
     );
     assert!(
         config.read().session.is_none(),
         "AgentPicker Esc must NOT create a session"
+    );
+}
+
+#[tokio::test]
+async fn picker_ctrl_d_exits_from_agent_picker() {
+    // Ctrl+D in AgentPicker must exit the process.
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["hermes".into()],
+        selected: 0,
+        query: String::new(),
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(
+        tui.app.should_quit,
+        "Ctrl+D in AgentPicker must set should_quit"
+    );
+    // Modal may remain or be cleared — the important thing is should_quit.
+}
+
+#[tokio::test]
+async fn picker_ctrl_c_exits_from_agent_picker() {
+    // Ctrl+C in AgentPicker must exit the process (no prompt to abort).
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::AgentPicker {
+        agents: vec!["hermes".into()],
+        selected: 0,
+        query: String::new(),
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(
+        tui.app.should_quit,
+        "Ctrl+C in AgentPicker must set should_quit"
+    );
+}
+
+#[tokio::test]
+async fn picker_ctrl_d_exits_from_session_picker() {
+    // Ctrl+D in SessionPicker must exit the process.
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![],
+        selected: 0,
+        origin_agent: Some("hermes".to_string()),
+        origin_session: None,
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(
+        tui.app.should_quit,
+        "Ctrl+D in SessionPicker must set should_quit"
+    );
+}
+
+#[tokio::test]
+async fn picker_ctrl_c_exits_from_session_picker() {
+    // Ctrl+C in SessionPicker must exit the process (no prompt to abort).
+    let tmp = tempfile::tempdir().unwrap();
+    let _lock = ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("HARNX_CONFIG_DIR", tmp.path().to_str().unwrap());
+
+    let config = picker_test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+
+    tui.app.modal = Some(crate::types::ModalState::SessionPicker {
+        sessions: vec![],
+        selected: 0,
+        origin_agent: None,
+        origin_session: None,
+    });
+
+    tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+
+    assert!(
+        tui.app.should_quit,
+        "Ctrl+C in SessionPicker must set should_quit"
     );
 }
 

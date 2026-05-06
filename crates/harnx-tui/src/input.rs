@@ -1808,6 +1808,16 @@ impl Tui {
     }
 
     async fn handle_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Ctrl+D always exits — no prompt running in picker state.
+        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
+            self.app.should_quit = true;
+            return Ok(());
+        }
+        // Ctrl+C exits in picker state — there is no in-flight prompt to abort.
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            self.app.should_quit = true;
+            return Ok(());
+        }
         match key.code {
             KeyCode::Up => {
                 if let Some(crate::types::ModalState::AgentPicker { selected, .. })
@@ -1979,33 +1989,61 @@ impl Tui {
                 }
             }
             KeyCode::Esc => {
-                // ESC on the SessionPicker restores the original state if there was a
-                // prior session. If there was no prior session, ESC does nothing (must
-                // select a session).
-                // ESC on the AgentPicker cancels only if an agent is already active
-                // (mid-session switch). If no agent is active (startup), ESC does
-                // nothing — selection is mandatory per #451.
+                // ESC behaviour depends on which picker is open and how it was reached.
+                //
+                // SessionPicker:
+                //   • origin_session is Some → restore origin agent+session (mid-switch cancel)
+                //   • origin_session is None AND origin_agent is None → came from AgentPicker
+                //     during startup; go back to the AgentPicker
+                //   • origin_session is None AND origin_agent is Some → direct startup with
+                //     `-a <agent>` and no session; ESC exits the process (#467)
+                //
+                // AgentPicker:
+                //   • agent already active (mid-switch) → dismiss picker (cancel switch)
+                //   • no agent active (startup) → exit the process (#467)
                 let mut should_restore_origin = false;
-                if let Some(crate::types::ModalState::SessionPicker { origin_session, .. }) =
-                    self.app.modal.as_ref()
+                let mut should_show_agent_picker = false;
+                if let Some(crate::types::ModalState::SessionPicker {
+                    origin_session,
+                    origin_agent,
+                    ..
+                }) = self.app.modal.as_ref()
                 {
                     if origin_session.is_some() {
                         should_restore_origin = true;
+                    } else if origin_agent.is_none() {
+                        // Came from AgentPicker (startup flow: harnx → pick agent → session
+                        // picker). ESC goes back to the AgentPicker.
+                        should_show_agent_picker = true;
+                    } else {
+                        // Direct startup with `-a <agent>`, no prior session. ESC exits.
+                        self.app.should_quit = true;
                     }
                 } else if matches!(
                     self.app.modal,
                     Some(crate::types::ModalState::AgentPicker { .. })
                 ) {
-                    // Only dismiss the AgentPicker if an agent is already active;
-                    // otherwise the picker is mandatory and must not be dismissed.
                     if self.config.read().agent.is_some() {
+                        // Agent already active — mid-switch cancel: just dismiss the picker.
                         self.app.modal = None;
+                    } else {
+                        // No agent active (startup). ESC exits the process (#467).
+                        self.app.should_quit = true;
                     }
                 } else if self.app.modal.is_some() {
                     self.app.modal = None;
                 }
 
-                if should_restore_origin {
+                if should_show_agent_picker {
+                    // Replace the SessionPicker with a fresh AgentPicker so the user can
+                    // pick a different agent (or the same one again).
+                    let agents = harnx_runtime::config::list_assistant_agents();
+                    self.app.modal = Some(crate::types::ModalState::AgentPicker {
+                        agents,
+                        selected: 0,
+                        query: String::new(),
+                    });
+                } else if should_restore_origin {
                     if let Some(crate::types::ModalState::SessionPicker {
                         origin_agent,
                         origin_session,

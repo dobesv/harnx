@@ -14,7 +14,7 @@ tags:
   - error-handling
   - picker
 plan_ref: "picker-bugs-435"
-last_updated: 2026-05-03
+last_updated: 2026-05-05
 ---
 
 ## Problem
@@ -24,6 +24,7 @@ Four bugs in the agent/session picker flow caused incorrect behavior:
 2. SessionPicker ESC didn't create a new session — dismiss behavior was inconsistent
 3. SessionPicker showed wrong sessions — `list_sessions_with_meta()` was called before agent activation, returning sessions from the previous agent's directory
 4. AgentPicker ESC dismissed picker when no agent was active — mandatory picker enforcement broken
+5. **(Issue #467)** ESC, Ctrl+C, Ctrl+D did nothing in pickers — no way to exit from picker modals
 
 Underlying issue: multi-step picker flow (AgentPicker → SessionPicker) lost the initial agent/session state, causing transcript reconciliation to see `prev_agent == curr_agent` after an agent switch and fail to clear stale messages.
 
@@ -34,6 +35,7 @@ Underlying issue: multi-step picker flow (AgentPicker → SessionPicker) lost th
 - **Wrong sessions bug**: Switching from agent A to agent B showed agent A's sessions in SessionPicker
 - **Transcript bug**: Switching agents via picker left stale transcript messages from the previous agent
 - **Mandatory picker bug**: Pressing ESC in AgentPicker when no agent was active dismissed the picker, leaving the app in an unusable state with no agent selected
+- **No-exit bug (#467)**: ESC, Ctrl+C, and Ctrl+D did nothing in pickers — user had no way to abort the picker flow and exit the process
 
 Error patterns from code review:
 ```rust
@@ -206,6 +208,9 @@ Key test coverage:
 - Multi-step flows need origin tracking for correct before/after comparison
 - Redesigned semantics (ESC = new session) can make previous defensive patterns (deferred activation) into bugs
 - **Mandatory picker enforcement**: For pickers shown at startup (no agent), ESC must NOT dismiss the picker. Check `config.read().agent.is_some()` before setting `self.app.modal = None`
+- **(#467) Ctrl+C/Ctrl+D early-return pattern**: When handling Ctrl key combinations in a function that already has a `match key.code` block, use `if` guards before the match rather than converting to `match (key.code, key.modifiers)`. This avoids rewriting existing match arms that check `key.modifiers == KeyModifiers::NONE || KeyModifiers::SHIFT`.
+- **(#467) Origin-based picker navigation**: Use `origin_agent` to distinguish "came from AgentPicker during startup" (`origin_agent.is_none()`) from "direct `-a <agent>` startup" (`origin_agent.is_some()`). In the former case, ESC goes back to AgentPicker; in the latter, ESC exits.
+- **(#467) `should_quit` for mandatory picker exit**: For mandatory pickers at startup, ESC now sets `should_quit = true` (process exit) instead of being a no-op. Issue #451's "mandatory selection" was overridden — users can now abort the flow.
 
 ### Mandatory Picker ESC Handling
 
@@ -231,7 +236,67 @@ KeyCode::Esc => {
 }
 ```
 
+### Ctrl+C/Ctrl+D Exit Handling (Issue #467)
+
+In picker state, Ctrl+C and Ctrl+D should exit the process rather than being ignored. The prompt is not running during picker display, so there's nothing to abort — the only sensible action is process exit.
+
+**Pattern: Early-return Ctrl checks before `match key.code`:**
+
+```rust
+// crates/harnx-tui/src/input.rs — handle_picker_key()
+async fn handle_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+    // Ctrl+D always exits — no prompt running in picker state.
+    if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
+        self.app.should_quit = true;
+        return Ok(());
+    }
+    // Ctrl+C exits in picker state — there is no in-flight prompt to abort.
+    if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+        self.app.should_quit = true;
+        return Ok(());
+    }
+    match key.code {
+        // ... existing match arms ...
+    }
+}
+```
+
+**Why early-return `if` guards?** Converting to `match (key.code, key.modifiers)` would require rewriting existing arms like `KeyCode::Char(c) if key.modifiers == KeyModifiers::NONE || KeyModifiers::SHIFT`. The `if` guard pattern keeps the change minimal and localized.
+
+### Origin-Based ESC Routing (Issue #467)
+
+SessionPicker ESC behavior depends on `origin_agent` and `origin_session`:
+
+```rust
+KeyCode::Esc => {
+    if let Some(ModalState::SessionPicker { origin_session, origin_agent, .. }) =
+        self.app.modal.as_ref()
+    {
+        if origin_session.is_some() {
+            // Mid-switch cancel: restore original agent+session
+            should_restore_origin = true;
+        } else if origin_agent.is_none() {
+            // Came from AgentPicker during startup (harnx → pick agent → session picker).
+            // ESC goes back to AgentPicker so user can choose a different agent.
+            let agents = list_assistant_agents();
+            self.app.modal = Some(ModalState::AgentPicker {
+                agents,
+                selected: 0,
+                query: String::new(),
+            });
+        } else {
+            // Direct startup with `-a <agent>`, no prior session. ESC exits.
+            self.app.should_quit = true;
+        }
+    }
+}
+```
+
+**Key distinction:** `origin_agent.is_none()` means "came from AgentPicker" (the agent was picked in this flow, not pre-existing). `origin_agent.is_some()` means direct `-a <agent>` startup where the user explicitly specified the agent.
+
 ## Related Issues
 
 - **PR:** [#435](https://github.com/dobesv/harnx/pull/435) — Agent session revamp
+- **Issue:** [#467](https://github.com/dobesv/harnx/issues/467) — ESC/Ctrl-C/Ctrl-D in pickers
 - **Related Solution:** [integration-issues/session-picker-multi-factor-sorting-2026-05-02.md](../integration-issues/session-picker-multi-factor-sorting-2026-05-02.md) — Original picker implementation
+- **Related Solution:** [integration-issues/raw-mode-ctrl-c-interrupt-2026-04-30.md](../integration-issues/raw-mode-ctrl-c-interrupt-2026-04-30.md) — Raw-mode terminal interrupt handling (Ctrl-C/Ctrl-D in CLI one-shot mode)
