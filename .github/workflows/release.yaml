@@ -46,19 +46,16 @@ jobs:
           os: ubuntu-latest
           use-cross: true
           cargo-flags: ""
-        - target: i686-unknown-linux-musl
-          os: ubuntu-latest
-          use-cross: true
-          cargo-flags: ""
         - target: i686-pc-windows-msvc
           os: windows-latest
           use-cross: true
           cargo-flags: ""
-        # 32-bit ARM Linux targets (armv7-unknown-linux-musleabihf,
-        # arm-unknown-linux-musleabihf) are intentionally excluded:
-        # `birdcage` (used by `harnx-mcp-bash` for filesystem sandboxing)
-        # references syscall constants that aren't defined in libc for
-        # those targets, so the build can't currently produce a working
+        # 32-bit Linux targets (i686-unknown-linux-musl,
+        # armv7-unknown-linux-musleabihf, arm-unknown-linux-musleabihf) are
+        # intentionally excluded: `birdcage` (used by `harnx-mcp-bash` for
+        # filesystem sandboxing) references syscall constants that aren't
+        # defined in libc for those targets (`SYS_shmget`, `SYS_accept`,
+        # `SYS_mmap`, ...), so the build can't currently produce a working
         # set of artifacts. Re-add once birdcage gains support or it's
         # made optional in harnx-mcp-bash.
 
