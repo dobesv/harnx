@@ -156,7 +156,9 @@ jobs:
 
   publish-crate:
     name: Publish to crates.io
-    if: ${{ needs.release.outputs.rc == 'false' }}
+    # Disabled: not yet ready to publish to crates.io. Re-enable by restoring
+    # the original condition: `${{ needs.release.outputs.rc == 'false' }}`.
+    if: false
     runs-on: ubuntu-latest
     needs: release
     steps:
