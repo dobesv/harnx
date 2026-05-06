@@ -680,6 +680,67 @@ pub fn exit(session: &mut Session, session_dir: &Path, is_tui: bool) -> Result<(
     Ok(())
 }
 
+/// Appends YAML log entry/entries for `msg` to `content`.
+///
+/// Tool-role messages containing `MessageContent::ToolCalls` are split
+/// into a `tool_calls` entry (the LLM's request) followed by a
+/// `tool_results` entry (the tool outputs), matching the format that
+/// `replay_log_entries` expects. All other messages are written as a
+/// single `message` entry.
+fn append_message_entries(content: &mut String, msg: &Message, session_id: &str) -> Result<()> {
+    if msg.role == MessageRole::Tool {
+        if let MessageContent::ToolCalls(tc) = &msg.content {
+            let calls: Vec<crate::tool::ToolCall> =
+                tc.tool_results.iter().map(|r| r.call.clone()).collect();
+            let tool_calls_entry = SessionLogEntry::ToolCalls {
+                text: tc.text.clone(),
+                thought: tc.thought.clone(),
+                calls,
+                timestamp: None,
+            };
+            content.push_str("---\n");
+            content
+                .push_str(&serde_yaml::to_string(&tool_calls_entry).with_context(|| {
+                    format!("Failed to serialize tool_calls in '{session_id}'")
+                })?);
+
+            let results: Vec<harnx_core::session::ToolOutput> = tc
+                .tool_results
+                .iter()
+                .map(|r| harnx_core::session::ToolOutput {
+                    id: r.call.id.clone(),
+                    name: r.call.name.clone(),
+                    output: r.output.clone(),
+                    switch_agent: r.switch_agent.clone(),
+                })
+                .collect();
+            let tool_results_entry = SessionLogEntry::ToolResults {
+                results,
+                timestamp: None,
+            };
+            content.push_str("---\n");
+            content.push_str(
+                &serde_yaml::to_string(&tool_results_entry).with_context(|| {
+                    format!("Failed to serialize tool_results in '{session_id}'")
+                })?,
+            );
+            return Ok(());
+        }
+    }
+
+    let entry = SessionLogEntry::Message {
+        role: msg.role,
+        content: msg.content.clone(),
+        timestamp: None,
+    };
+    content.push_str("---\n");
+    content.push_str(
+        &serde_yaml::to_string(&entry)
+            .with_context(|| format!("Failed to serialize message in '{session_id}'"))?,
+    );
+    Ok(())
+}
+
 /// Full save: rewrites the entire session file in log format.
 /// Used as a fallback when events were not incrementally appended.
 pub fn save(
@@ -696,16 +757,7 @@ pub fn save(
     let mut content = serde_yaml::to_string(&session.build_header_entry())
         .with_context(|| format!("Failed to serialize session header for '{}'", session.id))?;
     for msg in &session.compressed_messages {
-        let entry = SessionLogEntry::Message {
-            timestamp: None,
-            role: msg.role,
-            content: msg.content.clone(),
-        };
-        content.push_str("---\n");
-        content.push_str(
-            &serde_yaml::to_string(&entry)
-                .with_context(|| format!("Failed to serialize message in '{}'", session.id))?,
-        );
+        append_message_entries(&mut content, msg, &session.id)?;
     }
     if !session.compressed_messages.is_empty() {
         // Write a compress entry to mark the boundary.
@@ -730,29 +782,11 @@ pub fn save(
         // Write remaining messages (skip the system message from compress only if we wrote a compress entry).
         let start_idx = if wrote_compress { 1 } else { 0 };
         for msg in session.messages.iter().skip(start_idx) {
-            let entry = SessionLogEntry::Message {
-                role: msg.role,
-                content: msg.content.clone(),
-                timestamp: None, // Session save rewrites all entries; timestamps are from live events
-            };
-            content.push_str("---\n");
-            content.push_str(
-                &serde_yaml::to_string(&entry)
-                    .with_context(|| format!("Failed to serialize message in '{}'", session.id))?,
-            );
+            append_message_entries(&mut content, msg, &session.id)?;
         }
     } else {
         for msg in &session.messages {
-            let entry = SessionLogEntry::Message {
-                role: msg.role,
-                content: msg.content.clone(),
-                timestamp: None, // Session save rewrites all entries; timestamps are from live events
-            };
-            content.push_str("---\n");
-            content.push_str(
-                &serde_yaml::to_string(&entry)
-                    .with_context(|| format!("Failed to serialize message in '{}'", session.id))?,
-            );
+            append_message_entries(&mut content, msg, &session.id)?;
         }
     }
     if !session.data_urls.is_empty() {
