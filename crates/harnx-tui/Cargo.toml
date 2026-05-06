@@ -1,6 +1,6 @@
 [package]
 name = "harnx-tui"
-version = "0.30.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 description.workspace = true

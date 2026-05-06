@@ -26,6 +26,7 @@ members = [
 ]
 
 [workspace.package]
+version = "0.30.0"
 edition = "2021"
 authors = ["sigoden <sigoden@gmail.com>"]
 description = "All-in-one LLM CLI Tool"
@@ -115,10 +116,10 @@ jiff = { version = "0.2.23", features = ["serde"] }
 reqwest = { version = "0.13.0", features = ["json", "multipart", "socks", "rustls", "stream"], default-features = false }
 syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"], default-features = false }
 arboard = { version = "3.3.0", default-features = false }
-harnx-acp = { path = "crates/harnx-acp", version = "0.30.0" }
-harnx-acp-server = { path = "crates/harnx-acp-server", version = "0.30.0" }
+harnx-acp = { path = "crates/harnx-acp" }
+harnx-acp-server = { path = "crates/harnx-acp-server" }
 minijinja = { version = "2.19.0", default-features = false, features = ["builtins", "debug", "serde"] }
-harnx-mcp-history = { path = "crates/harnx-mcp-history", version = "0.30.0" }
+harnx-mcp-history = { path = "crates/harnx-mcp-history" }
 
 [patch.crates-io]
 ratatui_widget_scrolling = { path = "crates/ratatui-widget-scrolling" }
