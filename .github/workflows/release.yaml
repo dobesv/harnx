@@ -86,10 +86,13 @@ jobs:
 
     # rust-toolchain.toml pins the active toolchain to a specific 1.x.y, so
     # `cargo build` ignores the `stable` toolchain dtolnay set up. The target
-    # stdlib must be added to the pinned toolchain too. Skipped for cross
-    # builds — cross images carry the target stdlib themselves.
+    # stdlib must be added to the pinned toolchain too. Run unconditionally:
+    # cross silently falls back to plain cargo when no Docker image exists
+    # for the target (e.g. i686/aarch64-pc-windows-msvc), so the rustup
+    # target needs to be present even on `use-cross: true` jobs. When cross
+    # does run a real container build, `rustup target add` is a harmless
+    # no-op against the host toolchain.
     - name: Install Rust target for pinned toolchain
-      if: '!matrix.use-cross'
       shell: bash
       run: rustup target add ${{ matrix.target }}
 
