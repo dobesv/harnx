@@ -1612,22 +1612,22 @@ impl ServerHandler for PlansServer {
                     .with_meta(Meta(json!({"call_template": "- plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("list_tasks", "List tasks in a plan with optional filters.", Map::new())
                     .with_input_schema::<ListTasksParams>()
-                    .with_meta(Meta(json!({"call_template": "tasks", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "tasks {{ args.plan }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("add_task", "Create a task in a plan.", Map::new())
                     .with_input_schema::<AddTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "+ task {{ args.title }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "+ task {{ args.plan }}/{{ args.title }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_task", "Read a task by ID within a plan.", Map::new())
                     .with_input_schema::<GetTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "task {{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("update_task", "Update a task within its plan.", Map::new())
                     .with_input_schema::<UpdateTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "~ task {{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "~ task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("append_task", "Append markdown text to task body.", Map::new())
                     .with_input_schema::<AppendTaskParams>()
-                    .with_meta(Meta(json!({"call_template": ">> task {{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": ">> task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("delete_task", "Delete a task by ID.", Map::new())
                     .with_input_schema::<DeleteTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "- task {{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "- task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("list_notes", "List notes for a plan.", Map::new())
                     .with_input_schema::<ListNotesParams>()
                     .with_meta(Meta(json!({"call_template": "notes {{ args.plan }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
@@ -1636,10 +1636,10 @@ impl ServerHandler for PlansServer {
                     .with_meta(Meta(json!({"call_template": "+ note {{ args.plan }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_note", "Read a note from a plan.", Map::new())
                     .with_input_schema::<GetNoteParams>()
-                    .with_meta(Meta(json!({"call_template": "note {{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("delete_note", "Delete a note from a plan.", Map::new())
                     .with_input_schema::<DeleteNoteParams>()
-                    .with_meta(Meta(json!({"call_template": "- note {{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "- note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
             ],
             next_cursor: None,
         })
