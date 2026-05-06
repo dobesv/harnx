@@ -2587,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "harnx"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "agent-client-protocol",
  "ansi_colours",
@@ -2684,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-acp"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -2703,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-acp-server"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -2726,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-client"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2763,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-core"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "async-recursion",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-engine"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2806,7 +2806,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-fetch"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "fancy-regex 0.18.0",
@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-hooks"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "fancy-regex 0.18.0",
@@ -2842,7 +2842,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2863,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-bash"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "birdcage",
@@ -2884,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-fs"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "fancy-regex 0.18.0",
@@ -2902,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-history"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "gix",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-plans"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2928,7 +2928,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-mcp-time"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2943,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-rag"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2969,7 +2969,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-render"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "ansi_colours",
  "anyhow",
@@ -2983,7 +2983,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-runtime"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3046,7 +3046,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-serve"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3074,7 +3074,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-spinner"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -3084,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-test-bins"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "harnx-tui"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "async-trait",
