@@ -4,6 +4,8 @@
 //! crate and will move out in a later plan.
 
 mod client;
+#[doc(hidden)]
+pub mod compat;
 mod config;
 mod event;
 pub mod manager;
