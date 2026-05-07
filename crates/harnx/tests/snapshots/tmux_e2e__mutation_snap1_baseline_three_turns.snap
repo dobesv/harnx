@@ -1,9 +1,10 @@
 ---
 source: crates/harnx/tests/tmux_e2e.rs
+assertion_line: 2140
 expression: s
 ---
 Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
-# mutation-test-agent v
+mutation-test-agent v
 🤖 mutation-test-agent ▸ mutation-e2e-session
 > first message
 

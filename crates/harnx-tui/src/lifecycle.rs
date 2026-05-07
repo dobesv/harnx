@@ -75,6 +75,7 @@ impl Tui {
             llm_busy: false,
             scroll_state: ratatui_widget_scrolling::ScrollState::new(),
             streaming_assistant_idx: None,
+            cache_valid_width: None,
             last_ui_output_source: None,
             last_usage_source: None,
             last_usage_transcript_idx: None,
@@ -191,6 +192,7 @@ impl Tui {
                             text: banner,
                             seq: None,
                             timestamp: None, // Banner has no timestamp
+                            rendered_cache: None,
                         });
                     }
                 }
@@ -393,6 +395,7 @@ pub(crate) fn messages_to_transcript_items(
                         text,
                         seq: msg.log_seq,
                         timestamp: msg.log_timestamp,
+                        rendered_cache: None,
                     });
                 }
             }
@@ -408,6 +411,7 @@ pub(crate) fn messages_to_transcript_items(
                             text: tc.text.clone(),
                             seq: msg.log_seq,
                             timestamp: msg.log_timestamp,
+                            rendered_cache: None,
                         });
                     }
                     for r in &tc.tool_results {
@@ -435,6 +439,7 @@ pub(crate) fn messages_to_transcript_items(
                             body,
                             seq: msg.log_seq,
                             timestamp: msg.log_timestamp,
+                            rendered_cache: None,
                         });
                         let raw_result_fallback = harnx_core::tool::extract_user_display_text(
                             &r.output,
@@ -452,7 +457,10 @@ pub(crate) fn messages_to_transcript_items(
                         );
                         let trimmed = rendered.trim_end_matches('\n');
                         if !trimmed.is_empty() {
-                            items.push(TranscriptItem::ToolResultMarkdown(trimmed.to_string()));
+                            items.push(TranscriptItem::ToolResultMarkdown {
+                                text: trimmed.to_string(),
+                                rendered_cache: None,
+                            });
                         }
                     }
                 }

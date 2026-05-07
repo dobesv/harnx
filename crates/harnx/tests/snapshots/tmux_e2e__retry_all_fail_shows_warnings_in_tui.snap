@@ -1,9 +1,10 @@
 ---
 source: crates/harnx/tests/tmux_e2e.rs
+assertion_line: 1672
 expression: normalized
 ---
 Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
-# retry-agent v
+retry-agent v
 🤖 retry-agent ▸ temp
 > hello
 

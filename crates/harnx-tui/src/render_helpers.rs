@@ -1,104 +1,30 @@
 use harnx_core::event::AgentSource;
-use ratatui::style::Style;
+
+#[cfg(test)]
 use ratatui::text::{Line, Span};
 
+#[cfg(test)]
+use ratatui::style::Style;
+
 /// Render one line of inline markdown into ratatui spans, applying
-/// `base_style` as the foreground/modifier base. Delegates to the
-/// `tui-markdown` crate (which wraps `pulldown-cmark` + `syntect` +
-/// `ansi-to-tui` internally), so we get the same inline emphasis handling
-/// (`**bold**`, `*italic*`, `` `code` ``) without maintaining our own
-/// parser.
+/// `base_style` as the foreground/modifier base. Uses the new
+/// `render_markdown` module for consistent rendering.
 ///
 /// On render failure (empty result), returns the input as a single plain
 /// span so the user still sees the text — markdown styling is a
 /// presentation nicety, not a correctness requirement.
 ///
-/// Currently only used in tests; production rendering uses
-/// `markdown_lines` for full block parsing.
+/// Only used in tests.
 #[cfg(test)]
 pub(crate) fn markdown_line_spans(text: &str, base_style: Style) -> Line<'static> {
     let plain_fallback = || Line::from(Span::styled(text.to_string(), base_style));
-
-    // `tui_markdown::from_str` returns a `Text` with zero or more lines.
-    // For a single input line we expect exactly one parsed line; any
-    // additional lines (which shouldn't happen for inline markdown) are
-    // dropped — caller is expected to split the input on `\n` first.
-    let parsed = tui_markdown::from_str(text);
-    let first = match parsed.into_iter().next() {
-        Some(line) if !line.spans.is_empty() => line,
-        _ => return plain_fallback(),
-    };
-
-    Line::from(patch_spans(first.spans.into_iter().collect(), base_style))
-}
-
-/// Render multi-line markdown into ratatui lines, patching `base_style`
-/// under each parsed span. Used for assistant messages where the input
-/// may include code fences, lists, headings, and other block-level
-/// markdown — `tui-markdown` handles the whole document at once.
-///
-/// Single newlines in the input are converted to CommonMark hard line
-/// breaks (`  \n`) before parsing. CommonMark normally collapses single
-/// newlines into spaces (paragraph reflow), but in a CLI/TUI the LLM's
-/// chosen line breaks are part of the formatting the user wants to see.
-/// Paragraph breaks (`\n\n`) and fenced code blocks keep working: the
-/// extra trailing spaces inside fences are invisible.
-///
-/// Falls back to one plain `Line` per input newline when `tui-markdown`
-/// produces an empty result, so streaming partial markdown (e.g. an
-/// unclosed `**bold` while the chunk is still arriving) keeps showing.
-pub(crate) fn markdown_lines(text: &str, base_style: Style) -> Vec<Line<'static>> {
-    let with_hard_breaks = text.replace('\n', "  \n");
-    let parsed = tui_markdown::from_str(&with_hard_breaks);
-    if parsed.lines.is_empty() {
-        return text
-            .split('\n')
-            .map(|line| Line::from(Span::styled(line.to_string(), base_style)))
-            .collect();
+    let entry = crate::markdown_render::render_markdown(text, base_style, 120);
+    match entry.blocks.into_iter().next() {
+        Some(crate::markdown_render::MarkdownBlockData::Paragraph { lines, .. }) => {
+            lines.into_iter().next().unwrap_or_else(plain_fallback)
+        }
+        _ => plain_fallback(),
     }
-    parsed
-        .lines
-        .into_iter()
-        .filter(|line| !is_fence_marker_line(line))
-        .map(|line| Line::from(patch_spans(line.spans, base_style)))
-        .collect()
-}
-
-/// Return true if `line` is a bare code-fence marker emitted by `tui-markdown`
-/// (e.g. `` ```sh `` or `` ``` ``). These lines have a single unstyled span
-/// whose trimmed content consists entirely of backticks with an optional
-/// ASCII-lowercase language hint — they carry no information the user needs
-/// to see once the code block content is already rendered.
-fn is_fence_marker_line(line: &ratatui::text::Line<'_>) -> bool {
-    if line.spans.len() != 1 {
-        return false;
-    }
-    let span = &line.spans[0];
-    // Must be unstyled (no fg/bg override set by tui-markdown).
-    if span.style.fg.is_some() || span.style.bg.is_some() {
-        return false;
-    }
-    let content = span.content.trim();
-    // Match ``` optionally followed by an ASCII-lowercase language hint.
-    content.starts_with("```") && content[3..].chars().all(|c| c.is_ascii_lowercase())
-}
-
-/// Patch `base_style` under each parsed span so caller context (e.g. dim
-/// grey for tool body lines) flows through wherever the parsed span
-/// doesn't override it. `Style::patch(left, right)` keeps right's
-/// explicit fields and falls through to left for `None` ones.
-///
-/// Generic over the parsed span's lifetime so it can take output from
-/// `tui_markdown::from_str` (which borrows from the input string), then
-/// upgrades to `Span<'static>` via `Cow::into_owned`.
-fn patch_spans<'a>(spans: Vec<Span<'a>>, base_style: Style) -> Vec<Span<'static>> {
-    spans
-        .into_iter()
-        .map(|span| {
-            let merged = base_style.patch(span.style);
-            Span::styled(span.content.into_owned(), merged)
-        })
-        .collect()
 }
 
 pub(crate) fn render_status_line(markdown: Option<&str>, status: Option<&str>) -> Option<String> {
@@ -260,17 +186,24 @@ mod markdown_tests {
 
     #[test]
     fn multi_line_preserves_each_input_newline() {
-        // Without hard-break preprocessing CommonMark would collapse the
-        // three-line input into one line. We need each `\n` in the source
-        // to become a separate ratatui line.
-        let lines = markdown_lines("line-01\nline-02\nline-03", Style::default());
-        let texts: Vec<String> = lines
+        // Each newline in the source should become a separate line
+        use crate::markdown_render::{render_markdown, MarkdownBlockData};
+
+        let entry = render_markdown("line-01\nline-02\nline-03", Style::default(), 120);
+        let texts: Vec<String> = entry
+            .blocks
             .iter()
-            .map(|l| {
-                l.spans
+            .flat_map(|b| match b {
+                MarkdownBlockData::Paragraph { lines, .. } => lines
                     .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>(),
+                MarkdownBlockData::Table { .. } => vec![],
             })
             .collect();
         assert!(
@@ -292,33 +225,34 @@ mod markdown_tests {
 
     #[test]
     fn multi_line_keeps_paragraph_breaks() {
-        // `\n\n` is a paragraph break — should still produce an empty
-        // line between paragraphs after preprocessing.
-        let lines = markdown_lines("para1\n\npara2", Style::default());
-        let texts: Vec<String> = lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect();
-        let para1_idx = texts.iter().position(|t| t.contains("para1")).unwrap();
-        let para2_idx = texts.iter().position(|t| t.contains("para2")).unwrap();
+        // `\n\n` is a paragraph break — should produce separate blocks
+        use crate::markdown_render::render_markdown;
+
+        let entry = render_markdown("para1\n\npara2", Style::default(), 120);
+        // Check that there are two blocks (two paragraphs)
         assert!(
-            para2_idx > para1_idx + 1,
-            "expected an empty line between paragraphs; got {texts:?}"
+            entry.blocks.len() >= 2,
+            "expected at least 2 blocks for para1\n\npara2; got {} blocks",
+            entry.blocks.len()
         );
     }
 
     #[test]
     fn multi_line_renders_inline_emphasis() {
         // Emphasis still works across lines.
-        let lines = markdown_lines("first line\n**bold line**", Style::default());
-        let bold = lines
+        use crate::markdown_render::{render_markdown, MarkdownBlockData};
+
+        let entry = render_markdown("first line\n**bold line**", Style::default(), 120);
+        let bold = entry
+            .blocks
             .iter()
-            .flat_map(|l| l.spans.iter())
+            .flat_map(|b| match b {
+                MarkdownBlockData::Paragraph { lines, .. } => lines
+                    .iter()
+                    .flat_map(|l| l.spans.iter())
+                    .collect::<Vec<_>>(),
+                MarkdownBlockData::Table { .. } => vec![],
+            })
             .find(|s| s.content.as_ref() == "bold line")
             .expect("expected bold span");
         assert!(bold.style.add_modifier.contains(Modifier::BOLD));
@@ -375,17 +309,26 @@ mod markdown_tests {
 
     #[test]
     fn markdown_lines_filters_out_fence_markers() {
-        // Issue #434: code fence marker lines (```sh, ```) emitted by
-        // tui_markdown must be stripped so they don't appear as literal text.
+        // Issue #434: code fence marker lines (```sh, ```) must be stripped
+        // so they don't appear as literal text.
+        use crate::markdown_render::{render_markdown, MarkdownBlockData};
+
         let input = "```rust\nfn main() {}\n```";
-        let lines = markdown_lines(input, Style::default());
-        let texts: Vec<String> = lines
+        let entry = render_markdown(input, Style::default(), 120);
+        let texts: Vec<String> = entry
+            .blocks
             .iter()
-            .map(|l| {
-                l.spans
+            .flat_map(|b| match b {
+                MarkdownBlockData::Paragraph { lines, .. } => lines
                     .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>(),
+                MarkdownBlockData::Table { .. } => vec![],
             })
             .collect();
 
