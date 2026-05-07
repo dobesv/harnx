@@ -4,7 +4,10 @@ use ansi_colours::AsRGB;
 use anyhow::{anyhow, Context, Result};
 use crossterm::style::{Color, Stylize};
 use crossterm::terminal;
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use std::collections::HashMap;
+use std::iter;
+use std::mem;
 use std::sync::LazyLock;
 use syntect::highlighting::{Color as SyntectColor, FontStyle, Style, Theme};
 use syntect::parsing::SyntaxSet;
@@ -69,7 +72,9 @@ impl MarkdownRender {
     }
 
     pub fn render(&mut self, text: &str) -> String {
-        text.split('\n')
+        let preprocessed = preprocess_tables(text, self.wrap_width.map(usize::from));
+        preprocessed
+            .split('\n')
             .map(|line| self.render_line_mut(line))
             .collect::<Vec<String>>()
             .join("\n")
@@ -195,6 +200,227 @@ fn wrap(text: &str, width: usize) -> String {
         .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit)
         .initial_indent(&text[0..indent]);
     textwrap::wrap(&text[indent..], wrap_options).join("\n")
+}
+
+fn preprocess_tables(text: &str, wrap_width: Option<usize>) -> String {
+    let normalized = text.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let mut output = Vec::with_capacity(lines.len());
+    let mut idx = 0;
+    let mut in_fence = false;
+
+    while idx < lines.len() {
+        let line = lines[idx];
+        // Toggle fence state on lines that start with ``` (with optional info string).
+        // Use detect_code_block so 4+-space-indented backticks are not counted.
+        if detect_code_block(line).is_some() {
+            in_fence = !in_fence;
+            output.push(line.to_string());
+            idx += 1;
+            continue;
+        }
+        if in_fence {
+            // Inside a code fence: always emit raw line, never parse as table.
+            output.push(line.to_string());
+            idx += 1;
+        } else if let Some((table, consumed)) = try_parse_table_block(&lines[idx..], wrap_width) {
+            output.push(table);
+            idx += consumed;
+        } else {
+            output.push(line.to_string());
+            idx += 1;
+        }
+    }
+
+    output.join("\n")
+}
+
+fn try_parse_table_block(lines: &[&str], wrap_width: Option<usize>) -> Option<(String, usize)> {
+    let first_line = *lines.first()?;
+    let mut block = vec![first_line];
+
+    for next_line in lines.iter().skip(1).copied() {
+        if next_line.trim().is_empty() {
+            break;
+        }
+        if next_line.trim_start().starts_with('|') {
+            block.push(next_line);
+        } else {
+            break;
+        }
+    }
+
+    if block.len() < 2 {
+        return None;
+    }
+
+    let consumed = block.len();
+    let block_text = block.join("\n");
+    let parser = Parser::new_ext(&block_text, Options::ENABLE_TABLES);
+    let mut in_table = false;
+    let mut in_head = false;
+    let mut current_cell = String::new();
+    let mut current_row = Vec::new();
+    let mut headers = Vec::new();
+    let mut rows = Vec::new();
+    let mut alignments = Vec::new();
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::Table(found_alignments)) => {
+                in_table = true;
+                alignments = found_alignments;
+            }
+            Event::End(TagEnd::Table) => break,
+            Event::Start(Tag::TableHead) => in_head = true,
+            Event::End(TagEnd::TableHead) => {
+                if !current_row.is_empty() {
+                    headers = mem::take(&mut current_row);
+                }
+                in_head = false;
+            }
+            Event::Start(Tag::TableRow) => current_row.clear(),
+            Event::End(TagEnd::TableRow) => {
+                if in_head {
+                    headers = mem::take(&mut current_row);
+                } else {
+                    rows.push(mem::take(&mut current_row));
+                }
+            }
+            Event::Start(Tag::TableCell) => current_cell.clear(),
+            Event::End(TagEnd::TableCell) => current_row.push(normalize_table_cell(&current_cell)),
+            Event::Text(value) | Event::Code(value) => current_cell.push_str(&value),
+            Event::SoftBreak | Event::HardBreak => current_cell.push(' '),
+            _ => {}
+        }
+    }
+
+    if !in_table || headers.is_empty() {
+        return None;
+    }
+
+    Some((
+        format_table(&headers, &rows, &alignments, wrap_width),
+        consumed,
+    ))
+}
+
+fn normalize_table_cell(cell: &str) -> String {
+    cell.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn format_table(
+    headers: &[String],
+    rows: &[Vec<String>],
+    alignments: &[Alignment],
+    wrap_width: Option<usize>,
+) -> String {
+    let col_count = iter::once(headers.len())
+        .chain(rows.iter().map(Vec::len))
+        .max()
+        .unwrap_or_default();
+    let mut widths = vec![0; col_count];
+
+    for row in iter::once(headers).chain(rows.iter().map(Vec::as_slice)) {
+        for (idx, cell) in row.iter().enumerate() {
+            widths[idx] = widths[idx].max(cell.chars().count());
+        }
+    }
+
+    if let Some(max_width) = wrap_width {
+        clamp_table_width(&mut widths, max_width);
+    }
+
+    let header = format_table_row(headers, &widths, alignments);
+    let separator = format_table_separator(&widths, alignments);
+    let body = rows
+        .iter()
+        .map(|row| format_table_row(row, &widths, alignments))
+        .collect::<Vec<_>>();
+
+    iter::once(header)
+        .chain(iter::once(separator))
+        .chain(body)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn clamp_table_width(widths: &mut [usize], max_width: usize) {
+    let minimum_total = widths.len().saturating_mul(4).saturating_add(1);
+    if widths.is_empty() || minimum_total > max_width {
+        return;
+    }
+
+    while table_total_width(widths) > max_width {
+        let Some((idx, width)) = widths
+            .iter_mut()
+            .enumerate()
+            .max_by_key(|(_, width)| **width)
+        else {
+            break;
+        };
+        if *width <= 1 {
+            break;
+        }
+        *width -= 1;
+        if idx >= widths.len() {
+            break;
+        }
+    }
+}
+
+fn table_total_width(widths: &[usize]) -> usize {
+    widths.iter().sum::<usize>() + widths.len().saturating_mul(3) + 1
+}
+
+fn format_table_row(cells: &[String], widths: &[usize], alignments: &[Alignment]) -> String {
+    let mut row = String::from("|");
+
+    for (idx, width) in widths.iter().copied().enumerate() {
+        let cell = cells.get(idx).map_or("", String::as_str);
+        let cell = truncate_cell(cell, width);
+        let formatted = match alignments.get(idx).copied().unwrap_or(Alignment::None) {
+            Alignment::Left => format!(" {:<width$} |", cell, width = width),
+            Alignment::Center => {
+                let padding = width.saturating_sub(cell.chars().count());
+                let left = padding / 2;
+                let right = padding - left;
+                format!(" {}{}{} |", " ".repeat(left), cell, " ".repeat(right))
+            }
+            Alignment::Right => format!(" {:>width$} |", cell, width = width),
+            Alignment::None => format!(" {:<width$} |", cell, width = width),
+        };
+        row.push_str(&formatted);
+    }
+
+    row
+}
+
+fn truncate_cell(cell: &str, width: usize) -> String {
+    cell.chars().take(width).collect()
+}
+
+fn format_table_separator(widths: &[usize], alignments: &[Alignment]) -> String {
+    let mut row = String::from("|");
+
+    for (idx, width) in widths.iter().copied().enumerate() {
+        let dash_count = width.max(1);
+        let segment = match alignments.get(idx).copied().unwrap_or(Alignment::None) {
+            Alignment::Left => format!(":{:-<width$}|", "", width = dash_count + 1),
+            Alignment::Center => {
+                if dash_count == 1 {
+                    String::from("::|")
+                } else {
+                    format!(":{:-<width$}:|", "", width = dash_count)
+                }
+            }
+            Alignment::Right => format!("{:-<width$}:|", "", width = dash_count + 1),
+            Alignment::None => format!("{:-<width$}|", "", width = dash_count + 2),
+        };
+        row.push_str(&segment);
+    }
+
+    row
 }
 
 #[derive(Debug, Clone, Default)]
@@ -402,6 +628,25 @@ std::error::Error>> {
         assert_eq!(detect_code_block("    ```"), None);
         assert_eq!(detect_code_block("    ```python"), None);
         assert_eq!(detect_code_block("        ```"), None);
+    }
+
+    #[test]
+    fn gfm_table_renders_as_aligned_columns() {
+        let input = "| Name  | Age |\n| ----- | --- |\n| Alice | 30  |\n| Bob   | 25  |\n";
+        let options = RenderOptions::default();
+        let mut render = MarkdownRender::init(options).unwrap();
+        let output = render.render(input);
+        assert!(output.contains("Name"), "header missing: {output}");
+        assert!(output.contains("Alice"), "row missing: {output}");
+        assert!(
+            !output.contains("| ----- | --- |"),
+            "raw separator leaked: {output}"
+        );
+        assert!(output.contains('|'), "column separators missing: {output}");
+        assert!(
+            output.contains("|-------|-----|"),
+            "formatted separator missing: {output}"
+        );
     }
 
     /// Regression test for issue #403: bash output containing indented triple-backtick

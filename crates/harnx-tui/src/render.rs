@@ -1,3 +1,4 @@
+use crate::markdown_render::{MarkdownBlockData, RenderedEntry};
 use crate::types::Tui;
 use crate::types::{
     App, ModalState, ToolCallBody, TranscriptItem, MAX_INPUT_HEIGHT, MIN_INPUT_HEIGHT,
@@ -47,43 +48,36 @@ impl Tui {
         lines
     }
 
-    /// Multi-line markdown body renderer — used for tool call bodies and
-    /// tool results. Block-level constructs like fenced ```diff are handled
-    /// by the whole-document parser. The dim base style is patched under
-    /// each span so plain text still reads as dim.
-    fn render_markdown_block(text: &str) -> Vec<Line<'static>> {
-        let body_base = Style::default().add_modifier(Modifier::DIM);
-        crate::render_helpers::markdown_lines(text, body_base)
-    }
-
     /// Render a `ToolCall` transcript item: `→ tool_name` header followed
     /// by the body lines. Body rendering depends on its origin —
     /// `Markdown` (from a `call_template`) is rendered inline; `Yaml`
     /// (raw args, no template) is displayed verbatim, each line indented.
-    fn render_tool_call(tool_name: &str, body: Option<&ToolCallBody>) -> Vec<Line<'static>> {
+    fn render_tool_call(tool_name: &str, body: Option<&ToolCallBody>, width: u16) -> RenderedEntry {
         let dim_gray = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
 
-        let mut lines = match body {
-            Some(ToolCallBody::Markdown(_)) => Vec::new(),
-            _ => {
-                let header_text = format!("→ {tool_name}");
-                Self::render_text_entry("", &header_text, dim_gray, false)
-            }
-        };
         match body {
+            Some(ToolCallBody::Markdown(md)) => {
+                // Markdown body is the tool description itself — header suppressed
+                // intentionally (the markdown content replaces the "→ tool_name" line).
+                crate::markdown_render::render_markdown(md, dim_gray, width)
+            }
             Some(ToolCallBody::Yaml(yaml)) => {
+                let mut lines = vec![];
+                let header_text = format!("→ {tool_name}");
+                lines.extend(Self::render_text_entry("", &header_text, dim_gray, false));
                 for line in yaml.lines() {
                     lines.extend(Self::render_text_entry("", line, dim_gray, false));
                 }
+                RenderedEntry::from_lines(lines, width)
             }
-            Some(ToolCallBody::Markdown(md)) => {
-                lines.extend(Self::render_markdown_block(md));
+            None => {
+                let header_text = format!("→ {tool_name}");
+                let lines = Self::render_text_entry("", &header_text, dim_gray, false);
+                RenderedEntry::from_lines(lines, width)
             }
-            None => {}
         }
-        lines
     }
 
     fn render_meta_suffix(
@@ -123,36 +117,47 @@ impl Tui {
     }
 
     pub(super) fn render_entry(
-        entry: &TranscriptItem,
+        entry: &mut TranscriptItem,
         show_seq: bool,
         show_ts: bool,
         use_utc: bool,
-    ) -> Vec<Line<'static>> {
+        width: u16,
+        skip_cache: bool,
+    ) -> RenderedEntry {
         match entry {
-            TranscriptItem::SourceHeading(source) => Self::render_text_entry(
-                "",
-                &crate::render_helpers::source_heading(source),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-                false,
-            ),
-            TranscriptItem::SystemText(text) => Self::render_text_entry(
-                "",
-                text,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-                false,
-            ),
-            TranscriptItem::MutationNotice(text) => Self::render_text_entry(
-                "",
-                text,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::DIM),
-                false,
-            ),
+            TranscriptItem::SourceHeading(source) => {
+                let lines = Self::render_text_entry(
+                    "",
+                    &crate::render_helpers::source_heading(source),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
+            TranscriptItem::SystemText(text) => {
+                let lines = Self::render_text_entry(
+                    "",
+                    text,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
+            TranscriptItem::MutationNotice(text) => {
+                let lines = Self::render_text_entry(
+                    "",
+                    text,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
             TranscriptItem::UserText {
                 text,
                 seq,
@@ -173,28 +178,50 @@ impl Tui {
                         first_line.spans.push(suffix);
                     }
                 }
-                lines
+                RenderedEntry::from_lines(lines, width)
             }
             TranscriptItem::AssistantText {
                 text,
                 seq,
                 timestamp,
+                rendered_cache,
             } => {
+                if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
+                    if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
+                        return cached.clone();
+                    }
+                }
                 // Render assistant messages as markdown so headings, lists,
                 // code fences, and inline emphasis show their styling.
                 // Streaming chunks rebuild this entry on every render — an
                 // unclosed `**bold` mid-stream simply renders as literal
                 // asterisks for the moment, then upgrades to bold once the
                 // closing `**` arrives in a later chunk.
-                let mut lines = crate::render_helpers::markdown_lines(text, Style::default());
+                let mut entry =
+                    crate::markdown_render::render_markdown(text, Style::default(), width);
                 if let Some(suffix) =
                     Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
-                    if lines.is_empty() {
-                        lines.push(Line::from(""));
+                    // Attach suffix to first line of first Paragraph block.
+                    // If no paragraph block exists (all tables), insert a
+                    // suffix-only paragraph so metadata is never silently dropped.
+                    let mut attached = false;
+                    for block in &mut entry.blocks {
+                        if let MarkdownBlockData::Paragraph { lines, .. } = block {
+                            if let Some(first_line) = lines.first_mut() {
+                                first_line.spans.push(suffix.clone());
+                                attached = true;
+                            }
+                            break;
+                        }
                     }
-                    if let Some(first_line) = lines.first_mut() {
-                        first_line.spans.push(suffix);
+                    if !attached {
+                        let suffix_line = Line::from(suffix);
+                        entry.total_height += 1;
+                        entry.blocks.push(MarkdownBlockData::Paragraph {
+                            lines: vec![suffix_line],
+                            height: 1,
+                        });
                     }
                 }
                 // Match the prior trailing-spacing rule: pad after a
@@ -202,33 +229,64 @@ impl Tui {
                 // room) but skip the pad when the text already contains
                 // newlines.
                 if !text.contains('\n') {
-                    lines.push(Line::from(""));
+                    entry.blocks.push(MarkdownBlockData::Paragraph {
+                        lines: vec![Line::from("")],
+                        height: 1,
+                    });
+                    entry.total_height += 1;
                 }
-                lines
+                if !skip_cache {
+                    *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
+                }
+                entry
             }
-            TranscriptItem::ErrorText(text) => Self::render_text_entry(
-                "error: ",
+            TranscriptItem::ErrorText(text) => {
+                let lines = Self::render_text_entry(
+                    "error: ",
+                    text,
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    true,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
+            TranscriptItem::ThoughtText(text) => {
+                let lines = Self::render_text_entry(
+                    "",
+                    &format!("<think>{text}</think>"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
+            TranscriptItem::ToolResultMarkdown {
                 text,
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                true,
-            ),
-            TranscriptItem::ThoughtText(text) => Self::render_text_entry(
-                "",
-                &format!("<think>{text}</think>"),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-                false,
-            ),
-            TranscriptItem::ToolResultMarkdown(text) => Self::render_markdown_block(text),
-            TranscriptItem::StatusLine(text) => Self::render_text_entry(
-                "",
-                text,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-                false,
-            ),
+                rendered_cache,
+            } => {
+                if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
+                    if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
+                        return cached.clone();
+                    }
+                }
+                let body_base = Style::default().add_modifier(Modifier::DIM);
+                let entry = crate::markdown_render::render_markdown(text, body_base, width);
+                if !skip_cache {
+                    *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
+                }
+                entry
+            }
+            TranscriptItem::StatusLine(text) => {
+                let lines = Self::render_text_entry(
+                    "",
+                    text,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
             TranscriptItem::Plan(entries) => {
                 let mut lines = Self::render_text_entry(
                     "",
@@ -248,55 +306,84 @@ impl Tui {
                         false,
                     ));
                 }
-                lines
+                RenderedEntry::from_lines(lines, width)
             }
-            TranscriptItem::UsageLine(text) => Self::render_text_entry(
-                "",
-                text,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-                false,
-            ),
+            TranscriptItem::UsageLine(text) => {
+                let lines = Self::render_text_entry(
+                    "",
+                    text,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
             TranscriptItem::ToolCall {
                 tool_name,
                 body,
                 seq,
                 timestamp,
+                rendered_cache,
             } => {
-                let mut lines = vec![];
+                if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
+                    if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
+                        return cached.clone();
+                    }
+                }
+                let mut entry = Self::render_tool_call(tool_name, body.as_ref(), width);
                 if let Some(suffix) =
                     Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
-                    lines.push(Line::from(suffix));
+                    // Prepend a line with the suffix
+                    let suffix_line = Line::from(suffix);
+                    entry.total_height += 1;
+                    entry.blocks.insert(
+                        0,
+                        MarkdownBlockData::Paragraph {
+                            lines: vec![suffix_line],
+                            height: 1,
+                        },
+                    );
                 }
-                lines.extend(Self::render_tool_call(tool_name, body.as_ref()));
-                lines
+                if !skip_cache {
+                    *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
+                }
+                entry
             }
-            TranscriptItem::AttachmentHeader(text) => Self::render_text_entry(
-                "",
-                &format!("{text}:"),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-                false,
-            ),
-            TranscriptItem::AttachmentItem(text) => Self::render_text_entry(
-                "  - ",
-                text,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-                false,
-            ),
-            TranscriptItem::AttachmentPreviewLine(text) => Self::render_text_entry(
-                "      ",
-                text,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-                false,
-            ),
+            TranscriptItem::AttachmentHeader(text) => {
+                let lines = Self::render_text_entry(
+                    "",
+                    &format!("{text}:"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
+            TranscriptItem::AttachmentItem(text) => {
+                let lines = Self::render_text_entry(
+                    "  - ",
+                    text,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
+            TranscriptItem::AttachmentPreviewLine(text) => {
+                let lines = Self::render_text_entry(
+                    "      ",
+                    text,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
         }
     }
 
@@ -343,42 +430,18 @@ impl Tui {
             self.app.scroll_to_focused_item = false;
         }
 
-        let transcript_entries: Vec<Vec<Line<'static>>> = if self.app.transcript.is_empty() {
-            vec![vec![Line::from(Span::raw(""))]]
-        } else {
-            self.app
-                .transcript
-                .iter()
-                .enumerate()
-                .map(|(i, entry)| {
-                    let mut lines = Self::render_entry(entry, show_seq, show_ts, use_utc);
-                    if let Some(range) = &selected_range {
-                        if range.contains(&i) {
-                            for line in &mut lines {
-                                line.style = line.style.add_modifier(Modifier::REVERSED);
-                                for span in &mut line.spans {
-                                    span.style = span.style.add_modifier(Modifier::REVERSED);
-                                }
-                            }
-                        }
-                    }
-                    lines
-                })
-                .collect()
-        };
+        let transcript_entries = self.prepare_transcript_entries(
+            chunks[0].width,
+            show_seq,
+            show_ts,
+            use_utc,
+            &selected_range,
+        );
 
         self.app
             .scroll_state
-            .render(frame, chunks[0], &transcript_entries, |lines| {
-                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-                // Use Paragraph's own wrap-aware line count so the height we
-                // report to the scroll widget exactly matches what the widget
-                // will actually render.  Disagreement here causes the scroll
-                // widget to allocate a mis-sized buffer, which in turn leaves
-                // stale cells in the terminal and produces character-level
-                // rendering artifacts (stray letters, corrupted words).
-                let height = paragraph.line_count(chunks[0].width);
-                (height, paragraph)
+            .render(frame, chunks[0], &transcript_entries, |entry| {
+                (entry.total_height as usize, entry.clone())
             });
 
         // Clamp position to the freshly-updated last_max_position.
@@ -608,6 +671,7 @@ impl Tui {
                     text: String::new(),
                     seq: None,
                     timestamp: Some(chrono::Utc::now()),
+                    rendered_cache: None,
                 });
                 self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
             }
@@ -946,6 +1010,7 @@ impl Tui {
                 body,
                 seq,
                 timestamp,
+                rendered_cache: _,
             } => {
                 lines.push(Line::from(Span::styled("── tool call ──", label_style)));
                 if let Some(s) = seq {
@@ -982,6 +1047,7 @@ impl Tui {
                 text,
                 seq,
                 timestamp,
+                rendered_cache: _,
             } => {
                 lines.push(Line::from(Span::styled("── assistant ──", label_style)));
                 if let Some(s) = seq {
@@ -992,7 +1058,7 @@ impl Tui {
                 }
                 push_field!("text", text);
             }
-            TranscriptItem::ToolResultMarkdown(text) => {
+            TranscriptItem::ToolResultMarkdown { text, .. } => {
                 lines.push(Line::from(Span::styled("── tool result ──", label_style)));
                 push_field!("result", text);
             }
@@ -1164,6 +1230,89 @@ impl Tui {
         frame.render_widget(footer, chunks[1]);
     }
 
+    /// Build the rendered transcript entries for the given viewport width, applying
+    /// cache invalidation, per-item render, and selection highlighting. Called from
+    /// both the main view and the browsing view so the logic lives in one place.
+    fn prepare_transcript_entries(
+        &mut self,
+        width: u16,
+        show_seq: bool,
+        show_ts: bool,
+        use_utc: bool,
+        selected_range: &Option<std::ops::RangeInclusive<usize>>,
+    ) -> Vec<RenderedEntry> {
+        // Invalidate caches when the viewport width changes.
+        if Some(width) != self.app.cache_valid_width {
+            for item in &mut self.app.transcript {
+                match item {
+                    TranscriptItem::AssistantText { rendered_cache, .. } => *rendered_cache = None,
+                    TranscriptItem::ToolResultMarkdown { rendered_cache, .. } => {
+                        *rendered_cache = None
+                    }
+                    TranscriptItem::ToolCall { rendered_cache, .. } => *rendered_cache = None,
+                    _ => {}
+                }
+            }
+            self.app.cache_valid_width = Some(width);
+        }
+
+        if self.app.transcript.is_empty() {
+            return vec![RenderedEntry::from_lines(
+                vec![Line::from(Span::raw(""))],
+                width,
+            )];
+        }
+
+        let streaming_idx = self.app.streaming_assistant_idx;
+        self.app
+            .transcript
+            .iter_mut()
+            .enumerate()
+            .map(|(i, entry)| {
+                let mut rendered = Self::render_entry(
+                    entry,
+                    show_seq,
+                    show_ts,
+                    use_utc,
+                    width,
+                    Some(i) == streaming_idx,
+                );
+                if let Some(range) = selected_range {
+                    if range.contains(&i) {
+                        for block in &mut rendered.blocks {
+                            match block {
+                                MarkdownBlockData::Paragraph { lines, .. } => {
+                                    for line in lines.iter_mut() {
+                                        line.style = line.style.add_modifier(Modifier::REVERSED);
+                                        for span in line.spans.iter_mut() {
+                                            span.style =
+                                                span.style.add_modifier(Modifier::REVERSED);
+                                        }
+                                    }
+                                }
+                                MarkdownBlockData::Table { rows, header, .. } => {
+                                    let rev = ratatui::style::Style::default()
+                                        .add_modifier(Modifier::REVERSED);
+                                    if let Some(hdr) = header.as_mut() {
+                                        for cell in hdr.iter_mut() {
+                                            *cell = cell.clone().style(rev);
+                                        }
+                                    }
+                                    for row in rows.iter_mut() {
+                                        for cell in row.iter_mut() {
+                                            *cell = cell.clone().style(rev);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                rendered
+            })
+            .collect()
+    }
+
     pub(super) fn render_browsing_view(
         &mut self,
         frame: &mut Frame<'_>,
@@ -1202,36 +1351,18 @@ impl Tui {
             self.app.scroll_to_focused_item = false;
         }
 
-        let transcript_entries: Vec<Vec<Line<'static>>> = if self.app.transcript.is_empty() {
-            vec![vec![Line::from(Span::raw(""))]]
-        } else {
-            self.app
-                .transcript
-                .iter()
-                .enumerate()
-                .map(|(i, entry)| {
-                    let mut lines = Self::render_entry(entry, show_seq, show_ts, use_utc);
-                    if let Some(range) = &selected_range {
-                        if range.contains(&i) {
-                            for line in &mut lines {
-                                line.style = line.style.add_modifier(Modifier::REVERSED);
-                                for span in &mut line.spans {
-                                    span.style = span.style.add_modifier(Modifier::REVERSED);
-                                }
-                            }
-                        }
-                    }
-                    lines
-                })
-                .collect()
-        };
+        let transcript_entries = self.prepare_transcript_entries(
+            chunks[0].width,
+            show_seq,
+            show_ts,
+            use_utc,
+            &selected_range,
+        );
 
         self.app
             .browsing_view_scroll
-            .render(frame, chunks[0], &transcript_entries, |lines| {
-                let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-                let height = paragraph.line_count(chunks[0].width);
-                (height, paragraph)
+            .render(frame, chunks[0], &transcript_entries, |entry| {
+                (entry.total_height as usize, entry.clone())
             });
 
         // Clamp position to the freshly-updated last_max_position

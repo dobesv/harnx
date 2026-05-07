@@ -13,6 +13,7 @@ anyhow = { workspace = true }
 bincode = { workspace = true }
 crossterm = { workspace = true }
 nu-ansi-term = { workspace = true }
+pulldown-cmark = "0.13.3"
 serde = { workspace = true }
 syntect = { workspace = true }
 textwrap = { workspace = true }

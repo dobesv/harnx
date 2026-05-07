@@ -7,6 +7,7 @@ pub mod agent_event_sink;
 pub mod event_source;
 pub mod input;
 pub mod lifecycle;
+pub mod markdown_render;
 pub mod prompt;
 pub mod render;
 pub mod render_helpers;

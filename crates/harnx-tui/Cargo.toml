@@ -13,6 +13,7 @@ keywords.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+bincode = { workspace = true }
 chrono = { workspace = true }
 crossterm = { workspace = true }
 fancy-regex = { workspace = true }
@@ -35,10 +36,11 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 shell-words = { workspace = true }
 sha2 = { workspace = true }
+syntect = { workspace = true }
 textwrap = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-tui-markdown = "0.3.7"
+pulldown-cmark = "0.13.3"
 unicode-width = { workspace = true }
 uuid = { workspace = true }
 

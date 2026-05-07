@@ -122,7 +122,10 @@ fn tool_completed_to_transcript_items(
     if clean.is_empty() {
         return vec![];
     }
-    vec![TranscriptItem::ToolResultMarkdown(clean)]
+    vec![TranscriptItem::ToolResultMarkdown {
+        text: clean,
+        rendered_cache: None,
+    }]
 }
 
 impl Tui {
@@ -937,11 +940,15 @@ impl Tui {
                 if !output.is_empty() {
                     if let Some(idx) = self.app.streaming_assistant_idx {
                         match self.app.transcript.get_mut(idx) {
-                            Some(TranscriptItem::AssistantText { text: existing, .. })
-                                if !existing.is_empty() =>
-                            {
+                            Some(TranscriptItem::AssistantText {
+                                text: existing,
+                                rendered_cache,
+                                ..
+                            }) if !existing.is_empty() => {
                                 if existing != &output {
                                     *existing = output;
+                                    // Invalidate cached render so the updated text is re-rendered.
+                                    *rendered_cache = None;
                                 }
                             }
                             _ => {
@@ -949,6 +956,7 @@ impl Tui {
                                     text: output,
                                     seq: None,
                                     timestamp: Some(chrono::Utc::now()),
+                                    rendered_cache: None,
                                 });
                                 self.app.streaming_assistant_idx =
                                     Some(self.app.transcript.len() - 1);
@@ -959,6 +967,7 @@ impl Tui {
                             text: output,
                             seq: None,
                             timestamp: Some(chrono::Utc::now()),
+                            rendered_cache: None,
                         });
                         self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
                     }
@@ -1069,6 +1078,7 @@ impl Tui {
                     body: tool_call_body(markdown.as_deref(), &input),
                     seq: None,
                     timestamp: Some(chrono::Utc::now()),
+                    rendered_cache: None,
                 }]
             }
             // Not rendered by the TUI: Turn, Session, Status, Tool::Progress,
@@ -2191,7 +2201,7 @@ impl Tui {
                 ..
             } => Some(format!("{}({})", tool_name, body)),
             TranscriptItem::ToolCall { tool_name, .. } => Some(format!("{}()", tool_name)),
-            TranscriptItem::ToolResultMarkdown(text) => Some(text.clone()),
+            TranscriptItem::ToolResultMarkdown { text, .. } => Some(text.clone()),
             _ => None,
         }
     }
@@ -2307,7 +2317,7 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         match &items[0] {
-            TranscriptItem::ToolResultMarkdown(text) => {
+            TranscriptItem::ToolResultMarkdown { text, .. } => {
                 assert!(text.contains("Applied patch successfully"));
                 assert!(text.contains("```diff"));
                 assert!(text.contains("-old line"));

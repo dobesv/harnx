@@ -4,6 +4,7 @@ use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::config::SessionMeta;
 use harnx_runtime::utils::AbortSignal;
 
+use crate::markdown_render::RenderedEntry;
 use chrono::{DateTime, Utc};
 use ratatui_textarea::TextArea;
 use std::path::PathBuf;
@@ -69,6 +70,7 @@ pub(super) struct App {
     pub(super) llm_busy: bool,
     pub(super) scroll_state: ratatui_widget_scrolling::ScrollState,
     pub(super) streaming_assistant_idx: Option<usize>,
+    pub(super) cache_valid_width: Option<u16>,
     pub(super) last_ui_output_source: Option<AgentSource>,
     pub(super) last_usage_source: Option<AgentSource>,
     pub(super) last_usage_transcript_idx: Option<usize>,
@@ -206,7 +208,9 @@ impl ModalState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) type RenderedCache = Option<(u16, bool, bool, bool, RenderedEntry)>;
+
+#[derive(Clone, Debug)]
 pub(crate) enum TranscriptItem {
     SourceHeading(AgentSource),
     SystemText(String),
@@ -219,6 +223,7 @@ pub(crate) enum TranscriptItem {
         text: String,
         seq: Option<usize>,
         timestamp: Option<DateTime<Utc>>,
+        rendered_cache: RenderedCache,
     },
     ErrorText(String),
     ThoughtText(String),
@@ -226,7 +231,10 @@ pub(crate) enum TranscriptItem {
     /// MCP `CallToolResult`. Rendered through `markdown_lines` (with a
     /// dim base style) so block-level markdown like fenced diffs and
     /// inline emphasis from a `result_template` both display correctly.
-    ToolResultMarkdown(String),
+    ToolResultMarkdown {
+        text: String,
+        rendered_cache: RenderedCache,
+    },
     StatusLine(String),
     Plan(Vec<PlanEntry>),
     UsageLine(String),
@@ -235,6 +243,7 @@ pub(crate) enum TranscriptItem {
         body: Option<ToolCallBody>,
         seq: Option<usize>,
         timestamp: Option<DateTime<Utc>>,
+        rendered_cache: RenderedCache,
     },
     AttachmentHeader(String),
     AttachmentItem(String),
