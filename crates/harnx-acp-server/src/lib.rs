@@ -619,66 +619,12 @@ mod tests {
         config::{Config, CREATE_TITLE_AGENT},
         test_utils::{MockClient, MockTurnBuilder},
     };
-    use std::{
-        cell::RefCell,
-        pin::Pin,
-        rc::Rc,
-        sync::Arc,
-        task::{Context as TaskContext, Poll},
-    };
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
     use tempfile::TempDir;
-    use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, ReadBuf};
     use tokio::task::LocalSet;
     use tokio::time::{timeout, Duration};
 
-    struct TokioCompat<T> {
-        inner: T,
-    }
-
-    impl<T> TokioCompat<T> {
-        fn new(inner: T) -> Self {
-            Self { inner }
-        }
-    }
-
-    impl<T: TokioAsyncRead + Unpin> futures_util::io::AsyncRead for TokioCompat<T> {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut TaskContext<'_>,
-            buf: &mut [u8],
-        ) -> Poll<std::io::Result<usize>> {
-            let mut read_buf = ReadBuf::new(buf);
-            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
-                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                Poll::Pending => Poll::Pending,
-            }
-        }
-    }
-
-    impl<T: TokioAsyncWrite + Unpin> futures_util::io::AsyncWrite for TokioCompat<T> {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut TaskContext<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            Pin::new(&mut self.inner).poll_write(cx, buf)
-        }
-
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut TaskContext<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.inner).poll_flush(cx)
-        }
-
-        fn poll_close(
-            mut self: Pin<&mut Self>,
-            cx: &mut TaskContext<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Pin::new(&mut self.inner).poll_shutdown(cx)
-        }
-    }
+    use harnx_acp::compat::TokioCompat;
 
     #[derive(Clone)]
     struct TestClient {

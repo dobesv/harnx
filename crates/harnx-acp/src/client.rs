@@ -1,4 +1,4 @@
-use crate::{AcpServerConfig, NestedAcpEvent};
+use crate::{compat::TokioCompat, AcpServerConfig, NestedAcpEvent};
 
 use agent_client_protocol::{self as acp, Agent as _};
 use anyhow::{anyhow, Context, Result};
@@ -8,16 +8,12 @@ use harnx_core::event::{
 use serde_json::json;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::Duration;
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite, BufReader, ReadBuf,
-};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::runtime::Builder;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
@@ -82,10 +78,6 @@ struct AcpNotificationClient {
     activity_tx: broadcast::Sender<String>,
 }
 
-struct TokioCompat<T> {
-    inner: T,
-}
-
 impl AcpNotificationClient {
     fn new(
         agent_name: String,
@@ -128,45 +120,6 @@ impl AcpNotificationClient {
             use harnx_core::sink::emit_agent_event_with_source;
             emit_agent_event_with_source(event, Some(source));
         }
-    }
-}
-
-impl<T> TokioCompat<T> {
-    fn new(inner: T) -> Self {
-        Self { inner }
-    }
-}
-
-impl<T: TokioAsyncRead + Unpin> futures_util::io::AsyncRead for TokioCompat<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let mut read_buf = ReadBuf::new(buf);
-        match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<T: TokioAsyncWrite + Unpin> futures_util::io::AsyncWrite for TokioCompat<T> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
