@@ -769,7 +769,7 @@ async fn worker_main(
     );
     let conn = Rc::new(conn);
 
-    tokio::task::spawn_local(async move {
+    let mut io_handle = tokio::task::spawn_local(async move {
         if let Err(err) = handle_io.await {
             log::debug!("ACP I/O loop exited: {err}");
         }
@@ -800,120 +800,134 @@ async fn worker_main(
 
     let child = Rc::new(RefCell::new(Some(child)));
 
-    while let Some(command) = rx.recv().await {
-        match command {
-            WorkerCommand::NewSession { respond_to } => {
-                let conn = Rc::clone(&conn);
-                let sessions = sessions.clone();
-                let server_name = name.clone();
-                tokio::task::spawn_local(async move {
-                    let result = async {
-                        let response = conn
-                            .new_session(acp::NewSessionRequest::new(std::env::current_dir()?))
-                            .await
-                            .with_context(|| {
-                                format!("Failed to create ACP session on '{}'", server_name)
-                            })?;
-                        let session_id = response.session_id.0.to_string();
-                        sessions
-                            .write()
-                            .await
-                            .insert(session_id.clone(), SessionState::default());
-                        Ok(session_id)
-                    }
-                    .await;
-                    let _ = respond_to.send(result);
-                });
-            }
-            WorkerCommand::Prompt {
-                session_id,
-                message,
-                respond_to,
-            } => {
-                let conn = Rc::clone(&conn);
-                let sessions = sessions.clone();
-                let server_name = name.clone();
-                tokio::task::spawn_local(async move {
-                    let result = async {
-                        {
-                            let mut sessions = sessions.write().await;
-                            let state = sessions.entry(session_id.clone()).or_default();
-                            state.response_text.clear();
-                            state.stop_reason = None;
+    loop {
+        tokio::select! {
+            command = rx.recv() => {
+                match command {
+                    Some(command) => match command {
+                        WorkerCommand::NewSession { respond_to } => {
+                            let conn = Rc::clone(&conn);
+                            let sessions = sessions.clone();
+                            let server_name = name.clone();
+                            tokio::task::spawn_local(async move {
+                                let result = async {
+                                    let response = conn
+                                        .new_session(acp::NewSessionRequest::new(std::env::current_dir()?))
+                                        .await
+                                        .with_context(|| {
+                                            format!("Failed to create ACP session on '{}'", server_name)
+                                        })?;
+                                    let session_id = response.session_id.0.to_string();
+                                    sessions
+                                        .write()
+                                        .await
+                                        .insert(session_id.clone(), SessionState::default());
+                                    Ok(session_id)
+                                }
+                                .await;
+                                let _ = respond_to.send(result);
+                            });
                         }
+                        WorkerCommand::Prompt {
+                            session_id,
+                            message,
+                            respond_to,
+                        } => {
+                            let conn = Rc::clone(&conn);
+                            let sessions = sessions.clone();
+                            let server_name = name.clone();
+                            tokio::task::spawn_local(async move {
+                                let result = async {
+                                    {
+                                        let mut sessions = sessions.write().await;
+                                        let state = sessions.entry(session_id.clone()).or_default();
+                                        state.response_text.clear();
+                                        state.stop_reason = None;
+                                    }
 
-                        let response = conn
-                            .prompt(acp::PromptRequest::new(
-                                session_id.clone(),
-                                vec![message.into()],
-                            ))
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "Failed to send ACP prompt to session '{}' on '{}'",
-                                    session_id, server_name
-                                )
-                            })?;
+                                    let response = conn
+                                        .prompt(acp::PromptRequest::new(
+                                            session_id.clone(),
+                                            vec![message.into()],
+                                        ))
+                                        .await
+                                        .with_context(|| {
+                                            format!(
+                                                "Failed to send ACP prompt to session '{}' on '{}'",
+                                                session_id, server_name
+                                            )
+                                        })?;
 
-                        let mut sessions = sessions.write().await;
-                        let state = sessions.entry(session_id.clone()).or_default();
-                        state.stop_reason = Some(format!("{:?}", response.stop_reason));
-                        Ok(state.response_text.clone())
-                    }
-                    .await;
-                    let _ = respond_to.send(result);
-                });
-            }
-            WorkerCommand::LoadSession {
-                session_id,
-                respond_to,
-            } => {
-                let conn = Rc::clone(&conn);
-                let sessions = sessions.clone();
-                let server_name = name.clone();
-                tokio::task::spawn_local(async move {
-                    let result = async {
-                        conn.load_session(acp::LoadSessionRequest::new(
-                            session_id.clone(),
-                            std::env::current_dir()?,
-                        ))
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to load ACP session '{}' on '{}'",
-                                session_id, server_name
-                            )
-                        })?;
+                                    let mut sessions = sessions.write().await;
+                                    let state = sessions.entry(session_id.clone()).or_default();
+                                    state.stop_reason = Some(format!("{:?}", response.stop_reason));
+                                    Ok(state.response_text.clone())
+                                }
+                                .await;
+                                let _ = respond_to.send(result);
+                            });
+                        }
+                        WorkerCommand::LoadSession {
+                            session_id,
+                            respond_to,
+                        } => {
+                            let conn = Rc::clone(&conn);
+                            let sessions = sessions.clone();
+                            let server_name = name.clone();
+                            tokio::task::spawn_local(async move {
+                                let result = async {
+                                    conn.load_session(acp::LoadSessionRequest::new(
+                                        session_id.clone(),
+                                        std::env::current_dir()?,
+                                    ))
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                            "Failed to load ACP session '{}' on '{}'",
+                                            session_id, server_name
+                                        )
+                                    })?;
 
-                        sessions.write().await.entry(session_id).or_default();
-                        Ok(())
-                    }
-                    .await;
-                    let _ = respond_to.send(result);
-                });
+                                    sessions.write().await.entry(session_id).or_default();
+                                    Ok(())
+                                }
+                                .await;
+                                let _ = respond_to.send(result);
+                            });
+                        }
+                        WorkerCommand::CancelSession {
+                            session_id,
+                            respond_to,
+                        } => {
+                            let conn = Rc::clone(&conn);
+                            let server_name = name.clone();
+                            tokio::task::spawn_local(async move {
+                                let result = conn
+                                    .cancel(acp::CancelNotification::new(session_id.clone()))
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                            "Failed to cancel ACP session '{}' on '{}'",
+                                            session_id, server_name
+                                        )
+                                    });
+                                let _ = respond_to.send(result);
+                            });
+                        }
+                        WorkerCommand::Shutdown { respond_to } => {
+                            let result = shutdown_child(&child).await;
+                            let _ = respond_to.send(result);
+                            break;
+                        }
+                    },
+                    None => break,
+                }
             }
-            WorkerCommand::CancelSession {
-                session_id,
-                respond_to,
-            } => {
-                let conn = Rc::clone(&conn);
-                let server_name = name.clone();
-                tokio::task::spawn_local(async move {
-                    let result = conn
-                        .cancel(acp::CancelNotification::new(session_id.clone()))
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to cancel ACP session '{}' on '{}'",
-                                session_id, server_name
-                            )
-                        });
-                    let _ = respond_to.send(result);
-                });
-            }
-            WorkerCommand::Shutdown { respond_to } => {
-                let result = shutdown_child(&child).await;
-                let _ = respond_to.send(result);
+            _ = &mut io_handle => {
+                log::warn!(
+                    "ACP I/O loop for '{}' exited unexpectedly; terminating worker",
+                    name
+                );
                 break;
             }
         }
