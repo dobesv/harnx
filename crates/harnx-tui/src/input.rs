@@ -940,11 +940,15 @@ impl Tui {
                 if !output.is_empty() {
                     if let Some(idx) = self.app.streaming_assistant_idx {
                         match self.app.transcript.get_mut(idx) {
-                            Some(TranscriptItem::AssistantText { text: existing, .. })
-                                if !existing.is_empty() =>
-                            {
+                            Some(TranscriptItem::AssistantText {
+                                text: existing,
+                                rendered_cache,
+                                ..
+                            }) if !existing.is_empty() => {
                                 if existing != &output {
                                     *existing = output;
+                                    // Invalidate cached render so the updated text is re-rendered.
+                                    *rendered_cache = None;
                                 }
                             }
                             _ => {

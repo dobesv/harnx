@@ -59,6 +59,8 @@ impl Tui {
 
         match body {
             Some(ToolCallBody::Markdown(md)) => {
+                // Markdown body is the tool description itself — header suppressed
+                // intentionally (the markdown content replaces the "→ tool_name" line).
                 crate::markdown_render::render_markdown(md, dim_gray, width)
             }
             Some(ToolCallBody::Yaml(yaml)) => {
@@ -184,8 +186,8 @@ impl Tui {
                 timestamp,
                 rendered_cache,
             } => {
-                if let Some((w, cached)) = rendered_cache.as_ref() {
-                    if *w == width {
+                if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
+                    if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
                         return cached.clone();
                     }
                 }
@@ -234,7 +236,7 @@ impl Tui {
                     entry.total_height += 1;
                 }
                 if !skip_cache {
-                    *rendered_cache = Some((width, entry.clone()));
+                    *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
                 }
                 entry
             }
@@ -262,15 +264,15 @@ impl Tui {
                 text,
                 rendered_cache,
             } => {
-                if let Some((w, cached)) = rendered_cache.as_ref() {
-                    if *w == width {
+                if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
+                    if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
                         return cached.clone();
                     }
                 }
                 let body_base = Style::default().add_modifier(Modifier::DIM);
                 let entry = crate::markdown_render::render_markdown(text, body_base, width);
                 if !skip_cache {
-                    *rendered_cache = Some((width, entry.clone()));
+                    *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
                 }
                 entry
             }
@@ -324,8 +326,8 @@ impl Tui {
                 timestamp,
                 rendered_cache,
             } => {
-                if let Some((w, cached)) = rendered_cache.as_ref() {
-                    if *w == width {
+                if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
+                    if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
                         return cached.clone();
                     }
                 }
@@ -345,7 +347,7 @@ impl Tui {
                     );
                 }
                 if !skip_cache {
-                    *rendered_cache = Some((width, entry.clone()));
+                    *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
                 }
                 entry
             }
@@ -428,74 +430,13 @@ impl Tui {
             self.app.scroll_to_focused_item = false;
         }
 
-        let frame_width = chunks[0].width;
-        if Some(frame_width) != self.app.cache_valid_width {
-            for item in &mut self.app.transcript {
-                match item {
-                    TranscriptItem::AssistantText { rendered_cache, .. } => *rendered_cache = None,
-                    TranscriptItem::ToolResultMarkdown { rendered_cache, .. } => {
-                        *rendered_cache = None
-                    }
-                    TranscriptItem::ToolCall { rendered_cache, .. } => *rendered_cache = None,
-                    _ => {}
-                }
-            }
-            self.app.cache_valid_width = Some(frame_width);
-        }
-
-        let transcript_entries: Vec<RenderedEntry> = if self.app.transcript.is_empty() {
-            vec![RenderedEntry::from_lines(
-                vec![Line::from(Span::raw(""))],
-                chunks[0].width,
-            )]
-        } else {
-            self.app
-                .transcript
-                .iter_mut()
-                .enumerate()
-                .map(|(i, entry)| {
-                    let mut rendered = Self::render_entry(
-                        entry,
-                        show_seq,
-                        show_ts,
-                        use_utc,
-                        chunks[0].width,
-                        Some(i) == self.app.streaming_assistant_idx,
-                    );
-                    if let Some(range) = &selected_range {
-                        if range.contains(&i) {
-                            for block in &mut rendered.blocks {
-                                match block {
-                                    MarkdownBlockData::Paragraph { lines, .. } => {
-                                        for line in lines.iter_mut() {
-                                            line.style = line.style.add_modifier(Modifier::REVERSED);
-                                            for span in line.spans.iter_mut() {
-                                                span.style =
-                                                    span.style.add_modifier(Modifier::REVERSED);
-                                            }
-                                        }
-                                    }
-                                    MarkdownBlockData::Table { rows, header, .. } => {
-                                        let rev = ratatui::style::Style::default().add_modifier(Modifier::REVERSED);
-                                        if let Some(hdr) = header.as_mut() {
-                                            for cell in hdr.iter_mut() {
-                                                *cell = cell.clone().style(rev);
-                                            }
-                                        }
-                                        for row in rows.iter_mut() {
-                                            for cell in row.iter_mut() {
-                                                *cell = cell.clone().style(rev);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    rendered
-                })
-                .collect()
-        };
+        let transcript_entries = self.prepare_transcript_entries(
+            chunks[0].width,
+            show_seq,
+            show_ts,
+            use_utc,
+            &selected_range,
+        );
 
         self.app
             .scroll_state
@@ -1289,6 +1230,89 @@ impl Tui {
         frame.render_widget(footer, chunks[1]);
     }
 
+    /// Build the rendered transcript entries for the given viewport width, applying
+    /// cache invalidation, per-item render, and selection highlighting. Called from
+    /// both the main view and the browsing view so the logic lives in one place.
+    fn prepare_transcript_entries(
+        &mut self,
+        width: u16,
+        show_seq: bool,
+        show_ts: bool,
+        use_utc: bool,
+        selected_range: &Option<std::ops::RangeInclusive<usize>>,
+    ) -> Vec<RenderedEntry> {
+        // Invalidate caches when the viewport width changes.
+        if Some(width) != self.app.cache_valid_width {
+            for item in &mut self.app.transcript {
+                match item {
+                    TranscriptItem::AssistantText { rendered_cache, .. } => *rendered_cache = None,
+                    TranscriptItem::ToolResultMarkdown { rendered_cache, .. } => {
+                        *rendered_cache = None
+                    }
+                    TranscriptItem::ToolCall { rendered_cache, .. } => *rendered_cache = None,
+                    _ => {}
+                }
+            }
+            self.app.cache_valid_width = Some(width);
+        }
+
+        if self.app.transcript.is_empty() {
+            return vec![RenderedEntry::from_lines(
+                vec![Line::from(Span::raw(""))],
+                width,
+            )];
+        }
+
+        let streaming_idx = self.app.streaming_assistant_idx;
+        self.app
+            .transcript
+            .iter_mut()
+            .enumerate()
+            .map(|(i, entry)| {
+                let mut rendered = Self::render_entry(
+                    entry,
+                    show_seq,
+                    show_ts,
+                    use_utc,
+                    width,
+                    Some(i) == streaming_idx,
+                );
+                if let Some(range) = selected_range {
+                    if range.contains(&i) {
+                        for block in &mut rendered.blocks {
+                            match block {
+                                MarkdownBlockData::Paragraph { lines, .. } => {
+                                    for line in lines.iter_mut() {
+                                        line.style = line.style.add_modifier(Modifier::REVERSED);
+                                        for span in line.spans.iter_mut() {
+                                            span.style =
+                                                span.style.add_modifier(Modifier::REVERSED);
+                                        }
+                                    }
+                                }
+                                MarkdownBlockData::Table { rows, header, .. } => {
+                                    let rev = ratatui::style::Style::default()
+                                        .add_modifier(Modifier::REVERSED);
+                                    if let Some(hdr) = header.as_mut() {
+                                        for cell in hdr.iter_mut() {
+                                            *cell = cell.clone().style(rev);
+                                        }
+                                    }
+                                    for row in rows.iter_mut() {
+                                        for cell in row.iter_mut() {
+                                            *cell = cell.clone().style(rev);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                rendered
+            })
+            .collect()
+    }
+
     pub(super) fn render_browsing_view(
         &mut self,
         frame: &mut Frame<'_>,
@@ -1327,74 +1351,13 @@ impl Tui {
             self.app.scroll_to_focused_item = false;
         }
 
-        let frame_width = chunks[0].width;
-        if Some(frame_width) != self.app.cache_valid_width {
-            for item in &mut self.app.transcript {
-                match item {
-                    TranscriptItem::AssistantText { rendered_cache, .. } => *rendered_cache = None,
-                    TranscriptItem::ToolResultMarkdown { rendered_cache, .. } => {
-                        *rendered_cache = None
-                    }
-                    TranscriptItem::ToolCall { rendered_cache, .. } => *rendered_cache = None,
-                    _ => {}
-                }
-            }
-            self.app.cache_valid_width = Some(frame_width);
-        }
-
-        let transcript_entries: Vec<RenderedEntry> = if self.app.transcript.is_empty() {
-            vec![RenderedEntry::from_lines(
-                vec![Line::from(Span::raw(""))],
-                chunks[0].width,
-            )]
-        } else {
-            self.app
-                .transcript
-                .iter_mut()
-                .enumerate()
-                .map(|(i, entry)| {
-                    let mut rendered = Self::render_entry(
-                        entry,
-                        show_seq,
-                        show_ts,
-                        use_utc,
-                        chunks[0].width,
-                        Some(i) == self.app.streaming_assistant_idx,
-                    );
-                    if let Some(range) = &selected_range {
-                        if range.contains(&i) {
-                            for block in &mut rendered.blocks {
-                                match block {
-                                    MarkdownBlockData::Paragraph { lines, .. } => {
-                                        for line in lines.iter_mut() {
-                                            line.style = line.style.add_modifier(Modifier::REVERSED);
-                                            for span in line.spans.iter_mut() {
-                                                span.style =
-                                                    span.style.add_modifier(Modifier::REVERSED);
-                                            }
-                                        }
-                                    }
-                                    MarkdownBlockData::Table { rows, header, .. } => {
-                                        let rev = ratatui::style::Style::default().add_modifier(Modifier::REVERSED);
-                                        if let Some(hdr) = header.as_mut() {
-                                            for cell in hdr.iter_mut() {
-                                                *cell = cell.clone().style(rev);
-                                            }
-                                        }
-                                        for row in rows.iter_mut() {
-                                            for cell in row.iter_mut() {
-                                                *cell = cell.clone().style(rev);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    rendered
-                })
-                .collect()
-        };
+        let transcript_entries = self.prepare_transcript_entries(
+            chunks[0].width,
+            show_seq,
+            show_ts,
+            use_utc,
+            &selected_range,
+        );
 
         self.app
             .browsing_view_scroll

@@ -370,11 +370,11 @@ pub fn render_markdown(text: &str, base_style: Style, width: u16) -> RenderedEnt
                     .patch(Style::default().fg(Color::Cyan));
                 if let Some(state) = table_state.as_mut() {
                     let owned = content.into_string();
-                    state.current_cell_width = state.current_cell_width.max(
-                        UnicodeWidthStr::width(owned.as_str())
-                            .try_into()
-                            .unwrap_or(u16::MAX),
-                    );
+                    let fragment_width: u16 = UnicodeWidthStr::width(owned.as_str())
+                        .try_into()
+                        .unwrap_or(u16::MAX);
+                    state.current_cell_width =
+                        state.current_cell_width.saturating_add(fragment_width);
                     state.current_cell_spans.push(Span::styled(owned, style));
                 } else {
                     ensure_line_prefix(
@@ -430,7 +430,7 @@ pub fn render_markdown(text: &str, base_style: Style, width: u16) -> RenderedEnt
                 let marker = if checked { "[x] " } else { "[ ] " };
                 let style = resolve_span_style(base_style, &inline_stack, heading_style);
                 if let Some(state) = table_state.as_mut() {
-                    state.current_cell_width = state.current_cell_width.max(4);
+                    state.current_cell_width = state.current_cell_width.saturating_add(4);
                     state
                         .current_cell_spans
                         .push(Span::styled(marker.to_string(), style));
@@ -467,11 +467,11 @@ pub fn render_markdown(text: &str, base_style: Style, width: u16) -> RenderedEnt
                     .patch(Style::default().add_modifier(Modifier::UNDERLINED));
                 if let Some(state) = table_state.as_mut() {
                     let owned = format!("[{content}]");
-                    state.current_cell_width = state.current_cell_width.max(
-                        UnicodeWidthStr::width(owned.as_str())
-                            .try_into()
-                            .unwrap_or(u16::MAX),
-                    );
+                    let fragment_width: u16 = UnicodeWidthStr::width(owned.as_str())
+                        .try_into()
+                        .unwrap_or(u16::MAX);
+                    state.current_cell_width =
+                        state.current_cell_width.saturating_add(fragment_width);
                     state.current_cell_spans.push(Span::styled(owned, style));
                 } else {
                     ensure_line_prefix(
@@ -620,62 +620,38 @@ fn append_code_block_text(
     // Find syntax by language name or extension
     let syntax: Option<&SyntaxReference> = lang.and_then(|l| find_syntax_by_name(syntax_set, l));
 
-    // Process each line independently (syntect works line-by-line)
-    for segment in text.split('\n') {
+    // For the no-known-syntax path: detect from first line then reuse for all subsequent lines.
+    // We also handle diff as a special case.
+    let effective_syntax: Option<&SyntaxReference> = if syntax.is_some() {
+        syntax
+    } else {
+        // Peek at first non-empty segment for first-line detection
+        let first_seg = text.split('\n').next().unwrap_or("");
+        if first_seg.starts_with("diff --git") || lang == Some("diff") {
+            find_syntax_by_name(syntax_set, "diff")
+        } else {
+            find_syntax_by_first_line(syntax_set, first_seg)
+        }
+    };
+
+    // Create a single HighlightLines for the whole block so multi-line parser state
+    // (block comments, heredocs, strings) is preserved across lines.
+    let mut highlighter: Option<HighlightLines> =
+        effective_syntax.map(|s| HighlightLines::new(s, theme));
+
+    // Process each line; use index to detect first segment without string comparison.
+    for (seg_idx, segment) in text.split('\n').enumerate() {
         let needs_newline = !current_spans.is_empty() || !current_lines.is_empty();
-        if needs_newline && segment != text.split('\n').next().unwrap_or_default() {
+        if needs_newline && seg_idx != 0 {
             flush_line(current_lines, current_spans);
         }
         ensure_line_prefix(current_spans, blockquote_depth, pending_list_prefix);
 
         if !segment.is_empty() {
-            // Apply syntect highlighting to this line
-            let spans = if let Some(syntax) = syntax {
-                highlight_line_to_spans(segment, syntax, theme, syntax_set, base_style)
+            let spans = if let Some(hl) = highlighter.as_mut() {
+                highlight_line_to_spans(segment, hl, syntax_set, base_style)
             } else {
-                // No syntax found - try first-line detection for non-empty lines
-                let detected_syntax = find_syntax_by_first_line(syntax_set, segment);
-                if let Some(ds) = detected_syntax {
-                    if !segment.trim().is_empty() && !segment.starts_with("diff --git") {
-                        highlight_line_to_spans(segment, ds, theme, syntax_set, base_style)
-                    } else {
-                        // Fallback for diff files: use Diff syntax if available
-                        if segment.starts_with("diff --git") || lang == Some("diff") {
-                            find_syntax_by_name(syntax_set, "diff")
-                                .map(|diff_syntax| {
-                                    highlight_line_to_spans(
-                                        segment,
-                                        diff_syntax,
-                                        theme,
-                                        syntax_set,
-                                        base_style,
-                                    )
-                                })
-                                .unwrap_or_else(|| {
-                                    vec![Span::styled(segment.to_string(), base_style)]
-                                })
-                        } else {
-                            vec![Span::styled(segment.to_string(), base_style)]
-                        }
-                    }
-                } else {
-                    // Fallback for diff files: always use Diff syntax
-                    if segment.starts_with("diff --git") || lang == Some("diff") {
-                        find_syntax_by_name(syntax_set, "diff")
-                            .map(|diff_syntax| {
-                                highlight_line_to_spans(
-                                    segment,
-                                    diff_syntax,
-                                    theme,
-                                    syntax_set,
-                                    base_style,
-                                )
-                            })
-                            .unwrap_or_else(|| vec![Span::styled(segment.to_string(), base_style)])
-                    } else {
-                        vec![Span::styled(segment.to_string(), base_style)]
-                    }
-                }
+                vec![Span::styled(segment.to_string(), base_style)]
             };
             current_spans.extend(spans);
         }
@@ -730,13 +706,10 @@ fn find_syntax_by_first_line<'a>(
 /// Highlight a single line using syntect and convert to ratatui Spans.
 fn highlight_line_to_spans(
     line: &str,
-    syntax: &SyntaxReference,
-    theme: &Theme,
+    highlighter: &mut HighlightLines,
     syntax_set: &SyntaxSet,
     base_style: Style,
 ) -> Vec<Span<'static>> {
-    let mut highlighter = HighlightLines::new(syntax, theme);
-
     match highlighter.highlight_line(line, syntax_set) {
         Ok(ranges) => {
             let mut spans = Vec::new();

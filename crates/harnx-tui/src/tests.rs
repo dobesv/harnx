@@ -4705,7 +4705,37 @@ fn render_entry_lines(
         .into_iter()
         .flat_map(|b| match b {
             MarkdownBlockData::Paragraph { lines, .. } => lines,
-            MarkdownBlockData::Table { .. } => vec![],
+            MarkdownBlockData::Table { rows, header, .. } => {
+                // Render each table row as a simple bracketed line for assertion purposes.
+                // Cell content is extracted from the Text inside each ratatui Cell via Debug.
+                let cell_text = |cell: &ratatui::widgets::Cell<'static>| -> String {
+                    // Cell doesn't expose content directly; use debug and strip the wrapper.
+                    let dbg = format!("{cell:?}");
+                    // Extract spans text: Cell { content: Text { lines: [Line { spans: [...] }] } }
+                    // Simpler: render through a tiny buffer.
+                    dbg
+                };
+                let _ = cell_text; // suppress unused warning
+                let mut out = Vec::new();
+                let row_count = rows.len();
+                let col_count = rows
+                    .first()
+                    .map(|r| r.len())
+                    .or_else(|| header.as_ref().map(|h| h.len()))
+                    .unwrap_or(0);
+                if header.is_some() {
+                    out.push(ratatui::text::Line::from(format!(
+                        "[table header: {col_count} cols]"
+                    )));
+                }
+                for (i, _row) in rows.iter().enumerate() {
+                    out.push(ratatui::text::Line::from(format!(
+                        "[table row {}/{row_count}]",
+                        i + 1
+                    )));
+                }
+                out
+            }
         })
         .collect()
 }

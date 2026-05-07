@@ -207,13 +207,27 @@ fn preprocess_tables(text: &str, wrap_width: Option<usize>) -> String {
     let lines: Vec<&str> = normalized.split('\n').collect();
     let mut output = Vec::with_capacity(lines.len());
     let mut idx = 0;
+    let mut in_fence = false;
 
     while idx < lines.len() {
-        if let Some((table, consumed)) = try_parse_table_block(&lines[idx..], wrap_width) {
+        let line = lines[idx];
+        // Toggle fence state on lines that start with ``` (with optional info string).
+        // Use detect_code_block so 4+-space-indented backticks are not counted.
+        if detect_code_block(line).is_some() {
+            in_fence = !in_fence;
+            output.push(line.to_string());
+            idx += 1;
+            continue;
+        }
+        if in_fence {
+            // Inside a code fence: always emit raw line, never parse as table.
+            output.push(line.to_string());
+            idx += 1;
+        } else if let Some((table, consumed)) = try_parse_table_block(&lines[idx..], wrap_width) {
             output.push(table);
             idx += consumed;
         } else {
-            output.push(lines[idx].to_string());
+            output.push(line.to_string());
             idx += 1;
         }
     }

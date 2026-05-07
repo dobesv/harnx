@@ -208,6 +208,8 @@ impl ModalState {
     }
 }
 
+pub(crate) type RenderedCache = Option<(u16, bool, bool, bool, RenderedEntry)>;
+
 #[derive(Clone, Debug)]
 pub(crate) enum TranscriptItem {
     SourceHeading(AgentSource),
@@ -221,8 +223,7 @@ pub(crate) enum TranscriptItem {
         text: String,
         seq: Option<usize>,
         timestamp: Option<DateTime<Utc>>,
-        #[allow(clippy::type_complexity)]
-        rendered_cache: Option<(u16, RenderedEntry)>,
+        rendered_cache: RenderedCache,
     },
     ErrorText(String),
     ThoughtText(String),
@@ -232,8 +233,7 @@ pub(crate) enum TranscriptItem {
     /// inline emphasis from a `result_template` both display correctly.
     ToolResultMarkdown {
         text: String,
-        #[allow(clippy::type_complexity)]
-        rendered_cache: Option<(u16, RenderedEntry)>,
+        rendered_cache: RenderedCache,
     },
     StatusLine(String),
     Plan(Vec<PlanEntry>),
@@ -243,8 +243,7 @@ pub(crate) enum TranscriptItem {
         body: Option<ToolCallBody>,
         seq: Option<usize>,
         timestamp: Option<DateTime<Utc>>,
-        #[allow(clippy::type_complexity)]
-        rendered_cache: Option<(u16, RenderedEntry)>,
+        rendered_cache: RenderedCache,
     },
     AttachmentHeader(String),
     AttachmentItem(String),
