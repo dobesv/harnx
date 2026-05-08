@@ -1,0 +1,6 @@
+name: example-pkg
+description: "A demonstration harnx package showing the on-disk layout"
+harnx_min_version: "0.30.0"
+homepage: https://github.com/example/harnx-example-package
+license: MIT
+version: v0.1.0

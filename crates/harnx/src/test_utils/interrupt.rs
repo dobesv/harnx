@@ -416,6 +416,7 @@ pub fn write_with_sub_agent(
         description: None,
         idle_timeout_secs: 60,
         operation_timeout_secs: 60,
+        package: None,
     };
     std::fs::write(
         acp_servers_dir.join("child.yaml"),
@@ -527,6 +528,7 @@ pub async fn spawn_acp_client(
         description: None,
         idle_timeout_secs: 300,
         operation_timeout_secs: 60,
+        package: None,
     };
     let client = harnx_acp::AcpClient::new(config);
     client

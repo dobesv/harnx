@@ -1823,6 +1823,7 @@ async fn test_tool_result_switch_agent_parsing() {
         description: None,
         idle_timeout_secs: 300,
         operation_timeout_secs: 3600,
+        package: None,
     }]);
     config.write().acp_manager = Some(Arc::new(manager));
 

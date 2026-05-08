@@ -356,7 +356,7 @@ impl ModelType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct RequestPatch {
     pub chat_completions: Option<ApiPatch>,
     pub embeddings: Option<ApiPatch>,

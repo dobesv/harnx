@@ -274,6 +274,44 @@ fn matches_tool_glob(pattern: &str, name: &str) -> bool {
         .is_some_and(|g| g.compile_matcher().is_match(name))
 }
 
+/// Extract a valid package name from a directory path entry.
+/// Returns None for non-directories and hidden directories (starting with '.').
+fn package_dir_name(path: &std::path::Path) -> Option<String> {
+    if !path.is_dir() {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    if name.starts_with('.') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Compute the display name for an MCP server given the active agent's package.
+///
+/// - Top-level servers (`package == None`): unchanged name.
+/// - Same-package servers: bare name (the yaml stem, e.g. `fs`).
+/// - Other-package servers: `<sanitized_pkg>__<bare_name>` (e.g. `otherpkg__db`).
+pub fn mcp_server_display_name(server: &McpServerConfig, agent_package: Option<&str>) -> String {
+    use harnx_core::package_namespace::sanitize_for_tool_name;
+    match (&server.package, agent_package) {
+        (None, _) => server.name.clone(),
+        (Some(pkg), Some(ap)) if pkg == ap => server.name.clone(),
+        (Some(pkg), _) => format!("{}__{}", sanitize_for_tool_name(pkg), server.name),
+    }
+}
+
+/// Compute the display name for an ACP server given the active agent's package.
+/// Mirrors the MCP logic exactly.
+fn acp_server_display_name(server: &AcpServerConfig, agent_package: Option<&str>) -> String {
+    use harnx_core::package_namespace::sanitize_for_tool_name;
+    match (&server.package, agent_package) {
+        (None, _) => server.name.clone(),
+        (Some(pkg), Some(ap)) if pkg == ap => server.name.clone(),
+        (Some(pkg), _) => format!("{}__{}", sanitize_for_tool_name(pkg), server.name),
+    }
+}
+
 fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
     crate::config::agent::list_agents()
         .into_iter()
@@ -640,7 +678,13 @@ impl Config {
     }
 
     pub fn agent_file(name: &str) -> PathBuf {
-        paths::agent_file(name)
+        if let Some((pkg, stem)) = name.split_once('/') {
+            paths::package_dir(pkg)
+                .join(paths::AGENTS_DIR_NAME)
+                .join(format!("{stem}.md"))
+        } else {
+            paths::agents_config_dir().join(format!("{name}.md"))
+        }
     }
 
     pub fn models_override_file() -> PathBuf {
@@ -1206,7 +1250,7 @@ impl Config {
     pub fn retrieve_agent(&self, name: &str) -> Result<Agent> {
         let path = Self::agent_file(name);
         let mut agent = if path.exists() {
-            self::agent::load(&path)?
+            self::agent::load_with_qualified_name(&path, name)?
         } else {
             self::agent::builtin(name)?
         };
@@ -1266,6 +1310,13 @@ impl Config {
     }
 
     pub fn use_agent_obj(&mut self, agent: Agent) -> Result<()> {
+        // Reinitialize MCP/ACP managers scoped to the incoming agent's package
+        // (or None for top-level agents). This gives the agent a clean view:
+        // same-package MCP servers appear under their bare names, others prefixed.
+        let agent_package =
+            harnx_core::package_namespace::pkg_from_qualified(agent.name()).map(str::to_string);
+        self.reinit_managers_for_agent(agent_package.as_deref());
+
         if let Some(session) = self.session.as_mut() {
             session.guard_empty()?;
             session.set_agent(&agent)?;
@@ -1362,7 +1413,7 @@ impl Config {
         let mut agents: HashMap<String, AgentConfig> = HashMap::new();
         for name in list_agents() {
             let path = Self::agent_file(&name);
-            if let Ok(agent) = self::agent::load(&path) {
+            if let Ok(agent) = self::agent::load_with_qualified_name(&path, &name) {
                 agents.insert(name, agent.into_config());
             }
         }
@@ -2277,6 +2328,8 @@ impl Config {
         if self.agent.take().is_some() {
             self.rag.take();
             self.discontinuous_last_message();
+            // Restore global (no-agent) manager view: all package servers prefixed.
+            self.reinit_managers_for_agent(None);
         }
         Ok(())
     }
@@ -2927,8 +2980,51 @@ impl Config {
             Self::load_mcp_servers_from_dir(&config_dir.join(paths::MCP_SERVERS_DIR_NAME))?;
         config.acp_servers =
             Self::load_acp_servers_from_dir(&config_dir.join(paths::ACP_SERVERS_DIR_NAME))?;
+        let packages_dir = paths::packages_dir();
+        if packages_dir.is_dir() {
+            Self::load_packages(&mut config, &packages_dir)?;
+        }
         Self::auto_register_agents(&mut config.acp_servers)?;
+
         Ok(config)
+    }
+
+    fn load_packages(config: &mut Config, packages_dir: &Path) -> Result<()> {
+        let Ok(entries) = std::fs::read_dir(packages_dir) else {
+            return Ok(());
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let Some(pkg_name) = package_dir_name(&path) else {
+                continue;
+            };
+            Self::load_package_servers(config, &path, &pkg_name);
+        }
+        Ok(())
+    }
+
+    /// Load MCP and ACP servers from a single package directory.
+    ///
+    /// Servers are stored with their bare names (the yaml stem) and tagged with
+    /// `package = Some(pkg_name)`.  The actual display name used with the LLM
+    /// — bare or prefixed — is decided at `init_mcp_manager_for_agent` time
+    /// based on which agent is active.
+    fn load_package_servers(config: &mut Config, pkg_path: &Path, pkg_name: &str) {
+        let pkg_mcp_dir = pkg_path.join(paths::MCP_SERVERS_DIR_NAME);
+        if pkg_mcp_dir.is_dir() {
+            for mut server in Self::load_mcp_servers_from_dir(&pkg_mcp_dir).unwrap_or_default() {
+                server.package = Some(pkg_name.to_string());
+                config.mcp_servers.push(server);
+            }
+        }
+
+        let pkg_acp_dir = pkg_path.join(paths::ACP_SERVERS_DIR_NAME);
+        if pkg_acp_dir.is_dir() {
+            for mut server in Self::load_acp_servers_from_dir(&pkg_acp_dir).unwrap_or_default() {
+                server.package = Some(pkg_name.to_string());
+                config.acp_servers.push(server);
+            }
+        }
     }
 
     fn load_clients_from_dir(dir: &Path) -> Result<Vec<ClientConfig>> {
@@ -3002,6 +3098,10 @@ impl Config {
         let current_exe = std::env::current_exe()?.to_string_lossy().to_string();
         for agent_name in list_agents() {
             if !existing_names.contains(&agent_name) {
+                // Extract the package for package agents (e.g. "mypkg/coder" → Some("mypkg")).
+                // Top-level agents have package = None.
+                let pkg = harnx_core::package_namespace::pkg_from_qualified(&agent_name)
+                    .map(str::to_string);
                 acp_servers.push(AcpServerConfig {
                     name: agent_name.clone(),
                     command: current_exe.clone(),
@@ -3011,6 +3111,7 @@ impl Config {
                     description: None,
                     idle_timeout_secs: 300,
                     operation_timeout_secs: 3600,
+                    package: pkg,
                 });
             }
         }
@@ -3225,40 +3326,87 @@ impl Config {
         declarations
     }
 
-    fn init_mcp_manager(&mut self) {
-        if self.mcp_servers.is_empty() {
-            return;
-        }
-        let mut mcp_servers = self.mcp_servers.clone();
-        let mut extra_roots = self.mcp_root.clone();
-        if let Ok(cwd) = env::current_dir() {
-            if let Ok(cwd_str) = cwd.into_os_string().into_string() {
-                if !extra_roots.contains(&cwd_str) {
-                    extra_roots.insert(0, cwd_str);
-                }
-            }
-        }
-        if !extra_roots.is_empty() {
-            for server in mcp_servers.iter_mut() {
-                for root in extra_roots.iter().rev() {
-                    if !server.roots.contains(root) {
-                        server.roots.insert(0, root.clone());
+    /// (Re)initialize the MCP and ACP managers for the given active agent.
+    ///
+    /// `agent_package` is `Some("mypkg")` when the active agent belongs to
+    /// an installed package, or `None` for top-level agents.
+    ///
+    /// Package MCP/ACP servers that belong to the **same** package as the
+    /// active agent are registered under their **bare name** (e.g. `fs`),
+    /// so the LLM sees tools as `fs_read_file`.  Servers from other packages
+    /// keep their prefixed name (e.g. `otherpkg__db`), and top-level servers
+    /// are always registered under their original name.
+    ///
+    /// When switching agents this replaces the old managers entirely, killing
+    /// any running MCP server subprocesses, giving a clean slate.
+    fn reinit_managers_for_agent(&mut self, agent_package: Option<&str>) {
+        // ── MCP ──────────────────────────────────────────────────────────────
+        self.mcp_manager = if self.mcp_servers.is_empty() {
+            None
+        } else {
+            let mut mcp_servers: Vec<McpServerConfig> = self
+                .mcp_servers
+                .iter()
+                .filter_map(|s| {
+                    if !s.enabled {
+                        return None;
+                    }
+                    let mut s = s.clone();
+                    s.name = mcp_server_display_name(&s, agent_package);
+                    Some(s)
+                })
+                .collect();
+
+            // Prepend cwd to roots for every server
+            let mut extra_roots = self.mcp_root.clone();
+            if let Ok(cwd) = env::current_dir() {
+                if let Ok(cwd_str) = cwd.into_os_string().into_string() {
+                    if !extra_roots.contains(&cwd_str) {
+                        extra_roots.insert(0, cwd_str);
                     }
                 }
             }
-        }
-        let manager = McpManager::new();
-        manager.initialize(mcp_servers);
-        self.mcp_manager = Some(Arc::new(manager));
+            if !extra_roots.is_empty() {
+                for server in mcp_servers.iter_mut() {
+                    for root in extra_roots.iter().rev() {
+                        if !server.roots.contains(root) {
+                            server.roots.insert(0, root.clone());
+                        }
+                    }
+                }
+            }
+
+            let manager = McpManager::new();
+            manager.initialize(mcp_servers);
+            Some(Arc::new(manager))
+        };
+
+        // ── ACP ──────────────────────────────────────────────────────────────
+        self.acp_manager = if self.acp_servers.is_empty() {
+            None
+        } else {
+            let acp_servers: Vec<AcpServerConfig> = self
+                .acp_servers
+                .iter()
+                .map(|s| {
+                    let mut s = s.clone();
+                    s.name = acp_server_display_name(&s, agent_package);
+                    s
+                })
+                .collect();
+            let manager = AcpManager::new();
+            manager.initialize(acp_servers);
+            Some(Arc::new(manager))
+        };
+    }
+
+    fn init_mcp_manager(&mut self) {
+        self.reinit_managers_for_agent(None);
     }
 
     fn init_acp_manager(&mut self) {
-        if self.acp_servers.is_empty() {
-            return;
-        }
-        let manager = AcpManager::new();
-        manager.initialize(self.acp_servers.clone());
-        self.acp_manager = Some(Arc::new(manager));
+        // ACP init is folded into reinit_managers_for_agent; this stub exists
+        // so the call-site in Config::init() continues to compile unchanged.
     }
 
     pub fn mcp_list_servers(config: &GlobalConfig) -> Vec<String> {
@@ -4038,6 +4186,7 @@ mod tests {
             description: None,
             rename_tools: HashMap::new(),
             tool_templates: HashMap::new(),
+            package: None,
         };
         config.mcp_servers = vec![server];
         config.mcp_root = vec!["/extra".to_string()];

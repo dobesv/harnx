@@ -30,4 +30,8 @@ pub struct AcpServerConfig {
     pub idle_timeout_secs: u64,
     #[serde(default = "default_operation_timeout")]
     pub operation_timeout_secs: u64,
+    /// The package this server belongs to, if it came from an installed package.
+    /// Not serialized — set at runtime by the package loader.
+    #[serde(skip)]
+    pub package: Option<String>,
 }
