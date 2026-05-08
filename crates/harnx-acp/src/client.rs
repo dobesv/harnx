@@ -1201,6 +1201,7 @@ mod tests {
             description: None,
             idle_timeout_secs: 5,
             operation_timeout_secs: 30,
+            package: None,
         };
         let client = AcpClient::new(config);
 

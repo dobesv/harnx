@@ -15,6 +15,7 @@ members = [
     "crates/harnx-mcp-time",
     "crates/harnx-mcp-plans",
     "crates/harnx-mcp-history",
+    "crates/harnx-pkg",
     "crates/harnx-rag",
     "crates/harnx-render",
     "crates/harnx-runtime",
@@ -44,6 +45,7 @@ opt-level = "z"
 [workspace.dependencies]
 anyhow = "1.0.69"
 bytes = "1.4.0"
+axum = "0.8"
 clap = { version = "4.4.8", features = ["derive"] }
 dirs = "6.0.0"
 futures-util = "0.3.29"
@@ -72,7 +74,11 @@ ansi_colours = "1.2.2"
 reqwest-eventsource = { git = "https://github.com/jpopesculian/reqwest-eventsource", rev = "356e2f61827b193bd5ab389c38059bcc2eed90aa" }
 simplelog = "0.12.1"
 log = "0.4.20"
-gix = { version = "0.83.0", features = ["blob-diff", "worktree-mutation", "tree-editor"] }
+gix = { version = "0.83.0", features = ["blob-diff", "worktree-mutation", "tree-editor", "blocking-network-client"] }
+oci-client = "0.16"
+semver = { version = "1.0", features = ["serde"] }
+mockall = "0.13"
+registry-testkit = "0.1"
 shell-words = "1.1.0"
 sha2 = "0.11.0"
 unicode-width = "0.2.0"

@@ -1,0 +1,45 @@
+[package]
+name = "harnx-pkg"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Package manager for harnx agent configurations"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[[bin]]
+name = "harnx-pkg"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+flate2 = "1"
+gix = { workspace = true, features = ["blocking-network-client"] }
+harnx-core = { path = "../harnx-core" }
+log = { workspace = true }
+oci-client = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+simplelog = { workspace = true }
+tar = "0.4"
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+axum = { workspace = true }
+bytes = { workspace = true }
+mockall = { workspace = true }
+registry-testkit = { workspace = true }
+tempfile = "3"
+harnx-runtime = { path = "../harnx-runtime" }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true }

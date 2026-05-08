@@ -13,6 +13,15 @@ pub const CONFIG_FILE_NAME: &str = "config.yaml";
 /// Subdirectory holding user-authored macros.
 pub const MACROS_DIR_NAME: &str = "macros";
 
+/// Subdirectory holding installed packages.
+pub const PACKAGES_DIR_NAME: &str = "packages";
+
+/// Filename of the manifest written by harnx-pkg at install time.
+pub const PACKAGE_MANIFEST_FILE_NAME: &str = "manifest.yaml";
+
+/// Filename of optional metadata provided by the package itself.
+pub const PACKAGE_METADATA_FILE_NAME: &str = "package.yaml";
+
 /// Shell env file loaded by `load_env_file`, relative to the config dir.
 pub const ENV_FILE_NAME: &str = ".env";
 
@@ -176,6 +185,31 @@ pub fn acp_servers_dir() -> PathBuf {
     config_dir_path().join(ACP_SERVERS_DIR_NAME)
 }
 
+/// Root directory for all installed packages: `<config_dir>/packages/`.
+pub fn packages_dir() -> PathBuf {
+    config_dir().join(PACKAGES_DIR_NAME)
+}
+
+/// Directory for a specific installed package: `<config_dir>/packages/<name>/`.
+pub fn package_dir(name: &str) -> PathBuf {
+    packages_dir().join(name)
+}
+
+/// Path to the manifest file for a specific package.
+pub fn package_manifest_file(name: &str) -> PathBuf {
+    package_dir(name).join(PACKAGE_MANIFEST_FILE_NAME)
+}
+
+/// Path to the optional metadata file for a specific package.
+pub fn package_metadata_file(name: &str) -> PathBuf {
+    package_dir(name).join(PACKAGE_METADATA_FILE_NAME)
+}
+
+/// Path to the local patch file for a specific package: `<config_dir>/packages/<name>.patch.yaml`.
+pub fn package_patch_file(name: &str) -> PathBuf {
+    packages_dir().join(format!("{name}.patch.yaml"))
+}
+
 /// Path to a specific macro file by name (extension `.yaml`).
 pub fn macro_file(name: &str) -> PathBuf {
     macros_dir().join(format!("{name}.yaml"))
@@ -227,7 +261,14 @@ pub fn agents_config_dir() -> PathBuf {
 
 /// Per-agent instruction file: `<config_dir>/agents/<name>.md`.
 pub fn agent_file(name: &str) -> PathBuf {
-    agents_config_dir().join(format!("{name}.md"))
+    // Check if this is a package agent (contains '/')
+    if let Some((pkg, stem)) = name.split_once('/') {
+        package_dir(pkg)
+            .join(AGENTS_DIR_NAME)
+            .join(format!("{stem}.md"))
+    } else {
+        agents_config_dir().join(format!("{name}.md"))
+    }
 }
 
 /// Optional models-override YAML file; if present, overrides models.yaml entries.
@@ -621,5 +662,41 @@ mod tests {
             state_dir,
         );
         assert_eq!(got, PathBuf::from(test_path).join(HARNX_NAME));
+    }
+
+    #[test]
+    fn packages_dir_under_config_dir() {
+        let test_dir = "/tmp/harnx_pkg_path_test_4a7b";
+        let got = with_env("HARNX_CONFIG_DIR", test_dir, packages_dir);
+        assert!(
+            got.starts_with(test_dir),
+            "packages_dir() should be under config_dir"
+        );
+        assert!(
+            got.ends_with(PACKAGES_DIR_NAME),
+            "packages_dir() should end with 'packages'"
+        );
+    }
+
+    #[test]
+    fn package_dir_under_packages_dir() {
+        let test_dir = "/tmp/harnx_pkg_path_test_8c3d";
+        let got = with_env("HARNX_CONFIG_DIR", test_dir, || package_dir("mypkg"));
+        assert!(
+            got.ends_with("packages/mypkg"),
+            "package_dir('mypkg') should end with 'packages/mypkg', got: {}",
+            got.display()
+        );
+    }
+
+    #[test]
+    fn package_patch_file_sibling_to_dir() {
+        let test_dir = "/tmp/harnx_pkg_patch_test_f2e1";
+        let got = with_env("HARNX_CONFIG_DIR", test_dir, || package_patch_file("mypkg"));
+        assert!(
+            got.ends_with("packages/mypkg.patch.yaml"),
+            "package_patch_file('mypkg') should end with 'packages/mypkg.patch.yaml', got: {}",
+            got.display()
+        );
     }
 }

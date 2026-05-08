@@ -495,6 +495,7 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
         description: None,
         rename_tools: Default::default(),
         tool_templates: Default::default(),
+        package: None,
     };
     std::fs::write(
         mcp_servers_dir.join("repro249.yaml"),
@@ -1185,6 +1186,7 @@ fn write_handoff_fixture_files_inner(
             description: None,
             idle_timeout_secs: 300,
             operation_timeout_secs: 3600,
+            package: None,
         };
         std::fs::write(
             acp_servers_dir.join(format!("{}.yaml", HANDOFF_SUB_AGENT_NAME)),

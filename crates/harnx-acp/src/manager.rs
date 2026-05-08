@@ -609,6 +609,7 @@ mod tests {
             description: None,
             idle_timeout_secs: 300,
             operation_timeout_secs: 3600,
+            package: None,
         }
     }
 

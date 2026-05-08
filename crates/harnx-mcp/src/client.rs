@@ -565,6 +565,7 @@ mod tests {
             description: None,
             rename_tools: HashMap::new(),
             tool_templates: HashMap::new(),
+            package: None,
         }
     }
 

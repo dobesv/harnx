@@ -61,13 +61,92 @@ pub fn builtin(name: &str) -> Result<Agent> {
 }
 
 pub fn load(path: &Path) -> Result<Agent> {
-    let contents = read_to_string(path)
-        .with_context(|| format!("Failed to read agent file at '{}'", path.display()))?;
     let name = path
         .file_stem()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow!("Invalid agent file name: '{}'", path.display()))?;
-    Ok(Agent::new(AgentConfig::from_markdown(name, &contents)?))
+    load_with_qualified_name(path, name)
+}
+
+pub fn load_with_qualified_name(path: &Path, qualified_name: &str) -> Result<Agent> {
+    let contents = read_to_string(path)
+        .with_context(|| format!("Failed to read agent file at '{}'", path.display()))?;
+    load_with_qualified_name_from_contents(path, qualified_name, &contents)
+}
+
+fn load_with_qualified_name_from_contents(
+    path: &Path,
+    qualified_name: &str,
+    contents: &str,
+) -> Result<Agent> {
+    let mut config = AgentConfig::from_markdown(qualified_name, contents)?;
+    let _ = path;
+    if let Some((pkg, stem)) = qualified_name.split_once('/') {
+        apply_package_agent_transforms(&mut config, pkg, stem)?;
+    }
+    Ok(Agent::new(config))
+}
+
+/// Apply patches for package agents.
+///
+/// Note: `use_tools` entries are intentionally left as the author wrote them
+/// (e.g. `fs_read_file`).  The MCP manager is scoped to the active agent at
+/// runtime, so same-package servers are already registered under their bare
+/// names — no rewriting needed here.
+fn apply_package_agent_transforms(
+    config: &mut AgentConfig,
+    pkg_name: &str,
+    agent_stem: &str,
+) -> Result<()> {
+    if let Some(patch) = load_package_patch_for(pkg_name)? {
+        apply_agent_patch(config, agent_stem, &patch)?;
+    }
+    Ok(())
+}
+
+fn load_package_patch_for(pkg_name: &str) -> Result<Option<harnx_core::package::PackagePatch>> {
+    let patch_path = harnx_core::config_paths::package_patch_file(pkg_name);
+    if !patch_path.exists() {
+        return Ok(None);
+    }
+    let content = read_to_string(&patch_path)
+        .with_context(|| format!("Failed to read package patch at '{}'", patch_path.display()))?;
+    let patch = serde_yaml::from_str(&content).with_context(|| {
+        format!(
+            "Failed to parse package patch at '{}'",
+            patch_path.display()
+        )
+    })?;
+    Ok(Some(patch))
+}
+
+fn apply_agent_patch(
+    config: &mut AgentConfig,
+    agent_stem: &str,
+    patch: &harnx_core::package::PackagePatch,
+) -> Result<()> {
+    use fancy_regex::Regex;
+
+    for (pattern, agent_patch) in &patch.agents {
+        let regex = Regex::new(pattern)
+            .with_context(|| format!("Invalid package agent patch regex: '{pattern}'"))?;
+        if regex
+            .is_match(agent_stem)
+            .with_context(|| format!("Failed to test package agent patch regex: '{pattern}'"))?
+        {
+            if let Some(model) = &agent_patch.model {
+                config.set_model_id(Some(model.clone()));
+            }
+            if let Some(temp) = agent_patch.temperature {
+                config.set_temperature(Some(temp));
+            }
+            if let Some(fallback_models) = &agent_patch.fallback_models {
+                config.set_model_fallbacks(fallback_models.clone());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Load file-backed defaults for variables that have a `path:` field.
@@ -334,6 +413,33 @@ pub fn list_agents() -> Vec<String> {
             .collect(),
         Err(_) => vec![],
     };
+
+    // Also include package agents with qualified names (pkg/stem)
+    let packages_dir = harnx_core::config_paths::packages_dir();
+    if let Ok(pkg_entries) = read_dir(&packages_dir) {
+        for pkg_entry in pkg_entries.filter_map(|e| e.ok()) {
+            let pkg_path = pkg_entry.path();
+            if !pkg_path.is_dir() {
+                continue;
+            }
+            let pkg_name = match pkg_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) if !n.starts_with('.') => n.to_string(),
+                _ => continue,
+            };
+            let agents_dir = pkg_path.join(harnx_core::config_paths::AGENTS_DIR_NAME);
+            if let Ok(agent_entries) = read_dir(&agents_dir) {
+                for agent_entry in agent_entries.filter_map(|e| e.ok()) {
+                    let path = agent_entry.path();
+                    if path.extension().and_then(|x| x.to_str()) == Some("md") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            output.push(format!("{pkg_name}/{stem}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     output.sort();
     output.dedup();
     output

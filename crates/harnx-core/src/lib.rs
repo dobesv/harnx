@@ -20,6 +20,8 @@ pub mod llm_trace;
 pub mod macros;
 pub mod message;
 pub mod model;
+pub mod package;
+pub mod package_namespace;
 pub mod path;
 pub mod provider_config;
 pub mod retry_config;

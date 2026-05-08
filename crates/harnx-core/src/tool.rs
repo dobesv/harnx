@@ -108,11 +108,18 @@ fn make_template_env<'a>() -> Environment<'a> {
         "truncate",
         |value: &str, length: usize, end: Option<&str>| -> String {
             let ellipsis = end.unwrap_or("...");
-            if value.len() <= length {
+            // Count chars, not bytes — `length` is a character budget so multi-byte
+            // input (e.g. em-dashes) doesn't compare or slice on byte indices.
+            if value.chars().count() <= length {
                 value.to_string()
             } else {
-                let cut = length.saturating_sub(ellipsis.len());
-                format!("{}{}", &value[..cut], ellipsis)
+                let cut_chars = length.saturating_sub(ellipsis.chars().count());
+                let byte_idx = value
+                    .char_indices()
+                    .nth(cut_chars)
+                    .map(|(i, _)| i)
+                    .unwrap_or(value.len());
+                format!("{}{}", &value[..byte_idx], ellipsis)
             }
         },
     );
@@ -462,6 +469,76 @@ mod tests {
             "fallback",
         );
         assert_eq!(result.unwrap(), "ls");
+    }
+
+    #[test]
+    fn test_truncate_filter_short_value_unchanged() {
+        let out = render_tool_call_template(
+            "{{ args.s | truncate(20) }}",
+            &serde_json::json!({"s": "hello"}),
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn test_truncate_filter_ascii_truncates_with_default_ellipsis() {
+        let out = render_tool_call_template(
+            "{{ args.s | truncate(8) }}",
+            &serde_json::json!({"s": "abcdefghijkl"}),
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "abcde...");
+    }
+
+    #[test]
+    fn test_truncate_filter_custom_end() {
+        let out = render_tool_call_template(
+            "{{ args.id | truncate(8, '') }}",
+            &serde_json::json!({"id": "0123456789abcdef"}),
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "01234567");
+    }
+
+    /// Regression: previously `truncate` sliced on byte indices, which panicked
+    /// when the cut landed inside a multi-byte char like `—` (3 bytes in UTF-8).
+    #[test]
+    fn test_truncate_filter_does_not_panic_on_multibyte_boundary() {
+        // The em-dash sits across byte indices 56..59; `length=60` minus a
+        // 3-char ellipsis yields a 57-byte cut that bisected the em-dash.
+        let s = "## Goal\nImplement `crates/harnx-pkg/src/semver_util.rs` — pure semver logic for the package system.";
+        let out = render_tool_call_template(
+            "{{ args.s | truncate(60) }}",
+            &serde_json::json!({"s": s}),
+            "",
+        )
+        .unwrap();
+        assert!(
+            out.ends_with("..."),
+            "expected ellipsis suffix, got {out:?}"
+        );
+        assert_eq!(
+            out.chars().count(),
+            60,
+            "char count must equal requested length, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_filter_counts_chars_not_bytes() {
+        // 5 em-dashes = 5 chars but 15 bytes. With length=10 (>5 chars) it
+        // should NOT truncate, even though byte length exceeds 10.
+        let out = render_tool_call_template(
+            "{{ args.s | truncate(10) }}",
+            &serde_json::json!({"s": "—————"}),
+            "",
+        )
+        .unwrap();
+        assert_eq!(out, "—————");
     }
 
     #[test]
