@@ -83,6 +83,12 @@ pub enum ToolEvent {
         id: String,
         error: String,
     },
+    Blocked {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
