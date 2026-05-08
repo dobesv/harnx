@@ -1,6 +1,6 @@
 ---
 source: crates/harnx/tests/tmux_e2e.rs
-assertion_line: 1752
+assertion_line: 1754
 expression: normalized
 ---
 Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
@@ -12,8 +12,8 @@ retry-agent v
 RETRY_SUCCESS_RESPONSE: Hello from the retried model!
 
 📢 Autonaming the session.
+> retry-agent ▸ temp
 Should not reach here.
-
 
 
 

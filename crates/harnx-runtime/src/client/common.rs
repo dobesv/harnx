@@ -206,10 +206,19 @@ pub async fn call_chat_completions_streaming(
         }));
     }
 
-    // Emit Turn::Started so the installed sink starts a "Generating" spinner.
+    // Emit Turn::Started with source so the CLI sink shows agent+session heading.
     {
-        use harnx_core::event::{AgentEvent, TurnEvent};
-        harnx_core::sink::emit_agent_event(AgentEvent::Turn(TurnEvent::Started));
+        use harnx_core::event::{AgentEvent, AgentSource, TurnEvent};
+        let agent_source = {
+            let cfg = config.read();
+            let agent = cfg.extract_agent().name().to_string();
+            let session_id = cfg.session.as_ref().map(|s| s.id().to_string());
+            AgentSource { agent, session_id }
+        };
+        harnx_core::sink::emit_agent_event_with_source(
+            AgentEvent::Turn(TurnEvent::Started),
+            Some(agent_source),
+        );
     }
 
     // Drain the SseHandler's channel — chunk display is now driven by

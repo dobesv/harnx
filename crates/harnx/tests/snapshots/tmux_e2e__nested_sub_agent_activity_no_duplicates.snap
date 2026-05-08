@@ -1,6 +1,6 @@
 ---
 source: crates/harnx/tests/tmux_e2e.rs
-assertion_line: 1330
+assertion_line: 1332
 expression: normalized
 ---
 Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
@@ -28,8 +28,8 @@ response: Researcher delegating to analyst.
 Nested task complete
 
 📢 Autonaming the session.
+> nested-parent ▸ temp
 No more scripted responses.
-
 
 
 

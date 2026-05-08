@@ -222,6 +222,12 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
                 render_options,
                 abort_signal.clone(),
             );
+            {
+                let mut cfg = config.write();
+                if cfg.session.is_none() {
+                    cfg.use_session(None)?;
+                }
+            }
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
             let mut async_manager = AsyncHookManager::new();
             let persistent_manager =
@@ -747,6 +753,26 @@ mod resume_tests {
         assert_eq!(
             session_resume_command(&config).unwrap(),
             "harnx -a my-agent -s my-session"
+        );
+    }
+
+    #[test]
+    fn returns_agent_and_session_in_resume_command() {
+        // Test with UUID-like anonymous session and agent
+        let session = session_with_message("550e8400-e29b-41d4-a716-446655440000");
+        let mut agent = crate::config::Agent::default();
+        agent.set_name("atlas");
+
+        let config = Config {
+            agent: Some(agent),
+            session: Some(session),
+            ..Default::default()
+        };
+        let config = Arc::new(RwLock::new(config));
+
+        assert_eq!(
+            session_resume_command(&config).unwrap(),
+            "harnx -a atlas -s 550e8400-e29b-41d4-a716-446655440000"
         );
     }
 
