@@ -397,6 +397,9 @@ impl AgentEventSink for CliAgentEventSink {
             }) => {
                 state.print_tool_completed(&output, markdown.as_deref());
             }
+            AgentEvent::Tool(ToolEvent::Blocked { name, reason, .. }) => {
+                eprintln!("{}", warning_text(&format!("blocked: {name} — {reason}")));
+            }
             // Silent for Progress / Update — they are streamed mid-call
             // updates that would clutter stderr.
             AgentEvent::Tool(_) => {}
@@ -477,6 +480,15 @@ mod tests {
             None,
         );
         sink.emit(AgentEvent::Model(ModelEvent::Error("boom".into())), None);
+        sink.emit(
+            AgentEvent::Tool(ToolEvent::Blocked {
+                id: String::new(),
+                name: "test_tool".into(),
+                input: serde_json::Value::Null,
+                reason: "hook denied".into(),
+            }),
+            None,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

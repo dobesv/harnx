@@ -842,7 +842,9 @@ impl Tui {
         // across those events.
         let is_turn_boundary = matches!(
             &event,
-            AgentEvent::Tool(ToolEvent::Started { .. }) | AgentEvent::Plan { .. }
+            AgentEvent::Tool(ToolEvent::Started { .. })
+                | AgentEvent::Tool(ToolEvent::Blocked { .. })
+                | AgentEvent::Plan { .. }
         );
         if is_turn_boundary {
             self.app.streaming_assistant_idx = None;
@@ -1076,6 +1078,32 @@ impl Tui {
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
                     body: tool_call_body(markdown.as_deref(), &input),
+                    seq: None,
+                    timestamp: Some(chrono::Utc::now()),
+                    rendered_cache: None,
+                }]
+            }
+            AgentEvent::Tool(ToolEvent::Blocked {
+                name,
+                input,
+                reason,
+                ..
+            }) => {
+                let body = {
+                    let reason_text = format!("⊘ blocked: {reason}");
+                    let input_text = match &input {
+                        serde_json::Value::Null => String::new(),
+                        _ => {
+                            let yaml = harnx_runtime::utils::pretty_yaml_block(&input);
+                            format!("{yaml}\n")
+                        }
+                    };
+                    let full = format!("{input_text}{reason_text}");
+                    Some(crate::types::ToolCallBody::Markdown(full))
+                };
+                vec![TranscriptItem::ToolCall {
+                    tool_name: name,
+                    body,
                     seq: None,
                     timestamp: Some(chrono::Utc::now()),
                     rendered_cache: None,

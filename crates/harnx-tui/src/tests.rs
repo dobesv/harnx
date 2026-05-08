@@ -4486,6 +4486,46 @@ async fn tui_renders_started_title_when_template_provides_it() {
 }
 
 #[tokio::test]
+async fn tui_renders_blocked_tool_call_in_transcript() {
+    let mut tui = Tui::init(
+        &test_config(),
+        AsyncHookManager::new(),
+        Arc::new(Mutex::new(PersistentHookManager::new())),
+    )
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Blocked {
+            id: "call-1".into(),
+            name: "bash_exec".into(),
+            input: yaml_to_json("command: rm -rf /tmp/demo"),
+            reason: "hook denied".into(),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let tool_call = tui
+        .app
+        .transcript
+        .iter()
+        .find_map(|entry| match entry {
+            TranscriptItem::ToolCall { body, .. } => Some(body),
+            _ => None,
+        })
+        .expect("expected ToolCall transcript item");
+
+    match tool_call {
+        Some(ToolCallBody::Markdown(body)) => {
+            assert!(body.contains("⊘ blocked: hook denied"));
+            assert!(body.contains("command: rm -rf /tmp/demo"));
+        }
+        other => panic!("expected markdown tool body, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn tui_falls_back_to_yaml_when_no_template_title() {
     // Regression guard: when title is None (no template configured), the
     // existing yaml-of-input behavior must be preserved.

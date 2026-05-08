@@ -140,6 +140,11 @@ pub fn build_tool_eval_context(
         Arc::new(move |call: &ToolCall, result: &Value| {
             emit_tool_result_with_template(call, result, &decl_map_clone2);
         });
+    let decl_map_clone3 = Arc::clone(&decl_map);
+    let emit_tool_blocked_fn: Arc<ToolCallEmitFn> =
+        Arc::new(move |call: &ToolCall, blocked_result: &Value| {
+            emit_tool_blocked_with_template(call, blocked_result, &decl_map_clone3);
+        });
 
     let confirm_tool_use_fn: Arc<ConfirmToolUseFn> = Arc::new(default_confirm_tool_use);
 
@@ -149,6 +154,7 @@ pub fn build_tool_eval_context(
         allowed_tool_names,
         emit_tool_call_fn,
         emit_tool_result_fn,
+        emit_tool_blocked_fn,
         confirm_tool_use_fn,
         dispatch_hook_fn,
     }
@@ -265,6 +271,35 @@ fn emit_tool_result_with_template(
     if !harnx_core::sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
         print_tool_result_fallback(call, result, decl_map, &raw_fallback);
     }
+}
+
+fn emit_tool_blocked_with_template(
+    call: &ToolCall,
+    blocked_result: &Value,
+    decl_map: &HashMap<String, ToolDeclaration>,
+) {
+    use harnx_core::event::{AgentEvent, ToolEvent};
+
+    let reason = blocked_result
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("blocked by hook")
+        .to_string();
+
+    let raw_fallback = match &call.arguments {
+        Value::Null => String::new(),
+        _ => pretty_yaml_block(&call.arguments),
+    };
+    let input_rendered = render_call(call, &call.arguments, &raw_fallback, decl_map);
+
+    let event = AgentEvent::Tool(ToolEvent::Blocked {
+        id: call.id.clone().unwrap_or_default(),
+        name: call.name.clone(),
+        input: call.arguments.clone(),
+        reason,
+    });
+    let _ = input_rendered;
+    let _ = harnx_core::sink::emit_agent_event(event);
 }
 
 /// Look up `call.name` in `decl_map`, render `call_template` against `json_data`
