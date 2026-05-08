@@ -47,7 +47,9 @@ pub enum MarkdownBlockData {
     },
     Table {
         header: Option<Vec<Cell<'static>>>,
+        header_height: u16,
         rows: Vec<Vec<Cell<'static>>>,
+        row_heights: Vec<u16>,
         col_widths: Vec<u16>,
         height: u16,
     },
@@ -102,7 +104,9 @@ impl Widget for RenderedEntry {
                 }
                 MarkdownBlockData::Table {
                     header,
+                    header_height,
                     rows,
+                    row_heights,
                     col_widths,
                     ..
                 } => {
@@ -110,12 +114,17 @@ impl Widget for RenderedEntry {
                         .iter()
                         .map(|width| Constraint::Length(*width))
                         .collect();
-                    let body_rows: Vec<Row<'static>> = rows.into_iter().map(Row::new).collect();
+                    let body_rows: Vec<Row<'static>> = rows
+                        .into_iter()
+                        .zip(row_heights)
+                        .map(|(cells, height)| Row::new(cells).height(height))
+                        .collect();
                     let mut table = Table::new(body_rows, constraints.clone());
 
                     if let Some(hdr) = header {
-                        let header_row =
-                            Row::new(hdr).style(Style::default().add_modifier(Modifier::BOLD));
+                        let header_row = Row::new(hdr)
+                            .height(header_height)
+                            .style(Style::default().add_modifier(Modifier::BOLD));
                         table = table.header(header_row);
                     }
 
@@ -140,9 +149,9 @@ struct ListState {
 
 #[derive(Clone, Debug, Default)]
 struct TableState {
-    header: Option<Vec<Cell<'static>>>,
-    rows: Vec<Vec<Cell<'static>>>,
-    current_row: Vec<Cell<'static>>,
+    header: Option<Vec<Vec<Span<'static>>>>,
+    rows: Vec<Vec<Vec<Span<'static>>>>,
+    current_row: Vec<Vec<Span<'static>>>,
     current_row_widths: Vec<u16>,
     body_row_widths: Vec<Vec<u16>>,
     header_widths: Option<Vec<u16>>,
@@ -315,13 +324,10 @@ pub fn render_markdown(text: &str, base_style: Style, width: u16) -> RenderedEnt
                 }
                 TagEnd::TableCell => {
                     if let Some(state) = table_state.as_mut() {
-                        let cell = Cell::from(Text::from(Line::from(std::mem::take(
-                            &mut state.current_cell_spans,
-                        ))));
-                        state.current_row.push(cell);
                         state
-                            .current_row_widths
-                            .push(state.current_cell_width.max(3));
+                            .current_row
+                            .push(std::mem::take(&mut state.current_cell_spans));
+                        state.current_row_widths.push(state.current_cell_width);
                     }
                 }
                 TagEnd::Table => {
@@ -821,13 +827,68 @@ fn paragraph_height(lines: &[Line<'static>], width: u16) -> u16 {
         .unwrap_or(u16::MAX)
 }
 
+fn wrap_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![Line::from(spans)];
+    }
+
+    if spans.is_empty() {
+        return vec![Line::default()];
+    }
+
+    let mut plain_text = String::new();
+    let mut span_ranges = Vec::with_capacity(spans.len());
+    for span in spans {
+        let byte_start = plain_text.len();
+        plain_text.push_str(span.content.as_ref());
+        let byte_end = plain_text.len();
+        span_ranges.push((byte_start, byte_end, span.style));
+    }
+
+    let wrapped = textwrap::wrap(&plain_text, width as usize);
+    if wrapped.is_empty() {
+        return vec![Line::default()];
+    }
+
+    let mut search_start = 0usize;
+    let mut lines = Vec::with_capacity(wrapped.len());
+    for wrapped_line in wrapped {
+        let wrapped_line = wrapped_line.as_ref();
+        let relative_start = plain_text[search_start..]
+            .find(wrapped_line)
+            .unwrap_or_default();
+        let line_start = search_start + relative_start;
+        let line_end = line_start + wrapped_line.len();
+        search_start = line_end;
+
+        let line_spans = span_ranges
+            .iter()
+            .filter_map(|(span_start, span_end, style)| {
+                let overlap_start = (*span_start).max(line_start);
+                let overlap_end = (*span_end).min(line_end);
+                if overlap_start < overlap_end {
+                    Some(Span::styled(
+                        plain_text[overlap_start..overlap_end].to_string(),
+                        *style,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        lines.push(Line::from(line_spans));
+    }
+
+    lines
+}
+
 fn build_table_block(state: TableState, width: u16) -> MarkdownBlockData {
     let column_count = state
         .header
         .as_ref()
         .map(|header| header.len())
         .unwrap_or_else(|| state.rows.first().map(|row| row.len()).unwrap_or(0));
-    let mut col_widths = vec![3u16; column_count];
+    let mut col_widths = vec![0u16; column_count];
 
     if let Some(header_widths) = &state.header_widths {
         for (index, cell_width) in header_widths.iter().enumerate() {
@@ -840,45 +901,87 @@ fn build_table_block(state: TableState, width: u16) -> MarkdownBlockData {
         }
     }
 
-    shrink_table_widths(&mut col_widths, width);
+    let natural_widths = col_widths.clone();
+    shrink_table_widths(&mut col_widths, width, &natural_widths);
 
-    let height = if state.header.is_some() {
-        1 + 1 + state.rows.len() as u16 + 2
-    } else {
-        state.rows.len() as u16 + 2
-    };
+    let mut header_height = 0u16;
+    let header = state.header.map(|header| {
+        let mut max_line_count = 1u16;
+        let cells = header
+            .into_iter()
+            .enumerate()
+            .map(|(index, spans)| {
+                let lines = wrap_spans(spans, col_widths[index]);
+                max_line_count = max_line_count.max(lines.len().try_into().unwrap_or(u16::MAX));
+                Cell::from(Text::from(lines))
+            })
+            .collect::<Vec<_>>();
+        header_height = max_line_count;
+        cells
+    });
+    let mut row_heights = Vec::with_capacity(state.rows.len());
+    let rows = state
+        .rows
+        .into_iter()
+        .map(|row| {
+            let mut max_line_count = 1u16;
+            let cells = row
+                .into_iter()
+                .enumerate()
+                .map(|(index, spans)| {
+                    let lines = wrap_spans(spans, col_widths[index]);
+                    max_line_count = max_line_count.max(lines.len().try_into().unwrap_or(u16::MAX));
+                    Cell::from(Text::from(lines))
+                })
+                .collect::<Vec<_>>();
+            row_heights.push(max_line_count);
+            cells
+        })
+        .collect::<Vec<_>>();
+    let height =
+        2 + if header.is_some() {
+            header_height + 1
+        } else {
+            0
+        } + row_heights.iter().copied().sum::<u16>();
 
     MarkdownBlockData::Table {
-        header: state.header,
-        rows: state.rows,
+        header,
+        header_height,
+        rows,
+        row_heights,
         col_widths,
         height,
     }
 }
 
-fn shrink_table_widths(col_widths: &mut [u16], width: u16) {
+fn shrink_table_widths(col_widths: &mut [u16], available_width: u16, natural_widths: &[u16]) {
     if col_widths.is_empty() {
         return;
     }
 
+    let min_widths: Vec<u16> = natural_widths
+        .iter()
+        .map(|width| if *width > 10 { 10 } else { *width })
+        .collect();
     let separators = col_widths.len() as u16 + 1;
     let mut total_width: u16 = col_widths
         .iter()
         .copied()
         .sum::<u16>()
         .saturating_add(separators);
-    if total_width <= width {
+    if total_width <= available_width {
         return;
     }
 
-    let available = width
+    let available = available_width
         .saturating_sub(separators)
-        .max((col_widths.len() as u16) * 3);
+        .max(min_widths.iter().copied().sum::<u16>());
     let current_sum = col_widths.iter().copied().sum::<u16>().max(1);
 
-    for column_width in col_widths.iter_mut() {
+    for (index, column_width) in col_widths.iter_mut().enumerate() {
         let proportional = ((*column_width as u32 * available as u32) / current_sum as u32) as u16;
-        *column_width = proportional.max(3);
+        *column_width = proportional.max(min_widths[index]);
     }
 
     total_width = col_widths
@@ -886,11 +989,11 @@ fn shrink_table_widths(col_widths: &mut [u16], width: u16) {
         .copied()
         .sum::<u16>()
         .saturating_add(separators);
-    while total_width > width {
+    while total_width > available_width {
         if let Some((index, _)) = col_widths
             .iter()
             .enumerate()
-            .filter(|(_, w)| **w > 3)
+            .filter(|(index, w)| **w > min_widths[*index])
             .max_by_key(|(_, w)| **w)
         {
             col_widths[index] -= 1;
@@ -903,8 +1006,11 @@ fn shrink_table_widths(col_widths: &mut [u16], width: u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_markdown, MarkdownBlockData};
-    use ratatui::style::{Color, Modifier, Style};
+    use super::{render_markdown, shrink_table_widths, wrap_spans, MarkdownBlockData};
+    use ratatui::{
+        style::{Color, Modifier, Style},
+        text::Span,
+    };
 
     #[test]
     fn paragraph_renders_to_paragraph_block() {
@@ -997,6 +1103,128 @@ mod tests {
     }
 
     #[test]
+    fn wrap_spans_single_span_no_wrap() {
+        let lines = wrap_spans(vec![Span::raw("hello")], 10);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 1);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "hello");
+    }
+
+    #[test]
+    fn wrap_spans_single_span_wraps() {
+        let lines = wrap_spans(vec![Span::raw("hello world")], 5);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>())
+                .collect::<Vec<_>>(),
+            vec!["hello", "world"]
+        );
+    }
+
+    #[test]
+    fn wrap_spans_multi_span_wraps_at_boundary() {
+        let left_style = Style::default().fg(Color::Yellow);
+        let right_style = Style::default().fg(Color::Blue);
+        let lines = wrap_spans(
+            vec![
+                Span::styled("hello ", left_style),
+                Span::styled("world", right_style),
+            ],
+            6,
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "hello");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(lines[1].spans[0].content.as_ref(), "world");
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn wrap_spans_multi_span_wraps_mid_span() {
+        let style = Style::default().fg(Color::Green);
+        let lines = wrap_spans(vec![Span::styled("hello world", style)], 7);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>())
+                .collect::<Vec<_>>(),
+            vec!["hello", "world"]
+        );
+        assert!(lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .all(|span| span.style.fg == Some(Color::Green)));
+    }
+
+    #[test]
+    fn wrap_spans_empty() {
+        let lines = wrap_spans(Vec::new(), 10);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].spans.is_empty());
+    }
+
+    #[test]
+    fn wrap_spans_panic() {
+        let spans = vec![ratatui::text::Span::raw("a\n💖")];
+        let lines = wrap_spans(spans, 1);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn wrap_spans_zero_width() {
+        let lines = wrap_spans(vec![Span::raw("hello world")], 0);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "hello world");
+    }
+
+    #[test]
+    fn gfm_table_long_content_wraps_and_height_correct() {
+        let rendered = render_markdown(
+            "| col |\n| --- |\n| this is a very long cell value! |",
+            Style::default(),
+            13,
+        );
+        assert_eq!(rendered.blocks.len(), 1);
+        match &rendered.blocks[0] {
+            MarkdownBlockData::Table { rows, height, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert!(*height > rows.len() as u16 + 2);
+            }
+            other => panic!("expected table block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gfm_table_short_content_no_wrap() {
+        let rendered = render_markdown("| ab |\n| --- |\n| cd |", Style::default(), 80);
+        assert_eq!(rendered.blocks.len(), 1);
+        match &rendered.blocks[0] {
+            MarkdownBlockData::Table {
+                col_widths,
+                height,
+                rows,
+                ..
+            } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(col_widths[0], 2);
+                assert_eq!(*height, 5);
+            }
+            other => panic!("expected table block, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn total_height_sums_block_heights() {
         let rendered = render_markdown("first\n\nsecond", Style::default(), 80);
         let expected: u16 = rendered
@@ -1009,4 +1237,184 @@ mod tests {
             .sum();
         assert_eq!(rendered.total_height, expected);
     }
+
+    // ========================================
+    // shrink_table_widths tests
+    // ========================================
+
+    #[test]
+    fn shrink_table_widths_fits_no_change() {
+        // 3 columns of width [5, 4, 5], available_width=80.
+        // Table uses 5+4+5+4 separators = 18 < 80. No shrinkage needed.
+        let mut col_widths = vec![5u16, 4, 5];
+        let natural_widths = vec![5u16, 4, 5];
+        shrink_table_widths(&mut col_widths, 80, &natural_widths);
+        assert_eq!(col_widths, vec![5, 4, 5]);
+    }
+
+    #[test]
+    fn shrink_table_widths_large_columns_shrink_proportionally() {
+        // 2 columns natural widths [50, 50], available_width=30.
+        // Min per column = 10 (since natural > 10).
+        // Total natural = 100, separators = 3, available_for_content = 27.
+        // Proportional: floor(50 * 27 / 100) = 13 per column.
+        // Total = 13 + 13 + 3 = 29 ≤ 30. Each column >= min (10).
+        let mut col_widths = vec![50u16, 50];
+        let natural_widths = vec![50u16, 50];
+        shrink_table_widths(&mut col_widths, 30, &natural_widths);
+        assert_eq!(col_widths, vec![13, 13]);
+        // Verify minimum constraint is respected
+        assert!(col_widths[0] >= 10);
+        assert!(col_widths[1] >= 10);
+    }
+
+    #[test]
+    fn shrink_table_widths_small_columns_shrink_to_natural_min() {
+        // 2 columns natural widths [5, 5], available_width=10.
+        // Table needs 5+5+3=13 > 10. Min per column = 5 (since natural <= 10).
+        // Loop can't shrink below min. Result should be [5, 5].
+        let mut col_widths = vec![5u16, 5];
+        let natural_widths = vec![5u16, 5];
+        shrink_table_widths(&mut col_widths, 10, &natural_widths);
+        assert_eq!(col_widths, vec![5, 5]);
+    }
+
+    #[test]
+    fn shrink_table_widths_one_large_one_small() {
+        // Natural widths [50, 5]. Available_width=20.
+        // Min for col 0 = 10, min for col 1 = 5.
+        // Proportional: total natural = 55, available_for_content = 20 - 3 = 17.
+        // Col 0 gets floor(50*17/55) = 15, col 1 gets floor(5*17/55) = 1 → max(5) = 5.
+        // Total = 15+5+3 = 23 > 20.
+        // Trim widest (col 0 = 15 > 10) until total <= 20:
+        // 14+5+3=22, 13+5+3=21, 12+5+3=20. Result: [12, 5].
+        let mut col_widths = vec![50u16, 5];
+        let natural_widths = vec![50u16, 5];
+        shrink_table_widths(&mut col_widths, 20, &natural_widths);
+        assert!(
+            col_widths[0] >= 10,
+            "col 0 should be >= 10, got {}",
+            col_widths[0]
+        );
+        assert!(
+            col_widths[1] >= 5,
+            "col 1 should be >= 5, got {}",
+            col_widths[1]
+        );
+        // Also verify the expected exact result
+        assert_eq!(col_widths, vec![12, 5]);
+    }
+
+    #[test]
+    fn shrink_table_widths_empty() {
+        // Empty col_widths → no panic, nothing changes.
+        let mut col_widths: Vec<u16> = vec![];
+        let natural_widths: Vec<u16> = vec![];
+        shrink_table_widths(&mut col_widths, 80, &natural_widths);
+        assert!(col_widths.is_empty());
+    }
+
+    // ========================================
+    // Additional wrap_spans tests
+    // ========================================
+
+    #[test]
+    fn wrap_spans_unicode_multibyte_fits() {
+        // Span containing "日本語" (3 CJK chars, each width 2 = total display width 6).
+        // Call with width=10. Should return 1 line, content preserved.
+        let lines = wrap_spans(vec![Span::raw("日本語")], 10);
+        assert_eq!(lines.len(), 1);
+        let content: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(content, "日本語");
+    }
+
+    #[test]
+    fn wrap_spans_long_word_no_break() {
+        // Single span "supercalifragilistic" (20 chars) at width=10.
+        // textwrap default: long words that exceed width are NOT broken (no hyphenation).
+        // They may still be split across lines depending on textwrap's behavior.
+        // The important assertion is that the full content is preserved across all lines.
+        let lines = wrap_spans(vec![Span::raw("supercalifragilistic")], 10);
+        // Collect all content from all lines
+        let all_content: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert_eq!(all_content, "supercalifragilistic");
+    }
+
+    #[test]
+    fn wrap_spans_explicit_newline_in_span() {
+        // A span containing "line1\nline2" (with actual newline).
+        // textwrap treats \n as a hard line break.
+        // Assert the result has 2 lines.
+        let lines = wrap_spans(vec![Span::raw("line1\nline2")], 10);
+        assert_eq!(lines.len(), 2);
+        let line_contents: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(line_contents, vec!["line1", "line2"]);
+    }
+
+    #[test]
+    fn wrap_spans_repeated_substring_distinct_mapping() {
+        // Two spans: Span::styled("aa", StyleA) and Span::styled("aa", StyleB).
+        // Call with width=10 (no wrap needed).
+        // Assert: result is 1 line with 2 spans, first "aa" has StyleA, second "aa" has StyleB.
+        let style_a = Style::default().fg(Color::Red);
+        let style_b = Style::default().fg(Color::Blue);
+        let lines = wrap_spans(
+            vec![Span::styled("aa", style_a), Span::styled("aa", style_b)],
+            10,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans.len(), 2);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "aa");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(lines[0].spans[1].content.as_ref(), "aa");
+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn wrap_spans_exact_height_one_line_wraps() {
+        // Use width=5, single span "hello world" (11 chars).
+        // Assert exactly 2 lines returned, first line = "hello", second line = "world".
+        let lines = wrap_spans(vec![Span::raw("hello world")], 5);
+        assert_eq!(lines.len(), 2);
+        let line_contents: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(line_contents, vec!["hello", "world"]);
+    }
+
+    // ========================================
+    // Exact height test
+    // ========================================
+
+    #[test]
+    fn gfm_table_height_exact_formula() {
+        // Table with 1 header row and 2 body rows, all content short (≤ 5 chars each, width=80 — no wrapping).
+        // Header height = 1, each row height = 1.
+        // Expected height = 2 (borders) + 1 (header_height) + 1 (header separator) + 2 (2 body rows × 1) = 6.
+        let rendered = render_markdown(
+            "| col1 | col2 |\n| --- | --- |\n| abc | def |\n| ghi | jkl |",
+            Style::default(),
+            80,
+        );
+        assert_eq!(rendered.blocks.len(), 1);
+        match &rendered.blocks[0] {
+            MarkdownBlockData::Table { height, .. } => {
+                assert_eq!(*height, 6);
+            }
+            other => panic!("expected table block, got {other:?}"),
+        }
+    }
+}
+#[test]
+fn test_wrap_panic_3() {
+    let spans = vec![ratatui::text::Span::raw("💖   ")];
+    let lines = wrap_spans(spans, 2);
+    println!("{:?}", lines);
 }
