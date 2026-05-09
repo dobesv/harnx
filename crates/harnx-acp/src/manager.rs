@@ -210,8 +210,7 @@ impl Default for AcpManager {
 
 fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
     let session_new_call_template = format!("@ {} new session", server_name);
-    let session_prompt_call_template =
-        format!("@ {} {{{{ args.message | truncate(60) }}}}", server_name);
+    let session_prompt_call_template = "@ ".to_string() + server_name + "{% if args.session_id %} [{{ args.session_id | truncate(8, end='') }}]{% endif %}\n{{ args.message }}";
     let session_load_call_template = format!(
         "@ {} load {{{{ args.session_id | truncate(8, end='') }}}}",
         server_name

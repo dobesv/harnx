@@ -54,6 +54,11 @@ pub struct ToolEvalContext {
     /// (or YAML-pretty-prints the JSON), truncates to terminal
     /// dimensions, dims the text, and writes to stdout.
     pub emit_tool_result_fn: Arc<ToolCallEmitFn>,
+    /// Called when a PreToolUse hook blocks or a user denies a tool call.
+    /// Receives the tool call and the blocked result JSON (contains
+    /// `"error"` key). Harnx's default emits
+    /// `AgentEvent::Tool(ToolEvent::Blocked { .. })`.
+    pub emit_tool_blocked_fn: Arc<ToolCallEmitFn>,
     /// Called when a PreToolUse hook returns `Ask { reason }` and the
     /// user needs to confirm before the tool runs. Returns `true` if
     /// the user allows the tool; `false` otherwise. Harnx's default
@@ -131,6 +136,7 @@ pub async fn eval_tool_calls(
         }
         if let HookResultControl::Block { reason } = pre_outcome.control {
             let blocked_result = json!({"error": reason, "blocked_by_hook": true});
+            (ctx.emit_tool_blocked_fn)(&call, &blocked_result);
             output.push(ToolResult::new(call, blocked_result));
             is_all_null = false;
             continue;
@@ -139,6 +145,7 @@ pub async fn eval_tool_calls(
             if !(ctx.confirm_tool_use_fn)(&call.name, &json_data, reason.as_deref()) {
                 let deny_reason = reason.unwrap_or_else(|| "Denied by user".to_string());
                 let blocked_result = json!({"error": deny_reason, "blocked_by_hook": true});
+                (ctx.emit_tool_blocked_fn)(&call, &blocked_result);
                 output.push(ToolResult::new(call, blocked_result));
                 is_all_null = false;
                 continue;
@@ -410,7 +417,7 @@ mod tests {
         providers: Vec<Arc<dyn ToolProvider>>,
         dispatch_hook: impl Fn(HookEvent) -> HookOutcome + Send + Sync + 'static,
     ) -> ToolEvalContext {
-        test_context_with_emitters(providers, dispatch_hook, |_, _| {}, |_, _| {})
+        test_context_with_emitters(providers, dispatch_hook, |_, _| {}, |_, _| {}, |_, _| {})
     }
 
     fn test_context_with_emitters(
@@ -418,6 +425,7 @@ mod tests {
         dispatch_hook: impl Fn(HookEvent) -> HookOutcome + Send + Sync + 'static,
         emit_tool_call: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
         emit_tool_result: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
+        emit_tool_blocked: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
     ) -> ToolEvalContext {
         ToolEvalContext {
             providers,
@@ -425,6 +433,7 @@ mod tests {
             allowed_tool_names: HashSet::new(),
             emit_tool_call_fn: Arc::new(emit_tool_call),
             emit_tool_result_fn: Arc::new(emit_tool_result),
+            emit_tool_blocked_fn: Arc::new(emit_tool_blocked),
             confirm_tool_use_fn: Arc::new(|_, _, _| true),
             dispatch_hook_fn: Arc::new(move |event| {
                 let outcome = dispatch_hook(event);
@@ -566,6 +575,7 @@ mod tests {
             move |_, _| {
                 result_emit_count_clone.fetch_add(1, Ordering::SeqCst);
             },
+            |_, _| {},
         );
         let abort_signal = create_abort_signal();
 
@@ -578,9 +588,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_call_does_not_emit_started() {
+    async fn blocked_call_emits_blocked_event() {
         let started_emit_count = Arc::new(AtomicUsize::new(0));
         let started_emit_count_clone = Arc::clone(&started_emit_count);
+        let blocked_emit_count = Arc::new(AtomicUsize::new(0));
+        let blocked_emit_count_clone = Arc::clone(&blocked_emit_count);
         let ctx = test_context_with_emitters(
             vec![Arc::new(MockToolProvider::panic("tool_a"))],
             |event| match event {
@@ -596,6 +608,9 @@ mod tests {
                 started_emit_count_clone.fetch_add(1, Ordering::SeqCst);
             },
             |_, _| {},
+            move |_, _| {
+                blocked_emit_count_clone.fetch_add(1, Ordering::SeqCst);
+            },
         );
         let abort_signal = create_abort_signal();
 
@@ -605,5 +620,6 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(started_emit_count.load(Ordering::SeqCst), 0);
+        assert_eq!(blocked_emit_count.load(Ordering::SeqCst), 1);
     }
 }

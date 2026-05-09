@@ -272,7 +272,7 @@ impl ServerHandler for TimeServer {
             )
             .annotate(read_only.clone())
             .with_meta(Meta(json!({
-                "call_template": "time{% if args.timezone %} ({{ args.timezone }}){% endif %}",
+                "call_template": "🕐 time{% if args.timezone %} ({{ args.timezone }}){% endif %}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
             Tool::new(
@@ -335,7 +335,7 @@ impl ServerHandler for TimeServer {
             )
             .annotate(read_only.clone())
             .with_meta(Meta(json!({
-                "call_template": "convert time{% if args.isoTimestamp %} {{ args.isoTimestamp }}{% endif %}{% if args.unixTimestamp %} unix={{ args.unixTimestamp }}{% endif %}",
+                "call_template": "🕐 convert{% if args.isoTimestamp %} {{ args.isoTimestamp }}{% endif %}{% if args.unixTimestamp %} unix={{ args.unixTimestamp }}{% endif %}{% if args.epochMillis %} ms={{ args.epochMillis }}{% endif %}{% if args.sourceTimezone %} from={{ args.sourceTimezone }}{% endif %}{% if args.offsetDays %} +{{ args.offsetDays }}d{% endif %}{% if args.offsetHours %} +{{ args.offsetHours }}h{% endif %}{% if args.offsetMinutes %} +{{ args.offsetMinutes }}m{% endif %}{% if args.offsetSeconds %} +{{ args.offsetSeconds }}s{% endif %}{% if args.timezone %} → {{ args.timezone }}{% endif %}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
             Tool::new(
@@ -358,7 +358,7 @@ impl ServerHandler for TimeServer {
                     .open_world(false),
             )
             .with_meta(Meta(json!({
-                "call_template": "wait {{ args.seconds }}s",
+                "call_template": "⏳ wait {{ args.seconds }}s",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
             Tool::new(
@@ -390,7 +390,7 @@ impl ServerHandler for TimeServer {
                     .open_world(false),
             )
             .with_meta(Meta(json!({
-                "call_template": "wait until {{ args.time }}{% if args.timezone %} ({{ args.timezone }}){% endif %}",
+                "call_template": "⏳ wait until {{ args.time }}{% if args.timezone %} ({{ args.timezone }}){% endif %}",
                 "result_template": "{{ result.content[0].text | default('') }}"
             }).as_object().unwrap().clone())),
         ];
