@@ -301,7 +301,6 @@ harnx --agent coder --agent-variable language=rust "write a web server"
 .info agent          Show current agent info
 .edit agent          Edit the agent's .md file
 .save agent [name]   Save current agent configuration
-.exit agent          Exit the active agent
 ```
 
 ### Inline Prompt

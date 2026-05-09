@@ -11,7 +11,8 @@ pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
 pub use self::session_meta::{
-    build_picker_context, parse_session_meta, sort_sessions_for_picker, PickerContext, SessionMeta,
+    build_picker_context, find_matching_session, parse_session_meta, sort_sessions_for_picker,
+    PickerContext, SessionMeta,
 };
 pub use harnx_core::last_message::LastMessage;
 #[allow(unused_imports)]
@@ -25,8 +26,8 @@ use harnx_core::config_paths as paths;
 use harnx_core::session::SessionLogEntry;
 
 use crate::client::{
-    create_client_config, list_client_types, list_models, ClientConfig, MessageContentToolCalls,
-    Model, ModelType, ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
+    create_client_config, list_client_types, list_models, ClientConfig, Model, ModelType,
+    ProviderModels, OPENAI_COMPATIBLE_PROVIDERS,
 };
 use crate::commands::{run_command, split_args_text};
 use crate::tool::{ToolDeclaration, ToolResult, Tools};
@@ -47,8 +48,7 @@ use simplelog::LevelFilter;
 use std::collections::{HashMap, HashSet};
 use std::{
     env,
-    fs::{read_dir, read_to_string, remove_dir_all, remove_file, File, OpenOptions},
-    io::Write,
+    fs::{read_dir, read_to_string, remove_dir_all, remove_file},
     path::{Path, PathBuf},
     process,
     sync::{Arc, OnceLock},
@@ -1310,6 +1310,10 @@ impl Config {
     }
 
     pub fn use_agent_obj(&mut self, agent: Agent) -> Result<()> {
+        if self.agent.is_some() {
+            self.exit_agent()?;
+        }
+
         // Reinitialize MCP/ACP managers scoped to the incoming agent's package
         // (or None for top-level agents). This gives the agent a clean view:
         // same-package MCP servers appear under their bare names, others prefixed.
@@ -1317,12 +1321,7 @@ impl Config {
             harnx_core::package_namespace::pkg_from_qualified(agent.name()).map(str::to_string);
         self.reinit_managers_for_agent(agent_package.as_deref());
 
-        if let Some(session) = self.session.as_mut() {
-            session.guard_empty()?;
-            session.set_agent(&agent)?;
-        } else {
-            self.agent = Some(agent);
-        }
+        self.agent = Some(agent);
         Ok(())
     }
 
@@ -1424,9 +1423,7 @@ impl Config {
 
     pub fn use_session(&mut self, session_name: Option<&str>) -> Result<()> {
         if self.session.is_some() {
-            bail!(
-                "Already in a session, please run '.exit session' first to exit the current session."
-            );
+            self.exit_session()?;
         }
         let mut session;
         match session_name {
@@ -2287,7 +2284,7 @@ impl Config {
             bail!("Please enable tool use before using the agent.");
         }
         if config.read().agent.is_some() {
-            bail!("Already in a agent, please run '.exit agent' first to exit the current agent.");
+            config.write().exit_agent()?;
         }
         let agent = self::agent::init(config, agent_name, abort_signal).await?;
         let session = session_name.map(|v| v.to_string());
@@ -2848,54 +2845,7 @@ impl Config {
             }
         }
 
-        if !self.save {
-            return Ok(());
-        }
-        let mut file = self.open_message_file()?;
-        if output.is_empty() && input.tool_calls().is_none() {
-            return Ok(());
-        }
-        let now = now();
-        let summary = input.summary();
-        let raw_input = input.raw();
-        let scope = if self.agent.is_none() {
-            let agent_name = match input.agent().name() {
-                TEMP_AGENT_NAME => None,
-                "" => None,
-                name => Some(name),
-            };
-            match (agent_name, input.rag_name()) {
-                (Some(agent), Some(rag_name)) => format!(" ({agent}#{rag_name})"),
-                (Some(agent), _) => format!(" ({agent})"),
-                (None, Some(rag_name)) => format!(" (#{rag_name})"),
-                _ => String::new(),
-            }
-        } else {
-            String::new()
-        };
-        let tool_calls = match input.tool_calls() {
-            Some(MessageContentToolCalls {
-                tool_results, text, ..
-            }) => {
-                let mut lines = vec!["<tool_calls>".to_string()];
-                if !text.is_empty() {
-                    lines.push(text.clone());
-                }
-                lines.push(serde_json::to_string(&tool_results).unwrap_or_default());
-                lines.push("</tool_calls>\n".to_string());
-                lines.join("\n")
-            }
-            None => String::new(),
-        };
-        let thought = match thought {
-            Some(v) => format!("<think>\n{v}\n</think>\n"),
-            None => String::new(),
-        };
-        let output = format!(
-            "# CHAT: {summary} [{now}]{scope}\n{raw_input}\n--------\n{thought}{tool_calls}{output}\n--------\n\n",
-        );
-        file.write_all(output.as_bytes())
-            .with_context(|| "Failed to save message")
+        Ok(())
     }
 
     fn init_agent_shared_variables(&mut self) -> Result<()> {
@@ -2948,16 +2898,6 @@ impl Config {
             agent.set_session_variables(variables.clone());
         }
         Ok(())
-    }
-
-    fn open_message_file(&self) -> Result<File> {
-        let path = self.messages_file();
-        ensure_parent_exists(&path)?;
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("Failed to create/append {}", path.display()))
     }
 
     fn load_from_file(config_path: &Path) -> Result<Self> {

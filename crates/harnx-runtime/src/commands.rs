@@ -22,7 +22,7 @@ pub enum CommandOutcome {
     Exit,
 }
 
-pub static COMMANDS: LazyLock<[Command; 47]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 45]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -59,11 +59,9 @@ pub static COMMANDS: LazyLock<[Command; 47]> = LazyLock::new(|| {
             "Edit a range of log entries by sequence number",
         ),
         Command::new(".save session", "Save current session to file"),
-        Command::new(".exit session", "Exit active session"),
         Command::new(".agent", "Use an agent"),
         Command::new(".starter", "Use a conversation starter"),
         Command::new(".info agent", "Show agent info"),
-        Command::new(".exit agent", "Leave agent"),
         Command::new(".rag", "Initialize or access RAG"),
         Command::new(
             ".edit rag-docs",
@@ -664,18 +662,8 @@ Commands:
                 set_text(&output).context("Failed to copy the last chat response")?;
             }
             ".exit" => match args {
-                Some("session") => {
-                    if config.read().agent.is_some() {
-                        config.write().exit_agent_session()?;
-                    } else {
-                        config.write().exit_session()?;
-                    }
-                }
                 Some("rag") => {
                     config.write().exit_rag()?;
-                }
-                Some("agent") => {
-                    config.write().exit_agent()?;
                 }
                 Some(_) => unknown_command()?,
                 None => {

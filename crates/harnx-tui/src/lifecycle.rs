@@ -56,11 +56,32 @@ impl Tui {
         self.refresh_input_chrome();
     }
 
+    /// Check whether agents are available to start the TUI.
+    /// Returns an error if no agent is configured and no assistant agents are
+    /// installed on disk. Extracted so it can be called and tested independently
+    /// of the full `init()` path.
+    pub(crate) fn check_agents_available(config: &GlobalConfig, agents: &[String]) -> Result<()> {
+        if config.read().agent.is_none() && agents.is_empty() {
+            anyhow::bail!(
+                "No agents configured. Create an agent file in the agents/ directory first."
+            );
+        }
+        Ok(())
+    }
+
     pub fn init(
         config: &GlobalConfig,
         async_manager: AsyncHookManager,
         persistent_manager: Arc<Mutex<PersistentHookManager>>,
     ) -> Result<Self> {
+        let agents = list_assistant_agents();
+        // Skip agents check in tests: test configs use a bare `Config::default()`
+        // with no agents directory populated, but the production check is covered
+        // by direct unit tests of `check_agents_available`.
+        if !cfg!(test) {
+            Self::check_agents_available(config, &agents)?;
+        }
+
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         install_tui_agent_event_sink(event_tx.clone());
 

@@ -2705,7 +2705,8 @@ async fn direct_submit_with_attachments_renders_attachment_entries_in_transcript
     use crate::types::Attachment;
     use std::path::PathBuf;
 
-    let config = test_config();
+    // Agent + session required since #451 enforces both before prompt submission.
+    let config = test_config_with_mock_client_and_agent("test-agent", Some("test-session"));
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
 
@@ -5957,6 +5958,52 @@ async fn test_picker_shown_when_no_agent_and_agents_exist() {
 }
 
 // ---------------------------------------------------------------------------
+// check_agents_available — startup guard for no-agents case
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_check_agents_available_errors_when_no_agent_and_no_agents() {
+    // When no agent is set in config AND no assistant agents are installed,
+    // check_agents_available must return an error.
+    let config = test_config();
+    let result = crate::types::Tui::check_agents_available(&config, &[]);
+    assert!(
+        result.is_err(),
+        "check_agents_available must error when no agent selected and no agents installed"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("No agents configured"),
+        "error message should mention 'No agents configured', got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_check_agents_available_ok_when_agents_exist() {
+    // When assistant agents exist on disk, check_agents_available must not error
+    // even if no agent is currently selected.
+    let config = test_config();
+    let agents = vec!["my-agent".to_string()];
+    let result = crate::types::Tui::check_agents_available(&config, &agents);
+    assert!(
+        result.is_ok(),
+        "check_agents_available must not error when agents are available"
+    );
+}
+
+#[tokio::test]
+async fn test_check_agents_available_ok_when_agent_selected_even_without_agents_dir() {
+    // When an agent is already selected in config, check_agents_available
+    // must succeed regardless of the agents directory state.
+    let config = test_config_with_mock_client_and_agent("test-agent", None);
+    let result = crate::types::Tui::check_agents_available(&config, &[]);
+    assert!(
+        result.is_ok(),
+        "check_agents_available must not error when an agent is already active"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Picker tests — AgentPicker filtering, SessionPicker ESC, agent activation
 // ---------------------------------------------------------------------------
 
@@ -7006,5 +7053,55 @@ async fn test_browsing_mode_non_navigable_items_visible_not_focusable() {
         harness.tui().app.transcript_focus,
         Some(2),
         "Down should skip non-navigable ToolResultMarkdown at index 1 and focus AssistantText at index 2"
+    );
+}
+
+#[tokio::test]
+async fn test_agent_command_leaves_tui_without_session_gap() {
+    let mut harness = TuiTestHarness::with_size(60, 20);
+    let tui = harness.tui();
+    let config = tui.config.clone();
+
+    // 1. Setup initial state: agent + session
+    {
+        let mut guard = config.write();
+        let mut agent = harnx_runtime::config::Agent::default();
+        agent.set_name("agent-a");
+        guard.agent = Some(agent);
+
+        let session = harnx_runtime::config::session::new(&guard, "session-a").unwrap();
+        guard.session = Some(session);
+    }
+
+    // 2. Simulate .agent command effect (manually for speed, or we can try run_command)
+    // Actually let's use run_command if we can, but we need agent-b to exist.
+    // Let's just manually clear session to simulate what .agent does.
+    {
+        let mut guard = config.write();
+        guard.exit_session().unwrap();
+    }
+
+    // 3. Try to send a message
+    harness.tui().set_input_text("hello");
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    // 4. Check if it allowed the prompt task to start
+    // If there's a gap, it will be Some. If it's blocked, it should be None (and maybe a modal open).
+    let task_started = harness.tui().current_prompt_handle.is_some();
+
+    // We also check if a modal was opened to fix the situation
+    let modal_open = harness.tui().app.modal.is_some();
+
+    assert!(
+        !task_started,
+        "Prompt task should NOT have started without a session!"
+    );
+    assert!(
+        modal_open,
+        "Expected a picker to be open when session is missing!"
     );
 }
