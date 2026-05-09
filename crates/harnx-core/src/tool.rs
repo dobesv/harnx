@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn test_bash_exec_call_template_fence_closes_on_own_line() {
         // This is the actual template used by the bash exec tool.
-        let template = "```sh\n$ {{ args.command }}\n```{% if args.working_dir or args.timeout_secs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.timeout_secs %}[{{ args.timeout_secs }}s]{% endif %}{% endif %}";
+        let template = "```sh\n$ {{ args.command }}\n```{% if args.working_dir or args.timeout_secs or args.head_lines or args.tail_lines or args.max_output_bytes or args.inputs or args.outputs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.timeout_secs %}[{{ args.timeout_secs }}s] {% endif %}{% if args.head_lines is not none %}[head:{{ args.head_lines }}] {% endif %}{% if args.tail_lines is not none %}[tail_lines:{{ args.tail_lines }}] {% endif %}{% if args.max_output_bytes is not none %}[:{{ args.max_output_bytes }}b] {% endif %}{% if args.inputs %}[<{{ args.inputs | length }}] {% endif %}{% if args.outputs %}[>{{ args.outputs | length }}]{% endif %}{% endif %}";
 
         // No extras — bare fence, closing ``` is the last line.
         let out =
@@ -694,5 +694,44 @@ mod tests {
             "working_dir in combined output: {out:?}"
         );
         assert!(out.contains("[10s]"), "timeout in combined output: {out:?}");
+
+        // Extended optional args — fence must still close on its own line.
+        let out = render_tool_call_template(
+            template,
+            &serde_json::json!({
+                "command": "ls",
+                "head_lines": 5,
+                "tail_lines": 2,
+                "max_output_bytes": 1024,
+                "inputs": ["in.txt"],
+                "outputs": ["out.txt"]
+            }),
+            "",
+        )
+        .unwrap();
+        assert!(
+            out.lines().any(|l| l == "```"),
+            "closing fence must be on own line (extended args): {out:?}"
+        );
+        assert!(
+            out.contains("[head:5]"),
+            "head_lines in extended output: {out:?}"
+        );
+        assert!(
+            out.contains("[tail_lines:2]"),
+            "tail_lines in extended output: {out:?}"
+        );
+        assert!(
+            out.contains("[:1024b]"),
+            "max_output_bytes in extended output: {out:?}"
+        );
+        assert!(
+            out.contains("[<1]"),
+            "inputs count in extended output: {out:?}"
+        );
+        assert!(
+            out.contains("[>1]"),
+            "outputs count in extended output: {out:?}"
+        );
     }
 }

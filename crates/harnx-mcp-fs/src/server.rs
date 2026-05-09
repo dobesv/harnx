@@ -884,28 +884,28 @@ impl ServerHandler for FsServer {
                 Tool::new("read", "Read a text file with line numbers, pagination, grep filtering, and smart truncation.", Map::new())
                     .with_input_schema::<ReadFileParams>()
                     .annotate(read_only.clone())
-                    .with_meta(make_tool_meta("`# {{ args.path }}`{% if args.offset %} +{{ args.offset }}{% endif %}{% if args.limit %} :{{ args.limit }}{% endif %}{% if args.grep %} /{{ args.grep }}/{% endif %}")),
+                    .with_meta(make_tool_meta("📖 {{ args.path }}{% if args.offset %} +{{ args.offset }}{% endif %}{% if args.limit is not none %} [:{{ args.limit }}]{% endif %}{% if args.tail is not none %} [tail:{{ args.tail }}]{% endif %}{% if args.grep %} /{{ args.grep }}/{% endif %}{% if args.head_lines is not none %} [head:{{ args.head_lines }}]{% endif %}{% if args.tail_lines is not none %} [tail_lines:{{ args.tail_lines }}]{% endif %}{% if args.max_output_bytes is not none %} [:{{ args.max_output_bytes }}b]{% endif %}")),
                 Tool::new("write", "Write or create a file, replacing its contents.", Map::new())
                     .with_input_schema::<WriteFileParams>()
-                    .with_meta(make_tool_meta("`+ {{ args.path }}`")),
+                    .with_meta(make_tool_meta("✏️ {{ args.path }} ({{ args.content | length }}ch)")),
                 Tool::new("edit", "Replace exact text within an existing file.", Map::new())
                     .with_input_schema::<EditFileParams>()
-                    .with_meta(make_tool_meta("`* {{ args.path }}`")),
+                    .with_meta(make_tool_meta("🔧 {{ args.path }}{% if args.replace_all %} [all]{% endif %}\n▸ {{ args.old_text | truncate(60) }}\n↳ {{ args.new_text | truncate(60) }}")),
                 Tool::new("ls", "List directory contents, optionally recursively.", Map::new())
                     .with_input_schema::<ListDirectoryParams>()
                     .annotate(read_only.clone())
-                    .with_meta(make_tool_meta("`? {{ args.path }}`{% if args.recursive %} -r{% endif %}")),
+                    .with_meta(make_tool_meta("📂 {{ args.path }}{% if args.recursive %} -r{% endif %}")),
                 Tool::new("grep", "Search file contents with regex and optional context lines.", Map::new())
                     .with_input_schema::<SearchFilesParams>()
                     .annotate(read_only.clone())
-                    .with_meta(make_tool_meta("`? /{{ args.pattern }}/`{% if args.path %} {{ args.path }}{% endif %}")),
+                    .with_meta(make_tool_meta("🔍 /{{ args.pattern }}/{% if args.ignore_case %}i{% endif %}{% if args.path %} {{ args.path }}{% endif %}{% if args.include %} [{{ args.include }}]{% endif %}{% if args.context_lines %} ±{{ args.context_lines }}{% endif %}{% if args.max_results %} [max:{{ args.max_results }}]{% endif %}")),
                 Tool::new("find", "Find files by glob pattern.", Map::new())
                     .with_input_schema::<FindFilesParams>()
                     .annotate(read_only.clone())
-                    .with_meta(make_tool_meta("`? {{ args.pattern }}`{% if args.path %} {{ args.path }}{% endif %}")),
+                    .with_meta(make_tool_meta("🔎 {{ args.pattern }}{% if args.path %} {{ args.path }}{% endif %}{% if args.max_results %} [max:{{ args.max_results }}]{% endif %}")),
                 Tool::new("rollback_file", "Restore a repository to a prior harnx history snapshot. Pass the commit SHA from the 'commit <sha>' line at the top of a prior tool response's diff as the commit_id parameter.", Map::new())
                     .with_input_schema::<RollbackParams>()
-                    .with_meta(make_tool_meta("rollback {{ args.commit_id | truncate(8, end='') }}")),
+                    .with_meta(make_tool_meta("⏪ rollback {{ args.commit_id | truncate(8, end='') }}{% if args.repo_path %} @ {{ args.repo_path }}{% endif %}")),
             ];
 
         Ok(ListToolsResult {

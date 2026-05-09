@@ -10,11 +10,13 @@ nested-parent v
 
 Parent delegating to researcher.
 
-@ nested-researcher Research this deeply and delegate analysis.
+@ nested-researcher
+Research this deeply and delegate analysis.
 > nested-researcher ▸ [SID]
 Researcher delegating to analyst.
 
-@ nested-analyst Analyze data and report back.
+@ nested-analyst
+Analyze data and report back.
 > nested-analyst ▸ [SID]
 Analyst complete
 
@@ -30,8 +32,6 @@ Nested task complete
 📢 Autonaming the session.
 > nested-parent ▸ temp
 No more scripted responses.
-
-
 
 
 
