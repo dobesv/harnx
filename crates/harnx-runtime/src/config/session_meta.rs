@@ -38,6 +38,17 @@ pub fn build_picker_context() -> PickerContext {
 }
 
 pub(crate) fn session_recency_key(session: &SessionMeta) -> u128 {
+    // Prefer the file's modification time — it reflects when the session was
+    // last active, not when it was created.
+    if let Some(modified_ms) = session
+        .modified
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+    {
+        return u128::MAX - modified_ms;
+    }
+
+    // Fall back to the creation timestamp embedded in the session ID.
     if let Some(seconds) = crate::utils::session_name::decode_timestamp_session_id(&session.id) {
         return u128::MAX - (seconds as u128 * 1_000);
     }
@@ -50,14 +61,6 @@ pub(crate) fn session_recency_key(session: &SessionMeta) -> u128 {
                 return u128::MAX - timestamp_ms;
             }
         }
-    }
-
-    if let Some(modified_ms) = session
-        .modified
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis())
-    {
-        return u128::MAX - modified_ms;
     }
 
     u128::MAX
@@ -389,6 +392,34 @@ mod tests {
 
         let sorted = sort_sessions_for_picker(vec![older, newer.clone()], &context);
         assert_eq!(sorted[0].id, newer.id);
+    }
+
+    #[test]
+    fn test_sort_modified_beats_id_timestamp() {
+        // Session with a NEWER UUIDv7 ID (created later) but OLDER mtime loses
+        // to a session with an OLDER UUIDv7 ID but NEWER mtime.
+        // This verifies that mtime takes precedence over creation time.
+        let mut newer_id_older_mtime = session_meta("018f0d1c-5b2b-7000-8000-000000000000");
+        newer_id_older_mtime.modified = Some(UNIX_EPOCH + Duration::from_secs(10));
+
+        let mut older_id_newer_mtime = session_meta("018f0d1c-5b2a-7000-8000-000000000000");
+        older_id_newer_mtime.modified = Some(UNIX_EPOCH + Duration::from_secs(20));
+
+        let context = PickerContext {
+            current_terminal_id: None,
+            current_branch: None,
+            current_dir: "/nowhere".to_string(),
+            current_remote: None,
+        };
+
+        let sorted = sort_sessions_for_picker(
+            vec![newer_id_older_mtime, older_id_newer_mtime.clone()],
+            &context,
+        );
+        assert_eq!(
+            sorted[0].id, older_id_newer_mtime.id,
+            "session with newer mtime should sort first, even if its ID was created earlier"
+        );
     }
 
     #[test]
