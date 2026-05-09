@@ -223,9 +223,27 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
                 abort_signal.clone(),
             );
             {
+                let cfg = config.read();
+                if cfg.agent.is_none() {
+                    bail!("No agent selected. Use --agent/-a to specify an agent.");
+                }
+            }
+            {
                 let mut cfg = config.write();
                 if cfg.session.is_none() {
-                    cfg.use_session(None)?;
+                    use harnx_runtime::config::{build_picker_context, find_matching_session};
+                    let sessions = cfg.list_sessions_with_meta();
+                    let ctx = build_picker_context();
+                    let agent_name = cfg
+                        .agent
+                        .as_ref()
+                        .map(|a| a.name().to_string())
+                        .unwrap_or_default();
+                    let matching_id = find_matching_session(&sessions, &ctx, &agent_name);
+                    if let Some(ref id) = matching_id {
+                        eprintln!("{}", dimmed_text(&format!("Resuming session {id}")));
+                    }
+                    cfg.use_session(matching_id.as_deref())?;
                 }
             }
             let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;

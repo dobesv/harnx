@@ -423,6 +423,25 @@ impl Tui {
                         self.run_command(&text).await?;
                         self.refresh_input_chrome();
                     } else {
+                        // Guard: agent and session must both be active before
+                        // submitting a prompt. If not, open the appropriate picker
+                        // and keep the text in the input so the user can retry.
+                        // The in-memory check (agent/session None) is always safe;
+                        // resolve_initial_modal is only called when the check fires.
+                        {
+                            let needs_picker = {
+                                let cfg = self.config.read();
+                                cfg.agent.is_none() || cfg.session.is_none()
+                            };
+                            if needs_picker {
+                                if let Some(modal) =
+                                    crate::types::Tui::resolve_initial_modal(&self.config)
+                                {
+                                    self.app.modal = Some(modal);
+                                    return Ok(());
+                                }
+                            }
+                        }
                         let attachments_snapshot = self.app.attachments.clone();
                         self.app.transcript.push(TranscriptItem::UserText {
                             text: text.clone(),

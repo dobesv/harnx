@@ -47,7 +47,6 @@ openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
 .info session            Show session info
 .edit session            Modify current session
 .save session            Save current session to file
-.exit session            Exit active session
 ```
 
 ### `.agent` - agent management
@@ -57,7 +56,6 @@ openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
 .info agent              Show agent info
 .edit agent              Edit agent .md file
 .save agent [name]       Save current agent to file
-.exit agent              Exit active agent
 .starter                 Use a conversation starter
 ```
 
@@ -146,8 +144,6 @@ If the response is interrupted or unsatisfactory, you can regenerate it with `.r
 ### `.exit` - exit the current scope
 
 ```text
-.exit session            Exit active session
-.exit agent              Exit active agent
 .exit rag                Leave RAG
 .exit                    Exit the interactive session
 ```
