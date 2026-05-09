@@ -713,10 +713,25 @@ mod tests {
             out.lines().any(|l| l == "```"),
             "closing fence must be on own line (extended args): {out:?}"
         );
-        assert!(out.contains("[head:5]"), "head_lines in extended output: {out:?}");
-        assert!(out.contains("[tail_lines:2]"), "tail_lines in extended output: {out:?}");
-        assert!(out.contains("[:1024b]"), "max_output_bytes in extended output: {out:?}");
-        assert!(out.contains("[<1]"), "inputs count in extended output: {out:?}");
-        assert!(out.contains("[>1]"), "outputs count in extended output: {out:?}");
+        assert!(
+            out.contains("[head:5]"),
+            "head_lines in extended output: {out:?}"
+        );
+        assert!(
+            out.contains("[tail_lines:2]"),
+            "tail_lines in extended output: {out:?}"
+        );
+        assert!(
+            out.contains("[:1024b]"),
+            "max_output_bytes in extended output: {out:?}"
+        );
+        assert!(
+            out.contains("[<1]"),
+            "inputs count in extended output: {out:?}"
+        );
+        assert!(
+            out.contains("[>1]"),
+            "outputs count in extended output: {out:?}"
+        );
     }
 }
