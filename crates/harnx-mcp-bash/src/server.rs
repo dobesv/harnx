@@ -5,6 +5,7 @@ use harnx_mcp::safety::{
 
 use fancy_regex::Regex;
 use gix::ObjectId;
+use harnx_mcp::schema::object_schema_with_desc;
 use harnx_mcp_history::classify::{classify_command, SnapshotDecision};
 use harnx_mcp_history::HistoryManager;
 #[cfg(windows)]
@@ -73,16 +74,16 @@ impl JsonSchema for ExecCommandParams {
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
         let inputs = generator.subschema_for::<Option<Vec<String>>>();
         let outputs = generator.subschema_for::<Option<Vec<String>>>();
-        object_schema(
+        object_schema_with_desc(
             vec![
-                ("command", command),
-                ("working_dir", working_dir),
-                ("timeout_secs", timeout_secs),
-                ("head_lines", head_lines),
-                ("tail_lines", tail_lines),
-                ("max_output_bytes", max_output_bytes),
-                ("inputs", inputs),
-                ("outputs", outputs),
+                ("command", "Bash command to execute. Avoid shell pipes like | head, | tail, | grep — use head_lines, tail_lines, max_output_bytes instead.", command),
+                ("working_dir", "Working directory for the command. Defaults to the project root.", working_dir),
+                ("timeout_secs", "Kill the command after this many seconds. Default: no timeout.", timeout_secs),
+                ("head_lines", "Return only the first N lines of combined output. Prefer this over `| head -N` in the command.", head_lines),
+                ("tail_lines", "Return only the last N lines of combined output. Prefer this over `| tail -N` in the command.", tail_lines),
+                ("max_output_bytes", "Truncate output to this many bytes. Prefer this over `| head -c N` in the command.", max_output_bytes),
+                ("inputs", "Paths that the command will read (for sandbox allow-listing).", inputs),
+                ("outputs", "Paths that the command will write (triggers history snapshot).", outputs),
             ],
             &["command"],
         )
@@ -124,17 +125,25 @@ impl JsonSchema for ReadExecLogParams {
         let head_lines = generator.subschema_for::<Option<usize>>();
         let tail_lines = generator.subschema_for::<Option<usize>>();
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
-        object_schema(
+        object_schema_with_desc(
             vec![
-                ("execution_id", execution_id),
-                ("stream", stream),
-                ("offset", offset),
-                ("limit", limit),
-                ("tail", tail),
-                ("grep", grep),
-                ("head_lines", head_lines),
-                ("tail_lines", tail_lines),
-                ("max_output_bytes", max_output_bytes),
+                (
+                    "execution_id",
+                    "The execution_id returned by exec or spawn.",
+                    execution_id,
+                ),
+                ("stream", "'stdout' or 'stderr'.", stream),
+                ("offset", "Skip the first N lines of the log (1-indexed).", offset),
+                ("limit", "Return at most N lines.", limit),
+                ("tail", "Return only the last N lines.", tail),
+                ("grep", "Filter lines by regex before truncating.", grep),
+                ("head_lines", "Return only the first N lines.", head_lines),
+                ("tail_lines", "Return only the last N lines.", tail_lines),
+                (
+                    "max_output_bytes",
+                    "Truncate output to this many bytes.",
+                    max_output_bytes,
+                ),
             ],
             &["execution_id", "stream"],
         )
@@ -163,12 +172,20 @@ impl JsonSchema for SpawnCommandParams {
         let working_dir = generator.subschema_for::<Option<String>>();
         let inputs = generator.subschema_for::<Option<Vec<String>>>();
         let outputs = generator.subschema_for::<Option<Vec<String>>>();
-        object_schema(
+        object_schema_with_desc(
             vec![
-                ("command", command),
-                ("working_dir", working_dir),
-                ("inputs", inputs),
-                ("outputs", outputs),
+                ("command", "Bash command to run in the background.", command),
+                (
+                    "working_dir",
+                    "Working directory. Defaults to the project root.",
+                    working_dir,
+                ),
+                ("inputs", "Paths the command will read.", inputs),
+                (
+                    "outputs",
+                    "Paths the command will write (triggers history snapshot on wait).",
+                    outputs,
+                ),
             ],
             &["command"],
         )
@@ -202,14 +219,14 @@ impl JsonSchema for WaitParams {
         let tail_lines = generator.subschema_for::<Option<usize>>();
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
         let grep = generator.subschema_for::<Option<String>>();
-        object_schema(
+        object_schema_with_desc(
             vec![
-                ("execution_id", execution_id),
-                ("timeout_secs", timeout_secs),
-                ("head_lines", head_lines),
-                ("tail_lines", tail_lines),
-                ("max_output_bytes", max_output_bytes),
-                ("grep", grep),
+                ("execution_id", "The execution_id returned by spawn.", execution_id),
+                ("timeout_secs", "Seconds to wait before returning partial output without killing the process.", timeout_secs),
+                ("head_lines", "Return only the first N lines of output. Prefer this over post-processing with head.", head_lines),
+                ("tail_lines", "Return only the last N lines of output. Prefer this over post-processing with tail.", tail_lines),
+                ("max_output_bytes", "Truncate output to this many bytes.", max_output_bytes),
+                ("grep", "Filter output lines by regex.", grep),
             ],
             &["execution_id"],
         )
@@ -231,8 +248,19 @@ impl JsonSchema for TerminateParams {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let execution_id = generator.subschema_for::<String>();
         let signal = generator.subschema_for::<Option<String>>();
-        object_schema(
-            vec![("execution_id", execution_id), ("signal", signal)],
+        object_schema_with_desc(
+            vec![
+                (
+                    "execution_id",
+                    "The execution_id returned by spawn.",
+                    execution_id,
+                ),
+                (
+                    "signal",
+                    "Signal to send. One of: SIGTERM (default), SIGKILL, SIGINT, SIGHUP.",
+                    signal,
+                ),
+            ],
             &["execution_id"],
         )
     }
@@ -252,8 +280,19 @@ impl JsonSchema for RollbackParams {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let commit_id = generator.subschema_for::<String>();
         let repo_path = generator.subschema_for::<String>();
-        object_schema(
-            vec![("commit_id", commit_id), ("repo_path", repo_path)],
+        object_schema_with_desc(
+            vec![
+                (
+                    "commit_id",
+                    "The harnx snapshot commit SHA shown in a prior tool response diff header.",
+                    commit_id,
+                ),
+                (
+                    "repo_path",
+                    "Absolute path to the git repository root to roll back.",
+                    repo_path,
+                ),
+            ],
             &["commit_id", "repo_path"],
         )
     }
@@ -2026,7 +2065,7 @@ impl ServerHandler for BashServer {
             tools: vec![
                 Tool::new(
                     "exec",
-                    "Execute a local bash command and return truncated combined stdout/stderr. When output is cropped, stdout/stderr temp log files are included for later retrieval.",
+                    "Execute a local bash command and return truncated combined stdout/stderr. When output is cropped, stdout/stderr temp log files are included for later retrieval. Prefer head_lines/tail_lines/max_output_bytes params over piping to head/tail in the command string.",
                     Map::new(),
                 )
                 .with_input_schema::<ExecCommandParams>()
@@ -2053,7 +2092,7 @@ impl ServerHandler for BashServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "wait",
-                    "Wait for a spawned background process to exit. Returns the exit code, output metrics, and truncated output. If the process does not exit within the timeout, returns its current status and partial output without killing it.",
+                    "Wait for a spawned background process to exit. Returns the exit code, output metrics, and truncated output. If the process does not exit within the timeout, returns its current status and partial output without killing it. Use head_lines/tail_lines/grep to filter output rather than post-processing with shell tools.",
                     Map::new(),
                 )
                 .with_input_schema::<WaitParams>()
@@ -2255,32 +2294,6 @@ fn load_bash_env_file() -> Vec<(String, String)> {
             Some((key.to_string(), value.to_string()))
         })
         .collect()
-}
-
-fn object_schema(properties: Vec<(&str, Schema)>, required: &[&str]) -> Schema {
-    let mut schema = Map::new();
-    schema.insert("type".to_string(), Value::String("object".to_string()));
-
-    let mut property_map = Map::new();
-    for (name, property_schema) in properties {
-        property_map.insert(name.to_string(), property_schema.as_value().clone());
-    }
-    schema.insert("properties".to_string(), Value::Object(property_map));
-    schema.insert("additionalProperties".to_string(), Value::Bool(false));
-
-    if !required.is_empty() {
-        schema.insert(
-            "required".to_string(),
-            Value::Array(
-                required
-                    .iter()
-                    .map(|name| Value::String((*name).to_string()))
-                    .collect(),
-            ),
-        );
-    }
-
-    schema.into()
 }
 
 async fn read_pipe_to_file<R>(mut reader: R, mut writer: TokioFile) -> std::io::Result<Vec<u8>>
