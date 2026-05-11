@@ -14,7 +14,7 @@ tags:
   - uuidv7
   - terminal-fingerprinting
 plan_ref: "issue-422-session-handling-revamp"
-last_updated: 2026-05-03
+last_updated: 2026-05-09
 
 ## Problem
 
@@ -145,7 +145,7 @@ pub fn sort_sessions_for_picker(sessions: Vec<SessionMeta>, context: &PickerCont
             if session.git_branch == context.current_branch { 0 } else { 1 },
             if session.working_dir.as_deref() == Some(context.current_dir.as_str()) { 0 } else { 1 },
             if session.git_remote == context.current_remote { 0 } else { 1 },
-            session_recency_key(session),  // UUIDv7 timestamp, descending
+            session_recency_key(session),  // mtime first, then UUIDv7 timestamp
         )
     });
     sessions
@@ -173,11 +173,12 @@ pub(crate) fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState>
 
 ## Why This Works
 
-1. **UUIDv7** encodes timestamp in sort-friendly format; extracting from filename enables recency sort without file access
-2. **Header-only read** limits I/O to 64KB max; YAML document boundary detection is deterministic
-3. **Multi-tier sort** gives predictable ranking: sessions from current terminal/tab rank highest, then same branch, then same project
-4. **Terminal fingerprinting** works across macOS Terminal, Windows Terminal, Kitty, tmux, screen, and Linux VT
-5. **Backward compat** via `#[serde(default)]` on all new fields
+1. **File mtime first** — `session_recency_key()` now checks `session.modified` (file modification time) before falling back to UUIDv7 embedded timestamp; this ensures sessions sort by when they were last *active*, not when *created*
+2. **UUIDv7 fallback** — when mtime unavailable, creation timestamp from session ID (filename or UUIDv7) provides secondary recency signal
+3. **Header-only read** limits I/O to 64KB max; YAML document boundary detection is deterministic
+4. **Multi-tier sort** gives predictable ranking: sessions from current terminal/tab rank highest, then same branch, then same project
+5. **Terminal fingerprinting** works across macOS Terminal, Windows Terminal, Kitty, tmux, screen, and Linux VT
+6. **Backward compat** via `#[serde(default)]` on all new fields
 
 ## Prevention Strategies
 
@@ -185,26 +186,30 @@ pub(crate) fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState>
 - `test_parse_session_meta_multiline_yaml_separator` — validates `\n---\n` boundary detection
 - `test_sort_priority_*` — verify each tier of multi-factor sort
 - `test_read_header_large_but_within_64kb` — ensure large headers parse correctly
+- `test_sort_modified_beats_id_timestamp` — proves mtime wins over session ID embedded timestamp when the two conflict
 
 **Key Learnings:**
 - YAML document separator `---` must be matched at start-of-line (`\n---\n`) to avoid false positives in multiline strings
 - `git_branch()` returns empty String (not Option) on failure — callers must convert to None explicitly
 - Picker modal must be restored from `take()` if subsequent operation (`use_agent_by_name`, `use_session`) fails
 - Subagents create scratch files in project root — clean before committing
+- **Recency signal precedence:** file mtime > session ID embedded timestamp — "when last active" is more useful than "when created" for user-facing pickers
 
 **Code Review Checklist:**
 - [ ] YAML boundary detection uses start-of-line pattern
 - [ ] Modal restored on fallible operation failure
 - [ ] Empty string failures converted to None where Option expected
 - [ ] Sort tuple ordering matches priority spec
+- [ ] Recency key checks mtime before session ID timestamp
 
 ## Related Issues
 
 - **GitHub:** [Issue #422](https://github.com/dobesv/harnx/issues/422) — Session handling revamp
+- **GitHub:** [Issue #453](https://github.com/dobesv/harnx/issues/453) — Sort by last updated instead of created
 - **Follow-up:** [logic-errors/picker-flow-state-continuity-2026-05-03.md](../logic-errors/picker-flow-state-continuity-2026-05-03.md) — Bug fixes for picker flow: filter UI, ESC behavior, modal restoration, origin tracking for transcript reconciliation
 - **Files Changed:**
   - `crates/harnx-core/src/session.rs` — Header metadata fields
-  - `crates/harnx-runtime/src/config/session_meta.rs` — Header parsing, multi-tier sort
+  - `crates/harnx-runtime/src/config/session_meta.rs` — Header parsing, multi-tier sort, `session_recency_key()` mtime-first logic
   - `crates/harnx-runtime/src/utils/terminal_session.rs` — Terminal fingerprinting
   - `crates/harnx-tui/src/input.rs` — Picker key handling
   - `crates/harnx-tui/src/lifecycle.rs` — Modal resolution at startup
