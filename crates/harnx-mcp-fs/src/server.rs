@@ -65,6 +65,24 @@ pub struct EditFileParams {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct InsertParams {
+    pub path: String,
+    pub insert_line: usize,
+    pub insert_text: String,
+    #[serde(default)]
+    pub column: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReReplaceParams {
+    pub path: String,
+    pub pattern: String,
+    pub replacement: String,
+    #[serde(default)]
+    pub replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ListDirectoryParams {
     pub path: String,
     #[serde(default)]
@@ -164,6 +182,50 @@ impl JsonSchema for EditFileParams {
                 ("replace_all", replace_all),
             ],
             &["path", "old_text", "new_text"],
+        )
+    }
+}
+
+impl JsonSchema for InsertParams {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("InsertParams")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let path = generator.subschema_for::<String>();
+        let insert_line = generator.subschema_for::<usize>();
+        let insert_text = generator.subschema_for::<String>();
+        let column = generator.subschema_for::<Option<usize>>();
+        object_schema(
+            vec![
+                ("path", path),
+                ("insert_line", insert_line),
+                ("insert_text", insert_text),
+                ("column", column),
+            ],
+            &["path", "insert_line", "insert_text"],
+        )
+    }
+}
+
+impl JsonSchema for ReReplaceParams {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ReReplaceParams")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let path = generator.subschema_for::<String>();
+        let pattern = generator.subschema_for::<String>();
+        let replacement = generator.subschema_for::<String>();
+        let replace_all = generator.subschema_for::<Option<bool>>();
+        object_schema(
+            vec![
+                ("path", path),
+                ("pattern", pattern),
+                ("replacement", replacement),
+                ("replace_all", replace_all),
+            ],
+            &["path", "pattern", "replacement"],
         )
     }
 }
@@ -497,9 +559,239 @@ impl FsServer {
         Ok(CallToolResult::success(contents))
     }
 
+    async fn insert_impl(&self, params: InsertParams) -> Result<CallToolResult, ErrorData> {
+        let roots = self.roots.read().await;
+        let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
+        drop(roots);
+
+        let before_snap = self
+            .history
+            .snapshot_file(&path, "before insert")
+            .await
+            .map_err(|e| {
+                log::warn!("history before-snapshot failed: {e}");
+            })
+            .ok();
+
+        let content = std::fs::read_to_string(&path)
+            .map_err(|err| internal_error(format!("failed to read '{}': {err}", params.path)))?;
+
+        if content.len() > WRITE_MAX_BYTES {
+            return tool_error(format!(
+                "File too large for editing ({}, max {})",
+                format_size(content.len()),
+                format_size(WRITE_MAX_BYTES)
+            ));
+        }
+
+        let lines = content.split_inclusive('\n').collect::<Vec<_>>();
+        let total_lines = lines.len();
+        if params.insert_line > total_lines {
+            return tool_error(format!(
+                "insert_line {} out of range for file with {} lines",
+                params.insert_line, total_lines
+            ));
+        }
+
+        let new_content = if params.insert_line == 0 {
+            format!("{}{}", params.insert_text, content)
+        } else if params.column.unwrap_or(1) <= 1 {
+            format!(
+                "{}{}{}",
+                lines[..params.insert_line].join(""),
+                params.insert_text,
+                lines[params.insert_line..].join("")
+            )
+        } else {
+            let line = lines[params.insert_line - 1];
+            let (stripped_line, had_newline) = match line.strip_suffix('\n') {
+                Some(stripped) => (stripped, true),
+                None => (line, false),
+            };
+            let column = params.column.unwrap();
+            let insert_index = column - 1;
+            if insert_index > stripped_line.len() || !stripped_line.is_char_boundary(insert_index) {
+                return tool_error(format!(
+                    "column {} is not a valid UTF-8 character boundary in line {}",
+                    column, params.insert_line
+                ));
+            }
+            let new_line = if had_newline {
+                format!(
+                    "{}{}{}
+",
+                    &stripped_line[..insert_index],
+                    params.insert_text,
+                    &stripped_line[insert_index..]
+                )
+            } else {
+                format!(
+                    "{}{}{}",
+                    &stripped_line[..insert_index],
+                    params.insert_text,
+                    &stripped_line[insert_index..]
+                )
+            };
+            format!(
+                "{}{}{}",
+                lines[..params.insert_line - 1].join(""),
+                new_line,
+                lines[params.insert_line..].join("")
+            )
+        };
+
+        if new_content.len() > WRITE_MAX_BYTES {
+            return tool_error(format!(
+                "Insertion would produce a file too large ({}, max {})",
+                format_size(new_content.len()),
+                format_size(WRITE_MAX_BYTES)
+            ));
+        }
+
+        std::fs::write(&path, &new_content)
+            .map_err(|err| internal_error(format!("failed to write '{}': {err}", params.path)))?;
+
+        let after_snap_result = if let Some(before) = before_snap {
+            match self.history.snapshot_file(&path, "after insert").await {
+                Ok(after) => {
+                    let diff = if let Some(repo_dir) =
+                        harnx_mcp_history::discover::find_repo_for_path(&path)
+                    {
+                        self.history
+                            .diff_commits(&repo_dir, before, after)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    Some((after, diff))
+                }
+                Err(e) => {
+                    log::warn!("history after-snapshot failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut contents = vec![Content::text(format!(
+            "Inserted {} bytes into {}",
+            params.insert_text.len(),
+            params.path
+        ))];
+        if let Some((_after_id, diff_content)) = after_snap_result {
+            if !diff_content.is_empty() {
+                contents.push(Content::text(diff_content));
+            }
+        }
+        Ok(CallToolResult::success(contents))
+    }
+
+    async fn re_replace_impl(&self, params: ReReplaceParams) -> Result<CallToolResult, ErrorData> {
+        let roots = self.roots.read().await;
+        let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
+        drop(roots);
+
+        let before_snap = self
+            .history
+            .snapshot_file(&path, "before re_replace")
+            .await
+            .map_err(|e| {
+                log::warn!("history before-snapshot failed: {e}");
+            })
+            .ok();
+
+        let content = std::fs::read_to_string(&path)
+            .map_err(|err| internal_error(format!("failed to read '{}': {err}", params.path)))?;
+
+        if content.len() > WRITE_MAX_BYTES {
+            return tool_error(format!(
+                "File too large for editing ({}, max {})",
+                format_size(content.len()),
+                format_size(WRITE_MAX_BYTES)
+            ));
+        }
+
+        let regex = Regex::new(&params.pattern).map_err(|err| {
+            ErrorData::invalid_params(format!("invalid regex pattern: {err}"), None)
+        })?;
+        let count = regex
+            .find_iter(&content)
+            .filter_map(|result| result.ok())
+            .count();
+        if count == 0 {
+            return tool_error("pattern did not match anything in the file");
+        }
+
+        let replace_all = params.replace_all.unwrap_or(false);
+        if !replace_all && count > 1 {
+            return tool_error(format!(
+                "Found {} matches; set replace_all=true to replace all occurrences",
+                count
+            ));
+        }
+
+        let new_content = if replace_all {
+            regex
+                .replace_all(&content, params.replacement.as_str())
+                .into_owned()
+        } else {
+            regex
+                .replace(&content, params.replacement.as_str())
+                .into_owned()
+        };
+
+        if new_content.len() > WRITE_MAX_BYTES {
+            return tool_error(format!(
+                "Replacement would produce a file too large ({}, max {})",
+                format_size(new_content.len()),
+                format_size(WRITE_MAX_BYTES)
+            ));
+        }
+
+        std::fs::write(&path, &new_content)
+            .map_err(|err| internal_error(format!("failed to write '{}': {err}", params.path)))?;
+
+        let after_snap_result = if let Some(before) = before_snap {
+            match self.history.snapshot_file(&path, "after re_replace").await {
+                Ok(after) => {
+                    let diff = if let Some(repo_dir) =
+                        harnx_mcp_history::discover::find_repo_for_path(&path)
+                    {
+                        self.history
+                            .diff_commits(&repo_dir, before, after)
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    Some((after, diff))
+                }
+                Err(e) => {
+                    log::warn!("history after-snapshot failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut contents = vec![Content::text(format!(
+            "Replaced {} match(es) in {}",
+            count, params.path
+        ))];
+        if let Some((_after_id, diff_content)) = after_snap_result {
+            if !diff_content.is_empty() {
+                contents.push(Content::text(diff_content));
+            }
+        }
+        Ok(CallToolResult::success(contents))
+    }
+
     async fn edit_file_impl(&self, params: EditFileParams) -> Result<CallToolResult, ErrorData> {
         let roots = self.roots.read().await;
-        let path = validate_path(&params.path, &roots).map_err(invalid_params)?;
+        let path = validate_write_path(&params.path, &roots).map_err(invalid_params)?;
         drop(roots);
 
         // HISTORY: before snapshot
@@ -870,7 +1162,7 @@ impl ServerHandler for FsServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Filesystem MCP server with read, write, edit, listing, grep, and glob tools.",
+                "Filesystem MCP server with read, write, edit, insert, re_replace, listing, grep, and glob tools.",
             )
     }
 
@@ -891,6 +1183,20 @@ impl ServerHandler for FsServer {
                 Tool::new("edit", "Replace exact text within an existing file.", Map::new())
                     .with_input_schema::<EditFileParams>()
                     .with_meta(make_tool_meta("🔧 {{ args.path }}{% if args.replace_all %} [all]{% endif %}\n▸ {{ args.old_text | truncate(60) }}\n↳ {{ args.new_text | truncate(60) }}")),
+                Tool::new("insert",
+                    "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N      (use N = total lines to append). Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.",
+                    Map::new())
+                    .with_input_schema::<InsertParams>()
+                    .with_meta(make_tool_meta(
+                        "➕ {{ args.path }}:{{ args.insert_line }}{% if args.column %}:{{ args.column }}{% endif %}\n↳ {{ args.insert_text | truncate(60) }}"
+                    )),
+                Tool::new("re_replace",
+                    "Replace text in a file using a regular expression.      Uses fancy_regex syntax (supports lookahead/lookbehind).      Use $0 for the full match, $1/$2 etc. for capture groups in replacement.      Errors if pattern matches nothing. If pattern matches more than once,      set replace_all=true; otherwise only the first match is replaced.      For exact-text replacement use edit instead.",
+                    Map::new())
+                    .with_input_schema::<ReReplaceParams>()
+                    .with_meta(make_tool_meta(
+                        "🔁 {{ args.path }}{% if args.replace_all %} [all]{% endif %}\n▸ /{{ args.pattern }}/\n↳ {{ args.replacement | truncate(60) }}"
+                    )),
                 Tool::new("ls", "List directory contents, optionally recursively.", Map::new())
                     .with_input_schema::<ListDirectoryParams>()
                     .annotate(read_only.clone())
@@ -936,6 +1242,14 @@ impl ServerHandler for FsServer {
             "edit" => {
                 let params = parse_arguments::<EditFileParams>(request.arguments)?;
                 self.edit_file_impl(params).await
+            }
+            "insert" => {
+                let params = parse_arguments::<InsertParams>(request.arguments)?;
+                self.insert_impl(params).await
+            }
+            "re_replace" => {
+                let params = parse_arguments::<ReReplaceParams>(request.arguments)?;
+                self.re_replace_impl(params).await
             }
             "ls" => {
                 let params = parse_arguments::<ListDirectoryParams>(request.arguments)?;
@@ -1447,6 +1761,8 @@ mod tests {
                 "read",
                 "write",
                 "edit",
+                "insert",
+                "re_replace",
                 "ls",
                 "grep",
                 "find",
@@ -2108,5 +2424,382 @@ mod tests {
 
             (case.check)(user_summary(&result).as_str());
         }
+    }
+
+    #[tokio::test]
+    async fn test_insert_prepend() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("prepend.txt");
+        std::fs::write(
+            &file_path,
+            "beta
+gamma
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .insert_impl(InsertParams {
+                path: file_path.to_string_lossy().to_string(),
+                insert_line: 0,
+                insert_text: "alpha
+"
+                .to_string(),
+                column: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "alpha
+beta
+gamma
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_append() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("append.txt");
+        std::fs::write(
+            &file_path,
+            "alpha
+beta
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .insert_impl(InsertParams {
+                path: file_path.to_string_lossy().to_string(),
+                insert_line: 2,
+                insert_text: "gamma
+"
+                .to_string(),
+                column: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "alpha
+beta
+gamma
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_middle() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("middle.txt");
+        std::fs::write(
+            &file_path,
+            "one
+two
+three
+four
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .insert_impl(InsertParams {
+                path: file_path.to_string_lossy().to_string(),
+                insert_line: 2,
+                insert_text: "between
+"
+                .to_string(),
+                column: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "one
+two
+between
+three
+four
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_column() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("column.txt");
+        std::fs::write(
+            &file_path,
+            "abcd
+xyz
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .insert_impl(InsertParams {
+                path: file_path.to_string_lossy().to_string(),
+                insert_line: 1,
+                insert_text: "-MID-".to_string(),
+                column: Some(5),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "abcd-MID-
+xyz
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_column_utf8_boundary() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("utf8_boundary.txt");
+        std::fs::write(
+            &file_path, "🦀abc
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let ok_result = server
+            .insert_impl(InsertParams {
+                path: file_path.to_string_lossy().to_string(),
+                insert_line: 1,
+                insert_text: "X".to_string(),
+                column: Some(5),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(ok_result.is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "🦀Xabc
+"
+        );
+
+        std::fs::write(
+            &file_path, "🦀abc
+",
+        )
+        .unwrap();
+
+        let bad_result = server
+            .insert_impl(InsertParams {
+                path: file_path.to_string_lossy().to_string(),
+                insert_line: 1,
+                insert_text: "X".to_string(),
+                column: Some(2),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(bad_result.is_error, Some(true));
+        assert!(text_content(&bad_result).contains("UTF-8 character boundary"));
+    }
+
+    #[tokio::test]
+    async fn test_insert_line_out_of_range() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("line_oob.txt");
+        std::fs::write(
+            &file_path,
+            "alpha
+beta
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .insert_impl(InsertParams {
+                path: file_path.to_string_lossy().to_string(),
+                insert_line: 3,
+                insert_text: "gamma
+"
+                .to_string(),
+                column: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_insert_column_out_of_range() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("column_oob.txt");
+        std::fs::write(
+            &file_path, "abcd
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .insert_impl(InsertParams {
+                path: file_path.to_string_lossy().to_string(),
+                insert_line: 1,
+                insert_text: "X".to_string(),
+                column: Some(6),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_re_replace_basic() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("re_basic.txt");
+        std::fs::write(
+            &file_path, "foo123
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .re_replace_impl(ReReplaceParams {
+                path: file_path.to_string_lossy().to_string(),
+                pattern: r"foo(\d+)".to_string(),
+                replacement: "bar$1".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "bar123
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_re_replace_all() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("re_all.txt");
+        std::fs::write(
+            &file_path,
+            "foo1 foo2 foo3
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .re_replace_impl(ReReplaceParams {
+                path: file_path.to_string_lossy().to_string(),
+                pattern: r"foo(\d+)".to_string(),
+                replacement: "bar$1".to_string(),
+                replace_all: Some(true),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "bar1 bar2 bar3
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_re_replace_no_match() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("re_no_match.txt");
+        std::fs::write(
+            &file_path,
+            "alpha
+beta
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .re_replace_impl(ReReplaceParams {
+                path: file_path.to_string_lossy().to_string(),
+                pattern: "foo".to_string(),
+                replacement: "bar".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_content(&result).contains("did not match"));
+    }
+
+    #[tokio::test]
+    async fn test_re_replace_multiple_no_flag() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("re_multiple.txt");
+        std::fs::write(
+            &file_path,
+            "foo1 foo2
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .re_replace_impl(ReReplaceParams {
+                path: file_path.to_string_lossy().to_string(),
+                pattern: r"foo(\d+)".to_string(),
+                replacement: "bar$1".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(text_content(&result).contains("replace_all"));
+    }
+
+    #[tokio::test]
+    async fn test_re_replace_invalid_pattern() {
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("re_invalid.txt");
+        std::fs::write(
+            &file_path, "foo1
+",
+        )
+        .unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let err = server
+            .re_replace_impl(ReReplaceParams {
+                path: file_path.to_string_lossy().to_string(),
+                pattern: "(".to_string(),
+                replacement: "bar".to_string(),
+                replace_all: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.message.contains("invalid regex pattern"));
     }
 }
