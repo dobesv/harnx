@@ -6,7 +6,9 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use harnx_core::event::{AgentEvent, AgentSource};
 use harnx_render::pretty_error_string;
-use harnx_runtime::config::{build_picker_context, sort_sessions_for_picker};
+use harnx_runtime::config::{
+    build_picker_context, list_assistant_agents, sort_sessions_for_picker,
+};
 use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
@@ -20,6 +22,25 @@ const ATTACHMENT_PREVIEW_MAX_LINES: usize = 12;
 /// cooperative tools to observe the abort and return; short enough that
 /// the user does not feel a stall.
 const PROMPT_TASK_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickerCommand {
+    Agent,
+    Session,
+}
+
+fn picker_command_for_input(line: &str, pos: usize) -> Option<PickerCommand> {
+    let upto_cursor = &line[..pos];
+    // Normalise the same way the command parser does: strip leading whitespace,
+    // then check that the only remaining content is the bare command name
+    // (no argument started after the command).
+    let trimmed = upto_cursor.trim_start();
+    match trimmed.trim_end() {
+        ".agent" => Some(PickerCommand::Agent),
+        ".session" => Some(PickerCommand::Session),
+        _ => None,
+    }
+}
 
 fn unique_attachment_display_name(
     attachments: &[crate::types::Attachment],
@@ -1548,9 +1569,20 @@ impl Tui {
             p.min(line.len())
         };
 
+        let picker_command = picker_command_for_input(&line, pos);
         let completions = self.compute_completions(&line, pos).await;
         if completions.is_empty() {
-            return;
+            match picker_command {
+                Some(PickerCommand::Agent) => {
+                    self.open_agent_picker();
+                    return;
+                }
+                Some(PickerCommand::Session) => {
+                    self.open_session_picker();
+                    return;
+                }
+                None => return,
+            }
         }
 
         // Compute replacement bounds so we only replace the token under the cursor.
@@ -1684,11 +1716,74 @@ impl Tui {
                     .collect();
             }
 
+            if matches!(cmd, ".agent" | ".session") && args.iter().all(|arg| arg.is_empty()) {
+                return vec![];
+            }
+
             let filter = args.last().copied().unwrap_or("");
             return self.config.read().command_complete(cmd, &args, filter);
         }
 
         vec![]
+    }
+
+    fn open_agent_picker(&mut self) {
+        self.app.modal = Some(crate::types::ModalState::AgentPicker {
+            agents: list_assistant_agents(),
+            selected: 0,
+            query: String::new(),
+        });
+    }
+
+    fn open_session_picker(&mut self) {
+        let sessions = self.config.read().list_sessions_with_meta();
+        let ctx = build_picker_context();
+        let sessions = sort_sessions_for_picker(sessions, &ctx);
+        let origin_agent = self
+            .config
+            .read()
+            .agent
+            .as_ref()
+            .map(|a| a.name().to_string());
+        let origin_session = self
+            .config
+            .read()
+            .session
+            .as_ref()
+            .map(|s| s.id().to_string());
+        self.app.modal = Some(crate::types::ModalState::SessionPicker {
+            sessions,
+            selected: 0,
+            origin_agent,
+            origin_session,
+        });
+    }
+
+    fn maybe_open_picker_after_command(
+        &mut self,
+        outcome: harnx_runtime::commands::CommandOutcome,
+        prev_agent: Option<String>,
+    ) {
+        match outcome {
+            harnx_runtime::commands::CommandOutcome::Continue => {
+                let cfg = self.config.read();
+                let curr_agent = cfg.agent.as_ref().map(|a| a.name().to_string());
+                let session_missing = cfg.session.is_none();
+                drop(cfg);
+                if prev_agent != curr_agent && session_missing {
+                    self.open_session_picker();
+                }
+            }
+            harnx_runtime::commands::CommandOutcome::Exit => {
+                self.app.should_quit = true;
+            }
+            harnx_runtime::commands::CommandOutcome::OpenAgentPicker => {
+                self.open_agent_picker();
+            }
+            harnx_runtime::commands::CommandOutcome::OpenSessionPicker => {
+                self.open_session_picker();
+            }
+        }
     }
 
     fn reconcile_transcript_after_command(
@@ -1774,9 +1869,7 @@ impl Tui {
 
         match result {
             Ok(outcome) => {
-                if matches!(outcome, harnx_runtime::commands::CommandOutcome::Exit) {
-                    self.app.should_quit = true;
-                }
+                self.maybe_open_picker_after_command(outcome, prev_agent.clone());
                 let llm_busy = self.app.llm_busy;
                 let pending_message = self.app.pending_message.is_some();
                 Self::refresh_input_chrome_from_state(

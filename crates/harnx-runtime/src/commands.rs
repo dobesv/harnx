@@ -20,6 +20,10 @@ pub enum CommandOutcome {
     Continue,
     /// Exit the interactive session.
     Exit,
+    /// Open agent picker in TUI.
+    OpenAgentPicker,
+    /// Open session picker in TUI.
+    OpenSessionPicker,
 }
 
 pub static COMMANDS: LazyLock<[Command; 45]> = LazyLock::new(|| {
@@ -220,6 +224,9 @@ pub async fn run_command_with_output(
                 None => writeln!(output, "Usage: .prompt <text>...")?,
             },
             ".session" => {
+                if args.is_none() {
+                    return Ok(CommandOutcome::OpenSessionPicker);
+                }
                 config.write().use_session(args)?;
                 Config::maybe_autoname_session(config.clone());
             }
@@ -251,10 +258,7 @@ pub async fn run_command_with_output(
                     config.write().agent_variables = None;
                     ret?;
                 }
-                None => writeln!(
-                    output,
-                    r#"Usage: .agent <agent-name> [session-name] [key=value]..."#
-                )?,
+                None => return Ok(CommandOutcome::OpenAgentPicker),
             },
             ".starter" => match args {
                 Some(id) => {
