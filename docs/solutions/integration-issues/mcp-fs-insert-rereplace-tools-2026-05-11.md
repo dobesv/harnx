@@ -54,7 +54,7 @@ Position-based insertion with optional column offset:
 #[derive(Debug, Deserialize)]
 pub struct InsertParams {
     pub path: String,
-    pub insert_line: usize,       // 0-indexed: 0=prepend, N=after line N
+    pub insert_line: usize,       // 0 = prepend; 1..=N = 1-based line numbers (N appends)
     pub insert_text: String,
     #[serde(default)]
     pub column: Option<usize>,   // 1-indexed byte offset within line

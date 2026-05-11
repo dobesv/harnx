@@ -573,7 +573,8 @@ impl FsServer {
             })
             .ok();
 
-        let content = std::fs::read_to_string(&path)
+        let content = tokio::fs::read_to_string(&path)
+            .await
             .map_err(|err| internal_error(format!("failed to read '{}': {err}", params.path)))?;
 
         if content.len() > WRITE_MAX_BYTES {
@@ -590,6 +591,12 @@ impl FsServer {
             return tool_error(format!(
                 "insert_line {} out of range for file with {} lines",
                 params.insert_line, total_lines
+            ));
+        }
+
+        if params.column == Some(0) {
+            return Err(invalid_params(
+                "column is 1-indexed; 0 is invalid (use 1 for start of line or omit for whole-line insert)",
             ));
         }
 
@@ -702,7 +709,8 @@ impl FsServer {
             })
             .ok();
 
-        let content = std::fs::read_to_string(&path)
+        let content = tokio::fs::read_to_string(&path)
+            .await
             .map_err(|err| internal_error(format!("failed to read '{}': {err}", params.path)))?;
 
         if content.len() > WRITE_MAX_BYTES {
@@ -716,10 +724,13 @@ impl FsServer {
         let regex = Regex::new(&params.pattern).map_err(|err| {
             ErrorData::invalid_params(format!("invalid regex pattern: {err}"), None)
         })?;
-        let count = regex
-            .find_iter(&content)
-            .filter_map(|result| result.ok())
-            .count();
+        let mut count = 0usize;
+        for result in regex.find_iter(&content) {
+            match result {
+                Ok(_) => count += 1,
+                Err(err) => return tool_error(format!("regex evaluation error: {err}")),
+            }
+        }
         if count == 0 {
             return tool_error("pattern did not match anything in the file");
         }
@@ -732,15 +743,11 @@ impl FsServer {
             ));
         }
 
-        let new_content = if replace_all {
-            regex
-                .replace_all(&content, params.replacement.as_str())
-                .into_owned()
-        } else {
-            regex
-                .replace(&content, params.replacement.as_str())
-                .into_owned()
-        };
+        let limit = if replace_all { 0 } else { 1 };
+        let new_content = regex
+            .try_replacen(&content, limit, params.replacement.as_str())
+            .map_err(|err| internal_error(format!("regex replacement error: {err}")))?
+            .into_owned();
 
         if new_content.len() > WRITE_MAX_BYTES {
             return tool_error(format!(
