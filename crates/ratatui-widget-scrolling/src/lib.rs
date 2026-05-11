@@ -73,6 +73,18 @@ impl ScrollState {
         value_change
     }
 
+    /// Copy the height cache from `other` into `self`.
+    ///
+    /// This is used when a secondary scroll view (e.g. the browsing-mode overlay)
+    /// needs to immediately compute an accurate scroll position for
+    /// `scroll_position_to_show_item` without having rendered any content yet.
+    /// Copying the cache from the primary scroll view — which has already rendered
+    /// the same items at the same width — primes the secondary view with accurate
+    /// per-item heights so the first position calculation is correct.
+    pub fn copy_height_cache_from(&mut self, other: &Self) {
+        self.render_height_cache = other.render_height_cache.clone();
+    }
+
     fn get_height_log_from_cache_for_width(
         &mut self,
         width: u16,
