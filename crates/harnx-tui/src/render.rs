@@ -417,19 +417,6 @@ impl Tui {
             None
         };
 
-        if self.app.scroll_to_focused_item {
-            if let Some(focus) = self.app.transcript_focus {
-                let position = self.app.scroll_state.scroll_position_to_show_item(
-                    focus,
-                    chunks[0].width,
-                    chunks[0].height as usize,
-                    self.app.transcript.len(),
-                );
-                self.app.scroll_state.position = position;
-            }
-            self.app.scroll_to_focused_item = false;
-        }
-
         let transcript_entries = self.prepare_transcript_entries(
             chunks[0].width,
             show_seq,
@@ -1340,6 +1327,14 @@ impl Tui {
 
         if self.app.scroll_to_focused_item {
             if let Some(focus) = self.app.transcript_focus {
+                // Prime the browsing-view height cache from the main scroll state so that
+                // scroll_position_to_show_item has accurate per-item heights even on the
+                // very first render of the browsing overlay (before it has rendered anything
+                // itself). Without this, the cache defaults to height=1 per item, producing
+                // a wildly incorrect scroll position for multi-line transcript items.
+                self.app
+                    .browsing_view_scroll
+                    .copy_height_cache_from(&self.app.scroll_state);
                 let position = self.app.browsing_view_scroll.scroll_position_to_show_item(
                     focus,
                     chunks[0].width,

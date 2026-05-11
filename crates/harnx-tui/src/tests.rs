@@ -7056,6 +7056,96 @@ async fn test_browsing_mode_non_navigable_items_visible_not_focusable() {
     );
 }
 
+/// Regression test for GitHub issue #507.
+///
+/// When entering browsing mode with enough items to overflow the viewport,
+/// pressing UP should scroll the selected item into view immediately.
+///
+/// Before the fix two bugs combined to break this:
+/// 1. The `scroll_to_focused_item` flag was consumed (cleared) by dead code in
+///    the non-browsing render path, so `render_browsing_view` never saw it.
+/// 2. `browsing_view_scroll` had an empty height cache on first entry into
+///    browsing mode, making `scroll_position_to_show_item` default all items to
+///    height=1 and produce a wrong position.
+#[tokio::test]
+async fn test_browsing_mode_first_up_scrolls_last_item_into_view() {
+    // Small viewport: 60 wide, 12 tall.
+    // Browsing view reserves 2 rows for footer → 10 rows of content.
+    // 20 items means they do not all fit at once.
+    let mut harness = TuiTestHarness::with_size(60, 12);
+
+    harness.tui().app.transcript.clear();
+
+    for i in 0..20usize {
+        // Every fifth item is long enough to wrap at width 60, ensuring the
+        // height cache holds values > 1 for some entries.  If cache-priming
+        // were broken, scroll_position_to_show_item would use height=1 for
+        // every item and compute a wrong (too-small) scroll position.
+        let text = if i % 5 == 0 {
+            format!(
+                "Message {i} — this is a deliberately long line that exceeds sixty columns and must wrap"
+            )
+        } else {
+            format!("Message {i}")
+        };
+        harness.tui().app.transcript.push(TranscriptItem::UserText {
+            text,
+            seq: None,
+            timestamp: None,
+        });
+    }
+
+    // Render once in normal (non-browsing) mode so the main scroll_state
+    // builds an accurate height cache for these items.
+    harness.render();
+
+    // Simulate pressing UP from a blank input.  The handler sets
+    // transcript_focus to the last navigable item and scroll_to_focused_item = true.
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        harness.tui().app.transcript_browsing,
+        "transcript_browsing should be true after pressing UP"
+    );
+    assert_eq!(
+        harness.tui().app.transcript_focus,
+        Some(19),
+        "focus should be on the last item (index 19)"
+    );
+    assert!(
+        harness.tui().app.scroll_to_focused_item,
+        "scroll_to_focused_item should be set before first browsing render"
+    );
+
+    // Render the browsing view.  The fix primes the height cache from
+    // scroll_state before computing the position.
+    harness.render();
+
+    assert!(
+        !harness.tui().app.scroll_to_focused_item,
+        "scroll_to_focused_item should be cleared after render"
+    );
+
+    // A position of 0 would mean the viewport is showing the top of the list —
+    // the bug.  Any positive value means we scrolled toward the focused item.
+    let pos = harness.tui().app.browsing_view_scroll.position;
+    assert!(
+        pos > 0,
+        "browsing_view_scroll.position should be > 0 (scrolled to last item), got {pos}"
+    );
+
+    // The last message must be visible on screen.
+    let screen = harness.screen_contents();
+    assert!(
+        screen.contains("Message 19"),
+        "Last item 'Message 19' should be visible on screen after UP press.\nScreen:\n{screen}"
+    );
+}
+
 #[tokio::test]
 async fn test_agent_command_leaves_tui_without_session_gap() {
     let mut harness = TuiTestHarness::with_size(60, 20);
