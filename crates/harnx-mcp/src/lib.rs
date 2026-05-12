@@ -8,6 +8,7 @@ pub mod client;
 pub mod config;
 pub mod convert;
 pub mod safety;
+pub mod schema;
 
 pub use client::McpManager;
 pub use config::McpServerConfig;

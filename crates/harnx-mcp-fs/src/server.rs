@@ -9,6 +9,7 @@ use harnx_mcp::safety::{
     DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, LS_SCAN_HARD_LIMIT, READ_MAX_FILE_BYTES,
     SEARCH_FILE_MAX_BYTES, WRITE_MAX_BYTES,
 };
+use harnx_mcp::schema::object_schema_with_desc;
 use harnx_mcp_history::HistoryManager;
 
 use fancy_regex::Regex;
@@ -133,16 +134,16 @@ impl JsonSchema for ReadFileParams {
         let head_lines = generator.subschema_for::<Option<usize>>();
         let tail_lines = generator.subschema_for::<Option<usize>>();
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
-        object_schema(
+        object_schema_with_desc(
             vec![
-                ("path", path),
-                ("offset", offset),
-                ("limit", limit),
-                ("tail", tail),
-                ("grep", grep),
-                ("head_lines", head_lines),
-                ("tail_lines", tail_lines),
-                ("max_output_bytes", max_output_bytes),
+                ("path", "Absolute path to the file to read. Prefer this tool over shell commands like sed, cat, head, tail for reading files.", path),
+                ("offset", "Start reading at this line number (1-indexed). Use to read a specific line range instead of `sed -n 'N,Mp'`.", offset),
+                ("limit", "Maximum number of lines to return from offset. Combine with offset to read a range.", limit),
+                ("tail", "Return only the last N lines of the file.", tail),
+                ("grep", "Filter lines by regex pattern before returning.", grep),
+                ("head_lines", "Return only the first N lines. Prefer this over piping through head.", head_lines),
+                ("tail_lines", "Return only the last N lines. Prefer this over piping through tail.", tail_lines),
+                ("max_output_bytes", "Truncate output to at most this many bytes.", max_output_bytes),
             ],
             &["path"],
         )
@@ -157,8 +158,19 @@ impl JsonSchema for WriteFileParams {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let path = generator.subschema_for::<String>();
         let content = generator.subschema_for::<String>();
-        object_schema(
-            vec![("path", path), ("content", content)],
+        object_schema_with_desc(
+            vec![
+                (
+                    "path",
+                    "Absolute path to the file to write or create.",
+                    path,
+                ),
+                (
+                    "content",
+                    "Full file content to write (replaces existing content).",
+                    content,
+                ),
+            ],
             &["path", "content"],
         )
     }
@@ -174,12 +186,20 @@ impl JsonSchema for EditFileParams {
         let old_text = generator.subschema_for::<String>();
         let new_text = generator.subschema_for::<String>();
         let replace_all = generator.subschema_for::<Option<bool>>();
-        object_schema(
+        object_schema_with_desc(
             vec![
-                ("path", path),
-                ("old_text", old_text),
-                ("new_text", new_text),
-                ("replace_all", replace_all),
+                ("path", "Absolute path to the file to edit.", path),
+                (
+                    "old_text",
+                    "Exact text to find and replace. Must match exactly including whitespace.",
+                    old_text,
+                ),
+                ("new_text", "Replacement text.", new_text),
+                (
+                    "replace_all",
+                    "If true, replace all occurrences. Default: replace only the first.",
+                    replace_all,
+                ),
             ],
             &["path", "old_text", "new_text"],
         )
@@ -196,12 +216,12 @@ impl JsonSchema for InsertParams {
         let insert_line = generator.subschema_for::<usize>();
         let insert_text = generator.subschema_for::<String>();
         let column = generator.subschema_for::<Option<usize>>();
-        object_schema(
+        object_schema_with_desc(
             vec![
-                ("path", path),
-                ("insert_line", insert_line),
-                ("insert_text", insert_text),
-                ("column", column),
+                ("path", "Absolute path to the file to insert into.", path),
+                ("insert_line", "Insert after this line number. 0 = prepend before line 1. N = total lines to append.", insert_line),
+                ("insert_text", "Text to insert.", insert_text),
+                ("column", "1-indexed byte offset within the line for mid-line insertion. Default: 1 (start of line).", column),
             ],
             &["path", "insert_line", "insert_text"],
         )
@@ -218,12 +238,12 @@ impl JsonSchema for ReReplaceParams {
         let pattern = generator.subschema_for::<String>();
         let replacement = generator.subschema_for::<String>();
         let replace_all = generator.subschema_for::<Option<bool>>();
-        object_schema(
+        object_schema_with_desc(
             vec![
-                ("path", path),
-                ("pattern", pattern),
-                ("replacement", replacement),
-                ("replace_all", replace_all),
+                ("path", "Absolute path to the file.", path),
+                ("pattern", "fancy_regex pattern (supports lookahead/lookbehind). Use $0 for full match, $1/$2 for groups.", pattern),
+                ("replacement", "Replacement string. Use $0/$1/$2 for capture groups.", replacement),
+                ("replace_all", "If true, replace all matches. Default: replace only the first (errors if more than one match).", replace_all),
             ],
             &["path", "pattern", "replacement"],
         )
@@ -238,7 +258,13 @@ impl JsonSchema for ListDirectoryParams {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let path = generator.subschema_for::<String>();
         let recursive = generator.subschema_for::<Option<bool>>();
-        object_schema(vec![("path", path), ("recursive", recursive)], &["path"])
+        object_schema_with_desc(
+            vec![
+                ("path", "Absolute path to the directory to list. Prefer this tool over running bash ls.", path),
+                ("recursive", "If true, list recursively. Default: false.", recursive),
+            ],
+            &["path"],
+        )
     }
 }
 
@@ -254,14 +280,34 @@ impl JsonSchema for SearchFilesParams {
         let context_lines = generator.subschema_for::<Option<usize>>();
         let ignore_case = generator.subschema_for::<Option<bool>>();
         let max_results = generator.subschema_for::<Option<usize>>();
-        object_schema(
+        object_schema_with_desc(
             vec![
-                ("pattern", pattern),
-                ("path", path),
-                ("include", include),
-                ("context_lines", context_lines),
-                ("ignore_case", ignore_case),
-                ("max_results", max_results),
+                (
+                    "pattern",
+                    "Regex pattern to search for. Prefer this tool over running bash grep.",
+                    pattern,
+                ),
+                (
+                    "path",
+                    "Directory to search in. Defaults to project root.",
+                    path,
+                ),
+                (
+                    "include",
+                    "Glob pattern to filter files (e.g. '*.rs').",
+                    include,
+                ),
+                (
+                    "context_lines",
+                    "Number of lines of context around each match.",
+                    context_lines,
+                ),
+                ("ignore_case", "Case-insensitive search.", ignore_case),
+                (
+                    "max_results",
+                    "Maximum number of matching lines to return.",
+                    max_results,
+                ),
             ],
             &["pattern"],
         )
@@ -277,11 +323,11 @@ impl JsonSchema for FindFilesParams {
         let pattern = generator.subschema_for::<String>();
         let path = generator.subschema_for::<Option<String>>();
         let max_results = generator.subschema_for::<Option<usize>>();
-        object_schema(
+        object_schema_with_desc(
             vec![
-                ("pattern", pattern),
-                ("path", path),
-                ("max_results", max_results),
+                ("pattern", "Glob pattern to match file paths (e.g. '**/*.rs'). Prefer this tool over running bash find.", pattern),
+                ("path", "Directory to search in. Defaults to project root.", path),
+                ("max_results", "Maximum number of results to return.", max_results),
             ],
             &["pattern"],
         )
@@ -296,8 +342,19 @@ impl JsonSchema for RollbackParams {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let commit_id = generator.subschema_for::<String>();
         let repo_path = generator.subschema_for::<String>();
-        object_schema(
-            vec![("commit_id", commit_id), ("repo_path", repo_path)],
+        object_schema_with_desc(
+            vec![
+                (
+                    "commit_id",
+                    "The harnx snapshot commit SHA shown in a prior tool response diff header.",
+                    commit_id,
+                ),
+                (
+                    "repo_path",
+                    "Absolute path to the git repository root to roll back.",
+                    repo_path,
+                ),
+            ],
             &["commit_id", "repo_path"],
         )
     }
@@ -1180,7 +1237,7 @@ impl ServerHandler for FsServer {
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = ToolAnnotations::new().read_only(true);
         let tools = vec![
-                Tool::new("read", "Read a text file with line numbers, pagination, grep filtering, and smart truncation.", Map::new())
+                Tool::new("read", "Read a text file with line numbers, pagination, grep filtering, and smart truncation. Prefer this tool over shell commands like sed, cat, head, tail. Use offset+limit to read specific line ranges instead of sed -n.", Map::new())
                     .with_input_schema::<ReadFileParams>()
                     .annotate(read_only.clone())
                     .with_meta(make_tool_meta("📖 {{ args.path }}{% if args.offset %} +{{ args.offset }}{% endif %}{% if args.limit is not none %} [:{{ args.limit }}]{% endif %}{% if args.tail is not none %} [tail:{{ args.tail }}]{% endif %}{% if args.grep %} /{{ args.grep }}/{% endif %}{% if args.head_lines is not none %} [head:{{ args.head_lines }}]{% endif %}{% if args.tail_lines is not none %} [tail_lines:{{ args.tail_lines }}]{% endif %}{% if args.max_output_bytes is not none %} [:{{ args.max_output_bytes }}b]{% endif %}")),
@@ -1204,15 +1261,15 @@ impl ServerHandler for FsServer {
                     .with_meta(make_tool_meta(
                         "🔁 {{ args.path }}{% if args.replace_all %} [all]{% endif %}\n▸ /{{ args.pattern }}/\n↳ {{ args.replacement | truncate(60) }}"
                     )),
-                Tool::new("ls", "List directory contents, optionally recursively.", Map::new())
+                Tool::new("ls", "List directory contents, optionally recursively. Prefer this tool over running bash ls.", Map::new())
                     .with_input_schema::<ListDirectoryParams>()
                     .annotate(read_only.clone())
                     .with_meta(make_tool_meta("📂 {{ args.path }}{% if args.recursive %} -r{% endif %}")),
-                Tool::new("grep", "Search file contents with regex and optional context lines.", Map::new())
+                Tool::new("grep", "Search file contents with regex and optional context lines. Prefer this tool over running bash grep.", Map::new())
                     .with_input_schema::<SearchFilesParams>()
                     .annotate(read_only.clone())
                     .with_meta(make_tool_meta("🔍 /{{ args.pattern }}/{% if args.ignore_case %}i{% endif %}{% if args.path %} {{ args.path }}{% endif %}{% if args.include %} [{{ args.include }}]{% endif %}{% if args.context_lines %} ±{{ args.context_lines }}{% endif %}{% if args.max_results %} [max:{{ args.max_results }}]{% endif %}")),
-                Tool::new("find", "Find files by glob pattern.", Map::new())
+                Tool::new("find", "Find files by glob pattern. Prefer this tool over running bash find.", Map::new())
                     .with_input_schema::<FindFilesParams>()
                     .annotate(read_only.clone())
                     .with_meta(make_tool_meta("🔎 {{ args.pattern }}{% if args.path %} {{ args.path }}{% endif %}{% if args.max_results %} [max:{{ args.max_results }}]{% endif %}")),
@@ -1335,32 +1392,6 @@ fn default_search_path(roots: &[PathBuf]) -> PathBuf {
         .first()
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-}
-
-fn object_schema(properties: Vec<(&str, Schema)>, required: &[&str]) -> Schema {
-    let mut schema = Map::new();
-    schema.insert("type".to_string(), Value::String("object".to_string()));
-
-    let mut property_map = Map::new();
-    for (name, property_schema) in properties {
-        property_map.insert(name.to_string(), property_schema.as_value().clone());
-    }
-    schema.insert("properties".to_string(), Value::Object(property_map));
-    schema.insert("additionalProperties".to_string(), Value::Bool(false));
-
-    if !required.is_empty() {
-        schema.insert(
-            "required".to_string(),
-            Value::Array(
-                required
-                    .iter()
-                    .map(|name| Value::String((*name).to_string()))
-                    .collect(),
-            ),
-        );
-    }
-
-    schema.into()
 }
 
 fn walk_dir_flat(dir: &Path, entries: &mut Vec<String>, scan_count: &mut usize) {
