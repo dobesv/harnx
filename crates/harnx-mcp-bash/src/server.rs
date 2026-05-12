@@ -133,7 +133,11 @@ impl JsonSchema for ReadExecLogParams {
                     execution_id,
                 ),
                 ("stream", "'stdout' or 'stderr'.", stream),
-                ("offset", "Skip the first N lines of the log (1-indexed).", offset),
+                (
+                    "offset",
+                    "Skip the first N lines of the log (1-indexed).",
+                    offset,
+                ),
                 ("limit", "Return at most N lines.", limit),
                 ("tail", "Return only the last N lines.", tail),
                 ("grep", "Filter lines by regex before truncating.", grep),
