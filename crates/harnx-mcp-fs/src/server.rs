@@ -68,7 +68,8 @@ pub struct EditFileParams {
 #[derive(Debug, Deserialize)]
 pub struct InsertParams {
     pub path: String,
-    pub insert_line: usize,
+    #[serde(default)]
+    pub insert_line: Option<usize>,
     pub insert_text: String,
     #[serde(default)]
     pub column: Option<usize>,
@@ -213,17 +214,17 @@ impl JsonSchema for InsertParams {
 
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let path = generator.subschema_for::<String>();
-        let insert_line = generator.subschema_for::<usize>();
+        let insert_line = generator.subschema_for::<Option<usize>>();
         let insert_text = generator.subschema_for::<String>();
         let column = generator.subschema_for::<Option<usize>>();
         object_schema_with_desc(
             vec![
                 ("path", "Absolute path to the file to insert into.", path),
-                ("insert_line", "Insert after this line number. 0 = prepend before line 1. N = total lines to append.", insert_line),
+                ("insert_line", "Insert after this line number. 0 = prepend before line 1; N = insert after line N; omit (or use N = total lines) to append to the end of the file.", insert_line),
                 ("insert_text", "Text to insert.", insert_text),
                 ("column", "1-indexed byte offset within the line for mid-line insertion. Default: 1 (start of line).", column),
             ],
-            &["path", "insert_line", "insert_text"],
+            &["path", "insert_text"],
         )
     }
 }
@@ -644,10 +645,16 @@ impl FsServer {
 
         let lines = content.split_inclusive('\n').collect::<Vec<_>>();
         let total_lines = lines.len();
-        if params.insert_line > total_lines {
+        // None means append (equivalent to insert after last line).
+        // We track the original presence separately: when the caller omitted
+        // insert_line we must never enter the mid-line (column) branch even if
+        // a column value was supplied, because the intent is EOF-append.
+        let append_mode = params.insert_line.is_none();
+        let insert_line = params.insert_line.unwrap_or(total_lines);
+        if insert_line > total_lines {
             return tool_error(format!(
                 "insert_line {} out of range for file with {} lines",
-                params.insert_line, total_lines
+                insert_line, total_lines
             ));
         }
 
@@ -657,17 +664,17 @@ impl FsServer {
             ));
         }
 
-        let new_content = if params.insert_line == 0 {
+        let new_content = if insert_line == 0 {
             format!("{}{}", params.insert_text, content)
-        } else if params.column.unwrap_or(1) <= 1 {
+        } else if append_mode || params.column.unwrap_or(1) <= 1 {
             format!(
                 "{}{}{}",
-                lines[..params.insert_line].join(""),
+                lines[..insert_line].join(""),
                 params.insert_text,
-                lines[params.insert_line..].join("")
+                lines[insert_line..].join("")
             )
         } else {
-            let line = lines[params.insert_line - 1];
+            let line = lines[insert_line - 1];
             let (stripped_line, had_newline) = match line.strip_suffix('\n') {
                 Some(stripped) => (stripped, true),
                 None => (line, false),
@@ -677,7 +684,7 @@ impl FsServer {
             if insert_index > stripped_line.len() || !stripped_line.is_char_boundary(insert_index) {
                 return tool_error(format!(
                     "column {} is not a valid UTF-8 character boundary in line {}",
-                    column, params.insert_line
+                    column, insert_line
                 ));
             }
             let new_line = if had_newline {
@@ -698,9 +705,9 @@ impl FsServer {
             };
             format!(
                 "{}{}{}",
-                lines[..params.insert_line - 1].join(""),
+                lines[..insert_line - 1].join(""),
                 new_line,
-                lines[params.insert_line..].join("")
+                lines[insert_line..].join("")
             )
         };
 
@@ -1248,11 +1255,11 @@ impl ServerHandler for FsServer {
                     .with_input_schema::<EditFileParams>()
                     .with_meta(make_tool_meta("🔧 {{ args.path }}{% if args.replace_all %} [all]{% endif %}\n▸ {{ args.old_text | truncate(60) }}\n↳ {{ args.new_text | truncate(60) }}")),
                 Tool::new("insert",
-                    "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N      (use N = total lines to append). Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.",
+                    "Insert text into a file at a specific line position.      insert_line: 0 prepends before line 1; insert_line: N inserts after line N; omit insert_line (or set N = total lines) to append to the end of the file. Optional column (1-indexed byte offset within      the line, default 1 = start of line) for mid-line insertion.      For exact-text replacement use edit; for regex replacement use re_replace.",
                     Map::new())
                     .with_input_schema::<InsertParams>()
                     .with_meta(make_tool_meta(
-                        "➕ {{ args.path }}:{{ args.insert_line }}{% if args.column %}:{{ args.column }}{% endif %}\n↳ {{ args.insert_text | truncate(60) }}"
+                        "➕ {{ args.path }}:{{ args.insert_line | default(value=\"end\") }}{% if args.column %}:{{ args.column }}{% endif %}\n↳ {{ args.insert_text | truncate(60) }}"
                     )),
                 Tool::new("re_replace",
                     "Replace text in a file using a regular expression.      Uses fancy_regex syntax (supports lookahead/lookbehind).      Use $0 for the full match, $1/$2 etc. for capture groups in replacement.      Errors if pattern matches nothing. If pattern matches more than once,      set replace_all=true; otherwise only the first match is replaced.      For exact-text replacement use edit instead.",
@@ -2480,7 +2487,7 @@ gamma
         let result = server
             .insert_impl(InsertParams {
                 path: file_path.to_string_lossy().to_string(),
-                insert_line: 0,
+                insert_line: Some(0),
                 insert_text: "alpha
 "
                 .to_string(),
@@ -2515,7 +2522,7 @@ beta
         let result = server
             .insert_impl(InsertParams {
                 path: file_path.to_string_lossy().to_string(),
-                insert_line: 2,
+                insert_line: Some(2),
                 insert_text: "gamma
 "
                 .to_string(),
@@ -2531,6 +2538,57 @@ beta
 beta
 gamma
 "
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_append_omit_line() {
+        // Omitting insert_line entirely should append to end of file
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("append_omit.txt");
+        std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .insert_impl(InsertParams {
+                path: file_path.to_string_lossy().to_string(),
+                insert_line: None,
+                insert_text: "gamma\n".to_string(),
+                column: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "alpha\nbeta\ngamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_append_omit_line_ignores_column() {
+        // When insert_line is omitted, a supplied column must NOT trigger
+        // mid-line insertion — it must still append at EOF.
+        let temp_dir = TestDir::new();
+        let file_path = temp_dir.path().join("append_col.txt");
+        std::fs::write(&file_path, "alpha\nbeta\n").unwrap();
+        let server = FsServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .insert_impl(InsertParams {
+                path: file_path.to_string_lossy().to_string(),
+                insert_line: None,
+                insert_text: "gamma\n".to_string(),
+                column: Some(3), // would have inserted into last line without the fix
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "alpha\nbeta\ngamma\n"
         );
     }
 
@@ -2552,7 +2610,7 @@ four
         let result = server
             .insert_impl(InsertParams {
                 path: file_path.to_string_lossy().to_string(),
-                insert_line: 2,
+                insert_line: Some(2),
                 insert_text: "between
 "
                 .to_string(),
@@ -2589,7 +2647,7 @@ xyz
         let result = server
             .insert_impl(InsertParams {
                 path: file_path.to_string_lossy().to_string(),
-                insert_line: 1,
+                insert_line: Some(1),
                 insert_text: "-MID-".to_string(),
                 column: Some(5),
             })
@@ -2619,7 +2677,7 @@ xyz
         let ok_result = server
             .insert_impl(InsertParams {
                 path: file_path.to_string_lossy().to_string(),
-                insert_line: 1,
+                insert_line: Some(1),
                 insert_text: "X".to_string(),
                 column: Some(5),
             })
@@ -2642,7 +2700,7 @@ xyz
         let bad_result = server
             .insert_impl(InsertParams {
                 path: file_path.to_string_lossy().to_string(),
-                insert_line: 1,
+                insert_line: Some(1),
                 insert_text: "X".to_string(),
                 column: Some(2),
             })
@@ -2669,7 +2727,7 @@ beta
         let result = server
             .insert_impl(InsertParams {
                 path: file_path.to_string_lossy().to_string(),
-                insert_line: 3,
+                insert_line: Some(3),
                 insert_text: "gamma
 "
                 .to_string(),
@@ -2695,7 +2753,7 @@ beta
         let result = server
             .insert_impl(InsertParams {
                 path: file_path.to_string_lossy().to_string(),
-                insert_line: 1,
+                insert_line: Some(1),
                 insert_text: "X".to_string(),
                 column: Some(6),
             })
