@@ -126,6 +126,7 @@ harnx-acp = { path = "crates/harnx-acp" }
 harnx-acp-server = { path = "crates/harnx-acp-server" }
 minijinja = { version = "2.19.0", default-features = false, features = ["builtins", "debug", "serde"] }
 harnx-mcp-history = { path = "crates/harnx-mcp-history" }
+similar = "2"
 
 [patch.crates-io]
 ratatui_widget_scrolling = { path = "crates/ratatui-widget-scrolling" }

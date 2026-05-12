@@ -16,6 +16,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 schemars = { workspace = true }
+similar = { workspace = true }
 
 [[bin]]
 name = "harnx-mcp-plans"

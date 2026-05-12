@@ -13,6 +13,7 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use similar::{ChangeTag, TextDiff};
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -164,16 +165,21 @@ struct UpdateTaskParams {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
-    body: Option<String>,
+    replace_body: Option<String>,
+    #[serde(default)]
+    append_body: Option<String>,
+    #[serde(default)]
+    replace_in_body: Option<ReplaceInContent>,
     #[serde(default)]
     dependencies: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-struct AppendTaskParams {
-    plan: String,
-    id: String,
-    text: String,
+struct ReplaceInContent {
+    old_text: String,
+    new_text: String,
+    #[serde(default)]
+    replace_all: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -214,7 +220,12 @@ struct GetPlanParams {
 #[derive(Debug, Default, Clone, Deserialize)]
 struct UpdatePlanParams {
     name: String,
-    content: String,
+    #[serde(default)]
+    replace_content: Option<String>,
+    #[serde(default)]
+    append_content: Option<String>,
+    #[serde(default)]
+    replace_in_content: Option<ReplaceInContent>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -265,6 +276,22 @@ struct GetNoteParams {
 struct DeleteNoteParams {
     plan: String,
     note_id: String,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+struct UpdateNoteParams {
+    plan: String,
+    note_id: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    replace_body: Option<String>,
+    #[serde(default)]
+    append_body: Option<String>,
+    #[serde(default)]
+    replace_in_body: Option<ReplaceInContent>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -384,11 +411,27 @@ impl PlansServer {
             body: params.body.unwrap_or_default(),
         };
         write_task(&self.dir, &task).map_err(|err| ErrorData::internal_error(err, None))?;
-        result_text(format!(
+        let serialized =
+            serialize_task(&task).map_err(|err| ErrorData::internal_error(err, None))?;
+        let diff = diff_text(
+            "",
+            &serialized,
+            &format!("{}/tasks/{}.md", task.front.plan, task.front.id),
+        );
+        let msg = format!(
             "added task {} to plan {}",
             display_id(&task.front.id),
             task.front.plan
-        ))
+        );
+        if diff.is_empty() {
+            result_text(msg)
+        } else {
+            result_text(format!(
+                "{msg}
+
+{diff}"
+            ))
+        }
     }
 
     async fn handle_update_task(
@@ -421,34 +464,53 @@ impl PlansServer {
         if let Some(status) = params.status {
             task.front.status = status;
         }
-        if let Some(body) = params.body {
-            task.body = body;
+
+        // Body-edit: at most one of replace_body / append_body / replace_in_body
+        let body_count = [
+            params.replace_body.is_some(),
+            params.append_body.is_some(),
+            params.replace_in_body.is_some(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        if body_count > 1 {
+            return Err(ErrorData::invalid_params(
+                "at most one of replace_body, append_body, replace_in_body may be provided",
+                None,
+            ));
         }
+        let before_body = task.body.clone();
+        if let Some(rb) = params.replace_body {
+            task.body = rb;
+        } else if let Some(ab) = params.append_body {
+            if !task.body.is_empty() && !task.body.ends_with('\n') {
+                task.body.push('\n');
+            }
+            task.body.push_str(&ab);
+        } else if let Some(ri) = params.replace_in_body {
+            task.body = apply_replace_in(&task.body, &ri)?;
+        }
+
         if let Some(dependencies) = params.dependencies {
             task.front.dependencies = dependencies;
         }
 
         task.front.updated_at = Some(now_iso());
 
+        let task_id = task.front.id.clone();
         write_task(&self.dir, &task).map_err(|err| ErrorData::internal_error(err, None))?;
-        result_text(format!("updated task {}", display_id(&task.front.id)))
-    }
-
-    async fn handle_append_task(
-        &self,
-        params: AppendTaskParams,
-    ) -> Result<CallToolResult, ErrorData> {
-        let plan_name =
-            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
-        let mut task = read_task(&self.dir, &plan_name, &params.id)
-            .map_err(|err| ErrorData::invalid_params(err, None))?;
-        if !task.body.is_empty() && !task.body.ends_with('\n') {
-            task.body.push('\n');
+        let diff = diff_text(
+            &before_body,
+            &task.body,
+            &format!("{}/tasks/{}.md", plan_name, task_id),
+        );
+        let msg = format!("updated task {}", display_id(&task_id));
+        if diff.is_empty() {
+            result_text(msg)
+        } else {
+            result_text(format!("{msg}\n\n{diff}"))
         }
-        task.body.push_str(&params.text);
-        task.front.updated_at = Some(now_iso());
-        write_task(&self.dir, &task).map_err(|err| ErrorData::internal_error(err, None))?;
-        result_text(format!("appended to task {}", display_id(&task.front.id)))
     }
 
     async fn handle_delete_task(
@@ -468,9 +530,25 @@ impl PlansServer {
                 None,
             ));
         }
+        let before_content = std::fs::read_to_string(&path)
+            .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
         std::fs::remove_file(&path)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
-        result_text(format!("deleted task {}", display_id(&params.id)))
+        let diff = diff_text(
+            &before_content,
+            "",
+            &format!("{}/tasks/{}.md", plan_name, normalize_id(&params.id)),
+        );
+        let msg = format!("deleted task {}", display_id(&params.id));
+        if diff.is_empty() {
+            result_text(msg)
+        } else {
+            result_text(format!(
+                "{msg}
+
+{diff}"
+            ))
+        }
     }
 
     async fn handle_list_plans(&self) -> Result<CallToolResult, ErrorData> {
@@ -552,7 +630,13 @@ impl PlansServer {
             serialize_plan(&record).map_err(|err| ErrorData::internal_error(err, None))?;
         write_plan_file(&plan_file_path(&self.dir, &name), &serialized)
             .map_err(|err| ErrorData::internal_error(err, None))?;
-        result_text(format!("added plan {}", name))
+        let diff = diff_text("", &serialized, &format!("{name}/plan.md"));
+        let msg = format!("added plan {}", name);
+        if diff.is_empty() {
+            result_text(msg)
+        } else {
+            result_text(format!("{msg}\n\n{diff}"))
+        }
     }
 
     async fn handle_get_plan(&self, params: GetPlanParams) -> Result<CallToolResult, ErrorData> {
@@ -605,18 +689,52 @@ impl PlansServer {
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
 
         let path = plan_file_path(&self.dir, &name);
-        let existing = if path.exists() {
+        let (existing, existing_body) = if path.exists() {
             let content = std::fs::read_to_string(&path)
                 .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
-            let (front, _) = parse_plan_frontmatter(&content, &name)
+            let (front, body) = parse_plan_frontmatter(&content, &name)
                 .map_err(|err| ErrorData::internal_error(err, None))?;
-            front
+            (front, body)
         } else {
-            PlanFrontMatter {
-                id: name.clone(),
-                created_at: now_iso(),
-                ..Default::default()
+            (
+                PlanFrontMatter {
+                    id: name.clone(),
+                    created_at: now_iso(),
+                    ..Default::default()
+                },
+                String::new(),
+            )
+        };
+
+        // Body-edit: at most one of replace_content / append_content / replace_in_content
+        let body_count = [
+            params.replace_content.is_some(),
+            params.append_content.is_some(),
+            params.replace_in_content.is_some(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        if body_count > 1 {
+            return Err(ErrorData::invalid_params(
+                "at most one of replace_content, append_content, replace_in_content may be provided",
+                None,
+            ));
+        }
+        let before_body = existing_body.clone();
+        let new_body = if let Some(rc) = params.replace_content {
+            rc
+        } else if let Some(ac) = params.append_content {
+            let mut b = existing_body;
+            if !b.is_empty() && !b.ends_with('\n') {
+                b.push('\n');
             }
+            b.push_str(&ac);
+            b
+        } else if let Some(ri) = params.replace_in_content {
+            apply_replace_in(&existing_body, &ri)?
+        } else {
+            existing_body
         };
 
         let record = PlanRecord {
@@ -636,7 +754,7 @@ impl PlansServer {
                 },
                 updated_at: Some(now_iso()),
             },
-            body: params.content,
+            body: new_body.clone(),
         };
 
         // Validate task id uniqueness BEFORE writing anything
@@ -704,7 +822,7 @@ impl PlansServer {
             created_task_ids.push(display_id(&id));
         }
 
-        let text = if created_task_ids.is_empty() {
+        let base_msg = if created_task_ids.is_empty() {
             format!("updated plan {}", name)
         } else {
             format!(
@@ -713,7 +831,12 @@ impl PlansServer {
                 created_task_ids.join(", ")
             )
         };
-        result_text(text)
+        let diff = diff_text(&before_body, &new_body, &format!("{name}/plan.md"));
+        if diff.is_empty() {
+            result_text(base_msg)
+        } else {
+            result_text(format!("{base_msg}\n\n{diff}"))
+        }
     }
 
     async fn handle_delete_plan(
@@ -729,9 +852,76 @@ impl PlansServer {
                 None,
             ));
         }
+        let mut diffs = Vec::new();
+
+        let plan_file = plan_file_path(&self.dir, &name);
+        if plan_file.exists() {
+            let content = std::fs::read_to_string(&plan_file).unwrap_or_default();
+            let d = diff_text(&content, "", &format!("{name}/plan.md"));
+            if !d.is_empty() {
+                diffs.push(d);
+            }
+        }
+
+        let tasks_path = tasks_dir(&self.dir, &name);
+        if tasks_path.exists() {
+            if let Ok(entries) = std::fs::read_dir(&tasks_path) {
+                let mut files: Vec<_> = entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(OsStr::to_str) == Some("md"))
+                    .collect();
+                files.sort();
+                for f in files {
+                    let stem = f.file_stem().and_then(OsStr::to_str).unwrap_or("task");
+                    let content = std::fs::read_to_string(&f).unwrap_or_default();
+                    let d = diff_text(&content, "", &format!("{name}/tasks/{stem}.md"));
+                    if !d.is_empty() {
+                        diffs.push(d);
+                    }
+                }
+            }
+        }
+
+        let notes_path = notes_dir(&self.dir, &name);
+        if notes_path.exists() {
+            if let Ok(entries) = std::fs::read_dir(&notes_path) {
+                let mut files: Vec<_> = entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(OsStr::to_str) == Some("md"))
+                    .collect();
+                files.sort();
+                for f in files {
+                    let stem = f.file_stem().and_then(OsStr::to_str).unwrap_or("note");
+                    let content = std::fs::read_to_string(&f).unwrap_or_default();
+                    let d = diff_text(&content, "", &format!("{name}/notes/{stem}.md"));
+                    if !d.is_empty() {
+                        diffs.push(d);
+                    }
+                }
+            }
+        }
+
         std::fs::remove_dir_all(&dir)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
-        result_text(format!("deleted plan {}", name))
+
+        let msg = format!("deleted plan {}", name);
+        if diffs.is_empty() {
+            result_text(msg)
+        } else {
+            result_text(format!(
+                "{}
+
+{}",
+                msg,
+                diffs.join(
+                    "
+
+"
+                )
+            ))
+        }
     }
 
     async fn handle_list_notes(
@@ -797,11 +987,27 @@ impl PlansServer {
             body: params.body,
         };
         write_note(&self.dir, &plan, &note).map_err(|err| ErrorData::internal_error(err, None))?;
-        result_text(format!(
+        let serialized =
+            serialize_note(&note).map_err(|err| ErrorData::internal_error(err, None))?;
+        let diff = diff_text(
+            "",
+            &serialized,
+            &format!("{}/notes/{}.md", plan, display_note_id(&note.front.id)),
+        );
+        let msg = format!(
             "added note {} to plan {}",
             display_note_id(&note.front.id),
             plan
-        ))
+        );
+        if diff.is_empty() {
+            result_text(msg)
+        } else {
+            result_text(format!(
+                "{msg}
+
+{diff}"
+            ))
+        }
     }
 
     async fn handle_get_note(&self, params: GetNoteParams) -> Result<CallToolResult, ErrorData> {
@@ -849,9 +1055,97 @@ impl PlansServer {
                 None,
             ));
         }
+        let before_content = std::fs::read_to_string(&path)
+            .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
         std::fs::remove_file(&path)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
-        result_text(format!("deleted note {}", display_note_id(&params.note_id)))
+        let diff = diff_text(
+            &before_content,
+            "",
+            &format!("{}/notes/{}.md", plan, normalize_id(&params.note_id)),
+        );
+        let msg = format!("deleted note {}", display_note_id(&params.note_id));
+        if diff.is_empty() {
+            result_text(msg)
+        } else {
+            result_text(format!(
+                "{msg}
+
+{diff}"
+            ))
+        }
+    }
+
+    async fn handle_update_note(
+        &self,
+        params: UpdateNoteParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let plan =
+            validate_plan_name(&params.plan).map_err(|err| ErrorData::invalid_params(err, None))?;
+        let path = note_file_path(&self.dir, &plan, &params.note_id);
+        if !path.exists() {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "note {} not found in plan '{}'",
+                    display_note_id(&params.note_id),
+                    plan
+                ),
+                None,
+            ));
+        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
+        let (mut front, mut body) =
+            parse_note_frontmatter(&content).map_err(|err| ErrorData::internal_error(err, None))?;
+
+        if let Some(summary) = params.summary {
+            front.summary = Some(summary);
+        }
+        if let Some(author) = params.author {
+            front.author = Some(author);
+        }
+
+        let body_count = [
+            params.replace_body.is_some(),
+            params.append_body.is_some(),
+            params.replace_in_body.is_some(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+        if body_count > 1 {
+            return Err(ErrorData::invalid_params(
+                "at most one of replace_body, append_body, replace_in_body may be provided",
+                None,
+            ));
+        }
+        let before_body = body.clone();
+        if let Some(rb) = params.replace_body {
+            body = rb;
+        } else if let Some(ab) = params.append_body {
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&ab);
+        } else if let Some(ri) = params.replace_in_body {
+            body = apply_replace_in(&body, &ri)?;
+        }
+
+        front.updated_at = Some(now_iso());
+        let note = NoteRecord {
+            front,
+            body: body.clone(),
+        };
+        write_note(&self.dir, &plan, &note).map_err(|err| ErrorData::internal_error(err, None))?;
+
+        let note_path = format!("{}/notes/{}.md", plan, normalize_id(&params.note_id));
+        let diff = diff_text(&before_body, &body, &note_path);
+        let msg = format!("updated note {}", display_note_id(&params.note_id));
+        if diff.is_empty() {
+            result_text(msg)
+        } else {
+            result_text(format!("{msg}\n\n{diff}"))
+        }
     }
 }
 
@@ -936,6 +1230,51 @@ fn result_text(text: String) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::success(vec![Content::text(text)]))
 }
 
+fn diff_text(before: &str, after: &str, path: &str) -> String {
+    if before == after {
+        return String::new();
+    }
+    let diff = TextDiff::from_lines(before, after);
+    let mut output = format!("--- a/{path}\n+++ b/{path}\n");
+    for op in diff.ops() {
+        for change in diff.iter_changes(op) {
+            let sign = match change.tag() {
+                ChangeTag::Delete => "-",
+                ChangeTag::Insert => "+",
+                ChangeTag::Equal => " ",
+            };
+            let value = change.value();
+            output.push_str(sign);
+            output.push_str(value);
+            if !value.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+    }
+    format!("```diff\n{output}```")
+}
+
+fn apply_replace_in(body: &str, r: &ReplaceInContent) -> Result<String, ErrorData> {
+    if r.old_text.is_empty() {
+        return Err(ErrorData::invalid_params(
+            "old_text must not be empty",
+            None,
+        ));
+    }
+    if !body.contains(&*r.old_text) {
+        return Err(ErrorData::invalid_params(
+            format!("old_text {:?} not found in body", r.old_text),
+            None,
+        ));
+    }
+    let result = if r.replace_all == Some(true) {
+        body.replace(&*r.old_text, &r.new_text)
+    } else {
+        body.replacen(&*r.old_text, &r.new_text, 1)
+    };
+    Ok(result)
+}
+
 fn parse_arguments<T: serde::de::DeserializeOwned>(
     args: Option<Map<String, Value>>,
 ) -> Result<T, ErrorData> {
@@ -989,6 +1328,29 @@ macro_rules! impl_json_schema {
         }
     };
 }
+
+impl_json_schema!(
+    ReplaceInContent,
+    "ReplaceInContent",
+    |gen: &mut SchemaGenerator| vec![
+        (
+            "old_text",
+            "Text to find and replace",
+            gen.subschema_for::<String>()
+        ),
+        (
+            "new_text",
+            "Replacement text",
+            gen.subschema_for::<String>()
+        ),
+        (
+            "replace_all",
+            "If true, replace all occurrences; default replaces first only",
+            gen.subschema_for::<Option<bool>>()
+        ),
+    ],
+    &["old_text", "new_text"]
+);
 
 impl_json_schema!(
     ListTasksParams,
@@ -1073,7 +1435,8 @@ impl_json_schema!(
 impl_json_schema!(
     UpdateTaskParams,
     "UpdateTaskParams",
-    |gen: &mut SchemaGenerator| vec![
+    |gen: &mut SchemaGenerator| {
+        vec![
         ("plan", "Plan name", gen.subschema_for::<String>()),
         ("id", "Task ID", gen.subschema_for::<String>()),
         (
@@ -1112,28 +1475,28 @@ impl_json_schema!(
             gen.subschema_for::<Option<String>>()
         ),
         (
-            "body",
-            "Replace markdown body",
+            "replace_body",
+            "Replace entire task body with this content. Keep under 1000 words.",
             gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "append_body",
+            "Append text to task body. Auto-inserts newline separator if needed. Keep under 1000 words.",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "replace_in_body",
+            "Surgically replace text in task body.",
+            gen.subschema_for::<Option<ReplaceInContent>>()
         ),
         (
             "dependencies",
             "Replace dependencies with provided list",
             gen.subschema_for::<Option<Vec<String>>>()
         ),
-    ],
+    ]
+    },
     &["plan", "id"]
-);
-
-impl_json_schema!(
-    AppendTaskParams,
-    "AppendTaskParams",
-    |gen: &mut SchemaGenerator| vec![
-        ("plan", "Plan name", gen.subschema_for::<String>()),
-        ("id", "Task ID", gen.subschema_for::<String>()),
-        ("text", "Text to append", gen.subschema_for::<String>()),
-    ],
-    &["plan", "id", "text"]
 );
 
 impl_json_schema!(
@@ -1212,12 +1575,23 @@ impl_json_schema!(
 impl_json_schema!(
     UpdatePlanParams,
     "UpdatePlanParams",
-    |gen: &mut SchemaGenerator| vec![
+    |gen: &mut SchemaGenerator| {
+        vec![
         ("name", "Plan name", gen.subschema_for::<String>()),
         (
-            "content",
-            "Plan markdown body",
-            gen.subschema_for::<String>()
+            "replace_content",
+            "Replace entire plan body with this content. Keep under 1000 words.",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "append_content",
+            "Append text to plan body. Auto-inserts newline separator if needed. Keep under 1000 words.",
+            gen.subschema_for::<Option<String>>()
+        ),
+        (
+            "replace_in_content",
+            "Surgically replace text in plan body.",
+            gen.subschema_for::<Option<ReplaceInContent>>()
         ),
         (
             "title",
@@ -1259,8 +1633,9 @@ impl_json_schema!(
             "Optional tasks to create in batch",
             gen.subschema_for::<Option<Vec<TaskSpec>>>()
         ),
-    ],
-    &["name", "content"]
+    ]
+    },
+    &["name"]
 );
 
 impl_json_schema!(
@@ -1319,6 +1694,23 @@ impl_json_schema!(
         ("plan", "Plan name", gen.subschema_for::<String>()),
         ("note_id", "Note ID", gen.subschema_for::<String>()),
     ],
+    &["plan", "note_id"]
+);
+
+impl_json_schema!(
+    UpdateNoteParams,
+    "UpdateNoteParams",
+    |gen: &mut SchemaGenerator| {
+        vec![
+        ("plan", "Plan name", gen.subschema_for::<String>()),
+        ("note_id", "Note ID", gen.subschema_for::<String>()),
+        ("summary", "Optional note summary", gen.subschema_for::<Option<String>>()),
+        ("author", "Optional note author", gen.subschema_for::<Option<String>>()),
+        ("replace_body", "Replace entire note body with this content. Keep under 1000 words.", gen.subschema_for::<Option<String>>()),
+        ("append_body", "Append text to note body. Auto-inserts newline separator if needed. Keep under 1000 words.", gen.subschema_for::<Option<String>>()),
+        ("replace_in_body", "Surgically replace text in note body.", gen.subschema_for::<Option<ReplaceInContent>>()),
+    ]
+    },
     &["plan", "note_id"]
 );
 
@@ -1597,49 +1989,51 @@ impl ServerHandler for PlansServer {
             tools: vec![
                 Tool::new("list_plans", "List all plans with metadata and task/note counts.", Map::new())
                     .with_input_schema::<ListPlansParams>()
-                    .with_meta(Meta(json!({"call_template": "📋 plans", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
-                Tool::new("add_plan", "Create a new plan with optional metadata.", Map::new())
+                    .with_meta(Meta(json!({"call_template": "list plans", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                Tool::new("add_plan", "Create a new plan with optional metadata. Keep body content under 1000 words per call; use update_plan with replace_in_content for targeted edits.", Map::new())
                     .with_input_schema::<AddPlanParams>()
-                    .with_meta(Meta(json!({"call_template": "➕ plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "create plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_plan", "Read plan metadata, body, and list task/note IDs.", Map::new())
                     .with_input_schema::<GetPlanParams>()
-                    .with_meta(Meta(json!({"call_template": "📋 plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
-                Tool::new("update_plan", "Update plan body and metadata. Creates plan if it doesn't exist. Optionally batch-create tasks.", Map::new())
+                    .with_meta(Meta(json!({"call_template": "read plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                Tool::new("update_plan", "Update plan body and metadata. Creates plan if it doesn't exist. Use replace_content to rewrite body, append_content to extend it, or replace_in_content for surgical edits. Optionally batch-create tasks. Keep each write under 1000 words.", Map::new())
                     .with_input_schema::<UpdatePlanParams>()
-                    .with_meta(Meta(json!({"call_template": "🔄 plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.tasks %} [{{ args.tasks | length }} tasks]{% endif %}{% if args.content %}\n{{ args.content | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "update plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.tasks %} [{{ args.tasks | length }} tasks]{% endif %}{% if args.replace_content %}\n{{ args.replace_content | truncate(80) }}{% endif %}{% if args.append_content %}\n+{{ args.append_content | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("delete_plan", "Delete an entire plan and all its tasks and notes.", Map::new())
                     .with_input_schema::<DeletePlanParams>()
-                    .with_meta(Meta(json!({"call_template": "🗑️ plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "delete plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("list_tasks", "List tasks in a plan with optional filters.", Map::new())
                     .with_input_schema::<ListTasksParams>()
-                    .with_meta(Meta(json!({"call_template": "📋 tasks {{ args.plan }}{% if args.filter and args.filter != 'open' %} [{{ args.filter }}]{% endif %}{% if args.tag %} #{{ args.tag }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
-                Tool::new("add_task", "Create a task in a plan.", Map::new())
+                    .with_meta(Meta(json!({"call_template": "list tasks {{ args.plan }}{% if args.filter and args.filter != 'open' %} [{{ args.filter }}]{% endif %}{% if args.tag %} #{{ args.tag }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                Tool::new("add_task", "Create a task in a plan. Keep body under 1000 words; use update_task with replace_in_body for targeted edits.", Map::new())
                     .with_input_schema::<AddTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "➕ task {{ args.plan }}/{{ args.title }}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "create task {{ args.plan }}/{{ args.title }}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_task", "Read a task by ID within a plan.", Map::new())
                     .with_input_schema::<GetTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "📋 task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
-                Tool::new("update_task", "Update a task within its plan.", Map::new())
+                    .with_meta(Meta(json!({"call_template": "read task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                Tool::new("update_task", "Update a task within its plan. Use replace_body to rewrite body, append_body to extend it, or replace_in_body for surgical edits. Keep each write under 1000 words.", Map::new())
                     .with_input_schema::<UpdateTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "🔄 task {{ args.plan }}/{{ args.id }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
-                Tool::new("append_task", "Append markdown text to task body.", Map::new())
-                    .with_input_schema::<AppendTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "📝 task {{ args.plan }}/{{ args.id }}{% if args.text %}\n{{ args.text | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "update task {{ args.plan }}/{{ args.id }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.replace_body %}\n{{ args.replace_body | truncate(80) }}{% endif %}{% if args.append_body %}\n+{{ args.append_body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("delete_task", "Delete a task by ID.", Map::new())
                     .with_input_schema::<DeleteTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "🗑️ task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "delete task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("list_notes", "List notes for a plan.", Map::new())
                     .with_input_schema::<ListNotesParams>()
-                    .with_meta(Meta(json!({"call_template": "📋 notes {{ args.plan }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
-                Tool::new("add_note", "Add a note to a plan.", Map::new())
+                    .with_meta(Meta(json!({"call_template": "list notes {{ args.plan }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                Tool::new("add_note", "Add a note to a plan. Keep body under 1000 words; use update_note with replace_in_body for targeted edits.", Map::new())
                     .with_input_schema::<AddNoteParams>()
-                    .with_meta(Meta(json!({"call_template": "📝 note {{ args.plan }}{% if args.summary %} — {{ args.summary | truncate(60) }}{% endif %}{% if args.author %} by {{ args.author }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "add note {{ args.plan }}{% if args.summary %} — {{ args.summary | truncate(60) }}{% endif %}{% if args.author %} by {{ args.author }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_note", "Read a note from a plan.", Map::new())
                     .with_input_schema::<GetNoteParams>()
-                    .with_meta(Meta(json!({"call_template": "📋 note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "read note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                Tool::new("update_note", "Update a note within a plan. Use replace_body, append_body, or replace_in_body for body edits. Keep each write under 1000 words.", Map::new())
+                    .with_input_schema::<UpdateNoteParams>()
+                    .with_meta(Meta(json!({"call_template": "update note {{ args.plan }}/{{ args.note_id }}{% if args.summary %} — {{ args.summary | truncate(60) }}{% endif %}{% if args.replace_body %}
+{{ args.replace_body | truncate(80) }}{% endif %}{% if args.append_body %}
++{{ args.append_body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("delete_note", "Delete a note from a plan.", Map::new())
                     .with_input_schema::<DeleteNoteParams>()
-                    .with_meta(Meta(json!({"call_template": "🗑️ note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "delete note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
             ],
             next_cursor: None,
         })
@@ -1687,10 +2081,6 @@ impl ServerHandler for PlansServer {
                 let params = parse_arguments::<UpdateTaskParams>(request.arguments)?;
                 self.handle_update_task(params).await
             }
-            "append_task" => {
-                let params = parse_arguments::<AppendTaskParams>(request.arguments)?;
-                self.handle_append_task(params).await
-            }
             "delete_task" => {
                 let params = parse_arguments::<DeleteTaskParams>(request.arguments)?;
                 self.handle_delete_task(params).await
@@ -1706,6 +2096,10 @@ impl ServerHandler for PlansServer {
             "get_note" => {
                 let params = parse_arguments::<GetNoteParams>(request.arguments)?;
                 self.handle_get_note(params).await
+            }
+            "update_note" => {
+                let params = parse_arguments::<UpdateNoteParams>(request.arguments)?;
+                self.handle_update_note(params).await
             }
             "delete_note" => {
                 let params = parse_arguments::<DeleteNoteParams>(request.arguments)?;
@@ -2029,7 +2423,9 @@ mod tests {
                 executor: None,
                 tags: None,
                 status: Some("in_progress".to_string()),
-                body: None,
+                replace_body: None,
+                append_body: None,
+                replace_in_body: None,
                 dependencies: None,
             })
             .await
@@ -2050,7 +2446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_task_body() {
+    async fn append_body_via_update_task() {
         let dir = temp_test_dir("append-task-body");
         let server = PlansServer::new(dir);
 
@@ -2073,10 +2469,20 @@ mod tests {
         let id = extract_id(&extract_text(add));
 
         server
-            .handle_append_task(AppendTaskParams {
+            .handle_update_task(UpdateTaskParams {
                 plan: "plan-a".to_string(),
                 id: id.clone(),
-                text: "line2".to_string(),
+                append_body: Some("line2".to_string()),
+                title: None,
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: None,
+                status: None,
+                replace_body: None,
+                replace_in_body: None,
+                dependencies: None,
             })
             .await
             .unwrap();
@@ -2276,7 +2682,9 @@ mod tests {
                 executor: None,
                 tags: None,
                 status: Some("closed".to_string()),
-                body: None,
+                replace_body: None,
+                append_body: None,
+                replace_in_body: None,
                 dependencies: None,
             })
             .await
@@ -2304,6 +2712,339 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_plan_append_content() {
+        let dir = temp_test_dir("update-plan-append-content");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_plan(AddPlanParams {
+                name: "plan-a".to_string(),
+                title: Some("Plan".to_string()),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                body: Some("line1".to_string()),
+            })
+            .await
+            .unwrap();
+
+        server
+            .handle_update_plan(UpdatePlanParams {
+                name: "plan-a".to_string(),
+                replace_content: None,
+                append_content: Some("line2".to_string()),
+                replace_in_content: None,
+                title: None,
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                tasks: None,
+            })
+            .await
+            .unwrap();
+
+        let got = server
+            .handle_get_plan(GetPlanParams {
+                name: "plan-a".to_string(),
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&extract_text(got)).unwrap();
+        assert_eq!(
+            value["body"],
+            "line1
+line2"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_plan_replace_in_content() {
+        let dir = temp_test_dir("update-plan-replace-in-content");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_plan(AddPlanParams {
+                name: "plan-a".to_string(),
+                title: Some("Plan".to_string()),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                body: Some("hello world".to_string()),
+            })
+            .await
+            .unwrap();
+
+        server
+            .handle_update_plan(UpdatePlanParams {
+                name: "plan-a".to_string(),
+                replace_content: None,
+                append_content: None,
+                replace_in_content: Some(ReplaceInContent {
+                    old_text: "world".to_string(),
+                    new_text: "there".to_string(),
+                    replace_all: None,
+                }),
+                title: None,
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                tasks: None,
+            })
+            .await
+            .unwrap();
+
+        let got = server
+            .handle_get_plan(GetPlanParams {
+                name: "plan-a".to_string(),
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&extract_text(got)).unwrap();
+        assert_eq!(value["body"], "hello there");
+    }
+
+    #[tokio::test]
+    async fn update_plan_replace_in_content_not_found() {
+        let dir = temp_test_dir("update-plan-replace-in-content-not-found");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_plan(AddPlanParams {
+                name: "plan-a".to_string(),
+                title: Some("Plan".to_string()),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                body: Some("hello world".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let err = server
+            .handle_update_plan(UpdatePlanParams {
+                name: "plan-a".to_string(),
+                replace_content: None,
+                append_content: None,
+                replace_in_content: Some(ReplaceInContent {
+                    old_text: "missing".to_string(),
+                    new_text: "there".to_string(),
+                    replace_all: None,
+                }),
+                title: None,
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                tasks: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("not found"),
+            "expected not found error: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn update_plan_replace_in_content_empty_old_text_error() {
+        let dir = temp_test_dir("update-plan-replace-in-empty-old-text");
+        let server = PlansServer::new(dir);
+
+        let err = server
+            .handle_update_plan(UpdatePlanParams {
+                name: "plan-a".to_string(),
+                replace_content: None,
+                append_content: None,
+                replace_in_content: Some(ReplaceInContent {
+                    old_text: "".to_string(),
+                    new_text: "something".to_string(),
+                    replace_all: None,
+                }),
+                title: None,
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                tasks: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("empty"),
+            "expected empty old_text error: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn update_plan_two_content_fields_error() {
+        let dir = temp_test_dir("update-plan-two-content-fields-error");
+        let server = PlansServer::new(dir);
+
+        let err = server
+            .handle_update_plan(UpdatePlanParams {
+                name: "plan-a".to_string(),
+                replace_content: Some("one".to_string()),
+                append_content: Some("two".to_string()),
+                replace_in_content: None,
+                title: None,
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                tasks: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("at most one"),
+            "expected exclusivity error: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn update_plan_no_content_preserves_body() {
+        let dir = temp_test_dir("update-plan-no-content-preserves-body");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_plan(AddPlanParams {
+                name: "plan-a".to_string(),
+                title: Some("Plan".to_string()),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                body: Some("keep me".to_string()),
+            })
+            .await
+            .unwrap();
+
+        server
+            .handle_update_plan(UpdatePlanParams {
+                name: "plan-a".to_string(),
+                replace_content: None,
+                append_content: None,
+                replace_in_content: None,
+                title: Some("Renamed".to_string()),
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                git_branch: None,
+                github_owner_repo: None,
+                tasks: None,
+            })
+            .await
+            .unwrap();
+
+        let got = server
+            .handle_get_plan(GetPlanParams {
+                name: "plan-a".to_string(),
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&extract_text(got)).unwrap();
+        assert_eq!(value["title"], "Renamed");
+        assert_eq!(value["body"], "keep me");
+    }
+
+    #[tokio::test]
+    async fn update_note_fields() {
+        let dir = temp_test_dir("update-note-fields");
+        let server = PlansServer::new(dir);
+
+        server
+            .handle_add_note(AddNoteParams {
+                plan: "plan-a".to_string(),
+                id: Some("my-note".to_string()),
+                body: "hello world".to_string(),
+                summary: Some("before".to_string()),
+                author: Some("alice".to_string()),
+            })
+            .await
+            .unwrap();
+
+        server
+            .handle_update_note(UpdateNoteParams {
+                plan: "plan-a".to_string(),
+                note_id: "my-note".to_string(),
+                summary: Some("after".to_string()),
+                author: Some("bob".to_string()),
+                replace_body: None,
+                append_body: None,
+                replace_in_body: Some(ReplaceInContent {
+                    old_text: "world".to_string(),
+                    new_text: "there".to_string(),
+                    replace_all: None,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let got = server
+            .handle_get_note(GetNoteParams {
+                plan: "plan-a".to_string(),
+                note_id: "my-note".to_string(),
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&extract_text(got)).unwrap();
+        assert_eq!(value["summary"], "after");
+        assert_eq!(value["author"], "bob");
+        assert_eq!(value["body"], "hello there");
+    }
+
+    #[tokio::test]
+    async fn update_note_not_found() {
+        let dir = temp_test_dir("update-note-not-found");
+        let server = PlansServer::new(dir);
+
+        let err = server
+            .handle_update_note(UpdateNoteParams {
+                plan: "plan-a".to_string(),
+                note_id: "missing".to_string(),
+                summary: None,
+                author: None,
+                replace_body: Some("body".to_string()),
+                append_body: None,
+                replace_in_body: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("not found"),
+            "expected not found error: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
     async fn update_plan_batch_creates_tasks() {
         let dir = temp_test_dir("update-plan-batch");
         let server = PlansServer::new(dir.clone());
@@ -2311,7 +3052,9 @@ mod tests {
         server
             .handle_update_plan(UpdatePlanParams {
                 name: "plan-a".to_string(),
-                content: "plan body".to_string(),
+                replace_content: Some("plan body".to_string()),
+                append_content: None,
+                replace_in_content: None,
                 title: None,
                 summary: None,
                 author: None,
@@ -2386,7 +3129,9 @@ mod tests {
         let result = server
             .handle_update_plan(UpdatePlanParams {
                 name: "plan-a".to_string(),
-                content: "".to_string(),
+                replace_content: Some("".to_string()),
+                append_content: None,
+                replace_in_content: None,
                 title: None,
                 summary: None,
                 author: None,
@@ -2420,7 +3165,9 @@ mod tests {
         let result = server
             .handle_update_plan(UpdatePlanParams {
                 name: "plan-a".to_string(),
-                content: "".to_string(),
+                replace_content: Some("".to_string()),
+                append_content: None,
+                replace_in_content: None,
                 title: None,
                 summary: None,
                 author: None,
@@ -2470,7 +3217,9 @@ mod tests {
         server
             .handle_update_plan(UpdatePlanParams {
                 name: "plan-a".to_string(),
-                content: "plan body".to_string(),
+                replace_content: Some("plan body".to_string()),
+                append_content: None,
+                replace_in_content: None,
                 title: None,
                 summary: None,
                 author: None,
@@ -2709,7 +3458,9 @@ mod tests {
                 executor: None,
                 git_branch: None,
                 github_owner_repo: None,
-                content: "new body".to_string(),
+                replace_content: Some("new body".to_string()),
+                append_content: None,
+                replace_in_content: None,
                 tasks: None,
             })
             .await
@@ -2757,7 +3508,9 @@ mod tests {
                 executor: None,
                 git_branch: None,
                 github_owner_repo: None,
-                content: "after".to_string(),
+                replace_content: Some("after".to_string()),
+                append_content: None,
+                replace_in_content: None,
                 tasks: None,
             })
             .await
@@ -3149,8 +3902,8 @@ mod tests {
                 executor: None,
                 tags: vec![],
                 status: None,
-                body: None,
                 id: Some("my-task".to_string()),
+                body: None,
                 dependencies: vec![],
             })
             .await
@@ -3185,8 +3938,8 @@ mod tests {
                 executor: None,
                 tags: vec![],
                 status: None,
-                body: None,
                 id: Some("my-task".to_string()),
+                body: None,
                 dependencies: vec![],
             })
             .await
@@ -3203,7 +3956,9 @@ mod tests {
                 executor: None,
                 tags: None,
                 status: None,
-                body: None,
+                replace_body: None,
+                append_body: None,
+                replace_in_body: None,
                 dependencies: None,
             })
             .await
@@ -3216,7 +3971,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_task_wrong_plan_fails() {
+    async fn append_body_wrong_plan_fails() {
         let dir = temp_test_dir("append-task-wrong-plan");
         let server = PlansServer::new(dir);
 
@@ -3238,10 +3993,20 @@ mod tests {
             .unwrap();
 
         let err = server
-            .handle_append_task(AppendTaskParams {
+            .handle_update_task(UpdateTaskParams {
                 plan: "plan-b".to_string(),
                 id: "my-task".to_string(),
-                text: "appended".to_string(),
+                title: None,
+                summary: None,
+                author: None,
+                assignee: None,
+                executor: None,
+                tags: None,
+                status: None,
+                replace_body: None,
+                append_body: Some("appended".to_string()),
+                replace_in_body: None,
+                dependencies: None,
             })
             .await
             .unwrap_err();
@@ -3267,8 +4032,8 @@ mod tests {
                 executor: None,
                 tags: vec![],
                 status: None,
-                body: None,
                 id: Some("my-task".to_string()),
+                body: None,
                 dependencies: vec![],
             })
             .await
