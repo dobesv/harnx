@@ -416,7 +416,7 @@ impl PlansServer {
         let diff = diff_text(
             "",
             &serialized,
-            &format!("{}/{}.md", task.front.plan, task.front.id),
+            &format!("{}/tasks/{}.md", task.front.plan, task.front.id),
         );
         let msg = format!(
             "added task {} to plan {}",
@@ -503,7 +503,7 @@ impl PlansServer {
         let diff = diff_text(
             &before_body,
             &task.body,
-            &format!("{}/{}.md", plan_name, task_id),
+            &format!("{}/tasks/{}.md", plan_name, task_id),
         );
         let msg = format!("updated task {}", display_id(&task_id));
         if diff.is_empty() {
@@ -537,7 +537,7 @@ impl PlansServer {
         let diff = diff_text(
             &before_content,
             "",
-            &format!("{}/{}.md", plan_name, normalize_id(&params.id)),
+            &format!("{}/tasks/{}.md", plan_name, normalize_id(&params.id)),
         );
         let msg = format!("deleted task {}", display_id(&params.id));
         if diff.is_empty() {

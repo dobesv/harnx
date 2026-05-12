@@ -213,7 +213,7 @@ impl_json_schema!(
     |gen: &mut SchemaGenerator| vec![
         ("old_text", "Text to find and replace", gen.subschema_for::<String>()),
         ("new_text", "Replacement text", gen.subschema_for::<String>()),
-        ("replace_all", "Replace all occurrences if true", gen.subschema_for::<bool>()),
+        ("replace_all", "Replace all occurrences if true", gen.subschema_for::<Option<bool>>()),
     ],
     &["old_text", "new_text"]
 );
