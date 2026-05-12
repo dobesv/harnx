@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## 0.31.0 (2026-05-07)
+
+### Breaking Changes
+
+- remove all default session related features and configurations (#477)
+
+### Features
+
+- markdown table rendering with widget architecture and render cache (#351) (#486)
+
 ## 0.30.1 (2026-05-06)
 
 ### Features
