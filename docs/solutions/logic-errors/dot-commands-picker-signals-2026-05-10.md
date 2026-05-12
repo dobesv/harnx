@@ -72,7 +72,6 @@ Modified `.agent` and `.session` handlers to return appropriate outcomes:
         return Ok(CommandOutcome::OpenSessionPicker);
     }
     config.write().use_session(args)?;
-    Config::maybe_autoname_session(config.clone());
 }
 
 // .agent with no args → open agent picker

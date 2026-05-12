@@ -1670,7 +1670,9 @@ fn retry_all_fail_shows_warnings_in_tui() -> Result<()> {
         "fallback exhaustion message not visible in TUI transcript:\n{screen}"
     );
 
-    let normalized = normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen)));
+    let normalized = normalize_short_session_ids(&normalize_spinner_chars(&normalize_uuids(
+        &normalize_screen(&screen),
+    )));
     assert_snapshot!("retry_all_fail_shows_warnings_in_tui", normalized);
 
     Ok(())
@@ -1750,7 +1752,9 @@ fn retry_succeed_after_retry_shows_warning_then_response() -> Result<()> {
         "successful response not visible after retry:\n{screen}"
     );
 
-    let normalized = normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen)));
+    let normalized = normalize_short_session_ids(&normalize_spinner_chars(&normalize_uuids(
+        &normalize_screen(&screen),
+    )));
     assert_snapshot!(
         "retry_succeed_after_retry_shows_warning_then_response",
         normalized
@@ -1848,7 +1852,9 @@ fn retry_succeed_after_fallback_shows_transition() -> Result<()> {
         "fallback model response not visible:\n{screen}"
     );
 
-    let normalized = normalize_spinner_chars(&normalize_uuids(&normalize_screen(&screen)));
+    let normalized = normalize_short_session_ids(&normalize_spinner_chars(&normalize_uuids(
+        &normalize_screen(&screen),
+    )));
     assert_snapshot!("retry_succeed_after_fallback_shows_transition", normalized);
 
     Ok(())

@@ -1,11 +1,10 @@
 ---
 source: crates/harnx/tests/tmux_e2e.rs
-assertion_line: 1850
 expression: normalized
 ---
 Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
 retry-agent v
-🤖 retry-agent ▸ temp
+🤖 retry-agent ▸ [SID]
 > hello
 
 ⚠ Retryable error (status 500, Primary down (type: server_error)), attempt 1/2. Retrying in 10ms...
@@ -13,7 +12,6 @@ retry-agent v
 mock-llm:primary)), cooldown 60s. Trying next fallback.
 FALLBACK_SUCCESS: The fallback model handled it!
 
-📢 Autonaming the session.
 
 
 
@@ -50,4 +48,5 @@ FALLBACK_SUCCESS: The fallback model handled it!
 
 
 
-* 🤖 retry-agent ▸ temp   Context: 27(0%)
+
+* 🤖 retry-agent ▸ [SID]   Context: 27(0%)

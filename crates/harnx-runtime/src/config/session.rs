@@ -1,7 +1,7 @@
 use super::input::*;
 use super::*;
 
-pub use harnx_core::session::{AutoName, Session, SessionLogEntry};
+pub use harnx_core::session::{Session, SessionLogEntry};
 
 use crate::client::{
     render_message_input, CompletionTokenUsage, Message, MessageContent, MessageRole,
@@ -502,8 +502,7 @@ pub fn ensure_log_file(session: &mut Session) {
         return;
     };
 
-    let (dir, session_name) = resolve_save_path(session, &sessions_dir);
-    let session_path = dir.join(format!("{session_name}.yaml"));
+    let session_path = sessions_dir.join(format!("{}.yaml", session.id));
     if ensure_parent_exists(&session_path).is_err() {
         return;
     }
@@ -543,33 +542,6 @@ pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
     }
 }
 
-pub fn resolve_save_path(session: &mut Session, session_dir: &Path) -> (PathBuf, String) {
-    if let Some((dir, name)) = session.resolved_save_name.clone() {
-        // Update the cached name with autoname if it arrived since
-        // the first resolution.
-        if session.id == TEMP_SESSION_NAME && !name.contains('-') {
-            if let Some(autoname) = session.autoname() {
-                let name = format!("{name}-{autoname}");
-                session.resolved_save_name = Some((dir.clone(), name.clone()));
-                return (dir, name);
-            }
-        }
-        return (dir, name);
-    }
-    let mut dir = session_dir.to_path_buf();
-    let mut name = session.id.clone();
-    if name == TEMP_SESSION_NAME {
-        dir = dir.join("_");
-        let now = chrono::Local::now();
-        name = now.format("%Y%m%dT%H%M%S").to_string();
-        if let Some(autoname) = session.autoname() {
-            name = format!("{name}-{autoname}");
-        }
-    }
-    session.resolved_save_name = Some((dir.clone(), name.clone()));
-    (dir, name)
-}
-
 pub fn render(
     session: &Session,
     render: &mut MarkdownRender,
@@ -579,10 +551,6 @@ pub fn render(
 
     if let Some(path) = &session.path {
         items.push(("path", path.to_string()));
-    }
-
-    if let Some(autoname) = session.autoname() {
-        items.push(("autoname", autoname.to_string()));
     }
 
     items.push(("model", session.model().id()));
@@ -674,8 +642,8 @@ pub fn exit(session: &mut Session, session_dir: &Path, is_tui: bool) -> Result<(
     }
     // Session has unsaved changes that were not yet appended (e.g. legacy
     // callers or sessions that didn't go through init_log). Do a full save.
-    let (session_dir, session_name) = resolve_save_path(session, session_dir);
-    let session_path = session_dir.join(format!("{session_name}.yaml"));
+    let session_name = session.id.clone();
+    let session_path = session_dir.join(format!("{}.yaml", session.id));
     save(session, &session_name, &session_path, is_tui)?;
     Ok(())
 }
@@ -1049,15 +1017,10 @@ fn is_tool_continuation(input: &Input, messages: &[Message]) -> bool {
 /// push (skipped on continuation rounds), data-URL persistence, and
 /// any queued injected-user-text.  Returns `true` iff every log
 /// append succeeded.
-fn begin_turn(session: &mut Session, input: &Input, output: &str) -> Result<bool> {
+fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<bool> {
     let mut all_appended = true;
     let is_continuation = is_tool_continuation(input, &session.messages);
     if session.messages.is_empty() {
-        if session.id == TEMP_SESSION_NAME && session.save_session != Some(false) {
-            let raw_input = input.raw();
-            let chat_history = format!("USER: {raw_input}\nASSISTANT: {output}\n");
-            session.autoname = Some(AutoName::new_from_chat_history(chat_history));
-        }
         let agent_messages = input.agent().build_messages(input)?;
         for msg in agent_messages {
             let seq = session.next_seq();
@@ -1120,7 +1083,6 @@ pub fn clear_messages(session: &mut Session) {
     session.messages.clear();
     session.compressed_messages.clear();
     session.data_urls.clear();
-    session.autoname = None;
     session.completion_usage = CompletionTokenUsage::default();
     session.update_tokens();
     if !append_event(session, &SessionLogEntry::Clear) {

@@ -1,11 +1,10 @@
 ---
 source: crates/harnx/tests/tmux_e2e.rs
-assertion_line: 1672
 expression: normalized
 ---
 Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
 retry-agent v
-🤖 retry-agent ▸ temp
+🤖 retry-agent ▸ [SID]
 > hello
 
 ⚠ Retryable error (status 500, Internal Server Error (type: server_error)), attempt 1/3. Retrying in 10ms...
@@ -50,4 +49,4 @@ Caused by:
 
 
 
-* 🤖 retry-agent ▸ temp   Context: 19(0%)
+* 🤖 retry-agent ▸ [SID]   Context: 19(0%)

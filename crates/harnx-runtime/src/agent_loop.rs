@@ -462,7 +462,6 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
     if abort_signal.aborted() {
         bail!("interrupted by user");
     }
-    Config::maybe_autoname_session(config.clone());
     Config::maybe_compact_session(config.clone());
     Ok(())
 }
