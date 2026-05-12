@@ -1,6 +1,7 @@
 ---
 title: "Session resume hint on exit in a Rust CLI"
 date: 2026-05-05
+last_updated: 2026-05-12
 category: logic-errors
 problem_type: logic_error
 component: cli-session-management
@@ -12,6 +13,8 @@ tags:
   - cli-ux
   - shell-escaping
   - terminal-output
+  - ownership-lifecycle
+  - cross-crate-integration
 plan_ref: "issue-417"
 ---
 
@@ -109,3 +112,44 @@ fn test_resume_hint_empty_session_suppressed() {
 
 - **Changeset:** `.changesets/417-session-resume-hint.md`
 - **Related Solution:** [logic-errors/non-tui-terminal-output-fixes-2026-04-30.md](./non-tui-terminal-output-fixes-2026-04-30.md) — TUI vs non-TUI output handling
+
+---
+
+## Postscript: Double-Exit Bug (2026-05-12)
+
+### Problem
+
+Session resume hint worked in CMD mode but silently failed in TUI mode. The hint never printed because the session was already consumed.
+
+### Root Cause
+
+**Duplicate teardown in call stack.** The `Tui::run()` method in `crates/harnx-tui/src/lifecycle.rs` had a pre-existing `exit_session()` call that consumed session state. When `exit_session_with_hook()` was added to `start_interactive()` (the caller of `tui.run()`), PR #464 forgot to remove the redundant call inside `Tui::run()`.
+
+Execution order in TUI mode:
+
+1. `Tui::run()` → `exit_session()` → `config.session = None`
+2. `exit_session_with_hook()` → `session_resume_command(config)` → returns `None` (session already gone) → hint never printed
+
+### Fix
+
+Remove the `exit_session()` call from `Tui::run()`:
+
+```diff
+- self.config.write().exit_session()?;
+```
+
+The caller (`start_interactive`) owns the session lifecycle via `exit_session_with_hook()`. Lower-level TUI code should not clear session before top-level cleanup runs.
+
+### Key Lesson
+
+When layering new behavior on top of existing teardown logic, check every layer in the call stack for duplicate teardown that would consume state before new code can read it.
+
+**Easy to miss when:**
+- Duplicate is in a different crate (`harnx-tui`) from new code (`harnx/main.rs`)
+- Original teardown was correct for its local context but conflicts with new ownership expectations
+
+### Prevention Strategies
+
+- **Ownership audit**: When adding cleanup hooks, trace the full call stack for existing cleanup calls
+- **Cross-crate vigilance**: Session state ownership spans crates; implicit cleanup in lower layers can break higher-level hooks
+- **Test coverage**: Integration tests should verify cross-crate handoffs, not just isolated unit behavior

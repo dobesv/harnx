@@ -253,7 +253,6 @@ impl Tui {
         let mut event_source = CrosstermEventSource;
         let result = self.run_loop_inner(&mut terminal, &mut event_source).await;
         Self::restore_terminal(&mut terminal)?;
-        self.config.write().exit_session()?;
         result
     }
 
