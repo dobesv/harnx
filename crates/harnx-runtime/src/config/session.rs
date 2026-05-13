@@ -3,14 +3,11 @@ use super::*;
 
 pub use harnx_core::session::{Session, SessionLogEntry};
 
-use crate::client::{
-    render_message_input, CompletionTokenUsage, Message, MessageContent, MessageRole,
-};
+use crate::client::{CompletionTokenUsage, Message, MessageContent, MessageRole};
 use harnx_core::{
     event::{AgentEvent, SessionEvent},
     sink::emit_agent_event,
 };
-use harnx_render::MarkdownRender;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -542,11 +539,7 @@ pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
     }
 }
 
-pub fn render(
-    session: &Session,
-    render: &mut MarkdownRender,
-    agent_info: &Option<(String, Vec<String>)>,
-) -> Result<String> {
+pub fn render(session: &Session) -> Result<String> {
     let mut items = vec![];
 
     if let Some(path) = &session.path {
@@ -582,47 +575,10 @@ pub fn render(
         items.push(("max_input_tokens", max_input_tokens.to_string()));
     }
 
-    let mut lines: Vec<String> = items
+    let lines: Vec<String> = items
         .iter()
         .map(|(name, value)| format!("{name:<20}{value}"))
         .collect();
-
-    lines.push(String::new());
-
-    if !session.is_empty() {
-        let resolve_url_fn = |url: &str| resolve_data_url(&session.data_urls, url.to_string());
-
-        for message in &session.messages {
-            match message.role {
-                MessageRole::System => {
-                    lines.push(render.render(&render_message_input(
-                        &message.content,
-                        resolve_url_fn,
-                        agent_info,
-                    )));
-                }
-                MessageRole::Assistant => {
-                    if let MessageContent::Text(text) = &message.content {
-                        lines.push(render.render(text));
-                    }
-                    lines.push("".into());
-                }
-                MessageRole::User => {
-                    lines.push(format!(
-                        ">> {}",
-                        render_message_input(&message.content, resolve_url_fn, agent_info)
-                    ));
-                }
-                MessageRole::Tool => {
-                    lines.push(render_message_input(
-                        &message.content,
-                        resolve_url_fn,
-                        agent_info,
-                    ));
-                }
-            }
-        }
-    }
 
     Ok(lines.join("\n"))
 }
@@ -2123,18 +2079,13 @@ content: second
 
     #[test]
     fn render_shows_model_fallbacks() {
-        use harnx_render::{MarkdownRender, RenderOptions};
-
         let mut session = test_session();
         session.set_model_fallbacks(vec![
             "anthropic:claude".to_string(),
             "google:gemini".to_string(),
         ]);
 
-        let options = RenderOptions::default();
-        let mut md_render = MarkdownRender::init(options).unwrap();
-        let agent_info: Option<(String, Vec<String>)> = None;
-        let output = super::render(&session, &mut md_render, &agent_info).unwrap();
+        let output = super::render(&session).unwrap();
 
         assert!(
             output.contains("model_fallbacks"),
