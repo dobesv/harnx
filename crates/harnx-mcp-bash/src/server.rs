@@ -535,7 +535,11 @@ impl BashServer {
     fn system_writable_paths() -> Vec<PathBuf> {
         #[cfg(target_os = "linux")]
         {
-            vec![PathBuf::from("/tmp")]
+            // /dev/shm is a tmpfs used by Chrome/Puppeteer for inter-process
+            // shared memory.  Without write access the browser crashes on
+            // startup inside the sandbox (issue #528).  /tmp is included as
+            // the standard temporary-file directory.
+            vec![PathBuf::from("/tmp"), PathBuf::from("/dev/shm")]
         }
         #[cfg(target_os = "macos")]
         {
@@ -3102,7 +3106,10 @@ mod tests {
         );
         let pairs = collect_arg_pairs(&args);
 
+        // Both /tmp and /dev/shm must be writable — /dev/shm is a tmpfs used
+        // by Chrome/Puppeteer for inter-process shared memory (issue #528).
         assert!(pairs.contains(&("--write".into(), "/tmp".into())));
+        assert!(pairs.contains(&("--write".into(), "/dev/shm".into())));
     }
 
     #[cfg(all(unix, target_os = "macos"))]
