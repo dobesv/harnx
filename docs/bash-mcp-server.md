@@ -200,3 +200,19 @@ args: ["--extra-rwx", "~/.npm"]
 ```yaml
 args: ["--extra-rwx", "~/.cargo"]
 ```
+
+
+#### Run Chrome or Puppeteer
+
+Chrome uses `/dev/shm` for inter-process shared memory. Starting with this release, `/dev/shm` is already granted write access inside the sandbox, so Puppeteer scripts should start Chrome without any extra `--extra-write` flag.
+
+However, Chrome's own sub-process sandbox tries to create a nested Linux user namespace, which is blocked when it is already running inside birdcage's user namespace. You must launch Chrome with `--no-sandbox` and `--disable-dev-shm-usage` to work around this limitation:
+
+```js
+// puppeteer example
+const browser = await puppeteer.launch({
+  args: ['--no-sandbox', '--disable-dev-shm-usage'],
+});
+```
+
+These flags are also required in Docker containers and CI environments where the kernel restricts nested user namespaces (`ptrace_scope=1`). They are not related to harnx — they are standard container-mode Chrome flags.
