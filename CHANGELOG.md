@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+## 0.32.0 (2026-05-13)
+
+### Breaking Changes
+
+- remove all default session related features and configurations (#477)
+
+### Features
+
+- markdown table rendering with widget architecture and render cache (#351) (#486)
+- add package management system and runtime integration (#490)
+- add word wrap and multi-line row support to markdown tables (#495)
+- surface hook-blocked tool calls in TUI transcript (#356) (#496)
+- open agent/session picker for bare .agent/.session commands (#508)
+- add insert and re_replace tools (#511) (#514)
+- add surgical editing and unified diff output (#516)
+
+### Fixes
+
+- track I/O task JoinHandle to detect unexpected subprocess exit (#71) (#488)
+- sort session picker by last updated time instead of created time (#504)
+- scroll history into view on first navigation press (#509)
+- resolve duplicate exit_session call preventing resume hint (#522)
+
 ## 0.31.0 (2026-05-07)
 
 ### Breaking Changes
