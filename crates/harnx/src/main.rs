@@ -18,7 +18,7 @@ use crate::cli::Cli;
 use crate::client::{list_models, retry::call_with_retry_and_fallback, ModelType};
 use crate::config::{
     list_agents, list_assistant_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
-    WorkingMode, TEMP_SESSION_NAME,
+    WorkingMode,
 };
 use crate::tui::Tui;
 use harnx_hooks::{
@@ -128,10 +128,19 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     }
 
     if let Some(agent) = &cli.agent {
-        let session = cli.session.as_ref().map(|v| match v {
-            Some(v) => v.as_str(),
-            None => TEMP_SESSION_NAME,
-        });
+        // cli.session is Option<Option<String>>:
+        //   None          → --session not provided; no session
+        //   Some(None)    → bare --session flag; generate a new session ID
+        //   Some(Some(s)) → --session <id>; use that ID
+        let generated_session_id;
+        let session = match &cli.session {
+            None => None,
+            Some(None) => {
+                generated_session_id = config.read().new_session_id()?;
+                Some(generated_session_id.as_str())
+            }
+            Some(Some(s)) => Some(s.as_str()),
+        };
         if !cli.agent_variable.is_empty() {
             config.write().agent_variables = Some(
                 cli.agent_variable
@@ -328,11 +337,7 @@ fn session_resume_command(config: &GlobalConfig) -> Option<String> {
         return None;
     }
 
-    let session_name = session
-        .resolved_save_name
-        .as_ref()
-        .map(|(_, name)| name.as_str())
-        .unwrap_or_else(|| session.id());
+    let session_name = session.id();
 
     let agent_name = config_read.agent.as_ref().map(|a| a.name());
 
@@ -810,17 +815,6 @@ mod resume_tests {
         assert_eq!(
             session_resume_command(&config).unwrap(),
             "harnx -a 'my agent' -s 'my session'"
-        );
-    }
-
-    #[test]
-    fn uses_resolved_save_name_when_available() {
-        let mut session = session_with_message("temp");
-        session.resolved_save_name = Some((PathBuf::from("_"), "20240505-resolved".to_string()));
-        let config = make_config(Some(session));
-        assert_eq!(
-            session_resume_command(&config).unwrap(),
-            "harnx -s 20240505-resolved"
         );
     }
 }

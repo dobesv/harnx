@@ -194,11 +194,7 @@ pub struct Session {
     #[serde(skip)]
     pub compressing: bool,
     #[serde(skip)]
-    pub autoname: Option<AutoName>,
-    #[serde(skip)]
     pub sessions_dir: Option<PathBuf>,
-    #[serde(skip)]
-    pub resolved_save_name: Option<(PathBuf, String)>,
     #[serde(skip)]
     pub log_entry_count: usize,
     #[serde(skip)]
@@ -432,32 +428,6 @@ impl Session {
         self.compressing = compressing;
     }
 
-    pub fn need_autoname(&self) -> bool {
-        self.autoname.as_ref().map(|v| v.need()).unwrap_or_default()
-    }
-
-    pub fn set_autonaming(&mut self, naming: bool) {
-        if let Some(v) = self.autoname.as_mut() {
-            v.naming = naming;
-        }
-    }
-
-    pub fn chat_history_for_autonaming(&self) -> Option<String> {
-        self.autoname.as_ref().and_then(|v| v.chat_history.clone())
-    }
-
-    pub fn autoname(&self) -> Option<&str> {
-        self.autoname.as_ref().and_then(|v| v.name.as_deref())
-    }
-
-    pub fn set_autoname(&mut self, value: &str) {
-        let name = value
-            .chars()
-            .map(|v| if v.is_alphanumeric() { v } else { '-' })
-            .collect();
-        self.autoname = Some(AutoName::new(name));
-    }
-
     pub fn guard_empty(&self) -> Result<()> {
         if !self.is_empty() {
             bail!("Cannot perform this operation because the session has messages, please `.empty session` first.");
@@ -548,31 +518,6 @@ impl Session {
             self.compaction_agent = value;
             self.dirty = true;
         }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct AutoName {
-    pub(crate) naming: bool,
-    pub(crate) chat_history: Option<String>,
-    pub(crate) name: Option<String>,
-}
-
-impl AutoName {
-    pub fn new(name: String) -> Self {
-        Self {
-            name: Some(name),
-            ..Default::default()
-        }
-    }
-    pub fn new_from_chat_history(chat_history: String) -> Self {
-        Self {
-            chat_history: Some(chat_history),
-            ..Default::default()
-        }
-    }
-    pub fn need(&self) -> bool {
-        !self.naming && self.chat_history.is_some() && self.name.is_none()
     }
 }
 

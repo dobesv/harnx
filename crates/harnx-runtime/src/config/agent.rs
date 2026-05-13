@@ -11,9 +11,6 @@ pub use harnx_core::agent_config::{
     AgentConfig, AgentRole, AgentVariable, AgentVariables, TEMP_AGENT_NAME,
 };
 
-/// Built-in agent name: routes to the title-creation prompt.
-pub const CREATE_TITLE_AGENT: &str = harnx_core::agent_config::CREATE_TITLE_AGENT_NAME;
-
 const DEFAULT_AGENT_NAME: &str = "rag";
 
 #[derive(Debug, Clone, Default)]

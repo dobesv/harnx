@@ -1,11 +1,10 @@
 ---
 source: crates/harnx/tests/tmux_e2e.rs
-assertion_line: 1332
 expression: normalized
 ---
 Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
 nested-parent v
-🤖 nested-parent ▸ temp
+🤖 nested-parent ▸ [SID]
 > do nested delegation
 
 Parent delegating to researcher.
@@ -29,9 +28,6 @@ session_id: [SID]
 response: Researcher delegating to analyst.
 Nested task complete
 
-📢 Autonaming the session.
-> nested-parent ▸ temp
-No more scripted responses.
 
 
 
@@ -80,4 +76,7 @@ No more scripted responses.
 
 
 
-* 🤖 nested-parent ▸ temp   Context: [N](0%)
+
+
+
+* 🤖 nested-parent ▸ [SID]   Context: [N](0%)

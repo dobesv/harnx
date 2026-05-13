@@ -616,9 +616,12 @@ mod tests {
     use agent_client_protocol::Agent;
     use harnx_runtime::{
         client::{ClientConfig, ModelType, TestStateGuard},
-        config::{Config, CREATE_TITLE_AGENT},
+        config::Config,
         test_utils::{MockClient, MockTurnBuilder},
     };
+
+    /// Built-in agent used as a lightweight test fixture for ACP protocol tests.
+    const TEST_BUILTIN_AGENT: &str = harnx_core::agent_config::CREATE_TITLE_AGENT_NAME;
     use std::{cell::RefCell, rc::Rc, sync::Arc};
     use tempfile::TempDir;
     use tokio::task::LocalSet;
@@ -920,7 +923,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("create temp dir");
         write_test_agent(
             &temp,
-            CREATE_TITLE_AGENT,
+            TEST_BUILTIN_AGENT,
             "You create concise titles for conversations.",
         );
         let config = test_config();
@@ -940,7 +943,7 @@ mod tests {
             let _env = EnvGuard::new("HARNX_CONFIG_DIR", &temp_path);
 
             let (client_conn, chunks, server_handle, client_handle) =
-                setup_roundtrip(CREATE_TITLE_AGENT, config.clone());
+                setup_roundtrip(TEST_BUILTIN_AGENT, config.clone());
 
             timeout(
                 Duration::from_secs(5),
@@ -990,7 +993,7 @@ mod tests {
 
             let session_id = session.session_id.to_string();
             let session_path =
-                harnx_core::config_paths::session_file(Some(CREATE_TITLE_AGENT), &session_id);
+                harnx_core::config_paths::session_file(Some(TEST_BUILTIN_AGENT), &session_id);
             let top_level_path = harnx_core::config_paths::session_file(None, &session_id);
             assert!(
                 session_path.exists(),

@@ -3,11 +3,11 @@ pub mod input;
 pub mod session;
 pub mod session_meta;
 
+pub use self::agent::TEMP_AGENT_NAME;
 pub use self::agent::{
     complete_agent_variables, list_agents, list_assistant_agents, Agent, AgentConfig,
     AgentVariables,
 };
-pub use self::agent::{CREATE_TITLE_AGENT, TEMP_AGENT_NAME};
 pub use self::input::Input;
 use self::session::Session;
 pub use self::session_meta::{
@@ -57,7 +57,6 @@ use syntect::highlighting::ThemeSet;
 use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
 
 pub use harnx_rag::TEMP_RAG_NAME;
-pub const TEMP_SESSION_NAME: &str = "temp";
 
 const SERVE_ADDR: &str = "127.0.0.1:8000";
 
@@ -646,7 +645,7 @@ impl Config {
 
     /// Generate a unique short session ID and atomically claim it on disk.
     /// Retries with the next second's timestamp if the claim loses a race.
-    fn new_anonymous_session_id(&self) -> Result<String> {
+    pub fn new_session_id(&self) -> Result<String> {
         loop {
             let candidate =
                 crate::utils::session_name::generate_session_id(|c| self.session_file(c).exists());
@@ -1428,17 +1427,8 @@ impl Config {
         let mut session;
         match session_name {
             None => {
-                let short_id = self.new_anonymous_session_id()?;
+                let short_id = self.new_session_id()?;
                 session = Some(self::session::new(self, &short_id)?);
-            }
-            Some(TEMP_SESSION_NAME) => {
-                let session_file = self.session_file(TEMP_SESSION_NAME);
-                if session_file.exists() {
-                    remove_file(session_file).with_context(|| {
-                        format!("Failed to cleanup previous '{TEMP_SESSION_NAME}' session")
-                    })?;
-                }
-                session = Some(self::session::new(self, TEMP_SESSION_NAME)?);
             }
             Some(name) => {
                 let session_path = self.session_file(name);
@@ -1518,10 +1508,7 @@ impl Config {
         let session_name = match &self.session {
             Some(session) => match name {
                 Some(v) => v.to_string(),
-                None => session
-                    .autoname()
-                    .unwrap_or_else(|| session.id())
-                    .to_string(),
+                None => session.id().to_string(),
             },
             None => bail!("No session"),
         };
@@ -1943,55 +1930,6 @@ impl Config {
             .as_ref()
             .map(|v| v.compressing())
             .unwrap_or_default()
-    }
-
-    pub fn maybe_autoname_session(config: GlobalConfig) {
-        let mut need_autoname = false;
-        if let Some(session) = config.write().session.as_mut() {
-            if session.need_autoname() {
-                session.set_autonaming(true);
-                need_autoname = true;
-            }
-        }
-        if !need_autoname {
-            return;
-        }
-        let color = if config.read().light_theme() {
-            nu_ansi_term::Color::LightGray
-        } else {
-            nu_ansi_term::Color::DarkGray
-        };
-        crate::utils::emit_info(format!(
-            "📢 {}",
-            color.italic().paint("Autonaming the session.")
-        ));
-        tokio::spawn(async move {
-            if let Err(err) = Config::autoname_session(&config).await {
-                warn!("Failed to autonaming the session: {err}");
-            }
-            if let Some(session) = config.write().session.as_mut() {
-                session.set_autonaming(false);
-            }
-        });
-    }
-
-    pub async fn autoname_session(config: &GlobalConfig) -> Result<()> {
-        let text = match config
-            .read()
-            .session
-            .as_ref()
-            .and_then(|v| v.chat_history_for_autonaming())
-        {
-            Some(v) => v,
-            None => bail!("No chat history"),
-        };
-        let agent = config.read().retrieve_agent(CREATE_TITLE_AGENT)?;
-        let input = crate::config::input::from_str(config, &text, Some(agent));
-        let text = crate::config::input::fetch_chat_text(&input, config).await?;
-        if let Some(session) = config.write().session.as_mut() {
-            session.set_autoname(&text);
-        }
-        Ok(())
     }
 
     pub async fn use_rag(

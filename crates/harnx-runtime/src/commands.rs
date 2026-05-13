@@ -228,7 +228,6 @@ pub async fn run_command_with_output(
                     return Ok(CommandOutcome::OpenSessionPicker);
                 }
                 config.write().use_session(args)?;
-                Config::maybe_autoname_session(config.clone());
             }
             ".rag" => {
                 Config::use_rag(config, args, abort_signal.clone()).await?;
