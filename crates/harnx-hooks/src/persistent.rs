@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::{HookOutcome, HookPayload, HookResult, HookResultControl};
 
 use anyhow::{bail, Result};

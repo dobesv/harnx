@@ -320,7 +320,6 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
     ]
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn session_prompt_with_abort<Fut>(
     client: &AcpClient,
     session_id: String,
@@ -351,7 +350,6 @@ where
     }))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn session_prompt_with_abort_for_test<
     PromptFn,
     PromptFut,

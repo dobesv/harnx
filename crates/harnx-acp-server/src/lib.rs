@@ -143,8 +143,6 @@ pub struct HarnxAgent {
 
 #[derive(Clone)]
 struct HarnxSession {
-    #[allow(dead_code)]
-    id: String,
     abort_signal: AbortSignal,
     /// Fires when the session receives an ACP `session/cancel` notification.
     /// We use `notify_one` (rather than `notify_waiters`) so a cancel that
@@ -225,7 +223,6 @@ impl acp::Agent for HarnxAgent {
                 .clone();
         }
         let session = HarnxSession {
-            id: session_id.clone(),
             abort_signal: AbortSignalInner::new(),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
         };
