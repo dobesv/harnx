@@ -1,0 +1,12 @@
+chunk_delay_ms: 35
+turns:
+  - text_chunks:
+      - "Sure! "
+      - "Let me count the Rust source files "
+      - "in this workspace."
+  - text_chunks:
+      - "There are **42 Rust files** in the workspace, "
+      - "split across the `crates/` directory. "
+      - "The largest crate is `harnx-tui`, "
+      - "which holds the terminal UI built on ratatui."
+fallback_text: "(demo complete)"
