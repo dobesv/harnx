@@ -58,6 +58,8 @@ struct ExecCommandParams {
     inputs: Option<Vec<String>>,
     #[serde(default)]
     outputs: Option<Vec<String>>,
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
 }
 
 impl JsonSchema for ExecCommandParams {
@@ -74,6 +76,7 @@ impl JsonSchema for ExecCommandParams {
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
         let inputs = generator.subschema_for::<Option<Vec<String>>>();
         let outputs = generator.subschema_for::<Option<Vec<String>>>();
+        let env = generator.subschema_for::<Option<HashMap<String, String>>>();
         object_schema_with_desc(
             vec![
                 ("command", "Bash command to execute. Avoid shell pipes like | head, | tail, | grep — use head_lines, tail_lines, max_output_bytes instead.", command),
@@ -84,6 +87,7 @@ impl JsonSchema for ExecCommandParams {
                 ("max_output_bytes", "Truncate output to this many bytes. Prefer this over `| head -c N` in the command.", max_output_bytes),
                 ("inputs", "Paths that the command will read (for sandbox allow-listing).", inputs),
                 ("outputs", "Paths that the command will write (triggers history snapshot).", outputs),
+                ("env", "Additional environment variables for the command. Merged on top of the server's environment; per-call overrides only.", env),
             ],
             &["command"],
         )
@@ -164,6 +168,8 @@ struct SpawnCommandParams {
     inputs: Option<Vec<String>>,
     #[serde(default)]
     outputs: Option<Vec<String>>,
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
 }
 
 impl JsonSchema for SpawnCommandParams {
@@ -176,6 +182,7 @@ impl JsonSchema for SpawnCommandParams {
         let working_dir = generator.subschema_for::<Option<String>>();
         let inputs = generator.subschema_for::<Option<Vec<String>>>();
         let outputs = generator.subschema_for::<Option<Vec<String>>>();
+        let env = generator.subschema_for::<Option<HashMap<String, String>>>();
         object_schema_with_desc(
             vec![
                 ("command", "Bash command to run in the background.", command),
@@ -189,6 +196,11 @@ impl JsonSchema for SpawnCommandParams {
                     "outputs",
                     "Paths the command will write (triggers history snapshot on wait).",
                     outputs,
+                ),
+                (
+                    "env",
+                    "Additional environment variables for the command. Merged on top of the server's environment; per-call overrides only.",
+                    env,
                 ),
             ],
             &["command"],
@@ -959,6 +971,29 @@ impl BashServer {
     }
 
     // -----------------------------------------------------------------------
+    // env helpers
+    // -----------------------------------------------------------------------
+
+    /// Validate that every key in a per-call `env` map is a legal environment
+    /// variable name.  Keys must be non-empty and must not contain `=` or NUL
+    /// bytes, because:
+    /// - In sandbox mode the key is embedded in `--env KEY=VALUE`; a `=` in
+    ///   the key makes the `KEY` / `VALUE` split in `sandbox-run` ambiguous.
+    /// - On all platforms, the OS env API rejects keys with NUL bytes.
+    fn validate_extra_env(env: &HashMap<String, String>) -> Result<(), ErrorData> {
+        for key in env.keys() {
+            if key.is_empty() || key.contains('=') || key.contains('\0') {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "invalid env key {key:?}: keys must be non-empty and must not contain '=' or NUL"
+                    ),
+                    None,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     // exec
     // -----------------------------------------------------------------------
 
@@ -966,6 +1001,9 @@ impl BashServer {
         &self,
         params: ExecCommandParams,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(ref extra_env) = params.env {
+            Self::validate_extra_env(extra_env)?;
+        }
         if params.command.trim().is_empty() {
             return Err(ErrorData::invalid_params("command cannot be empty", None));
         }
@@ -1063,6 +1101,12 @@ impl BashServer {
                 );
                 sb_args.push(OsString::from("--working-dir"));
                 sb_args.push(working_dir.as_os_str().to_owned());
+                if let Some(ref extra_env) = params.env {
+                    for (key, value) in extra_env {
+                        sb_args.push(OsString::from("--env"));
+                        sb_args.push(OsString::from(format!("{key}={value}")));
+                    }
+                }
                 sb_args.push(OsString::from("--"));
                 sb_args.push(OsString::from("bash"));
                 sb_args.push(OsString::from("-c"));
@@ -1082,6 +1126,7 @@ impl BashServer {
             unreachable!()
         } else {
             let child_env = self.build_child_env();
+            let extra_env = params.env.clone().unwrap_or_default();
             CommandWrap::with_new("bash", |command| {
                 command
                     .args(["-c", &params.command])
@@ -1089,6 +1134,7 @@ impl BashServer {
                     .stdin(Stdio::null());
                 command.env_clear();
                 command.envs(child_env.iter().map(|(k, v)| (k, v)));
+                command.envs(extra_env.iter());
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
             })
         };
@@ -1464,6 +1510,9 @@ impl BashServer {
     // -----------------------------------------------------------------------
 
     async fn spawn_impl(&self, params: SpawnCommandParams) -> Result<CallToolResult, ErrorData> {
+        if let Some(ref extra_env) = params.env {
+            Self::validate_extra_env(extra_env)?;
+        }
         if params.command.trim().is_empty() {
             return Err(ErrorData::invalid_params("command cannot be empty", None));
         }
@@ -1542,6 +1591,12 @@ impl BashServer {
                 );
                 sb_args.push(OsString::from("--working-dir"));
                 sb_args.push(working_dir.as_os_str().to_owned());
+                if let Some(ref extra_env) = params.env {
+                    for (key, value) in extra_env {
+                        sb_args.push(OsString::from("--env"));
+                        sb_args.push(OsString::from(format!("{key}={value}")));
+                    }
+                }
                 sb_args.push(OsString::from("--"));
                 sb_args.push(OsString::from("bash"));
                 sb_args.push(OsString::from("-c"));
@@ -1561,6 +1616,7 @@ impl BashServer {
             unreachable!()
         } else {
             let child_env = self.build_child_env();
+            let extra_env = params.env.clone().unwrap_or_default();
             CommandWrap::with_new("bash", |command| {
                 command
                     .args(["-c", &params.command])
@@ -1568,6 +1624,7 @@ impl BashServer {
                     .stdin(Stdio::null());
                 command.env_clear();
                 command.envs(child_env.iter().map(|(k, v)| (k, v)));
+                command.envs(extra_env.iter());
                 command
                     .stdout(Stdio::from(stdout_file))
                     .stderr(Stdio::from(stderr_file));
@@ -3352,6 +3409,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: Some(vec!["/etc".into()]),
                 outputs: None,
+                env: None,
             })
             .await;
 
@@ -3380,6 +3438,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: Some(vec!["/etc".into()]),
+                env: None,
             })
             .await;
 
@@ -3440,6 +3499,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -3476,6 +3536,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: Some(vec![]),
+                env: None,
             })
             .await
             .unwrap();
@@ -3519,6 +3580,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: Some(outputs.clone()),
+                env: None,
             })
             .await
             .unwrap();
@@ -3547,6 +3609,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: Some(outputs),
+                env: None,
             })
             .await
             .unwrap();
@@ -3579,6 +3642,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await;
 
@@ -3604,10 +3668,71 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_exec_rejects_invalid_env_keys() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        // Empty key
+        let mut bad_env = std::collections::HashMap::new();
+        bad_env.insert("".to_string(), "value".to_string());
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "true".to_string(),
+                working_dir: None,
+                timeout_secs: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+                env: Some(bad_env),
+            })
+            .await;
+        assert!(result.is_err(), "empty key should be rejected");
+
+        // Key with '='
+        let mut bad_env2 = std::collections::HashMap::new();
+        bad_env2.insert("FOO=BAR".to_string(), "value".to_string());
+        let result2 = server
+            .exec_command_impl(ExecCommandParams {
+                command: "true".to_string(),
+                working_dir: None,
+                timeout_secs: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+                env: Some(bad_env2),
+            })
+            .await;
+        assert!(result2.is_err(), "key containing '=' should be rejected");
+
+        // Key with NUL byte
+        let mut bad_env3 = std::collections::HashMap::new();
+        bad_env3.insert("FOO\0BAR".to_string(), "value".to_string());
+        let result3 = server
+            .exec_command_impl(ExecCommandParams {
+                command: "true".to_string(),
+                working_dir: None,
+                timeout_secs: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+                env: Some(bad_env3),
+            })
+            .await;
+        assert!(result3.is_err(), "key containing NUL should be rejected");
     }
 
     #[tokio::test]
@@ -3625,6 +3750,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -3649,6 +3775,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -3682,6 +3809,162 @@ mod tests {
         assert!(stderr_log_path.exists());
     }
 
+    #[tokio::test]
+    async fn test_exec_per_call_env_vars() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let mut extra_env = std::collections::HashMap::new();
+        extra_env.insert("MY_TEST_VAR".to_string(), "hello_from_env".to_string());
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "echo $MY_TEST_VAR".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+                env: Some(extra_env),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("hello_from_env"),
+            "env var should be visible to command: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_per_call_env_vars() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let mut extra_env = std::collections::HashMap::new();
+        extra_env.insert("MY_SPAWN_VAR".to_string(), "spawned_value".to_string());
+
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "echo $MY_SPAWN_VAR".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
+                env: Some(extra_env),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        let execution_id = extract_field(&text, "execution_id");
+
+        let wait_result = server
+            .wait_impl(WaitParams {
+                execution_id,
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                grep: None,
+            })
+            .await
+            .unwrap();
+
+        let wait_text = text_content(&wait_result);
+        assert!(
+            wait_text.contains("spawned_value"),
+            "env var should be visible to spawned command: {wait_text}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_sandbox_exec_per_call_env_vars() {
+        if !sandbox_runtime_works() {
+            return;
+        }
+        let temp_dir = TestDir::new();
+        let server = sandboxed_server(vec![temp_dir.path().to_path_buf()]);
+
+        let mut extra_env = std::collections::HashMap::new();
+        extra_env.insert(
+            "MY_SANDBOX_VAR".to_string(),
+            "sandbox_exec_value".to_string(),
+        );
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "echo $MY_SANDBOX_VAR".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(15),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+                env: Some(extra_env),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("sandbox_exec_value"),
+            "env var should be visible to sandboxed command: {text}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_sandbox_spawn_per_call_env_vars() {
+        if !sandbox_runtime_works() {
+            return;
+        }
+        let temp_dir = TestDir::new();
+        let server = sandboxed_server(vec![temp_dir.path().to_path_buf()]);
+
+        let mut extra_env = std::collections::HashMap::new();
+        extra_env.insert(
+            "MY_SANDBOX_SPAWN_VAR".to_string(),
+            "sandbox_spawn_value".to_string(),
+        );
+
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "echo $MY_SANDBOX_SPAWN_VAR".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
+                env: Some(extra_env),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        let execution_id = extract_field(&text, "execution_id");
+
+        let wait_result = server
+            .wait_impl(WaitParams {
+                execution_id,
+                timeout_secs: Some(15),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                grep: None,
+            })
+            .await
+            .unwrap();
+
+        let wait_text = text_content(&wait_result);
+        assert!(
+            wait_text.contains("sandbox_spawn_value"),
+            "env var should be visible to sandboxed spawned command: {wait_text}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -3705,6 +3988,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -3734,6 +4018,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -3764,6 +4049,7 @@ mod tests {
                 max_output_bytes: Some(16),
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -3852,6 +4138,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -3876,6 +4163,7 @@ mod tests {
                 working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -3919,6 +4207,7 @@ mod tests {
                 working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -3953,6 +4242,7 @@ mod tests {
                 working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -4023,6 +4313,7 @@ mod tests {
                 working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
                 inputs: None,
                 outputs: None,
+                env: None,
             })
             .await
             .unwrap();
@@ -4066,6 +4357,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: Some(vec!["specific_file.txt".to_string()]),
+                env: None,
             })
             .await
             .unwrap();
@@ -4095,6 +4387,7 @@ mod tests {
                 max_output_bytes: None,
                 inputs: None,
                 outputs: Some(vec![]),
+                env: None,
             })
             .await
             .unwrap();
@@ -4117,6 +4410,7 @@ mod tests {
                 working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
                 inputs: None,
                 outputs: Some(vec!["out.txt".to_string()]),
+                env: None,
             })
             .await
             .unwrap();
@@ -4150,5 +4444,93 @@ mod tests {
         assert!(text.contains("exit_code: 0"));
         assert!(diff_text.contains("out.txt"));
         assert!(!diff_text.contains("other.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_exec_env_special_chars_and_override() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let mut extra_env = std::collections::HashMap::new();
+        extra_env.insert("VAR_WITH_EQUALS".to_string(), "key=value=more".to_string());
+        extra_env.insert("VAR_WITH_NEWLINE".to_string(), "line1\nline2".to_string());
+        extra_env.insert("PAGER".to_string(), "custom_pager".to_string());
+
+        let command = r#"echo $VAR_WITH_EQUALS; echo "$VAR_WITH_NEWLINE"; echo $PAGER"#;
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: command.to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+                env: Some(extra_env),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("key=value=more"),
+            "Should handle multiple equals: {text}"
+        );
+        assert!(
+            text.contains("line1\nline2"),
+            "Should handle newlines: {text}"
+        );
+        assert!(
+            text.contains("custom_pager"),
+            "Should override base env: {text}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_sandbox_exec_env_special_chars_and_override() {
+        if !sandbox_runtime_works() {
+            return;
+        }
+        let temp_dir = TestDir::new();
+        let server = sandboxed_server(vec![temp_dir.path().to_path_buf()]);
+
+        let mut extra_env = std::collections::HashMap::new();
+        extra_env.insert("VAR_WITH_EQUALS".to_string(), "key=value=more".to_string());
+        extra_env.insert("VAR_WITH_NEWLINE".to_string(), "line1\nline2".to_string());
+        extra_env.insert("PAGER".to_string(), "custom_pager".to_string());
+
+        let command = r#"echo $VAR_WITH_EQUALS; echo "$VAR_WITH_NEWLINE"; echo $PAGER"#;
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: command.to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(15),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+                env: Some(extra_env),
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("key=value=more"),
+            "Should handle multiple equals: {text}"
+        );
+        assert!(
+            text.contains("line1\nline2"),
+            "Should handle newlines: {text}"
+        );
+        assert!(
+            text.contains("custom_pager"),
+            "Should override base env: {text}"
+        );
     }
 }
