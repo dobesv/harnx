@@ -1,15 +1,22 @@
 use crate::{compat::TokioCompat, AcpServerConfig, NestedAcpEvent};
 
-use agent_client_protocol::{self as acp, Agent as _};
+use agent_client_protocol as acp;
+use agent_client_protocol::schema::{
+    CancelNotification, ContentBlock as AcpContentBlock, CreateTerminalRequest,
+    CreateTerminalResponse, Implementation, InitializeRequest, InitializeResponse,
+    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest,
+    ReadTextFileResponse, RequestPermissionRequest, RequestPermissionResponse, SessionInfoUpdate,
+    SessionNotification, SessionUpdate, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
+    WriteTextFileRequest, WriteTextFileResponse,
+};
 use anyhow::{anyhow, Context, Result};
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, PlanEntry, ToolEvent, ToolKind, ToolStatus,
 };
 use serde_json::json;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -29,7 +36,7 @@ pub struct AcpClient {
     operation_timeout: Duration,
     connected: Arc<RwLock<bool>>,
     connection_failed: Arc<RwLock<bool>>,
-    initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
+    initialize_response: Arc<RwLock<Option<InitializeResponse>>>,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
     worker: Arc<Mutex<Option<AcpWorkerHandle>>>,
     chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<NestedAcpEvent>>>>,
@@ -95,13 +102,6 @@ impl AcpNotificationClient {
 
     async fn forward_agent_event(&self, event: AgentEvent, source: AgentSource) {
         let mut forwarders = self.chunk_forwarder.write().await;
-
-        // Prefer delivery through a registered chunk forwarder when one is
-        // present.  Registered forwarders (e.g. `forward_acp_chunks` in
-        // `tool.rs` for the parent TUI, or `forward_task` in `server.rs` for
-        // nested ACP relay) already know how to surface the event to the
-        // right destination — emitting directly here would cause the same
-        // event to appear twice in the parent transcript.
         let mut forwarded_to_chunk = false;
         forwarders.retain(|_, tx| {
             match tx.send(NestedAcpEvent::Agent(event.clone(), Some(source.clone()))) {
@@ -113,38 +113,18 @@ impl AcpNotificationClient {
             }
         });
 
-        // When no forwarder is registered (e.g. direct parent TUI mode with
-        // no tool call in flight), fall back to the unified AgentEvent sink
-        // so the event still reaches the transcript.
         if !forwarded_to_chunk {
             use harnx_core::sink::emit_agent_event_with_source;
             emit_agent_event_with_source(event, Some(source));
         }
     }
-}
 
-#[async_trait::async_trait(?Send)]
-impl acp::Client for AcpNotificationClient {
-    async fn request_permission(
-        &self,
-        _args: acp::RequestPermissionRequest,
-    ) -> acp::Result<acp::RequestPermissionResponse> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
+    async fn session_notification(&self, args: SessionNotification) -> Result<()> {
         let session_id = args.session_id.0.to_string();
         let _ = self.activity_tx.send(session_id.clone());
         let resolved_source = resolve_notification_source(&self.agent_name, &args);
 
-        // Handle SessionInfoUpdate separately: its display output is
-        // display-only metadata (e.g. usage banners) that must never be
-        // appended to `state.response_text`.  When chunks are re-emitted
-        // upward by server.rs they become AgentMessageChunk, which *would*
-        // trigger the response_text append in the parent.  By handling
-        // SessionInfoUpdate with an early return we keep it out of the
-        // shared chunk → response_text path entirely.
-        if let acp::SessionUpdate::SessionInfoUpdate(ref info) = args.update {
+        if let SessionUpdate::SessionInfoUpdate(ref info) = args.update {
             if let Some(event) = session_info_update_event(info, resolved_source.clone()) {
                 self.forward_agent_event(event, resolved_source.clone())
                     .await;
@@ -152,12 +132,10 @@ impl acp::Client for AcpNotificationClient {
             return Ok(());
         }
 
-        let is_agent_message = matches!(args.update, acp::SessionUpdate::AgentMessageChunk(_));
-        // `message_text` records the streamed text for session
-        // response_text appending when the update is an AgentMessageChunk.
+        let is_agent_message = matches!(args.update, SessionUpdate::AgentMessageChunk(_));
         let mut message_text: Option<String> = None;
         let event: Option<AgentEvent> = match args.update {
-            acp::SessionUpdate::AgentMessageChunk(chunk) => {
+            SessionUpdate::AgentMessageChunk(chunk) => {
                 let text = chunk_text(&chunk.content);
                 if text.trim().is_empty() {
                     None
@@ -168,7 +146,7 @@ impl acp::Client for AcpNotificationClient {
                     }))
                 }
             }
-            acp::SessionUpdate::AgentThoughtChunk(chunk) => {
+            SessionUpdate::AgentThoughtChunk(chunk) => {
                 let text = chunk_text(&chunk.content);
                 if text.trim().is_empty() {
                     None
@@ -178,11 +156,10 @@ impl acp::Client for AcpNotificationClient {
                     }))
                 }
             }
-            acp::SessionUpdate::ToolCall(tc) => {
+            SessionUpdate::ToolCall(tc) => {
                 let input = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
                 let meta = tc.meta.as_ref().map(|m| serde_json::json!(m));
                 let markdown = meta.as_ref().and_then(markdown_from_meta_value);
-                // ACP protocol ToolCall.title is the tool name — distinct from our internal markdown field
                 Some(AgentEvent::Tool(ToolEvent::Started {
                     id: tc.tool_call_id.to_string(),
                     name: tc.title.clone(),
@@ -192,8 +169,7 @@ impl acp::Client for AcpNotificationClient {
                     locations: vec![],
                 }))
             }
-            acp::SessionUpdate::ToolCallUpdate(tcu) => {
-                // ACP ToolCallUpdate.fields.title carries the rendered display text (our internal "markdown")
+            SessionUpdate::ToolCallUpdate(tcu) => {
                 let markdown = tcu.fields.title.clone();
                 let raw_output = tcu.fields.raw_output.clone();
                 let status_str = tcu.fields.status.as_ref().map(|status| {
@@ -211,8 +187,6 @@ impl acp::Client for AcpNotificationClient {
                             markdown,
                         }))
                     } else {
-                        // status=completed but no raw_output — emit an Update with
-                        // Completed status so the parent TUI can close the tool bubble.
                         Some(AgentEvent::Tool(ToolEvent::Update {
                             id: tcu.tool_call_id.to_string(),
                             markdown,
@@ -232,7 +206,7 @@ impl acp::Client for AcpNotificationClient {
                     }))
                 }
             }
-            acp::SessionUpdate::Plan(p) => {
+            SessionUpdate::Plan(p) => {
                 let entries: Vec<PlanEntry> = p
                     .entries
                     .iter()
@@ -250,17 +224,11 @@ impl acp::Client for AcpNotificationClient {
                     Some(AgentEvent::Plan { entries })
                 }
             }
-            // SessionInfoUpdate is handled above via early return.
-            acp::SessionUpdate::SessionInfoUpdate(_) => unreachable!(),
-            // Explicitly list known-but-unhandled variants so new ones from
-            // future ACP SDK upgrades surface as compile warnings in the
-            // wildcard arm below.
-            acp::SessionUpdate::UserMessageChunk(_)
-            | acp::SessionUpdate::AvailableCommandsUpdate(_)
-            | acp::SessionUpdate::CurrentModeUpdate(_)
-            | acp::SessionUpdate::ConfigOptionUpdate(_) => None,
-            // Required catch-all: SessionUpdate is #[non_exhaustive].
-            // Log so future variants aren't silently swallowed.
+            SessionUpdate::SessionInfoUpdate(_) => unreachable!(),
+            SessionUpdate::UserMessageChunk(_)
+            | SessionUpdate::AvailableCommandsUpdate(_)
+            | SessionUpdate::CurrentModeUpdate(_)
+            | SessionUpdate::ConfigOptionUpdate(_) => None,
             other => {
                 log::debug!("Unhandled ACP SessionUpdate variant: {:?}", other);
                 None
@@ -268,14 +236,6 @@ impl acp::Client for AcpNotificationClient {
         };
 
         if let Some(event) = event {
-            // Append to response_text BEFORE forwarding the event.
-            //
-            // `forward_agent_event` acquires `self.chunk_forwarder.write()`
-            // which can yield, allowing the `WorkerCommand::Prompt` task to
-            // run and snapshot `response_text` via `state.response_text.clone()`
-            // before this notification's text has been appended.  Writing first
-            // ensures the text is visible to the prompt-completion task regardless
-            // of scheduling order.
             if is_agent_message {
                 if let Some(ref chunk) = message_text {
                     let mut sessions = self.sessions.write().await;
@@ -290,60 +250,42 @@ impl acp::Client for AcpNotificationClient {
         Ok(())
     }
 
+    async fn request_permission(
+        &self,
+        _args: RequestPermissionRequest,
+    ) -> acp::Result<RequestPermissionResponse> {
+        Err(acp::Error::method_not_found())
+    }
+
     async fn write_text_file(
         &self,
-        _args: acp::WriteTextFileRequest,
-    ) -> acp::Result<acp::WriteTextFileResponse> {
+        _args: WriteTextFileRequest,
+    ) -> acp::Result<WriteTextFileResponse> {
         Err(acp::Error::method_not_found())
     }
 
     async fn read_text_file(
         &self,
-        _args: acp::ReadTextFileRequest,
-    ) -> acp::Result<acp::ReadTextFileResponse> {
+        _args: ReadTextFileRequest,
+    ) -> acp::Result<ReadTextFileResponse> {
         Err(acp::Error::method_not_found())
     }
 
     async fn create_terminal(
         &self,
-        _args: acp::CreateTerminalRequest,
-    ) -> acp::Result<acp::CreateTerminalResponse> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn terminal_output(
-        &self,
-        _args: acp::TerminalOutputRequest,
-    ) -> acp::Result<acp::TerminalOutputResponse> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn release_terminal(
-        &self,
-        _args: acp::ReleaseTerminalRequest,
-    ) -> acp::Result<acp::ReleaseTerminalResponse> {
+        _args: CreateTerminalRequest,
+    ) -> acp::Result<CreateTerminalResponse> {
         Err(acp::Error::method_not_found())
     }
 
     async fn wait_for_terminal_exit(
         &self,
-        _args: acp::WaitForTerminalExitRequest,
-    ) -> acp::Result<acp::WaitForTerminalExitResponse> {
+        _args: WaitForTerminalExitRequest,
+    ) -> acp::Result<WaitForTerminalExitResponse> {
         Err(acp::Error::method_not_found())
     }
 
-    async fn kill_terminal(
-        &self,
-        _args: acp::KillTerminalRequest,
-    ) -> acp::Result<acp::KillTerminalResponse> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
-        Err(acp::Error::method_not_found())
-    }
-
-    async fn ext_notification(&self, _args: acp::ExtNotification) -> acp::Result<()> {
+    async fn kill_terminal(&self, _args: KillTerminalRequest) -> acp::Result<KillTerminalResponse> {
         Err(acp::Error::method_not_found())
     }
 }
@@ -382,17 +324,14 @@ impl AcpClient {
                 w.dead_rx.try_recv(),
                 Err(oneshot::error::TryRecvError::Closed)
             ) {
-                // Worker is still alive (Err(Empty)) or already connected — trust it.
                 *self.connected.write().await = true;
                 return Ok(());
             }
-            // Worker died (Err(Closed)) — clear stale state and fall through to re-spawn.
             *worker_guard = None;
             *self.connected.write().await = false;
             *self.initialize_response.write().await = None;
             self.sessions.write().await.clear();
         } else if *self.connected.read().await {
-            // connected=true but no worker — shouldn't happen; reset fully and reconnect.
             *self.connected.write().await = false;
             *self.initialize_response.write().await = None;
             self.sessions.write().await.clear();
@@ -583,11 +522,6 @@ impl AcpClient {
     }
 
     async fn ensure_connected(&self) -> Result<()> {
-        // Delegate entirely to connect(), which holds the worker mutex for its
-        // full body (liveness probe → state clear → spawn → store).  This
-        // means concurrent callers serialize naturally: the second caller enters
-        // connect() after the first has already stored a fresh worker handle,
-        // sees it alive, and returns Ok(()) without spawning a duplicate.
         self.connect().await
     }
 
@@ -605,7 +539,7 @@ fn spawn_worker(
     name: String,
     config: AcpServerConfig,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
-    initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
+    initialize_response: Arc<RwLock<Option<InitializeResponse>>>,
     chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<NestedAcpEvent>>>>,
     activity_tx: broadcast::Sender<String>,
 ) -> Result<(AcpWorkerHandle, oneshot::Receiver<Result<()>>)> {
@@ -669,7 +603,7 @@ async fn worker_main(
     name: String,
     config: AcpServerConfig,
     sessions: Arc<RwLock<HashMap<String, SessionState>>>,
-    initialize_response: Arc<RwLock<Option<acp::InitializeResponse>>>,
+    initialize_response: Arc<RwLock<Option<InitializeResponse>>>,
     mut rx: mpsc::UnboundedReceiver<WorkerCommand>,
     ready_tx: oneshot::Sender<Result<()>>,
     chunk_forwarder: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<NestedAcpEvent>>>>,
@@ -710,188 +644,259 @@ async fn worker_main(
         });
     }
 
-    let client =
-        AcpNotificationClient::new(name.clone(), sessions.clone(), chunk_forwarder, activity_tx);
-    let (conn, handle_io) = acp::ClientSideConnection::new(
-        client,
-        TokioCompat::new(stdin),
-        TokioCompat::new(stdout),
-        |future| {
-            tokio::task::spawn_local(future);
-        },
-    );
-    let conn = Rc::new(conn);
+    let transport = acp::ByteStreams::new(TokioCompat::new(stdin), TokioCompat::new(stdout));
+    let client = Arc::new(AcpNotificationClient::new(
+        name.clone(),
+        sessions.clone(),
+        chunk_forwarder,
+        activity_tx,
+    ));
+    let child = Arc::new(tokio::sync::Mutex::new(Some(child)));
 
-    let mut io_handle = tokio::task::spawn_local(async move {
-        if let Err(err) = handle_io.await {
-            log::debug!("ACP I/O loop exited: {err}");
-        }
-    });
-
-    let init = tokio::select! {
-        result = conn.initialize(
-            acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
-                acp::Implementation::new("harnx", env!("CARGO_PKG_VERSION")).title("Harnx"),
-            ),
-        ) => {
-            result.with_context(|| format!("Failed to initialize ACP server '{}'", name))?
-        }
-        _ = &mut abort_rx => {
-            if let Err(err) = child.kill().await {
-                if err.kind() != std::io::ErrorKind::InvalidInput {
-                    return Err(err).context("Failed to kill ACP subprocess");
+    let result = acp::Client
+        .builder()
+        .on_receive_notification(
+            {
+                let client = Arc::clone(&client);
+                async move |notification: SessionNotification, _cx| {
+                    client
+                        .session_notification(notification)
+                        .await
+                        .map_err(|_err| acp::Error::internal_error())
                 }
-            }
-            let _ = child.wait().await;
-            let _ = ready_tx.send(Err(anyhow!("ACP server '{}' initialization aborted", name)));
-            return Ok(());
-        }
-    };
+            },
+            acp::on_receive_notification!(),
+        )
+        .on_receive_request(
+            {
+                let client = Arc::clone(&client);
+                async move |request: RequestPermissionRequest, responder, _cx| {
+                    let response = client.request_permission(request).await?;
+                    responder.respond(response)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let client = Arc::clone(&client);
+                async move |request: WriteTextFileRequest, responder, _cx| {
+                    let response = client.write_text_file(request).await?;
+                    responder.respond(response)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let client = Arc::clone(&client);
+                async move |request: ReadTextFileRequest, responder, _cx| {
+                    let response = client.read_text_file(request).await?;
+                    responder.respond(response)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let client = Arc::clone(&client);
+                async move |request: CreateTerminalRequest, responder, _cx| {
+                    let response = client.create_terminal(request).await?;
+                    responder.respond(response)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let client = Arc::clone(&client);
+                async move |request: WaitForTerminalExitRequest, responder, _cx| {
+                    let response = client.wait_for_terminal_exit(request).await?;
+                    responder.respond(response)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let client = Arc::clone(&client);
+                async move |request: KillTerminalRequest, responder, _cx| {
+                    let response = client.kill_terminal(request).await?;
+                    responder.respond(response)
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .connect_with(transport, async move |connection: acp::ConnectionTo<acp::Agent>| {
+            let init_fut = connection.send_request(
+                InitializeRequest::new(ProtocolVersion::V1)
+                    .client_info(Implementation::new("harnx", env!("CARGO_PKG_VERSION")).title("Harnx")),
+            );
+            let init = tokio::select! {
+                result = init_fut.block_task() => {
+                    result.with_context(|| format!("Failed to initialize ACP server '{}'", name))?
+                }
+                _ = &mut abort_rx => {
+                    let _ = shutdown_child(&child).await;
+                    let _ = ready_tx.send(Err(anyhow!("ACP server '{}' initialization aborted", name)));
+                    return Ok(());
+                }
+            };
 
-    *initialize_response.write().await = Some(init);
-    let _ = ready_tx.send(Ok(()));
+            *initialize_response.write().await = Some(init);
+            let _ = ready_tx.send(Ok(()));
 
-    let child = Rc::new(RefCell::new(Some(child)));
-
-    loop {
-        tokio::select! {
-            command = rx.recv() => {
-                match command {
-                    Some(command) => match command {
-                        WorkerCommand::NewSession { respond_to } => {
-                            let conn = Rc::clone(&conn);
-                            let sessions = sessions.clone();
-                            let server_name = name.clone();
-                            tokio::task::spawn_local(async move {
-                                let result = async {
-                                    let response = conn
-                                        .new_session(acp::NewSessionRequest::new(std::env::current_dir()?))
-                                        .await
-                                        .with_context(|| {
-                                            format!("Failed to create ACP session on '{}'", server_name)
-                                        })?;
-                                    let session_id = response.session_id.0.to_string();
-                                    sessions
-                                        .write()
-                                        .await
-                                        .insert(session_id.clone(), SessionState::default());
-                                    Ok(session_id)
-                                }
-                                .await;
-                                let _ = respond_to.send(result);
-                            });
-                        }
-                        WorkerCommand::Prompt {
-                            session_id,
-                            message,
-                            respond_to,
-                        } => {
-                            let conn = Rc::clone(&conn);
-                            let sessions = sessions.clone();
-                            let server_name = name.clone();
-                            tokio::task::spawn_local(async move {
-                                let result = async {
-                                    {
-                                        let mut sessions = sessions.write().await;
-                                        let state = sessions.entry(session_id.clone()).or_default();
-                                        state.response_text.clear();
-                                        state.stop_reason = None;
-                                    }
-
-                                    let response = conn
-                                        .prompt(acp::PromptRequest::new(
-                                            session_id.clone(),
-                                            vec![message.into()],
-                                        ))
-                                        .await
-                                        .with_context(|| {
-                                            format!(
-                                                "Failed to send ACP prompt to session '{}' on '{}'",
-                                                session_id, server_name
-                                            )
-                                        })?;
-
-                                    let mut sessions = sessions.write().await;
-                                    let state = sessions.entry(session_id.clone()).or_default();
-                                    state.stop_reason = Some(format!("{:?}", response.stop_reason));
-                                    Ok(state.response_text.clone())
-                                }
-                                .await;
-                                let _ = respond_to.send(result);
-                            });
-                        }
-                        WorkerCommand::LoadSession {
-                            session_id,
-                            respond_to,
-                        } => {
-                            let conn = Rc::clone(&conn);
-                            let sessions = sessions.clone();
-                            let server_name = name.clone();
-                            tokio::task::spawn_local(async move {
-                                let result = async {
-                                    conn.load_session(acp::LoadSessionRequest::new(
-                                        session_id.clone(),
-                                        std::env::current_dir()?,
-                                    ))
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "Failed to load ACP session '{}' on '{}'",
-                                            session_id, server_name
-                                        )
+            loop {
+                tokio::select! {
+                    command = rx.recv() => {
+                        match command {
+                            Some(command) => match command {
+                                WorkerCommand::NewSession { respond_to } => {
+                                    let sessions = sessions.clone();
+                                    let server_name = name.clone();
+                                    let connection = connection.clone();
+                                    let task_connection = connection.clone();
+                                    connection.spawn(async move {
+                                        let result = async {
+                                            let response: NewSessionResponse = task_connection
+                                                .send_request(NewSessionRequest::new(std::env::current_dir()?))
+                                                .block_task()
+                                                .await
+                                                .with_context(|| {
+                                                    format!("Failed to create ACP session on '{}'", server_name)
+                                                })?;
+                                            let session_id = response.session_id.0.to_string();
+                                            sessions
+                                                .write()
+                                                .await
+                                                .insert(session_id.clone(), SessionState::default());
+                                            Ok(session_id)
+                                        }
+                                        .await;
+                                        let _ = respond_to.send(result);
+                                        Ok(())
                                     })?;
-
-                                    sessions.write().await.entry(session_id).or_default();
-                                    Ok(())
                                 }
-                                .await;
-                                let _ = respond_to.send(result);
-                            });
+                                WorkerCommand::Prompt {
+                                    session_id,
+                                    message,
+                                    respond_to,
+                                } => {
+                                    let sessions = sessions.clone();
+                                    let server_name = name.clone();
+                                    let connection = connection.clone();
+                                    let task_connection = connection.clone();
+                                    connection.spawn(async move {
+                                        let result = async {
+                                            {
+                                                let mut sessions = sessions.write().await;
+                                                let state = sessions.entry(session_id.clone()).or_default();
+                                                state.response_text.clear();
+                                                state.stop_reason = None;
+                                            }
+
+                                            let response: PromptResponse = task_connection
+                                                .send_request(PromptRequest::new(
+                                                    session_id.clone(),
+                                                    vec![message.into()],
+                                                ))
+                                                .block_task()
+                                                .await
+                                                .with_context(|| {
+                                                    format!(
+                                                        "Failed to send ACP prompt to session '{}' on '{}'",
+                                                        session_id, server_name
+                                                    )
+                                                })?;
+
+                                            let mut sessions = sessions.write().await;
+                                            let state = sessions.entry(session_id.clone()).or_default();
+                                            state.stop_reason = Some(format!("{:?}", response.stop_reason));
+                                            Ok(state.response_text.clone())
+                                        }
+                                        .await;
+                                        let _ = respond_to.send(result);
+                                        Ok(())
+                                    })?;
+                                }
+                                WorkerCommand::LoadSession {
+                                    session_id,
+                                    respond_to,
+                                } => {
+                                    let sessions = sessions.clone();
+                                    let server_name = name.clone();
+                                    let connection = connection.clone();
+                                    let task_connection = connection.clone();
+                                    connection.spawn(async move {
+                                        let result = async {
+                                            let _response = task_connection
+                                                .send_request(LoadSessionRequest::new(
+                                                    session_id.clone(),
+                                                    std::env::current_dir()?,
+                                                ))
+                                                .block_task()
+                                                .await
+                                                .with_context(|| {
+                                                    format!(
+                                                        "Failed to load ACP session '{}' on '{}'",
+                                                        session_id, server_name
+                                                    )
+                                                })?;
+
+                                            sessions.write().await.entry(session_id).or_default();
+                                            Ok(())
+                                        }
+                                        .await;
+                                        let _ = respond_to.send(result);
+                                        Ok(())
+                                    })?;
+                                }
+                                WorkerCommand::CancelSession {
+                                    session_id,
+                                    respond_to,
+                                } => {
+                                    let server_name = name.clone();
+                                    let connection = connection.clone();
+                                    let task_connection = connection.clone();
+                                    connection.spawn(async move {
+                                        let result = task_connection
+                                            .send_notification(CancelNotification::new(session_id.clone()))
+                                            .with_context(|| {
+                                                format!(
+                                                    "Failed to cancel ACP session '{}' on '{}'",
+                                                    session_id, server_name
+                                                )
+                                            });
+                                        let _ = respond_to.send(result);
+                                        Ok(())
+                                    })?;
+                                }
+                                WorkerCommand::Shutdown { respond_to } => {
+                                    let result = shutdown_child(&child).await;
+                                    let _ = respond_to.send(result);
+                                    break;
+                                }
+                            },
+                            None => break,
                         }
-                        WorkerCommand::CancelSession {
-                            session_id,
-                            respond_to,
-                        } => {
-                            let conn = Rc::clone(&conn);
-                            let server_name = name.clone();
-                            tokio::task::spawn_local(async move {
-                                let result = conn
-                                    .cancel(acp::CancelNotification::new(session_id.clone()))
-                                    .await
-                                    .with_context(|| {
-                                        format!(
-                                            "Failed to cancel ACP session '{}' on '{}'",
-                                            session_id, server_name
-                                        )
-                                    });
-                                let _ = respond_to.send(result);
-                            });
-                        }
-                        WorkerCommand::Shutdown { respond_to } => {
-                            let result = shutdown_child(&child).await;
-                            let _ = respond_to.send(result);
-                            break;
-                        }
-                    },
-                    None => break,
+                    }
+                    _ = &mut abort_rx => {
+                        let _ = shutdown_child(&child).await;
+                        break;
+                    }
                 }
             }
-            _ = &mut io_handle => {
-                log::warn!(
-                    "ACP I/O loop for '{}' exited unexpectedly; terminating worker",
-                    name
-                );
-                break;
-            }
-        }
-    }
 
-    Ok(())
+            Ok(())
+        })
+        .await;
+
+    Ok(result.map(|_| ())?)
 }
 
-async fn shutdown_child(child: &Rc<RefCell<Option<Child>>>) -> Result<()> {
-    let child = child.borrow_mut().take();
-    if let Some(mut child) = child {
+async fn shutdown_child(child: &Arc<tokio::sync::Mutex<Option<Child>>>) -> Result<()> {
+    let mut child_guard = child.lock().await;
+    if let Some(mut child) = child_guard.take() {
         if let Err(err) = child.kill().await {
             if err.kind() != std::io::ErrorKind::InvalidInput {
                 return Err(err).context("Failed to kill ACP subprocess");
@@ -959,46 +964,46 @@ fn markdown_from_meta_value(value: &serde_json::Value) -> Option<String> {
 
 fn resolve_notification_source(
     fallback_agent: &str,
-    notification: &acp::SessionNotification,
+    notification: &SessionNotification,
 ) -> AgentSource {
     let session_id = notification.session_id.0.to_string();
     let (update_agent, update_session) = match &notification.update {
-        acp::SessionUpdate::AgentMessageChunk(chunk) => {
+        SessionUpdate::AgentMessageChunk(chunk) => {
             let meta = chunk.meta.as_ref().map(|meta| json!(meta));
             (
                 meta.as_ref().and_then(agent_from_meta_value),
                 meta.as_ref().and_then(session_from_meta_value),
             )
         }
-        acp::SessionUpdate::AgentThoughtChunk(chunk) => {
+        SessionUpdate::AgentThoughtChunk(chunk) => {
             let meta = chunk.meta.as_ref().map(|meta| json!(meta));
             (
                 meta.as_ref().and_then(agent_from_meta_value),
                 meta.as_ref().and_then(session_from_meta_value),
             )
         }
-        acp::SessionUpdate::ToolCall(call) => {
+        SessionUpdate::ToolCall(call) => {
             let meta = call.meta.as_ref().map(|meta| json!(meta));
             (
                 meta.as_ref().and_then(agent_from_meta_value),
                 meta.as_ref().and_then(session_from_meta_value),
             )
         }
-        acp::SessionUpdate::ToolCallUpdate(update) => {
+        SessionUpdate::ToolCallUpdate(update) => {
             let meta = update.meta.as_ref().map(|meta| json!(meta));
             (
                 meta.as_ref().and_then(agent_from_meta_value),
                 meta.as_ref().and_then(session_from_meta_value),
             )
         }
-        acp::SessionUpdate::Plan(plan) => {
+        SessionUpdate::Plan(plan) => {
             let meta = plan.meta.as_ref().map(|meta| json!(meta));
             (
                 meta.as_ref().and_then(agent_from_meta_value),
                 meta.as_ref().and_then(session_from_meta_value),
             )
         }
-        acp::SessionUpdate::SessionInfoUpdate(info) => {
+        SessionUpdate::SessionInfoUpdate(info) => {
             let direct_meta = info.meta.as_ref().map(|meta| json!(meta));
             (
                 direct_meta
@@ -1030,10 +1035,7 @@ fn resolve_notification_source(
     }
 }
 
-fn session_info_update_event(
-    info: &acp::SessionInfoUpdate,
-    source: AgentSource,
-) -> Option<AgentEvent> {
+fn session_info_update_event(info: &SessionInfoUpdate, source: AgentSource) -> Option<AgentEvent> {
     let meta = info.meta.as_ref()?;
     let usage = meta.get("harnx:usage")?;
     let input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
@@ -1053,9 +1055,6 @@ fn session_info_update_event(
     }))
 }
 
-/// Parse an ACP `status` string into the typed `ToolStatus`. Accepts the
-/// snake_case form emitted by the ACP SDK as well as the PascalCase /
-/// kebab-case forms that upstream producers sometimes use.
 fn parse_tool_status_str(status: &str) -> Option<ToolStatus> {
     match status {
         "pending" | "Pending" => Some(ToolStatus::Pending),
@@ -1066,9 +1065,6 @@ fn parse_tool_status_str(status: &str) -> Option<ToolStatus> {
     }
 }
 
-/// Format an `AgentSource` as a single-line session heading, matching the
-/// rendering used by the harnx TUI. Kept inline here so this crate has no
-/// reverse dependency on harnx rendering helpers.
 fn source_heading(source: &AgentSource) -> String {
     match &source.session_id {
         Some(session_id) if !session_id.is_empty() => {
@@ -1078,13 +1074,13 @@ fn source_heading(source: &AgentSource) -> String {
     }
 }
 
-fn chunk_text(content: &acp::ContentBlock) -> String {
+fn chunk_text(content: &AcpContentBlock) -> String {
     match content {
-        acp::ContentBlock::Text(text) => text.text.clone(),
-        acp::ContentBlock::ResourceLink(link) => link.uri.to_string(),
-        acp::ContentBlock::Image(_) => "<image>".to_string(),
-        acp::ContentBlock::Audio(_) => "<audio>".to_string(),
-        acp::ContentBlock::Resource(_) => "<resource>".to_string(),
+        AcpContentBlock::Text(text) => text.text.clone(),
+        AcpContentBlock::ResourceLink(link) => link.uri.to_string(),
+        AcpContentBlock::Image(_) => "<image>".to_string(),
+        AcpContentBlock::Audio(_) => "<audio>".to_string(),
+        AcpContentBlock::Resource(_) => "<resource>".to_string(),
         _ => String::new(),
     }
 }
@@ -1092,12 +1088,14 @@ fn chunk_text(content: &acp::ContentBlock) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::Client as _;
+    use agent_client_protocol::schema::{
+        ContentChunk, SessionId, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    };
     use serde_json::json;
 
     #[test]
     fn session_info_update_event_emits_usage_model_event() {
-        let info = acp::SessionInfoUpdate::new().meta(serde_json::Map::from_iter([(
+        let info = SessionInfoUpdate::new().meta(serde_json::Map::from_iter([(
             "harnx:usage".to_string(),
             json!({
                 "agent": "aristarchus",
@@ -1134,9 +1132,9 @@ mod tests {
 
     #[test]
     fn resolve_notification_source_falls_back_to_client_name() {
-        let notification = acp::SessionNotification::new(
-            acp::SessionId::new("outer-session"),
-            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("hello".into())),
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new("hello".into())),
         );
 
         let source = resolve_notification_source("argus", &notification);
@@ -1146,9 +1144,9 @@ mod tests {
 
     #[test]
     fn resolve_notification_source_uses_nested_session_when_present() {
-        let notification = acp::SessionNotification::new(
-            acp::SessionId::new("outer-session"),
-            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("hello".into()).meta(
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new("hello".into()).meta(
                 serde_json::Map::from_iter([
                     ("agent".to_string(), json!("aristarchus")),
                     ("session".to_string(), json!("nested-session")),
@@ -1163,9 +1161,9 @@ mod tests {
 
     #[test]
     fn resolve_notification_source_uses_nested_tool_call_metadata() {
-        let notification = acp::SessionNotification::new(
-            acp::SessionId::new("outer-session"),
-            acp::SessionUpdate::ToolCall(acp::ToolCall::new("ls", "path: /tmp").meta(
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::ToolCall(ToolCall::new("ls", "path: /tmp").meta(
                 serde_json::Map::from_iter([
                     ("agent".to_string(), json!("pytheas")),
                     (
@@ -1186,12 +1184,6 @@ mod tests {
 
     #[tokio::test]
     async fn worker_death_triggers_reconnection_attempt() {
-        // Unit test: inject a stale (dead) worker handle directly into the
-        // client and verify that `ensure_connected()` detects the dead worker,
-        // resets state, and then attempts to reconnect (the reconnect will fail
-        // because the command doesn't exist, but the important thing is that
-        // `connected` is reset to false rather than being left stuck at true).
-
         let config = AcpServerConfig {
             name: "mock-dead".to_string(),
             command: "__harnx_test_nonexistent_binary__".to_string(),
@@ -1205,15 +1197,11 @@ mod tests {
         };
         let client = AcpClient::new(config);
 
-        // Create a dead worker handle: drop dead_tx immediately so dead_rx
-        // will return Err(TryRecvError::Closed) on try_recv(), which is the
-        // death signal.  (Dropping without sending yields Closed, not Ok(()).)
         let (tx, _rx) = mpsc::unbounded_channel::<WorkerCommand>();
         let (abort_tx, _abort_rx) = oneshot::channel::<()>();
         let (dead_tx, dead_rx) = oneshot::channel::<()>();
-        drop(dead_tx); // sender dropped → dead_rx fires immediately
+        drop(dead_tx);
 
-        // Build a fake join handle by spawning a thread that does nothing.
         let join = thread::spawn(|| {});
 
         let stale_handle = AcpWorkerHandle {
@@ -1223,21 +1211,15 @@ mod tests {
             dead_rx,
         };
 
-        // Plant the stale handle and set connected = true to simulate the
-        // post-crash stuck state.
         *client.worker.lock().await = Some(stale_handle);
         *client.connected.write().await = true;
 
-        // ensure_connected() must detect the dead worker and attempt to
-        // reconnect.  The reconnect fails (no such binary), so it returns Err.
         let result = client.ensure_connected().await;
 
-        // The critical assertion: connected must be false, not stuck at true.
         assert!(
             !*client.connected.read().await,
             "connected must be reset after dead worker detected"
         );
-        // All connection state must be cleared, not just `connected`.
         assert!(
             client.sessions.read().await.is_empty(),
             "sessions must be cleared after dead worker detected"
@@ -1246,12 +1228,10 @@ mod tests {
             client.initialize_response.read().await.is_none(),
             "initialize_response must be cleared after dead worker detected"
         );
-        // Worker handle must be gone too.
         assert!(
             client.worker.lock().await.is_none(),
             "worker must be cleared after dead worker detected"
         );
-        // The reconnect error proves a fresh spawn was attempted.
         assert!(
             result.is_err(),
             "ensure_connected should return an error when the binary does not exist"
@@ -1272,10 +1252,10 @@ mod tests {
             activity_tx,
         );
 
-        let notification = acp::SessionNotification::new(
-            acp::SessionId::new("outer-session"),
-            acp::SessionUpdate::ToolCall(
-                acp::ToolCall::new("call-1", "pytheas_session_prompt")
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::ToolCall(
+                ToolCall::new("call-1", "pytheas_session_prompt")
                     .raw_input(json!({
                         "message": "Count files in /tmp using ls first.",
                         "session_id": "608e48b6-c880-4168-b028-1bda3469be07",
@@ -1298,21 +1278,29 @@ mod tests {
             other => panic!("unexpected nested ACP event: {other:?}"),
         };
 
-        match &forwarded_event {
-            AgentEvent::Tool(ToolEvent::Started { name, input, .. }) => {
+        match forwarded_event {
+            AgentEvent::Tool(ToolEvent::Started {
+                id,
+                name,
+                input,
+                kind,
+                ..
+            }) => {
+                assert_eq!(id, "call-1");
                 assert_eq!(name, "pytheas_session_prompt");
+                assert!(matches!(kind, ToolKind::Other));
                 assert_eq!(
-                    input["message"],
-                    json!("Count files in /tmp using ls first.")
-                );
-                assert_eq!(
-                    input["session_id"],
-                    json!("608e48b6-c880-4168-b028-1bda3469be07")
+                    input,
+                    json!({
+                        "message": "Count files in /tmp using ls first.",
+                        "session_id": "608e48b6-c880-4168-b028-1bda3469be07",
+                    })
                 );
             }
             other => panic!("unexpected forwarded event: {other:?}"),
         }
-        let source = forwarded_source.expect("forwarded agent source");
+
+        let source = forwarded_source.expect("nested source should be preserved");
         assert_eq!(source.agent, "pytheas");
         assert_eq!(
             source.session_id.as_deref(),
@@ -1321,7 +1309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_tool_call_update_with_completed_status_and_raw_output_emits_completed_event() {
+    async fn nested_tool_call_completed_event_preserves_structured_output_for_tui_pipeline() {
         let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1335,14 +1323,15 @@ mod tests {
         );
 
         let expected_output = json!({"result": "file.txt"});
-        let notification = acp::SessionNotification::new(
-            acp::SessionId::new("outer-session"),
-            acp::SessionUpdate::ToolCallUpdate(
-                acp::ToolCallUpdate::new(
-                    "call-id-1",
-                    acp::ToolCallUpdateFields::new()
-                        .status(acp::ToolCallStatus::Completed)
-                        .raw_output(expected_output.clone()),
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::ToolCallUpdate(
+                ToolCallUpdate::new(
+                    "call-1",
+                    ToolCallUpdateFields::new()
+                        .status(ToolCallStatus::Completed)
+                        .raw_output(expected_output.clone())
+                        .title("done"),
                 )
                 .meta(serde_json::Map::from_iter([
                     ("agent".to_string(), json!("pytheas")),
@@ -1354,25 +1343,28 @@ mod tests {
             ),
         );
 
-        client
-            .session_notification(notification)
-            .await
-            .expect("session notification should succeed");
+        client.session_notification(notification).await.unwrap();
 
-        let NestedAcpEvent::Agent(forwarded_event, forwarded_source) =
-            chunk_rx.recv().await.expect("forwarded nested ACP event")
-        else {
-            panic!("unexpected nested ACP event");
+        let forwarded = chunk_rx.recv().await.expect("forwarded nested ACP event");
+        let (forwarded_event, forwarded_source) = match forwarded {
+            NestedAcpEvent::Agent(event, source) => (event, source),
+            other => panic!("unexpected nested ACP event: {other:?}"),
         };
 
         match forwarded_event {
-            AgentEvent::Tool(ToolEvent::Completed { id, output, .. }) => {
-                assert_eq!(id, "call-id-1");
+            AgentEvent::Tool(ToolEvent::Completed {
+                id,
+                output,
+                markdown,
+            }) => {
+                assert_eq!(id, "call-1");
                 assert_eq!(output, expected_output);
+                assert_eq!(markdown.as_deref(), Some("done"));
             }
             other => panic!("unexpected forwarded event: {other:?}"),
         }
-        let source = forwarded_source.expect("forwarded agent source");
+
+        let source = forwarded_source.expect("nested source should be preserved");
         assert_eq!(source.agent, "pytheas");
         assert_eq!(
             source.session_id.as_deref(),
@@ -1381,7 +1373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_tool_call_update_with_in_progress_status_emits_update_event() {
+    async fn nested_usage_session_info_update_emits_usage_event_without_message_chunk() {
         let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1389,57 +1381,67 @@ mod tests {
         let (activity_tx, _) = tokio::sync::broadcast::channel(8);
         let client = AcpNotificationClient::new(
             "working".to_string(),
-            sessions,
+            sessions.clone(),
             chunk_forwarder,
             activity_tx,
         );
 
-        let notification = acp::SessionNotification::new(
-            acp::SessionId::new("outer-session"),
-            acp::SessionUpdate::ToolCallUpdate(
-                acp::ToolCallUpdate::new(
-                    "call-id-1",
-                    acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
-                )
-                .meta(serde_json::Map::from_iter([
-                    ("agent".to_string(), json!("pytheas")),
-                    (
-                        "session".to_string(),
-                        json!("608e48b6-c880-4168-b028-1bda3469be07"),
-                    ),
-                ])),
-            ),
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().meta(
+                serde_json::Map::from_iter([(
+                    "harnx:usage".to_string(),
+                    json!({
+                        "agent": "pytheas",
+                        "session": "608e48b6-c880-4168-b028-1bda3469be07",
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "cached_tokens": 3,
+                    }),
+                )]),
+            )),
         );
 
-        client
-            .session_notification(notification)
-            .await
-            .expect("session notification should succeed");
+        client.session_notification(notification).await.unwrap();
 
-        let NestedAcpEvent::Agent(forwarded_event, forwarded_source) =
-            chunk_rx.recv().await.expect("forwarded nested ACP event")
-        else {
-            panic!("unexpected nested ACP event");
+        let forwarded = chunk_rx.recv().await.expect("forwarded nested ACP event");
+        let (forwarded_event, forwarded_source) = match forwarded {
+            NestedAcpEvent::Agent(event, source) => (event, source),
+            other => panic!("unexpected nested ACP event: {other:?}"),
         };
 
         match forwarded_event {
-            AgentEvent::Tool(ToolEvent::Update { id, status, .. }) => {
-                assert_eq!(id, "call-id-1");
-                assert!(matches!(status, Some(ToolStatus::InProgress)));
+            AgentEvent::Model(ModelEvent::Usage {
+                input,
+                output,
+                cached,
+                session_label,
+            }) => {
+                assert_eq!(input, 11);
+                assert_eq!(output, 7);
+                assert_eq!(cached, 3);
+                assert_eq!(
+                    session_label.as_deref(),
+                    Some("> pytheas ▸ 608e48b6-c880-4168-b028-1bda3469be07")
+                );
             }
             other => panic!("unexpected forwarded event: {other:?}"),
         }
-        let source = forwarded_source.expect("forwarded agent source");
+
+        let source = forwarded_source.expect("nested source should be preserved");
         assert_eq!(source.agent, "pytheas");
         assert_eq!(
             source.session_id.as_deref(),
             Some("608e48b6-c880-4168-b028-1bda3469be07")
         );
+        assert!(
+            sessions.read().await.is_empty(),
+            "usage update must not create/append response text state"
+        );
     }
 
     #[tokio::test]
-    async fn nested_tool_call_completed_status_without_raw_output_emits_update_with_completed_status(
-    ) {
+    async fn tool_call_update_completed_without_output_emits_completed_update_event() {
         let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1452,12 +1454,11 @@ mod tests {
             activity_tx,
         );
 
-        // status=completed but NO raw_output — must not drop the event
-        let notification = acp::SessionNotification::new(
-            acp::SessionId::new("outer-session"),
-            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 "call-no-output",
-                acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
             )),
         );
 
@@ -1498,10 +1499,10 @@ mod tests {
             activity_tx,
         );
 
-        let notification = acp::SessionNotification::new(
-            acp::SessionId::new("outer-session"),
-            acp::SessionUpdate::ToolCall(
-                acp::ToolCall::new("call-1", "bash_exec")
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::ToolCall(
+                ToolCall::new("call-1", "bash_exec")
                     .raw_input(json!({"command": "ls -la /tmp"}))
                     .meta(serde_json::Map::from_iter([
                         ("agent".to_string(), json!("pytheas")),
