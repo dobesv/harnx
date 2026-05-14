@@ -1,4 +1,6 @@
-use crate::{HookOutcome, HookPayload, HookResult, HookResultControl};
+use crate::{
+    executor::control_from_result, HookOutcome, HookPayload, HookResult, HookResultControl,
+};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -214,10 +216,10 @@ impl PersistentHookProcess {
 
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => Ok(HookOutcome {
-                control: HookResultControl::Continue,
-                result,
-            }),
+            Ok(Ok(result)) => {
+                let control = control_from_result(&result);
+                Ok(HookOutcome { control, result })
+            }
             Ok(Err(_)) => {
                 self.pending.lock().await.remove(&id);
                 bail!("persistent hook process exited unexpectedly")

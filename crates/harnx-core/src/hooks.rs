@@ -90,6 +90,10 @@ pub struct HookSpecificOutput {
     pub permission_decision: Option<String>,
     #[serde(default)]
     pub permission_decision_reason: Option<String>,
+    #[serde(default)]
+    pub tool_input: Option<Value>,
+    #[serde(default)]
+    pub tool_response: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -103,6 +107,10 @@ pub struct HookResult {
     pub system_message: Option<String>,
     #[serde(default, rename = "hookSpecificOutput")]
     pub hook_specific_output: Option<HookSpecificOutput>,
+    #[serde(default)]
+    pub mutated_tool_input: Option<Value>,
+    #[serde(default)]
+    pub mutated_tool_response: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -521,6 +529,36 @@ entries:
             output.permission_decision_reason.as_deref(),
             Some("blocked")
         );
+        assert!(output.tool_input.is_none());
+        assert!(output.tool_response.is_none());
+    }
+
+    #[test]
+    fn test_hook_specific_output_deserializes_tool_input() {
+        let output: HookSpecificOutput = serde_json::from_str(r#"{"toolInput":{"mutated":true}}"#)
+            .expect("deserialize tool input mutation");
+
+        assert_eq!(output.tool_input, Some(json!({"mutated": true})));
+        assert!(output.tool_response.is_none());
+    }
+
+    #[test]
+    fn test_hook_specific_output_deserializes_tool_response() {
+        let output: HookSpecificOutput = serde_json::from_str(r#"{"toolResponse":{"ok":true}}"#)
+            .expect("deserialize tool response mutation");
+
+        assert!(output.tool_input.is_none());
+        assert_eq!(output.tool_response, Some(json!({"ok": true})));
+    }
+
+    #[test]
+    fn test_hook_specific_output_deserializes_both_mutations() {
+        let output: HookSpecificOutput =
+            serde_json::from_str(r#"{"toolInput":{"mutated":true},"toolResponse":{"ok":true}}"#)
+                .expect("deserialize both hook mutations");
+
+        assert_eq!(output.tool_input, Some(json!({"mutated": true})));
+        assert_eq!(output.tool_response, Some(json!({"ok": true})));
     }
 
     #[test]
@@ -530,6 +568,8 @@ entries:
 
         assert_eq!(output.permission_decision.as_deref(), Some("ask"));
         assert!(output.permission_decision_reason.is_none());
+        assert!(output.tool_input.is_none());
+        assert!(output.tool_response.is_none());
     }
 
     #[test]
@@ -555,5 +595,18 @@ entries:
         assert_eq!(result.resume, Some(true));
         assert_eq!(result.additional_context.as_deref(), Some("keep going"));
         assert!(result.hook_specific_output.is_none());
+        assert!(result.mutated_tool_input.is_none());
+        assert!(result.mutated_tool_response.is_none());
+    }
+
+    #[test]
+    fn test_hook_result_deserializes_mutated_tool_fields() {
+        let result: HookResult = serde_json::from_str(
+            r#"{"mutatedToolInput":{"mutated":true},"mutatedToolResponse":{"ok":true}}"#,
+        )
+        .expect("deserialize mutated tool fields");
+
+        assert_eq!(result.mutated_tool_input, Some(json!({"mutated": true})));
+        assert_eq!(result.mutated_tool_response, Some(json!({"ok": true})));
     }
 }

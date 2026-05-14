@@ -3,6 +3,7 @@ use crate::{
     HookOutcome, HookPayload, HookResult, HookResultControl, PersistentHookManager,
 };
 
+use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -65,7 +66,7 @@ pub async fn dispatch_hooks_with_count_and_manager(
     async_manager: Option<&AsyncHookManager>,
     persistent_manager: Option<&Arc<TokioMutex<PersistentHookManager>>>,
 ) -> HookOutcome {
-    let payload = HookPayload {
+    let mut payload = HookPayload {
         session_id: session_id.to_string(),
         cwd: cwd.to_path_buf(),
         resume_count,
@@ -74,6 +75,8 @@ pub async fn dispatch_hooks_with_count_and_manager(
 
     let mut additional_contexts = vec![];
     let mut resume = false;
+    let mut current_tool_input: Option<Value> = None;
+    let mut current_tool_response: Option<Value> = None;
 
     for hook in hooks {
         if hook.event != event.event_name() || !hook.is_supported_type() {
@@ -95,6 +98,12 @@ pub async fn dispatch_hooks_with_count_and_manager(
             continue;
         }
 
+        patch_payload_mutation(
+            &mut payload.hook_event,
+            current_tool_input.as_ref(),
+            current_tool_response.as_ref(),
+        );
+
         if hook.async_hook == Some(true) {
             if let Some(manager) = async_manager {
                 manager.spawn_hook(payload.clone(), hook.command.clone(), hook.timeout);
@@ -111,17 +120,35 @@ pub async fn dispatch_hooks_with_count_and_manager(
                     .await;
                 let HookOutcome { control, result } = outcome;
 
+                // Extract mutations before branching so Ask/Block also carry them.
+                if let Some(ref hso) = result.hook_specific_output {
+                    if let Some(ref ti) = hso.tool_input {
+                        current_tool_input = Some(ti.clone());
+                    }
+                    if let Some(ref tr) = hso.tool_response {
+                        current_tool_response = Some(tr.clone());
+                    }
+                }
+
                 match control {
                     HookResultControl::Block { reason } => {
                         return HookOutcome {
                             control: HookResultControl::Block { reason },
-                            result,
+                            result: HookResult {
+                                mutated_tool_input: current_tool_input,
+                                mutated_tool_response: current_tool_response,
+                                ..result
+                            },
                         };
                     }
                     HookResultControl::Ask { reason } => {
                         return HookOutcome {
                             control: HookResultControl::Ask { reason },
-                            result,
+                            result: HookResult {
+                                mutated_tool_input: current_tool_input,
+                                mutated_tool_response: current_tool_response,
+                                ..result
+                            },
                         };
                     }
                     HookResultControl::Continue => {
@@ -143,17 +170,36 @@ pub async fn dispatch_hooks_with_count_and_manager(
         let outcome = execute_command_hook(&payload, &hook.command, hook.timeout).await;
         let HookOutcome { control, result } = outcome;
 
+        // Extract mutations from this hook before branching on control so that
+        // even Ask/Block outcomes carry the current hook's mutation forward.
+        if let Some(ref hso) = result.hook_specific_output {
+            if let Some(ref ti) = hso.tool_input {
+                current_tool_input = Some(ti.clone());
+            }
+            if let Some(ref tr) = hso.tool_response {
+                current_tool_response = Some(tr.clone());
+            }
+        }
+
         match control {
             HookResultControl::Block { reason } => {
                 return HookOutcome {
                     control: HookResultControl::Block { reason },
-                    result,
+                    result: HookResult {
+                        mutated_tool_input: current_tool_input,
+                        mutated_tool_response: current_tool_response,
+                        ..result
+                    },
                 };
             }
             HookResultControl::Ask { reason } => {
                 return HookOutcome {
                     control: HookResultControl::Ask { reason },
-                    result,
+                    result: HookResult {
+                        mutated_tool_input: current_tool_input,
+                        mutated_tool_response: current_tool_response,
+                        ..result
+                    },
                 };
             }
             HookResultControl::Continue => {
@@ -174,8 +220,40 @@ pub async fn dispatch_hooks_with_count_and_manager(
             additional_context: (!additional_contexts.is_empty())
                 .then(|| additional_contexts.join("\n")),
             resume: resume.then_some(true),
+            mutated_tool_input: current_tool_input,
+            mutated_tool_response: current_tool_response,
             ..HookResult::default()
         },
+    }
+}
+
+fn patch_payload_mutation(
+    event: &mut HookEvent,
+    tool_input: Option<&Value>,
+    tool_response: Option<&Value>,
+) {
+    match event {
+        HookEvent::PreToolUse {
+            tool_input: payload_tool_input,
+            ..
+        } => {
+            if let Some(tool_input) = tool_input {
+                *payload_tool_input = tool_input.clone();
+            }
+        }
+        HookEvent::PostToolUse {
+            tool_input: payload_tool_input,
+            tool_response: payload_tool_response,
+            ..
+        } => {
+            if let Some(tool_input) = tool_input {
+                *payload_tool_input = tool_input.clone();
+            }
+            if let Some(tool_response) = tool_response {
+                *payload_tool_response = tool_response.clone();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -380,6 +458,64 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn tool_input_mutation_command(dir: &Path, value: serde_json::Value) -> String {
+        let output = json!({
+            "hookSpecificOutput": {
+                "toolInput": value,
+            }
+        })
+        .to_string();
+        write_script(
+            dir,
+            "tool-input-mutation",
+            &format!("printf '%s\n' {}", shell_quote(&output)),
+        )
+    }
+
+    #[cfg(unix)]
+    fn tool_response_mutation_command(dir: &Path, value: serde_json::Value) -> String {
+        let output = json!({
+            "hookSpecificOutput": {
+                "toolResponse": value,
+            }
+        })
+        .to_string();
+        write_script(
+            dir,
+            "tool-response-mutation",
+            &format!("printf '%s\n' {}", shell_quote(&output)),
+        )
+    }
+
+    #[cfg(unix)]
+    fn dump_and_mutate_tool_input_command(
+        dir: &Path,
+        path: &Path,
+        value: serde_json::Value,
+    ) -> String {
+        let output = json!({
+            "hookSpecificOutput": {
+                "toolInput": value,
+            }
+        })
+        .to_string();
+        write_script(
+            dir,
+            "dump-and-mutate-tool-input",
+            &format!(
+                "cat > {path}\nprintf '%s\n' {output}",
+                path = shell_quote(&path.display().to_string()),
+                output = shell_quote(&output),
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn invalid_json_command(dir: &Path) -> String {
+        write_script(dir, "invalid-json", "printf '%s\n' '{not json}'")
+    }
+
+    #[cfg(unix)]
     fn payload_dump_command(dir: &Path, path: &Path) -> String {
         write_script(
             dir,
@@ -468,6 +604,205 @@ mod tests {
             HookResultControl::Continue => panic!("expected ask hook outcome"),
         }
         assert!(!second_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dispatch_pre_tool_mutation_single_hook() {
+        let cwd = temp_test_dir("pre-tool-mutation-single");
+        let hooks = vec![hook_config(
+            "PreToolUse",
+            tool_input_mutation_command(&cwd, json!({"mutated": true})),
+        )];
+
+        let outcome = dispatch_hooks(
+            &pre_tool_use_event("shell"),
+            &hooks,
+            "session-mutate-1",
+            &cwd,
+        )
+        .await;
+
+        assert!(matches!(outcome.control, HookResultControl::Continue));
+        assert_eq!(
+            outcome.result.mutated_tool_input,
+            Some(json!({"mutated": true}))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dispatch_pre_tool_mutation_chains_between_hooks() {
+        let cwd = temp_test_dir("pre-tool-mutation-chain");
+        let payload_dump = cwd.join("second-payload.json");
+        let hooks = vec![
+            hook_config(
+                "PreToolUse",
+                tool_input_mutation_command(&cwd, json!({"step": 1})),
+            ),
+            hook_config(
+                "PreToolUse",
+                dump_and_mutate_tool_input_command(&cwd, &payload_dump, json!({"step": 2})),
+            ),
+        ];
+
+        let outcome = dispatch_hooks(
+            &pre_tool_use_event("shell"),
+            &hooks,
+            "session-mutate-2",
+            &cwd,
+        )
+        .await;
+
+        assert!(matches!(outcome.control, HookResultControl::Continue));
+        let payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&payload_dump).expect("read chained payload dump"),
+        )
+        .expect("parse chained payload dump");
+        assert_eq!(payload["tool_input"], json!({"step": 1}));
+        assert_eq!(outcome.result.mutated_tool_input, Some(json!({"step": 2})));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dispatch_post_tool_mutation_single_hook() {
+        let cwd = temp_test_dir("post-tool-mutation-single");
+        let event = HookEvent::PostToolUse {
+            tool_name: "shell".to_string(),
+            tool_input: json!({"command": "pwd"}),
+            tool_use_id: "call-post-1".to_string(),
+            tool_response: json!({"ok": false}),
+        };
+        let hooks = vec![hook_config(
+            "PostToolUse",
+            tool_response_mutation_command(&cwd, json!({"ok": true})),
+        )];
+
+        let outcome = dispatch_hooks(&event, &hooks, "session-post-1", &cwd).await;
+
+        assert!(matches!(outcome.control, HookResultControl::Continue));
+        assert_eq!(
+            outcome.result.mutated_tool_response,
+            Some(json!({"ok": true}))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dispatch_block_wins_over_mutation() {
+        let cwd = temp_test_dir("block-over-mutation");
+        let blocked_marker = cwd.join("blocked.txt");
+        let hooks = vec![
+            hook_config(
+                "PreToolUse",
+                tool_input_mutation_command(&cwd, json!({"step": 1})),
+            ),
+            hook_config("PreToolUse", block_command(&cwd, &blocked_marker)),
+        ];
+
+        let outcome = dispatch_hooks(
+            &pre_tool_use_event("shell"),
+            &hooks,
+            "session-block-1",
+            &cwd,
+        )
+        .await;
+
+        match outcome.control {
+            HookResultControl::Block { reason } => assert_eq!(reason, "blocked"),
+            HookResultControl::Ask { .. } => panic!("expected blocked hook outcome, got ask"),
+            HookResultControl::Continue => panic!("expected blocked hook outcome"),
+        }
+        assert!(blocked_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dispatch_ask_preserves_prior_tool_input_mutation() {
+        let cwd = temp_test_dir("ask-preserves-mutation");
+        let hooks = vec![
+            hook_config(
+                "PreToolUse",
+                tool_input_mutation_command(&cwd, json!({"mutated": true})),
+            ),
+            hook_config("PreToolUse", ask_json_command(&cwd, "confirm this")),
+        ];
+
+        let outcome = dispatch_hooks(
+            &pre_tool_use_event("shell"),
+            &hooks,
+            "session-ask-mutation",
+            &cwd,
+        )
+        .await;
+
+        match outcome.control {
+            HookResultControl::Ask { reason } => {
+                assert_eq!(reason.as_deref(), Some("confirm this"));
+            }
+            HookResultControl::Block { .. } => panic!("expected ask hook outcome, got block"),
+            HookResultControl::Continue => panic!("expected ask hook outcome"),
+        }
+        assert_eq!(
+            outcome.result.mutated_tool_input,
+            Some(json!({"mutated": true}))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dispatch_block_preserves_prior_tool_input_mutation() {
+        let cwd = temp_test_dir("block-preserves-mutation");
+        let hooks = vec![
+            hook_config(
+                "PreToolUse",
+                tool_input_mutation_command(&cwd, json!({"mutated": true})),
+            ),
+            hook_config(
+                "PreToolUse",
+                block_command(&cwd, &cwd.join("block-marker.txt")),
+            ),
+        ];
+
+        let outcome = dispatch_hooks(
+            &pre_tool_use_event("shell"),
+            &hooks,
+            "session-block-mutation",
+            &cwd,
+        )
+        .await;
+
+        match outcome.control {
+            HookResultControl::Block { reason } => assert_eq!(reason, "blocked"),
+            HookResultControl::Ask { .. } => panic!("expected blocked hook outcome, got ask"),
+            HookResultControl::Continue => panic!("expected blocked hook outcome"),
+        }
+        assert_eq!(
+            outcome.result.mutated_tool_input,
+            Some(json!({"mutated": true}))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dispatch_bad_json_yields_no_mutation() {
+        let cwd = temp_test_dir("bad-json-no-mutation");
+        let hooks = vec![hook_config("PreToolUse", invalid_json_command(&cwd))];
+
+        let outcome = dispatch_hooks(
+            &pre_tool_use_event("shell"),
+            &hooks,
+            "session-bad-json",
+            &cwd,
+        )
+        .await;
+
+        assert!(matches!(outcome.control, HookResultControl::Continue));
+        assert!(outcome.result.mutated_tool_input.is_none());
+        assert_eq!(
+            outcome.result.additional_context.as_deref(),
+            Some("{not json}")
+        );
     }
 
     #[tokio::test]
