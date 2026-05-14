@@ -29,6 +29,13 @@ pub async fn resolve(source: &CredentialSource) -> Result<String> {
             std::env::var(env).with_context(|| format!("env var '{env}' not set"))
         }
         CredentialSource::Command { command } => {
+            #[cfg(windows)]
+            let output = Command::new("cmd")
+                .args(["/C", command])
+                .output()
+                .await
+                .with_context(|| "failed to execute credential command")?;
+            #[cfg(not(windows))]
             let output = Command::new("sh")
                 .args(["-c", command])
                 .output()
@@ -232,19 +239,17 @@ mod tests {
             .contains("env var 'HARNX_TEST_CREDENTIAL_MISSING' not set"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn resolve_command_success() {
         let temp_dir = tempfile::tempdir().unwrap();
         let script_path = temp_dir.path().join("echo-token.sh");
         fs::write(&script_path, "#!/bin/sh\necho mytoken\n").unwrap();
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&script_path, permissions).unwrap();
-        }
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
 
         let resolved = resolve(&CredentialSource::Command {
             command: script_path.display().to_string(),
@@ -255,6 +260,20 @@ mod tests {
         assert_eq!(resolved, "mytoken");
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resolve_command_success() {
+        // On Windows use cmd /C echo — the trailing space is trimmed by resolve()
+        let resolved = resolve(&CredentialSource::Command {
+            command: "echo mytoken".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(resolved, "mytoken");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn resolve_command_failure() {
         let err = resolve(&CredentialSource::Command {
@@ -266,6 +285,19 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("failed (exit 12)"));
         assert!(!message.contains("sensitive output"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resolve_command_failure() {
+        let err = resolve(&CredentialSource::Command {
+            command: "exit 12".to_string(),
+        })
+        .await
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("failed (exit"));
     }
 
     #[tokio::test]
