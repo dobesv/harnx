@@ -1,0 +1,9 @@
+type: openai-compatible
+name: mock
+api_key: sk-mock
+api_base: http://127.0.0.1:3829/v1
+models:
+  - name: mock-llm
+    max_input_tokens: 32000
+    max_output_tokens: 4000
+    supports_tool_use: true
