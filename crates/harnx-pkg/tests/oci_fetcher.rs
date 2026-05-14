@@ -5,14 +5,18 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Path as AxumPath, Query, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
     routing::{get, head, patch, post, put},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
-use harnx_pkg::fetch::{oci::OciFetcher, PackageFetcher};
+use harnx_pkg::{
+    credentials::resolve_oci_auth,
+    fetch::{oci::OciFetcher, PackageFetcher},
+};
 use oci_client::{
     client::{ClientConfig, ClientProtocol, Config, ImageLayer},
     manifest,
@@ -27,7 +31,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn test_oci_fetch_basic() {
-    let server = TestRegistry::new().await;
+    let server = TestRegistry::new().start().await;
     let image = format!("localhost:{}/harnx-test-pkg", server.port());
 
     push_test_package(
@@ -38,7 +42,7 @@ async fn test_oci_fetch_basic() {
     )
     .await;
 
-    let fetcher = OciFetcher;
+    let fetcher = OciFetcher::anonymous();
     let result = fetcher
         .fetch(&format!("oci://{image}"), "v1.0.0", None)
         .await
@@ -51,7 +55,7 @@ async fn test_oci_fetch_basic() {
 
 #[tokio::test]
 async fn test_oci_list_tags() {
-    let server = TestRegistry::new().await;
+    let server = TestRegistry::new().start().await;
     let image = format!("localhost:{}/harnx-test-pkg", server.port());
 
     push_test_package(
@@ -76,7 +80,7 @@ async fn test_oci_list_tags() {
     )
     .await;
 
-    let fetcher = OciFetcher;
+    let fetcher = OciFetcher::anonymous();
     let versions = fetcher.list_tags(&format!("oci://{image}")).await.unwrap();
 
     assert_eq!(versions, vec![Version::new(1, 0, 0), Version::new(2, 0, 0)]);
@@ -84,14 +88,156 @@ async fn test_oci_list_tags() {
 
 #[tokio::test]
 async fn test_oci_fetch_non_semver_rejected() {
-    let fetcher = OciFetcher;
+    let fetcher = OciFetcher::anonymous();
     let result = fetcher
         .fetch("oci://localhost:5000/harnx/test-pkg", "latest", None)
         .await;
     assert!(result.is_err(), "Expected error for non-semver tag");
 }
 
+#[tokio::test]
+async fn test_oci_fetch_with_basic_auth() {
+    let server = TestRegistry::new()
+        .with_auth("testuser", "testpass")
+        .start()
+        .await;
+    let image = format!("localhost:{}/harnx-private-pkg", server.port());
+
+    let push_auth = RegistryAuth::Basic("testuser".to_string(), "testpass".to_string());
+    push_test_package_with_auth(
+        &server.registry_host(),
+        &image,
+        "v1.0.0",
+        &[("agents/private.md", "---\nmodel: test\n---\nPrivate")],
+        &push_auth,
+    )
+    .await;
+
+    let config_dir = tempfile::tempdir().unwrap();
+    write_registry_config(
+        config_dir.path(),
+        &server.registry_host(),
+        "testuser",
+        "testpass",
+    );
+
+    // Set config dir, resolve auth (async-safe), then restore
+    unsafe { std::env::set_var("HARNX_CONFIG_DIR", config_dir.path()) };
+    let auth = resolve_oci_auth(&format!("oci://{image}")).await.unwrap();
+    unsafe { std::env::remove_var("HARNX_CONFIG_DIR") };
+
+    let fetcher = OciFetcher::with_auth(auth);
+    let result = fetcher
+        .fetch(&format!("oci://{image}"), "v1.0.0", None)
+        .await
+        .unwrap();
+
+    assert!(result.dir.path().join("agents/private.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(result.dir.path().join("agents/private.md")).unwrap(),
+        "---\nmodel: test\n---\nPrivate"
+    );
+}
+
+#[tokio::test]
+async fn test_oci_fetch_wrong_auth_fails() {
+    let server = TestRegistry::new()
+        .with_auth("testuser", "testpass")
+        .start()
+        .await;
+    let image = format!("localhost:{}/harnx-private-pkg", server.port());
+
+    let push_auth = RegistryAuth::Basic("testuser".to_string(), "testpass".to_string());
+    push_test_package_with_auth(
+        &server.registry_host(),
+        &image,
+        "v1.0.0",
+        &[("agents/private.md", "---\nmodel: test\n---\nPrivate")],
+        &push_auth,
+    )
+    .await;
+
+    let config_dir = tempfile::tempdir().unwrap();
+    write_registry_config(
+        config_dir.path(),
+        &server.registry_host(),
+        "wronguser",
+        "wrongpass",
+    );
+
+    // Set config dir, resolve auth (async-safe), then restore
+    unsafe { std::env::set_var("HARNX_CONFIG_DIR", config_dir.path()) };
+    let auth = resolve_oci_auth(&format!("oci://{image}")).await.unwrap();
+    unsafe { std::env::remove_var("HARNX_CONFIG_DIR") };
+
+    let fetcher = OciFetcher::with_auth(auth);
+    let result = fetcher
+        .fetch(&format!("oci://{image}"), "v1.0.0", None)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Expected fetch to fail with wrong basic auth"
+    );
+}
+
+#[tokio::test]
+async fn test_oci_fetch_anon_against_private_fails() {
+    let server = TestRegistry::new()
+        .with_auth("testuser", "testpass")
+        .start()
+        .await;
+    let image = format!("localhost:{}/harnx-private-pkg", server.port());
+
+    let push_auth = RegistryAuth::Basic("testuser".to_string(), "testpass".to_string());
+    push_test_package_with_auth(
+        &server.registry_host(),
+        &image,
+        "v1.0.0",
+        &[("agents/private.md", "---\nmodel: test\n---\nPrivate")],
+        &push_auth,
+    )
+    .await;
+
+    let fetcher = OciFetcher::anonymous();
+    let result = fetcher
+        .fetch(&format!("oci://{image}"), "v1.0.0", None)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Expected anonymous fetch to fail against private registry"
+    );
+}
+
+fn write_registry_config(
+    config_dir: &std::path::Path,
+    registry_url: &str,
+    username: &str,
+    password: &str,
+) {
+    let repo_dir = config_dir.join("package_repos");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::write(
+        repo_dir.join("test-registry.yaml"),
+        format!(
+            "url: \"{registry_url}\"\nusername:\n  value: \"{username}\"\npassword:\n  value: \"{password}\"\n"
+        ),
+    )
+    .unwrap();
+}
+
 async fn push_test_package(registry_host: &str, image: &str, tag: &str, files: &[(&str, &str)]) {
+    push_test_package_with_auth(registry_host, image, tag, files, &RegistryAuth::Anonymous).await;
+}
+
+async fn push_test_package_with_auth(
+    registry_host: &str,
+    image: &str,
+    tag: &str,
+    files: &[(&str, &str)],
+    auth: &RegistryAuth,
+) {
     let archive = build_tar_gz(files);
     let reference: Reference = format!("{image}:{tag}").parse().unwrap();
     let client = Client::new(ClientConfig {
@@ -109,13 +255,7 @@ async fn push_test_package(registry_host: &str, image: &str, tag: &str, files: &
     let image_manifest = manifest::OciImageManifest::build(&layers, &config, None);
 
     client
-        .push(
-            &reference,
-            &layers,
-            config,
-            &RegistryAuth::Anonymous,
-            Some(image_manifest),
-        )
+        .push(&reference, &layers, config, auth, Some(image_manifest))
         .await
         .unwrap_or_else(|err| panic!("push failed for {registry_host}: {err:?}"));
 }
@@ -141,14 +281,26 @@ fn build_tar_gz(files: &[(&str, &str)]) -> Bytes {
 }
 
 struct TestRegistry {
-    _server: JoinHandle<()>,
-    registry_host: String,
-    port: u16,
+    expected_auth: Option<(String, String)>,
 }
 
 impl TestRegistry {
-    async fn new() -> Self {
-        let state = Arc::new(RegistryState::default());
+    fn new() -> Self {
+        Self {
+            expected_auth: None,
+        }
+    }
+
+    fn with_auth(mut self, username: &str, password: &str) -> Self {
+        self.expected_auth = Some((username.to_string(), password.to_string()));
+        self
+    }
+
+    async fn start(self) -> RunningTestRegistry {
+        let state = Arc::new(RegistryState {
+            expected_auth: self.expected_auth,
+            ..Default::default()
+        });
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let registry_host = format!("localhost:{port}");
@@ -164,20 +316,31 @@ impl TestRegistry {
             .route("/v2/{name}/manifests/{reference}", get(get_manifest))
             .route("/v2/{name}/manifests/{reference}", head(check_manifest))
             .route("/v2/{name}/tags/list", get(list_tags))
-            .layer(middleware::from_fn(log_request))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                log_request,
+            ))
             .with_state(state);
 
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
 
-        Self {
+        RunningTestRegistry {
             _server: server,
             registry_host,
             port,
         }
     }
+}
 
+struct RunningTestRegistry {
+    _server: JoinHandle<()>,
+    registry_host: String,
+    port: u16,
+}
+
+impl RunningTestRegistry {
     fn port(&self) -> u16 {
         self.port
     }
@@ -189,6 +352,7 @@ impl TestRegistry {
 
 #[derive(Default)]
 struct RegistryState {
+    expected_auth: Option<(String, String)>,
     blobs: RwLock<HashMap<String, Bytes>>,
     uploads: RwLock<HashMap<String, Vec<u8>>>,
     manifests: RwLock<HashMap<(String, String), ManifestEntry>>,
@@ -437,7 +601,52 @@ async fn list_tags(
     Json(TagListResponse { name, tags })
 }
 
-async fn log_request(req: Request, next: Next) -> Response {
+async fn log_request(
+    State(state): State<Arc<RegistryState>>,
+    req: Request,
+    next: Next,
+) -> Response {
     eprintln!("test registry {} {}", req.method(), req.uri());
+
+    let Some((expected_username, expected_password)) = state.expected_auth.as_ref() else {
+        return next.run(req).await;
+    };
+
+    let Some(auth_header) = req.headers().get(header::AUTHORIZATION) else {
+        return unauthorized_response();
+    };
+
+    let Ok(auth_header) = auth_header.to_str() else {
+        return unauthorized_response();
+    };
+
+    let Some(encoded) = auth_header.strip_prefix("Basic ") else {
+        return unauthorized_response();
+    };
+
+    let Ok(decoded) = STANDARD.decode(encoded) else {
+        return unauthorized_response();
+    };
+
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return unauthorized_response();
+    };
+
+    let Some((username, password)) = decoded.split_once(":") else {
+        return unauthorized_response();
+    };
+
+    if username != expected_username || password != expected_password {
+        return unauthorized_response();
+    }
+
     next.run(req).await
+}
+
+fn unauthorized_response() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(header::WWW_AUTHENTICATE, "Basic realm=\"test\"")
+        .body(Body::empty())
+        .unwrap()
 }

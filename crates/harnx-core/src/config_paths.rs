@@ -16,6 +16,9 @@ pub const MACROS_DIR_NAME: &str = "macros";
 /// Subdirectory holding installed packages.
 pub const PACKAGES_DIR_NAME: &str = "packages";
 
+/// Subdirectory holding per-registry credential configuration files.
+pub const PACKAGE_REPOS_DIR_NAME: &str = "package_repos";
+
 /// Filename of the manifest written by harnx-pkg at install time.
 pub const PACKAGE_MANIFEST_FILE_NAME: &str = "manifest.yaml";
 
@@ -188,6 +191,11 @@ pub fn acp_servers_dir() -> PathBuf {
 /// Root directory for all installed packages: `<config_dir>/packages/`.
 pub fn packages_dir() -> PathBuf {
     config_dir().join(PACKAGES_DIR_NAME)
+}
+
+/// Root directory for per-registry credential config files: `<config_dir>/package_repos/`.
+pub fn package_repos_dir() -> PathBuf {
+    config_dir().join(PACKAGE_REPOS_DIR_NAME)
 }
 
 /// Directory for a specific installed package: `<config_dir>/packages/<name>/`.
@@ -675,6 +683,20 @@ mod tests {
         assert!(
             got.ends_with(PACKAGES_DIR_NAME),
             "packages_dir() should end with 'packages'"
+        );
+    }
+
+    #[test]
+    fn package_repos_dir_under_config_dir() {
+        let test_dir = "/tmp/harnx_pkg_repos_path_test_5c8d";
+        let got = with_env("HARNX_CONFIG_DIR", test_dir, package_repos_dir);
+        assert!(
+            got.starts_with(test_dir),
+            "package_repos_dir() should be under config_dir"
+        );
+        assert!(
+            got.ends_with(PACKAGE_REPOS_DIR_NAME),
+            "package_repos_dir() should end with 'package_repos'"
         );
     }
 
