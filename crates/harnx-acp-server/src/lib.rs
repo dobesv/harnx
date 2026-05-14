@@ -11,11 +11,14 @@ mod server_main;
 pub use server_main::run;
 
 #[cfg(test)]
+mod lib_tests;
+#[cfg(test)]
 mod test_regression_issue_68;
 
-use agent_client_protocol::{self as acp, Client as AcpClientTrait};
+use agent_client_protocol as acp;
+use agent_client_protocol::schema::*;
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, ToolEvent};
 use harnx_runtime::config::GlobalConfig;
@@ -137,8 +140,8 @@ impl harnx_core::event::AgentEventSink for AcpChunkSink {
 pub struct HarnxAgent {
     agent_name: String,
     config: GlobalConfig,
-    sessions: RefCell<HashMap<String, HarnxSession>>,
-    connection: RefCell<Option<Rc<acp::AgentSideConnection>>>,
+    sessions: Arc<tokio::sync::Mutex<HashMap<String, HarnxSession>>>,
+    connection: Arc<tokio::sync::Mutex<Option<acp::ConnectionTo<acp::Client>>>>,
 }
 
 #[derive(Clone)]
@@ -166,41 +169,31 @@ impl HarnxAgent {
         Self {
             agent_name,
             config,
-            sessions: RefCell::new(HashMap::new()),
-            connection: RefCell::new(None),
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            connection: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
-    pub fn set_connection(&self, conn: Rc<acp::AgentSideConnection>) {
-        self.connection.replace(Some(conn));
+    pub async fn set_connection(&self, conn: acp::ConnectionTo<acp::Client>) {
+        *self.connection.lock().await = Some(conn);
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl acp::Agent for HarnxAgent {
-    async fn initialize(
-        &self,
-        args: acp::InitializeRequest,
-    ) -> acp::Result<acp::InitializeResponse> {
-        Ok(acp::InitializeResponse::new(args.protocol_version)
-            .agent_capabilities(acp::AgentCapabilities::new())
+impl HarnxAgent {
+    async fn initialize(&self, args: InitializeRequest) -> acp::Result<InitializeResponse> {
+        Ok(InitializeResponse::new(args.protocol_version)
+            .agent_capabilities(AgentCapabilities::new())
             .agent_info(
-                acp::Implementation::new("harnx", env!("CARGO_PKG_VERSION"))
+                Implementation::new("harnx", env!("CARGO_PKG_VERSION"))
                     .title(self.agent_name.clone()),
             ))
     }
 
-    async fn authenticate(
-        &self,
-        _args: acp::AuthenticateRequest,
-    ) -> acp::Result<acp::AuthenticateResponse> {
-        Ok(acp::AuthenticateResponse::default())
+    async fn authenticate(&self, _args: AuthenticateRequest) -> acp::Result<AuthenticateResponse> {
+        Ok(AuthenticateResponse::default())
     }
 
-    async fn new_session(
-        &self,
-        _args: acp::NewSessionRequest,
-    ) -> acp::Result<acp::NewSessionResponse> {
+    async fn new_session(&self, _args: NewSessionRequest) -> acp::Result<NewSessionResponse> {
         let session_id;
         {
             let mut config = self.config.write();
@@ -227,14 +220,13 @@ impl acp::Agent for HarnxAgent {
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
         };
         self.sessions
-            .borrow_mut()
+            .lock()
+            .await
             .insert(session_id.clone(), session);
-        Ok(acp::NewSessionResponse::new(acp::SessionId::new(
-            session_id,
-        )))
+        Ok(NewSessionResponse::new(SessionId::new(session_id)))
     }
 
-    async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
+    async fn prompt(&self, args: PromptRequest) -> acp::Result<PromptResponse> {
         let session_key = args.session_id.0.to_string();
         let prompt_text: String = args
             .prompt
@@ -244,7 +236,7 @@ impl acp::Agent for HarnxAgent {
             .join("\n");
 
         let (abort_signal, cancel_notify) = {
-            let sessions = self.sessions.borrow();
+            let sessions = self.sessions.lock().await;
             let session = sessions
                 .get(session_key.as_str())
                 .ok_or_else(acp::Error::invalid_params)?;
@@ -301,7 +293,7 @@ impl acp::Agent for HarnxAgent {
         harnx_core::sink::install_agent_event_sink(sink);
 
         // Spawn local task to drain chunk_rx → session_notification.
-        let connection_for_fwd = self.connection.borrow().clone();
+        let connection_for_fwd = self.connection.lock().await.clone();
         let session_key_for_fwd = session_key.clone();
         // Helpers: fire a session_notification without blocking the LocalSet
         // thread. Each notification is spawned as its own local task so
@@ -335,7 +327,7 @@ impl acp::Agent for HarnxAgent {
         }
 
         fn spawn_notify_text(
-            conn: &Option<Rc<acp::AgentSideConnection>>,
+            conn: &Option<acp::ConnectionTo<acp::Client>>,
             session_key: &str,
             text: String,
             source: Option<AgentSource>,
@@ -346,23 +338,23 @@ impl acp::Agent for HarnxAgent {
             if let Some(conn) = conn.clone() {
                 let sid = session_key.to_string();
                 tokio::task::spawn_local(async move {
-                    let mut chunk = acp::ContentChunk::new(text.into());
+                    let mut chunk = ContentChunk::new(text.into());
                     if let Some(source) = source.as_ref() {
                         if let Some(meta) = meta_from_source(source) {
                             chunk = chunk.meta(meta);
                         }
                     }
-                    let notification = acp::SessionNotification::new(
-                        acp::SessionId::new(sid),
-                        acp::SessionUpdate::AgentMessageChunk(chunk),
+                    let notification = SessionNotification::new(
+                        SessionId::new(sid),
+                        SessionUpdate::AgentMessageChunk(chunk),
                     );
-                    let _ = conn.session_notification(notification).await;
+                    let _ = conn.send_notification(notification);
                 });
             }
         }
 
         fn spawn_notify_tool_call(
-            conn: &Option<Rc<acp::AgentSideConnection>>,
+            conn: &Option<acp::ConnectionTo<acp::Client>>,
             session_key: &str,
             id: String,
             name: String,
@@ -374,7 +366,7 @@ impl acp::Agent for HarnxAgent {
                 let sid = session_key.to_string();
                 tokio::task::spawn_local(async move {
                     let tool_call_id = if id.is_empty() { name.clone() } else { id };
-                    let mut tc = acp::ToolCall::new(tool_call_id, name).raw_input(input);
+                    let mut tc = ToolCall::new(tool_call_id, name).raw_input(input);
                     let mut meta_map: Option<serde_json::Map<String, serde_json::Value>> = None;
                     if let Some(source) = source.as_ref() {
                         meta_map = meta_from_source(source);
@@ -386,17 +378,15 @@ impl acp::Agent for HarnxAgent {
                     if let Some(map) = meta_map {
                         tc = tc.meta(map);
                     }
-                    let notification = acp::SessionNotification::new(
-                        acp::SessionId::new(sid),
-                        acp::SessionUpdate::ToolCall(tc),
-                    );
-                    let _ = conn.session_notification(notification).await;
+                    let notification =
+                        SessionNotification::new(SessionId::new(sid), SessionUpdate::ToolCall(tc));
+                    let _ = conn.send_notification(notification);
                 });
             }
         }
 
         fn spawn_notify_tool_update(
-            conn: &Option<Rc<acp::AgentSideConnection>>,
+            conn: &Option<acp::ConnectionTo<acp::Client>>,
             session_key: &str,
             id: String,
             markdown: Option<String>,
@@ -407,37 +397,35 @@ impl acp::Agent for HarnxAgent {
                 let sid = session_key.to_string();
                 tokio::task::spawn_local(async move {
                     let acp_status = status.map(|s| match s {
-                        harnx_core::event::ToolStatus::Pending => acp::ToolCallStatus::Pending,
-                        harnx_core::event::ToolStatus::InProgress => {
-                            acp::ToolCallStatus::InProgress
-                        }
-                        harnx_core::event::ToolStatus::Completed => acp::ToolCallStatus::Completed,
-                        harnx_core::event::ToolStatus::Failed => acp::ToolCallStatus::Failed,
+                        harnx_core::event::ToolStatus::Pending => ToolCallStatus::Pending,
+                        harnx_core::event::ToolStatus::InProgress => ToolCallStatus::InProgress,
+                        harnx_core::event::ToolStatus::Completed => ToolCallStatus::Completed,
+                        harnx_core::event::ToolStatus::Failed => ToolCallStatus::Failed,
                     });
-                    let mut fields = acp::ToolCallUpdateFields::new();
+                    let mut fields = ToolCallUpdateFields::new();
                     if let Some(s) = acp_status {
                         fields = fields.status(s);
                     }
                     if let Some(md) = markdown.filter(|t| !t.is_empty()) {
                         fields = fields.title(md);
                     }
-                    let mut tcu = acp::ToolCallUpdate::new(id, fields);
+                    let mut tcu = ToolCallUpdate::new(id, fields);
                     if let Some(source) = source.as_ref() {
                         if let Some(meta) = meta_from_source(source) {
                             tcu = tcu.meta(meta);
                         }
                     }
-                    let notification = acp::SessionNotification::new(
-                        acp::SessionId::new(sid),
-                        acp::SessionUpdate::ToolCallUpdate(tcu),
+                    let notification = SessionNotification::new(
+                        SessionId::new(sid),
+                        SessionUpdate::ToolCallUpdate(tcu),
                     );
-                    let _ = conn.session_notification(notification).await;
+                    let _ = conn.send_notification(notification);
                 });
             }
         }
 
         fn spawn_notify_tool_completed(
-            conn: &Option<Rc<acp::AgentSideConnection>>,
+            conn: &Option<acp::ConnectionTo<acp::Client>>,
             session_key: &str,
             id: String,
             output: serde_json::Value,
@@ -447,29 +435,29 @@ impl acp::Agent for HarnxAgent {
             if let Some(conn) = conn.clone() {
                 let sid = session_key.to_string();
                 tokio::task::spawn_local(async move {
-                    let mut fields = acp::ToolCallUpdateFields::new()
-                        .status(acp::ToolCallStatus::Completed)
+                    let mut fields = ToolCallUpdateFields::new()
+                        .status(ToolCallStatus::Completed)
                         .raw_output(output);
                     if let Some(md) = markdown.filter(|t| !t.is_empty()) {
                         fields = fields.title(md);
                     }
-                    let mut tcu = acp::ToolCallUpdate::new(id, fields);
+                    let mut tcu = ToolCallUpdate::new(id, fields);
                     if let Some(source) = source.as_ref() {
                         if let Some(meta) = meta_from_source(source) {
                             tcu = tcu.meta(meta);
                         }
                     }
-                    let notification = acp::SessionNotification::new(
-                        acp::SessionId::new(sid),
-                        acp::SessionUpdate::ToolCallUpdate(tcu),
+                    let notification = SessionNotification::new(
+                        SessionId::new(sid),
+                        SessionUpdate::ToolCallUpdate(tcu),
                     );
-                    let _ = conn.session_notification(notification).await;
+                    let _ = conn.send_notification(notification);
                 });
             }
         }
 
         fn spawn_notify_forward(
-            conn: &Option<Rc<acp::AgentSideConnection>>,
+            conn: &Option<acp::ConnectionTo<acp::Client>>,
             session_key: &str,
             update: AcpForward,
         ) {
@@ -548,14 +536,14 @@ impl acp::Agent for HarnxAgent {
         // Pure hard-cancel-on-notify (the previous approach) skipped
         // step 1 — sub-agents were leaked because the AcpManager call
         // was dropped before it could dispatch `session/cancel`.
-        // 100 ms is well above the ~30 ms a single AcpManager
+        // 250 ms is well above the ~30 ms a single AcpManager
         // observes-abort + dispatches-cancel takes; nested layers each
         // run their own grace in parallel, so the bound doesn't
         // compound across depth.
         let abort_for_grace = abort_signal.clone();
         let grace_cancel = async move {
             harnx_core::abort::wait_abort_signal(&abort_for_grace).await;
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         };
 
         let loop_result = tokio::select! {
@@ -564,7 +552,7 @@ impl acp::Agent for HarnxAgent {
                 cancel_listener.abort();
                 harnx_core::sink::clear_agent_event_sink();
                 fwd_task.abort();
-                return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+                return Ok(PromptResponse::new(StopReason::Cancelled));
             }
         };
 
@@ -576,17 +564,15 @@ impl acp::Agent for HarnxAgent {
         let _ = fwd_task.await;
 
         match loop_result {
-            Ok(()) => Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)),
-            Err(_e) if abort_signal.aborted() => {
-                Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
-            }
+            Ok(()) => Ok(PromptResponse::new(StopReason::EndTurn)),
+            Err(_e) if abort_signal.aborted() => Ok(PromptResponse::new(StopReason::Cancelled)),
             Err(e) => Err(acp::Error::new(-32603, format!("Agent loop error: {e:#}"))),
         }
     }
 
-    async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
+    async fn cancel(&self, args: CancelNotification) -> acp::Result<()> {
         let session_id = args.session_id.0;
-        let sessions = self.sessions.borrow();
+        let sessions = self.sessions.lock().await;
         let session = sessions
             .get(session_id.as_ref())
             .ok_or_else(acp::Error::invalid_params)?;
@@ -596,522 +582,13 @@ impl acp::Agent for HarnxAgent {
     }
 }
 
-fn content_block_to_text(content: &acp::ContentBlock) -> String {
+fn content_block_to_text(content: &ContentBlock) -> String {
     match content {
-        acp::ContentBlock::Text(text) => text.text.clone(),
-        acp::ContentBlock::ResourceLink(link) => link.uri.to_string(),
-        acp::ContentBlock::Image(_) => "<image>".to_string(),
-        acp::ContentBlock::Audio(_) => "<audio>".to_string(),
-        acp::ContentBlock::Resource(_) => "<resource>".to_string(),
+        ContentBlock::Text(text) => text.text.clone(),
+        ContentBlock::ResourceLink(link) => link.uri.to_string(),
+        ContentBlock::Image(_) => "<image>".to_string(),
+        ContentBlock::Audio(_) => "<audio>".to_string(),
+        ContentBlock::Resource(_) => "<resource>".to_string(),
         _ => String::new(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use agent_client_protocol::Agent;
-    use harnx_runtime::{
-        client::{ClientConfig, ModelType, TestStateGuard},
-        config::Config,
-        test_utils::{MockClient, MockTurnBuilder},
-    };
-
-    /// Built-in agent used as a lightweight test fixture for ACP protocol tests.
-    const TEST_BUILTIN_AGENT: &str = harnx_core::agent_config::CREATE_TITLE_AGENT_NAME;
-    use std::{cell::RefCell, rc::Rc, sync::Arc};
-    use tempfile::TempDir;
-    use tokio::task::LocalSet;
-    use tokio::time::{timeout, Duration};
-
-    use harnx_acp::compat::TokioCompat;
-
-    #[derive(Clone)]
-    struct TestClient {
-        chunks: Rc<RefCell<Vec<String>>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl acp::Client for TestClient {
-        async fn request_permission(
-            &self,
-            _args: acp::RequestPermissionRequest,
-        ) -> acp::Result<acp::RequestPermissionResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
-            if let acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) =
-                args.update
-            {
-                let text = content_block_to_text(&content);
-                if !text.is_empty() {
-                    self.chunks.borrow_mut().push(text);
-                }
-            }
-            Ok(())
-        }
-    }
-
-    fn run_local<F: std::future::Future>(future: F) -> F::Output {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build ACP server test runtime");
-        let local_set = LocalSet::new();
-        local_set.block_on(&rt, future)
-    }
-
-    #[test]
-    fn acp_chunk_sink_forwards_tool_completed_and_update_to_channel() {
-        use harnx_core::event::{AgentEvent, AgentEventSink, ToolEvent, ToolStatus};
-        use tokio::sync::mpsc::unbounded_channel;
-
-        let (tx, mut rx) = unbounded_channel::<AcpForward>();
-        let sink = AcpChunkSink { tx };
-
-        sink.emit(
-            AgentEvent::Tool(ToolEvent::Completed {
-                id: "call-1".to_string(),
-                output: serde_json::json!({"text": "result"}),
-                markdown: Some("**result**".to_string()),
-            }),
-            None,
-        );
-
-        sink.emit(
-            AgentEvent::Tool(ToolEvent::Update {
-                id: "call-1".to_string(),
-                markdown: None,
-                status: Some(ToolStatus::InProgress),
-                content: None,
-            }),
-            None,
-        );
-
-        let completed = rx.try_recv().expect("should have ToolCompleted");
-        let update = rx.try_recv().expect("should have ToolUpdate");
-
-        match completed {
-            AcpForward::ToolCompleted {
-                id,
-                output,
-                markdown,
-                ..
-            } => {
-                assert_eq!(id, "call-1");
-                assert_eq!(output, serde_json::json!({"text": "result"}));
-                assert_eq!(markdown.as_deref(), Some("**result**"));
-            }
-            _ => panic!("expected ToolCompleted"),
-        }
-        match update {
-            AcpForward::ToolUpdate { id, status, .. } => {
-                assert_eq!(id, "call-1");
-                assert!(matches!(status, Some(ToolStatus::InProgress)));
-            }
-            _ => panic!("expected ToolUpdate"),
-        }
-    }
-
-    fn test_config() -> GlobalConfig {
-        use parking_lot::RwLock;
-        use std::sync::Arc;
-
-        let clients: Vec<ClientConfig> = serde_yaml::from_str(
-            r#"
-- type: openai
-  api_key: test-key
-  models:
-    - name: gpt-4o
-      type: chat
-      max_input_tokens: 128000
-      max_output_tokens: 8192
-"#,
-        )
-        .expect("parse test client config");
-
-        let mut config = Config::default();
-        config.clients = clients;
-        config.model = harnx_runtime::client::retrieve_model(
-            &config.clients,
-            "openai:gpt-4o",
-            ModelType::Chat,
-        )
-        .expect("load test model");
-        config.save_session = Some(true);
-
-        Arc::new(RwLock::new(config))
-    }
-
-    fn write_test_agent(temp: &TempDir, agent_name: &str, prompt: &str) {
-        let agents_dir = temp.path().join("agents");
-        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
-        let agent_content = format!("---\nmodel: openai:gpt-4o\n---\n{prompt}\n");
-        std::fs::write(agents_dir.join(format!("{agent_name}.md")), agent_content)
-            .expect("write test agent file");
-    }
-
-    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
-
-    impl EnvGuard {
-        fn new(key: &'static str, value: &std::path::Path) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self(key, prev)
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(v) = self.1.take() {
-                unsafe { std::env::set_var(self.0, v) };
-            } else {
-                unsafe { std::env::remove_var(self.0) };
-            }
-        }
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn setup_roundtrip(
-        agent_name: &str,
-        config: GlobalConfig,
-    ) -> (
-        acp::ClientSideConnection,
-        Rc<RefCell<Vec<String>>>,
-        tokio::task::JoinHandle<acp::Result<()>>,
-        tokio::task::JoinHandle<acp::Result<()>>,
-    ) {
-        let agent = Rc::new(HarnxAgent::new(agent_name.to_string(), config));
-        let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let (server_reader, server_writer) = tokio::io::split(server_stream);
-        let (client_reader, client_writer) = tokio::io::split(client_stream);
-
-        let (server_conn, server_io) = acp::AgentSideConnection::new(
-            Rc::clone(&agent),
-            TokioCompat::new(server_writer),
-            TokioCompat::new(server_reader),
-            |future| {
-                tokio::task::spawn_local(future);
-            },
-        );
-        agent.set_connection(Rc::new(server_conn));
-
-        let chunks = Rc::new(RefCell::new(Vec::new()));
-        let (client_conn, client_io) = acp::ClientSideConnection::new(
-            TestClient {
-                chunks: Rc::clone(&chunks),
-            },
-            TokioCompat::new(client_writer),
-            TokioCompat::new(client_reader),
-            |future| {
-                tokio::task::spawn_local(future);
-            },
-        );
-
-        let server_handle = tokio::task::spawn_local(server_io);
-        let client_handle = tokio::task::spawn_local(client_io);
-
-        (client_conn, chunks, server_handle, client_handle)
-    }
-
-    #[test]
-    fn test_new_session_returns_unique_ids() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        write_test_agent(&temp, "test", "You are test agent.");
-        let config = test_config();
-        let temp_path = temp.path().to_path_buf();
-        run_local(async move {
-            let _guard = TestStateGuard::new(None).await;
-            let _env = EnvGuard::new("HARNX_CONFIG_DIR", &temp_path);
-            let agent = HarnxAgent::new("test".to_string(), config);
-            let cwd = std::env::current_dir().expect("current dir");
-
-            let resp1 = agent
-                .new_session(acp::NewSessionRequest::new(cwd.clone()))
-                .await
-                .expect("create first session");
-            let resp2 = agent
-                .new_session(acp::NewSessionRequest::new(cwd))
-                .await
-                .expect("create second session");
-            let session_id1 = resp1.session_id.0.to_string();
-            let session_id2 = resp2.session_id.0.to_string();
-
-            assert_ne!(resp1.session_id, resp2.session_id);
-            assert!(agent.sessions.borrow().contains_key(session_id1.as_str()));
-            assert!(agent.sessions.borrow().contains_key(session_id2.as_str()));
-        });
-    }
-
-    #[test]
-    fn test_cancel_marks_session() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        write_test_agent(&temp, "test", "You are test agent.");
-        let config = test_config();
-        let temp_path = temp.path().to_path_buf();
-        run_local(async move {
-            let _guard = TestStateGuard::new(None).await;
-            let _env = EnvGuard::new("HARNX_CONFIG_DIR", &temp_path);
-            let agent = HarnxAgent::new("test".to_string(), config);
-            let response = agent
-                .new_session(acp::NewSessionRequest::new(
-                    std::env::current_dir().expect("current dir"),
-                ))
-                .await
-                .expect("create session");
-            let session_id = response.session_id.0.to_string();
-
-            agent
-                .cancel(acp::CancelNotification::new(session_id.clone()))
-                .await
-                .expect("cancel session");
-
-            let sessions = agent.sessions.borrow();
-            let session = sessions.get(session_id.as_str()).expect("stored session");
-            assert!(session.abort_signal.aborted());
-        });
-    }
-
-    #[test]
-    fn test_cancel_unknown_session_errors() {
-        let config = test_config();
-        run_local(async move {
-            let agent = HarnxAgent::new("test".to_string(), config);
-
-            let result = agent
-                .cancel(acp::CancelNotification::new("nonexistent".to_string()))
-                .await;
-
-            assert!(result.is_err());
-        });
-    }
-
-    #[test]
-    fn test_acp_server_initialize_handshake() {
-        let config = test_config();
-
-        run_local(async move {
-            let (client_conn, _chunks, server_handle, client_handle) =
-                setup_roundtrip("test", config);
-
-            let response = timeout(
-                Duration::from_secs(5),
-                client_conn.initialize(
-                    acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
-                        acp::Implementation::new("test-client", "0.1.0").title("Test Client"),
-                    ),
-                ),
-            )
-            .await
-            .expect("initialize should not hang")
-            .expect("initialize should succeed");
-
-            assert_eq!(response.protocol_version, acp::ProtocolVersion::V1);
-            assert!(response.agent_info.is_some());
-
-            server_handle.abort();
-            client_handle.abort();
-        });
-    }
-
-    #[test]
-    fn test_acp_server_new_session_and_prompt_roundtrip() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        write_test_agent(
-            &temp,
-            TEST_BUILTIN_AGENT,
-            "You create concise titles for conversations.",
-        );
-        let config = test_config();
-        let temp_path = temp.path().to_path_buf();
-
-        run_local(async move {
-            let _guard = TestStateGuard::new(Some(Arc::new(
-                MockClient::builder()
-                    .add_turn(
-                        MockTurnBuilder::new()
-                            .add_text_chunk("mock roundtrip response")
-                            .build(),
-                    )
-                    .build(),
-            )))
-            .await;
-            let _env = EnvGuard::new("HARNX_CONFIG_DIR", &temp_path);
-
-            let (client_conn, chunks, server_handle, client_handle) =
-                setup_roundtrip(TEST_BUILTIN_AGENT, config.clone());
-
-            timeout(
-                Duration::from_secs(5),
-                client_conn.initialize(
-                    acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
-                        acp::Implementation::new("test-client", "0.1.0").title("Test Client"),
-                    ),
-                ),
-            )
-            .await
-            .expect("initialize should not hang")
-            .expect("initialize should succeed");
-
-            let session = timeout(
-                Duration::from_secs(5),
-                client_conn.new_session(acp::NewSessionRequest::new(
-                    std::env::current_dir().expect("current dir"),
-                )),
-            )
-            .await
-            .expect("new_session should not hang")
-            .expect("new_session should succeed");
-
-            assert_eq!(
-                config.read().session.as_ref().map(|s| s.id().to_string()),
-                Some(session.session_id.to_string())
-            );
-
-            let response = timeout(
-                Duration::from_secs(5),
-                client_conn.prompt(acp::PromptRequest::new(
-                    session.session_id.to_string(),
-                    vec![acp::ContentBlock::from("hello from client")],
-                )),
-            )
-            .await
-            .expect("prompt should not hang")
-            .expect("prompt should succeed");
-
-            assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
-            let chunks = chunks.borrow();
-            assert!(
-                chunks.iter().any(|chunk| !chunk.trim().is_empty()),
-                "expected prompt roundtrip output to include at least one non-empty chunk, got {:?}",
-                *chunks
-            );
-
-            let session_id = session.session_id.to_string();
-            let session_path =
-                harnx_core::config_paths::session_file(Some(TEST_BUILTIN_AGENT), &session_id);
-            let top_level_path = harnx_core::config_paths::session_file(None, &session_id);
-            assert!(
-                session_path.exists(),
-                "ACP prompt should persist session to disk at {}",
-                session_path.display()
-            );
-            assert!(
-                !top_level_path.exists(),
-                "session must NOT be saved to top-level path {}, should be agent-scoped",
-                top_level_path.display()
-            );
-
-            // Verify session file actually contains conversation content.
-            let session_content =
-                std::fs::read_to_string(&session_path).expect("read session file");
-            assert!(
-                session_content.contains("hello from client"),
-                "session file should contain the user prompt; got:\n{session_content}"
-            );
-            assert!(
-                session_content.contains("mock roundtrip response"),
-                "session file should contain the assistant response; got:\n{session_content}"
-            );
-
-            server_handle.abort();
-            client_handle.abort();
-        });
-    }
-
-    /// Verify that system-level variables (e.g. `{{__os__}}`) are expanded in
-    /// the agent's system prompt when running in ACP mode.  The session file
-    /// should contain the expanded OS name, not the raw `{{__os__}}` template.
-    #[test]
-    fn test_acp_prompt_expands_system_variables_in_session() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        write_test_agent(
-            &temp,
-            "vartest",
-            "You are running on {{__os__}}. Help the user.",
-        );
-
-        let config = test_config();
-        let temp_path = temp.path().to_path_buf();
-
-        run_local(async move {
-            let _guard = TestStateGuard::new(Some(Arc::new(
-                MockClient::builder()
-                    .add_turn(
-                        MockTurnBuilder::new()
-                            .add_text_chunk("variable expansion response")
-                            .build(),
-                    )
-                    .build(),
-            )))
-            .await;
-            let _env = EnvGuard::new("HARNX_CONFIG_DIR", &temp_path);
-
-            let (client_conn, _chunks, server_handle, client_handle) =
-                setup_roundtrip("vartest", config.clone());
-
-            timeout(
-                Duration::from_secs(5),
-                client_conn.initialize(
-                    acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
-                        acp::Implementation::new("test-client", "0.1.0").title("Test Client"),
-                    ),
-                ),
-            )
-            .await
-            .expect("initialize should not hang")
-            .expect("initialize should succeed");
-
-            let session = timeout(
-                Duration::from_secs(5),
-                client_conn.new_session(acp::NewSessionRequest::new(
-                    std::env::current_dir().expect("current dir"),
-                )),
-            )
-            .await
-            .expect("new_session should not hang")
-            .expect("new_session should succeed");
-
-            let _response = timeout(
-                Duration::from_secs(5),
-                client_conn.prompt(acp::PromptRequest::new(
-                    session.session_id.to_string(),
-                    vec![acp::ContentBlock::from("expand variables test")],
-                )),
-            )
-            .await
-            .expect("prompt should not hang")
-            .expect("prompt should succeed");
-
-            // The session file should contain the expanded OS name
-            // (e.g. "linux", "macos") instead of the raw template.
-            let session_id = session.session_id.to_string();
-            let session_path = harnx_core::config_paths::session_file(Some("vartest"), &session_id);
-            let top_level_path = harnx_core::config_paths::session_file(None, &session_id);
-            assert!(
-                session_path.exists(),
-                "session file should exist at {}",
-                session_path.display()
-            );
-            assert!(
-                !top_level_path.exists(),
-                "session must NOT be saved to top-level path {}, should be agent-scoped",
-                top_level_path.display()
-            );
-            let content = std::fs::read_to_string(&session_path).expect("read session");
-            assert!(
-                !content.contains("{{__os__}}"),
-                "session should not contain unexpanded {{{{__os__}}}} variable; got:\n{content}"
-            );
-            let current_os = std::env::consts::OS;
-            assert!(
-                content.contains(current_os),
-                "session should contain expanded OS name '{current_os}'; got:\n{content}"
-            );
-
-            server_handle.abort();
-            client_handle.abort();
-        });
     }
 }
