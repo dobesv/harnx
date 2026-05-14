@@ -26,3 +26,25 @@ toolsets:
 #     type: claude-command
 #     matcher: "Bash"
 #     command: "dcg"
+#
+# Example: Mutate tool input via hookSpecificOutput.toolInput
+# This shows how a PreToolUse hook can inject environment variables into Bash calls.
+#
+# hooks:
+#   entries:
+#   - event: PreToolUse
+#     type: claude-command
+#     matcher: "Bash"
+#     command: "/path/to/inject-env-hook.sh"
+#
+# The inject-env-hook.sh script would look like:
+#   #!/usr/bin/env python3
+#   import json, sys
+#   data = json.load(sys.stdin)
+#   # Mutate tool_input to add env vars
+#   data["tool_input"]["env"] = {"MY_VAR": "secret-value"}
+#   # Emit mutated input via hookSpecificOutput
+#   json.dump({"hookSpecificOutput": {"toolInput": data["tool_input"]}}, sys.stdout)
+#
+# PreToolUse hooks can return hookSpecificOutput.toolInput to mutate tool arguments.
+# PostToolUse hooks can return hookSpecificOutput.toolResponse to mutate the tool response.

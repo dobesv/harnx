@@ -231,7 +231,7 @@ Relative paths are resolved from the agent's data directory.
 
 ## Hooks
 
-Hooks let you run external commands at specific points during agent execution. They're configured under the `hooks` front-matter field.
+Hooks let you run external commands at specific points during agent execution. They're configured under the `hooks` front-matter field. For a complete reference, see [Hooks Guide](hooks-guide.md).
 
 ### Configuration
 
@@ -257,7 +257,7 @@ hooks:
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `event` | `string` | yes | — | Hook event name (e.g. `PreToolUse`, `Stop`, `SessionStart`) |
-| `type` | `string` | yes | — | Execution protocol. Supported: `claude-command`, `claude-command-persistent` |
+| `type` | `string` | yes | — | Execution protocol. Supported: `claude-command`, `claude-command-persistent`. Note: `PreToolUse` hooks can return `hookSpecificOutput.toolInput` to mutate tool arguments; `PostToolUse` hooks can return `hookSpecificOutput.toolResponse` to mutate the response. |
 | `matcher` | `string` | no | none | Regex pattern to match against the tool name (for tool-related events) |
 | `command` | `string` | yes | — | Shell command to execute |
 | `timeout` | `integer` | no | `30` | Timeout in seconds |

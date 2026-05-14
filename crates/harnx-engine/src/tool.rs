@@ -141,6 +141,12 @@ pub async fn eval_tool_calls(
             is_all_null = false;
             continue;
         }
+        let (json_data, tool_input) = if let Some(mutated) = pre_outcome.result.mutated_tool_input {
+            (mutated.clone(), mutated)
+        } else {
+            (json_data, tool_input)
+        };
+
         if let HookResultControl::Ask { reason } = pre_outcome.control {
             if !(ctx.confirm_tool_use_fn)(&call.name, &json_data, reason.as_deref()) {
                 let deny_reason = reason.unwrap_or_else(|| "Denied by user".to_string());
@@ -185,7 +191,10 @@ pub async fn eval_tool_calls(
                     tool_use_id: tool_use_id.clone(),
                     tool_response: result.clone(),
                 };
-                let _ = (ctx.dispatch_hook_fn)(post_event).await;
+                let post_outcome = (ctx.dispatch_hook_fn)(post_event).await;
+                if let Some(mutated_response) = post_outcome.result.mutated_tool_response {
+                    result = mutated_response;
+                }
                 (ctx.emit_tool_result_fn)(&call, &result);
                 if !result.is_null() {
                     is_all_null = false;
@@ -406,6 +415,51 @@ mod tests {
         }
     }
 
+    struct CapturingToolProvider {
+        tool_name: String,
+        received_arguments: Arc<Mutex<Vec<Value>>>,
+        result: Value,
+    }
+
+    impl CapturingToolProvider {
+        fn new(tool_name: &str, received_arguments: Arc<Mutex<Vec<Value>>>, result: Value) -> Self {
+            Self {
+                tool_name: tool_name.to_string(),
+                received_arguments,
+                result,
+            }
+        }
+    }
+
+    impl ToolProvider for CapturingToolProvider {
+        fn name(&self) -> &str {
+            "capturing-mock"
+        }
+
+        fn has_tool(&self, tool_name: &str) -> bool {
+            self.tool_name == tool_name
+        }
+
+        fn call_tool<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            tool_name: &'life1 str,
+            arguments: Value,
+            _abort: &'life2 AbortSignal,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                assert_eq!(tool_name, self.tool_name);
+                self.received_arguments.lock().await.push(arguments);
+                Ok(self.result.clone())
+            })
+        }
+    }
+
     fn continue_hook_outcome() -> HookOutcome {
         HookOutcome {
             control: HookResultControl::Continue,
@@ -621,5 +675,129 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(started_emit_count.load(Ordering::SeqCst), 0);
         assert_eq!(blocked_emit_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_mutation_applied_to_tool() {
+        let received_arguments = Arc::new(Mutex::new(Vec::new()));
+        let received_arguments_clone = Arc::clone(&received_arguments);
+        let ctx = test_context_with_emitters(
+            vec![Arc::new(CapturingToolProvider::new(
+                "tool_a",
+                received_arguments_clone,
+                json!({"raw": true}),
+            ))],
+            |event| match event {
+                HookEvent::PreToolUse { .. } => HookOutcome {
+                    control: HookResultControl::Continue,
+                    result: HookResult {
+                        mutated_tool_input: Some(json!({"injected": true})),
+                        ..HookResult::default()
+                    },
+                },
+                _ => continue_hook_outcome(),
+            },
+            |_, _| {},
+            |_, _| {},
+            |_, _| {},
+        );
+        let abort_signal = create_abort_signal();
+
+        let result = eval_tool_calls(
+            &ctx,
+            vec![ToolCall::new(
+                "tool_a".to_string(),
+                json!({"original": true}),
+                None,
+                None,
+            )],
+            &abort_signal,
+        )
+        .await
+        .expect("tool call should succeed");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            received_arguments.lock().await.as_slice(),
+            &[json!({"injected": true})]
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_mutation_replaces_result() {
+        let ctx = test_context_with_emitters(
+            vec![Arc::new(MockToolProvider::ok(
+                "tool_a",
+                Duration::ZERO,
+                json!({"raw": true}),
+            ))],
+            |event| match event {
+                HookEvent::PostToolUse { .. } => HookOutcome {
+                    control: HookResultControl::Continue,
+                    result: HookResult {
+                        mutated_tool_response: Some(json!({"mutated": true})),
+                        ..HookResult::default()
+                    },
+                },
+                _ => continue_hook_outcome(),
+            },
+            |_, _| {},
+            |_, _| {},
+            |_, _| {},
+        );
+        let abort_signal = create_abort_signal();
+
+        let result = eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
+            .await
+            .expect("tool call should succeed");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].output, json!({"mutated": true}));
+    }
+
+    #[tokio::test]
+    async fn pre_mutation_reflected_in_post_tool_use_event() {
+        let post_tool_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let post_tool_inputs_clone = Arc::clone(&post_tool_inputs);
+        let ctx = test_context_with_emitters(
+            vec![Arc::new(MockToolProvider::ok(
+                "tool_a",
+                Duration::ZERO,
+                json!({"raw": true}),
+            ))],
+            move |event| match event {
+                HookEvent::PreToolUse { .. } => HookOutcome {
+                    control: HookResultControl::Continue,
+                    result: HookResult {
+                        mutated_tool_input: Some(json!({"injected": true})),
+                        ..HookResult::default()
+                    },
+                },
+                HookEvent::PostToolUse { tool_input, .. } => {
+                    post_tool_inputs_clone
+                        .lock()
+                        .expect("lock post tool inputs")
+                        .push(tool_input);
+                    continue_hook_outcome()
+                }
+                _ => continue_hook_outcome(),
+            },
+            |_, _| {},
+            |_, _| {},
+            |_, _| {},
+        );
+        let abort_signal = create_abort_signal();
+
+        eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
+            .await
+            .expect("tool call should succeed");
+
+        assert_eq!(
+            post_tool_inputs
+                .lock()
+                .expect("lock post tool inputs")
+                .as_slice(),
+            &[json!({"injected": true})]
+        );
     }
 }

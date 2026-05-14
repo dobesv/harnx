@@ -103,34 +103,40 @@ pub async fn execute_command_hook(
     }
 }
 
-fn parse_success_output(stdout: &[u8]) -> HookOutcome {
+/// Derive the `HookResultControl` from a parsed `HookResult` based on the
+/// `hookSpecificOutput.permissionDecision` field. This is the shared control-
+/// derivation logic used by both one-shot and persistent hooks.
+pub fn control_from_result(result: &HookResult) -> HookResultControl {
+    match result
+        .hook_specific_output
+        .as_ref()
+        .and_then(|output| output.permission_decision.as_deref())
+    {
+        Some("deny") => HookResultControl::Block {
+            reason: result
+                .hook_specific_output
+                .as_ref()
+                .and_then(|output| output.permission_decision_reason.clone())
+                .unwrap_or_else(|| "Denied by hook".to_string()),
+        },
+        Some("ask") => HookResultControl::Ask {
+            reason: result
+                .hook_specific_output
+                .as_ref()
+                .and_then(|output| output.permission_decision_reason.clone()),
+        },
+        _ => HookResultControl::Continue,
+    }
+}
+
+pub fn parse_success_output(stdout: &[u8]) -> HookOutcome {
     if stdout.is_empty() {
         return continue_with_default();
     }
 
     match serde_json::from_slice::<HookResult>(stdout) {
         Ok(result) => {
-            let control = match result
-                .hook_specific_output
-                .as_ref()
-                .and_then(|output| output.permission_decision.as_deref())
-            {
-                Some("deny") => HookResultControl::Block {
-                    reason: result
-                        .hook_specific_output
-                        .as_ref()
-                        .and_then(|output| output.permission_decision_reason.clone())
-                        .unwrap_or_else(|| "Denied by hook".to_string()),
-                },
-                Some("ask") => HookResultControl::Ask {
-                    reason: result
-                        .hook_specific_output
-                        .as_ref()
-                        .and_then(|output| output.permission_decision_reason.clone()),
-                },
-                _ => HookResultControl::Continue,
-            };
-
+            let control = control_from_result(&result);
             HookOutcome { control, result }
         }
         Err(_) => {
