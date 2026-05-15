@@ -1,6 +1,15 @@
 # Multi-package syntax (`[packages.harnx]`) is used so existing changeset
 # files keep their `harnx: <level>` front matter. With single-package
 # `[package]` syntax, changesets would need to drop the package name.
+#
+# Agent packages (pantheon, coding, …) each have their own entry below.
+# Their versions live in packages/<name>/package.yaml and changelogs in
+# packages/<name>/CHANGELOG.md. Changesets targeting them use the package
+# name as the key, e.g.:
+#   ---
+#   pantheon: minor
+#   ---
+# Knope tags them as `pantheon/v0.2.0`, which triggers publish-packages.yaml.
 [packages.harnx]
 # All workspace crates (except ratatui-widget-scrolling) inherit `version`
 # from `[workspace.package]` in the root Cargo.toml. knope updates that one
@@ -11,6 +20,20 @@ changelog = "CHANGELOG.md"
 # With multi-package syntax knope prepends the package name to tags, so
 # tags look like `harnx/v0.30.1` (NOT `v0.30.1`). The release workflow
 # trigger pattern in `.github/workflows/release.yaml` matches accordingly.
+tag_prefix = "v"
+
+[packages.pantheon]
+versioned_files = [
+  { path = "packages/pantheon/package.yaml", regex = 'version: v(?<version>\d+\.\d+\.\d+.*)' },
+]
+changelog = "packages/pantheon/CHANGELOG.md"
+tag_prefix = "v"
+
+[packages.coding]
+versioned_files = [
+  { path = "packages/coding/package.yaml", regex = 'version: v(?<version>\d+\.\d+\.\d+.*)' },
+]
+changelog = "packages/coding/CHANGELOG.md"
 tag_prefix = "v"
 
 [[workflows]]

@@ -1,0 +1,153 @@
+name: Publish Agent Packages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'packages/**'
+      - '.github/workflows/publish-packages.yaml'
+    # Knope tags agent packages as `<name>/v<version>` (e.g. `pantheon/v0.2.0`).
+    # List each package explicitly — GitHub tag patterns don't support
+    # a wildcard in the prefix position before the slash.
+    tags:
+      - 'pantheon/v[0-9]+.[0-9]+.[0-9]+*'
+      - 'coding/v[0-9]+.[0-9]+.[0-9]+*'
+
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Package to publish (e.g. pantheon, coding) — leave empty for all'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  discover:
+    name: Discover packages
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.list.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: List packages
+        id: list
+        run: |
+          INPUT="${{ github.event.inputs.package }}"
+          REF="${GITHUB_REF}"  # e.g. refs/tags/pantheon/v0.2.0
+
+          if [ -n "$INPUT" ]; then
+            # Single package requested via workflow_dispatch
+            PACKAGES="[\"$INPUT\"]"
+          elif [[ "$REF" == refs/tags/* ]]; then
+            # Tag push: extract package name from tag prefix (e.g. pantheon/v0.2.0 → pantheon)
+            TAG="${REF#refs/tags/}"
+            PKG="${TAG%%/*}"
+            PACKAGES="[\"$PKG\"]"
+          else
+            # Branch push: publish all packages
+            PACKAGES=$(ls packages/ | jq -Rc '[.]' | jq -sc 'add')
+          fi
+          echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
+          echo "Will publish: $PACKAGES"
+
+  publish:
+    name: Publish ${{ matrix.package }}
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJson(needs.discover.outputs.packages) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify package directory exists
+        run: |
+          if [ ! -d "packages/${{ matrix.package }}" ]; then
+            echo "Package directory packages/${{ matrix.package }} not found"
+            exit 1
+          fi
+
+      - name: Read package version
+        id: version
+        run: |
+          PKG_DIR="packages/${{ matrix.package }}"
+          # Read version from package.yaml if present
+          if [ -f "$PKG_DIR/package.yaml" ]; then
+            VERSION=$(grep '^version:' "$PKG_DIR/package.yaml" | sed 's/version: *//' | tr -d '"'"'" | head -1)
+          else
+            VERSION="v0.1.0"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Package ${{ matrix.package }} version: $VERSION"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image name
+        id: image
+        run: |
+          REPO="${{ github.repository }}"
+          OWNER="${REPO%%/*}"
+          IMAGE="ghcr.io/${OWNER}/harnx-packages/${{ matrix.package }}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Image: $IMAGE"
+
+      - name: Build and push OCI package image
+        run: |
+          IMAGE="${{ steps.image.outputs.image }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_DIR="packages/${{ matrix.package }}"
+
+          # Create a minimal OCI image containing just the package directory.
+          # We use a scratch-based image with the package files baked in at /package.
+          #
+          # The image is tagged with both the version and 'latest'.
+          # Users install it with: harnx pkg install ghcr.io/…/<pkg>:latest
+
+          # Write a minimal Dockerfile
+          cat > /tmp/Dockerfile.pkg << 'DOCKERFILE'
+          FROM scratch
+          COPY . /package
+          LABEL org.opencontainers.image.source="https://github.com/${{ github.repository }}"
+          LABEL org.opencontainers.image.description="Harnx agent package: ${{ matrix.package }}"
+          LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+          DOCKERFILE
+
+          # Build from the package directory so COPY . copies package contents
+          docker build \
+            -f /tmp/Dockerfile.pkg \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "$PKG_DIR"
+
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+
+          echo "✓ Published $IMAGE:$VERSION and $IMAGE:latest"
+
+      - name: Summary
+        run: |
+          IMAGE="${{ steps.image.outputs.image }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "## Published \`${{ matrix.package }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image**: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tags**: \`$VERSION\`, \`latest\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Install with:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```sh' >> "$GITHUB_STEP_SUMMARY"
+          echo "harnx pkg install $IMAGE:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

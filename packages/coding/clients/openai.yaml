@@ -1,0 +1,2 @@
+type: openai
+# api_key: sk-...   # or set OPENAI_API_KEY env var

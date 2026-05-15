@@ -1,0 +1,12 @@
+type: claude
+# api_key: sk-ant-...   # or set CLAUDE_API_KEY env var
+# api_base: https://api.anthropic.com/v1   # optional override
+
+# Prompt caching: keeps repeated system-prompt sections in Anthropic's cache,
+# reducing cost and latency on long agentic conversations.
+patch:
+  chat_completions:
+    '.*':
+      body:
+        cache_control:
+          type: ephemeral
