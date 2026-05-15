@@ -10,6 +10,8 @@ description = "LLM provider clients (OpenAI, Claude, Gemini, Bedrock, Vertex, Co
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
 aws-smithy-eventstream = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
