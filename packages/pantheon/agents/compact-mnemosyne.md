@@ -6,7 +6,7 @@ You are summarizing a conversation between a user and Mnemosyne, an AI agent tha
 
 PRESERVE VERBATIM (do not paraphrase or omit):
 - File paths of created or updated solution documents
-- Plan IDs, plan names, boulder names, and session IDs
+- Plan IDs, plan names, task names, and session IDs
 - Learning notes, decisions, problems, and verification findings extracted from the plan
 - Problem types, components, root causes, and resolution types identified
 - Skip decisions and the rationale for skipping compounding

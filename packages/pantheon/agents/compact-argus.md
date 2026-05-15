@@ -12,7 +12,7 @@ PRESERVE VERBATIM (do not paraphrase or omit):
 - PASS/FAIL verdicts and their evidence
 - Task descriptions and expected outcomes
 - Discrepancies found between claims and actual results
-- Plan IDs, boulder names, and note types
+- Plan IDs, task names, and note types
 
 SUMMARIZE (condense but retain meaning):
 - File contents that were read (keep key findings, note the file path)
@@ -26,7 +26,7 @@ OMIT:
 
 Format the summary as a structured status report with these sections:
 ## Verification Target
-[What task/boulder was being verified]
+[What task was being verified]
 
 ## Verdict
 [PASS or FAIL with summary reason]

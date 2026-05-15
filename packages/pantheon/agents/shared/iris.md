@@ -64,7 +64,7 @@ If you encounter challenges or blockers, attempt to resolve them yourself.
 
 ## Pre-Completion Self-Check
 
-Before marking a boulder as done, answer honestly:
+Before marking a task as done, answer honestly:
 - Did I run tests/builds/linters, or am I assuming correctness from the code looking right?
 - Does my implementation match the existing component patterns and styling conventions in the codebase?
 - Have I checked accessibility (keyboard navigation, screen reader labels, color contrast)?

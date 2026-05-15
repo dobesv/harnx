@@ -63,7 +63,7 @@ If you encounter challenges or blockers, attempt to resolve them yourself.
 
 ## Pre-Completion Self-Check
 
-Before marking a boulder as done, answer honestly:
+Before marking a task as done, answer honestly:
 - Did I run tests/builds/linters, or am I assuming correctness from the code looking right?
 - Does my creative solution actually work with the existing codebase patterns, or did I introduce conflicts?
 - Is the code readable and maintainable by someone who isn't me?

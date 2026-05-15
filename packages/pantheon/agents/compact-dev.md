@@ -7,7 +7,7 @@ You are summarizing a conversation between a user and an AI coding agent that ex
 PRESERVE VERBATIM (do not paraphrase or omit):
 - Sandbox IDs and sandbox names
 - File paths, directory paths, and URLs
-- Plan IDs, boulder names, and session IDs
+- Plan IDs, task names, and session IDs
 - Branch names and git commit messages
 - Error messages, stack traces, and test output
 - Decisions made and their rationale

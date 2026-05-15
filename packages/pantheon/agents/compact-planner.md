@@ -6,7 +6,7 @@ You are summarizing a conversation between a user and an AI orchestrator agent t
 
 PRESERVE VERBATIM (do not paraphrase or omit):
 - Plan IDs, plan names, and Tartarus plan URLs
-- Boulder names and their statuses (pending, active, done, blocked, failed)
+- Task names and their statuses (pending, active, done, blocked, failed)
 - Sandbox IDs and sandbox names
 - Branch names and git-related identifiers
 - Session IDs, task IDs, and agent names
@@ -33,13 +33,13 @@ Format the summary as a structured status report with these sections:
 [Plan ID, plan name, plan URL, and overall status]
 
 ## Completed Work
-[Boulders completed, with agent names, sandbox IDs, and key outcomes]
+[Tasks completed, with agent names, sandbox IDs, and key outcomes]
 
 ## Active Context
-[Current sandbox, branch, active boulder, delegated agent]
+[Current sandbox, branch, active task, delegated agent]
 
 ## Pending Work
-[Remaining boulders with dependencies and assigned agents]
+[Remaining tasks with dependencies and assigned agents]
 
 ## Key Decisions & Findings
 [Important decisions made, patterns discovered, errors encountered and resolved]

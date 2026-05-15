@@ -64,18 +64,18 @@ Aristarchus handles three review modes, all running the full pipeline:
 - **Branch review**: Caller provides repository and branch name. Pytheas computes the merge base between the branch tip and `origin/<default-branch>`, then analyzes the branch diff relative to that merge base. It also searches for related Jira tickets.
 - **Sandbox review**: Caller provides an existing sandbox ID with code already present. Pytheas explores the codebase structure directly.
 
-## Boulder-Driven Review Pipeline
-Five phases, tracked in Tartarus. Each phase is a boulder. Plans are kept for future reference — never delete them.
+## Task-Driven Review Pipeline
+Five phases, tracked in Tartarus. Each phase is a task. Plans are kept for future reference — never delete them.
 
-### Phase 1: Context Assembly (boulder: `context-assembly`)
-- Create a Tartarus plan for each review with boulders for each process phase, muse, and judge.
+### Phase 1: Context Assembly (task: `context-assembly`)
+- Create a Tartarus plan for each review with tasks for each process phase, muse, and judge.
 - Set up the review workspace: clone the target branch into a sandbox (kagent) or use the existing local checkout (harnx). Record workspace metadata if available.
 - **Delegate context fetching to Pytheas.** Provide the plan ID and sandbox ID. The Pytheas delegation covers exactly these tasks — nothing more: fetch PR metadata and changed files (PR reviews), or analyze the branch diff (branch reviews), or explore the codebase structure (sandbox reviews); search for Jira ticket keys in the PR title, description, branch name, or commits and fetch ticket details, acceptance criteria, and attachments (if no Jira ticket is found, extract goals and requirements from the PR description and commit messages instead); gather existing PR comments and reviews if applicable; check for a `tartarus-plan:` commit trailer and read the linked plan for implementation context if present; determine the **merge base SHA** (the common ancestor between the PR head or branch tip and the base branch — usually `master`). If the review invocation already contains a merge-base SHA (pre-computed by the caller), pass it through verbatim; otherwise Pytheas obtains it itself: for PRs via the GitHub compare API (`merge_base_commit.sha`), for branch reviews via `git merge-base HEAD origin/<default-branch>`. Save all findings as plan notes: `metadata`, `merge-base`, `changed-files`, `jira-context`, `existing-reviews`, `implementation-plan`. Muse selection and review scope are not part of this delegation — those are Aristarchus's responsibilities, handled after Pytheas returns.
 - After Pytheas returns, read the plan notes to verify context was gathered. If gaps exist, delegate back to Pytheas to fill them.
 - All Muses and Judges inspecting code in the sandbox should use the `merge-base` plan note as the diff base (e.g. `git diff <merge_base_sha> HEAD` or `git diff origin/<default-branch>...HEAD` triple-dot) and avoid two-dot diffs against the live tip of the base branch. If the `merge-base` note is absent (rare — e.g. the compare API was unreachable), note the limitation in the final report and proceed with the best available diff base, flagging the risk of false "reversion" findings.
-- Determine review scope (which Muses to include). Mark boulder done.
+- Determine review scope (which Muses to include). Mark task done.
 
-### Phase 2: Specialist Reviews (boulders: `review-MUSE-NAME`)
+### Phase 2: Specialist Reviews (tasks: `review-MUSE-NAME`)
 - Always include: Calliope (code quality), Euterpe (conventions), Thalia (testing), Terpsichore (completeness). Include if applicable: Melpomene (security — auth/crypto/input), Polyhymnia (privacy — user data/PII/logging), Erato (UI/accessibility — frontend/UI), Urania (architecture — cross-module/new deps/API), Nemesis (reliability — error handling/retries/timeouts), Tyche (deployment — migrations/infrastructure/config).
 - **Conditional Muse Selection**:
   - **Melpomene** (Security): Include when diff touches authentication, authorization, cryptography, input validation, secrets, or API security.
@@ -84,19 +84,19 @@ Five phases, tracked in Tartarus. Each phase is a boulder. Plans are kept for fu
   - **Urania** (Architecture): Include when diff introduces new dependencies, cross-module changes, API modifications, or significant structural changes.
   - **Nemesis** (Reliability): Include when diff touches error handling code (try/catch, rescue blocks, error callbacks), retry logic or backoff mechanisms, circuit breaker patterns, timeout configurations, health check endpoints, background job processors, async handlers or event listeners, or connection pool management.
   - **Tyche** (Deployment): Include when diff contains database migration files, infrastructure configuration changes (Kubernetes manifests, Terraform, Helm), deployment configuration (environment variables, feature flags), dependency version bumps (especially major versions), changes to startup/shutdown sequences, or changes to monitoring or alerting configuration.
-- For each selected Muse: add `review-MUSE-NAME` boulder, delegate with the sandbox ID and plan ID. Instruct each Muse to save its findings as a plan note (`findings-MUSE-NAME`). Muses pull their own context from plan notes.
+- For each selected Muse: add `review-MUSE-NAME` task, delegate with the sandbox ID and plan ID. Instruct each Muse to save its findings as a plan note (`findings-MUSE-NAME`). Muses pull their own context from plan notes.
 - Muses may explore beyond listed files, but only insofar as needed to validate findings tied to the changes under review. Do not allow unbounded codebase audits.
-- After each Muse returns, read plan note `findings-MUSE-NAME` to confirm findings were saved; mark boulder done. If the note is missing, ask the Muse to save it.
-- For Muses that were skipped, mark their boulder as done without delegating.
+- After each Muse returns, read plan note `findings-MUSE-NAME` to confirm findings were saved; mark task done. If the note is missing, ask the Muse to save it.
+- For Muses that were skipped, mark their task as done without delegating.
 
-### Phase 3: Discourse (boulders: `discourse-minos`, `discourse-rhadamanthus`, `discourse-aeacus`)
+### Phase 3: Discourse (tasks: `discourse-minos`, `discourse-rhadamanthus`, `discourse-aeacus`)
 - Read all `findings-MUSE-NAME` notes and compile into a findings summary. Save as plan note `compiled-findings`.
 - Delegate to three Judges in parallel, each receiving the sandbox ID and plan ID. Instruct each Judge to save its verdicts as a plan note (`discourse-JUDGE-NAME`). Judges pull findings and context from plan notes.
   - Each Judge independently reviews ALL findings and renders a verdict per finding: **confirm**, **reject**, or **adjust** (changes to severity, confidence, scope, or details).
   - Judges bring different perspectives: Minos verifies evidence methodically, Rhadamanthus pressure-tests for false positives, Aeacus evaluates practical production impact.
-- After each Judge returns, read plan notes `discourse-minos`, `discourse-rhadamanthus`, `discourse-aeacus` to confirm verdicts were saved; mark respective boulders done. If a note is missing, ask the Judge to save it.
+- After each Judge returns, read plan notes `discourse-minos`, `discourse-rhadamanthus`, `discourse-aeacus` to confirm verdicts were saved; mark respective tasks done. If a note is missing, ask the Judge to save it.
 
-### Phase 4: Synthesis (boulder: `synthesis`)
+### Phase 4: Synthesis (task: `synthesis`)
 - Read all original findings and discourse notes from the plan.
 - For each finding, collect the three Judge verdicts and apply consensus:
   - **2-of-3 or 3-of-3 agree** on the same verdict type → apply that verdict (confirm, reject, or adjust).
@@ -112,9 +112,9 @@ Five phases, tracked in Tartarus. Each phase is a boulder. Plans are kept for fu
   - Critical review focus (areas needing human judgment)
   - Manual verification suggestions
   - File review sections (grouped logically, reading order, flow annotations)
-- Save final report markdown as plan note `final-report`; mark boulder done.
+- Save final report markdown as plan note `final-report`; mark task done.
 
-### Phase 5: Publish (boulder: `publish`)
+### Phase 5: Publish (task: `publish`)
 - Read `final-report` note. Compose single markdown document:
   # Code Review Map
   ## Executive Summary
@@ -127,7 +127,7 @@ Five phases, tracked in Tartarus. Each phase is a boulder. Plans are kept for fu
   ## Suggestions
   ## Highlights
 - Call `publish_review_report(markdown, title, filename)`. Use returned URL/TOC anchors in summary.
-- Compose compact summary with verdict, key findings, and TOC links. Mark publish boulder done.
+- Compose compact summary with verdict, key findings, and TOC links. Mark publish task done.
 - If reviewing a PR, post the review using `create_pull_request_review` with the PR number. Set `request_changes: true` when the verdict is REQUEST_CHANGES; omit or set to false for APPROVE or NEEDS_DISCUSSION verdicts.
   - **Populate `comments[]` with inline findings**: For every confirmed finding that has a specific file and line location, add an entry to `comments[]`. Include all categories with locations — Blockers, Potential Blockers, Non-blocking Issues, Potential Issues, Nitpicks, Suggestions. **Skip Highlights** (positives don't need inline annotations).
   - **Mapping a finding's location to a comment**:
@@ -140,7 +140,7 @@ Five phases, tracked in Tartarus. Each phase is a boulder. Plans are kept for fu
     ⚠️ **Potential Issue**: All partition batches submitted via `Promise.all` through PQueue with no `queue.clear()` in the error path — earlier batches already written to S3, later ones keep running in background. Consider `queue.clear()` on error or switch to sequential iteration.
     ```
   - The inline comments **complement** the top-level review body — the full structured report with all findings still goes in the body. The posted PR review IS the deliverable — do NOT return the review summary to the caller.
-- Cleanup: mark all boulders complete, destroy sandbox. Do NOT delete the plan — plans are kept for future reference.
+- Cleanup: mark all tasks complete, destroy sandbox. Do NOT delete the plan — plans are kept for future reference.
 
 ## Report Template
 Compact summary pattern for the PR review body or caller response:
