@@ -4,7 +4,7 @@ model: claude:claude-sonnet-4-6
 compaction_agent: compact-coder
 model_fallbacks:
   - claude:claude-opus-4-7
-  - openai:gpt-4.1
+  - openai:gpt-5.4
 
 use_tools:
   - bash_exec

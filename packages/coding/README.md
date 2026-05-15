@@ -13,10 +13,10 @@ multi-agent orchestration overhead.
 
 ## Quick start
 
-Install from GHCR:
+Install from GHCR (replace `v0.1.0` with the current release):
 
 ```sh
-harnx pkg install ghcr.io/dobesv/harnx-packages/coding:latest
+harnx-pkg add ghcr.io/dobesv/harnx-packages/coding v0.1.0
 ```
 
 Set your API keys in `~/.config/harnx/.env`:
