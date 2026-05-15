@@ -43,9 +43,6 @@ args:
   - ~/.gitignore
   - --extra-read
   - ~/.gitignore_global
-  # Allow access to codescene config/license
-  - --extra-rwx
-  - ~/.codescene
   # Allow access to user-local binaries
   - --extra-exec
   - ~/.local/bin

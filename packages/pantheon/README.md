@@ -228,13 +228,16 @@ Since package files are read-only, use the patch file to customise MCP servers:
 # ~/.config/harnx/packages/pantheon.patch.yaml
 mcp_servers:
   "bash":
-    # Append extra args without replacing the package's existing args:
+    # Append extra args without replacing the package's existing args.
+    # --extra-exec / --extra-rwx extend sandbox filesystem access.
+    # --env VAR_NAME passes a variable from the host into sandboxed commands.
     args_append:
       - --extra-exec
       - /opt/company-tools/bin
-    # Merge extra env vars (package env vars are preserved):
-    env:
-      MY_TOKEN: "..."
+      - --extra-rwx
+      - ~/.codescene
+      - --env
+      - CS_ACCESS_TOKEN
     # Replace the roots list entirely:
     roots:
       - "."
@@ -251,7 +254,7 @@ Available patch keys per server:
 | `enabled` | Enable or disable the server |
 | `args` | Replace the args list entirely |
 | `args_append` | Append args after the package's existing args |
-| `env` | Merge env vars (patch keys win; others preserved) |
+| `env` | Set environment variables on the server process (key/value pairs). Mainly useful for servers that read config from their environment (e.g. API keys for `exa`). |
 | `roots` | Replace the roots list entirely |
 
 ### Optional / advanced
