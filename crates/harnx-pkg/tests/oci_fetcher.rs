@@ -17,6 +17,30 @@ use harnx_pkg::{
     credentials::resolve_oci_auth,
     fetch::{oci::OciFetcher, PackageFetcher},
 };
+
+static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn new(key: &'static str, val: impl AsRef<std::path::Path>) -> Self {
+        let prev = std::env::var_os(key);
+        unsafe { std::env::set_var(key, val.as_ref()) };
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => unsafe { std::env::set_var(self.key, v) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
 use oci_client::{
     client::{ClientConfig, ClientProtocol, Config, ImageLayer},
     manifest,
@@ -121,10 +145,9 @@ async fn test_oci_fetch_with_basic_auth() {
         "testpass",
     );
 
-    // Set config dir, resolve auth (async-safe), then restore
-    unsafe { std::env::set_var("HARNX_CONFIG_DIR", config_dir.path()) };
+    let _env_lock = ENV_MUTEX.lock().await;
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", config_dir.path());
     let auth = resolve_oci_auth(&format!("oci://{image}")).await.unwrap();
-    unsafe { std::env::remove_var("HARNX_CONFIG_DIR") };
 
     let fetcher = OciFetcher::with_auth(auth);
     let result = fetcher
@@ -165,10 +188,9 @@ async fn test_oci_fetch_wrong_auth_fails() {
         "wrongpass",
     );
 
-    // Set config dir, resolve auth (async-safe), then restore
-    unsafe { std::env::set_var("HARNX_CONFIG_DIR", config_dir.path()) };
+    let _env_lock = ENV_MUTEX.lock().await;
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", config_dir.path());
     let auth = resolve_oci_auth(&format!("oci://{image}")).await.unwrap();
-    unsafe { std::env::remove_var("HARNX_CONFIG_DIR") };
 
     let fetcher = OciFetcher::with_auth(auth);
     let result = fetcher

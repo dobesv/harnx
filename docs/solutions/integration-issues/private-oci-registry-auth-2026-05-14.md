@@ -31,7 +31,7 @@ harnx-pkg's OCI fetcher had no mechanism to authenticate against private OCI reg
 
 Implemented per-registry credential configuration stored in `~/.config/harnx/package_repos/*.yaml`. Each YAML file specifies a registry URL prefix and optional `username` and `password` fields. Credentials can be sourced from:
 - `env: VAR_NAME` — read from environment variable
-- `command: "sh -c ..."` — execute shell command (e.g., `gh auth token`)
+- `command: "..."` — execute command directly (e.g., `gh auth token`)
 - `value: "literal"` — hardcoded value
 
 Created `credentials` module with `resolve_oci_auth(url)` that finds matching config and constructs `RegistryAuth::Basic` or `Anonymous`.

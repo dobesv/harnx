@@ -26,9 +26,9 @@ Credentials (username and password) can be sourced in three ways:
     ```yaml
     password: { env: "VAR_NAME" }
     ```
-*   **`command`**: Runs a shell command and uses its `stdout` (trimmed) as the credential.
+*   **`command`**: Runs a command and uses its `stdout` (trimmed) as the credential.
     ```yaml
-    password: { command: "sh cmd" }
+    password: { command: "gh auth token" }
     ```
 *   **`value`**: Uses an inline literal value. Avoid using this for secrets.
     ```yaml

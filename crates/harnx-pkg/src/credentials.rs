@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -64,7 +63,9 @@ fn normalized_prefix(value: &str) -> &str {
 }
 
 fn stripped_url(url: &str) -> &str {
-    url.strip_prefix("oci://").unwrap_or(url)
+    url.strip_prefix("oci://")
+        .or_else(|| url.strip_prefix("OCI://"))
+        .unwrap_or(url)
 }
 
 fn split_host_and_path(url: &str) -> (&str, &str) {
@@ -79,7 +80,7 @@ fn is_repo_prefix_match(target: &str, config: &str) -> bool {
     let (target_host, target_path) = split_host_and_path(target);
     let (config_host, config_path) = split_host_and_path(config);
 
-    if target_host != config_host {
+    if !target_host.eq_ignore_ascii_case(config_host) {
         return false;
     }
 
@@ -97,23 +98,29 @@ fn is_repo_prefix_match(target: &str, config: &str) -> bool {
         .is_none_or(|byte| *byte == b'/')
 }
 
-fn load_repo_config(path: &Path) -> Result<PackageRepoConfig> {
-    let raw = fs::read_to_string(path)
+async fn load_repo_config(path: &Path) -> Result<PackageRepoConfig> {
+    let raw = tokio::fs::read_to_string(path)
+        .await
         .with_context(|| format!("failed to read package repo config {}", path.display()))?;
     serde_yaml::from_str(&raw)
         .with_context(|| format!("failed to parse package repo config {}", path.display()))
 }
 
-fn repo_config_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+async fn repo_config_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .with_context(|| format!("failed to read package repo dir {}", dir.display()))?;
 
-    for entry in fs::read_dir(dir)
-        .with_context(|| format!("failed to read package repo dir {}", dir.display()))?
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .with_context(|| "failed to read package repo dir entry")?
     {
-        let entry = entry.with_context(|| "failed to read package repo dir entry")?;
         let path = entry.path();
         if entry
             .file_type()
+            .await
             .with_context(|| format!("failed to read file type for {}", path.display()))?
             .is_file()
             && path.extension().is_some_and(|ext| ext == "yaml")
@@ -125,20 +132,29 @@ fn repo_config_paths(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn find_repo_config(url: &str) -> Result<Option<PackageRepoConfig>> {
+async fn find_repo_config(url: &str) -> Result<Option<PackageRepoConfig>> {
     let dir = harnx_core::config_paths::package_repos_dir();
-    if !dir.exists() {
+    if tokio::fs::metadata(&dir).await.is_err() {
         return Ok(None);
     }
 
     let target = stripped_url(url);
-    let mut matches = repo_config_paths(&dir)?
-        .into_iter()
-        .map(|path| load_repo_config(&path))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|config| is_repo_prefix_match(target, &config.url))
-        .collect::<Vec<_>>();
+    let mut matches = Vec::new();
+    for path in repo_config_paths(&dir).await? {
+        match load_repo_config(&path).await {
+            Ok(config) => {
+                if is_repo_prefix_match(target, &config.url) {
+                    matches.push(config);
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Skipping malformed credential config {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
 
     matches.sort_by(|a, b| {
         normalized_prefix(stripped_url(&b.url))
@@ -150,7 +166,7 @@ fn find_repo_config(url: &str) -> Result<Option<PackageRepoConfig>> {
 }
 
 pub async fn resolve_oci_auth(url: &str) -> Result<RegistryAuth> {
-    let Some(config) = find_repo_config(url)? else {
+    let Some(config) = find_repo_config(url).await? else {
         return Ok(RegistryAuth::Anonymous);
     };
 
@@ -187,25 +203,13 @@ mod tests {
         ENV_MUTEX.get_or_init(|| Mutex::new(()))
     }
 
-    fn with_env_var<F, R>(key: &str, value: Option<&str>, f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        let _guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
-        let prior = env::var_os(key);
+    fn set_env_var(key: &'static str, value: Option<&str>) -> std::sync::MutexGuard<'static, ()> {
+        let guard = env_mutex().lock().unwrap_or_else(|e| e.into_inner());
         match value {
             Some(value) => unsafe { env::set_var(key, value) },
             None => unsafe { env::remove_var(key) },
         }
-
-        let result = f();
-
-        match prior {
-            Some(value) => unsafe { env::set_var(key, value) },
-            None => unsafe { env::remove_var(key) },
-        }
-
-        result
+        guard
     }
 
     #[test]
@@ -311,8 +315,9 @@ mod tests {
         assert_eq!(resolved, "literal-secret");
     }
 
-    #[test]
-    fn prefix_match_most_specific() {
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn prefix_match_most_specific() {
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_dir = temp_dir.path().join("package_repos");
         fs::create_dir_all(&repo_dir).unwrap();
@@ -327,17 +332,18 @@ mod tests {
         )
         .unwrap();
 
-        let found = with_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str(), || {
-            find_repo_config("ghcr.io/myorg/pkg")
-        })
-        .unwrap()
-        .unwrap();
+        let _guard = set_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str());
+        let found = find_repo_config("ghcr.io/myorg/pkg")
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(found.url, "ghcr.io/myorg");
     }
 
-    #[test]
-    fn prefix_match_no_partial_path_segment() {
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn prefix_match_no_partial_path_segment() {
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_dir = temp_dir.path().join("package_repos");
         fs::create_dir_all(&repo_dir).unwrap();
@@ -347,16 +353,36 @@ mod tests {
         )
         .unwrap();
 
-        let found = with_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str(), || {
-            find_repo_config("ghcr.io/myorg-evil/pkg")
-        })
-        .unwrap();
+        let _guard = set_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str());
+        let found = find_repo_config("ghcr.io/myorg-evil/pkg").await.unwrap();
 
         assert!(found.is_none());
     }
 
-    #[test]
-    fn prefix_match_no_host_suffix() {
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn prefix_match_host_case_insensitive() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("package_repos");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::write(
+            repo_dir.join("ghcr.yaml"),
+            "url: GHCR.IO/myorg\npassword:\n  value: token\n",
+        )
+        .unwrap();
+
+        let _guard = set_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str());
+        let found = find_repo_config("ghcr.io/myorg/pkg")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.url, "GHCR.IO/myorg");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn prefix_match_no_host_suffix() {
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_dir = temp_dir.path().join("package_repos");
         fs::create_dir_all(&repo_dir).unwrap();
@@ -366,16 +392,17 @@ mod tests {
         )
         .unwrap();
 
-        let found = with_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str(), || {
-            find_repo_config("registry.internal.attacker.com/pkg")
-        })
-        .unwrap();
+        let _guard = set_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str());
+        let found = find_repo_config("registry.internal.attacker.com/pkg")
+            .await
+            .unwrap();
 
         assert!(found.is_none());
     }
 
-    #[test]
-    fn prefix_match_none() {
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn prefix_match_none() {
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_dir = temp_dir.path().join("package_repos");
         fs::create_dir_all(&repo_dir).unwrap();
@@ -385,16 +412,15 @@ mod tests {
         )
         .unwrap();
 
-        let found = with_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str(), || {
-            find_repo_config("example.com/other/pkg")
-        })
-        .unwrap();
+        let _guard = set_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str());
+        let found = find_repo_config("example.com/other/pkg").await.unwrap();
 
         assert!(found.is_none());
     }
 
-    #[test]
-    fn prefix_match_strips_scheme() {
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn prefix_match_strips_scheme() {
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_dir = temp_dir.path().join("package_repos");
         fs::create_dir_all(&repo_dir).unwrap();
@@ -404,11 +430,11 @@ mod tests {
         )
         .unwrap();
 
-        let found = with_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str(), || {
-            find_repo_config("oci://ghcr.io/myorg/pkg")
-        })
-        .unwrap()
-        .unwrap();
+        let _guard = set_env_var("HARNX_CONFIG_DIR", temp_dir.path().to_str());
+        let found = find_repo_config("oci://ghcr.io/myorg/pkg")
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(found.url, "ghcr.io/myorg");
     }
