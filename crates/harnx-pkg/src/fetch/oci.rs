@@ -14,7 +14,23 @@ use oci_client::{
 use super::{FetchedPackage, PackageFetcher};
 use crate::semver_util::parse_semver_tag;
 
-pub struct OciFetcher;
+pub struct OciFetcher {
+    auth: RegistryAuth,
+}
+
+impl OciFetcher {
+    // Used by integration tests; binary resolves auth via resolve_oci_auth → with_auth
+    #[allow(dead_code)]
+    pub fn anonymous() -> Self {
+        Self {
+            auth: RegistryAuth::Anonymous,
+        }
+    }
+
+    pub fn with_auth(auth: RegistryAuth) -> Self {
+        Self { auth }
+    }
+}
 
 #[async_trait]
 impl PackageFetcher for OciFetcher {
@@ -27,7 +43,7 @@ impl PackageFetcher for OciFetcher {
             .with_context(|| format!("invalid OCI reference for '{url}:{tag}'"))?;
 
         let client = oci_client_for_registry(&registry);
-        let auth = RegistryAuth::Anonymous;
+        let auth = self.auth.clone();
         let accepted_media_types = [
             manifest::IMAGE_LAYER_MEDIA_TYPE,
             manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
@@ -79,7 +95,7 @@ impl PackageFetcher for OciFetcher {
 
         let client = oci_client_for_registry(&registry);
         let response = client
-            .list_tags(&reference, &RegistryAuth::Anonymous, None, None)
+            .list_tags(&reference, &self.auth, None, None)
             .await
             .with_context(|| format!("failed to list OCI tags for '{url}'"))?;
 

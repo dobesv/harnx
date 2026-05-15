@@ -31,10 +31,11 @@ serde_yaml = { workspace = true }
 simplelog = { workspace = true }
 tar = "0.4"
 tempfile = "3"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
 
 [dev-dependencies]
 axum = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 mockall = { workspace = true }
 registry-testkit = { workspace = true }

@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod credentials;
 mod fetch;
 mod install;
 mod semver_util;

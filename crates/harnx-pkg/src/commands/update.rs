@@ -21,7 +21,7 @@ pub async fn run(args: &UpdateArgs) -> Result<()> {
 }
 
 async fn update_one(manifest: PackageManifest) -> Result<()> {
-    let fetcher = fetcher_for_source(&manifest.source);
+    let fetcher = fetcher_for_source(&manifest.source).await?;
     let url = source_url(&manifest.source);
     let installed_tag = source_tag(&manifest.source);
     let installed_ver = parse_semver_tag(installed_tag)?;
