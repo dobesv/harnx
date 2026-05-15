@@ -1,0 +1,8 @@
+command: harnx-mcp-fs
+description: Filesystem read/write access for agents
+
+# Restricts agent filesystem access to the current working directory.
+# To allow access to additional paths, shadow this file with your own copy at
+# ~/.config/harnx/mcp_servers/fs.yaml and add entries to roots:
+roots:
+  - "."

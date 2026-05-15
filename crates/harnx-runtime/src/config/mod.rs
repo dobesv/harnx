@@ -287,6 +287,56 @@ fn package_dir_name(path: &std::path::Path) -> Option<String> {
 }
 
 /// Compute the display name for an MCP server given the active agent's package.
+/// Load the package patch file for `pkg_name`, returning `None` if it doesn't exist.
+fn load_package_mcp_patch(pkg_name: &str) -> Option<harnx_core::package::PackagePatch> {
+    let patch_path = paths::package_patch_file(pkg_name);
+    if !patch_path.exists() {
+        return None;
+    }
+    let content = read_to_string(&patch_path).ok()?;
+    serde_yaml::from_str(&content).ok()
+}
+
+/// Apply matching entries from a package patch's `mcp_servers` map to a server config.
+///
+/// Keys are fancy-regex patterns matched against the bare server name (stem).
+/// On match:
+/// - `enabled`  replaces the server's enabled flag.
+/// - `args`     replaces the server's args list entirely.
+/// - `env`      is merged into the server's env (patch keys win, others preserved).
+/// - `roots`    replaces the server's roots list entirely.
+fn apply_mcp_server_patch(
+    server: &mut McpServerConfig,
+    patches: &indexmap::IndexMap<String, harnx_core::package::McpServerPatch>,
+) {
+    use fancy_regex::Regex;
+    for (pattern, patch) in patches {
+        let Ok(regex) = Regex::new(pattern) else {
+            log::warn!("Invalid package mcp_server patch regex: '{pattern}'");
+            continue;
+        };
+        let matched = regex.is_match(&server.name).unwrap_or(false);
+        if !matched {
+            continue;
+        }
+        if let Some(enabled) = patch.enabled {
+            server.enabled = enabled;
+        }
+        if let Some(args) = &patch.args {
+            server.args = args.clone();
+        }
+        if !patch.args_append.is_empty() {
+            server.args.extend(patch.args_append.clone());
+        }
+        if !patch.env.is_empty() {
+            server.env.extend(patch.env.clone());
+        }
+        if let Some(roots) = &patch.roots {
+            server.roots = roots.clone();
+        }
+    }
+}
+
 ///
 /// - Top-level servers (`package == None`): unchanged name.
 /// - Same-package servers: bare name (the yaml stem, e.g. `fs`).
@@ -2890,8 +2940,12 @@ impl Config {
     fn load_package_servers(config: &mut Config, pkg_path: &Path, pkg_name: &str) {
         let pkg_mcp_dir = pkg_path.join(paths::MCP_SERVERS_DIR_NAME);
         if pkg_mcp_dir.is_dir() {
+            let patch = load_package_mcp_patch(pkg_name);
             for mut server in Self::load_mcp_servers_from_dir(&pkg_mcp_dir).unwrap_or_default() {
                 server.package = Some(pkg_name.to_string());
+                if let Some(patch) = &patch {
+                    apply_mcp_server_patch(&mut server, &patch.mcp_servers);
+                }
                 config.mcp_servers.push(server);
             }
         }

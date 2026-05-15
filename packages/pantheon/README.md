@@ -46,7 +46,7 @@ results, and a multi-agent code review pipeline.
 ### Compaction Agents
 `compact-dev`, `compact-researcher`, `compact-planner`, `compact-reviewer`,
 `compact-argus`, `compact-mnemosyne`, `compact-reliability`, `compact-deploy` —
-lightweight context-compression agents (gemini-2.5-flash-lite) used to keep
+lightweight context-compression agents (gemini-3.1-flash-lite-preview) used to keep
 long conversations within token limits.
 
 ---
@@ -65,6 +65,7 @@ Then set your API keys in `~/.config/harnx/.env`:
 CLAUDE_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 GEMINI_API_KEY=AIza...
+BEDROCK_API_KEY=...   # for the zai.glm-5 agents
 ```
 
 Run Sisyphus:
@@ -83,76 +84,87 @@ harnx daedalus
 
 ## Client configs included
 
-The package ships three generic client configs:
+The package ships four client configs:
 
 | File | Provider | Used by |
 |------|----------|---------|
 | `clients/claude.yaml` | Anthropic Claude API | sisyphus, daedalus, atlas |
 | `clients/openai.yaml` | OpenAI API | hephaestus, plato, aristarchus, zosimus, … |
 | `clients/gemini.yaml` | Google Gemini API | argus, clio, pytheas, compaction agents, … |
+| `clients/bedrock.yaml` | AWS Bedrock | hermes, hestia, athena, metis, oracle, mnemosyne, nemesis, rhadamanthus, tyche, urania |
 
 API keys are loaded from `~/.config/harnx/.env` (recommended) or from the
-environment. The variable names are `CLAUDE_API_KEY`, `OPENAI_API_KEY`, and
-`GEMINI_API_KEY`.
+environment. Variable names: `CLAUDE_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `BEDROCK_API_KEY`.
 
 ---
 
 ## Overriding models
 
-The package ships with sensible public-release defaults. You can override any
-agent's model without editing the package files by creating a local override
-file in your harnx config directory.
+The package ships with sensible public-release defaults. To override agent
+settings without editing package files (which are overwritten on update), use a
+**patch file** placed next to the installed package directory:
 
-### Override a single agent's model
-
-Create `~/.config/harnx/agents/<agent-name>.md` with just the frontmatter
-fields you want to change. Harnx merges local agent files with package agents,
-with the local file taking precedence for any keys it defines.
-
-Example — use Claude Opus for Hephaestus instead of GPT-4.1:
-
-```markdown
----
-model: claude:claude-opus-4-7
----
+```
+~/.config/harnx/packages/pantheon.patch.yaml
 ```
 
-Save as `~/.config/harnx/agents/hephaestus.md`.
+### Patch file format
+
+```yaml
+agents:
+  ".*":                      # regex matched against bare agent name
+    model: claude:claude-opus-4-7   # override model for every agent
+  "hephaestus":              # match only hephaestus
+    model: openai:o3
+  "zosimus":
+    model: openai:o3
+```
+
+Keys in the patch take precedence over the package's values. The regex is
+matched against the bare agent name (e.g. `hephaestus`), not the qualified
+`pantheon/hephaestus` form.
 
 ### Use your own private/preview models
 
-If you have access to preview models (e.g. newer Gemini or GPT snapshots), you
-can override agent models to point to those. Example for all Gemini agents:
+If you have access to preview models, override per-agent or use `".*"` to
+replace all at once:
 
-```sh
-# ~/.config/harnx/agents/sisyphus.md
----
-model: claude:claude-sonnet-4-6    # your preferred private model
----
+```yaml
+# ~/.config/harnx/packages/pantheon.patch.yaml
+agents:
+  ".*":
+    model: openai:gpt-5.4   # replace every agent's model
 ```
 
 ### Using the Bedrock client for `zai.glm-5` agents
 
 Several agents (hermes, hestia, athena, metis, oracle, mnemosyne, nemesis,
-rhadamanthus, tyche, urania) use `bedrock:zai.glm-5` via AWS Bedrock. To use
-them, add `~/.config/harnx/clients/bedrock.yaml`:
+rhadamanthus, tyche, urania) use `bedrock:zai.glm-5`. The Bedrock client config
+is included in the package (`clients/bedrock.yaml`) — no manual setup needed.
 
-```yaml
-type: openai-compatible
-name: bedrock
-api_base: https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1
-models:
-  - name: zai.glm-5
-    type: chat
-    max_input_tokens: 200000
-    max_output_tokens: 128000
+Set your Bedrock API key in `~/.config/harnx/.env`:
+
+```sh
+BEDROCK_API_KEY=...
 ```
 
-AWS credentials are picked up from the standard environment (`AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, `AWS_REGION`) or from `~/.aws/credentials`.
+If you use a different AWS region, override `api_base` via the patch file:
 
-If you don't have Bedrock access, override those agents to use any OpenAI-compatible
-model, e.g. `openai:gpt-4.1-mini`.
+```yaml
+# ~/.config/harnx/packages/pantheon.patch.yaml
+clients:
+  "bedrock":
+    api_base: https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1
+```
+
+If you don't have Bedrock access, override those agents to a different model:
+
+```yaml
+# ~/.config/harnx/packages/pantheon.patch.yaml
+agents:
+  "hermes|hestia|athena|metis|oracle|mnemosyne|nemesis|rhadamanthus|tyche|urania":
+    model: openai:gpt-4.1-mini
+```
 
 ---
 
@@ -171,18 +183,78 @@ local `~/.config/harnx/agents/shared/` directory.
 
 ---
 
-## MCP servers used
+## MCP servers
 
-Agents in this package use the following MCP tool namespaces. Install the
-corresponding MCP servers in your harnx config to use all features:
+The package includes ready-to-use MCP server configs in `mcp_servers/`. These
+are automatically active when the package is installed — you don't need to copy
+or symlink anything.
 
-| Namespace | Server | Purpose |
-|-----------|--------|---------|
-| `bash_*` | `harnx-mcp-bash` (bundled) | Shell execution |
-| `fs_*` | `harnx-mcp-fs` (bundled) | File system read/write |
-| `plans_*` | `harnx-mcp-plans` (bundled) | Plan/task management |
-| `time_*` | `harnx-mcp-time` (bundled) | Time utilities |
-| `fetch_*` | `mcp-fetch` | HTTP fetch |
-| `exa_*` | `mcp-exa` | Web search (Exa API) |
-| `context7_*` | `mcp-context7` | Library documentation |
-| `grep_*` | `mcp-grep` | GitHub code search |
+> **Don't edit files inside the package directory.** They will be overwritten
+> when you run `harnx-pkg update`. To customise a server, create a file with
+> the same name in `~/.config/harnx/mcp_servers/` — your top-level config
+> takes precedence over the package's copy.
+
+### Bundled with harnx (no extra install)
+
+| Server | Namespace | Notes |
+|--------|-----------|-------|
+| `bash.yaml` | `bash_*` | Shell execution. Rooted at `.` (working directory). Common toolchain exec paths (asdf, bun, cargo, nvm, pyenv, rustup, yarn, etc.) are pre-configured — non-existent paths are silently ignored. |
+| `fs.yaml` | `fs_*` | Filesystem read/write. Rooted at `.` (working directory) to avoid exposing credentials in `~`. |
+| `plans.yaml` | `plans_*` | Plan/task/note management, stored in `.agent/plans/` relative to the working directory. |
+| `time.yaml` | `time_*` | Current time and wait/sleep utilities. |
+
+### External servers (require install)
+
+| Server | Namespace | Requires | Notes |
+|--------|-----------|----------|-------|
+| `fetch.yaml` | `fetch_*` | Node.js / npx | Fetches URLs as markdown or text. No API key. |
+| `exa.yaml` | `exa_*` | Node.js / npx | Web search via Exa. Requires `EXA_API_KEY`. |
+| `context7.yaml` | `context7_*` | Node.js / npx | Library docs lookup. No API key. |
+| `grep.yaml` | `grep_*` | uv / uvx | GitHub code search via grep.app. No API key. |
+
+Add your Exa key to `~/.config/harnx/.env`:
+
+```sh
+EXA_API_KEY=...
+```
+
+Get a key at [exa.ai](https://exa.ai).
+
+### Customising MCP server config
+
+Since package files are read-only, use the patch file to customise MCP servers:
+
+```yaml
+# ~/.config/harnx/packages/pantheon.patch.yaml
+mcp_servers:
+  "bash":
+    # Append extra args without replacing the package's existing args:
+    args_append:
+      - --extra-exec
+      - /opt/company-tools/bin
+    # Merge extra env vars (package env vars are preserved):
+    env:
+      MY_TOKEN: "..."
+    # Replace the roots list entirely:
+    roots:
+      - "."
+      - /opt/company-sdk
+  "exa":
+    # Disable a server you don't want:
+    enabled: false
+```
+
+Available patch keys per server:
+
+| Key | Effect |
+|-----|--------|
+| `enabled` | Enable or disable the server |
+| `args` | Replace the args list entirely |
+| `args_append` | Append args after the package's existing args |
+| `env` | Merge env vars (patch keys win; others preserved) |
+| `roots` | Replace the roots list entirely |
+
+### Optional / advanced
+
+`tmux_*` and `trigger_agent` tools in `sisyphus.md` are harnx built-ins for
+TUI/tmux workflow features — no separate server config needed.

@@ -1,0 +1,46 @@
+command: harnx-mcp-bash
+description: Shell execution — lets agents run commands and scripts
+
+# Restricts the bash sandbox to the current working directory.
+# To allow access to additional paths, shadow this file with your own copy at
+# ~/.config/harnx/mcp_servers/bash.yaml and add entries to roots: / args:
+roots:
+  - "."
+
+args:
+  # --- common tool ecosystem paths ---
+  # Non-existent paths are silently ignored, so it's safe to include all of these.
+  - --extra-exec
+  - ~/.asdf
+  - --extra-exec
+  - ~/.bun
+  - --extra-rwx
+  - ~/.bun/install/cache
+  - --extra-rwx
+  - ~/.cache
+  - --extra-exec
+  - ~/.cargo
+  - --extra-exec
+  - ~/.local/bin
+  - --extra-rwx
+  - ~/.npm
+  - --extra-rwx
+  - ~/.nvm
+  - --extra-exec
+  - ~/.pyenv
+  - --extra-rwx
+  - ~/.ruff_cache
+  - --extra-exec
+  - ~/.rustup
+  - --extra-rwx
+  - ~/.yarn
+
+  # --- git / GitHub ---
+  - --env
+  - GITHUB_TOKEN
+  - --env
+  - GH_TOKEN
+
+  # --- prevent interactive editor prompts ---
+  - --env
+  - EDITOR=true

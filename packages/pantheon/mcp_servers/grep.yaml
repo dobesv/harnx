@@ -1,0 +1,9 @@
+command: uvx
+args:
+  - "grep-mcp"
+description: >-
+  GitHub code search via grep.app. Used by Pytheas, Sisyphus, and Zosimus
+  to find real-world usage examples of APIs and patterns in public repos.
+
+# Requires: uv / uvx  (https://docs.astral.sh/uv/)
+# No API key needed.

@@ -1,0 +1,2 @@
+command: harnx-mcp-time
+description: Time and timezone utilities — lets agents check the current time and wait.
