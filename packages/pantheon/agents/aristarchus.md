@@ -1,5 +1,4 @@
 ---
-role: subagent
 model: openai:gpt-5.4
 compaction_agent: compact-reviewer
 use_tools:
