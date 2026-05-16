@@ -1,6 +1,15 @@
 # Multi-package syntax (`[packages.harnx]`) is used so existing changeset
 # files keep their `harnx: <level>` front matter. With single-package
 # `[package]` syntax, changesets would need to drop the package name.
+#
+# Agent packages (pantheon, coding, …) each have their own entry below.
+# Their versions live in packages/<name>/package.yaml and changelogs in
+# packages/<name>/CHANGELOG.md. Changesets targeting them use the package
+# name as the key, e.g.:
+#   ---
+#   pantheon: minor
+#   ---
+# Knope tags them as `pantheon/v0.2.0`, which triggers publish-packages.yaml.
 [packages.harnx]
 # All workspace crates (except ratatui-widget-scrolling) inherit `version`
 # from `[workspace.package]` in the root Cargo.toml. knope updates that one
@@ -13,11 +22,41 @@ changelog = "CHANGELOG.md"
 # trigger pattern in `.github/workflows/release.yaml` matches accordingly.
 tag_prefix = "v"
 
+[packages.pantheon]
+versioned_files = [
+  { path = "packages/pantheon/package.yaml", regex = 'version: v(?<version>\d+\.\d+\.\d+.*)' },
+]
+changelog = "packages/pantheon/CHANGELOG.md"
+tag_prefix = "v"
+
+[packages.coding]
+versioned_files = [
+  { path = "packages/coding/package.yaml", regex = 'version: v(?<version>\d+\.\d+\.\d+.*)' },
+]
+changelog = "packages/coding/CHANGELOG.md"
+tag_prefix = "v"
+
 [[workflows]]
 name = "release"
 
 [[workflows.steps]]
 type = "PrepareRelease"
+
+# Sync the `version:` field in all agent .md frontmatter to match the
+# package version that PrepareRelease just wrote to each package.yaml.
+[[workflows.steps]]
+type = "Command"
+command = """
+for pkg in pantheon coding; do
+  dir="packages/$pkg"
+  [ -f "$dir/package.yaml" ] || continue
+  ver=$(grep -m1 '^version:' "$dir/package.yaml" | sed "s/version: v//")
+  [ -n "$ver" ] || continue
+  find "$dir/agents" -maxdepth 1 -name "*.md" | while read f; do
+    sed -i "s/^version: .*/version: '$ver'/" "$f"
+  done
+done
+"""
 
 # `PrepareRelease` deletes the consumed changeset files from disk but
 # (in our setup) doesn't always stage those deletions. Force-stage

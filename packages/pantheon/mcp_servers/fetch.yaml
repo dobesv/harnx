@@ -1,0 +1,9 @@
+command: npx
+args:
+  - "-y"
+  - "mcp-fetch-server@1.1.2"
+description: >-
+  Fetch web pages as markdown, plain text, or JSON. Used by Pytheas,
+  Zosimus, Hephaestus, and other agents to read documentation and URLs.
+
+# Requires: Node.js / npx

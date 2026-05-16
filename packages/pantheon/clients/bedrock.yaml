@@ -1,0 +1,15 @@
+type: openai-compatible
+name: bedrock
+# AWS Bedrock OpenAI-compatible endpoint.
+# Change the region in api_base if you use a different one.
+api_base: https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1
+models:
+  - name: zai.glm-5
+    type: chat
+    max_input_tokens: 200000
+    max_output_tokens: 128000
+
+# Authentication: set BEDROCK_API_KEY in ~/.config/harnx/.env
+# This should be an AWS SigV4-signed token or API key configured for your
+# Bedrock endpoint. The standard AWS credential chain is not currently
+# supported — the key must be provided explicitly.

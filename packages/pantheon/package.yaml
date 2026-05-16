@@ -1,0 +1,12 @@
+name: pantheon
+version: v0.1.0
+description: >
+  The Pantheon compound-engineering agent suite — Sisyphus orchestrator plus
+  a full roster of specialist agents (Hephaestus, Iris, Apollo, Athena, Hermes,
+  Hestia, Plato, Clio, Mnemosyne, Argus, Aristarchus, Pytheas, Zosimus,
+  Librarian, Oracle, Peitho, and many more). Includes the Daedalus/Atlas
+  plan-execution pipeline and the full Aristarchus multi-agent code review
+  pipeline with 9 Muses and 3 Judges.
+harnx_min_version: "0.30.0"
+homepage: https://github.com/dobesv/harnx
+license: MIT OR Apache-2.0

@@ -1,0 +1,11 @@
+type: openai
+# api_key: sk-...   # or set OPENAI_API_KEY env var
+# api_base: https://api.openai.com/v1   # optional override
+
+# Use patch to set per-model options like reasoning_effort.
+# Keys under chat_completions are regex patterns matched against the full model name.
+# patch:
+#   chat_completions:
+#     'o3':
+#       body:
+#         reasoning_effort: high

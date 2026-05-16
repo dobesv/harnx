@@ -1,0 +1,9 @@
+type: claude
+# api_key: sk-ant-...   # or set CLAUDE_API_KEY env var
+
+patch:
+  chat_completions:
+    '.*':
+      body:
+        cache_control:
+          type: ephemeral

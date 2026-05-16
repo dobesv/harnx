@@ -1,0 +1,13 @@
+command: npx
+args:
+  - "-y"
+  - "exa-mcp-server"
+description: >-
+  Web search via Exa API. Used by Librarian, Sisyphus, and Zosimus for
+  research and fact-finding.
+
+# Requires: Node.js / npx and an Exa API key.
+# Set EXA_API_KEY in ~/.config/harnx/.env
+# Sign up at https://exa.ai to get a key.
+env:
+  EXA_API_KEY: "$EXA_API_KEY"

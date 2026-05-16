@@ -1,0 +1,83 @@
+command: harnx-mcp-bash
+description: Shell execution — lets agents run commands and scripts
+
+# Restricts the bash sandbox to the current working directory.
+# To allow access to additional paths, shadow this file with your own copy at
+# ~/.config/harnx/mcp_servers/bash.yaml and add entries to roots: / args:
+roots:
+  - "."
+
+args:
+  # Allow access to asdf installed binaries
+  - --extra-exec
+  - ~/.asdf
+  - --extra-read
+  - ~/.tool-versions
+  - --extra-read
+  - ~/dev_cert
+  # Allow access to bun binaries and cache
+  - --extra-exec
+  - ~/.bun
+  - --extra-rwx
+  - ~/.bun/install/cache
+  # Allow access to various caches
+  - --extra-rwx
+  - ~/.cache
+  # Allow access to various config files
+  - --extra-read
+  - ~/.config/acli
+  - --extra-write
+  - ~/.config/chromium
+  - --extra-read
+  - ~/.config/dcg
+  - --extra-read
+  - ~/.config/git
+  - --extra-rwx
+  - ~/.config/go
+  - --extra-read
+  - ~/.config/rtk
+  # Git config
+  - --extra-read
+  - ~/.gitconfig
+  - --extra-read
+  - ~/.gitignore
+  - --extra-read
+  - ~/.gitignore_global
+  # Allow access to user-local binaries
+  - --extra-exec
+  - ~/.local/bin
+  # Allow access to mono
+  - --extra-rwx
+  - ~/.mono
+  # Allow access to npm config and cache
+  - --extra-rwx
+  - ~/.npm
+  # Allow access to npm config and cache
+  - --extra-rwx
+  - ~/.nvm
+  - --extra-rwx
+  - ~/.ruff_cache
+  - --extra-exec
+  - ~/.rustup
+  # Allow cargo registry proc-macro .so files to be dlopen'd by rustc
+  - --extra-exec
+  - ~/.cargo
+  - --extra-rwx
+  - ~/.yarn
+  # Allow access to google chrome binaries
+  - --extra-exec
+  - /opt/google/chrome
+  # Disable interactive editor
+  - --env
+  - "EDITOR=true"
+  # Tell puppeteer not to use sandbox
+  - --env
+  - "PUPPETEER_NO_SANDBOX=1"
+  # Passthrough GITHUB_TOKEN and GH_TOKEN so the agent can do remote git operations
+  - --env
+  - GITHUB_TOKEN
+  - --env
+  - GH_TOKEN
+  # --- prevent interactive editor prompts ---
+  - --env
+  - EDITOR=true

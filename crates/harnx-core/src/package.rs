@@ -1,5 +1,6 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::model::RequestPatch;
 
@@ -81,6 +82,30 @@ pub struct ClientPatch {
     pub patch: Option<RequestPatch>,
 }
 
+/// MCP server patch entry — overrides for a matched server's config fields.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct McpServerPatch {
+    /// Disable this server entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Replace the command arguments entirely.
+    /// Use `args_append` instead when you only need to add flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    /// Append extra arguments after the package's existing args.
+    /// Applied after `args` (so if both are set, `args` is set first, then
+    /// `args_append` is appended to that).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args_append: Vec<String>,
+    /// Merge additional environment variables into the server's env (individual
+    /// keys override package values; keys not listed here are preserved).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    /// Override the roots list (replaces the package's roots entirely).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roots: Option<Vec<String>>,
+}
+
 /// Contents of packages/<pkg>.patch.yaml — local customization of installed package.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct PackagePatch {
@@ -90,6 +115,9 @@ pub struct PackagePatch {
     /// Map of client name regexp → patch to apply.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub clients: IndexMap<String, ClientPatch>,
+    /// Map of MCP server name regexp → patch to apply.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub mcp_servers: IndexMap<String, McpServerPatch>,
 }
 
 #[cfg(test)]
@@ -148,6 +176,33 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_server_patch_serde_roundtrip() {
+        let mut env = HashMap::new();
+        env.insert("EXA_API_KEY".to_string(), "test-key".to_string());
+
+        let mcp_patch = McpServerPatch {
+            enabled: Some(false),
+            args: Some(vec!["--flag".to_string()]),
+            args_append: vec!["--extra".to_string()],
+            env,
+            roots: Some(vec!["/projects".to_string()]),
+        };
+
+        let mut mcp_servers = IndexMap::new();
+        mcp_servers.insert("bash".to_string(), mcp_patch);
+
+        let patch = PackagePatch {
+            agents: IndexMap::new(),
+            clients: IndexMap::new(),
+            mcp_servers,
+        };
+
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        let roundtrip: PackagePatch = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(roundtrip, patch);
+    }
+
+    #[test]
     fn test_patch_serde_roundtrip() {
         let mut agents = IndexMap::new();
         agents.insert(
@@ -168,7 +223,11 @@ mod tests {
         let mut clients = IndexMap::new();
         clients.insert(".*".to_string(), client_patch);
 
-        let patch = PackagePatch { agents, clients };
+        let patch = PackagePatch {
+            agents,
+            clients,
+            mcp_servers: IndexMap::new(),
+        };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
         let roundtrip: PackagePatch = serde_yaml::from_str(&yaml).unwrap();
