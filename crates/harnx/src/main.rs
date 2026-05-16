@@ -492,6 +492,7 @@ async fn start_directive_inner(
             thought.as_deref(),
             tool_calls,
             &abort_signal,
+            persistent_manager,
         )
         .await?
     };

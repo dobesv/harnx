@@ -3,7 +3,7 @@ use crate::{
     utils::*,
 };
 use anyhow::Result;
-use harnx_hooks::HookEvent;
+use harnx_hooks::{HookEvent, PersistentHookManager};
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -33,6 +33,7 @@ pub async fn execute_tool_round(
     thought: Option<&str>,
     tool_calls: Vec<ToolCall>,
     abort_signal: &AbortSignal,
+    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
 ) -> Result<Vec<ToolResult>> {
     let dry_run = config.read().dry_run;
     if !dry_run {
@@ -41,7 +42,7 @@ pub async fn execute_tool_round(
             .save_session_tool_calls(input, output, thought, &tool_calls)?;
     }
     let agent_use_tools = input.agent().use_tools().map(|v| v.join(","));
-    let eval_ctx = build_tool_eval_context(config, agent_use_tools.as_deref());
+    let eval_ctx = build_tool_eval_context(config, agent_use_tools.as_deref(), persistent_manager);
     let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal).await {
         Ok(results) => results,
         Err(err) => {
@@ -85,6 +86,7 @@ pub async fn execute_tool_round(
 pub fn build_tool_eval_context(
     config: &GlobalConfig,
     agent_use_tools: Option<&str>,
+    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
 ) -> ToolEvalContext {
     let guard = config.read();
     let decl_map: Arc<HashMap<String, ToolDeclaration>> = Arc::new(
@@ -120,12 +122,23 @@ pub fn build_tool_eval_context(
     let hooks_entries = hooks.entries.clone();
     let session_id = session_name.clone().unwrap_or_else(|| "cmd".to_string());
     let cwd = std::env::current_dir().unwrap_or_default();
+    let persistent_manager = persistent_manager.clone();
     let dispatch_hook_fn: Arc<DispatchHookFn> = Arc::new(move |event: HookEvent| {
         let hooks_entries = hooks_entries.clone();
         let session_id = session_id.clone();
         let cwd = cwd.clone();
+        let persistent_manager = persistent_manager.clone();
         Box::pin(async move {
-            harnx_hooks::dispatch::dispatch_hooks(&event, &hooks_entries, &session_id, &cwd).await
+            harnx_hooks::dispatch::dispatch_hooks_with_count_and_manager(
+                &event,
+                &hooks_entries,
+                &session_id,
+                &cwd,
+                0,
+                None,
+                Some(&persistent_manager),
+            )
+            .await
         })
     });
 
@@ -364,8 +377,11 @@ mod tests {
         let calls = vec![call];
 
         let abort_signal = create_abort_signal();
+        let persistent_manager = std::sync::Arc::new(tokio::sync::Mutex::new(
+            harnx_hooks::PersistentHookManager::new(),
+        ));
         let result = eval_tool_calls(
-            &build_tool_eval_context(&config, None),
+            &build_tool_eval_context(&config, None, &persistent_manager),
             calls,
             &abort_signal,
         )

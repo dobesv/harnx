@@ -263,6 +263,7 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
                 thought.as_deref(),
                 tool_calls,
                 abort_signal,
+                &ctx.persistent_manager,
             )
             .await?
         };
