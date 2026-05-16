@@ -62,13 +62,13 @@ Based on the classification, perform targeted analysis:
 ### For Research
 - Define clear exit criteria: when is the investigation "done"?
 - What specific questions need answers?
-- Delegate to `pytheas` for codebase investigation or GitHub/Jira context research.
+- Delegate to `pytheas` for codebase investigation or issue tracker / GitHub context research.
 - Delegate to `librarian` for external documentation and best practices.
 
 ## Research Delegation
 
 You have access to research agents to gather information:
-- `pytheas`: Codebase analysis, GitHub/Jira context — clone repos, search code, map structure, fetch PR/ticket data.
+- `pytheas`: Codebase analysis, issue tracker / GitHub context — clone repos, search code, map structure, fetch PR/ticket data.
 - `librarian`: External research — documentation, best practices, examples.
 
 Use them proactively. Do NOT ask the user questions you could answer by

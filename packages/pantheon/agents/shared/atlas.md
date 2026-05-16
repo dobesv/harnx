@@ -266,7 +266,7 @@ precedence over an `"Issue: none"` sentinel — update the note with the new ref
 ## Mid-Execution Research
 
 If a task reveals unexpected complexity or missing information:
-- Delegate to `pytheas` for codebase investigation or issue-tracker context research (Jira or GitHub Issues).
+- Delegate to `pytheas` for codebase investigation or issue tracker context research.
 - Delegate to `librarian` for external documentation. Pytheas caches findings as plan notes — check existing notes before re-fetching.
 - Delegate to `oracle` for architectural decisions.
  Feed research results into the delegation as additional context.
