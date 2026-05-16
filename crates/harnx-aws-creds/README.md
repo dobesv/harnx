@@ -41,6 +41,17 @@ hooks:
     - event: PreToolUse
       type: claude-command-persistent
       matcher: "bash_exec|bash_spawn"
+      command: harnx-aws-creds --profile my-profile
+```
+
+Replace `my-profile` with the name of the AWS profile you want to use, or omit `--profile` entirely to use the default credential chain:
+
+```yaml
+hooks:
+  entries:
+    - event: PreToolUse
+      type: claude-command-persistent
+      matcher: "bash_exec|bash_spawn"
       command: harnx-aws-creds
 ```
 
