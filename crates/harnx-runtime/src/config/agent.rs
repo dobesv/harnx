@@ -445,35 +445,76 @@ pub fn list_agents() -> Vec<String> {
 /// Returns names of agents whose role is [`AgentRole::Assistant`].
 /// Unlike [`list_agents`], this reads and parses each agent file.
 /// Silently skips files that fail to parse.
+///
+/// Includes agents from the top-level `agents/` directory (bare names) and
+/// from `packages/<pkg>/agents/` directories (as `pkg/stem` qualified names).
 pub fn list_assistant_agents() -> Vec<String> {
     let agents_dir = Config::agents_config_dir();
-    let Ok(entries) = read_dir(&agents_dir) else {
-        return vec![];
-    };
-    let mut output: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let path = e.path();
-            if path.extension().and_then(|x| x.to_str()) != Some("md") {
-                return None;
-            }
-            let name = path.file_stem()?.to_str()?.to_string();
-            let contents = read_to_string(&path).ok()?;
-            let config = AgentConfig::from_markdown(&name, &contents).ok()?;
-            if config.role == AgentRole::Assistant {
-                Some(name)
-            } else {
-                None
-            }
+    let mut output: Vec<String> = read_dir(&agents_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let path = e.path();
+                    if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                        return None;
+                    }
+                    let name = path.file_stem()?.to_str()?.to_string();
+                    let contents = read_to_string(&path).ok()?;
+                    let config = AgentConfig::from_markdown(&name, &contents).ok()?;
+                    if config.role == AgentRole::Assistant {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
         })
-        .collect();
+        .unwrap_or_default();
+
+    // Also include assistant agents from packages with qualified names (pkg/stem)
+    let packages_dir = harnx_core::config_paths::packages_dir();
+    if let Ok(pkg_entries) = read_dir(&packages_dir) {
+        for pkg_entry in pkg_entries.filter_map(|e| e.ok()) {
+            let pkg_path = pkg_entry.path();
+            if !pkg_path.is_dir() {
+                continue;
+            }
+            let pkg_name = match pkg_path.file_name().and_then(|n| n.to_str()) {
+                Some(n) if !n.starts_with('.') => n.to_string(),
+                _ => continue,
+            };
+            let agents_dir = pkg_path.join(harnx_core::config_paths::AGENTS_DIR_NAME);
+            if let Ok(agent_entries) = read_dir(&agents_dir) {
+                for agent_entry in agent_entries.filter_map(|e| e.ok()) {
+                    let path = agent_entry.path();
+                    if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                        continue;
+                    }
+                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let Ok(contents) = read_to_string(&path) else {
+                        continue;
+                    };
+                    let qualified = format!("{pkg_name}/{stem}");
+                    if let Ok(config) = AgentConfig::from_markdown(&qualified, &contents) {
+                        if config.role == AgentRole::Assistant {
+                            output.push(qualified);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     output.sort();
     output.dedup();
     output
 }
 
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
-    let markdown_path = Config::agents_config_dir().join(format!("{agent_name}.md"));
+    let markdown_path = Config::agent_file(agent_name);
     if markdown_path.exists() {
         if let Ok(agent) = load(&markdown_path) {
             return agent
