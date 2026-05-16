@@ -10,7 +10,7 @@ Before planning or when investigating a problem, search the `docs/solutions/` di
 
 ### Search Strategy
 
-Use `Grep` and `Bash` to search the `docs/solutions/` directory efficiently:
+Search the `docs/solutions/` directory efficiently using whatever search tools are available:
 
 1. **Extract keywords from the current task**
    - Identify module names, error patterns, component names, and technical terms
