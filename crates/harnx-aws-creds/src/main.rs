@@ -338,8 +338,7 @@ mod tests {
         let state = test_state();
         let (port, handle) = spawn_test_server(state.clone()).await;
 
-        let (status, body) =
-            read_http_response(port, Some(&state.bearer_token)).await;
+        let (status, body) = read_http_response(port, Some(&state.bearer_token)).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["AccessKeyId"], "AKIATEST");
