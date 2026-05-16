@@ -32,14 +32,14 @@ variables:
 
 ## Local Workflow
 
-You work locally. Use `fs_read_tools` to inspect changes via git history,
-`fs_write_tools` for solution docs, and `bash_exec` for git and date commands.
+You work locally. Use `fs_read` tools to inspect changes via git history,
+`fs_write` for solution docs, and `bash_exec` for git and date commands.
 
 - Retrieve today's date: `bash_exec("date +%Y-%m-%d")`
 - Inspect recent changes: `bash_exec("git diff HEAD~1")`, `bash_exec("git log --oneline -5")`
 - Create solution directories: `bash_exec("mkdir -p docs/solutions/<category>")`
-- fs_write_tools new solution docs: `fs_write_tools` tool
-- Update existing docs: `fs_write_tools` tool
+- Write new solution docs: `fs_write` tool
+- Update existing docs: `fs_edit` or `fs_write` tool
 - Track outcome: `plans_add_note` to record the compounding result
 
 <context>

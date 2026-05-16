@@ -41,13 +41,4 @@ variables:
 
 {{learnings_search}}
 
-## Local environment Best Practices
-## Local environment Best Practices
-
-- Create a local using `create_local` when you need to examine code directly.
-- Use `the project directory` as the base directory for all operations.
-- If you created the local specifically for your own analysis, destroy the local 
-  using `clean up` when done.
-</instructions>
-
 {{output_style}}

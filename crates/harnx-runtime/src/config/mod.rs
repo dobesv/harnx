@@ -293,8 +293,20 @@ fn load_package_mcp_patch(pkg_name: &str) -> Option<harnx_core::package::Package
     if !patch_path.exists() {
         return None;
     }
-    let content = read_to_string(&patch_path).ok()?;
-    serde_yaml::from_str(&content).ok()
+    let content = match read_to_string(&patch_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to read package patch file {}: {}", patch_path.display(), e);
+            return None;
+        }
+    };
+    match serde_yaml::from_str(&content) {
+        Ok(patch) => Some(patch),
+        Err(e) => {
+            log::warn!("Failed to parse package patch file {}: {}", patch_path.display(), e);
+            None
+        }
+    }
 }
 
 /// Apply matching entries from a package patch's `mcp_servers` map to a server config.

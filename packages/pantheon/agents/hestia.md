@@ -43,8 +43,8 @@ variables:
 
 You work locally. The repo is already checked out. You do not need to clone repos.
 
-- Inspect before editing: `fs_read_tools`.
-- fs_write_tools safely: prefer `fs_write_tools`; use `fs_write_tools` for new or fully replaced files.
+- Inspect before editing: use `fs_read` and related read tools.
+- Edit safely: prefer `fs_edit` for targeted changes; use `fs_write` for new or fully replaced files.
 - Execute/verify: `bash_exec` for tests/linters/builds.
 - Track context: add notes with `plans_add_note`.
 

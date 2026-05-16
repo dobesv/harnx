@@ -97,6 +97,7 @@ tags:
   - tag1
   - tag2
 plan_ref: "<plan name, if applicable>"
+last_updated: YYYY-MM-DD  # only present when updating an existing doc
 ---
 ```
 
@@ -275,8 +276,8 @@ Example:
 
 Solution documents should be named descriptively and placed in the appropriate category directory:
 
-- Format: `<kebab-case-description>.md`
-- Example: `cache-invalidation-race-condition.md` in `logic-errors/`
+- Format: `<kebab-case-description>-YYYY-MM-DD.md`
+- Example: `cache-invalidation-race-condition-2024-03-15.md` in `logic-errors/`
 - Avoid generic names like `fix.md` or `solution.md`
 
 2. Search for overlapping `docs/solutions/` entries before creating anything new.
