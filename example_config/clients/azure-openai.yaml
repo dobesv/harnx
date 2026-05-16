@@ -2,7 +2,7 @@
 # Note: Azure OpenAI requires manual model listing as deployment names vary.
 
 type: azure-openai
-name: azure-openai   # Use azure_openai (underscore) for shell-safe env var names
+name: azure_openai   # Underscore keeps env var names shell-safe (AZURE_OPENAI_API_KEY)
 
 # Required: The base URL of your Azure OpenAI resource
 # Format: https://{RESOURCE}.openai.azure.com

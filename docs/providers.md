@@ -219,5 +219,5 @@ api_base: https://api.groq.com/openai/v1
 ```
 
 > **Note:** The shorthand names (e.g., `groq`, `deepseek`, `xai`) are used as the `name` field, **not** the `type` field. The `type` must always be `openai-compatible`. The `api_base` is pre-configured by harnx when the name matches a known provider, so you can omit it if using a standard provider name.
-
+>
 > ² Cloudflare's URL contains a literal `{ACCOUNT_ID}` placeholder. You must supply the correct URL explicitly via `api_base` in your config file — the placeholder is not substituted automatically.
