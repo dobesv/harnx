@@ -122,7 +122,8 @@ jobs:
       run: |
         $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
           -p harnx -p harnx-serve -p harnx-acp-server \
-          -p harnx-mcp-bash -p harnx-mcp-fs -p harnx-mcp-plans -p harnx-mcp-time
+          -p harnx-mcp-bash -p harnx-mcp-fs -p harnx-mcp-plans -p harnx-mcp-time \
+          -p harnx-aws-creds
 
     - name: Build Archives
       shell: bash
