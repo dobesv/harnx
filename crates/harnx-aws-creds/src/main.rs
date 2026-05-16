@@ -65,12 +65,13 @@ async fn build_app_state(args: &Args) -> Result<Arc<AppState>> {
 }
 
 async fn creds_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let expected = format!("Bearer {}", state.bearer_token);
+    // AWS SDKs send the value of AWS_CONTAINER_AUTHORIZATION_TOKEN directly as the
+    // Authorization header — no "Bearer " prefix per the container credentials spec.
     let actual = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
 
-    if actual != Some(expected.as_str()) {
+    if actual != Some(state.bearer_token.as_str()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -119,6 +120,54 @@ async fn run_hook_loop(state: &AppState, port: u16) -> Result<()> {
     run_hook_loop_io(state, port, stdin, stdout).await
 }
 
+/// Process a single JSONL hook line and return the response Value to write,
+/// or None if the line should be silently skipped (malformed JSON, missing id).
+fn handle_hook_line(line: &str, state: &AppState, port: u16) -> Option<Value> {
+    // Parse JSON — if malformed, log and skip (don't kill the process).
+    let request: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("harnx-aws-creds: ignoring malformed JSON line: {err}");
+            return None;
+        }
+    };
+
+    // Extract id — required to produce a valid response. If missing, skip.
+    let id = match request.get("id").and_then(Value::as_str) {
+        Some(id) => id,
+        None => {
+            eprintln!("harnx-aws-creds: ignoring hook event with missing/non-string id");
+            return None;
+        }
+    };
+
+    let response = match (
+        request.get("hook_event_name").and_then(Value::as_str),
+        request.get("tool_name").and_then(Value::as_str),
+        request.get("tool_input"),
+    ) {
+        (Some("PreToolUse"), Some("bash_exec" | "bash_spawn"), Some(tool_input)) => {
+            match mutate_tool_input(tool_input, state, port) {
+                Ok(mutated) => json!({
+                    "id": id,
+                    "hookSpecificOutput": {
+                        "toolInput": mutated,
+                    }
+                }),
+                Err(err) => {
+                    // Mutation failed (e.g. tool_input/env not an object) — emit no-op
+                    // so the tool call still proceeds without injection.
+                    eprintln!("harnx-aws-creds: failed to mutate tool input: {err}");
+                    json!({ "id": id })
+                }
+            }
+        }
+        _ => json!({ "id": id }),
+    };
+
+    Some(response)
+}
+
 async fn run_hook_loop_io<R, W>(state: &AppState, port: u16, input: R, mut output: W) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -127,52 +176,12 @@ where
     let mut lines = BufReader::new(input).lines();
 
     while let Some(line) = lines.next_line().await? {
-        // Parse JSON — if malformed, log and skip (don't kill the process).
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("harnx-aws-creds: ignoring malformed JSON line: {err}");
-                continue;
-            }
-        };
-
-        // Extract id — required to produce a valid response. If missing, skip.
-        let id = match request.get("id").and_then(Value::as_str) {
-            Some(id) => id,
-            None => {
-                eprintln!("harnx-aws-creds: ignoring hook event with missing/non-string id");
-                continue;
-            }
-        };
-
-        let response = match (
-            request.get("hook_event_name").and_then(Value::as_str),
-            request.get("tool_name").and_then(Value::as_str),
-            request.get("tool_input"),
-        ) {
-            (Some("PreToolUse"), Some("bash_exec" | "bash_spawn"), Some(tool_input)) => {
-                match mutate_tool_input(tool_input, state, port) {
-                    Ok(mutated) => json!({
-                        "id": id,
-                        "hookSpecificOutput": {
-                            "toolInput": mutated,
-                        }
-                    }),
-                    Err(err) => {
-                        // Mutation failed (e.g. tool_input/env not an object) — emit no-op
-                        // so the tool call still proceeds without injection.
-                        eprintln!("harnx-aws-creds: failed to mutate tool input: {err}");
-                        json!({ "id": id })
-                    }
-                }
-            }
-            _ => json!({ "id": id }),
-        };
-
-        let mut encoded = serde_json::to_vec(&response)?;
-        encoded.push(b'\n');
-        output.write_all(&encoded).await?;
-        output.flush().await?;
+        if let Some(response) = handle_hook_line(&line, state, port) {
+            let mut encoded = serde_json::to_vec(&response)?;
+            encoded.push(b'\n');
+            output.write_all(&encoded).await?;
+            output.flush().await?;
+        }
     }
 
     Ok(())
@@ -303,13 +312,14 @@ mod tests {
         (axum::http::StatusCode::from_u16(status_code).unwrap(), body)
     }
 
-    async fn run_hook_once(input: &str, port: u16) -> String {
+    /// Shared wiring: write `input` into a duplex pipe, run the hook loop, return raw output.
+    async fn run_hook_with_io(input: &str, port: u16) -> String {
         let state = test_state();
-        let (mut input_writer, input_reader) = tokio::io::duplex(4096);
+        let (mut input_writer, input_reader) = tokio::io::duplex(16384);
         input_writer.write_all(input.as_bytes()).await.unwrap();
         drop(input_writer);
 
-        let (output_writer, mut output_reader) = tokio::io::duplex(4096);
+        let (output_writer, mut output_reader) = tokio::io::duplex(16384);
         run_hook_loop_io(&state, port, input_reader, output_writer)
             .await
             .unwrap();
@@ -319,13 +329,17 @@ mod tests {
         output
     }
 
+    async fn run_hook_once(input: &str, port: u16) -> String {
+        run_hook_with_io(input, port).await
+    }
+
     #[tokio::test]
     async fn creds_200_valid_token() {
         let state = test_state();
         let (port, handle) = spawn_test_server(state.clone()).await;
 
         let (status, body) =
-            read_http_response(port, Some(&format!("Bearer {}", state.bearer_token))).await;
+            read_http_response(port, Some(&state.bearer_token)).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["AccessKeyId"], "AKIATEST");
@@ -342,7 +356,7 @@ mod tests {
         let (port, handle) = spawn_test_server(test_state()).await;
 
         let (status, body) =
-            read_http_response(port, Some(&format!("Bearer {}-wrong", state.bearer_token))).await;
+            read_http_response(port, Some(&format!("{}-wrong", state.bearer_token))).await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body, Value::Null);
@@ -441,22 +455,9 @@ mod tests {
         assert_eq!(env["AWS_CONTAINER_AUTHORIZATION_TOKEN"], "testtoken");
     }
 
-    // Helper: send multiple lines, collect all output lines
+    // Helper: send multiple lines, collect all output lines as parsed Values
     async fn run_hook_multi(inputs: &[&str], port: u16) -> Vec<Value> {
-        let state = test_state();
-        let combined = inputs.join("");
-        let (mut input_writer, input_reader) = tokio::io::duplex(16384);
-        input_writer.write_all(combined.as_bytes()).await.unwrap();
-        drop(input_writer);
-
-        let (output_writer, mut output_reader) = tokio::io::duplex(16384);
-        run_hook_loop_io(&state, port, input_reader, output_writer)
-            .await
-            .unwrap();
-
-        let mut output = String::new();
-        output_reader.read_to_string(&mut output).await.unwrap();
-
+        let output = run_hook_with_io(&inputs.join(""), port).await;
         output
             .lines()
             .filter(|l| !l.is_empty())
