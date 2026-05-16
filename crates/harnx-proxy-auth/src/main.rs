@@ -9,7 +9,9 @@ use harnx_proxy_auth::{ca, cli, filter, hook, proxy};
 async fn main() -> Result<()> {
     // Write tracing output to stderr so it never interleaves with the
     // readiness lines or JSONL responses on stdout.
-    tracing_subscriber::fmt().with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
 
     let args = <cli::Args as Parser>::parse();
     let filter_expr = args.combined_filter();
@@ -29,8 +31,7 @@ async fn main() -> Result<()> {
         writeln!(stdout, "PROXY_PORT={port}")?;
         writeln!(stdout, "CA_CERT_PATH={}", ca_cert_path.display())?;
         use base64::Engine as _;
-        let ca_cert_b64 =
-            base64::engine::general_purpose::STANDARD.encode(ca_cert_pem.as_bytes());
+        let ca_cert_b64 = base64::engine::general_purpose::STANDARD.encode(ca_cert_pem.as_bytes());
         writeln!(stdout, "CA_CERT_PEM_B64={ca_cert_b64}")?;
         stdout.flush()?;
     } // lock dropped here

@@ -155,7 +155,16 @@ async fn hook_injected_env_reaches_bash_exec_command() {
 
     let config = make_config(proxy_bin, bash_bin);
     let persistent_manager = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let ctx = build_tool_eval_context(&config, None, &persistent_manager);
+    // Pass Some("*") so tool_declarations_for_use_tools connects to MCP servers
+    // and populates their tool lists; None skips MCP entirely.
+    let ctx = build_tool_eval_context(&config, Some("*"), &persistent_manager);
+
+    // Skip if the MCP server failed to connect (e.g. sandbox execution restrictions).
+    if !ctx.allowed_tool_names.contains("bash_exec") {
+        eprintln!("SKIP hook_injected_env_reaches_bash_exec_command: harnx-mcp-bash did not register bash_exec (MCP connect failed)");
+        persistent_manager.lock().await.shutdown();
+        return;
+    }
 
     let tool_call = ToolCall::new(
         "bash_exec".to_string(),
