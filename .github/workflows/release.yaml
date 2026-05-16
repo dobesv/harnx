@@ -106,7 +106,7 @@ jobs:
       if: matrix.use-cross
       shell: bash
       run: echo "BUILD_CMD=cross" >> $GITHUB_ENV
-  
+
     - name: Show Version Information (Rust, cargo, GCC)
       shell: bash
       run: |
@@ -116,7 +116,7 @@ jobs:
         rustup default
         cargo -V
         rustc -V
-      
+
     - name: Build
       shell: bash
       run: |
@@ -187,6 +187,127 @@ jobs:
         draft: false
         files: ${{ steps.package.outputs.archives }}
         prerelease: ${{ steps.check-tag.outputs.rc == 'true' }}
+
+  docker:
+    name: Publish Docker Images
+    needs: release
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#harnx/}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p docker-assets linux-amd64 linux-arm64
+          cd docker-assets
+          V=${{ steps.version.outputs.version }}
+          # Download x86_64 (amd64) archives
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-serve-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-acp-server-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-bash-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-fs-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-plans-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-time-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          # Download aarch64 (arm64) archives
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-serve-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-acp-server-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-bash-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-fs-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-plans-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-time-$V-aarch64-unknown-linux-musl.tar.gz" || true
+
+      - name: Extract archives
+        run: |
+          cd docker-assets
+          for f in *x86_64*.tar.gz; do
+            [ -f "$f" ] && tar -xzf "$f" -C ../linux-amd64/
+          done
+          for f in *aarch64*.tar.gz; do
+            [ -f "$f" ] && tar -xzf "$f" -C ../linux-arm64/
+          done
+
+      - name: Verify extracted binaries
+        run: |
+          missing=0
+          for dir in linux-amd64 linux-arm64; do
+            for bin in harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-bash-sandbox-run harnx-mcp-fs harnx-mcp-plans harnx-mcp-time; do
+              if [ ! -f "$dir/$bin" ]; then
+                echo "ERROR: missing $dir/$bin"
+                missing=1
+              fi
+            done
+          done
+          [ "$missing" -eq 0 ] || { echo "Some binaries are missing. Check asset download step."; exit 1; }
+
+      - name: Build and push harnx-mcp-time
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/harnx-mcp-time.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/dobesv/harnx-mcp-time:${{ steps.version.outputs.version }}
+            ${{ needs.release.outputs.rc == 'false' && 'ghcr.io/dobesv/harnx-mcp-time:latest' || '' }}
+
+      - name: Build and push harnx-mcp-plans
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/harnx-mcp-plans.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/dobesv/harnx-mcp-plans:${{ steps.version.outputs.version }}
+            ${{ needs.release.outputs.rc == 'false' && 'ghcr.io/dobesv/harnx-mcp-plans:latest' || '' }}
+
+      - name: Build and push harnx
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/harnx.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/dobesv/harnx:${{ steps.version.outputs.version }}
+            ${{ needs.release.outputs.rc == 'false' && 'ghcr.io/dobesv/harnx:latest' || '' }}
 
   publish-crate:
     name: Publish to crates.io
