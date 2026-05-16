@@ -70,9 +70,6 @@ pub struct ConfigData {
     pub highlight: bool,
     pub theme: Option<String>,
 
-    pub show_sequence_numbers: bool,
-    pub show_timestamps: bool,
-
     pub serve_addr: Option<String>,
     pub user_agent: Option<String>,
     pub save_shell_history: bool,
@@ -115,9 +112,6 @@ impl Default for ConfigData {
 
             highlight: true,
             theme: None,
-
-            show_sequence_numbers: false,
-            show_timestamps: false,
 
             serve_addr: None,
             user_agent: None,
