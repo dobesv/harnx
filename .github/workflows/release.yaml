@@ -147,6 +147,7 @@ jobs:
           "harnx-mcp-fs:harnx-mcp-fs"
           "harnx-mcp-plans:harnx-mcp-plans"
           "harnx-mcp-time:harnx-mcp-time"
+          "harnx-aws-creds:harnx-aws-creds"
         )
 
         archives=()
@@ -237,6 +238,8 @@ jobs:
             --pattern "harnx-mcp-plans-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-mcp-time-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-aws-creds-$V-x86_64-unknown-linux-musl.tar.gz" || true
           # Download aarch64 (arm64) archives
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-$V-aarch64-unknown-linux-musl.tar.gz" || true
@@ -252,6 +255,8 @@ jobs:
             --pattern "harnx-mcp-plans-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-mcp-time-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-aws-creds-$V-aarch64-unknown-linux-musl.tar.gz" || true
 
       - name: Extract archives
         run: |
@@ -267,7 +272,7 @@ jobs:
         run: |
           missing=0
           for dir in linux-amd64 linux-arm64; do
-            for bin in harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-bash-sandbox-run harnx-mcp-fs harnx-mcp-plans harnx-mcp-time; do
+            for bin in harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-bash-sandbox-run harnx-mcp-fs harnx-mcp-plans harnx-mcp-time harnx-aws-creds; do
               if [ ! -f "$dir/$bin" ]; then
                 echo "ERROR: missing $dir/$bin"
                 missing=1
