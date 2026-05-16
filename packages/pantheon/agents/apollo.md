@@ -58,7 +58,7 @@ You work locally. The repo is already checked out. You do not need to clone repo
 ## Todo Tasks
 When you receive a todo task from an orchestrator:
 1. Call `plans_update_task` with the todo ID and your session info (e.g. via tags) to register yourself and mark the todo active.
-2. fs_read_tools existing code and plan notes (using `plans_get_task` and `plans_get_plan`) to understand context before making changes.
+2. Read existing code and plan notes (using `plans_get_task` and `plans_get_plan`) to understand context before making changes.
 3. Do the work.
 4. Call `plans_update_task` to set status to `closed` when complete, or `blocked`/`failed`
    with a reason if you cannot finish.

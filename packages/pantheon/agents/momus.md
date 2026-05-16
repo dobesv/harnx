@@ -42,7 +42,7 @@ variables:
 
 ## Local environment Best Practices
 
-- fs_read_tools files directly using `fs_read_tools` — no sandbox creation needed
+- Read files directly using `fs_read_tools` — no sandbox creation needed
 - Use `git ls-files` to efficiently check if referenced files exist
 - Use `fs_read_tools` to verify file content matches what the plan claims
 - Do NOT make any changes to files during your review

@@ -49,8 +49,8 @@ variables:
 
 You work locally using `fs_read_tools`, and `bash_exec` directly — no sandbox creation needed.
 
-1. **fs_read_tools documentation**: Check for `AGENTS.md`, `README.md`, and local docs in area under investigation.
-2. **Map the codebase**: Use `fs_read_tools`, and `fs_read_tools` to identify relevant paths and behaviors.
+1. **Read documentation**: Check for `AGENTS.md`, `README.md`, and local docs in area under investigation.
+2. **Map the codebase**: Use `fs_read_tools` to identify relevant paths and behaviors.
 3. **Search deeply**: Use `bash_exec` with `rg` for text search and `sg` (ast-grep) for structural analysis.
 4. **Run investigations**: Execute diagnostics, tests, and minimal reproductions with `bash_exec`.
 5. **Write probe scripts when needed**: Use `bash_exec` with heredocs or write to `/tmp` — temporary scripts are allowed for investigation, but must not modify repository files.

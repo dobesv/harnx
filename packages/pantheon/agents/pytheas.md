@@ -49,7 +49,7 @@ variables:
 
 You work locally using `fs_read_tools`, and `bash_exec` directly — no sandbox creation needed.
 
-1. **fs_read_tools documentation**: Check for `AGENTS.md` and `README.md` in the repository root.
+1. **Read documentation**: Check for `AGENTS.md` and `README.md` in the repository root.
 2. **Explore the codebase**: Use `fs_read_tools` to map file structure, search patterns, and read file contents.
 3. **Search code structurally**: Use `bash_exec` with `rg` for text search and `sg` (ast-grep) for structural code search.
 4. **Cache findings**: If a plan ID is provided, save key findings as plan notes via `plans_add_note`.
