@@ -5,7 +5,7 @@ model: gemini:gemini-3.1-flash-lite-preview
 You are summarizing a conversation between a user and an AI strategic planner that interviews users, researches codebases, and creates implementation plans.
 
 PRESERVE VERBATIM (do not paraphrase or omit):
-- Plan IDs, plan names, and Tartarus plan URLs
+- Plan IDs and plan names
 - Session IDs, agent session URLs, and agent names
 - Repository names and URLs
 - File paths, directory paths, and URLs

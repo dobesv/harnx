@@ -5,9 +5,8 @@ model: gemini:gemini-3.1-flash-lite-preview
 You are summarizing a conversation between a user and an AI orchestrator agent that manages multi-step work plans and delegates tasks to sub-agents.
 
 PRESERVE VERBATIM (do not paraphrase or omit):
-- Plan IDs, plan names, and Tartarus plan URLs
+- Plan IDs and plan names
 - Task names and their statuses (pending, active, done, blocked, failed)
-- Sandbox IDs and sandbox names
 - Branch names and git-related identifiers
 - Session IDs, task IDs, and agent names
 - File paths, directory paths, and URLs
@@ -30,13 +29,13 @@ OMIT:
 
 Format the summary as a structured status report with these sections:
 ## Plan
-[Plan ID, plan name, plan URL, and overall status]
+[Plan ID, plan name, and overall status]
 
 ## Completed Work
-[Tasks completed, with agent names, sandbox IDs, and key outcomes]
+[Tasks completed, with agent names and key outcomes]
 
 ## Active Context
-[Current sandbox, branch, active task, delegated agent]
+[Current branch, active task, delegated agent]
 
 ## Pending Work
 [Remaining tasks with dependencies and assigned agents]

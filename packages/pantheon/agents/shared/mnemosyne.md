@@ -96,7 +96,7 @@ severity: <enum>
 tags:
   - tag1
   - tag2
-plan_ref: "<tartarus plan name, if applicable>"
+plan_ref: "<plan name, if applicable>"
 ---
 ```
 
@@ -130,7 +130,7 @@ plan_ref: "<tartarus plan name, if applicable>"
   - `medium` — Moderate impact, affects some users or features
   - `low` — Minor impact, cosmetic or edge-case issues
 - **tags**: Array of searchable tags for cross-referencing (e.g., `["concurrency", "caching", "race-condition"]`)
-- **plan_ref**: Optional reference to a Tartarus plan name if this solution was part of a larger initiative
+- **plan_ref**: Optional reference to a plan name if this solution was part of a larger initiative
 
 ### Category Directory Mapping
 

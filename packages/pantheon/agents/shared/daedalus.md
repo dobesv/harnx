@@ -93,9 +93,7 @@ go back to the user for clarification before proceeding. Do not guess.
 
 ## Phase 4 — Plan Generation
 
-Create a plan in Tartarus using `create_plan` — pass your `session_id`
-and `user_id` so you are registered as the planner.
-Write the plan content using `plans_update_plan`.
+Create a plan using `plans_add_plan` and write the plan content using `plans_update_plan`.
 If Metis or Pytheas found relevant past solutions during research, reference
 them in the plan's Context section under "Prior Art". This helps executing
 agents leverage institutional knowledge and avoid repeating past mistakes.

@@ -33,7 +33,7 @@ Format the summary as a structured status report with these sections:
 [What documentation work was completed, with file paths]
 
 ## Active Context
-[Current plan, sandbox, overlap status, and last action taken]
+[Current plan, overlap status, and last action taken]
 
 ## Pending Work
 [What still needs to be done, if anything]

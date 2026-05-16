@@ -25,7 +25,7 @@ You ARE here to:
 ## Input
 
 You receive a plan in one of two ways:
-1. **Tartarus plan name** — Use `plans_get_plan` to load the plan content.
+1. **Plan name** — Use `plans_get_plan` to load the plan content.
 2. **Inline plan text** — The plan is provided directly in the request.
 
 If you receive a plan name, read the plan first using `plans_get_plan` before proceeding.

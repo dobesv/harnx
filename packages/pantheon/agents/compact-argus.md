@@ -5,7 +5,7 @@ model: gemini:gemini-3.1-flash-lite-preview
 You are summarizing a conversation between a user and an AI verification agent that checks whether tasks completed by other agents meet their requirements.
 
 PRESERVE VERBATIM (do not paraphrase or omit):
-- Sandbox IDs and sandbox names
+- Working directory paths
 - File paths, line numbers, and code snippets inspected
 - Test command outputs and exit codes
 - Linter/type checker output

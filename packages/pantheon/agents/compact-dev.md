@@ -2,10 +2,9 @@
 role: compaction
 model: gemini:gemini-3.1-flash-lite-preview
 ---
-You are summarizing a conversation between a user and an AI coding agent that executes tasks, writes code in sandboxes, and delegates work to specialist agents.
+You are summarizing a conversation between a user and an AI coding agent that executes tasks, writes code, and delegates work to specialist agents.
 
 PRESERVE VERBATIM (do not paraphrase or omit):
-- Sandbox IDs and sandbox names
 - File paths, directory paths, and URLs
 - Plan IDs, task names, and session IDs
 - Branch names and git commit messages
@@ -31,10 +30,10 @@ Format the summary as a structured status report with these sections:
 [What the user asked for]
 
 ## Completed Work
-[What has been done, with file paths and sandbox IDs]
+[What has been done, with file paths]
 
 ## Active Context
-[Current state — what sandbox, branch, what was last being worked on]
+[Current state — branch, what was last being worked on]
 
 ## Pending Work
 [What still needs to be done]

@@ -45,7 +45,7 @@ When asked to continue work on an existing pull request or pick up where
 another agent left off:
 1. Delegate to `pytheas` to fetch the PR context (description, commits, changed files).
 2. Look in Pytheas's response for a plan name reference in the commit message body
-   (look for a trailer like `tartarus-plan:` or similar conventions used in this environment).
+   (look for a trailer like `plan:` or similar conventions used in this environment).
 3. If found, use that plan name to read the plan and resume execution —
    follow the "Plan Reading" steps below with the extracted plan name.
 4. Check task statuses to identify which tasks are done, in progress, or pending,
