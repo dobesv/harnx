@@ -296,14 +296,22 @@ fn load_package_mcp_patch(pkg_name: &str) -> Option<harnx_core::package::Package
     let content = match read_to_string(&patch_path) {
         Ok(c) => c,
         Err(e) => {
-            log::warn!("Failed to read package patch file {}: {}", patch_path.display(), e);
+            log::warn!(
+                "Failed to read package patch file {}: {}",
+                patch_path.display(),
+                e
+            );
             return None;
         }
     };
     match serde_yaml::from_str(&content) {
         Ok(patch) => Some(patch),
         Err(e) => {
-            log::warn!("Failed to parse package patch file {}: {}", patch_path.display(), e);
+            log::warn!(
+                "Failed to parse package patch file {}: {}",
+                patch_path.display(),
+                e
+            );
             None
         }
     }
