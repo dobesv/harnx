@@ -18,6 +18,14 @@ pub use harnx_engine::tool::{
     eval_tool_calls, ConfirmToolUseFn, DispatchHookFn, ToolCallEmitFn, ToolEvalContext,
 };
 
+/// The LLM text completion that immediately preceded a tool round.
+/// Groups the assistant output text and optional chain-of-thought together
+/// so `execute_tool_round` doesn't need separate `output` and `thought` args.
+pub struct CompletionText<'a> {
+    pub output: &'a str,
+    pub thought: Option<&'a str>,
+}
+
 /// Persist a tool round and execute its calls.  Writes the
 /// `ToolCalls` session-log entry BEFORE running tools (so the
 /// transcript captures the request even on crash/interrupt), runs
@@ -29,17 +37,19 @@ pub use harnx_engine::tool::{
 pub async fn execute_tool_round(
     config: &GlobalConfig,
     input: &Input,
-    output: &str,
-    thought: Option<&str>,
+    completion: &CompletionText<'_>,
     tool_calls: Vec<ToolCall>,
     abort_signal: &AbortSignal,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
 ) -> Result<Vec<ToolResult>> {
     let dry_run = config.read().dry_run;
     if !dry_run {
-        config
-            .write()
-            .save_session_tool_calls(input, output, thought, &tool_calls)?;
+        config.write().save_session_tool_calls(
+            input,
+            completion.output,
+            completion.thought,
+            &tool_calls,
+        )?;
     }
     let agent_use_tools = input.agent().use_tools().map(|v| v.join(","));
     let eval_ctx = build_tool_eval_context(config, agent_use_tools.as_deref(), persistent_manager);
@@ -83,6 +93,63 @@ pub async fn execute_tool_round(
 /// server holds the agent only on the per-prompt `Input` (because each
 /// `prompt` call may target a different agent on the same Config).
 /// Passing the use_tools list explicitly keeps both paths correct.
+/// Build the hook dispatch closure, capturing hooks config and the persistent
+/// manager so `ToolEvalContext` can fire PreToolUse/PostToolUse hooks.
+fn build_dispatch_hook_fn(
+    hooks: &harnx_hooks::HooksConfig,
+    session_name: Option<&str>,
+    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
+) -> Arc<DispatchHookFn> {
+    let hooks_entries = hooks.entries.clone();
+    let session_id = session_name.unwrap_or("cmd").to_string();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let persistent_manager = persistent_manager.clone();
+    Arc::new(move |event: HookEvent| {
+        let hooks_entries = hooks_entries.clone();
+        let session_id = session_id.clone();
+        let cwd = cwd.clone();
+        let persistent_manager = persistent_manager.clone();
+        Box::pin(async move {
+            harnx_hooks::dispatch::dispatch_hooks_with_count_and_manager(
+                &event,
+                &hooks_entries,
+                &session_id,
+                &cwd,
+                0,
+                None,
+                Some(&persistent_manager),
+            )
+            .await
+        })
+    })
+}
+
+/// Build the three emit closures (call / result / blocked) over a shared decl map.
+fn build_emit_fns(
+    decl_map: &Arc<HashMap<String, ToolDeclaration>>,
+) -> (
+    Arc<ToolCallEmitFn>,
+    Arc<ToolCallEmitFn>,
+    Arc<ToolCallEmitFn>,
+) {
+    let m1 = Arc::clone(decl_map);
+    let emit_tool_call_fn: Arc<ToolCallEmitFn> =
+        Arc::new(move |call: &ToolCall, json_data: &Value| {
+            emit_tool_call_with_template(call, json_data, &m1);
+        });
+    let m2 = Arc::clone(decl_map);
+    let emit_tool_result_fn: Arc<ToolCallEmitFn> =
+        Arc::new(move |call: &ToolCall, result: &Value| {
+            emit_tool_result_with_template(call, result, &m2);
+        });
+    let m3 = Arc::clone(decl_map);
+    let emit_tool_blocked_fn: Arc<ToolCallEmitFn> =
+        Arc::new(move |call: &ToolCall, blocked_result: &Value| {
+            emit_tool_blocked_with_template(call, blocked_result, &m3);
+        });
+    (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn)
+}
+
 pub fn build_tool_eval_context(
     config: &GlobalConfig,
     agent_use_tools: Option<&str>,
@@ -100,15 +167,11 @@ pub fn build_tool_eval_context(
     let hooks = guard.resolved_hooks();
     let acp_manager = guard.acp_manager.clone();
     let mcp_manager = guard.mcp_manager.clone();
-    let session_name = guard
-        .session
-        .as_ref()
-        .map(|session| session.id().to_string());
+    let session_name = guard.session.as_ref().map(|s| s.id().to_string());
     drop(guard);
 
     // Build the provider list in ACP-first order so ACP sub-agent
-    // handoffs take priority over any namespaced MCP tool with the
-    // same name.
+    // handoffs take priority over any namespaced MCP tool with the same name.
     let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
     if let Some(acp) = acp_manager {
         providers.push(acp as Arc<dyn ToolProvider>);
@@ -117,49 +180,9 @@ pub fn build_tool_eval_context(
         providers.push(mcp as Arc<dyn ToolProvider>);
     }
 
-    // Capture owned state for the dispatch callback so the
-    // returned future is `'static` and `Send`.
-    let hooks_entries = hooks.entries.clone();
-    let session_id = session_name.clone().unwrap_or_else(|| "cmd".to_string());
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let persistent_manager = persistent_manager.clone();
-    let dispatch_hook_fn: Arc<DispatchHookFn> = Arc::new(move |event: HookEvent| {
-        let hooks_entries = hooks_entries.clone();
-        let session_id = session_id.clone();
-        let cwd = cwd.clone();
-        let persistent_manager = persistent_manager.clone();
-        Box::pin(async move {
-            harnx_hooks::dispatch::dispatch_hooks_with_count_and_manager(
-                &event,
-                &hooks_entries,
-                &session_id,
-                &cwd,
-                0,
-                None,
-                Some(&persistent_manager),
-            )
-            .await
-        })
-    });
-
-    let decl_map_clone = Arc::clone(&decl_map);
-    let emit_tool_call_fn: Arc<ToolCallEmitFn> =
-        Arc::new(move |call: &ToolCall, json_data: &Value| {
-            emit_tool_call_with_template(call, json_data, &decl_map_clone);
-        });
-
-    let decl_map_clone2 = Arc::clone(&decl_map);
-    let emit_tool_result_fn: Arc<ToolCallEmitFn> =
-        Arc::new(move |call: &ToolCall, result: &Value| {
-            emit_tool_result_with_template(call, result, &decl_map_clone2);
-        });
-    let decl_map_clone3 = Arc::clone(&decl_map);
-    let emit_tool_blocked_fn: Arc<ToolCallEmitFn> =
-        Arc::new(move |call: &ToolCall, blocked_result: &Value| {
-            emit_tool_blocked_with_template(call, blocked_result, &decl_map_clone3);
-        });
-
-    let confirm_tool_use_fn: Arc<ConfirmToolUseFn> = Arc::new(default_confirm_tool_use);
+    let dispatch_hook_fn =
+        build_dispatch_hook_fn(&hooks, session_name.as_deref(), persistent_manager);
+    let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn) = build_emit_fns(&decl_map);
 
     ToolEvalContext {
         providers,
@@ -168,7 +191,7 @@ pub fn build_tool_eval_context(
         emit_tool_call_fn,
         emit_tool_result_fn,
         emit_tool_blocked_fn,
-        confirm_tool_use_fn,
+        confirm_tool_use_fn: Arc::new(default_confirm_tool_use),
         dispatch_hook_fn,
     }
 }

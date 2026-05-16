@@ -1843,14 +1843,11 @@ async fn test_tool_result_switch_agent_parsing() {
     // switch_agent parsing path that runs in eval_tool_calls (line 126-141 of
     // tool.rs) on the result object.
     let abort_signal = harnx_runtime::utils::create_abort_signal();
+    let pm = std::sync::Arc::new(tokio::sync::Mutex::new(
+        harnx_hooks::PersistentHookManager::new(),
+    ));
     let mut results = eval_tool_calls(
-        &harnx_runtime::tool::build_tool_eval_context(
-            &config,
-            None,
-            &std::sync::Arc::new(tokio::sync::Mutex::new(
-                harnx_hooks::PersistentHookManager::new(),
-            )),
-        ),
+        &harnx_runtime::tool::build_tool_eval_context(&config, None, &pm),
         vec![call],
         &abort_signal,
     )

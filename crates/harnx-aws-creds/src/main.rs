@@ -333,61 +333,65 @@ mod tests {
         run_hook_with_io(input, port).await
     }
 
+    /// Spawn a server, send one GET /creds with the given Authorization header
+    /// value (None = omit header), shut down, return (status, body).
+    async fn creds_request_with(authorization: Option<&str>) -> (StatusCode, Value) {
+        let state = test_state();
+        let (port, handle) = spawn_test_server(state.clone()).await;
+        let result = read_http_response(port, authorization).await;
+        handle.abort();
+        let _ = handle.await;
+        result
+    }
+
     #[tokio::test]
     async fn creds_200_valid_token() {
         let state = test_state();
-        let (port, handle) = spawn_test_server(state.clone()).await;
-
-        let (status, body) = read_http_response(port, Some(&state.bearer_token)).await;
+        let token = state.bearer_token.clone();
+        let (port, handle) = spawn_test_server(state).await;
+        let (status, body) = read_http_response(port, Some(&token)).await;
+        handle.abort();
+        let _ = handle.await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["AccessKeyId"], "AKIATEST");
         assert_eq!(body["SecretAccessKey"], "SECRET");
         assert_eq!(body["Token"], "TOKEN");
-
-        handle.abort();
-        let _ = handle.await;
     }
 
     #[tokio::test]
     async fn creds_401_wrong_token() {
         let state = test_state();
-        let (port, handle) = spawn_test_server(test_state()).await;
-
-        let (status, body) =
-            read_http_response(port, Some(&format!("{}-wrong", state.bearer_token))).await;
+        let bad = format!("{}-wrong", state.bearer_token);
+        let (status, body) = creds_request_with(Some(&bad)).await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body, Value::Null);
-
-        handle.abort();
-        let _ = handle.await;
     }
 
     #[tokio::test]
     async fn creds_401_missing_token() {
-        let (port, handle) = spawn_test_server(test_state()).await;
-
-        let (status, body) = read_http_response(port, None).await;
+        let (status, body) = creds_request_with(None).await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body, Value::Null);
+    }
 
-        handle.abort();
-        let _ = handle.await;
+    /// Run a PreToolUse bash_exec hook event and return the injected env object.
+    async fn hook_injected_env(tool_input_json: &str) -> Value {
+        let line = format!(
+            "{{\"id\":\"1\",\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"bash_exec\",\"tool_input\":{tool_input_json}}}\n"
+        );
+        let output = run_hook_once(&line, 12345).await;
+        let response: Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(response["id"], "1");
+        response["hookSpecificOutput"]["toolInput"]["env"].clone()
     }
 
     #[tokio::test]
     async fn hook_injects_env_bash_exec() {
-        let output = run_hook_once(
-            "{\"id\":\"1\",\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"bash_exec\",\"tool_input\":{\"command\":\"ls\",\"env\":{\"EXISTING\":\"val\"}}}\n",
-            12345,
-        )
-        .await;
+        let env = hook_injected_env(r#"{"command":"ls","env":{"EXISTING":"val"}}"#).await;
 
-        let response: Value = serde_json::from_str(output.trim()).unwrap();
-        let env = &response["hookSpecificOutput"]["toolInput"]["env"];
-        assert_eq!(response["id"], "1");
         assert_eq!(env["EXISTING"], "val");
         assert_eq!(
             env["AWS_CONTAINER_CREDENTIALS_FULL_URI"],
@@ -399,15 +403,8 @@ mod tests {
 
     #[tokio::test]
     async fn hook_injects_env_no_prior_env() {
-        let output = run_hook_once(
-            "{\"id\":\"1\",\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"bash_exec\",\"tool_input\":{\"command\":\"ls\"}}\n",
-            12345,
-        )
-        .await;
+        let env = hook_injected_env(r#"{"command":"ls"}"#).await;
 
-        let response: Value = serde_json::from_str(output.trim()).unwrap();
-        let env = &response["hookSpecificOutput"]["toolInput"]["env"];
-        assert_eq!(response["id"], "1");
         assert_eq!(
             env["AWS_CONTAINER_CREDENTIALS_FULL_URI"],
             "http://127.0.0.1:12345/creds"
@@ -442,14 +439,8 @@ mod tests {
 
     #[tokio::test]
     async fn hook_aws_vars_overwrite_existing() {
-        let output = run_hook_once(
-            "{\"id\":\"1\",\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"bash_exec\",\"tool_input\":{\"command\":\"ls\",\"env\":{\"AWS_REGION\":\"wrong\"}}}\n",
-            12345,
-        )
-        .await;
+        let env = hook_injected_env(r#"{"command":"ls","env":{"AWS_REGION":"wrong"}}"#).await;
 
-        let response: Value = serde_json::from_str(output.trim()).unwrap();
-        let env = &response["hookSpecificOutput"]["toolInput"]["env"];
         assert_eq!(env["AWS_REGION"], "us-east-1");
         assert_eq!(env["AWS_CONTAINER_AUTHORIZATION_TOKEN"], "testtoken");
     }

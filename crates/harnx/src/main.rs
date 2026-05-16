@@ -488,8 +488,10 @@ async fn start_directive_inner(
         harnx_runtime::tool::execute_tool_round(
             config,
             &input,
-            &output,
-            thought.as_deref(),
+            &harnx_runtime::tool::CompletionText {
+                output: &output,
+                thought: thought.as_deref(),
+            },
             tool_calls,
             &abort_signal,
             persistent_manager,
