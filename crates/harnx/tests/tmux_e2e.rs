@@ -20,6 +20,91 @@ const TEST_AGENT_NAME: &str = "test-agent";
 const TEST_SUB_AGENT_NAME: &str = "test-sub-agent";
 
 #[test]
+#[cfg(unix)]
+fn proxy_auth_hook_injects_env_vars_into_bash_exec() -> Result<()> {
+    if !TmuxHarness::is_available() {
+        eprintln!("skipping proxy_auth_hook_injects_env_vars_into_bash_exec: tmux is unavailable");
+        return Ok(());
+    }
+
+    let repo_root = repo_root()?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let harnx_proxy_auth_bin = harnx_proxy_auth_bin(&harnx_bin);
+    if !harnx_proxy_auth_bin.exists() {
+        eprintln!(
+            "skipping proxy_auth_hook_injects_env_vars_into_bash_exec: harnx-proxy-auth binary not found at {}",
+            harnx_proxy_auth_bin.display()
+        );
+        return Ok(());
+    }
+
+    let temp = TempDir::new().context("failed to create temp dir")?;
+    let mock = MockOpenAiServer::start(proxy_auth_hook_script())?;
+    let paths = TestPaths::new(temp.path(), mock.port())?;
+    write_proxy_auth_fixture_files(&paths, &harnx_proxy_auth_bin)?;
+
+    let path_env = format!(
+        "{}:{}",
+        harnx_bin
+            .parent()
+            .context("harnx binary missing parent directory")?
+            .display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let tmux = match TmuxHarness::new(&repo_root, 120, 35) {
+        Ok(tmux) => tmux,
+        Err(err) => {
+            eprintln!(
+                "skipping proxy_auth_hook_injects_env_vars_into_bash_exec: tmux is unavailable or unusable ({err:#})"
+            );
+            return Ok(());
+        }
+    };
+    tmux.send_keys(&["C-l"])?;
+
+    tmux.send_text(&format!(
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}",
+        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref())
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+
+    tmux.send_text(&format!(
+        "export PATH={} && cd {}; printf '__READY_PROXY__\n'",
+        shell_escape(&path_env),
+        shell_escape(repo_root.to_string_lossy().as_ref())
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for(Duration::from_secs(5), |screen| {
+        count_occurrences(screen, "__READY_PROXY__") >= 2
+    })?;
+
+    tmux.send_text(&format!(
+        "{} -s proxy-auth-e2e -m mock-llm:test {}",
+        shell_escape(harnx_bin.to_string_lossy().as_ref()),
+        shell_escape("Run a bash command")
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+    let screen = tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains("HTTPS_PROXY=http://127.0.0.1:")
+    })?;
+
+    assert!(
+        screen.contains("HTTPS_PROXY=http://127.0.0.1:"),
+        "expected HTTPS_PROXY injection in output, got screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("SSL_CERT_FILE=") && screen.contains("ca.pem"),
+        "expected SSL_CERT_FILE ending with ca.pem in output, got screen:\n{screen}"
+    );
+
+    drop(tmux);
+    drop(mock);
+    Ok(())
+}
+#[test]
 fn repro_249_top_level_delegation_markers() -> Result<()> {
     if !TmuxHarness::is_available() {
         eprintln!("skipping repro_249_top_level_delegation_markers: tmux is unavailable");
@@ -321,6 +406,11 @@ fn normalize_short_session_ids(text: &str) -> String {
     out
 }
 
+fn harnx_proxy_auth_bin(harnx_bin: &Path) -> PathBuf {
+    let ext = std::env::consts::EXE_SUFFIX;
+    harnx_bin.with_file_name(format!("harnx-proxy-auth{ext}"))
+}
+
 fn shell_escape(s: &str) -> String {
     let escaped = s.replace('"', "\\\"");
     format!("\"{escaped}\"")
@@ -426,6 +516,102 @@ fn script() -> MockOpenAiScript {
         fallback_text: "No more scripted responses.".to_string(),
         chunk_delay_ms: 0,
     }
+}
+
+fn proxy_auth_hook_script() -> MockOpenAiScript {
+    MockOpenAiScript {
+        turns: vec![
+            MockOpenAiTurn {
+                text_chunks: vec![],
+                tool_calls: vec![MockOpenAiToolCall {
+                    name: "bash_exec".to_string(),
+                    arguments: json!({
+                        "command": "echo HTTPS_PROXY=$HTTPS_PROXY SSL_CERT_FILE=$SSL_CERT_FILE"
+                    }),
+                    id: Some("call_proxy_env".to_string()),
+                }],
+                error: None,
+                expect: None,
+            },
+            MockOpenAiTurn {
+                text_chunks: vec!["Done.".to_string()],
+                tool_calls: vec![],
+                error: None,
+                expect: None,
+            },
+        ],
+        fallback_text: "No more scripted responses.".to_string(),
+        chunk_delay_ms: 0,
+    }
+}
+
+fn write_proxy_auth_fixture_files(paths: &TestPaths, proxy_auth_bin: &Path) -> Result<()> {
+    std::fs::create_dir_all(&paths.harnx_config_dir)?;
+
+    std::fs::write(
+        &paths.config_path,
+        format!(
+            "save: false
+hooks:
+  - event: PreToolUse
+    matcher: bash_exec|bash_spawn
+    command: {} --hook '.'
+    type: claude-command-persistent
+",
+            shell_escape(proxy_auth_bin.to_string_lossy().as_ref())
+        ),
+    )?;
+
+    let clients_dir = paths.harnx_config_dir.join("clients");
+    std::fs::create_dir_all(&clients_dir)?;
+
+    let client = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
+        (
+            serde_yaml::Value::String("type".to_string()),
+            serde_yaml::Value::String("openai-compatible".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("name".to_string()),
+            serde_yaml::Value::String("mock-llm".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("api_base".to_string()),
+            serde_yaml::Value::String(format!("http://127.0.0.1:{}/v1", paths.port)),
+        ),
+        (
+            serde_yaml::Value::String("api_key".to_string()),
+            serde_yaml::Value::String("dummy".to_string()),
+        ),
+        (
+            serde_yaml::Value::String("models".to_string()),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(
+                serde_yaml::Mapping::from_iter([
+                    (
+                        serde_yaml::Value::String("name".to_string()),
+                        serde_yaml::Value::String("test".to_string()),
+                    ),
+                    (
+                        serde_yaml::Value::String("max_input_tokens".to_string()),
+                        serde_yaml::Value::Number(32000.into()),
+                    ),
+                    (
+                        serde_yaml::Value::String("max_output_tokens".to_string()),
+                        serde_yaml::Value::Number(4096.into()),
+                    ),
+                    (
+                        serde_yaml::Value::String("supports_tool_use".to_string()),
+                        serde_yaml::Value::Bool(true),
+                    ),
+                ]),
+            )]),
+        ),
+    ]));
+    std::fs::write(
+        paths.harnx_config_dir.join("clients").join("mock-llm.yaml"),
+        serde_yaml::to_string(&client)?,
+    )?;
+
+    Ok(())
 }
 
 fn write_fixture_files(paths: &TestPaths) -> Result<()> {
