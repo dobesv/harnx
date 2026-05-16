@@ -76,7 +76,7 @@ Minor style nits can go in the Recommendation section as observations; reserve
 FAIL for clear violations that meaningfully hurt code quality.
 
 ### 4. Determine Verification Commands
-Before running anything, check `AGENTS.md` for project-specific verification instructions. If it defines commands for testing, linting, or type-checking, those take precedence over defaults below. Also check `package.json`, `Makefile`, `pyproject.toml`, `Cargo.toml`, etc. for configured scripts.
+Before running anything, check `AGENTS.md` for project-specific verification instructions. Also check `README.md` and config files (`package.json` scripts, `Makefile` targets, `Cargo.toml`, `pyproject.toml`, etc.) for test/lint/check commands. Use whatever the project defines — do not guess or invent invocations.
 
 ### 5. Run Tests
 Run the **full** project test suite — not just tests related to changed files.
