@@ -1844,7 +1844,13 @@ async fn test_tool_result_switch_agent_parsing() {
     // tool.rs) on the result object.
     let abort_signal = harnx_runtime::utils::create_abort_signal();
     let mut results = eval_tool_calls(
-        &harnx_runtime::tool::build_tool_eval_context(&config, None),
+        &harnx_runtime::tool::build_tool_eval_context(
+            &config,
+            None,
+            &std::sync::Arc::new(tokio::sync::Mutex::new(
+                harnx_hooks::PersistentHookManager::new(),
+            )),
+        ),
         vec![call],
         &abort_signal,
     )
