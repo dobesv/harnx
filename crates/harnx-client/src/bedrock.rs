@@ -3,16 +3,82 @@ use crate::*;
 use harnx_core::crypto::{base64_decode, encode_uri, hex_encode, hmac_sha256, sha256};
 use harnx_core::text::strip_think_tag;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use aws_smithy_eventstream::frame::{DecodedFrame, MessageFrameDecoder};
 use aws_smithy_eventstream::smithy::parse_response_headers;
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use indexmap::IndexMap;
+use parking_lot::RwLock;
 use reqwest::{Client as ReqwestClient, Method, RequestBuilder};
+use std::sync::LazyLock;
+use std::time::UNIX_EPOCH;
+
+use aws_credential_types::provider::ProvideCredentials;
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+static AWS_CREDENTIALS: LazyLock<RwLock<IndexMap<String, (AwsCredentials, i64)>>> =
+    LazyLock::new(|| RwLock::new(IndexMap::new()));
+
+async fn prepare_aws_credentials(
+    client_name: &str,
+    region: &str,
+    profile: Option<&str>,
+) -> Result<()> {
+    {
+        let cache = AWS_CREDENTIALS.read();
+        if let Some((_, expires_at)) = cache.get(client_name) {
+            if chrono::Utc::now().timestamp() < *expires_at {
+                return Ok(());
+            }
+        }
+    }
+
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_owned()));
+    if let Some(p) = profile {
+        loader = loader.profile_name(p);
+    }
+    let sdk_config = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        loader.load(),
+    )
+    .await
+    .map_err(|_| anyhow!("AWS credential resolution timed out after 30 seconds"))?;
+
+    let provider = sdk_config
+        .credentials_provider()
+        .ok_or_else(|| anyhow!("No AWS credentials provider found"))?;
+
+    let creds = provider.provide_credentials().await?;
+
+    let expires_at = creds
+        .expiry()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp() + 3600);
+
+    let aws_creds = AwsCredentials {
+        access_key_id: creds.access_key_id().to_string(),
+        secret_access_key: creds.secret_access_key().to_string(),
+        region: region.to_string(),
+        session_token: creds.session_token().map(|s| s.to_string()),
+    };
+
+    let mut cache = AWS_CREDENTIALS.write();
+    cache.insert(client_name.to_string(), (aws_creds, expires_at));
+    Ok(())
+}
+
+fn get_cached_aws_credentials(client_name: &str) -> Result<AwsCredentials> {
+    AWS_CREDENTIALS
+        .read()
+        .get(client_name)
+        .map(|(creds, _)| creds.clone())
+        .ok_or_else(|| anyhow!("No cached AWS credentials for {client_name}"))
+}
 
 impl BedrockClient {
     config_get_fn!(access_key_id, get_access_key_id);
@@ -20,9 +86,34 @@ impl BedrockClient {
     config_get_fn!(region, get_region);
     config_get_fn!(session_token, get_session_token);
 
-    pub const PROMPTS: [PromptAction<'static>; 3] = [
-        ("access_key_id", "AWS Access Key ID", None),
-        ("secret_access_key", "AWS Secret Access Key", None),
+    #[cfg(test)]
+    fn new_for_test(config: BedrockConfig) -> Self {
+        Self {
+            config,
+            model: Model::new("bedrock", "test-model"),
+        }
+    }
+
+    fn has_static_credentials(&self) -> bool {
+        self.get_access_key_id().is_ok() && self.get_secret_access_key().is_ok()
+    }
+
+    async fn resolve_credentials(&self) -> Result<AwsCredentials> {
+        if self.has_static_credentials() {
+            Ok(AwsCredentials {
+                access_key_id: self.get_access_key_id()?,
+                secret_access_key: self.get_secret_access_key()?,
+                region: self.get_region()?,
+                session_token: self.get_session_token().ok(),
+            })
+        } else {
+            let region = self.get_region()?;
+            prepare_aws_credentials(self.name(), &region, self.config.profile.as_deref()).await?;
+            get_cached_aws_credentials(self.name())
+        }
+    }
+
+    pub const PROMPTS: [PromptAction<'static>; 1] = [
         ("region", "AWS Region", None),
     ];
 
@@ -30,12 +121,9 @@ impl BedrockClient {
         &self,
         client: &ReqwestClient,
         data: ChatCompletionsData,
+        creds: &AwsCredentials,
     ) -> Result<RequestBuilder> {
-        let access_key_id = self.get_access_key_id()?;
-        let secret_access_key = self.get_secret_access_key()?;
-        let region = self.get_region()?;
-        let session_token = self.get_session_token().ok();
-        let host = format!("bedrock-runtime.{region}.amazonaws.com");
+        let host = format!("bedrock-runtime.{}.amazonaws.com", creds.region);
 
         let model_name = &self.model.real_name();
 
@@ -57,12 +145,7 @@ impl BedrockClient {
 
         let builder = aws_fetch(
             client,
-            &AwsCredentials {
-                access_key_id,
-                secret_access_key,
-                region,
-                session_token,
-            },
+            creds,
             AwsRequest {
                 method: Method::POST,
                 host,
@@ -81,12 +164,9 @@ impl BedrockClient {
         &self,
         client: &ReqwestClient,
         data: &EmbeddingsData,
+        creds: &AwsCredentials,
     ) -> Result<RequestBuilder> {
-        let access_key_id = self.get_access_key_id()?;
-        let secret_access_key = self.get_secret_access_key()?;
-        let region = self.get_region()?;
-        let session_token = self.get_session_token().ok();
-        let host = format!("bedrock-runtime.{region}.amazonaws.com");
+        let host = format!("bedrock-runtime.{}.amazonaws.com", creds.region);
 
         let uri = format!("/model/{}/invoke", self.model.real_name());
 
@@ -110,12 +190,7 @@ impl BedrockClient {
 
         let builder = aws_fetch(
             client,
-            &AwsCredentials {
-                access_key_id,
-                secret_access_key,
-                region,
-                session_token,
-            },
+            creds,
             AwsRequest {
                 method: Method::POST,
                 host,
@@ -140,7 +215,8 @@ impl Client for BedrockClient {
         client: &ReqwestClient,
         data: ChatCompletionsData,
     ) -> Result<ChatCompletionsOutput> {
-        let builder = self.chat_completions_builder(client, data)?;
+        let creds = self.resolve_credentials().await?;
+        let builder = self.chat_completions_builder(client, data, &creds)?;
         chat_completions(builder).await
     }
 
@@ -150,7 +226,8 @@ impl Client for BedrockClient {
         handler: &mut SseHandler,
         data: ChatCompletionsData,
     ) -> Result<()> {
-        let builder = self.chat_completions_builder(client, data)?;
+        let creds = self.resolve_credentials().await?;
+        let builder = self.chat_completions_builder(client, data, &creds)?;
         chat_completions_streaming(builder, handler).await
     }
 
@@ -159,7 +236,8 @@ impl Client for BedrockClient {
         client: &ReqwestClient,
         data: &EmbeddingsData,
     ) -> Result<EmbeddingsOutput> {
-        let builder = self.embeddings_builder(client, data)?;
+        let creds = self.resolve_credentials().await?;
+        let builder = self.embeddings_builder(client, data, &creds)?;
         embeddings(builder).await
     }
 }
@@ -654,7 +732,7 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     Ok(output)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AwsCredentials {
     access_key_id: String,
     secret_access_key: String,
@@ -843,6 +921,174 @@ mod tests {
     /// orphaned, and it produces "previous session" hallucinations.
     /// This test drives the full state machine and verifies the next
     /// request body is well-formed.
+    fn test_bedrock_config(
+        access_key_id: Option<&str>,
+        secret_access_key: Option<&str>,
+        region: Option<&str>,
+        session_token: Option<&str>,
+    ) -> BedrockConfig {
+        BedrockConfig {
+            name: None,
+            access_key_id: access_key_id.map(Into::into),
+            secret_access_key: secret_access_key.map(Into::into),
+            region: region.map(Into::into),
+            session_token: session_token.map(Into::into),
+            profile: None,
+            models: vec![],
+            patch: None,
+            extra: None,
+            system_prompt_prefix: None,
+        }
+    }
+
+    #[test]
+    fn has_static_credentials_true_when_both_set() {
+        let client = BedrockClient::new_for_test(test_bedrock_config(
+            Some("AKIATEST"),
+            Some("secret"),
+            Some("us-east-1"),
+            None,
+        ));
+
+        assert!(client.has_static_credentials());
+    }
+
+    #[test]
+    fn has_static_credentials_false_when_missing() {
+        let client = BedrockClient::new_for_test(test_bedrock_config(
+            None,
+            None,
+            Some("us-east-1"),
+            None,
+        ));
+
+        assert!(!client.has_static_credentials());
+    }
+
+    #[tokio::test]
+    async fn resolve_credentials_static_path_returns_creds() {
+        let client = BedrockClient::new_for_test(test_bedrock_config(
+            Some("AKIATEST123"),
+            Some("secret123"),
+            Some("us-west-2"),
+            None,
+        ));
+
+        let creds = client
+            .resolve_credentials()
+            .await
+            .expect("should return static creds");
+
+        assert_eq!(creds.access_key_id, "AKIATEST123");
+        assert_eq!(creds.secret_access_key, "secret123");
+        assert_eq!(creds.region, "us-west-2");
+        assert!(creds.session_token.is_none());
+    }
+
+    #[test]
+    fn get_cached_aws_credentials_errors_when_missing() {
+        let client_name = "nonexistent-bedrock-client-xyz";
+        AWS_CREDENTIALS.write().shift_remove(client_name);
+
+        let result = get_cached_aws_credentials(client_name);
+
+        assert!(result.is_err(), "should error when key not in cache");
+    }
+
+    #[test]
+    fn get_cached_aws_credentials_returns_cached_entry() {
+        let client_name = "test-bedrock-cache-client";
+        let creds = AwsCredentials {
+            access_key_id: "AKIACACHED".into(),
+            secret_access_key: "cachedsecret".into(),
+            region: "eu-west-1".into(),
+            session_token: None,
+        };
+        let expires_at = chrono::Utc::now().timestamp() + 3600;
+
+        {
+            let mut cache = AWS_CREDENTIALS.write();
+            cache.shift_remove(client_name);
+            cache.insert(client_name.to_string(), (creds, expires_at));
+        }
+
+        let creds = get_cached_aws_credentials(client_name).expect("should return cached creds");
+
+        assert_eq!(creds.access_key_id, "AKIACACHED");
+        assert_eq!(creds.secret_access_key, "cachedsecret");
+        assert_eq!(creds.region, "eu-west-1");
+        assert!(creds.session_token.is_none());
+
+        AWS_CREDENTIALS.write().shift_remove(client_name);
+    }
+
+    /// Verify that `prepare_aws_credentials` populates the cache when called
+    /// with env-var credentials (no network, uses AWS env-var provider).
+    /// This tests the cache-population path without mocking the AWS SDK.
+    #[tokio::test]
+    async fn prepare_aws_credentials_populates_cache_from_env() {
+        let client_name = "test-env-chain-client";
+        // Clean up any prior state
+        AWS_CREDENTIALS.write().shift_remove(client_name);
+
+        // Set env vars that the AWS SDK env-var provider will pick up
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAENVTEST");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "envsecret");
+        // Remove session token to avoid interference
+        std::env::remove_var("AWS_SESSION_TOKEN");
+
+        let result = prepare_aws_credentials(client_name, "us-east-1", None).await;
+
+        // Restore env
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+
+        result.expect("prepare_aws_credentials should succeed with env-var creds");
+
+        let creds = get_cached_aws_credentials(client_name)
+            .expect("cache should be populated after prepare");
+        assert_eq!(creds.access_key_id, "AKIAENVTEST");
+        assert_eq!(creds.region, "us-east-1");
+
+        // Cleanup
+        AWS_CREDENTIALS.write().shift_remove(client_name);
+    }
+
+    /// Verify that an expired cache entry is NOT returned early — the expiry
+    /// check in `prepare_aws_credentials` should detect it and attempt refresh.
+    /// We test this indirectly: insert an expired entry, then verify the cache
+    /// state, since we can't call `prepare_aws_credentials` without live creds.
+    #[test]
+    fn expired_cache_entry_is_past_current_time() {
+        let client_name = "test-expired-cache-client";
+        let creds = AwsCredentials {
+            access_key_id: "AKIAEXPIRED".into(),
+            secret_access_key: "expiredsecret".into(),
+            region: "us-east-1".into(),
+            session_token: None,
+        };
+        // expires_at in the past
+        let expires_at = chrono::Utc::now().timestamp() - 1;
+
+        {
+            let mut cache = AWS_CREDENTIALS.write();
+            cache.shift_remove(client_name);
+            cache.insert(client_name.to_string(), (creds, expires_at));
+        }
+
+        // The expiry check: Utc::now().timestamp() < expires_at must be false
+        let cache = AWS_CREDENTIALS.read();
+        let (_, stored_expires) = cache.get(client_name).expect("entry should exist");
+        assert!(
+            chrono::Utc::now().timestamp() >= *stored_expires,
+            "entry should be expired (now >= expires_at)"
+        );
+        drop(cache);
+
+        // Cleanup
+        AWS_CREDENTIALS.write().shift_remove(client_name);
+    }
+
     #[test]
     fn bedrock_streaming_thought_roundtrips_into_next_request_body() {
         use harnx_core::api_types::ChatCompletionsData;

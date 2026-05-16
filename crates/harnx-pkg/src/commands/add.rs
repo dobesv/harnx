@@ -15,7 +15,7 @@ pub async fn run(args: &AddArgs) -> Result<()> {
     })?;
 
     let is_oci = is_oci_url(&args.url);
-    let fetcher: Box<dyn PackageFetcher> = fetcher_for_url(&args.url);
+    let fetcher: Box<dyn PackageFetcher> = fetcher_for_url(&args.url).await?;
     let name = args
         .name
         .clone()
@@ -53,9 +53,10 @@ pub fn is_oci_url(url: &str) -> bool {
         && !url.starts_with("ssh://")
 }
 
-pub fn fetcher_for_url(url: &str) -> Box<dyn PackageFetcher> {
+pub async fn fetcher_for_url(url: &str) -> Result<Box<dyn PackageFetcher>> {
     if is_oci_url(url) {
-        return Box::new(OciFetcher);
+        let auth = crate::credentials::resolve_oci_auth(url).await?;
+        return Ok(Box::new(OciFetcher::with_auth(auth)));
     }
     if url.ends_with(".git")
         || url.contains("github.com")
@@ -65,11 +66,11 @@ pub fn fetcher_for_url(url: &str) -> Box<dyn PackageFetcher> {
         || url.starts_with("git://")
         || url.starts_with("ssh://")
     {
-        return Box::new(GitFetcher);
+        return Ok(Box::new(GitFetcher));
     }
     // Default: try git
     log::warn!("Cannot determine source type from URL '{url}', trying git");
-    Box::new(GitFetcher)
+    Ok(Box::new(GitFetcher))
 }
 
 pub fn infer_package_name(url: &str) -> String {

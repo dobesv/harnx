@@ -13,7 +13,7 @@ pub async fn run(args: &CheckForUpdatesArgs) -> Result<()> {
     };
 
     for manifest in &packages {
-        let fetcher = fetcher_for_source(&manifest.source);
+        let fetcher = fetcher_for_source(&manifest.source).await?;
         let url = source_url(&manifest.source);
         let installed_tag = source_tag(&manifest.source);
         let installed_ver = parse_semver_tag(installed_tag)?;
@@ -37,10 +37,13 @@ pub async fn run(args: &CheckForUpdatesArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn fetcher_for_source(source: &PackageSource) -> Box<dyn PackageFetcher> {
+pub async fn fetcher_for_source(source: &PackageSource) -> Result<Box<dyn PackageFetcher>> {
     match source {
-        PackageSource::Git { .. } => Box::new(GitFetcher),
-        PackageSource::Oci { .. } => Box::new(OciFetcher),
+        PackageSource::Git { .. } => Ok(Box::new(GitFetcher)),
+        PackageSource::Oci { url, .. } => {
+            let auth = crate::credentials::resolve_oci_auth(url).await?;
+            Ok(Box::new(OciFetcher::with_auth(auth)))
+        }
     }
 }
 
