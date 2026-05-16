@@ -421,6 +421,7 @@ fn normalize_short_session_ids(text: &str) -> String {
     out
 }
 
+#[cfg(unix)]
 fn harnx_proxy_auth_bin(harnx_bin: &Path) -> PathBuf {
     let ext = std::env::consts::EXE_SUFFIX;
     harnx_bin.with_file_name(format!("harnx-proxy-auth{ext}"))
@@ -533,6 +534,7 @@ fn script() -> MockOpenAiScript {
     }
 }
 
+#[cfg(unix)]
 fn proxy_auth_hook_script() -> MockOpenAiScript {
     MockOpenAiScript {
         turns: vec![
@@ -560,6 +562,7 @@ fn proxy_auth_hook_script() -> MockOpenAiScript {
     }
 }
 
+#[cfg(unix)]
 fn write_proxy_auth_fixture_files(paths: &TestPaths, proxy_auth_bin: &Path) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
