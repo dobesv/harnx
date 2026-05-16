@@ -2153,7 +2153,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<SpawnCommandParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "```sh\n> {{ args.command }}\n```{% if args.working_dir or args.inputs or args.outputs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.inputs %}[<{{ args.inputs | length }}] {% endif %}{% if args.outputs %}[>{{ args.outputs | length }}]{% endif %}{% endif %}",
+                    "call_template": "```sh\n$ {{ args.command }} &\n```{% if args.working_dir or args.inputs or args.outputs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.inputs %}[<{{ args.inputs | length }}] {% endif %}{% if args.outputs %}[>{{ args.outputs | length }}]{% endif %}{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "wait",
