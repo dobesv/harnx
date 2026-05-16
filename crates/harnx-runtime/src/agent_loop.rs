@@ -14,7 +14,7 @@
 
 use crate::{
     config::{Config, GlobalConfig, Input},
-    tool::{execute_tool_round, ToolResult},
+    tool::{execute_tool_round, CompletionText, ToolResult},
     utils::dimmed_text,
 };
 use anyhow::{bail, Result};
@@ -259,10 +259,13 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
             execute_tool_round(
                 config,
                 &input,
-                &output,
-                thought.as_deref(),
+                &CompletionText {
+                    output: &output,
+                    thought: thought.as_deref(),
+                },
                 tool_calls,
                 abort_signal,
+                &ctx.persistent_manager,
             )
             .await?
         };

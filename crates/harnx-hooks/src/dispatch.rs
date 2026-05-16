@@ -867,4 +867,77 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1200)).await;
     }
+
+    // A persistent hook script that reads JSONL lines, echoes back the id, and
+    // injects {"injected": true} into hookSpecificOutput.toolInput.
+    #[cfg(unix)]
+    fn persistent_mutate_command(dir: &Path) -> String {
+        write_script(
+            dir,
+            "persistent-mutate",
+            r#"while IFS= read -r line; do
+  id=${line#*\"id\":\"}; id=${id%%\"*}
+  printf '{"id":"%s","hookSpecificOutput":{"toolInput":{"injected":true}}}\n' "$id"
+done"#,
+        )
+    }
+
+    // Regression test: persistent hooks were silently skipped when
+    // persistent_manager was None (the bug in build_tool_eval_context).
+    // Passing None must produce no mutation; passing Some(pm) must mutate.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dispatch_persistent_hook_requires_manager() {
+        use crate::PersistentHookManager;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let cwd = temp_test_dir("persistent-hook-manager");
+        let command = persistent_mutate_command(&cwd);
+        let hooks = vec![HookConfig {
+            hook_type: "claude-command-persistent".to_string(),
+            ..hook_config("PreToolUse", command)
+        }];
+        let event = pre_tool_use_event("bash_exec");
+
+        // With None: persistent hook is skipped — no mutation.
+        let outcome_no_pm = dispatch_hooks_with_count_and_manager(
+            &event,
+            &hooks,
+            "session-no-pm",
+            &cwd,
+            0,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(outcome_no_pm.control, HookResultControl::Continue));
+        assert!(
+            outcome_no_pm.result.mutated_tool_input.is_none(),
+            "persistent hook must be skipped when no manager is passed"
+        );
+
+        // With Some(pm): persistent hook runs and mutates tool_input.
+        let pm = Arc::new(Mutex::new(PersistentHookManager::new()));
+        let outcome_with_pm = dispatch_hooks_with_count_and_manager(
+            &event,
+            &hooks,
+            "session-with-pm",
+            &cwd,
+            0,
+            None,
+            Some(&pm),
+        )
+        .await;
+        assert!(matches!(
+            outcome_with_pm.control,
+            HookResultControl::Continue
+        ));
+        assert_eq!(
+            outcome_with_pm.result.mutated_tool_input,
+            Some(serde_json::json!({"injected": true})),
+            "persistent hook must mutate tool_input when manager is provided"
+        );
+        pm.lock().await.shutdown();
+    }
 }

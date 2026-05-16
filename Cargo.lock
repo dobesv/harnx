@@ -3315,6 +3315,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-aws-creds"
+version = "0.32.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-credential-types",
+ "axum",
+ "chrono",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "harnx-client"
 version = "0.32.0"
 dependencies = [
