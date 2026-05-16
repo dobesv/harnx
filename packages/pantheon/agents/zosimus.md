@@ -28,9 +28,9 @@ variables:
 - name: repo_docs
   description: Instructions for discovering repository documentation
   path: shared/repo-documentation-discovery.md
-- name: jira_acli_lookup
-  description: Brief guide for fetching Jira issue information with acli
-  path: shared/jira-acli-lookup.md
+- name: issue_tracker_lookup
+  description: Guide for identifying and querying the project issue tracker
+  path: shared/issue-tracker-lookup.md
 - name: github_gh_lookup
   description: Brief guide for fetching GitHub issue and pull request information with gh
   path: shared/github-gh-lookup.md
@@ -41,7 +41,7 @@ variables:
 
 {{zosimus_core}}
 
-{{jira_acli_lookup}}
+{{issue_tracker_lookup}}
 
 {{github_gh_lookup}}
 
