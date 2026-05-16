@@ -283,7 +283,7 @@ jobs:
           [ "$missing" -eq 0 ] || { echo "Some binaries are missing. Check asset download step."; exit 1; }
 
       - name: Build and push harnx-mcp-time
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/harnx-mcp-time.Dockerfile
@@ -294,7 +294,7 @@ jobs:
             ${{ needs.release.outputs.rc == 'false' && 'ghcr.io/dobesv/harnx-mcp-time:latest' || '' }}
 
       - name: Build and push harnx-mcp-plans
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/harnx-mcp-plans.Dockerfile
@@ -305,7 +305,7 @@ jobs:
             ${{ needs.release.outputs.rc == 'false' && 'ghcr.io/dobesv/harnx-mcp-plans:latest' || '' }}
 
       - name: Build and push harnx
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/harnx.Dockerfile
