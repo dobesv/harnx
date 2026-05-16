@@ -1,0 +1,27 @@
+# AWS Bedrock Configuration
+# Bedrock uses AWS credentials to authenticate.
+# If credentials are omitted, the standard AWS credential chain is used
+# (env vars AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, ~/.aws/config, IAM roles, etc.).
+
+type: bedrock
+name: bedrock             # Optional: defaults to "bedrock"
+
+# Required: AWS Region (e.g., us-east-1, us-west-2)
+region: us-east-1
+
+# Optional: Explicit credentials (overrides environment/profiles)
+# access_key_id: "..."
+# secret_access_key: "..."
+# session_token: "..."
+
+# Optional: AWS Profile name
+# profile: "default"
+
+# Optional: System prompt prefix for all models on this client (list of strings)
+# system_prompt_prefix:
+#   - "You are a helpful assistant."
+
+# Optional: Custom model list (if not using built-in catalog)
+# models:
+#   - name: "anthropic.claude-3-sonnet-20240229-v1:0"
+#     type: chat
