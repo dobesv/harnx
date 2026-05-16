@@ -1,0 +1,14 @@
+# Google Vertex AI Configuration
+# Vertex AI uses Google Application Default Credentials (ADC).
+
+type: vertexai
+name: vertexai
+
+# Required: Google Cloud Project ID
+project_id: "your-project-id"
+
+# Required: Google Cloud Location (e.g., us-central1)
+location: "us-central1"
+
+# Optional: Path to a service account key file (overrides default ADC)
+# adc_file: "/path/to/service-account.json"

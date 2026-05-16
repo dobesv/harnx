@@ -64,6 +64,8 @@ The `config.yaml` file contains global behavior and appearance settings.
 
 Each LLM provider is configured in its own YAML file within the `clients/` directory (e.g., `clients/openai.yaml`).
 
+For a complete list of supported providers and their specific configuration options, see the [**LLM Providers Reference**](providers.md).
+
 **Note:** The filename is for organization only. The client's ID used in `model` settings (e.g., `myclient:gpt-4`) is determined by the `name` field inside the configuration file.
 
 ### General Client Options
@@ -158,7 +160,7 @@ A comprehensive reference for the new folder structure and common provider/serve
 
 This directory includes:
 - `config.yaml` with recommended global settings.
-- `clients/` examples for OpenAI, Claude, Gemini, and Ollama.
+- `clients/` examples for OpenAI, Claude, Gemini, Bedrock, Azure, Vertex AI, and more.
 - `mcp_servers/` examples for filesystem, shell, and web search.
 - `agents/` and `acp_servers/` usage documentation.
 
