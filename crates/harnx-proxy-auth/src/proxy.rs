@@ -64,19 +64,20 @@ fn request_json(req: &Request<Body>) -> Value {
 }
 
 fn replace_headers(headers: &mut http::HeaderMap, new_headers: &Map<String, Value>) {
-    headers.clear();
-
+    // Patch semantics: only touch keys present in new_headers.
+    // null value → remove the header; string value → upsert; anything else → skip.
+    // This preserves headers the filter didn't mention (e.g. Host, Content-Length).
     for (name, value) in new_headers {
-        let Some(value) = value.as_str() else {
-            continue;
-        };
         let Ok(name) = name.parse::<HeaderName>() else {
             continue;
         };
-        let Ok(value) = HeaderValue::from_str(value) else {
-            continue;
-        };
-        headers.insert(name, value);
+        if value.is_null() {
+            headers.remove(&name);
+        } else if let Some(s) = value.as_str() {
+            if let Ok(v) = HeaderValue::from_str(s) {
+                headers.insert(name, v);
+            }
+        }
     }
 }
 

@@ -132,9 +132,9 @@ async fn hook_dispatch_injects_proxy_env_into_bash_exec_input() {
 
 // ── Test 2: full stack through bash execution ──────────────────────────────
 
-/// Verify that the injected env vars actually reach the shell command.
-/// Exercises the full `eval_tool_calls` path with the real persistent manager
-/// threaded through `build_tool_eval_context`.
+/// Verify that the injected env vars actually reach the shell command via the
+/// full `eval_tool_calls` path, with the persistent manager threaded through
+/// `build_tool_eval_context` so `claude-command-persistent` hooks fire.
 ///
 /// Requires both `harnx-proxy-auth` and `harnx-mcp-bash` to be built.
 #[tokio::test(flavor = "multi_thread")]

@@ -17,7 +17,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
@@ -176,7 +176,7 @@ async fn read_proxy_readiness(proxy: &mut Child) -> Result<ProxyReadiness> {
 }
 
 async fn spawn_test_server() -> Result<TestServer> {
-    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 

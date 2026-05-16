@@ -256,7 +256,7 @@ It acts as a local HTTPS MITM (Man-in-the-Middle) proxy. When configured as a `c
 
 ### Installation
 
-`harnx-proxy-auth` is built alongside the main `harnx` binary. You can install it via `cargo install --path .` from the repository root to ensure it's in your `PATH`.
+`harnx-proxy-auth` is built alongside the main `harnx` binary. You can install it via `cargo install --path crates/harnx-proxy-auth` from the repository root to ensure it's in your `PATH`.
 
 ### CLI Flags
 

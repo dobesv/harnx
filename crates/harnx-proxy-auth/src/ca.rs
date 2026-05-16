@@ -1,25 +1,11 @@
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use hudsucker::rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair};
-
-#[derive(Debug)]
-pub struct CaTempDir(PathBuf);
-
-impl CaTempDir {
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for CaTempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use tempfile::TempDir;
 
 pub struct CaSetup {
     pub cert_pem_path: PathBuf,
@@ -27,15 +13,14 @@ pub struct CaSetup {
     pub cert: Certificate,
 }
 
-pub fn setup() -> Result<(CaSetup, CaTempDir)> {
-    let temp_dir_path =
-        std::env::temp_dir().join(format!("harnx-auth-proxy-{}", std::process::id()));
-    fs::create_dir_all(&temp_dir_path)?;
+pub fn setup() -> Result<(CaSetup, TempDir)> {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("harnx-auth-proxy-")
+        .tempdir()?;
 
     #[cfg(unix)]
-    fs::set_permissions(&temp_dir_path, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o700))?;
 
-    let temp_dir = CaTempDir(temp_dir_path);
     let cert_pem_path = temp_dir.path().join("ca.pem");
 
     let key_pair = KeyPair::generate()?;
