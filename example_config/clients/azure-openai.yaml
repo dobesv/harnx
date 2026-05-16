@@ -1,0 +1,19 @@
+# Azure OpenAI Configuration
+# Note: Azure OpenAI requires manual model listing as deployment names vary.
+
+type: azure-openai
+name: azure_openai   # Underscore keeps env var names shell-safe (AZURE_OPENAI_API_KEY)
+
+# Required: The base URL of your Azure OpenAI resource
+# Format: https://{RESOURCE}.openai.azure.com
+api_base: "https://your-resource.openai.azure.com"
+
+# Required: Your Azure OpenAI API key
+api_key: "your-api-key"
+
+# Models must be listed manually with 'name' matching your Azure deployment name.
+models:
+  - name: "gpt-4o"           # Deployment name on Azure
+    type: chat
+  - name: "text-embedding-3-small"
+    type: embeddings
