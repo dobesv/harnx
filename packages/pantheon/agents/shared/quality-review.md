@@ -7,10 +7,9 @@ until the Aristarchus review passes.
 After all implementation work is complete and individually verified by Argus:
 
 1. **Run the full verification suite.** This is mandatory — do not skip or abbreviate.
-   - First, check `AGENTS.md` for project-specific verification instructions. If it defines commands for testing, linting, or type-checking, those take precedence.
-   - Run the **full test suite** (not just tests related to changed files): e.g. `cargo test`, `npm test`, `pytest`, `go test ./...`
-   - Run **all linters and static analysis**: e.g. `cargo clippy`, `npx eslint .`, `ruff check`, `go vet ./...`
-   - Run **type checkers** if applicable: e.g. `npx tsc --noEmit`, `mypy`
+   - Check `AGENTS.md` for project-specific verification instructions first — these take precedence. Also check `README.md` and config files (`package.json`, `Makefile`, `Cargo.toml`, `pyproject.toml`, etc.) for configured test/lint/check scripts.
+   - Run the **full test suite** (not just tests related to changed files).
+   - Run **all linters, static analysis, and type checkers** the project has configured.
    - If any of these fail, fix the failures before proceeding. Do not report completion with a failing test suite or linter.
 2. Check for uncommitted changes: run `git status --short`. If changes exist in
    the working tree (unstaged or staged), note this — Aristarchus and its

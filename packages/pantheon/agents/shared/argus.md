@@ -80,17 +80,14 @@ Before running anything, check `AGENTS.md` for project-specific verification ins
 
 ### 5. Run Tests
 Run the **full** project test suite — not just tests related to changed files.
-- Run the full suite to catch regressions: e.g. `cargo test`, `npm test`, `pytest`, `go test ./...`
-- Also run targeted tests for changed code if identifiable, for faster feedback
-- Record pass/fail counts and any specific failures
+- Use the commands defined in `AGENTS.md`, `README.md`, or project config files (identified in step 4).
+- Also run targeted tests for changed code if identifiable, for faster feedback.
+- Record pass/fail counts and any specific failures.
 - **Skipping this step is not acceptable.** If tests cannot be run, state why explicitly and FAIL.
 
 ### 6. Run Diagnostics
 Run **all** linters, type checkers, and static analysis tools the project has configured. This is not optional.
-- Rust: `cargo clippy -- -D warnings`
-- TypeScript: `npx tsc --noEmit` AND `npx eslint .`
-- Go: `go vet ./...`
-- Python: `ruff check` and `mypy` (if configured)
+- Use the commands identified in step 4 — do not guess or invent commands.
 - **Skipping this step is not acceptable.** If a tool is not installed or configured, note it; do not silently omit it.
 
 ### 7. Cross-Check Claims
