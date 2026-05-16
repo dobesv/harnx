@@ -62,6 +62,30 @@ Download pre-built archives for macOS, Linux, and Windows from
 publishes a separate archive per binary per target (e.g.
 `harnx-0.30.0-x86_64-unknown-linux-musl.tar.gz`). Extract and add to `$PATH`.
 
+### Docker Images
+
+Docker images are published to GitHub Container Registry (GHCR) on every release:
+
+| Image | Contents |
+|---|---|
+| `ghcr.io/dobesv/harnx-mcp-time:<ver>` | `harnx-mcp-time` binary |
+| `ghcr.io/dobesv/harnx-mcp-plans:<ver>` | `harnx-mcp-plans` binary |
+| `ghcr.io/dobesv/harnx:<ver>` | All 8 binaries: `harnx`, `harnx-serve`, `harnx-acp-server`, `harnx-mcp-bash`, `harnx-mcp-bash-sandbox-run`, `harnx-mcp-fs`, `harnx-mcp-plans`, `harnx-mcp-time` |
+
+- **Multi-arch**: All images support `linux/amd64` and `linux/arm64` (Graviton, Apple Silicon).
+- **No Entrypoint**: The all-in-one `ghcr.io/dobesv/harnx` image has no fixed entrypoint; specify the binary you wish to run.
+- **Latest Tag**: Stable releases include a `:latest` tag; RC releases do not.
+
+**Examples:**
+
+```sh
+# Pull the latest time MCP server
+docker pull ghcr.io/dobesv/harnx-mcp-time:latest
+
+# Run the all-in-one image as a server
+docker run ghcr.io/dobesv/harnx harnx-serve
+```
+
 ## Features
 
 ### Multi-Providers
@@ -139,8 +163,8 @@ Harnx ships with several built-in MCP servers ready to enable in your config. Se
     *   **Filesystem sandboxing via [birdcage](https://crates.io/crates/birdcage)** (Linux/macOS) — write access limited to roots by default; per-call `inputs`/`outputs` overrides.
     *   Process group management (kill-on-drop) and background `spawn` + `wait` pattern.
     *   Path validation and history snapshots around mutating commands.
-*   **`harnx-mcp-time`** — Time and timezone utilities (`get_current_time`, `convert_time`, `wait`).
-*   **`harnx-mcp-plans`** — File-based plan/task/note management (`list_plans`, `add_task`, `get_task`, etc.)
+*   **`harnx-mcp-time`** — Time and timezone utilities (`get_current_time`, `convert_time`, `wait`). ([Docker image available](#docker-images))
+*   **`harnx-mcp-plans`** — File-based plan/task/note management (`list_plans`, `add_task`, `get_task`, etc.) ([Docker image available](#docker-images))
     *   YAML front-matter markdown storage for plans, tasks, and notes with rich metadata.
 
 #### AI Agents (CLI version of OpenAI GPTs)

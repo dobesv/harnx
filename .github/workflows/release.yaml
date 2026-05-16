@@ -187,6 +187,22 @@ jobs:
         draft: false
         files: ${{ steps.package.outputs.archives }}
         prerelease: ${{ steps.check-tag.outputs.rc == 'true' }}
+        append_body: true
+        body: |
+          ### Docker Images
+
+          Docker images are published to GHCR for this release:
+
+          - `ghcr.io/dobesv/harnx-mcp-time:${{ steps.check-tag.outputs.version }}`
+          - `ghcr.io/dobesv/harnx-mcp-plans:${{ steps.check-tag.outputs.version }}`
+          - `ghcr.io/dobesv/harnx:${{ steps.check-tag.outputs.version }}` (All-in-one image)
+
+          ${{ steps.check-tag.outputs.rc == 'false' && 'The `:latest` tag is also updated for stable releases.' || '' }}
+
+          Example usage:
+          ```sh
+          docker run ghcr.io/dobesv/harnx:${{ steps.check-tag.outputs.version }} harnx --version
+          ```
 
   docker:
     name: Publish Docker Images

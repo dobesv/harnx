@@ -6,6 +6,15 @@
 
 The server starts child bash processes with a curated environment, NOT the full host environment. This prevents sensitive information (like API keys or other secrets) in the parent shell from being accidentally exposed to the LLM agent's tool calls. Environment curation is independent of sandboxing — it applies on every platform, including Windows where filesystem sandboxing is unavailable.
 
+## Docker
+
+The `harnx-mcp-bash` binary is available in the all-in-one `ghcr.io/dobesv/harnx` Docker image. You can pull and run it directly:
+
+```sh
+docker pull ghcr.io/dobesv/harnx:latest
+docker run -it ghcr.io/dobesv/harnx harnx-mcp-bash --help
+```
+
 ## Default Environment Allowlist
 
 By default, only a minimal set of host environment variables is passed through to the child bash process:
