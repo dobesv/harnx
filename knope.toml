@@ -42,6 +42,22 @@ name = "release"
 [[workflows.steps]]
 type = "PrepareRelease"
 
+# Sync the `version:` field in all agent .md frontmatter to match the
+# package version that PrepareRelease just wrote to each package.yaml.
+[[workflows.steps]]
+type = "Command"
+command = """
+for pkg in pantheon coding; do
+  dir="packages/$pkg"
+  [ -f "$dir/package.yaml" ] || continue
+  ver=$(grep -m1 '^version:' "$dir/package.yaml" | sed "s/version: v//")
+  [ -n "$ver" ] || continue
+  find "$dir/agents" -maxdepth 1 -name "*.md" | while read f; do
+    sed -i "s/^version: .*/version: '$ver'/" "$f"
+  done
+done
+"""
+
 # `PrepareRelease` deletes the consumed changeset files from disk but
 # (in our setup) doesn't always stage those deletions. Force-stage
 # everything in the working tree so the upcoming commit captures the
