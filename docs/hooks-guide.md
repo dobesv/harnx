@@ -283,8 +283,13 @@ Filter should return same object, optionally with modified `headers`. Multiple `
 Examples:
 
 ```sh
+# Single host — exact match only
 harnx-proxy-auth --hook 'if .host == "github.com" then .headers.authorization = "Bearer \(env.GITHUB_TOKEN)" else . end'
-harnx-proxy-auth --hook 'if .host | endswith("github.com") then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)" else . end'
+
+# GitHub hosts allowlist — use explicit equality, not endswith() which would match naughtygithub.com
+harnx-proxy-auth --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
+  then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
+  else . end'
 ```
 
 ### Hook Configuration

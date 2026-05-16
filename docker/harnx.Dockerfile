@@ -15,3 +15,4 @@ COPY linux-${TARGETARCH}/harnx-mcp-fs /usr/local/bin/harnx-mcp-fs
 COPY linux-${TARGETARCH}/harnx-mcp-plans /usr/local/bin/harnx-mcp-plans
 COPY linux-${TARGETARCH}/harnx-mcp-time /usr/local/bin/harnx-mcp-time
 COPY linux-${TARGETARCH}/harnx-aws-creds /usr/local/bin/harnx-aws-creds
+COPY linux-${TARGETARCH}/harnx-proxy-auth /usr/local/bin/harnx-proxy-auth
