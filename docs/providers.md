@@ -80,9 +80,9 @@ Access models hosted on AWS Bedrock.
 | `access_key_id` | AWS Access Key ID. | `BEDROCK_ACCESS_KEY_ID` |
 | `secret_access_key` | AWS Secret Access Key. | `BEDROCK_SECRET_ACCESS_KEY` |
 | `session_token` | AWS Session Token. | `BEDROCK_SESSION_TOKEN` |
-| `profile` | AWS Profile name. | Config file only (no env var override). |
+| `profile` | AWS Profile name. Pin a specific `~/.aws/config` profile. | Use `AWS_PROFILE` env var (standard AWS convention) or set `profile` in config. |
 
-**Special Behavior:** Credentials are optional. If omitted, `harnx` uses the standard AWS credential provider chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars, `~/.aws/config`, IAM roles, etc.).
+**Special Behavior:** Credentials are optional. If omitted, `harnx` uses the standard AWS credential provider chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars, `AWS_PROFILE`, `~/.aws/config`, IAM roles, EC2 instance profiles, SSO, etc.).
 
 **Example:**
 ```yaml

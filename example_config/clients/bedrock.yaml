@@ -14,7 +14,7 @@ region: us-east-1
 # secret_access_key: "..."
 # session_token: "..."
 
-# Optional: AWS Profile name
+# Optional: AWS Profile name (overrides AWS_PROFILE env var)
 # profile: "default"
 
 # Optional: System prompt prefix for all models on this client (list of strings)
