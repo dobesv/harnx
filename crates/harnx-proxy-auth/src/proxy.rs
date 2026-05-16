@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use http::{header::HeaderName, HeaderValue};
+use http::{header::HeaderName, HeaderValue, Response, StatusCode};
 use hudsucker::{
-    certificate_authority::RcgenAuthority, hyper::Request, rcgen::Issuer,
-    rustls::crypto::aws_lc_rs, Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
+    certificate_authority::RcgenAuthority,
+    hyper::{body::Bytes, Request},
+    rcgen::Issuer,
+    rustls::crypto::aws_lc_rs,
+    Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
 };
 use serde_json::{Map, Value};
 use tokio::net::TcpListener;
@@ -27,6 +30,25 @@ impl HttpHandler for AuthHandler {
 
         match filter::apply_filter(&self.filter, req_json) {
             Ok(result) => {
+                // If the filter sets `.block` to a truthy value, return a 403 response
+                // instead of forwarding the request.
+                // - `true`          → generic "Blocked by proxy" message
+                // - a string        → that string is used as the response body
+                let block_reason = match result.get("block") {
+                    Some(Value::Bool(true)) => Some("Blocked by proxy".to_string()),
+                    Some(Value::String(reason)) if !reason.is_empty() => Some(reason.clone()),
+                    _ => None,
+                };
+                if let Some(reason) = block_reason {
+                    tracing::info!(reason = %reason, "request blocked by filter");
+                    let response = Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header("content-type", "text/plain")
+                        .body(Body::from(Bytes::from(reason)))
+                        .unwrap_or_else(|_| Response::new(Body::empty()));
+                    return response.into();
+                }
+
                 if let Some(headers) = result.get("headers").and_then(Value::as_object) {
                     replace_headers(req.headers_mut(), headers);
                 }

@@ -278,7 +278,12 @@ Each hook is jq/jaq filter expression applied to JSON request object with fields
 }
 ```
 
-Filter should return same object, optionally with modified `headers`. Multiple `--hook` flags are combined as pipe: `hook1 | hook2 | ...`.
+Filter should return the same object, optionally with:
+
+- **Modified `headers`** — patch the request headers (null removes a header, string upserts it).
+- **`block` field** — set `.block = true` or `.block = "reason"` to reject the request with a `403 Forbidden` response instead of forwarding it. Use this to prevent requests to specific hosts or paths.
+
+Multiple `--hook` flags are combined as a pipe: `hook1 | hook2 | ...`.
 
 Examples:
 
@@ -289,6 +294,15 @@ harnx-proxy-auth --hook 'if .host == "github.com" then .headers.authorization = 
 # GitHub hosts allowlist — use explicit equality, not endswith() which would match naughtygithub.com
 harnx-proxy-auth --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
   then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
+  else . end'
+
+# Block requests to a specific host (returns 403 to the client)
+harnx-proxy-auth --hook 'if .host == "blocked.example.com" then .block = "host not allowed" else . end'
+
+# Block and inject auth in one filter
+harnx-proxy-auth --hook '
+  if .host == "blocked.example.com" then .block = true
+  elif .host == "api.github.com" then .headers.authorization = "Bearer \(env.GITHUB_TOKEN)"
   else . end'
 ```
 

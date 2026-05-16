@@ -568,7 +568,9 @@ fn write_proxy_auth_fixture_files(paths: &TestPaths, proxy_auth_bin: &Path) -> R
 
     // Build the config.yaml with the hook entry. Use serde_yaml to produce a
     // correctly-quoted command value regardless of special chars in the path.
-    let hook_command = format!("{} --hook .", proxy_auth_bin.display());
+    // Single-quote the binary path so spaces in the path don't split the token.
+    let bin_path = proxy_auth_bin.to_string_lossy().replace('\'', "'\\''");
+    let hook_command = format!("'{bin_path}' --hook .");
     let config_yaml = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
         (
             serde_yaml::Value::String("save".to_string()),

@@ -108,6 +108,38 @@ mod tests {
     }
 
     #[test]
+    fn block_true_sets_block_field() {
+        let filter = compile("if .host == \"evil.com\" then .block = true else . end")
+            .expect("block filter compiles");
+        let blocked = apply_filter(&filter, request_json()).expect("filter applies");
+        // github.com is not evil.com — no block field
+        assert!(blocked.get("block").is_none());
+
+        let evil = serde_json::json!({
+            "method": "GET",
+            "host": "evil.com",
+            "path": "/",
+            "headers": {}
+        });
+        let blocked = apply_filter(&filter, evil).expect("filter applies");
+        assert_eq!(blocked["block"], true);
+    }
+
+    #[test]
+    fn block_string_sets_reason() {
+        let filter = compile("if .host == \"evil.com\" then .block = \"not allowed\" else . end")
+            .expect("block string filter compiles");
+        let evil = serde_json::json!({
+            "method": "GET",
+            "host": "evil.com",
+            "path": "/",
+            "headers": {}
+        });
+        let result = apply_filter(&filter, evil).expect("filter applies");
+        assert_eq!(result["block"], "not allowed");
+    }
+
+    #[test]
     fn github_auth_filter_uses_env_var() {
         unsafe {
             std::env::set_var("GITHUB_TOKEN", "test-token");

@@ -114,7 +114,7 @@ Use re-exported types from hudsucker:
 // ca.rs
 use hudsucker::rcgen::{BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair};
 
-pub fn setup() -> Result<(CaSetup, CaTempDir)> {
+pub fn setup() -> Result<(CaSetup, TempDir)> {
     let key_pair = KeyPair::generate()?;
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
