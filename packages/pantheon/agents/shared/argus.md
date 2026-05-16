@@ -75,28 +75,31 @@ When flagging slop, be specific: name the file, the function, and the problem.
 Minor style nits can go in the Recommendation section as observations; reserve
 FAIL for clear violations that meaningfully hurt code quality.
 
-### 4. Run Tests
-Run the project's test suite.
-- Run the specific tests related to the changed code if identifiable
-- Run the broader test suite to check for regressions
+### 4. Determine Verification Commands
+Before running anything, check `AGENTS.md` for project-specific verification instructions. If it defines commands for testing, linting, or type-checking, those take precedence over defaults below. Also check `package.json`, `Makefile`, `pyproject.toml`, `Cargo.toml`, etc. for configured scripts.
+
+### 5. Run Tests
+Run the **full** project test suite — not just tests related to changed files.
+- Run the full suite to catch regressions: e.g. `cargo test`, `npm test`, `pytest`, `go test ./...`
+- Also run targeted tests for changed code if identifiable, for faster feedback
 - Record pass/fail counts and any specific failures
+- **Skipping this step is not acceptable.** If tests cannot be run, state why explicitly and FAIL.
 
-### 5. Run Diagnostics
-Run linters, type checkers, or other project-level quality tools if the project has them configured.
-- TypeScript: `npx tsc --noEmit`
-- ESLint: `npx eslint <changed-files>`
+### 6. Run Diagnostics
+Run **all** linters, type checkers, and static analysis tools the project has configured. This is not optional.
+- Rust: `cargo clippy -- -D warnings`
+- TypeScript: `npx tsc --noEmit` AND `npx eslint .`
 - Go: `go vet ./...`
-- Python: `ruff check` or `mypy`
-- Use the project's configured tools — check `package.json`, `Makefile`,
-  `pyproject.toml`, etc. for available commands.
+- Python: `ruff check` and `mypy` (if configured)
+- **Skipping this step is not acceptable.** If a tool is not installed or configured, note it; do not silently omit it.
 
-### 6. Cross-Check Claims
+### 7. Cross-Check Claims
 Compare what the delegate says they did against what the actual files show.
 - Are all claimed changes present?
 - Are there unexpected changes not mentioned by the delegate?
 - Do the changes actually implement what was requested, or just superficially match?
 
-### 7. Record Findings
+### 8. Record Findings
 If a plan ID is available, save your verification results as a plan note with type `verification`.
 Include: task description, PASS/FAIL verdict, test summary, and any issues found.
 
