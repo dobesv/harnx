@@ -232,7 +232,7 @@ fn make_config(proxy_bin: PathBuf, bash_bin: PathBuf) -> GlobalConfig {
         roots: vec![repo_root.to_string_lossy().into_owned()],
         enabled: true,
         description: Some("bash test server".to_string()),
-        rename_tools: HashMap::new(),
+        rename_tools: HashMap::from([("exec".to_string(), "bash_exec".to_string())]),
         tool_templates: HashMap::new(),
         package: None,
     }];

@@ -553,10 +553,11 @@ fn write_proxy_auth_fixture_files(paths: &TestPaths, proxy_auth_bin: &Path) -> R
         format!(
             "save: false
 hooks:
-  - event: PreToolUse
-    matcher: bash_exec|bash_spawn
-    command: {} --hook '.'
-    type: claude-command-persistent
+  entries:
+    - event: PreToolUse
+      matcher: \"bash_exec|bash_spawn\"
+      command: {} --hook '.'
+      type: claude-command-persistent
 ",
             shell_escape(proxy_auth_bin.to_string_lossy().as_ref())
         ),
