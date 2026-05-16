@@ -147,7 +147,7 @@ Harnx ships with several built-in MCP servers ready to enable in your config. Se
 
 AI Agent = Instructions (Prompt) + Tools (Function Callings) + Documents (RAG).
 
-![harnx-agent](https://github.com/user-attachments/assets/0b7e687d-e642-4e8a-b1c1-d2d9b2da2b6b)
+<img width="1100" height="520" alt="agent" src="https://github.com/user-attachments/assets/6bbdc451-a7ed-4f90-ad2d-1f6f1250c8eb" />
 
 ### Local Server Capabilities
 
@@ -180,13 +180,13 @@ curl -X POST -H "Content-Type: application/json" -d '{
 
 A web application to interact with supported LLMs directly from your browser.
 
-![harnx-llm-playground](https://github.com/user-attachments/assets/aab1e124-1274-4452-b703-ef15cda55439)
+<img width="1280" height="800" alt="playground" src="https://github.com/user-attachments/assets/a9cb2be7-56c3-4cd7-ac65-18d66524d705" />
 
 #### LLM Arena
 
 A web platform to compare different LLMs side-by-side.
 
-![harnx-llm-arena](https://github.com/user-attachments/assets/edabba53-a1ef-4817-9153-38542ffbfec6)
+<img width="1280" height="800" alt="arena" src="https://github.com/user-attachments/assets/ecd3401f-334b-459c-9803-3d32cd0bec51" />
 
 ## Custom Themes
 

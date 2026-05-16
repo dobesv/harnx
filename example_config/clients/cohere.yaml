@@ -1,0 +1,10 @@
+# Cohere Configuration
+
+type: cohere
+name: cohere
+
+# Your Cohere API key
+api_key: "your-api-key"
+
+# Optional: Custom API base
+# api_base: "https://api.cohere.ai/v1"
