@@ -543,8 +543,8 @@ impl Default for Config {
             model_cooldowns: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
             macro_flag: false,
             info_flag: false,
-            show_sequence_numbers: false,
-            show_timestamps: false,
+            show_sequence_numbers: ConfigData::default().show_sequence_numbers,
+            show_timestamps: ConfigData::default().show_timestamps,
             agent_variables: None,
             mcp_root: vec![],
 
@@ -2919,6 +2919,8 @@ impl Config {
             ConfigData::default()
         };
         let mut config = Self {
+            show_sequence_numbers: data.show_sequence_numbers,
+            show_timestamps: data.show_timestamps,
             data,
             ..Self::default()
         };
