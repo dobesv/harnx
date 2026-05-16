@@ -24,6 +24,7 @@ members = [
     "crates/harnx-spinner",
     "crates/harnx-test-bins",
     "crates/harnx-tui",
+    "crates/harnx-proxy-auth",
     "crates/ratatui-widget-scrolling",
 ]
 
@@ -86,9 +87,15 @@ unicode-width = "0.2.0"
 async-recursion = "1.1.1"
 http = "1.1.0"
 http-body-util = "0.1"
+hudsucker = { version = "0.24.1", features = ["rcgen-ca"] }
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy"] }
+moka = { version = "0.12", features = ["sync"] }
+rcgen = "0.13"
 time = { version = "0.3.36", features = ["macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+jaq-all = { version = "0.1", features = ["formats"] }
 indexmap = { version = "2.2.6", features = ["serde"] }
 hmac = "0.13.0"
 aws-config = { version = "1", features = ["sso"] }
@@ -103,6 +110,7 @@ hnsw_rs = "0.3.0"
 rayon = "1.10.0"
 uuid = { version = "1.9.1", features = ["v4", "v7"] }
 scraper = { version = "0.27.0", default-features = false, features = ["deterministic"] }
+tempfile = "3"
 sys-locale = "0.3.1"
 html_to_markdown = "0.1.0"
 os_info = { version = "3.8.2", default-features = false }
