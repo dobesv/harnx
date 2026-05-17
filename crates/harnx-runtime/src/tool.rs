@@ -3,6 +3,7 @@ use crate::{
     utils::*,
 };
 use anyhow::Result;
+use harnx_core::hooks::HookConfig;
 use harnx_hooks::{HookEvent, PersistentHookManager};
 
 use serde_json::Value;
@@ -97,6 +98,10 @@ pub async fn execute_tool_round(
 /// manager so `ToolEvalContext` can fire PreToolUse/PostToolUse hooks.
 fn build_dispatch_hook_fn(
     hooks: &harnx_hooks::HooksConfig,
+    // Value is (bare_server_tool_name, hook_entries). The matcher in each entry is
+    // evaluated against the bare name, not the prefixed display name, so renaming
+    // an MCP server doesn't require updating hook matchers.
+    per_tool_hooks: HashMap<String, (String, Vec<HookConfig>)>,
     session_name: Option<&str>,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
 ) -> Arc<DispatchHookFn> {
@@ -106,13 +111,49 @@ fn build_dispatch_hook_fn(
     let persistent_manager = persistent_manager.clone();
     Arc::new(move |event: HookEvent| {
         let hooks_entries = hooks_entries.clone();
+        let per_tool_hooks = per_tool_hooks.clone();
         let session_id = session_id.clone();
         let cwd = cwd.clone();
         let persistent_manager = persistent_manager.clone();
         Box::pin(async move {
+            let display_tool_name = match &event {
+                HookEvent::PreToolUse { tool_name, .. }
+                | HookEvent::PostToolUse { tool_name, .. }
+                | HookEvent::PostToolUseFailure { tool_name, .. } => Some(tool_name.as_str()),
+                _ => None,
+            };
+
+            // For server-scoped hooks, match the hook's `matcher` against the bare
+            // (unprefixed) tool name. Strip the matcher from entries we add to the
+            // merged list so the global dispatcher doesn't re-check against the
+            // prefixed display name and accidentally reject them.
+            let mut merged_entries: Vec<HookConfig> = if let Some(display_name) = display_tool_name
+            {
+                per_tool_hooks
+                    .get(display_name)
+                    .map(|(bare_name, entries)| {
+                        entries
+                            .iter()
+                            .filter(|hook| {
+                                harnx_hooks::CompiledMatcher::compile(&hook.matcher)
+                                    .map(|m| m.matches_str(bare_name))
+                                    .unwrap_or(false)
+                            })
+                            .map(|hook| HookConfig {
+                                matcher: None,
+                                ..hook.clone()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            merged_entries.extend(hooks_entries.clone());
+
             harnx_hooks::dispatch::dispatch_hooks_with_count_and_manager(
                 &event,
-                &hooks_entries,
+                &merged_entries,
                 &session_id,
                 &cwd,
                 0,
@@ -167,6 +208,37 @@ pub fn build_tool_eval_context(
     let hooks = guard.resolved_hooks();
     let acp_manager = guard.acp_manager.clone();
     let mcp_manager = guard.mcp_manager.clone();
+    // Build a map from display tool name → (bare_tool_name, server_hook_entries).
+    // Look up hooks via the McpManager (which stores clients keyed by display name),
+    // so packaged/prefixed servers are found correctly. Server hooks are filtered to
+    // only tool-use events; their matchers are evaluated against the bare name so
+    // renaming a server doesn't require updating hook matchers.
+    let per_tool_hooks: HashMap<String, (String, Vec<HookConfig>)> = decl_map
+        .iter()
+        .filter_map(|(tool_name, decl)| {
+            let server_name = decl.mcp_server_name.as_ref()?;
+            let bare_name = decl
+                .mcp_tool_name
+                .clone()
+                .unwrap_or_else(|| tool_name.clone());
+            let server_hooks = mcp_manager
+                .as_ref()?
+                .get_client(server_name)
+                .and_then(|client| client.hooks().cloned())?;
+            let hook_entries = server_hooks
+                .entries
+                .iter()
+                .filter(|hook| {
+                    matches!(
+                        hook.event.as_str(),
+                        "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (!hook_entries.is_empty()).then(|| (tool_name.clone(), (bare_name, hook_entries)))
+        })
+        .collect();
     let session_name = guard.session.as_ref().map(|s| s.id().to_string());
     drop(guard);
 
@@ -180,8 +252,12 @@ pub fn build_tool_eval_context(
         providers.push(mcp as Arc<dyn ToolProvider>);
     }
 
-    let dispatch_hook_fn =
-        build_dispatch_hook_fn(&hooks, session_name.as_deref(), persistent_manager);
+    let dispatch_hook_fn = build_dispatch_hook_fn(
+        &hooks,
+        per_tool_hooks,
+        session_name.as_deref(),
+        persistent_manager,
+    );
     let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn) = build_emit_fns(&decl_map);
 
     ToolEvalContext {
@@ -508,6 +584,7 @@ mod tests {
             description: String::new(),
             parameters: Default::default(),
             mcp_tool_name: Some(name.to_string()),
+            mcp_server_name: None,
             call_template: call_template.map(String::from),
             result_template: result_template.map(String::from),
         }
@@ -652,6 +729,191 @@ mod tests {
         let result_val = json!({"output": "file.txt"});
         let result = render_result_for_display(&call, &result_val, "raw fallback", &decl_map);
         assert!(result.is_none(), "no result_template => should return None");
+    }
+
+    // --- Server-scoped hook dispatch tests -----------------------------------
+    //
+    // These tests exercise `build_dispatch_hook_fn` directly to verify that
+    // per-server hooks use bare-name matching and are correctly merged with
+    // global hooks.
+
+    fn make_hook_config(event: &str, matcher: Option<&str>, command: &str) -> HookConfig {
+        HookConfig {
+            event: event.to_string(),
+            matcher: matcher.map(|s| s.to_string()),
+            command: command.to_string(),
+            timeout: Some(5),
+            status_message: None,
+            async_hook: None,
+            hook_type: "claude-command".to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn pre_tool_use_event_with_name(tool_name: &str) -> HookEvent {
+        HookEvent::PreToolUse {
+            tool_name: tool_name.to_string(),
+            tool_input: serde_json::json!({}),
+            tool_use_id: "test-id".to_string(),
+        }
+    }
+
+    fn session_start_event() -> HookEvent {
+        HookEvent::SessionStart {
+            source: "test".to_string(),
+            model: "test-model".to_string(),
+        }
+    }
+
+    fn make_per_tool_hooks(
+        display_name: &str,
+        bare_name: &str,
+        hooks: Vec<HookConfig>,
+    ) -> HashMap<String, (String, Vec<HookConfig>)> {
+        let mut map = HashMap::new();
+        map.insert(display_name.to_string(), (bare_name.to_string(), hooks));
+        map
+    }
+
+    async fn dispatch_and_collect_context(
+        global_hooks: Vec<HookConfig>,
+        per_tool_hooks: HashMap<String, (String, Vec<HookConfig>)>,
+        event: HookEvent,
+    ) -> harnx_hooks::HookOutcome {
+        use harnx_hooks::HooksConfig;
+
+        let hooks_config = HooksConfig {
+            max_resume: None,
+            entries: global_hooks,
+        };
+        let pm = Arc::new(tokio::sync::Mutex::new(
+            harnx_hooks::PersistentHookManager::new(),
+        ));
+        let dispatch_fn = build_dispatch_hook_fn(&hooks_config, per_tool_hooks, None, &pm);
+        (dispatch_fn)(event).await
+    }
+
+    /// A no-matcher server hook applies to all tools on that server.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_hook_no_matcher_matches_any_tool() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("hook.sh");
+        let mut f = std::fs::File::create(&script_path).expect("create script");
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "cat > /dev/null").unwrap();
+        writeln!(f, "echo '{{\"additionalContext\":\"server-hook-ran\"}}'").unwrap();
+        drop(f);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server_hook = make_hook_config(
+            "PreToolUse",
+            None, // no matcher — should match all tools
+            script_path.to_str().unwrap(),
+        );
+        let per_tool = make_per_tool_hooks(
+            "myserver_exec", // display name
+            "exec",          // bare name
+            vec![server_hook],
+        );
+        let outcome = dispatch_and_collect_context(
+            vec![],
+            per_tool,
+            pre_tool_use_event_with_name("myserver_exec"),
+        )
+        .await;
+        assert!(
+            outcome.result.additional_context.as_deref() == Some("server-hook-ran"),
+            "no-matcher server hook should run for any tool on the server, got: {:?}",
+            outcome.result.additional_context
+        );
+    }
+
+    /// A server hook with `matcher: "exec"` matches the bare name `exec`,
+    /// NOT the prefixed display name `myserver_exec`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_hook_matcher_uses_bare_name_not_display_name() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("hook.sh");
+        let mut f = std::fs::File::create(&script_path).expect("create script");
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "cat > /dev/null").unwrap();
+        writeln!(f, "echo '{{\"additionalContext\":\"bare-match\"}}'").unwrap();
+        drop(f);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // matcher = "^exec$" — matches bare name "exec" but NOT "myserver_exec"
+        let server_hook =
+            make_hook_config("PreToolUse", Some("^exec$"), script_path.to_str().unwrap());
+        let per_tool = make_per_tool_hooks(
+            "myserver_exec", // display name (what the event carries)
+            "exec",          // bare name (what the matcher runs against)
+            vec![server_hook],
+        );
+        let outcome = dispatch_and_collect_context(
+            vec![],
+            per_tool,
+            pre_tool_use_event_with_name("myserver_exec"),
+        )
+        .await;
+        assert_eq!(
+            outcome.result.additional_context.as_deref(),
+            Some("bare-match"),
+            "matcher 'exec' should match bare name 'exec', even though display name is 'myserver_exec'"
+        );
+    }
+
+    /// A server hook whose matcher doesn't match the bare name is excluded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_hook_matcher_excludes_non_matching_bare_name() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("hook.sh");
+        let mut f = std::fs::File::create(&script_path).expect("create script");
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "cat > /dev/null").unwrap();
+        writeln!(f, "echo '{{\"additionalContext\":\"should-not-run\"}}'").unwrap();
+        drop(f);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // matcher = "^list$" does NOT match bare name "exec"
+        let server_hook =
+            make_hook_config("PreToolUse", Some("^list$"), script_path.to_str().unwrap());
+        let per_tool = make_per_tool_hooks("myserver_exec", "exec", vec![server_hook]);
+        let outcome = dispatch_and_collect_context(
+            vec![],
+            per_tool,
+            pre_tool_use_event_with_name("myserver_exec"),
+        )
+        .await;
+        assert!(
+            outcome.result.additional_context.is_none(),
+            "hook with matcher '^list$' should not run for bare name 'exec'"
+        );
+    }
+
+    /// Non-tool events (e.g. SessionStart) don't pick up server hooks
+    /// because `per_tool_hooks` is keyed by display tool name.
+    #[tokio::test]
+    async fn server_hooks_not_applied_to_non_tool_events() {
+        // No script needed — we just verify the hook doesn't fire.
+        // A hook entry that would normally match is in per_tool_hooks, but
+        // the event is SessionStart which yields no display_tool_name.
+        let server_hook = make_hook_config("SessionStart", None, "echo hi");
+        let per_tool = make_per_tool_hooks("myserver_exec", "exec", vec![server_hook]);
+        let outcome = dispatch_and_collect_context(vec![], per_tool, session_start_event()).await;
+        // SessionStart is not in the filtered tool-use events list so it
+        // would have been stripped at build_tool_eval_context time, but
+        // even if it were present, display_tool_name is None for non-tool
+        // events so no per_tool_hooks lookup happens.
+        assert!(outcome.result.additional_context.is_none());
     }
 
     #[test]

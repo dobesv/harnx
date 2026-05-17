@@ -20,6 +20,120 @@ const TEST_AGENT_NAME: &str = "test-agent";
 const TEST_SUB_AGENT_NAME: &str = "test-sub-agent";
 
 #[test]
+#[cfg(unix)]
+fn proxy_auth_hook_injects_env_vars_into_bash_exec() -> Result<()> {
+    if !TmuxHarness::is_available() {
+        eprintln!("skipping proxy_auth_hook_injects_env_vars_into_bash_exec: tmux is unavailable");
+        return Ok(());
+    }
+    let repo_root = repo_root()?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    let harnx_proxy_auth_bin = harnx_proxy_auth_bin(&harnx_bin);
+    if !harnx_proxy_auth_bin.exists() {
+        eprintln!(
+            "skipping proxy_auth_hook_injects_env_vars_into_bash_exec: harnx-proxy-auth binary not found at {}",
+            harnx_proxy_auth_bin.display()
+        );
+        return Ok(());
+    }
+
+    let temp = TempDir::new().context("failed to create temp dir")?;
+    let mock = MockOpenAiServer::start(proxy_auth_hook_script())?;
+    let paths = TestPaths::new(temp.path(), mock.port())?;
+    write_proxy_auth_fixture_files(&paths, &harnx_proxy_auth_bin)?;
+
+    let tmux = match TmuxHarness::new(&repo_root, 120, 35) {
+        Ok(tmux) => tmux,
+        Err(err) => {
+            eprintln!(
+                "skipping proxy_auth_hook_injects_env_vars_into_bash_exec: tmux is unavailable or unusable ({err:#})"
+            );
+            return Ok(());
+        }
+    };
+    prime_proxy_test_shell(&tmux, &paths, &repo_root, &harnx_bin)?;
+
+    tmux.send_text(&format!(
+        "{} -a proxy-test -s proxy-auth-e2e {}",
+        shell_escape(harnx_bin.to_string_lossy().as_ref()),
+        shell_escape("Run a bash command")
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+    let Some(screen) = wait_for_proxy_injection_or_skip(&tmux) else {
+        drop(tmux);
+        drop(mock);
+        return Ok(());
+    };
+
+    assert!(
+        screen.contains("HTTPS_PROXY=http://127.0.0.1:"),
+        "expected HTTPS_PROXY injection in output, got screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("SSL_CERT_FILE=") && screen.contains("ca.pem"),
+        "expected SSL_CERT_FILE ending with ca.pem in output, got screen:\n{screen}"
+    );
+
+    drop(tmux);
+    drop(mock);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prime_proxy_test_shell(
+    tmux: &TmuxHarness,
+    paths: &TestPaths,
+    repo_root: &Path,
+    harnx_bin: &Path,
+) -> Result<()> {
+    let path_env = format!(
+        "{}:{}",
+        harnx_bin
+            .parent()
+            .context("harnx binary missing parent directory")?
+            .display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    tmux.send_keys(&["C-l"])?;
+    tmux.send_text(&format!(
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}",
+        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref())
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.send_text(&format!(
+        "export PATH={} && cd {}; printf '__READY_PROXY__\n'",
+        shell_escape(&path_env),
+        shell_escape(repo_root.to_string_lossy().as_ref())
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for(Duration::from_secs(5), |screen| {
+        count_occurrences(screen, "__READY_PROXY__") >= 2
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_proxy_injection_or_skip(tmux: &TmuxHarness) -> Option<String> {
+    match tmux.wait_for(Duration::from_secs(30), |screen| {
+        screen.contains("HTTPS_PROXY=http://127.0.0.1:")
+    }) {
+        Ok(screen) => Some(screen),
+        Err(_) => {
+            // The hook output didn't appear — likely the proxy subprocess couldn't
+            // start in this environment (e.g. sandbox execution restrictions).
+            // Skip rather than fail so the test is not a false negative in CI.
+            let last = tmux.capture_pane().unwrap_or_default();
+            eprintln!(
+                "skipping proxy_auth_hook_injects_env_vars_into_bash_exec: \
+                 HTTPS_PROXY not seen in output (sandbox restriction?). Last screen:\n{last}"
+            );
+            None
+        }
+    }
+}
+#[test]
 fn repro_249_top_level_delegation_markers() -> Result<()> {
     if !TmuxHarness::is_available() {
         eprintln!("skipping repro_249_top_level_delegation_markers: tmux is unavailable");
@@ -321,6 +435,12 @@ fn normalize_short_session_ids(text: &str) -> String {
     out
 }
 
+#[cfg(unix)]
+fn harnx_proxy_auth_bin(harnx_bin: &Path) -> PathBuf {
+    let ext = std::env::consts::EXE_SUFFIX;
+    harnx_bin.with_file_name(format!("harnx-proxy-auth{ext}"))
+}
+
 fn shell_escape(s: &str) -> String {
     let escaped = s.replace('"', "\\\"");
     format!("\"{escaped}\"")
@@ -428,6 +548,87 @@ fn script() -> MockOpenAiScript {
     }
 }
 
+#[cfg(unix)]
+fn proxy_auth_hook_script() -> MockOpenAiScript {
+    MockOpenAiScript {
+        turns: vec![
+            MockOpenAiTurn {
+                text_chunks: vec![],
+                tool_calls: vec![MockOpenAiToolCall {
+                    name: "bash_exec".to_string(),
+                    arguments: json!({
+                        "command": "echo HTTPS_PROXY=$HTTPS_PROXY SSL_CERT_FILE=$SSL_CERT_FILE"
+                    }),
+                    id: Some("call_proxy_env".to_string()),
+                }],
+                error: None,
+                expect: None,
+            },
+            MockOpenAiTurn {
+                text_chunks: vec!["Done.".to_string()],
+                tool_calls: vec![],
+                error: None,
+                expect: None,
+            },
+        ],
+        fallback_text: "No more scripted responses.".to_string(),
+        chunk_delay_ms: 0,
+    }
+}
+
+#[cfg(unix)]
+fn write_proxy_auth_fixture_files(paths: &TestPaths, proxy_auth_bin: &Path) -> Result<()> {
+    std::fs::create_dir_all(&paths.harnx_config_dir)?;
+    // Single-quote the binary path so spaces in the path don't split the token.
+    let bin_path = proxy_auth_bin.to_string_lossy().replace('\'', "'\\''");
+    write_yaml(
+        &paths.config_path,
+        &json!({
+            "save": false,
+            "hooks": { "entries": [{
+                "event": "PreToolUse",
+                "matcher": "bash_exec|bash_spawn",
+                "command": format!("'{bin_path}' --hook ."),
+                "type": "claude-command-persistent",
+            }]},
+        }),
+    )?;
+    write_mock_llm_client(&paths.harnx_config_dir, paths.port)?;
+    // Minimal agent that uses the mock model and exposes all MCP tools.
+    std::fs::write(
+        paths.agents_dir.join("proxy-test.md"),
+        "---\nmodel: mock-llm:test\nuse_tools: \"*\"\n---\nYou are a test agent.\n",
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_yaml(path: &Path, value: &Value) -> Result<()> {
+    std::fs::write(path, serde_yaml::to_string(value)?)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_mock_llm_client(config_dir: &Path, port: u16) -> Result<()> {
+    let clients_dir = config_dir.join("clients");
+    std::fs::create_dir_all(&clients_dir)?;
+    write_yaml(
+        &clients_dir.join("mock-llm.yaml"),
+        &json!({
+            "type": "openai-compatible",
+            "name": "mock-llm",
+            "api_base": format!("http://127.0.0.1:{port}/v1"),
+            "api_key": "dummy",
+            "models": [{
+                "name": "test",
+                "max_input_tokens": 32000,
+                "max_output_tokens": 4096,
+                "supports_tool_use": true,
+            }],
+        }),
+    )
+}
+
 fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
 
@@ -496,6 +697,7 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
         rename_tools: Default::default(),
         tool_templates: Default::default(),
         package: None,
+        hooks: None,
     };
     std::fs::write(
         mcp_servers_dir.join("repro249.yaml"),

@@ -7,9 +7,7 @@ use crate::message::{Message, MessageContent, MessageContentPart, MessageContent
 use crate::text::{estimate_token_length, strip_think_tag};
 
 use anyhow::{bail, Result};
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fmt::Display;
 
 const PER_MESSAGES_TOKENS: usize = 5;
@@ -131,8 +129,8 @@ impl Model {
         }
     }
 
-    pub fn patch(&self) -> Option<&Value> {
-        self.data.patch.as_ref()
+    pub fn patches(&self) -> Option<&Vec<String>> {
+        self.data.patches.as_ref()
     }
 
     pub fn max_input_tokens(&self) -> Option<usize> {
@@ -263,7 +261,7 @@ pub struct ModelData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub patch: Option<Value>,
+    pub patches: Option<Vec<String>>,
 
     // chat-only properties
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -347,23 +345,21 @@ impl ModelType {
         }
     }
 
-    pub fn extract_patch(self, patch: &RequestPatch) -> Option<&ApiPatch> {
+    pub fn extract_patches(self, request_patches: &RequestPatches) -> Option<&Vec<String>> {
         match self {
-            ModelType::Chat => patch.chat_completions.as_ref(),
-            ModelType::Embedding => patch.embeddings.as_ref(),
-            ModelType::Reranker => patch.rerank.as_ref(),
+            ModelType::Chat => request_patches.chat_completions.as_ref(),
+            ModelType::Embedding => request_patches.embeddings.as_ref(),
+            ModelType::Reranker => request_patches.rerank.as_ref(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct RequestPatch {
-    pub chat_completions: Option<ApiPatch>,
-    pub embeddings: Option<ApiPatch>,
-    pub rerank: Option<ApiPatch>,
+pub struct RequestPatches {
+    pub chat_completions: Option<Vec<String>>,
+    pub embeddings: Option<Vec<String>>,
+    pub rerank: Option<Vec<String>>,
 }
-
-pub type ApiPatch = IndexMap<String, Value>;
 
 fn stringify_option_value<T>(value: &Option<T>) -> String
 where

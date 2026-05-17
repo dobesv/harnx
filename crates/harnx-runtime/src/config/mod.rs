@@ -317,43 +317,27 @@ fn load_package_mcp_patch(pkg_name: &str) -> Option<harnx_core::package::Package
     }
 }
 
-/// Apply matching entries from a package patch's `mcp_servers` map to a server config.
-///
-/// Keys are fancy-regex patterns matched against the bare server name (stem).
-/// On match:
-/// - `enabled`  replaces the server's enabled flag.
-/// - `args`     replaces the server's args list entirely.
-/// - `env`      is merged into the server's env (patch keys win, others preserved).
-/// - `roots`    replaces the server's roots list entirely.
-fn apply_mcp_server_patch(
-    server: &mut McpServerConfig,
-    patches: &indexmap::IndexMap<String, harnx_core::package::McpServerPatch>,
-) {
-    use fancy_regex::Regex;
-    for (pattern, patch) in patches {
-        let Ok(regex) = Regex::new(pattern) else {
-            log::warn!("Invalid package mcp_server patch regex: '{pattern}'");
-            continue;
-        };
-        let matched = regex.is_match(&server.name).unwrap_or(false);
-        if !matched {
-            continue;
+fn apply_mcp_server_patch(server: &mut McpServerConfig, patches: &[String]) {
+    if patches.is_empty() {
+        return;
+    }
+    // Save fields marked #[serde(skip)] that are not included in JSON serialization.
+    let saved_package = server.package.clone();
+    let input = match serde_json::to_value(&*server) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("Failed to serialize McpServerConfig for jaq patch: {e}");
+            return;
         }
-        if let Some(enabled) = patch.enabled {
-            server.enabled = enabled;
+    };
+    let output = harnx_core::jaq::eval_filters(patches, input);
+    match serde_json::from_value(output) {
+        Ok(patched) => {
+            *server = patched;
+            // Restore #[serde(skip)] fields that are not preserved by JSON round-trip.
+            server.package = saved_package;
         }
-        if let Some(args) = &patch.args {
-            server.args = args.clone();
-        }
-        if !patch.args_append.is_empty() {
-            server.args.extend(patch.args_append.clone());
-        }
-        if !patch.env.is_empty() {
-            server.env.extend(patch.env.clone());
-        }
-        if let Some(roots) = &patch.roots {
-            server.roots = roots.clone();
-        }
+        Err(e) => log::warn!("Failed to deserialize McpServerConfig after jaq patch: {e}"),
     }
 }
 
@@ -416,6 +400,7 @@ fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
                     ..Default::default()
                 },
                 mcp_tool_name: None,
+                mcp_server_name: None,
                 call_template: None,
                 result_template: None,
             }
@@ -3354,7 +3339,7 @@ impl Config {
         };
     }
 
-    fn init_mcp_manager(&mut self) {
+    pub fn init_mcp_manager(&mut self) {
         self.reinit_managers_for_agent(None);
     }
 
@@ -3902,7 +3887,7 @@ mod tests {
                         api_base: None,
                         api_key: None,
                         models: vec![],
-                        patch: None,
+                        patches: None,
                         extra: None,
                         system_prompt_prefix: None,
                     },
@@ -4141,6 +4126,7 @@ mod tests {
             rename_tools: HashMap::new(),
             tool_templates: HashMap::new(),
             package: None,
+            hooks: None,
         };
         config.mcp_servers = vec![server];
         config.mcp_root = vec!["/extra".to_string()];
@@ -4569,5 +4555,81 @@ mod tests {
             Some("Loaded body"),
             "shared_variables should be populated from the file-backed default"
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_patch_tests {
+    use super::apply_mcp_server_patch;
+    use harnx_mcp::McpServerConfig;
+
+    fn make_server(name: &str, command: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: command.to_string(),
+            args: vec![],
+            env: Default::default(),
+            roots: vec![],
+            enabled: true,
+            description: None,
+            rename_tools: Default::default(),
+            tool_templates: Default::default(),
+            package: Some("mypkg".to_string()), // Important: test that this is preserved
+            hooks: None,
+        }
+    }
+
+    #[test]
+    fn apply_mcp_server_patch_with_identity_expression_leaves_config_unchanged() {
+        let mut server = make_server("test-server", "mcp-test");
+        let original_name = server.name.clone();
+        let original_command = server.command.clone();
+
+        apply_mcp_server_patch(&mut server, &[".".to_string()]);
+
+        assert_eq!(server.name, original_name);
+        assert_eq!(server.command, original_command);
+    }
+
+    #[test]
+    fn apply_mcp_server_patch_sets_field_via_jq_expression() {
+        let mut server = make_server("test-server", "mcp-original");
+
+        apply_mcp_server_patch(
+            &mut server,
+            &[
+                r#".command = "mcp-patched""#.to_string(),
+                r#".args = ["--verbose"]"#.to_string(),
+            ],
+        );
+
+        assert_eq!(server.command, "mcp-patched");
+        assert_eq!(server.args, vec!["--verbose"]);
+    }
+
+    #[test]
+    fn apply_mcp_server_patch_with_empty_patches_is_noop() {
+        let mut server = make_server("test-server", "mcp-test");
+        let original_name = server.name.clone();
+
+        apply_mcp_server_patch(&mut server, &[]);
+
+        assert_eq!(server.name, original_name);
+    }
+
+    #[test]
+    fn apply_mcp_server_patch_preserves_server_package_field() {
+        let mut server = make_server("test-server", "mcp-test");
+        assert_eq!(server.package, Some("mypkg".to_string()));
+
+        // Apply a patch that would serialize and deserialize
+        apply_mcp_server_patch(
+            &mut server,
+            &[r#".description = "Updated description""#.to_string()],
+        );
+
+        // The package field should be preserved even though it has #[serde(skip)]
+        assert_eq!(server.package, Some("mypkg".to_string()));
+        assert_eq!(server.description, Some("Updated description".to_string()));
     }
 }

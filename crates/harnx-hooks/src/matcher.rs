@@ -28,6 +28,16 @@ impl CompiledMatcher {
                 .unwrap_or(false),
         }
     }
+
+    /// Match against an explicit text string instead of extracting from an event.
+    /// Used for server-scoped hooks where the matcher applies to the bare (unprefixed)
+    /// tool name rather than the display name carried in the event.
+    pub fn matches_str(&self, text: &str) -> bool {
+        match &self.regex {
+            None => true,
+            Some(regex) => regex.is_match(text).unwrap_or(false),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -35,6 +45,38 @@ mod tests {
     use super::CompiledMatcher;
     use crate::HookEvent;
     use serde_json::json;
+
+    // --- matches_str tests ---------------------------------------------------
+
+    #[test]
+    fn test_matches_str_no_pattern_matches_all() {
+        let matcher = CompiledMatcher::compile(&None).expect("compile empty matcher");
+        assert!(matcher.matches_str("anything"));
+        assert!(matcher.matches_str(""));
+    }
+
+    #[test]
+    fn test_matches_str_exact_match() {
+        let matcher = CompiledMatcher::compile(&Some("^exec$".to_string())).expect("compile regex");
+        assert!(matcher.matches_str("exec"));
+        assert!(!matcher.matches_str("bash_exec"));
+        assert!(!matcher.matches_str("exec_more"));
+    }
+
+    #[test]
+    fn test_matches_str_partial_pattern() {
+        let matcher = CompiledMatcher::compile(&Some("exec".to_string())).expect("compile regex");
+        // "exec" as a substring regex matches both
+        assert!(matcher.matches_str("exec"));
+        assert!(matcher.matches_str("bash_exec"));
+    }
+
+    #[test]
+    fn test_matches_str_no_match() {
+        let matcher = CompiledMatcher::compile(&Some("^list".to_string())).expect("compile regex");
+        assert!(!matcher.matches_str("exec"));
+        assert!(matcher.matches_str("list_files"));
+    }
 
     #[test]
     fn test_matcher_no_pattern() {

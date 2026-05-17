@@ -110,30 +110,26 @@ settings without editing package files (which are overwritten on update), use a
 
 ### Patch file format
 
+Each field in the patch file (`agents`, `clients`, `mcp_servers`) is an array
+of jq expressions. Each expression receives the full config struct as JSON and
+returns it modified; use `if .name == "..." then ... end` to target specific
+entries (the `else .` is implicit when omitted).
+
 ```yaml
 agents:
-  ".*":                      # regex matched against bare agent name
-    model: claude:claude-opus-4-7   # override model for every agent
-  "hephaestus":              # match only hephaestus
-    model: openai:o3
-  "zosimus":
-    model: openai:o3
+  - '.model = "claude:claude-opus-4-7"'   # override model for every agent
+  - 'if .name == "hephaestus" then .model = "openai:o3" end'
+  - 'if .name == "zosimus" then .model = "openai:o3" end'
 ```
-
-Keys in the patch take precedence over the package's values. The regex is
-matched against the bare agent name (e.g. `hephaestus`), not the qualified
-`pantheon/hephaestus` form.
 
 ### Use your own private/preview models
 
-If you have access to preview models, override per-agent or use `".*"` to
-replace all at once:
+If you have access to preview models, override per-agent or set all at once:
 
 ```yaml
 # ~/.config/harnx/packages/pantheon.patch.yaml
 agents:
-  ".*":
-    model: openai:gpt-5.4   # replace every agent's model
+  - '.model = "openai:gpt-5.4"'   # replace every agent's model
 ```
 
 ### Using the Bedrock client for `zai.glm-5` agents
@@ -153,8 +149,7 @@ If you use a different AWS region, override `api_base` via the patch file:
 ```yaml
 # ~/.config/harnx/packages/pantheon.patch.yaml
 clients:
-  "bedrock":
-    api_base: https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1
+  - 'if .name == "bedrock" then .api_base = "https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1" end'
 ```
 
 If you don't have Bedrock access, override those agents to a different model:
@@ -162,8 +157,7 @@ If you don't have Bedrock access, override those agents to a different model:
 ```yaml
 # ~/.config/harnx/packages/pantheon.patch.yaml
 agents:
-  "hermes|hestia|athena|metis|oracle|mnemosyne|nemesis|rhadamanthus|tyche|urania":
-    model: openai:gpt-4.1-mini
+  - 'if ([.name] | inside(["hermes","hestia","athena","metis","oracle","mnemosyne","nemesis","rhadamanthus","tyche","urania"])) then .model = "openai:gpt-4.1-mini" end'
 ```
 
 ---
@@ -227,35 +221,29 @@ Since package files are read-only, use the patch file to customise MCP servers:
 ```yaml
 # ~/.config/harnx/packages/pantheon.patch.yaml
 mcp_servers:
-  "bash":
-    # Append extra args without replacing the package's existing args.
-    # --extra-exec / --extra-rwx extend sandbox filesystem access.
-    # --env VAR_NAME passes a variable from the host into sandboxed commands.
-    args_append:
-      - --extra-exec
-      - /opt/company-tools/bin
-      - --extra-rwx
-      - ~/.codescene
-      - --env
-      - CS_ACCESS_TOKEN
-    # Replace the roots list entirely:
-    roots:
-      - "."
-      - /opt/company-sdk
-  "exa":
-    # Disable a server you don't want:
-    enabled: false
+  # Each entry is a jq expression; .name is the server name.
+  # The expression receives the full server config as JSON and returns it modified.
+
+  # Append extra args to the bash server (for sandbox filesystem access):
+  - 'if .name == "bash" then .args += ["--extra-exec", "/opt/company-tools/bin", "--extra-rwx", "~/.codescene", "--env", "CS_ACCESS_TOKEN"] end'
+
+  # Add an extra root (keep the package's existing roots):
+  - 'if .name == "bash" then .roots += ["/opt/company-sdk"] end'
+
+  # Disable a server you don't want:
+  - 'if .name == "exa" then .enabled = false end'
 ```
 
-Available patch keys per server:
+Available fields you can set per server with jq:
 
-| Key | Effect |
-|-----|--------|
-| `enabled` | Enable or disable the server |
-| `args` | Replace the args list entirely |
-| `args_append` | Append args after the package's existing args |
-| `env` | Set environment variables on the server process (key/value pairs). Mainly useful for servers that read config from their environment (e.g. API keys for `exa`). |
-| `roots` | Replace the roots list entirely |
+| Field | Effect |
+|-------|--------|
+| `.enabled` | Enable or disable the server (`true`/`false`) |
+| `.args` | Replace the args list entirely |
+| `.args += [...]` | Append args after the existing args |
+| `.env.KEY = "value"` | Set an environment variable on the server process |
+| `.roots += [...]` | Append to the roots list |
+| `.roots` | Replace the roots list entirely |
 
 ### Optional / advanced
 

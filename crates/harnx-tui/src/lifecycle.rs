@@ -533,6 +533,7 @@ mod tests {
             description: String::new(),
             parameters: Default::default(),
             mcp_tool_name: Some("bash_exec".to_string()),
+            mcp_server_name: None,
             call_template: Some("${{ args.command }}".to_string()),
             result_template: None,
         };
@@ -586,6 +587,7 @@ mod tests {
             description: String::new(),
             parameters: Default::default(),
             mcp_tool_name: Some("no_template_tool".to_string()),
+            mcp_server_name: None,
             call_template: None,
             result_template: None,
         };

@@ -116,30 +116,17 @@ fn load_package_patch_for(pkg_name: &str) -> Result<Option<harnx_core::package::
 
 fn apply_agent_patch(
     config: &mut AgentConfig,
-    agent_stem: &str,
+    _agent_stem: &str,
     patch: &harnx_core::package::PackagePatch,
 ) -> Result<()> {
-    use fancy_regex::Regex;
-
-    for (pattern, agent_patch) in &patch.agents {
-        let regex = Regex::new(pattern)
-            .with_context(|| format!("Invalid package agent patch regex: '{pattern}'"))?;
-        if regex
-            .is_match(agent_stem)
-            .with_context(|| format!("Failed to test package agent patch regex: '{pattern}'"))?
-        {
-            if let Some(model) = &agent_patch.model {
-                config.set_model_id(Some(model.clone()));
-            }
-            if let Some(temp) = agent_patch.temperature {
-                config.set_temperature(Some(temp));
-            }
-            if let Some(fallback_models) = &agent_patch.fallback_models {
-                config.set_model_fallbacks(fallback_models.clone());
-            }
-        }
+    if patch.agents.is_empty() {
+        return Ok(());
     }
-
+    let input = serde_json::to_value(&*config)
+        .with_context(|| "Failed to serialize AgentConfig for jaq patch")?;
+    let output = harnx_core::jaq::eval_filters(&patch.agents, input);
+    *config = serde_json::from_value(output)
+        .with_context(|| "Failed to deserialize AgentConfig after jaq patch")?;
     Ok(())
 }
 
@@ -631,6 +618,7 @@ mod tests {
             description: description.to_string(),
             parameters: Default::default(),
             mcp_tool_name: None,
+            mcp_server_name: None,
             call_template: None,
             result_template: None,
         }
@@ -1129,5 +1117,84 @@ You are a test agent.
             Ok(())
         })
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::apply_agent_patch;
+    use harnx_core::package::PackagePatch;
+
+    fn make_patch(agents: Vec<&str>) -> PackagePatch {
+        PackagePatch {
+            agents: agents.into_iter().map(String::from).collect(),
+            clients: vec![],
+            mcp_servers: vec![],
+        }
+    }
+
+    fn make_agent_config(name: &str, model: &str) -> super::AgentConfig {
+        let content = format!("---\nmodel: {}\n---\nYou are a test agent.", model);
+        super::AgentConfig::from_markdown(name, &content).expect("should parse agent config")
+    }
+
+    #[test]
+    fn apply_agent_patch_with_identity_expression_leaves_config_unchanged() {
+        let mut config = make_agent_config("test-agent", "openai:gpt-4o");
+        let original_model = config.model_id().map(String::from);
+        let original_temperature = config.temperature();
+
+        let patch = make_patch(vec!["."]);
+        let result = apply_agent_patch(&mut config, "test-agent", &patch);
+
+        assert!(result.is_ok());
+        assert_eq!(config.model_id(), original_model.as_deref());
+        assert_eq!(config.temperature(), original_temperature);
+    }
+
+    #[test]
+    fn apply_agent_patch_with_model_setting_expression_updates_config() {
+        let mut config = make_agent_config("test-agent", "openai:gpt-4o");
+        assert_eq!(config.model_id(), Some("openai:gpt-4o"));
+
+        // Note: AgentConfig serializes model_id as "model" in JSON
+        let patch = make_patch(vec![
+            r#".model = "anthropic:claude-3-5-sonnet""#,
+            r#".temperature = 0.7"#,
+        ]);
+        let result = apply_agent_patch(&mut config, "test-agent", &patch);
+
+        assert!(result.is_ok());
+        assert_eq!(config.model_id(), Some("anthropic:claude-3-5-sonnet"));
+        assert_eq!(config.temperature(), Some(0.7));
+    }
+
+    #[test]
+    fn apply_agent_patch_with_empty_patches_is_noop() {
+        let mut config = make_agent_config("test-agent", "openai:gpt-4o");
+        let original_model = config.model_id().map(String::from);
+
+        let patch = make_patch(vec![]);
+        let result = apply_agent_patch(&mut config, "test-agent", &patch);
+
+        assert!(result.is_ok());
+        assert_eq!(config.model_id(), original_model.as_deref());
+    }
+
+    #[test]
+    fn apply_agent_patch_with_invalid_jq_expression_skips_and_leaves_config_unchanged() {
+        let mut config = make_agent_config("test-agent", "openai:gpt-4o");
+        let original_model = config.model_id().map(String::from);
+
+        // Invalid expression - unclosed string
+        // Note: The field name in JSON is "model", not "model_id"
+        let patch = make_patch(vec![r#".model = "unclosed"#]);
+        let result = apply_agent_patch(&mut config, "test-agent", &patch);
+
+        // The function should return Ok but the config should be unchanged
+        // (jaq logs a warning and skips invalid expressions)
+        assert!(result.is_ok());
+        // On invalid expression, jaq eval_filters returns the input unchanged
+        assert_eq!(config.model_id(), original_model.as_deref());
     }
 }

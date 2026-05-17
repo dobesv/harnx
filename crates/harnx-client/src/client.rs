@@ -1,7 +1,6 @@
 use crate::{OpenAICompatibleClient, SseHandler, OPENAI_COMPATIBLE_PROVIDERS};
 
 use anyhow::{bail, Context, Result};
-use fancy_regex::Regex;
 use indexmap::IndexMap;
 use parking_lot::RwLock;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
@@ -19,7 +18,7 @@ pub use harnx_core::message::{
     extract_system_message, ImageUrl, Message, MessageContent, MessageContentPart,
     MessageContentToolCalls, MessageRole,
 };
-pub use harnx_core::model::{Model, ModelData, ModelType, ProviderModels, RequestPatch};
+pub use harnx_core::model::{Model, ModelData, ModelType, ProviderModels, RequestPatches};
 pub use harnx_core::tool::ToolCall;
 
 /// Parse retry/cooldown duration from HTTP response headers.
@@ -141,53 +140,6 @@ pub static ALL_PROVIDER_MODELS: LazyLock<Vec<ProviderModels>> = LazyLock::new(||
     serde_yaml::from_str(MODELS_YAML).unwrap()
 });
 
-static ESCAPE_SLASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?<!\\)/").unwrap());
-
-static PATCH_VAR_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$\{(\w+)\}|\$([A-Z_][A-Z0-9_]*)").unwrap());
-
-/// Interpolates `$VAR` and `${VAR}` patterns in header values.
-///
-/// Built-in variables:
-/// - `HARNX_MODEL` → model_name
-/// - `HARNX_CLIENT` → client_name
-///
-/// Falls back to environment variables for other names.
-/// Returns an error if a variable cannot be resolved.
-pub fn interpolate_patch_vars(value: &str, model_name: &str, client_name: &str) -> Result<String> {
-    let result = PATCH_VAR_RE.replace_all(value, |caps: &fancy_regex::Captures| {
-        let var_name = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
-
-        match var_name {
-            "HARNX_MODEL" => model_name.to_string(),
-            "HARNX_CLIENT" => client_name.to_string(),
-            _ => {
-                match std::env::var(var_name) {
-                    Ok(val) => val,
-                    Err(_) => {
-                        // Return a marker that we'll detect after the replace_all
-                        format!("__UNRESOLVED__{var_name}__")
-                    }
-                }
-            }
-        }
-    });
-
-    // Check if there are any unresolved variables
-    if result.contains("__UNRESOLVED__") {
-        // Extract the variable name from the marker
-        if let Some(start) = result.find("__UNRESOLVED__") {
-            let marker_start = start + "__UNRESOLVED__".len();
-            if let Some(marker_end) = result[marker_start..].find("__") {
-                let var_name = &result[marker_start..marker_start + marker_end];
-                bail!("Unresolved variable '${var_name}' in patch header.\n  Built-in variables: $HARNX_MODEL, $HARNX_CLIENT\n  Other names are resolved from environment variables.\n  To fix: use a built-in, or set the env var: export {var_name}=<value>");
-            }
-        }
-    }
-
-    Ok(result.into_owned())
-}
-
 /// Per-call configuration values that a `Client` implementation needs
 /// to read during a single `chat_completions` or `embeddings` call.
 ///
@@ -214,18 +166,11 @@ fn set_proxy(mut builder: reqwest::ClientBuilder, proxy: &str) -> Result<reqwest
     Ok(builder)
 }
 
-fn patch_env_name(client_name: &str, api_name: &str) -> String {
-    // Mirrors harnx's `get_env_name("patch_{client}_{api}")` — hard-coded
-    // to the `HARNX_` prefix so that moving this code into `harnx-client`
-    // preserves behavior regardless of `CARGO_CRATE_NAME`.
-    format!("HARNX_PATCH_{}_{}", client_name, api_name).to_ascii_uppercase()
-}
-
 #[async_trait::async_trait]
 pub trait Client: Sync + Send {
     fn extra_config(&self) -> Option<&ExtraConfig>;
 
-    fn patch_config(&self) -> Option<&RequestPatch>;
+    fn patches_config(&self) -> Option<&RequestPatches>;
 
     fn name(&self) -> &str;
 
@@ -333,48 +278,31 @@ pub trait Client: Sync + Send {
     }
 
     fn patch_request_data(&self, request_data: &mut RequestData) -> Result<()> {
-        let model_type = self.model().model_type();
-        if let Some(patch) = self.model().patch() {
-            request_data.apply_patch(patch.clone());
-            // Interpolate variables in headers after applying model-level patch
-            for value in request_data.headers.values_mut() {
-                *value =
-                    interpolate_patch_vars(value, self.model().name(), self.model().client_name())?;
+        let mut json_value = request_data.to_json_value();
+
+        if let Some(patches) = self.model().patches() {
+            json_value = harnx_core::jaq::eval_filters(patches, json_value);
+        }
+
+        if let Some(patches_config) = self.patches_config() {
+            if let Some(patches) = self.model().model_type().extract_patches(patches_config) {
+                json_value = harnx_core::jaq::eval_filters(patches, json_value);
             }
         }
 
-        let patch_map = std::env::var(patch_env_name(
-            self.model().client_name(),
-            model_type.api_name(),
-        ))
-        .ok()
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .or_else(|| {
-            self.patch_config()
-                .and_then(|v| model_type.extract_patch(v))
-                .cloned()
-        });
-        let patch_map = match patch_map {
-            Some(v) => v,
-            _ => return Ok(()),
+        let api_name = match self.model().model_type() {
+            ModelType::Chat => "CHAT_COMPLETIONS",
+            ModelType::Embedding => "EMBEDDINGS",
+            ModelType::Reranker => "RERANK",
         };
-        for (key, patch) in patch_map {
-            let key = ESCAPE_SLASH_RE.replace_all(&key, r"\/");
-            if let Ok(regex) = Regex::new(&format!("^({key})$")) {
-                if let Ok(true) = regex.is_match(self.model().name()) {
-                    request_data.apply_patch(patch);
-                    // Interpolate variables in headers after applying config-level patch
-                    for value in request_data.headers.values_mut() {
-                        *value = interpolate_patch_vars(
-                            value,
-                            self.model().name(),
-                            self.model().client_name(),
-                        )?;
-                    }
-                    return Ok(());
-                }
-            }
+        let env_name = format!("HARNX_PATCH_{}_{}", self.name(), api_name).to_ascii_uppercase();
+        if let Ok(raw_patches) = std::env::var(&env_name) {
+            let patches: Vec<String> = serde_json::from_str(&raw_patches)
+                .with_context(|| format!("Invalid JSON patch array in {env_name}"))?;
+            json_value = harnx_core::jaq::eval_filters(&patches, json_value);
         }
+
+        *request_data = RequestData::from_json_value(json_value)?;
         Ok(())
     }
 }
@@ -419,6 +347,40 @@ impl RequestData {
         self.headers.insert(key.to_string(), value.to_string());
     }
 
+    pub fn to_json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "url": self.url,
+            "headers": self.headers,
+            "body": self.body,
+        })
+    }
+
+    pub fn from_json_value(v: serde_json::Value) -> anyhow::Result<Self> {
+        let mut obj = v
+            .as_object()
+            .cloned()
+            .context("Patched request data must be a JSON object")?;
+
+        let url = obj
+            .remove("url")
+            .context("Patched request data missing 'url'")?
+            .as_str()
+            .map(ToOwned::to_owned)
+            .context("Patched request data field 'url' must be a string")?;
+
+        let headers_value = obj
+            .remove("headers")
+            .context("Patched request data missing 'headers'")?;
+        let headers: IndexMap<String, String> = serde_json::from_value(headers_value)
+            .context("Patched request data field 'headers' must be an object of strings")?;
+
+        let body = obj
+            .remove("body")
+            .context("Patched request data missing 'body'")?;
+
+        Ok(Self { url, headers, body })
+    }
+
     pub fn into_builder(self, client: &ReqwestClient) -> RequestBuilder {
         let RequestData { url, headers, body } = self;
         debug!("Request {url} {body}");
@@ -430,24 +392,6 @@ impl RequestData {
         }
         builder = builder.json(&body);
         builder
-    }
-
-    pub fn apply_patch(&mut self, patch: Value) {
-        if let Some(patch_url) = patch["url"].as_str() {
-            self.url = patch_url.into();
-        }
-        if let Some(patch_body) = patch.get("body") {
-            json_patch::merge(&mut self.body, patch_body)
-        }
-        if let Some(patch_headers) = patch["headers"].as_object() {
-            for (key, value) in patch_headers {
-                if let Some(value) = value.as_str() {
-                    self.header(key, value)
-                } else if value.is_null() {
-                    self.headers.swap_remove(key);
-                }
-            }
-        }
     }
 }
 
@@ -546,81 +490,145 @@ pub fn json_str_from_map<'a>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod request_data_tests {
+    use super::RequestData;
+    use indexmap::IndexMap;
+    use serde_json::json;
 
     #[test]
-    fn test_interpolate_harnx_model() {
-        let result = interpolate_patch_vars("$HARNX_MODEL", "gpt-4", "openai");
-        assert_eq!(result.unwrap(), "gpt-4");
-    }
+    fn request_data_to_json_value_round_trips() {
+        let mut headers = IndexMap::new();
+        headers.insert("authorization".to_string(), "Bearer test-token".to_string());
+        headers.insert("content-type".to_string(), "application/json".to_string());
 
-    #[test]
-    fn test_interpolate_harnx_client() {
-        let result = interpolate_patch_vars("${HARNX_CLIENT}", "gpt-4", "openai");
-        assert_eq!(result.unwrap(), "openai");
-    }
+        let request_data = RequestData {
+            url: "https://api.example.com/v1/chat/completions".to_string(),
+            headers,
+            body: json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }),
+        };
 
-    #[test]
-    fn test_interpolate_multiple_vars() {
-        let result = interpolate_patch_vars(
-            "cc=$HARNX_MODEL; app=$HARNX_CLIENT",
-            "claude-3",
-            "anthropic",
+        let json_value = request_data.to_json_value();
+
+        // Verify structure matches expected {url, headers, body}
+        assert_eq!(
+            json_value.get("url").and_then(|v| v.as_str()),
+            Some("https://api.example.com/v1/chat/completions")
         );
-        assert_eq!(result.unwrap(), "cc=claude-3; app=anthropic");
+        let headers_obj = json_value
+            .get("headers")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert_eq!(
+            headers_obj.get("authorization").and_then(|v| v.as_str()),
+            Some("Bearer test-token")
+        );
+        assert_eq!(
+            headers_obj.get("content-type").and_then(|v| v.as_str()),
+            Some("application/json")
+        );
+        let body = json_value.get("body").unwrap();
+        assert_eq!(body.get("model").and_then(|v| v.as_str()), Some("gpt-4o"));
     }
 
     #[test]
-    fn test_interpolate_no_vars() {
-        let result = interpolate_patch_vars("no variables here", "gpt-4", "openai");
-        assert_eq!(result.unwrap(), "no variables here");
+    fn request_data_from_json_value_restores_fields() {
+        let json_value = json!({
+            "url": "https://api.example.com/v1/embeddings",
+            "headers": {
+                "authorization": "Bearer embed-token",
+                "x-custom-header": "custom-value"
+            },
+            "body": {
+                "model": "text-embedding-3-small",
+                "input": "test input"
+            }
+        });
+
+        let request_data = RequestData::from_json_value(json_value).expect("should parse JSON");
+
+        assert_eq!(request_data.url, "https://api.example.com/v1/embeddings");
+        assert_eq!(
+            request_data.headers.get("authorization"),
+            Some(&"Bearer embed-token".to_string())
+        );
+        assert_eq!(
+            request_data.headers.get("x-custom-header"),
+            Some(&"custom-value".to_string())
+        );
+        assert_eq!(
+            request_data.body.get("model").and_then(|v| v.as_str()),
+            Some("text-embedding-3-small")
+        );
+        assert_eq!(
+            request_data.body.get("input").and_then(|v| v.as_str()),
+            Some("test input")
+        );
     }
 
     #[test]
-    fn test_interpolate_unknown_var_error() {
-        let result = interpolate_patch_vars("$UNKNOWN_VAR", "gpt-4", "openai");
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Unresolved variable '$UNKNOWN_VAR'"));
-        assert!(err_msg.contains("$HARNX_MODEL, $HARNX_CLIENT"));
-        assert!(err_msg.contains("export UNKNOWN_VAR="));
+    fn patch_request_data_applies_jaq_filters_via_model_patches() {
+        // Create a RequestData with initial values
+        let mut headers = IndexMap::new();
+        headers.insert("authorization".to_string(), "Bearer original".to_string());
+
+        let request_data = RequestData {
+            url: "https://api.original.com/v1/chat".to_string(),
+            headers,
+            body: json!({
+                "model": "original-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }),
+        };
+
+        // Convert to JSON, apply a jaq filter, and convert back
+        let mut json_value = request_data.to_json_value();
+
+        // Simulate what patch_request_data does: apply jaq filters
+        let patches = vec![
+            r#".url = "https://api.patched.com/v1/chat""#.to_string(),
+            r#".headers.authorization = "Bearer patched-token""#.to_string(),
+            r#".body.model = "patched-model""#.to_string(),
+        ];
+        json_value = harnx_core::jaq::eval_filters(&patches, json_value);
+
+        let patched_data =
+            RequestData::from_json_value(json_value).expect("should parse patched JSON");
+
+        // Verify the patches were applied
+        assert_eq!(patched_data.url, "https://api.patched.com/v1/chat");
+        assert_eq!(
+            patched_data.headers.get("authorization"),
+            Some(&"Bearer patched-token".to_string())
+        );
+        assert_eq!(
+            patched_data.body.get("model").and_then(|v| v.as_str()),
+            Some("patched-model")
+        );
+        // Original content should still be present
+        assert_eq!(
+            patched_data
+                .body
+                .get("messages")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(1)
+        );
     }
 
     #[test]
-    fn test_interpolate_env_var() {
-        unsafe {
-            std::env::set_var("TEST_VAR_PATCH", "test_value");
-        }
-        let result = interpolate_patch_vars("$TEST_VAR_PATCH", "gpt-4", "openai");
-        assert_eq!(result.unwrap(), "test_value");
-        unsafe {
-            std::env::remove_var("TEST_VAR_PATCH");
-        }
-    }
+    fn env_var_patch_format_json_array_deserializes_and_applies() {
+        // Simulates HARNX_PATCH_OPENAI_CHAT_COMPLETIONS env var value
+        let env_var_value = r#"[".body.max_tokens = 100", ".body.temperature = 0.5"]"#;
+        let patches: Vec<String> = serde_json::from_str(env_var_value)
+            .expect("env var should parse as JSON array of strings");
 
-    #[test]
-    fn test_interpolate_empty_string() {
-        let result = interpolate_patch_vars("", "gpt-4", "openai");
-        assert_eq!(result.unwrap(), "");
-    }
+        let input = serde_json::json!({"url": "...", "headers": {}, "body": {"model": "gpt-4o"}});
+        let output = harnx_core::jaq::eval_filters(&patches, input);
 
-    #[test]
-    fn test_interpolate_mixed_vars_and_text() {
-        unsafe {
-            std::env::set_var("CUSTOM_HEADER", "custom_value");
-        }
-        let result =
-            interpolate_patch_vars("Bearer $HARNX_MODEL-$CUSTOM_HEADER", "gpt-4", "openai");
-        assert_eq!(result.unwrap(), "Bearer gpt-4-custom_value");
-        unsafe {
-            std::env::remove_var("CUSTOM_HEADER");
-        }
-    }
-
-    #[test]
-    fn test_interpolate_braced_and_unbraced() {
-        let result = interpolate_patch_vars("${HARNX_MODEL}:$HARNX_CLIENT", "gpt-4", "openai");
-        assert_eq!(result.unwrap(), "gpt-4:openai");
+        assert_eq!(output["body"]["max_tokens"].as_i64(), Some(100));
+        assert_eq!(output["body"]["temperature"].as_f64(), Some(0.5));
     }
 }

@@ -241,3 +241,103 @@ hooks:
       command: "tee -a tool_audit.log"
       async: true
 ```
+
+## 11. GitHub Auth Proxy (`harnx-proxy-auth`)
+
+The `harnx-proxy-auth` binary is a specialized persistent hook that solves the problem of injecting authentication headers into HTTPS requests made by tools like `curl`, `git`, or custom scripts, without having to manually rewrite every command.
+
+### Feature Overview
+
+It acts as a local HTTPS MITM (Man-in-the-Middle) proxy. When configured as a `claude-command-persistent` hook for `bash_exec` or `bash_spawn`, it:
+1. Starts a local proxy server.
+2. Generates an ephemeral CA certificate.
+3. Injects proxy configuration environment variables into the tool's environment.
+4. Transparently injects headers (like `Authorization`) into requests that match configured URL patterns.
+
+### Installation
+
+`harnx-proxy-auth` is built alongside the main `harnx` binary. You can install it via `cargo install --path crates/harnx-proxy-auth` from the repository root to ensure it's in your `PATH`.
+
+### CLI Flags
+
+Primary configuration is done via `--hook`:
+
+`--hook <JQ_FILTER>`
+
+Each hook is jq/jaq filter expression applied to JSON request object with fields:
+
+```json
+{
+  "method": "GET",
+  "host": "github.com",
+  "path": "/repos/foo/bar",
+  "headers": {
+    "authorization": "existing-value",
+    "content-type": "application/json"
+  }
+}
+```
+
+Filter should return the same object, optionally with:
+
+- **Modified `headers`** — patch the request headers (null removes a header, string upserts it).
+- **`block` field** — set `.block = true` or `.block = "reason"` to reject the request with a `403 Forbidden` response instead of forwarding it. Use this to prevent requests to specific hosts or paths.
+
+Multiple `--hook` flags are combined as a pipe: `hook1 | hook2 | ...`.
+
+Examples:
+
+```sh
+# Single host — exact match only
+harnx-proxy-auth --hook 'if .host == "github.com" then .headers.authorization = "Bearer \(env.GITHUB_TOKEN)" end'
+
+# GitHub hosts allowlist — use explicit equality, not endswith() which would match naughtygithub.com
+harnx-proxy-auth --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
+  then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
+  end'
+
+# Block requests to a specific host (returns 403 to the client)
+harnx-proxy-auth --hook 'if .host == "blocked.example.com" then .block = "host not allowed" end'
+
+# Block and inject auth in one filter
+harnx-proxy-auth --hook '
+  if .host == "blocked.example.com" then .block = true
+  elif .host == "api.github.com" then .headers.authorization = "Bearer \(env.GITHUB_TOKEN)"
+  else . end'
+```
+
+### Hook Configuration
+
+Add it to your `config.yaml` as persistent hook for bash tools:
+
+```yaml
+hooks:
+  entries:
+  - event: PreToolUse
+    type: claude-command-persistent
+    matcher: "bash_exec|bash_spawn"
+    command: >-
+      harnx-proxy-auth
+      --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
+          then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
+          end'
+```
+
+### Injected Environment Variables
+
+When the hook runs, it injects the following variables into the tool's environment:
+
+| Variable | Purpose |
+| :--- | :--- |
+| `HTTPS_PROXY` | Directs HTTPS traffic to the local proxy. |
+| `SSL_CERT_FILE` | Points to the ephemeral CA certificate so tools trust the proxy. |
+| `REQUESTS_CA_BUNDLE` | Used by Python `requests` library. |
+| `CURL_CA_BUNDLE` | Used by `curl`. |
+| `NODE_EXTRA_CA_CERTS` | Used by Node.js. |
+| `GIT_SSL_CAINFO` | Used by `git`. |
+
+### Security & Precedence
+
+*   **User Precedence**: If the agent or user already defined any of these environment variables in the tool call, `harnx-proxy-auth` will **not** overwrite them. This allows for manual overrides.
+*   **Ephemeral CA**: The proxy CA certificate is generated on startup and deleted immediately upon the hook's exit. It is only trusted by the processes spawned during a single harnx run.
+*   **Scoped Injection**: Request mutation scope is defined by your jaq filter. Requests that do not match your condition should return `.`, leaving traffic unchanged.

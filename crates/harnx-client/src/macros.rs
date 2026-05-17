@@ -152,8 +152,8 @@ macro_rules! client_common_fns {
             self.config.extra.as_ref()
         }
 
-        fn patch_config(&self) -> Option<&$crate::RequestPatch> {
-            self.config.patch.as_ref()
+        fn patches_config(&self) -> Option<&$crate::RequestPatches> {
+            self.config.patches.as_ref()
         }
 
         fn name(&self) -> &str {

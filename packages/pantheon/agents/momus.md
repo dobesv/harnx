@@ -40,17 +40,6 @@ variables:
 
 {{ast_grep_search}}
 
-## Local environment Best Practices
-
-- Read files directly using `fs_read_tools` — no sandbox creation needed
-- Use `git ls-files` to efficiently check if referenced files exist
-- Use `fs_read_tools` to verify file content matches what the plan claims
-- Do NOT make any changes to files during your review
-
-## Default Repositories
-
-When the plan does not specify a repository, ask the user which repository they are working in before proceeding.
-
 ---
 
 ## Final Reminders
