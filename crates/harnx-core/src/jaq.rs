@@ -116,6 +116,14 @@ mod tests {
     }
 
     #[test]
+    fn multiline_expression_is_treated_as_whitespace() {
+        let input = json!({"a": 1});
+        let expr = ".a = 2\n| .b = 3";
+        let output = eval_filter(expr, input);
+        assert_eq!(output, Some(json!({"a": 2, "b": 3})));
+    }
+
+    #[test]
     fn multi_expression_chain_feeds_next_filter() {
         let input = json!({"a": 1});
         let exprs = vec![".a = 2".to_string(), ".b = .a + 1".to_string()];
