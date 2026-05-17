@@ -1,6 +1,6 @@
 use std::{ffi::OsString, path::Path, sync::Mutex};
 
-use harnx_runtime::config::{list_agents, Config};
+use harnx_runtime::config::{complete_agent_variables, list_agents, list_assistant_agents, Config};
 
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -77,6 +77,129 @@ fn package_loading_test_package_agent_not_listed_bare() {
     assert!(
         !agents.contains(&"coder".to_string()),
         "Bare 'coder' should not be in agents list: {agents:?}"
+    );
+}
+
+#[test]
+fn package_loading_test_package_assistant_agent_appears_in_list_assistant_agents() {
+    // Regression test for issue #569: agent picker did not show agents from packages
+    // because list_assistant_agents() only scanned the top-level agents/ directory.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    // An agent with default (Assistant) role
+    install_test_package(
+        tmp.path(),
+        "mypkg",
+        &[("agents/helper.md", "---\nmodel: test\n---\nI help.")],
+    );
+
+    let agents = list_assistant_agents();
+    assert!(
+        agents.contains(&"mypkg/helper".to_string()),
+        "Expected 'mypkg/helper' in list_assistant_agents, got: {agents:?}"
+    );
+}
+
+#[test]
+fn package_loading_test_package_subagent_not_in_list_assistant_agents() {
+    // Agents with role: subagent should NOT appear in the picker.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    install_test_package(
+        tmp.path(),
+        "mypkg",
+        &[(
+            "agents/worker.md",
+            "---\nmodel: test\nrole: subagent\n---\nI work silently.",
+        )],
+    );
+
+    let agents = list_assistant_agents();
+    assert!(
+        !agents.contains(&"mypkg/worker".to_string()),
+        "Subagent 'mypkg/worker' should not appear in list_assistant_agents: {agents:?}"
+    );
+}
+
+#[test]
+fn package_loading_test_multiple_packages_assistant_sorted_deduped() {
+    // list_assistant_agents() across multiple packages must be sorted and deduplicated.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    install_test_package(
+        tmp.path(),
+        "zeta",
+        &[("agents/assist.md", "---\nmodel: test\n---\nZeta assistant.")],
+    );
+    install_test_package(
+        tmp.path(),
+        "alpha",
+        &[(
+            "agents/assist.md",
+            "---\nmodel: test\n---\nAlpha assistant.",
+        )],
+    );
+
+    let agents = list_assistant_agents();
+    assert!(
+        agents.contains(&"alpha/assist".to_string()),
+        "Expected 'alpha/assist' in list_assistant_agents, got: {agents:?}"
+    );
+    assert!(
+        agents.contains(&"zeta/assist".to_string()),
+        "Expected 'zeta/assist' in list_assistant_agents, got: {agents:?}"
+    );
+    // Sorted: alpha before zeta
+    let alpha_pos = agents.iter().position(|s| s == "alpha/assist").unwrap();
+    let zeta_pos = agents.iter().position(|s| s == "zeta/assist").unwrap();
+    assert!(
+        alpha_pos < zeta_pos,
+        "Expected sorted order (alpha before zeta), got: {agents:?}"
+    );
+    // No duplicates
+    let deduped: Vec<_> = {
+        let mut v = agents.clone();
+        v.dedup();
+        v
+    };
+    assert_eq!(
+        agents, deduped,
+        "list_assistant_agents() must not contain duplicates"
+    );
+}
+
+#[test]
+fn package_loading_test_package_agent_variable_completion() {
+    // Regression test: complete_agent_variables() must resolve package agents via
+    // packages/<pkg>/agents/<stem>.md, not agents/<pkg>/<stem>.md.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    install_test_package(
+        tmp.path(),
+        "mypkg",
+        &[(
+            "agents/helper.md",
+            "---\nmodel: test\nvariables:\n  - name: TARGET\n    description: The target to help with\n---\nI help with $TARGET.",
+        )],
+    );
+
+    let vars = complete_agent_variables("mypkg/helper");
+    assert!(
+        !vars.is_empty(),
+        "Expected variable completions for 'mypkg/helper', got none"
+    );
+    let names: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(
+        names.contains(&"TARGET="),
+        "Expected 'TARGET=' in completions, got: {names:?}"
     );
 }
 
