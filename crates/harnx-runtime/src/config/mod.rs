@@ -3354,7 +3354,7 @@ impl Config {
         };
     }
 
-    fn init_mcp_manager(&mut self) {
+    pub fn init_mcp_manager(&mut self) {
         self.reinit_managers_for_agent(None);
     }
 

@@ -10,14 +10,17 @@ keybindings: emacs
 tool_use: true
 use_tools: '*'
 toolsets:
-  fs_read:
-    - Read
-    - ListDirectory
-    - Grep
-    - Glob
-  fs_write:
-    - Write
-    - Edit
+  fs_read_tools:
+    - fs_read
+    - fs_ls
+    - fs_grep
+    - fs_find
+  fs_write_tools:
+    - fs_write
+    - fs_edit
+    - fs_insert
+    - fs_re_replace
+    - fs_rollback_file
 
 # ---- hooks ----
 # hooks:
@@ -48,3 +51,17 @@ toolsets:
 #
 # PreToolUse hooks can return hookSpecificOutput.toolInput to mutate tool arguments.
 # PostToolUse hooks can return hookSpecificOutput.toolResponse to mutate the tool response.
+# Example: Inject GitHub auth headers for HTTPS requests via the harnx-proxy-auth hook.
+# This is a persistent hook process that acts as an HTTPS MITM proxy, injecting auth
+# headers based on URL-matcher rules. It runs once and handles all bash_exec/bash_spawn events.
+#
+# hooks:
+#   entries:
+#   - event: PreToolUse
+#     type: claude-command-persistent
+#     matcher: "bash_exec|bash_spawn"
+#     command: >-
+#       harnx-proxy-auth
+#       --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
+#           then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
+#           else . end'
