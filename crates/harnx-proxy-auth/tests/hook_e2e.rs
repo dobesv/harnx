@@ -246,6 +246,7 @@ fn make_config(proxy_bin: PathBuf, bash_bin: PathBuf) -> GlobalConfig {
         rename_tools: HashMap::from([("exec".to_string(), "bash_exec".to_string())]),
         tool_templates: HashMap::new(),
         package: None,
+        hooks: None,
     }];
 
     config.init_mcp_manager();

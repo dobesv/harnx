@@ -697,6 +697,7 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
         rename_tools: Default::default(),
         tool_templates: Default::default(),
         package: None,
+        hooks: None,
     };
     std::fs::write(
         mcp_servers_dir.join("repro249.yaml"),

@@ -23,6 +23,7 @@ pub fn mcp_tool_to_declaration(
         description: tool_description.to_string(),
         parameters: convert_json_schema(input_schema)?,
         mcp_tool_name: Some(server_tool_name.to_string()),
+        mcp_server_name: None,
         call_template: templates.call_template,
         result_template: templates.result_template,
     })

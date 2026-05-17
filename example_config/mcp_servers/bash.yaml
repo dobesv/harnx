@@ -83,3 +83,11 @@ args:
 #   HARNX_BASH_EXTRA_READABLE: /opt/sdk      # Extra readable path via environment
 #   HARNX_BASH_EXTRA_EXEC: /opt/tools/bin    # Extra executable path via environment
 #   HARNX_BASH_ENV_PASSTHROUGH: GITHUB_TOKEN,SSH_AUTH_SOCK  # Comma-separated list to pass through
+# hooks:
+#   entries:
+#   - event: PreToolUse
+#     type: claude-command
+#     command: /path/to/my-bash-hook.sh
+#     # matcher applies to the bare (server-side) tool name, e.g. "exec" not "bash_exec".
+#     # This means renaming the server doesn't require updating hook matchers.
+#     # matcher: "exec"
