@@ -230,6 +230,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                 ..Default::default()
             },
             mcp_tool_name: Some("session_new".to_string()),
+            mcp_server_name: None,
             call_template: Some(session_new_call_template),
             result_template: None,
         },
@@ -266,6 +267,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                 ..Default::default()
             },
             mcp_tool_name: Some("session_prompt".to_string()),
+            mcp_server_name: None,
             call_template: Some(session_prompt_call_template),
             result_template: None,
         },
@@ -290,6 +292,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                 ..Default::default()
             },
             mcp_tool_name: Some("session_load".to_string()),
+            mcp_server_name: None,
             call_template: Some(session_load_call_template),
             result_template: None,
         },
@@ -314,6 +317,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                 ..Default::default()
             },
             mcp_tool_name: Some("session_cancel".to_string()),
+            mcp_server_name: None,
             call_template: Some(session_cancel_call_template),
             result_template: None,
         },

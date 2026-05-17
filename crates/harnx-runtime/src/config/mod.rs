@@ -416,6 +416,7 @@ fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
                     ..Default::default()
                 },
                 mcp_tool_name: None,
+                mcp_server_name: None,
                 call_template: None,
                 result_template: None,
             }
@@ -4141,6 +4142,7 @@ mod tests {
             rename_tools: HashMap::new(),
             tool_templates: HashMap::new(),
             package: None,
+            hooks: None,
         };
         config.mcp_servers = vec![server];
         config.mcp_root = vec!["/extra".to_string()];

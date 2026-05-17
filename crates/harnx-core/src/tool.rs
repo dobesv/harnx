@@ -94,6 +94,8 @@ pub struct ToolDeclaration {
     #[serde(skip, default)]
     pub mcp_tool_name: Option<String>,
     #[serde(skip, default)]
+    pub mcp_server_name: Option<String>,
+    #[serde(skip, default)]
     pub call_template: Option<String>,
     #[serde(skip, default)]
     pub result_template: Option<String>,

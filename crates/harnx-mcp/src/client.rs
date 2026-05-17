@@ -158,6 +158,12 @@ impl McpClient {
         &self.name
     }
 
+    /// Returns the hooks configuration for this server, if any.
+    /// Used by the runtime to build per-server hook dispatch tables.
+    pub fn hooks(&self) -> Option<&harnx_core::hooks::HooksConfig> {
+        self.config.hooks.as_ref()
+    }
+
     pub fn is_connected(&self) -> bool {
         *self.connected.read()
     }
@@ -311,13 +317,15 @@ impl McpClient {
                     result_template,
                 };
 
-                mcp_tool_to_declaration(
+                let mut declaration = mcp_tool_to_declaration(
                     &final_name,
                     &server_tool_name,
                     tool.description.as_deref().unwrap_or_default(),
                     &input_schema,
                     templates,
-                )
+                )?;
+                declaration.mcp_server_name = Some(self.name.clone());
+                Ok(declaration)
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -566,6 +574,7 @@ mod tests {
             rename_tools: HashMap::new(),
             tool_templates: HashMap::new(),
             package: None,
+            hooks: None,
         }
     }
 

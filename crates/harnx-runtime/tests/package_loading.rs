@@ -288,6 +288,7 @@ fn package_loading_test_mcp_server_display_names_for_agent() {
         rename_tools: Default::default(),
         tool_templates: Default::default(),
         package: Some("mypkg".to_string()),
+        hooks: None,
     };
 
     // Construct a different-package server

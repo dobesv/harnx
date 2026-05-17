@@ -1,3 +1,4 @@
+use harnx_core::hooks::HooksConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -35,6 +36,8 @@ pub struct McpServerConfig {
     /// Per-tool MiniJinja display templates. Overrides `_meta` templates from the MCP server.
     #[serde(default)]
     pub tool_templates: HashMap<String, ToolDisplayTemplates>,
+    #[serde(default)]
+    pub hooks: Option<HooksConfig>,
     /// The package this server belongs to, if it came from an installed package.
     /// Not serialized — set at runtime by the package loader.
     /// Used to present the server under its bare name when the active agent
