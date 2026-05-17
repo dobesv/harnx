@@ -935,7 +935,7 @@ mod tests {
             session_token: session_token.map(Into::into),
             profile: None,
             models: vec![],
-            patch: None,
+            patches: None,
             extra: None,
             system_prompt_prefix: None,
         }

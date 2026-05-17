@@ -3,7 +3,7 @@
 use serde::Deserialize;
 
 use crate::api_types::ExtraConfig;
-use crate::model::{ModelData, RequestPatch};
+use crate::model::{ModelData, RequestPatches};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct VertexAIConfig {
@@ -13,7 +13,7 @@ pub struct VertexAIConfig {
     pub adc_file: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
-    pub patch: Option<RequestPatch>,
+    pub patches: Option<RequestPatches>,
     pub extra: Option<ExtraConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<Vec<String>>,

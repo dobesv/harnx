@@ -2,7 +2,7 @@ use crate::{list_all_models, list_client_names, ClientConfig};
 
 use anyhow::{bail, Result};
 
-pub use harnx_core::model::{Model, ModelType, ProviderModels, RequestPatch};
+pub use harnx_core::model::{Model, ModelType, ProviderModels, RequestPatches};
 
 pub fn retrieve_model(
     clients: &[ClientConfig],

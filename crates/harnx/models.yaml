@@ -187,13 +187,8 @@
       output_price: 25
       supports_vision: true
       supports_tool_use: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: claude-opus-4-6
       max_input_tokens: 200000
       max_output_tokens: 128000
@@ -211,13 +206,8 @@
       output_price: 25
       supports_vision: true
       supports_tool_use: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: claude-sonnet-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -235,13 +225,8 @@
       output_price: 15
       supports_vision: true
       supports_tool_use: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: claude-opus-4-5-20251101
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -259,13 +244,8 @@
       output_price: 25
       supports_vision: true
       supports_tool_use: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: claude-sonnet-4-5-20250929
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -283,13 +263,8 @@
       output_price: 15
       supports_vision: true
       supports_tool_use: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: claude-haiku-4-5-20251001
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -307,14 +282,8 @@
       output_price: 5
       supports_vision: true
       supports_tool_use: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
-
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
 # Links:
 #  - https://docs.mistral.ai/getting-started/models/models_overview/
 #  - https://mistral.ai/pricing#api-pricing
@@ -621,13 +590,8 @@
       input_price: 5
       output_price: 25
       supports_vision: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: claude-opus-4-6
       max_input_tokens: 200000
       max_output_tokens: 128000
@@ -644,13 +608,8 @@
       input_price: 5
       output_price: 25
       supports_vision: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: claude-sonnet-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -667,13 +626,8 @@
       input_price: 3
       output_price: 15
       supports_vision: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: claude-opus-4-5@20251101
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -690,13 +644,8 @@
       input_price: 5
       output_price: 25
       supports_vision: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: claude-sonnet-4-5@20250929
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -713,13 +662,8 @@
       input_price: 3
       output_price: 15
       supports_vision: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: claude-haiku-4-5@20251001
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -736,13 +680,8 @@
       input_price: 1
       output_price: 5
       supports_vision: true
-      patch:
-        body:
-          temperature: null
-          top_p: null
-          thinking:
-            type: enabled
-            budget_tokens: 16000
+      patches:
+        - 'del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}'
     - name: text-embedding-005
       type: embedding
       max_input_tokens: 20000
@@ -781,15 +720,8 @@
       input_price: 5
       output_price: 25
       supports_vision: true
-      patch:
-        body:
-          inferenceConfig:
-            temperature: null
-            topP: null
-          additionalModelRequestFields:
-            thinking:
-              type: enabled
-              budget_tokens: 16000
+      patches:
+        - '.body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}'
     - name: us.anthropic.claude-opus-4-6-v1
       max_input_tokens: 200000
       max_output_tokens: 128000
@@ -806,15 +738,8 @@
       input_price: 5
       output_price: 25
       supports_vision: true
-      patch:
-        body:
-          inferenceConfig:
-            temperature: null
-            topP: null
-          additionalModelRequestFields:
-            thinking:
-              type: enabled
-              budget_tokens: 16000
+      patches:
+        - '.body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}'
     - name: us.anthropic.claude-sonnet-4-6
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -831,15 +756,8 @@
       input_price: 3
       output_price: 15
       supports_vision: true
-      patch:
-        body:
-          inferenceConfig:
-            temperature: null
-            topP: null
-          additionalModelRequestFields:
-            thinking:
-              type: enabled
-              budget_tokens: 16000
+      patches:
+        - '.body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}'
     - name: us.anthropic.claude-opus-4-5-20251101-v1:0
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -856,15 +774,8 @@
       input_price: 5
       output_price: 25
       supports_vision: true
-      patch:
-        body:
-          inferenceConfig:
-            temperature: null
-            topP: null
-          additionalModelRequestFields:
-            thinking:
-              type: enabled
-              budget_tokens: 16000
+      patches:
+        - '.body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}'
     - name: us.anthropic.claude-sonnet-4-5-20250929-v1:0
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -881,15 +792,8 @@
       input_price: 3
       output_price: 15
       supports_vision: true
-      patch:
-        body:
-          inferenceConfig:
-            temperature: null
-            topP: null
-          additionalModelRequestFields:
-            thinking:
-              type: enabled
-              budget_tokens: 16000
+      patches:
+        - '.body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}'
     - name: us.anthropic.claude-haiku-4-5-20251001-v1:0
       max_input_tokens: 200000
       max_output_tokens: 8192
@@ -906,15 +810,8 @@
       input_price: 1
       output_price: 5
       supports_vision: true
-      patch:
-        body:
-          inferenceConfig:
-            temperature: null
-            topP: null
-          additionalModelRequestFields:
-            thinking:
-              type: enabled
-              budget_tokens: 16000
+      patches:
+        - '.body.inferenceConfig = {"temperature":null,"topP":null} | .body.additionalModelRequestFields = {"thinking":{"type":"enabled","budget_tokens":16000}}'
     - name: us.meta.llama4-maverick-17b-instruct-v1:0
       max_input_tokens: 131072
       max_output_tokens: 8192
@@ -1079,9 +976,8 @@
     - name: qwen3.5-plus
       max_input_tokens: 262144
       supports_tool_use: true
-      patch:
-        body:
-          enable_thinking: false
+      patches:
+        - '.body.enable_thinking = false'
     - name: qwen3.5-plus:thinking
       real_name: qwen3.5-plus
       max_input_tokens: 262144
@@ -1093,9 +989,8 @@
       real_name: qwen3-max
       max_input_tokens: 262144
       supports_tool_use: true
-      patch:
-        body:
-          enable_thinking: true
+      patches:
+        - '.body.enable_thinking = true'
     - name: qwen3-vl-plus
       max_input_tokens: 262144
       supports_vision: true
@@ -1109,9 +1004,8 @@
     - name: qwen3.5-397b-a17b
       max_input_tokens: 262144
       supports_tool_use: true
-      patch:
-        body:
-          enable_thinking: false
+      patches:
+        - '.body.enable_thinking = false'
     - name: qwen3.5-397b-a17b:thinking
       real_name: qwen3.5-397b-a17b
       max_input_tokens: 262144
@@ -1263,10 +1157,8 @@
       real_name: glm-5
       max_input_tokens: 202752
       supports_tool_use: true
-      patch:
-        body:
-          thinking:
-            type: disabled
+      patches:
+        - '.body.thinking = {"type":"disabled"}'
     - name: glm-4.7
       max_input_tokens: 202752
       supports_tool_use: true
@@ -1274,10 +1166,8 @@
       real_name: glm-4.7
       max_input_tokens: 202752
       supports_tool_use: true
-      patch:
-        body:
-          thinking:
-            type: disabled
+      patches:
+        - '.body.thinking = {"type":"disabled"}'
     - name: glm-4.7-flash
       max_input_tokens: 202752
       input_price: 0
@@ -1680,16 +1570,14 @@
       max_input_tokens: 128000
       input_price: 2
       output_price: 8
-      patch:
-        body:
-          include_reasoning: true
+      patches:
+        - '.body.include_reasoning = true'
     - name: perplexity/sonar-deep-research
       max_input_tokens: 200000
       input_price: 2
       output_price: 8
-      patch:
-        body:
-          include_reasoning: true
+      patches:
+        - '.body.include_reasoning = true'
     - name: minimax/minimax-m2.5
       max_input_tokens: 196608
       input_price: 0.3

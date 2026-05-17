@@ -42,7 +42,7 @@
 //! ```
 
 use crate::client::{
-    ChatCompletionsData, ChatCompletionsOutput, Client, ExtraConfig, Model, RequestPatch,
+    ChatCompletionsData, ChatCompletionsOutput, Client, ExtraConfig, Model, RequestPatches,
     SseHandler, ToolCall,
 };
 use crate::config::{Config, GlobalConfig};
@@ -316,7 +316,7 @@ pub struct MockClient {
     model: Model,
     name: String,
     extra_config: Option<ExtraConfig>,
-    patch_config: Option<RequestPatch>,
+    patch_config: Option<RequestPatches>,
     default_turn: Option<MockTurn>,
     state: RwLock<MockClientState>,
 }
@@ -359,7 +359,7 @@ impl Client for MockClient {
         self.extra_config.as_ref()
     }
 
-    fn patch_config(&self) -> Option<&RequestPatch> {
+    fn patches_config(&self) -> Option<&RequestPatches> {
         self.patch_config.as_ref()
     }
 
@@ -429,7 +429,7 @@ pub struct MockClientBuilder {
     model: Model,
     name: String,
     extra_config: Option<ExtraConfig>,
-    patch_config: Option<RequestPatch>,
+    patch_config: Option<RequestPatches>,
     turns: Vec<MockTurn>,
     default_turn: Option<MockTurn>,
 }
@@ -474,7 +474,7 @@ impl MockClientBuilder {
     }
 
     /// Set the request patch configuration.
-    pub fn patch_config(mut self, patch_config: RequestPatch) -> Self {
+    pub fn patch_config(mut self, patch_config: RequestPatches) -> Self {
         self.patch_config = Some(patch_config);
         self
     }

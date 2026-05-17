@@ -17,7 +17,6 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
-fancy-regex = { workspace = true }
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 hmac = { workspace = true }
@@ -26,7 +25,6 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 indexmap = { workspace = true }
-json-patch = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
 path-absolutize = { workspace = true }

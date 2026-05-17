@@ -51,18 +51,15 @@ update), use a patch file placed next to the installed package directory:
 
 ```yaml
 agents:
-  "coder":
-    model: openai:gpt-4.1          # lighter model for everyday tasks
-  "compact-coder":
-    model: gemini:gemini-2.5-flash  # or any other cheap compaction model
+  - 'if .name == "coder" then .model = "openai:gpt-4.1" end'
+  - 'if .name == "compact-coder" then .model = "gemini:gemini-2.5-flash" end'
 ```
 
 To use Claude Opus for harder problems:
 
 ```yaml
 agents:
-  "coder":
-    model: claude:claude-opus-4-7
+  - 'if .name == "coder" then .model = "claude:claude-opus-4-7" end'
 ```
 
 ## MCP servers
@@ -109,30 +106,25 @@ Since package files are read-only, use the patch file to customise MCP servers:
 ```yaml
 # ~/.config/harnx/packages/coding.patch.yaml
 mcp_servers:
-  "bash":
-    # Append extra args without replacing the package's existing args.
-    # --extra-exec / --extra-rwx extend sandbox filesystem access.
-    # --env VAR_NAME passes a variable from the host into sandboxed commands.
-    args_append:
-      - --extra-exec
-      - /opt/company-tools/bin
-      - --env
-      - MY_API_KEY
-    # Replace the roots list entirely:
-    roots:
-      - .
-      - ~/projects/myapp
-  "exa":
-    # Disable a server you don't want:
-    enabled: false
+  # Each entry is a jq expression; .name is the server name.
+  # The expression receives the full server config as JSON and returns it modified.
+
+  # Append extra args to the bash server (for sandbox filesystem access):
+  - 'if .name == "bash" then .args += ["--extra-exec", "/opt/company-tools/bin", "--env", "MY_API_KEY"] end'
+
+  # Replace the roots list entirely:
+  - 'if .name == "bash" then .roots = [".", "~/projects/myapp"] end'
+
+  # Disable a server you don't want:
+  - 'if .name == "exa" then .enabled = false end'
 ```
 
-Available patch keys per server:
+Available fields you can set per server with jq:
 
-| Key | Effect |
-|-----|--------|
-| `enabled` | Enable or disable the server |
-| `args` | Replace the args list entirely |
-| `args_append` | Append args after the package's existing args |
-| `env` | Set environment variables on the server process (key/value pairs). Mainly useful for servers that read config from their environment (e.g. API keys for `exa`). |
-| `roots` | Replace the roots list entirely |
+| Field | Effect |
+|-------|--------|
+| `.enabled` | Enable or disable the server (`true`/`false`) |
+| `.args` | Replace the args list entirely |
+| `.args += [...]` | Append args after the existing args |
+| `.env.KEY = "value"` | Set an environment variable on the server process |
+| `.roots` | Replace the roots list entirely |

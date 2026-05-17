@@ -55,7 +55,6 @@ hmac = { workspace = true }
 aws-smithy-eventstream = { workspace = true }
 urlencoding = { workspace = true }
 unicode-segmentation = { workspace = true }
-json-patch = { workspace = true }
 bitflags = { workspace = true }
 path-absolutize = { workspace = true }
 hnsw_rs = { workspace = true }
