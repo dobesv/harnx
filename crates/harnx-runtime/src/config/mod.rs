@@ -4575,6 +4575,7 @@ mod mcp_patch_tests {
             rename_tools: Default::default(),
             tool_templates: Default::default(),
             package: Some("mypkg".to_string()), // Important: test that this is preserved
+            hooks: None,
         }
     }
 
