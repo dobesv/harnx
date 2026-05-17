@@ -1,5 +1,6 @@
 use std::{ffi::OsString, path::Path, sync::Mutex};
 
+use harnx_core::package_namespace::resolve_package_relative_name;
 use harnx_runtime::config::{complete_agent_variables, list_agents, list_assistant_agents, Config};
 
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
@@ -40,6 +41,240 @@ fn install_test_package(config_dir: &Path, pkg_name: &str, files: &[(&str, &str)
         "name: {pkg_name}\nsource:\n  type: git\n  url: file:///fake\n  tag: v1.0.0\n  commit: abc123\ninstalled_at: \"2025-01-01T00:00:00Z\"\n"
     );
     std::fs::write(pkg_dir.join("manifest.yaml"), manifest).unwrap();
+}
+
+#[test]
+fn package_loading_test_package_client_loaded_with_qualified_name() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    install_test_package(
+        tmp.path(),
+        "mypkg",
+        &[(
+            "clients/openai.yaml",
+            "type: openai
+",
+        )],
+    );
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+
+    assert!(
+        config
+            .clients
+            .iter()
+            .any(|client| client.effective_name() == "mypkg/openai"),
+        "Expected qualified package client in config.clients, got: {:?}",
+        config
+            .clients
+            .iter()
+            .map(|client| client.effective_name().to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn package_loading_test_package_agent_model_rewritten_to_qualified() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    install_test_package(
+        tmp.path(),
+        "mypkg",
+        &[
+            (
+                "clients/openai.yaml",
+                "type: openai
+",
+            ),
+            (
+                "agents/worker.md",
+                "---
+model: openai:gpt-4o
+---
+You work.",
+            ),
+        ],
+    );
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+    let agent = config.retrieve_agent("mypkg/worker").unwrap();
+
+    assert_eq!(agent.model_id(), Some("mypkg/openai:gpt-4o"));
+}
+
+#[test]
+fn package_loading_test_package_agent_model_leading_slash_rewritten_to_top_level() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    std::fs::create_dir_all(tmp.path().join("clients")).unwrap();
+    std::fs::write(
+        tmp.path().join("clients/openai.yaml"),
+        "type: openai
+",
+    )
+    .unwrap();
+    install_test_package(
+        tmp.path(),
+        "mypkg",
+        &[(
+            "agents/worker.md",
+            "---
+model: /openai:gpt-4o
+---
+You work.",
+        )],
+    );
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+    let agent = config.retrieve_agent("mypkg/worker").unwrap();
+
+    assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
+}
+
+#[test]
+fn package_loading_test_package_agent_model_cross_package_unchanged() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    install_test_package(
+        tmp.path(),
+        "other",
+        &[(
+            "clients/openai.yaml",
+            "type: openai
+",
+        )],
+    );
+    install_test_package(
+        tmp.path(),
+        "mypkg",
+        &[(
+            "agents/worker.md",
+            "---
+model: other/openai:gpt-4o
+---
+You work.",
+        )],
+    );
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+    let agent = config.retrieve_agent("mypkg/worker").unwrap();
+
+    assert_eq!(agent.model_id(), Some("other/openai:gpt-4o"));
+}
+
+#[test]
+fn package_loading_test_package_clients_same_bare_name_do_not_collide() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    install_test_package(
+        tmp.path(),
+        "pkg-a",
+        &[(
+            "clients/openai.yaml",
+            "type: openai
+",
+        )],
+    );
+    install_test_package(
+        tmp.path(),
+        "pkg-b",
+        &[(
+            "clients/openai.yaml",
+            "type: openai
+",
+        )],
+    );
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+
+    let client_names = config
+        .clients
+        .iter()
+        .map(|client| client.effective_name().to_string())
+        .collect::<Vec<_>>();
+    assert!(client_names.contains(&"pkg-a/openai".to_string()));
+    assert!(client_names.contains(&"pkg-b/openai".to_string()));
+}
+
+#[test]
+fn package_loading_test_top_level_agent_model_stays_unchanged() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    std::fs::create_dir_all(tmp.path().join("clients")).unwrap();
+    std::fs::write(
+        tmp.path().join("clients/openai.yaml"),
+        "type: openai
+",
+    )
+    .unwrap();
+    std::fs::create_dir_all(tmp.path().join("agents")).unwrap();
+    std::fs::write(
+        tmp.path().join("agents/worker.md"),
+        "---
+model: openai:gpt-4o
+---
+You work.",
+    )
+    .unwrap();
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+    let agent = config.retrieve_agent("worker").unwrap();
+
+    assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
 }
 
 #[test]
@@ -267,6 +502,95 @@ fn package_loading_test_package_agent_file_resolves_correctly() {
         path.exists(),
         "Expected resolved agent path to exist: {}",
         path.display()
+    );
+}
+
+#[test]
+fn package_loading_test_compaction_agent_bare_name_resolves_within_package() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    install_test_package(
+        tmp.path(),
+        "mypkg",
+        &[
+            (
+                "agents/main.md",
+                "---\ncompaction_agent: compactor\n---\nYou are the main agent.",
+            ),
+            (
+                "agents/compactor.md",
+                "---\nrole: compaction\n---\nSummarize for mypkg.",
+            ),
+        ],
+    );
+
+    let agents_dir = tmp.path().join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(
+        agents_dir.join("compactor.md"),
+        "---\nrole: compaction\n---\nTop-level summarizer.",
+    )
+    .unwrap();
+
+    let resolved = resolve_package_relative_name("compactor", Some("mypkg"));
+    assert_eq!(resolved, "mypkg/compactor");
+
+    let config = Config::default();
+    let package_compactor = config.retrieve_agent(&resolved).unwrap();
+    assert_eq!(package_compactor.name(), "mypkg/compactor");
+    let package_prompt = package_compactor.interpolated_instructions().unwrap();
+    assert!(
+        package_prompt.contains("mypkg"),
+        "Expected package-scoped compactor prompt, got: {:?}",
+        package_prompt
+    );
+
+    let top_level_compactor = config.retrieve_agent("compactor").unwrap();
+    assert_eq!(top_level_compactor.name(), "compactor");
+    let top_level_prompt = top_level_compactor.interpolated_instructions().unwrap();
+    assert!(
+        top_level_prompt.contains("Top-level"),
+        "Expected top-level compactor prompt, got: {:?}",
+        top_level_prompt
+    );
+}
+
+#[test]
+fn package_loading_test_compaction_agent_leading_slash_resolves_top_level() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    install_test_package(
+        tmp.path(),
+        "mypkg",
+        &[(
+            "agents/main.md",
+            "---\ncompaction_agent: /compactor\n---\nYou are the main agent.",
+        )],
+    );
+
+    let agents_dir = tmp.path().join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(
+        agents_dir.join("compactor.md"),
+        "---\nrole: compaction\n---\nTop-level summarizer.",
+    )
+    .unwrap();
+
+    let resolved = resolve_package_relative_name("/compactor", Some("mypkg"));
+    assert_eq!(resolved, "compactor");
+
+    let config = Config::default();
+    let top_level_compactor = config.retrieve_agent(&resolved).unwrap();
+    assert_eq!(top_level_compactor.name(), "compactor");
+    let top_level_prompt = top_level_compactor.interpolated_instructions().unwrap();
+    assert!(
+        top_level_prompt.contains("Top-level"),
+        "Expected top-level compactor prompt, got: {:?}",
+        top_level_prompt
     );
 }
 

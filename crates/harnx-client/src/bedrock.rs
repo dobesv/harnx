@@ -938,6 +938,7 @@ mod tests {
             patches: None,
             extra: None,
             system_prompt_prefix: None,
+            package: None,
         }
     }
 

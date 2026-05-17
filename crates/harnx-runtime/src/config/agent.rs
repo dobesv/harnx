@@ -95,6 +95,45 @@ fn apply_package_agent_transforms(
     if let Some(patch) = load_package_patch_for(pkg_name)? {
         apply_agent_patch(config, agent_stem, &patch)?;
     }
+    // Rewrite model_id: resolve the client-name part relative to this package.
+    // Format is "client:model" or just "client". The leading-slash escape "/foo"
+    // resolves to top-level "foo"; "other/foo" passes through unchanged.
+    if let Some(model_id) = config.model_id().map(ToOwned::to_owned) {
+        let resolved = match model_id.split_once(':') {
+            Some((client_part, model_part)) => {
+                let resolved_client = harnx_core::package_namespace::resolve_package_relative_name(
+                    client_part,
+                    Some(pkg_name),
+                );
+                format!("{resolved_client}:{model_part}")
+            }
+            None => harnx_core::package_namespace::resolve_package_relative_name(
+                &model_id,
+                Some(pkg_name),
+            ),
+        };
+        config.set_model_id(Some(resolved));
+    }
+    // Rewrite model_fallbacks too
+    let resolved_fallbacks: Vec<String> = config
+        .model_fallbacks()
+        .iter()
+        .map(|fb| match fb.split_once(':') {
+            Some((client_part, model_part)) => {
+                let resolved_client = harnx_core::package_namespace::resolve_package_relative_name(
+                    client_part,
+                    Some(pkg_name),
+                );
+                format!("{resolved_client}:{model_part}")
+            }
+            None => {
+                harnx_core::package_namespace::resolve_package_relative_name(fb, Some(pkg_name))
+            }
+        })
+        .collect();
+    if !resolved_fallbacks.is_empty() {
+        config.set_model_fallbacks(resolved_fallbacks);
+    }
     Ok(())
 }
 

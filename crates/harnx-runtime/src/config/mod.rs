@@ -1956,6 +1956,8 @@ impl Config {
         }
 
         // Check if the current agent has a compaction_agent configured
+        let active_agent_name = config.read().extract_agent().name().to_string();
+        let active_pkg = harnx_core::package_namespace::pkg_from_qualified(&active_agent_name);
         let compaction_agent_name = config
             .read()
             .extract_agent()
@@ -1963,7 +1965,9 @@ impl Config {
             .map(str::to_owned);
 
         let (prompt, agent_override) = if let Some(name) = compaction_agent_name {
-            match config.read().retrieve_agent(&name) {
+            let resolved_name =
+                harnx_core::package_namespace::resolve_package_relative_name(&name, active_pkg);
+            match config.read().retrieve_agent(&resolved_name) {
                 Ok(mut compaction_agent) => {
                     if let Err(e) = self::agent::resolve_variables(&mut compaction_agent) {
                         warn!("Failed to resolve variables for compaction_agent '{name}': {e}");
@@ -3000,7 +3004,6 @@ impl Config {
         pkg_name: &str,
         patch: Option<&harnx_core::package::PackagePatch>,
     ) -> Vec<ClientConfig> {
-        let _ = pkg_name;
         let pkg_clients_dir = pkg_path.join(paths::CLIENTS_DIR_NAME);
         if !pkg_clients_dir.is_dir() {
             return vec![];
@@ -3009,6 +3012,16 @@ impl Config {
         if let Some(patch) = patch {
             for client in &mut clients {
                 apply_client_patch(client, &patch.clients);
+            }
+        }
+        // Qualify client names with package prefix after patching.
+        // Must be after patching because apply_client_patch round-trips through
+        // serde_json and resets #[serde(skip)] fields like `package`.
+        for client in &mut clients {
+            let bare_name = client.effective_name().to_string();
+            if !bare_name.contains('/') {
+                let qualified = format!("{pkg_name}/{bare_name}");
+                client.set_name_and_package(qualified, pkg_name.to_string());
             }
         }
         clients
@@ -3938,6 +3951,7 @@ mod tests {
                         patches: None,
                         extra: None,
                         system_prompt_prefix: None,
+                        package: None,
                     },
                 ));
             config.model = harnx_client::Model::new("test", "model");
@@ -4534,6 +4548,136 @@ mod tests {
         );
     }
 
+    /// compact_session with a package-scoped compaction_agent bare name must
+    /// resolve to the same-package compactor, not a top-level agent of the same name.
+    #[tokio::test]
+    async fn test_compact_session_package_bare_compaction_agent_resolves_within_package() {
+        use crate::client::TestStateGuard;
+        use crate::test_utils::{MockClient, MockTurnBuilder};
+        use std::io::Write as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let package_agents_dir = temp.path().join("packages/mypkg/agents");
+        std::fs::create_dir_all(&package_agents_dir).unwrap();
+        let top_level_agents_dir = temp.path().join("agents");
+        std::fs::create_dir_all(&top_level_agents_dir).unwrap();
+
+        std::fs::write(
+            temp.path().join("packages/mypkg/manifest.yaml"),
+            "name: mypkg\nsource:\n  type: git\n  url: file:///fake\n  tag: v1.0.0\n  commit: abc123\ninstalled_at: \"2025-01-01T00:00:00Z\"\n",
+        )
+        .unwrap();
+
+        // Use /gemini (leading slash) to escape to top-level so the model
+        // reference is not rewritten to mypkg/gemini by apply_package_agent_transforms.
+        let package_compactor = "---\nmodel: /gemini:gemini-3.1-flash-lite-preview\n---\nYou are the PACKAGE compactor. Produce a concise summary.\n";
+        let mut package_file =
+            std::fs::File::create(package_agents_dir.join("compactor.md")).unwrap();
+        package_file
+            .write_all(package_compactor.as_bytes())
+            .unwrap();
+
+        let top_level_compactor = "---\nmodel: gemini:gemini-3.1-flash-lite-preview\n---\nYou are the TOP-LEVEL compactor. Produce a concise summary.\n";
+        let mut top_level_file =
+            std::fs::File::create(top_level_agents_dir.join("compactor.md")).unwrap();
+        top_level_file
+            .write_all(top_level_compactor.as_bytes())
+            .unwrap();
+
+        let mut main_agent = Agent::new(
+            AgentConfig::from_markdown(
+                "mypkg/main",
+                "---\nmodel: gemini:gemini-3.1-flash-lite-preview\n---\nYou are the main package agent.",
+            )
+            .unwrap(),
+        );
+        main_agent.set_compaction_agent(Some("compactor".to_string()));
+        main_agent.set_model(crate::client::Model::new(
+            "gemini",
+            "gemini-3.1-flash-lite-preview",
+        ));
+
+        let mut config = Config {
+            data: ConfigData {
+                stream: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn new(key: &'static str, value: &std::path::Path) -> Self {
+                let prev = std::env::var_os(key);
+                unsafe { std::env::set_var(key, value) };
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => unsafe { std::env::set_var(self.key, v) },
+                    None => unsafe { std::env::remove_var(self.key) },
+                }
+            }
+        }
+
+        config.agent = Some(main_agent);
+
+        let mut session = self::session::new(&config, "test-session").unwrap();
+        session.push_message_for_test(
+            MessageRole::User,
+            "Tell me about package-local compaction.".to_string(),
+        );
+        config.session = Some(session);
+        let config = Arc::new(RwLock::new(config));
+
+        let mock = Arc::new(
+            MockClient::builder()
+                .add_turn(MockTurnBuilder::new().add_text_chunk("Compacted.").build())
+                .build(),
+        );
+        let _guard = TestStateGuard::new(Some(mock.clone())).await;
+        let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+
+        Config::compact_session(&config).await.unwrap();
+
+        let history = mock.conversation_history();
+        assert_eq!(
+            history.conversation_history.len(),
+            1,
+            "expected exactly one LLM call"
+        );
+        let messages = &history.conversation_history[0].messages;
+
+        let has_package_system = messages.iter().any(|m| {
+            m.role == MessageRole::System
+                && if let MessageContent::Text(t) = &m.content {
+                    t.contains("PACKAGE compactor")
+                } else {
+                    false
+                }
+        });
+        assert!(
+            has_package_system,
+            "package compactor system prompt must be used; messages: {messages:?}"
+        );
+
+        let has_top_level_system = messages.iter().any(|m| {
+            m.role == MessageRole::System
+                && if let MessageContent::Text(t) = &m.content {
+                    t.contains("TOP-LEVEL compactor")
+                } else {
+                    false
+                }
+        });
+        assert!(
+            !has_top_level_system,
+            "top-level compactor system prompt must not be used; messages: {messages:?}"
+        );
+    }
     /// Regression test for the ACP-server failure where `use_agent_by_name`
     /// followed by `use_session` bailed with "agent variables are required"
     /// for an agent whose variables use `path:` (file-backed defaults).  The
