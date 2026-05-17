@@ -14,7 +14,10 @@ tags:
   - serde
   - json-round-trip
   - yaml-migration
+  - client-config
+  - package-patching
 plan_ref: "jaq-patch-dsl"
+last_updated: 2026-05-16
 ---
 
 ## Problem
@@ -180,6 +183,77 @@ patches:
 ## Related Issues
 
 - **GitHub:** #565 — Replace YAML DSL patches with jq/jaq expressions
+- **GitHub:** #581 — Enable client config patching from packages (`PackagePatch.clients`)
 - **Plan:** `jaq-patch-dsl`
+- **Plan:** `patch-clients-from-packages`
 - **Changeset:** `.changesets/jaq-patch-expressions.md`
 - **Migration targets:** `models.yaml` (25 entries), `example_config/clients/*.yaml`, `packages/*/clients/*.yaml`
+
+---
+
+## Addendum: Client Config Patching (#581)
+
+### Problem Extension
+
+`PackagePatch.clients` existed in the schema as "dead surface" — the field was defined but never applied at runtime. Package authors could not ship `clients/` subdirectories with configs that get patched via `<pkg>.patches.yaml`.
+
+### Key Insight: Serialize Must Be Derived Alongside Deserialize
+
+Provider config structs (`OpenAIConfig`, `ClaudeConfig`, etc.) and `ExtraConfig` only derived `Deserialize`. The jaq patch system serializes configs to JSON, applies jq filters, then deserializes back. `Serialize` had to be added to:
+- All provider config structs in `harnx-client`
+- `ExtraConfig` struct
+- The `ClientConfig` enum in the `register_client!` macro
+
+Without `Serialize`, `serde_json::to_value(&client)` fails at runtime.
+
+### No skip Fields in ClientConfig
+
+Unlike `McpServerConfig` which has `package: Option<String>` marked `#[serde(skip)]`, `ClientConfig` has no skip fields. This means `apply_client_patch`:
+
+```rust
+fn apply_client_patch(client: &mut ClientConfig, patches: &[String]) {
+    if patches.is_empty() { return; }
+    let input = match serde_json::to_value(&*client) {
+        Ok(v) => v,
+        Err(e) => { log::warn!("Failed to serialize ClientConfig for jaq patch: {e}"); return; }
+    };
+    let output = harnx_core::jaq::eval_filters(patches, input);
+    match serde_json::from_value(output) {
+        Ok(patched) => { *client = patched; }
+        Err(e) => log::warn!("Failed to deserialize ClientConfig after jaq patch: {e}"),
+    }
+}
+```
+
+No save/restore logic needed — JSON round-trip is lossless for `ClientConfig`.
+
+### Package Loading Integration
+
+In `load_package_servers`, the same pattern used for MCP/ACP servers applies to clients:
+
+```rust
+let pkg_clients_dir = pkg_path.join(paths::CLIENTS_DIR_NAME);
+if pkg_clients_dir.is_dir() {
+    let patch = load_package_mcp_patch(pkg_name);  // loads full PackagePatch
+    for mut client in Self::load_clients_from_dir(&pkg_clients_dir).unwrap_or_default() {
+        if let Some(patch) = &patch {
+            apply_client_patch(&mut client, &patch.clients);
+        }
+        config.clients.push(client);
+    }
+}
+```
+
+Note: `load_package_mcp_patch()` loads the full `PackagePatch` (not just MCP). The misleading name is a known non-blocker.
+
+### Design Gap: ClientConfig Lacks Package Attribution
+
+MCP/ACP server configs have `package: Option<String>` (runtime-only, skip-serialized) for origin tracking. `ClientConfig` lacks this field. Clients loaded from packages are anonymous re: their origin. Not a bug, but a design asymmetry to be aware of for future work.
+
+### Tests
+
+`client_patch_tests` module verifies:
+- Identity expression leaves config unchanged
+- Empty patches no-op
+- Field setting via jq (e.g., `.api_key = "sk-patched"`)
+- Invalid jq expressions fail gracefully (log warning, config unchanged)

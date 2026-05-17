@@ -341,6 +341,26 @@ fn apply_mcp_server_patch(server: &mut McpServerConfig, patches: &[String]) {
     }
 }
 
+fn apply_client_patch(client: &mut ClientConfig, patches: &[String]) {
+    if patches.is_empty() {
+        return;
+    }
+    let input = match serde_json::to_value(&*client) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("Failed to serialize ClientConfig for jaq patch: {e}");
+            return;
+        }
+    };
+    let output = harnx_core::jaq::eval_filters(patches, input);
+    match serde_json::from_value(output) {
+        Ok(patched) => {
+            *client = patched;
+        }
+        Err(e) => log::warn!("Failed to deserialize ClientConfig after jaq patch: {e}"),
+    }
+}
+
 ///
 /// - Top-level servers (`package == None`): unchanged name.
 /// - Same-package servers: bare name (the yaml stem, e.g. `fs`).
@@ -2945,9 +2965,11 @@ impl Config {
     /// — bare or prefixed — is decided at `init_mcp_manager_for_agent` time
     /// based on which agent is active.
     fn load_package_servers(config: &mut Config, pkg_path: &Path, pkg_name: &str) {
+        // Load the patch file once — shared by MCP servers and clients.
+        let patch = load_package_mcp_patch(pkg_name);
+
         let pkg_mcp_dir = pkg_path.join(paths::MCP_SERVERS_DIR_NAME);
         if pkg_mcp_dir.is_dir() {
-            let patch = load_package_mcp_patch(pkg_name);
             for mut server in Self::load_mcp_servers_from_dir(&pkg_mcp_dir).unwrap_or_default() {
                 server.package = Some(pkg_name.to_string());
                 if let Some(patch) = &patch {
@@ -2964,6 +2986,32 @@ impl Config {
                 config.acp_servers.push(server);
             }
         }
+
+        config.clients.extend(Self::load_package_clients(
+            pkg_path,
+            pkg_name,
+            patch.as_ref(),
+        ));
+    }
+
+    /// Load clients from a single package directory, applying any patch expressions.
+    fn load_package_clients(
+        pkg_path: &Path,
+        pkg_name: &str,
+        patch: Option<&harnx_core::package::PackagePatch>,
+    ) -> Vec<ClientConfig> {
+        let _ = pkg_name;
+        let pkg_clients_dir = pkg_path.join(paths::CLIENTS_DIR_NAME);
+        if !pkg_clients_dir.is_dir() {
+            return vec![];
+        }
+        let mut clients = Self::load_clients_from_dir(&pkg_clients_dir).unwrap_or_default();
+        if let Some(patch) = patch {
+            for client in &mut clients {
+                apply_client_patch(client, &patch.clients);
+            }
+        }
+        clients
     }
 
     fn load_clients_from_dir(dir: &Path) -> Result<Vec<ClientConfig>> {
@@ -4631,5 +4679,55 @@ mod mcp_patch_tests {
         // The package field should be preserved even though it has #[serde(skip)]
         assert_eq!(server.package, Some("mypkg".to_string()));
         assert_eq!(server.description, Some("Updated description".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod client_patch_tests {
+    use super::apply_client_patch;
+    use harnx_client::ClientConfig;
+
+    fn make_openai_client() -> ClientConfig {
+        serde_yaml::from_str("type: openai\napi_key: sk-original\n")
+            .expect("should parse openai client config")
+    }
+
+    #[test]
+    fn apply_client_patch_with_identity_expression_leaves_config_unchanged() {
+        let mut client = make_openai_client();
+        let before = serde_json::to_value(&client).expect("serialize");
+        apply_client_patch(&mut client, &[".".to_string()]);
+        let after = serde_json::to_value(&client).expect("serialize");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn apply_client_patch_with_empty_patches_is_noop() {
+        let mut client = make_openai_client();
+        let before = serde_json::to_value(&client).expect("serialize");
+        apply_client_patch(&mut client, &[]);
+        let after = serde_json::to_value(&client).expect("serialize");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn apply_client_patch_sets_field_via_jq_expression() {
+        let mut client = make_openai_client();
+        apply_client_patch(&mut client, &[r#".api_key = "sk-patched""#.to_string()]);
+        if let ClientConfig::OpenAIConfig(c) = &client {
+            assert_eq!(c.api_key.as_deref(), Some("sk-patched"));
+        } else {
+            panic!("expected OpenAI client, got: {client:?}");
+        }
+    }
+
+    #[test]
+    fn apply_client_patch_with_invalid_jq_expression_leaves_config_unchanged() {
+        let mut client = make_openai_client();
+        let before = serde_json::to_value(&client).expect("serialize");
+        // Unclosed string — jaq will skip this expression
+        apply_client_patch(&mut client, &[r#".api_key = "unclosed"#.to_string()]);
+        let after = serde_json::to_value(&client).expect("serialize");
+        assert_eq!(before, after);
     }
 }

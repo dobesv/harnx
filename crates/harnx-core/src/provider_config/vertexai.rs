@@ -1,11 +1,11 @@
 //! `VertexAIConfig` — per-provider config for Google Vertex AI.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api_types::ExtraConfig;
 use crate::model::{ModelData, RequestPatches};
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VertexAIConfig {
     pub name: Option<String>,
     pub project_id: Option<String>,
