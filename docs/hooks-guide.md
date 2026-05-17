@@ -289,15 +289,15 @@ Examples:
 
 ```sh
 # Single host — exact match only
-harnx-proxy-auth --hook 'if .host == "github.com" then .headers.authorization = "Bearer \(env.GITHUB_TOKEN)" else . end'
+harnx-proxy-auth --hook 'if .host == "github.com" then .headers.authorization = "Bearer \(env.GITHUB_TOKEN)" end'
 
 # GitHub hosts allowlist — use explicit equality, not endswith() which would match naughtygithub.com
 harnx-proxy-auth --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
   then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
-  else . end'
+  end'
 
 # Block requests to a specific host (returns 403 to the client)
-harnx-proxy-auth --hook 'if .host == "blocked.example.com" then .block = "host not allowed" else . end'
+harnx-proxy-auth --hook 'if .host == "blocked.example.com" then .block = "host not allowed" end'
 
 # Block and inject auth in one filter
 harnx-proxy-auth --hook '
@@ -320,7 +320,7 @@ hooks:
       harnx-proxy-auth
       --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
           then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
-          else . end'           
+          end'
 ```
 
 ### Injected Environment Variables

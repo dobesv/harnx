@@ -227,8 +227,8 @@ mcp_servers:
   # Append extra args to the bash server (for sandbox filesystem access):
   - 'if .name == "bash" then .args += ["--extra-exec", "/opt/company-tools/bin", "--extra-rwx", "~/.codescene", "--env", "CS_ACCESS_TOKEN"] end'
 
-  # Replace the roots list entirely:
-  - 'if .name == "bash" then .roots = [".", "/opt/company-sdk"] end'
+  # Add an extra root (keep the package's existing roots):
+  - 'if .name == "bash" then .roots += ["/opt/company-sdk"] end'
 
   # Disable a server you don't want:
   - 'if .name == "exa" then .enabled = false end'
@@ -242,6 +242,7 @@ Available fields you can set per server with jq:
 | `.args` | Replace the args list entirely |
 | `.args += [...]` | Append args after the existing args |
 | `.env.KEY = "value"` | Set an environment variable on the server process |
+| `.roots += [...]` | Append to the roots list |
 | `.roots` | Replace the roots list entirely |
 
 ### Optional / advanced

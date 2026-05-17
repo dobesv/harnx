@@ -108,6 +108,15 @@ mod tests {
     }
 
     #[test]
+    fn if_without_else_passes_through_on_no_match() {
+        // implicit `else .` — non-matching input returns unchanged
+        let filter = compile("if .host == \"evil.com\" then .block = true end")
+            .expect("if-without-else compiles");
+        let output = apply_filter(&filter, request_json()).expect("filter applies");
+        assert_eq!(output, request_json()); // github.com — passes through unchanged
+    }
+
+    #[test]
     fn block_true_sets_block_field() {
         let filter = compile("if .host == \"evil.com\" then .block = true else . end")
             .expect("block filter compiles");
