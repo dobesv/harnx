@@ -380,9 +380,9 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
             .patches()
             .map(|p| {
                 p.iter().any(|expr| {
-                    expr.contains("\"max_tokens\"")
-                        && expr.contains("null")
-                        && expr.contains("max_completion_tokens")
+                    // jq patches use field-path syntax: `.body.max_tokens = null`
+                    // (not quoted JSON key form like `"max_tokens"`)
+                    expr.contains(".max_tokens") && expr.contains("null")
                 })
             })
             .unwrap_or(false);
@@ -546,6 +546,58 @@ mod tests {
             ids,
             vec![Some("call_A"), Some("call_B")],
             "each tool_call must be emitted exactly once"
+        );
+    }
+
+    fn make_model_with_patches(patches: Vec<&str>) -> harnx_core::model::Model {
+        let mut model = harnx_core::model::Model::new("openai", "gpt-4o");
+        model.set_max_tokens(Some(1024), true);
+        model.data_mut().patches = Some(patches.into_iter().map(String::from).collect());
+        model
+    }
+
+    #[test]
+    fn null_max_tokens_patch_uses_max_completion_tokens_key() {
+        let model = make_model_with_patches(vec![
+            "del(.body.max_tokens) | .body.max_completion_tokens = null",
+            ".body.max_tokens = null",
+        ]);
+        let data = ChatCompletionsData {
+            messages: vec![],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+        };
+        let body = openai_build_chat_completions_body(data, &model);
+        assert!(
+            body.get("max_completion_tokens").is_some(),
+            "should use max_completion_tokens when patch nulls max_tokens"
+        );
+        assert!(
+            body.get("max_tokens").is_none(),
+            "should not set max_tokens when patch nulls it"
+        );
+    }
+
+    #[test]
+    fn no_null_max_tokens_patch_uses_max_tokens_key() {
+        let model = make_model_with_patches(vec![".body.temperature = 0"]);
+        let data = ChatCompletionsData {
+            messages: vec![],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+        };
+        let body = openai_build_chat_completions_body(data, &model);
+        assert!(
+            body.get("max_tokens").is_some(),
+            "should use max_tokens when no patch nulls it"
+        );
+        assert!(
+            body.get("max_completion_tokens").is_none(),
+            "should not set max_completion_tokens without a null-max_tokens patch"
         );
     }
 }
