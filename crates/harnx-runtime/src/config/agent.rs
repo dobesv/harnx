@@ -202,7 +202,7 @@ pub fn resolve_variables(agent: &mut Agent) -> Result<()> {
 pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) -> Result<Agent> {
     let agent_file_path = Config::agent_file(name);
     let mut agent = if agent_file_path.exists() {
-        load(&agent_file_path)?
+        load_with_qualified_name(&agent_file_path, name)?
     } else {
         builtin(name)?
     };
@@ -507,7 +507,7 @@ pub async fn list_assistant_agents() -> Vec<String> {
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
     let markdown_path = Config::agent_file(agent_name);
     if markdown_path.exists() {
-        if let Ok(agent) = load(&markdown_path) {
+        if let Ok(agent) = load_with_qualified_name(&markdown_path, agent_name) {
             return agent
                 .defined_variables()
                 .iter()
@@ -1027,6 +1027,35 @@ You are a test agent.
             agent.defined_variables()[0].default.as_deref(),
             Some("Nested prompt")
         );
+    }
+
+    /// Regression for: `harnx -a pkg/agent` and `.agent pkg/agent` would load
+    /// the file at `packages/<pkg>/agents/<stem>.md` but call `load(path)` —
+    /// which derives the agent name from the file stem alone, dropping the
+    /// `<pkg>/` qualifier. As a result the loaded agent reported its name as
+    /// the bare stem (so it looked like a top-level agent had been selected),
+    /// `pkg_from_qualified(agent.name())` returned `None`, and the package
+    /// transforms (patches, namespaced managers) were never applied.
+    #[test]
+    fn test_init_preserves_qualified_name_for_package_agent() {
+        with_test_config_dir(|config_dir| {
+            let pkg_agents_dir = config_dir.join("packages/pantheon/agents");
+            fs::create_dir_all(&pkg_agents_dir)?;
+            fs::write(
+                pkg_agents_dir.join("sisyphus.md"),
+                "---\nrole: assistant\n---\nPackage-scoped agent.",
+            )?;
+            let config = GlobalConfig::default();
+            let runtime = tokio::runtime::Runtime::new()?;
+            let agent = runtime.block_on(super::init(
+                &config,
+                "pantheon/sisyphus",
+                create_abort_signal(),
+            ))?;
+            assert_eq!(agent.name(), "pantheon/sisyphus");
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
