@@ -91,7 +91,7 @@ hudsucker = { version = "0.24.1", features = ["rcgen-ca"] }
 hyper = { version = "1.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["server-auto", "client-legacy"] }
 moka = { version = "0.12", features = ["sync"] }
-rcgen = "0.13"
+rcgen = "0.14"
 time = { version = "0.3.36", features = ["macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
