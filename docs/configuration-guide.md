@@ -101,7 +101,7 @@ For prefix or pattern matching, use `test` within the expression:
 ```yaml
 patches:
   chat_completions:
-    - 'if (.body.model | test("gpt-5.*")) then .body.reasoning_effort = "high" else . end'
+    - 'if (.body.model | test("gpt-5.*")) then .body.reasoning_effort = "high" end'
 ```
 
 ## MCP Servers (`mcp_servers/`)
