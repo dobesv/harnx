@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use harnx_core::abort::create_abort_signal;
-use harnx_core::hooks::{HookConfig, HookEvent, HookResultControl, HooksConfig};
+use harnx_core::hooks::{HookConfig, HookEvent, HookOutcome, HookResultControl, HooksConfig};
 use harnx_core::tool::ToolCall;
 use harnx_core::working_mode::WorkingMode;
 use harnx_engine::tool::eval_tool_calls;
@@ -41,37 +41,15 @@ async fn hook_dispatch_injects_proxy_env_into_bash_exec_input() {
         return;
     };
 
-    let hook_command = format!("{} --hook '.'", shell_escape_path(&proxy_bin));
-    let hooks = vec![HookConfig {
-        event: "PreToolUse".to_string(),
-        matcher: Some("bash_exec".to_string()),
-        command: hook_command,
-        timeout: None, // use framework default (30s); proxy startup can be slow on CI
-        status_message: None,
-        async_hook: None,
-        hook_type: "claude-command-persistent".to_string(),
-    }];
-
-    let event = HookEvent::PreToolUse {
-        tool_name: "bash_exec".to_string(),
-        tool_input: json!({ "command": "echo hello" }),
-        tool_use_id: "toolu_hook_e2e_1".to_string(),
-    };
-
-    let persistent_manager = Arc::new(Mutex::new(PersistentHookManager::new()));
-
-    let outcome = dispatch_hooks_with_count_and_manager(
-        &event,
-        &hooks,
-        "hook-e2e-session",
-        Path::new(env!("CARGO_MANIFEST_DIR")),
-        0,
-        None,
-        Some(&persistent_manager),
+    let outcome = dispatch_one_hook(
+        &proxy_bin,
+        HookEvent::PreToolUse {
+            tool_name: "bash_exec".to_string(),
+            tool_input: json!({ "command": "echo hello" }),
+            tool_use_id: "toolu_hook_e2e_1".to_string(),
+        },
     )
     .await;
-
-    persistent_manager.lock().await.shutdown();
 
     assert!(
         matches!(outcome.control, HookResultControl::Continue),
@@ -82,7 +60,6 @@ async fn hook_dispatch_injects_proxy_env_into_bash_exec_input() {
         .result
         .mutated_tool_input
         .expect("persistent hook must mutate tool_input for bash_exec");
-
     let env = mutated
         .get("env")
         .and_then(Value::as_object)
@@ -105,29 +82,54 @@ async fn hook_dispatch_injects_proxy_env_into_bash_exec_input() {
         ssl_cert_file.ends_with("ca.pem"),
         "SSL_CERT_FILE should point to CA cert, got: {ssl_cert_file}"
     );
+}
 
-    // Non-bash tools must NOT be mutated.
-    let event_other = HookEvent::PreToolUse {
-        tool_name: "read_file".to_string(),
-        tool_input: json!({ "path": "/tmp/test" }),
-        tool_use_id: "toolu_hook_e2e_2".to_string(),
+#[tokio::test(flavor = "multi_thread")]
+async fn hook_dispatch_does_not_mutate_non_bash_tools() {
+    let Some(proxy_bin) = proxy_binary_path() else {
+        eprintln!("SKIP hook_dispatch_does_not_mutate_non_bash_tools: harnx-proxy-auth not found");
+        return;
     };
-    let persistent_manager2 = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let outcome_other = dispatch_hooks_with_count_and_manager(
-        &event_other,
+
+    let outcome = dispatch_one_hook(
+        &proxy_bin,
+        HookEvent::PreToolUse {
+            tool_name: "read_file".to_string(),
+            tool_input: json!({ "path": "/tmp/test" }),
+            tool_use_id: "toolu_hook_e2e_2".to_string(),
+        },
+    )
+    .await;
+
+    assert!(
+        outcome.result.mutated_tool_input.is_none(),
+        "non-bash tool must not be mutated"
+    );
+}
+
+async fn dispatch_one_hook(proxy_bin: &Path, event: HookEvent) -> HookOutcome {
+    let hooks = vec![HookConfig {
+        event: "PreToolUse".to_string(),
+        matcher: Some("bash_exec".to_string()),
+        command: format!("{} --hook '.'", shell_escape_path(proxy_bin)),
+        timeout: None, // use framework default (30s); proxy startup can be slow on CI
+        status_message: None,
+        async_hook: None,
+        hook_type: "claude-command-persistent".to_string(),
+    }];
+    let persistent_manager = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let outcome = dispatch_hooks_with_count_and_manager(
+        &event,
         &hooks,
         "hook-e2e-session",
         Path::new(env!("CARGO_MANIFEST_DIR")),
         0,
         None,
-        Some(&persistent_manager2),
+        Some(&persistent_manager),
     )
     .await;
-    persistent_manager2.lock().await.shutdown();
-    assert!(
-        outcome_other.result.mutated_tool_input.is_none(),
-        "non-bash tool must not be mutated"
-    );
+    persistent_manager.lock().await.shutdown();
+    outcome
 }
 
 // ── Test 2: full stack through bash execution ──────────────────────────────

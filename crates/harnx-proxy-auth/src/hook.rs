@@ -85,6 +85,7 @@ fn augment_tool_input(tool_input: Option<Value>, proxy_port: u16, ca_cert_path: 
     };
 
     for (key, value) in [
+        ("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}")),
         ("HTTPS_PROXY", format!("http://127.0.0.1:{proxy_port}")),
         ("SSL_CERT_FILE", ca_cert_path.to_owned()),
         ("NODE_EXTRA_CA_CERTS", ca_cert_path.to_owned()),
@@ -109,6 +110,7 @@ mod tests {
 
     fn expected_proxy_env() -> Value {
         json!({
+            "HTTP_PROXY": format!("http://127.0.0.1:{PROXY_PORT}"),
             "HTTPS_PROXY": format!("http://127.0.0.1:{PROXY_PORT}"),
             "SSL_CERT_FILE": CA_CERT_PATH,
             "NODE_EXTRA_CA_CERTS": CA_CERT_PATH,
@@ -130,6 +132,7 @@ mod tests {
                 "command": "echo hi",
                 "env": {
                     "FOO": "bar",
+                    "HTTP_PROXY": format!("http://127.0.0.1:{PROXY_PORT}"),
                     "HTTPS_PROXY": format!("http://127.0.0.1:{PROXY_PORT}"),
                     "SSL_CERT_FILE": CA_CERT_PATH,
                     "NODE_EXTRA_CA_CERTS": CA_CERT_PATH,

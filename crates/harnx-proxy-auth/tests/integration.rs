@@ -167,7 +167,8 @@ async fn read_proxy_readiness(proxy: &mut Child) -> Result<ProxyReadiness> {
     let mut lines = BufReader::new(stdout).lines();
 
     let (proxy_port, ca_cert_b64) = collect_readiness_lines(&mut lines).await?;
-    let ca_cert_pem = harnx_proxy_auth::base64_decode(&ca_cert_b64);
+    let ca_cert_pem = harnx_proxy_auth::base64_decode(&ca_cert_b64)
+        .context("decode CA_CERT_PEM_B64 readiness line")?;
 
     Ok(ProxyReadiness {
         proxy_port,
