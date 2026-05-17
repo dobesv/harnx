@@ -144,20 +144,19 @@ Patch files use **jq filter strings** to modify package configurations. Each ent
 
 ```yaml
 agents:
-  - 'if (.name | test(".*")) then .model = "claude:claude-3-5-sonnet" else . end'
-  - 'if .name == "coder" then .fallback_models = ["openai:gpt-4o"] else . end'
+  - '.model = "claude:claude-3-5-sonnet"'          # applies to every agent
+  - 'if .name == "coder" then .fallback_models = ["openai:gpt-4o"] end'
 
 clients:
-  - 'if .name == "claude" then .api_key = "sk-..." else . end'
+  - 'if .name == "claude" then .api_key = "sk-..." end'
 
 mcp_servers:
-  - 'if .name == "filesystem" then .enabled = false else . end'
+  - 'if .name == "filesystem" then .enabled = false end'
 ```
 
-- **Matching**: Use `if .name == "..." then ... else . end` for exact matching, or `if (.name | test("...")) then ... else . end` for regex matching.
+- **Matching**: Use `if .name == "..." then ... end` for exact matching, or `if (.name | test("...")) then ... end` for pattern matching. The `else .` (pass through unchanged) is implicit when omitted.
 - **Context**: Agent patches match against the bare agent name (stem), not the qualified `pkg/name` form.
 - **Chaining**: Filters are applied in sequence. If a filter fails, it is skipped with a warning.
-- **Identity**: Always ensure your filter returns the original object (using `else .`) if the condition doesn't match, otherwise the configuration will be lost.
 
 ## manifest.yaml schema
 

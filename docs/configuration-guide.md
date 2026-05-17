@@ -85,18 +85,18 @@ The `patches.chat_completions`, `patches.embeddings`, and `patches.rerank` field
 
 Filters are applied in sequence. If an expression fails, a warning is logged and that specific patch is skipped.
 
-Since patches no longer use regex keys for matching, you can use `if/then/else` logic within the jq expression itself to target specific models:
+To target specific models, use `if/then` within the expression:
 
 ```yaml
 type: openai
 patches:
   chat_completions:
-    - 'if .body.model == "o4-mini" then .body.reasoning_effort = "low" else . end'
-    - 'if .body.model == "o3" then .body.reasoning_effort = "medium" else . end'
-    - 'if .body.model == "gpt-4.1" then .body.reasoning_effort = "high" else . end'
+    - 'if .body.model == "o4-mini" then .body.reasoning_effort = "low" end'
+    - 'if .body.model == "o3" then .body.reasoning_effort = "medium" end'
+    - 'if .body.model == "gpt-4.1" then .body.reasoning_effort = "high" end'
 ```
 
-You can also use regex matching within the jq filter:
+For prefix or pattern matching, use `test` within the expression:
 
 ```yaml
 patches:
