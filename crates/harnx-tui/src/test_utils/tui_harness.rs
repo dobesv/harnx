@@ -26,9 +26,9 @@ use tokio::sync::Mutex;
 /// ```ignore
 /// use crate::test_utils::TuiTestHarness;
 ///
-/// #[test]
-/// fn test_basic_render() {
-///     let mut harness = TuiTestHarness::new();
+/// #[tokio::test]
+/// async fn test_basic_render() {
+///     let mut harness = TuiTestHarness::new().await;
 ///     harness.render();
 ///     let output = harness.screen_contents();
 ///     assert!(output.contains("some expected text"));
@@ -59,7 +59,9 @@ impl TuiTestHarness {
 
     async fn with_config_and_size(config: GlobalConfig, width: u16, height: u16) -> Self {
         let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-        let tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
+        let tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+            .await
+            .unwrap();
 
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend).unwrap();

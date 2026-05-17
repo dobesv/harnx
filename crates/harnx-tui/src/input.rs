@@ -1720,8 +1720,17 @@ impl Tui {
                 return vec![];
             }
 
-            let filter = args.last().copied().unwrap_or("");
-            return self.config.read().command_complete(cmd, &args, filter).await;
+            // Fetch agents async outside the config lock to avoid holding a
+            // parking_lot read guard across an await point.
+            let precomputed_agents = if cmd == ".agent" && args.len() == 1 {
+                list_assistant_agents().await
+            } else {
+                Vec::new()
+            };
+            return self
+                .config
+                .read()
+                .command_complete(cmd, &args, precomputed_agents);
         }
 
         vec![]
@@ -1869,7 +1878,8 @@ impl Tui {
 
         match result {
             Ok(outcome) => {
-                self.maybe_open_picker_after_command(outcome, prev_agent.clone()).await;
+                self.maybe_open_picker_after_command(outcome, prev_agent.clone())
+                    .await;
                 let llm_busy = self.app.llm_busy;
                 let pending_message = self.app.pending_message.is_some();
                 Self::refresh_input_chrome_from_state(

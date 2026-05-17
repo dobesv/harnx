@@ -81,9 +81,12 @@ fn package_loading_test_package_agent_not_listed_bare() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn package_loading_test_package_assistant_agent_appears_in_list_assistant_agents() {
     // Regression test for issue #569: agent picker did not show agents from packages
     // because list_assistant_agents() only scanned the top-level agents/ directory.
+    // ENV_MUTEX serializes tests that mutate HARNX_CONFIG_DIR; holding the std::sync
+    // guard across the await is acceptable here because no other task contends for it.
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
@@ -103,6 +106,7 @@ async fn package_loading_test_package_assistant_agent_appears_in_list_assistant_
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn package_loading_test_package_subagent_not_in_list_assistant_agents() {
     // Agents with role: subagent should NOT appear in the picker.
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -126,6 +130,7 @@ async fn package_loading_test_package_subagent_not_in_list_assistant_agents() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn package_loading_test_multiple_packages_assistant_sorted_deduped() {
     // list_assistant_agents() across multiple packages must be sorted and deduplicated.
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());

@@ -439,6 +439,44 @@ pub fn list_agents() -> Vec<String> {
     output
 }
 
+/// If `path` is a markdown agent file whose role matches [`AgentRole::Assistant`],
+/// returns the parsed agent's stem plus its content. Returns `None` for files
+/// that aren't markdown, fail to read, fail to parse, or aren't assistants.
+async fn read_assistant_agent(path: &Path, name_for_parse: &str) -> Option<String> {
+    if path.extension().and_then(|x| x.to_str()) != Some("md") {
+        return None;
+    }
+    let stem = path.file_stem().and_then(|s| s.to_str())?.to_string();
+    let contents = tokio::fs::read_to_string(path).await.ok()?;
+    let config = AgentConfig::from_markdown(name_for_parse, &contents).ok()?;
+    (config.role == AgentRole::Assistant).then_some(stem)
+}
+
+/// Collects assistant agent names from a directory of agent markdown files.
+/// Each entry uses `name_for(stem)` to compute the display name and the name
+/// passed to [`AgentConfig::from_markdown`].
+async fn collect_assistant_agents_in_dir<F>(dir: &Path, name_for: F) -> Vec<String>
+where
+    F: Fn(&str) -> String,
+{
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let display_name = name_for(stem);
+        if read_assistant_agent(&path, &display_name).await.is_some() {
+            out.push(display_name);
+        }
+    }
+    out
+}
+
 /// Returns names of agents whose role is [`AgentRole::Assistant`].
 /// Unlike [`list_agents`], this reads and parses each agent file.
 /// Silently skips files that fail to parse.
@@ -446,34 +484,10 @@ pub fn list_agents() -> Vec<String> {
 /// Includes agents from the top-level `agents/` directory (bare names) and
 /// from `packages/<pkg>/agents/` directories (as `pkg/stem` qualified names).
 pub async fn list_assistant_agents() -> Vec<String> {
-    let agents_dir = Config::agents_config_dir();
-    let mut output: Vec<String> = match tokio::fs::read_dir(&agents_dir).await {
-        Ok(mut dir) => {
-            let mut agents = Vec::new();
-            while let Ok(Some(entry)) = dir.next_entry().await {
-                let path = entry.path();
-                if path.extension().and_then(|x| x.to_str()) != Some("md") {
-                    continue;
-                }
-                let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
-                    continue;
-                };
-                let Ok(contents) = tokio::fs::read_to_string(&path).await else {
-                    continue;
-                };
-                let Ok(config) = AgentConfig::from_markdown(&name, &contents) else {
-                    continue;
-                };
-                if config.role == AgentRole::Assistant {
-                    agents.push(name);
-                }
-            }
-            agents
-        }
-        Err(_) => Vec::new(),
-    };
+    let mut output =
+        collect_assistant_agents_in_dir(&Config::agents_config_dir(), |stem| stem.to_string())
+            .await;
 
-    // Also include assistant agents from packages with qualified names (pkg/stem)
     let packages_dir = harnx_core::config_paths::packages_dir();
     if let Ok(mut pkg_dir) = tokio::fs::read_dir(&packages_dir).await {
         while let Ok(Some(pkg_entry)) = pkg_dir.next_entry().await {
@@ -481,31 +495,20 @@ pub async fn list_assistant_agents() -> Vec<String> {
             if !pkg_path.is_dir() {
                 continue;
             }
-            let pkg_name = match pkg_path.file_name().and_then(|n| n.to_str()) {
-                Some(n) if !n.starts_with('.') => n.to_string(),
-                _ => continue,
+            let Some(pkg_name) = pkg_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.starts_with('.'))
+                .map(|s| s.to_string())
+            else {
+                continue;
             };
-            let agents_dir = pkg_path.join(harnx_core::config_paths::AGENTS_DIR_NAME);
-            if let Ok(mut agent_dir) = tokio::fs::read_dir(&agents_dir).await {
-                while let Ok(Some(agent_entry)) = agent_dir.next_entry().await {
-                    let path = agent_entry.path();
-                    if path.extension().and_then(|x| x.to_str()) != Some("md") {
-                        continue;
-                    }
-                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    let Ok(contents) = tokio::fs::read_to_string(&path).await else {
-                        continue;
-                    };
-                    let qualified = format!("{pkg_name}/{stem}");
-                    if let Ok(config) = AgentConfig::from_markdown(&qualified, &contents) {
-                        if config.role == AgentRole::Assistant {
-                            output.push(qualified);
-                        }
-                    }
-                }
-            }
+            let pkg_agents_dir = pkg_path.join(harnx_core::config_paths::AGENTS_DIR_NAME);
+            let qualified = collect_assistant_agents_in_dir(&pkg_agents_dir, |stem| {
+                format!("{pkg_name}/{stem}")
+            })
+            .await;
+            output.extend(qualified);
         }
     }
 
