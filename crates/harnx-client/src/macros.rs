@@ -10,7 +10,7 @@ macro_rules! register_client {
             use harnx_core::provider_config::$module::$config;
         )+
 
-        #[derive(Debug, Clone, serde::Deserialize)]
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
         #[serde(tag = "type")]
         pub enum ClientConfig {
             $(

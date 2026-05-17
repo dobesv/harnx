@@ -1,11 +1,11 @@
 //! `ClaudeConfig` — per-provider config for Anthropic Claude.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api_types::ExtraConfig;
 use crate::model::{ModelData, RequestPatches};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,

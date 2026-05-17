@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::message::Message;
 use crate::tool::{ToolCall, ToolDeclaration};
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExtraConfig {
     pub proxy: Option<String>,
     pub connect_timeout: Option<u64>,

@@ -1,12 +1,12 @@
 //! `OpenAICompatibleConfig` — per-provider config for the generic
 //! OpenAI-compatible client (used by xAI, Groq, Mistral, DeepSeek, etc.).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api_types::ExtraConfig;
 use crate::model::{ModelData, RequestPatches};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAICompatibleConfig {
     pub name: Option<String>,
     pub api_base: Option<String>,
