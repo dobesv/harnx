@@ -3,7 +3,7 @@
 use serde::Deserialize;
 
 use crate::api_types::ExtraConfig;
-use crate::model::{ModelData, RequestPatch};
+use crate::model::{ModelData, RequestPatches};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClaudeConfig {
@@ -12,7 +12,7 @@ pub struct ClaudeConfig {
     pub api_base: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelData>,
-    pub patch: Option<RequestPatch>,
+    pub patches: Option<RequestPatches>,
     pub extra: Option<ExtraConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<Vec<String>>,

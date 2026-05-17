@@ -140,21 +140,24 @@ You can override any package's configuration by creating a patch file next to th
 
 ### Patch file format
 
+Patch files use **jq filter strings** to modify package configurations. Each entry in `agents`, `clients`, and `mcp_servers` is an array of filters. Each filter receives the full configuration object for the respective entity and must return the modified version.
+
 ```yaml
 agents:
-  ".*":                        # regexp matching agent name (within package)
-    model: claude-3-5-sonnet   # override model for all agents
-    temperature: 0.5
-  "coder":                     # match only the "coder" agent
-    fallback_models:
-      - gpt-4o
+  - 'if (.name | test(".*")) then .model = "claude:claude-3-5-sonnet" else . end'
+  - 'if .name == "coder" then .fallback_models = ["openai:gpt-4o"] else . end'
 
 clients:
-  "claude":                    # regexp matching client name
-    api_key: sk-...
+  - 'if .name == "claude" then .api_key = "sk-..." else . end'
+
+mcp_servers:
+  - 'if .name == "filesystem" then .enabled = false else . end'
 ```
 
-Agent patches match against the bare agent name (stem), not the qualified `pkg/name` form.
+- **Matching**: Use `if .name == "..." then ... else . end` for exact matching, or `if (.name | test("...")) then ... else . end` for regex matching.
+- **Context**: Agent patches match against the bare agent name (stem), not the qualified `pkg/name` form.
+- **Chaining**: Filters are applied in sequence. If a filter fails, it is skipped with a warning.
+- **Identity**: Always ensure your filter returns the original object (using `else .`) if the condition doesn't match, otherwise the configuration will be lost.
 
 ## manifest.yaml schema
 

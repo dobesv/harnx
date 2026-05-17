@@ -97,8 +97,8 @@ impl Client for TestClient {
         self.inner.extra_config()
     }
 
-    fn patch_config(&self) -> Option<&RequestPatch> {
-        self.inner.patch_config()
+    fn patches_config(&self) -> Option<&RequestPatches> {
+        self.inner.patches_config()
     }
 
     fn name(&self) -> &str {

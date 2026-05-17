@@ -75,46 +75,34 @@ type: openai              # Provider type (openai, claude, gemini, etc.)
 name: my-openai           # Client ID for model strings (e.g., my-openai:gpt-4)
 api_key: sk-...           # Optional if <NAME>_API_KEY env var is set
 api_base: https://...     # Optional custom endpoint
-patch:                    # Patch API requests (url, headers, body)
+patches:                  # Patch API requests using jq expressions
   chat_completions:
-    '.*':                 # Regex pattern matched against the model name
-      body:
-        cache_control:
-          type: ephemeral
-```
+    - '.body.cache_control = {"type":"ephemeral"}'
 
 ### Per-Model Patches
 
-The keys under `patch.chat_completions` (and `patch.embeddings`, `patch.rerank`) are **regex patterns** matched against the model name. Each pattern must match the **entire** model name (patterns are automatically anchored with `^` and `$`), so `o3` matches only the model named exactly `o3`, not `o3-mini`. Use `o3.*` to match all models starting with `o3`. This lets you apply different settings to different models within the same client.
+The `patches.chat_completions`, `patches.embeddings`, and `patches.rerank` fields are arrays of **jq filter strings**. Each filter receives the full request object as JSON (`{url, headers, body}`) and must return the modified version.
 
-For example, to set different `reasoning_effort` values per model:
+Filters are applied in sequence. If an expression fails, a warning is logged and that specific patch is skipped.
+
+Since patches no longer use regex keys for matching, you can use `if/then/else` logic within the jq expression itself to target specific models:
 
 ```yaml
 type: openai
-patch:
+patches:
   chat_completions:
-    o4-mini:
-      body:
-        reasoning_effort: low
-    o3:
-      body:
-        reasoning_effort: medium
-    gpt-4.1:
-      body:
-        reasoning_effort: high
+    - 'if .body.model == "o4-mini" then .body.reasoning_effort = "low" else . end'
+    - 'if .body.model == "o3" then .body.reasoning_effort = "medium" else . end'
+    - 'if .body.model == "gpt-4.1" then .body.reasoning_effort = "high" else . end'
 ```
 
-You can also use regex patterns to match multiple models at once:
+You can also use regex matching within the jq filter:
 
 ```yaml
-patch:
+patches:
   chat_completions:
-    'gpt-5.*':            # Match all GPT 5 models
-      body:
-        reasoning_effort: high
+    - 'if (.body.model | test("gpt-5.*")) then .body.reasoning_effort = "high" else . end'
 ```
-
-**Note:** Only the first matching pattern is applied, so place more specific patterns before broader ones.
 
 ## MCP Servers (`mcp_servers/`)
 

@@ -1,8 +1,4 @@
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-use crate::model::RequestPatch;
 
 /// Source from which a package was installed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -24,100 +20,40 @@ pub enum PackageSource {
     },
 }
 
-/// Written by harnx-pkg at install time into packages/<name>/manifest.yaml.
+/// Metadata about an installed package, persisted alongside the package files.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PackageManifest {
     pub name: String,
     pub source: PackageSource,
+    /// ISO 8601 timestamp when the package was installed.
     pub installed_at: String,
 }
 
-/// Optional metadata provided by package itself in package.yaml.
+/// Contents of packages/<pkg>/package.yaml — the package's metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct PackageMetadata {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    /// Human-readable description of the package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub harnx_min_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub homepage: Option<String>,
+    /// SPDX license identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
 
-/// Agent patch entry — overrides for matched agent's config fields.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct AgentPatch {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_models: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-}
-
-/// Client patch entry — typed overrides for a matched client's config.
-///
-/// Fields mirror the common subset of all provider configs. Provider-specific
-/// fields (Bedrock credentials, VertexAI project_id, etc.) are intentionally
-/// omitted — those should be configured at the system level, not in a package patch.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct ClientPatch {
-    /// Override the API key for this client.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    /// Override the API base URL for this client.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_base: Option<String>,
-    /// Prepend lines to the system prompt for all requests through this client.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt_prefix: Option<Vec<String>>,
-    /// Override request-body patches (merged into the client's existing `patch` config).
-    /// Contains per-endpoint patches: `chat_completions`, `embeddings`, `rerank`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub patch: Option<RequestPatch>,
-}
-
-/// MCP server patch entry — overrides for a matched server's config fields.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct McpServerPatch {
-    /// Disable this server entirely.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    /// Replace the command arguments entirely.
-    /// Use `args_append` instead when you only need to add flags.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub args: Option<Vec<String>>,
-    /// Append extra arguments after the package's existing args.
-    /// Applied after `args` (so if both are set, `args` is set first, then
-    /// `args_append` is appended to that).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub args_append: Vec<String>,
-    /// Merge additional environment variables into the server's env (individual
-    /// keys override package values; keys not listed here are preserved).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub env: HashMap<String, String>,
-    /// Override the roots list (replaces the package's roots entirely).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub roots: Option<Vec<String>>,
-}
-
 /// Contents of packages/<pkg>.patch.yaml — local customization of installed package.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PackagePatch {
-    /// Map of agent name regexp → patch to apply.
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-    pub agents: IndexMap<String, AgentPatch>,
-    /// Map of client name regexp → patch to apply.
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-    pub clients: IndexMap<String, ClientPatch>,
-    /// Map of MCP server name regexp → patch to apply.
-    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
-    pub mcp_servers: IndexMap<String, McpServerPatch>,
+    /// JQ expressions for patching agent configs.
+    #[serde(default)]
+    pub agents: Vec<String>,
+    /// JQ expressions for patching client configs.
+    #[serde(default)]
+    pub clients: Vec<String>,
+    /// JQ expressions for patching MCP server configs.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
 }
 
 #[cfg(test)]
@@ -148,10 +84,10 @@ mod tests {
         let manifest = PackageManifest {
             name: "example".to_string(),
             source: PackageSource::Oci {
-                url: "ghcr.io/example/package".to_string(),
-                tag: "1.0.0".to_string(),
-                digest: "sha256:deadbeef".to_string(),
-                subpath: Some("path".to_string()),
+                url: "oci://registry.example.com/example".to_string(),
+                tag: "v1.2.3".to_string(),
+                digest: "sha256:abc123".to_string(),
+                subpath: None,
             },
             installed_at: "2026-05-07T00:00:00Z".to_string(),
         };
@@ -163,38 +99,11 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_serde_partial() {
-        let yaml = "name: Example Package\ndescription: Test package\n";
-        let metadata: PackageMetadata = serde_yaml::from_str(yaml).unwrap();
-
-        assert_eq!(metadata.name.as_deref(), Some("Example Package"));
-        assert_eq!(metadata.description.as_deref(), Some("Test package"));
-        assert_eq!(metadata.harnx_min_version, None);
-        assert_eq!(metadata.homepage, None);
-        assert_eq!(metadata.license, None);
-        assert_eq!(metadata.version, None);
-    }
-
-    #[test]
-    fn test_mcp_server_patch_serde_roundtrip() {
-        let mut env = HashMap::new();
-        env.insert("EXA_API_KEY".to_string(), "test-key".to_string());
-
-        let mcp_patch = McpServerPatch {
-            enabled: Some(false),
-            args: Some(vec!["--flag".to_string()]),
-            args_append: vec!["--extra".to_string()],
-            env,
-            roots: Some(vec!["/projects".to_string()]),
-        };
-
-        let mut mcp_servers = IndexMap::new();
-        mcp_servers.insert("bash".to_string(), mcp_patch);
-
+    fn test_package_patch_serde_roundtrip() {
         let patch = PackagePatch {
-            agents: IndexMap::new(),
-            clients: IndexMap::new(),
-            mcp_servers,
+            agents: vec![".model = \"claude\"".to_string()],
+            clients: vec![".api_key = \"sk-test\"".to_string()],
+            mcp_servers: vec![".enabled = false".to_string()],
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
@@ -203,60 +112,24 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_serde_roundtrip() {
-        let mut agents = IndexMap::new();
-        agents.insert(
-            ".*".to_string(),
-            AgentPatch {
-                model: Some("claude".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let client_patch = ClientPatch {
-            api_key: Some("sk-test".to_string()),
-            api_base: Some("https://example.invalid/v1".to_string()),
-            system_prompt_prefix: Some(vec!["Always respond in haiku.".to_string()]),
-            patch: None,
-        };
-
-        let mut clients = IndexMap::new();
-        clients.insert(".*".to_string(), client_patch);
-
-        let patch = PackagePatch {
-            agents,
-            clients,
-            mcp_servers: IndexMap::new(),
-        };
+    fn test_package_patch_empty_roundtrip() {
+        let patch = PackagePatch::default();
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
         let roundtrip: PackagePatch = serde_yaml::from_str(&yaml).unwrap();
-
         assert_eq!(roundtrip, patch);
     }
 
     #[test]
-    fn test_client_patch_with_request_patch_roundtrip() {
-        use crate::model::RequestPatch;
-        use indexmap::IndexMap;
-        use serde_json::json;
-
-        let mut chat = IndexMap::new();
-        chat.insert("max_tokens".to_string(), json!(2048));
-
-        let client_patch = ClientPatch {
-            api_key: None,
-            api_base: None,
-            system_prompt_prefix: None,
-            patch: Some(RequestPatch {
-                chat_completions: Some(chat),
-                embeddings: None,
-                rerank: None,
-            }),
+    fn test_package_patch_partial() {
+        let patch = PackagePatch {
+            agents: vec![".model = \"claude\"".to_string()],
+            clients: Vec::new(),
+            mcp_servers: Vec::new(),
         };
 
-        let yaml = serde_yaml::to_string(&client_patch).unwrap();
-        let roundtrip: ClientPatch = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(roundtrip, client_patch);
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        let roundtrip: PackagePatch = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(roundtrip, patch);
     }
 }

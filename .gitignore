@@ -1,4 +1,6 @@
 /target
+/target-local
+**/target-local
 /tmp
 /.env
 *.log*.snap.new

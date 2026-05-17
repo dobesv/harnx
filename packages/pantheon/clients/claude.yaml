@@ -4,9 +4,6 @@ type: claude
 
 # Prompt caching: keeps repeated system-prompt sections in Anthropic's cache,
 # reducing cost and latency on long agentic conversations.
-patch:
+patches:
   chat_completions:
-    '.*':
-      body:
-        cache_control:
-          type: ephemeral
+    - '.body.cache_control = {"type":"ephemeral"}'

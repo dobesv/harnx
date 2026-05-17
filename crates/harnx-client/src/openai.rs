@@ -375,11 +375,18 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
     });
 
     if let Some(v) = model.max_tokens_param() {
-        if model
-            .patch()
-            .and_then(|v| v.get("body").and_then(|v| v.get("max_tokens")))
-            == Some(&Value::Null)
-        {
+        // Check if patches specify max_tokens: null (should use max_completion_tokens instead)
+        let patches_have_null_max_tokens = model
+            .patches()
+            .map(|p| {
+                p.iter().any(|expr| {
+                    expr.contains("\"max_tokens\"")
+                        && expr.contains("null")
+                        && expr.contains("max_completion_tokens")
+                })
+            })
+            .unwrap_or(false);
+        if patches_have_null_max_tokens {
             body["max_completion_tokens"] = v.into();
         } else {
             body["max_tokens"] = v.into();
