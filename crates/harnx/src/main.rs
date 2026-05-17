@@ -108,7 +108,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         return Ok(());
     }
     if cli.list_assistant_agents {
-        let agents = list_assistant_agents().join("\n");
+        let agents = list_assistant_agents().await.join("\n");
         println!("{agents}");
         return Ok(());
     }
@@ -665,7 +665,7 @@ async fn start_interactive(config: &GlobalConfig) -> Result<()> {
     let async_manager = AsyncHookManager::new();
     let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
     dispatch_session_start(config, "tui", &async_manager, &persistent_manager).await;
-    let mut tui: Tui = Tui::init(config, async_manager, persistent_manager.clone())?;
+    let mut tui: Tui = Tui::init(config, async_manager, persistent_manager.clone()).await?;
     let result = tui.run().await;
     let async_manager = tui.async_manager().lock().await;
     exit_session_with_hook(config, &async_manager, &persistent_manager).await?;

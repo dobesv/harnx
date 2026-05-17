@@ -2461,7 +2461,7 @@ impl Config {
         .ok_or_else(|| anyhow!("Editor not found. Please add the `editor` configuration or set the $EDITOR or $VISUAL environment variable."))
     }
 
-    pub fn command_complete(
+    pub async fn command_complete(
         &self,
         cmd: &str,
         args: &[&str],
@@ -2477,7 +2477,7 @@ impl Config {
                     .collect(),
                 ".session" => map_completion_values(self.list_sessions()),
                 ".rag" => map_completion_values(Self::list_rags()),
-                ".agent" => map_completion_values(list_assistant_agents()),
+                ".agent" => map_completion_values(list_assistant_agents().await),
                 ".macro" => map_completion_values(Self::list_macros()),
                 ".info" => map_completion_values(vec!["session", "agent", "rag", "tools"]),
                 ".mcp" => map_completion_values(vec![

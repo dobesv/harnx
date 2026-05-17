@@ -2,10 +2,7 @@ use super::*;
 
 use anyhow::{anyhow, Context, Result};
 use inquire::{validator::Validation, Text};
-use std::{
-    fs::{read_dir, read_to_string},
-    path::Path,
-};
+use std::path::Path;
 
 pub use harnx_core::agent_config::{
     AgentConfig, AgentRole, AgentVariable, AgentVariables, TEMP_AGENT_NAME,
@@ -448,34 +445,38 @@ pub fn list_agents() -> Vec<String> {
 ///
 /// Includes agents from the top-level `agents/` directory (bare names) and
 /// from `packages/<pkg>/agents/` directories (as `pkg/stem` qualified names).
-pub fn list_assistant_agents() -> Vec<String> {
+pub async fn list_assistant_agents() -> Vec<String> {
     let agents_dir = Config::agents_config_dir();
-    let mut output: Vec<String> = read_dir(&agents_dir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter_map(|e| {
-                    let path = e.path();
-                    if path.extension().and_then(|x| x.to_str()) != Some("md") {
-                        return None;
-                    }
-                    let name = path.file_stem()?.to_str()?.to_string();
-                    let contents = read_to_string(&path).ok()?;
-                    let config = AgentConfig::from_markdown(&name, &contents).ok()?;
-                    if config.role == AgentRole::Assistant {
-                        Some(name)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut output: Vec<String> = match tokio::fs::read_dir(&agents_dir).await {
+        Ok(mut dir) => {
+            let mut agents = Vec::new();
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("md") {
+                    continue;
+                }
+                let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()) else {
+                    continue;
+                };
+                let Ok(contents) = tokio::fs::read_to_string(&path).await else {
+                    continue;
+                };
+                let Ok(config) = AgentConfig::from_markdown(&name, &contents) else {
+                    continue;
+                };
+                if config.role == AgentRole::Assistant {
+                    agents.push(name);
+                }
+            }
+            agents
+        }
+        Err(_) => Vec::new(),
+    };
 
     // Also include assistant agents from packages with qualified names (pkg/stem)
     let packages_dir = harnx_core::config_paths::packages_dir();
-    if let Ok(pkg_entries) = read_dir(&packages_dir) {
-        for pkg_entry in pkg_entries.filter_map(|e| e.ok()) {
+    if let Ok(mut pkg_dir) = tokio::fs::read_dir(&packages_dir).await {
+        while let Ok(Some(pkg_entry)) = pkg_dir.next_entry().await {
             let pkg_path = pkg_entry.path();
             if !pkg_path.is_dir() {
                 continue;
@@ -485,8 +486,8 @@ pub fn list_assistant_agents() -> Vec<String> {
                 _ => continue,
             };
             let agents_dir = pkg_path.join(harnx_core::config_paths::AGENTS_DIR_NAME);
-            if let Ok(agent_entries) = read_dir(&agents_dir) {
-                for agent_entry in agent_entries.filter_map(|e| e.ok()) {
+            if let Ok(mut agent_dir) = tokio::fs::read_dir(&agents_dir).await {
+                while let Ok(Some(agent_entry)) = agent_dir.next_entry().await {
                     let path = agent_entry.path();
                     if path.extension().and_then(|x| x.to_str()) != Some("md") {
                         continue;
@@ -494,7 +495,7 @@ pub fn list_assistant_agents() -> Vec<String> {
                     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                         continue;
                     };
-                    let Ok(contents) = read_to_string(&path) else {
+                    let Ok(contents) = tokio::fs::read_to_string(&path).await else {
                         continue;
                     };
                     let qualified = format!("{pkg_name}/{stem}");
@@ -1053,7 +1054,8 @@ You are a test agent.
                 agents_dir.join("gamma.md"),
                 "---\nrole: compaction\nmodel: openai:gpt-4o\n---\nCompaction agent.",
             )?;
-            let result = list_assistant_agents();
+            let runtime = tokio::runtime::Runtime::new()?;
+            let result = runtime.block_on(list_assistant_agents());
             assert_eq!(result, vec!["alpha"]);
             Ok(())
         })
@@ -1072,7 +1074,8 @@ You are a test agent.
                 agents_dir.join("explicit-subagent.md"),
                 "---\nrole: subagent\n---\nSub-agent.",
             )?;
-            let result = list_assistant_agents();
+            let runtime = tokio::runtime::Runtime::new()?;
+            let result = runtime.block_on(list_assistant_agents());
             assert_eq!(result, vec!["no-role"]);
             Ok(())
         })
@@ -1082,7 +1085,8 @@ You are a test agent.
     #[test]
     fn test_list_assistant_agents_empty_dir() {
         with_test_config_dir(|_config_dir| {
-            let result = list_assistant_agents();
+            let runtime = tokio::runtime::Runtime::new()?;
+            let result = runtime.block_on(list_assistant_agents());
             assert!(result.is_empty());
             Ok(())
         })
@@ -1101,7 +1105,8 @@ You are a test agent.
                 agents_dir.join("good.md"),
                 "---\nmodel: openai:gpt-4o\n---\nGood agent.",
             )?;
-            let result = list_assistant_agents();
+            let runtime = tokio::runtime::Runtime::new()?;
+            let result = runtime.block_on(list_assistant_agents());
             assert_eq!(result, vec!["good"]);
             Ok(())
         })
@@ -1115,7 +1120,8 @@ You are a test agent.
             fs::write(agents_dir.join("zebra.md"), "You are zebra.")?;
             fs::write(agents_dir.join("apple.md"), "You are apple.")?;
             fs::write(agents_dir.join("mango.md"), "You are mango.")?;
-            let result = list_assistant_agents();
+            let runtime = tokio::runtime::Runtime::new()?;
+            let result = runtime.block_on(list_assistant_agents());
             assert_eq!(result, vec!["apple", "mango", "zebra"]);
             Ok(())
         })

@@ -42,24 +42,24 @@ pub struct TuiTestHarness {
 
 impl TuiTestHarness {
     /// Create a new test harness with default configuration.
-    pub fn new() -> Self {
-        Self::with_size(80, 24)
+    pub async fn new() -> Self {
+        Self::with_size(80, 24).await
     }
 
     /// Create a new test harness with a specific terminal size.
-    pub fn with_size(width: u16, height: u16) -> Self {
+    pub async fn with_size(width: u16, height: u16) -> Self {
         let config = Self::create_test_config();
-        Self::with_config_and_size(config, width, height)
+        Self::with_config_and_size(config, width, height).await
     }
 
     /// Create a test harness with a specific configuration.
-    pub fn with_config(config: GlobalConfig) -> Self {
-        Self::with_config_and_size(config, 80, 24)
+    pub async fn with_config(config: GlobalConfig) -> Self {
+        Self::with_config_and_size(config, 80, 24).await
     }
 
-    fn with_config_and_size(config: GlobalConfig, width: u16, height: u16) -> Self {
+    async fn with_config_and_size(config: GlobalConfig, width: u16, height: u16) -> Self {
         let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-        let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+        let tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
         let backend = TestBackend::new(width, height);
         let terminal = Terminal::new(backend).unwrap();
@@ -173,12 +173,6 @@ impl TuiTestHarness {
     }
 }
 
-impl Default for TuiTestHarness {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,7 +180,7 @@ mod tests {
 
     #[tokio::test]
     async fn harness_renders_initial_screen() {
-        let mut harness = TuiTestHarness::new();
+        let mut harness = TuiTestHarness::new().await;
         harness.render();
         let contents = harness.screen_contents();
         assert!(
@@ -197,7 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn screen_contents_snapshot() {
-        let mut harness = TuiTestHarness::with_size(40, 10);
+        let mut harness = TuiTestHarness::with_size(40, 10).await;
         harness.render();
         let contents = harness.screen_contents();
         // Normalize: trim trailing whitespace and mask the harnx version so

@@ -91,7 +91,7 @@ fn mask_harnx_version(s: &str) -> String {
 async fn input_cursor_style_remains_visible_in_normal_and_pending_states() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     Tui::refresh_input_chrome_from_state(&config, &mut tui.app, false, false);
     let normal_style = tui.app.input.cursor_style();
@@ -107,7 +107,7 @@ async fn input_cursor_style_remains_visible_in_normal_and_pending_states() {
 async fn pending_message_is_rendered_with_input_highlight_and_no_status_text() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
     tui.app.llm_busy = true;
     tui.queue_pending_message("queued message".to_string())
         .await;
@@ -123,7 +123,7 @@ async fn pending_message_is_rendered_with_input_highlight_and_no_status_text() {
 async fn pending_message_is_cleared_when_user_edits_again() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
     tui.app.llm_busy = true;
     tui.queue_pending_message("queued message".to_string())
         .await;
@@ -142,7 +142,7 @@ async fn pending_message_is_cleared_when_user_edits_again() {
 async fn shift_enter_inserts_newline_without_submitting() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.apply_draft_edit_for_test(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
     tui.apply_draft_edit_for_test(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
@@ -160,7 +160,7 @@ async fn shift_enter_inserts_newline_without_submitting() {
 async fn pending_message_is_auto_sent_after_finish() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
     tui.app.llm_busy = true;
     tui.queue_pending_message("follow up".to_string()).await;
 
@@ -190,7 +190,7 @@ async fn pending_dot_command_restores_attachments_before_running() {
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
     tui.app.llm_busy = true;
     tui.app.pending_message = Some(crate::types::PendingMessage {
         text: ".info attachments".to_string(),
@@ -229,7 +229,7 @@ async fn pending_dot_command_restores_attachments_before_running() {
 async fn pending_message_consumed_clears_pending_and_shows_in_transcript() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
     tui.app.llm_busy = true;
     tui.queue_pending_message("interject here".to_string())
         .await;
@@ -264,7 +264,7 @@ async fn pending_message_not_double_submitted_after_consumed() {
     // the subsequent LlmFinal should NOT re-submit it.
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
     tui.app.llm_busy = true;
     tui.queue_pending_message("once only".to_string()).await;
 
@@ -309,7 +309,7 @@ async fn pending_dot_command_not_consumed_mid_tool_loop() {
     // for LlmFinal where submit_pending_message_inner handles them.
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
     tui.app.llm_busy = true;
 
     // Queue a dot-command as pending.
@@ -344,7 +344,7 @@ async fn pending_message_with_attachments_not_consumed_mid_tool_loop() {
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
     tui.app.llm_busy = true;
 
     let pending = crate::types::PendingMessage {
@@ -374,7 +374,7 @@ async fn pending_message_with_attachments_not_consumed_mid_tool_loop() {
 async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.handle_tui_event(TuiEvent::Agent(
         AgentEvent::Model(ModelEvent::MessageChunk {
@@ -420,7 +420,7 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
 async fn ui_output_inserts_heading_when_source_changes() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let source = AgentSource {
         agent: "argus".to_string(),
@@ -481,7 +481,7 @@ async fn ui_output_inserts_heading_when_source_changes() {
 async fn compute_completions_handles_trailing_space_after_command() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let line = ".model ";
     let completions = tui.compute_completions(line, line.len()).await;
@@ -493,7 +493,7 @@ async fn compute_completions_handles_trailing_space_after_command() {
 async fn compute_completions_appends_space_for_command_matches() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let completions = tui.compute_completions(".mod", 4).await;
 
@@ -504,7 +504,7 @@ async fn compute_completions_appends_space_for_command_matches() {
 async fn apply_completion_preserves_text_after_cursor() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.set_input_text(".model gp --info");
     tui.app.completion_prefix = ".model ".to_string();
@@ -521,7 +521,7 @@ async fn apply_completion_preserves_text_after_cursor() {
 async fn info_commands_render_into_tui_transcript() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.run_command(".info session").await.unwrap();
     while let Ok(event) = tui.event_rx.try_recv() {
@@ -550,7 +550,7 @@ async fn info_commands_render_into_tui_transcript() {
 async fn info_session_does_not_print_raw_output_in_tui_mode() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.run_command(".info session").await.unwrap();
     while let Ok(event) = tui.event_rx.try_recv() {
@@ -741,7 +741,7 @@ async fn structured_system_entries_do_not_insert_blank_lines_between_each_line()
 async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     for chunk in ["thinking ", "before ", "tool"] {
         tui.handle_tui_event(TuiEvent::Agent(
@@ -815,7 +815,7 @@ async fn top_level_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
 async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let source = Some(AgentSource {
         agent: "argus".to_string(),
@@ -988,7 +988,7 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
 async fn structured_ui_output_variants_render_in_transcript() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.handle_tui_event(TuiEvent::Agent(
         AgentEvent::Tool(ToolEvent::Started {
@@ -1122,7 +1122,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
 async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.handle_tui_event(TuiEvent::Agent(
         AgentEvent::Tool(ToolEvent::Started {
@@ -1199,7 +1199,7 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
 async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let source = AgentSource {
         agent: "pytheas".to_string(),
@@ -1271,7 +1271,7 @@ async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() 
 async fn acp_message_chunks_coalesce_like_direct_llm_streaming() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let source = AgentSource {
         agent: "aristarchus".to_string(),
@@ -1317,7 +1317,7 @@ async fn submitting_message_with_attachments_renders_attachment_list_and_preview
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("notes.txt");
@@ -1386,7 +1386,7 @@ async fn representative_commands_render_into_tui_transcript() {
     let commands = [".help", ".info session", ".mcp list"];
 
     for command in commands {
-        let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent.clone()).unwrap();
+        let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent.clone()).await.unwrap();
         tui.run_command(command).await.unwrap();
         while let Ok(event) = tui.event_rx.try_recv() {
             tui.handle_tui_event(event).await.unwrap();
@@ -1433,7 +1433,7 @@ async fn test_basic_message_and_streaming_response() {
 
     guard.set_client(Some(mock_client.clone()));
 
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
     assert!(
         harness.tui().config.read().session.is_none(),
         "harness config should not have a session before prompt starts"
@@ -1576,7 +1576,7 @@ fn seq_numbers_appear_after_session_reload() {
 async fn live_log_seq_assignment_patches_latest_unsequenced_transcript_items() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
     tui.app.show_sequence_numbers = true;
 
     tui.app.transcript.push(TranscriptItem::UserText {
@@ -1655,7 +1655,7 @@ async fn test_streaming_with_tool_calls() {
 
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
         timestamp: None,
@@ -1744,7 +1744,7 @@ async fn test_sub_agent_delegation_tool_appears() {
 
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
         timestamp: None,
@@ -2123,7 +2123,7 @@ async fn test_ctrl_c_cancels_streaming() {
 
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
         timestamp: None,
@@ -2212,7 +2212,7 @@ async fn test_streaming_error_shows_in_transcript() {
 
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
         timestamp: None,
@@ -2310,7 +2310,7 @@ async fn test_streaming_error_shows_full_cause_chain_in_transcript() {
 
     let config =
         test_config_with_mock_client_and_agent("test-agent", Some("error-chain-display-session"));
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
     harness.tui().clear_transcript();
 
     // Inject the already-formatted error directly into the TUI event channel,
@@ -2387,7 +2387,7 @@ async fn test_cancel_during_tool_execution() {
 
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
     harness.tui().clear_transcript();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
         timestamp: None,
@@ -2454,7 +2454,7 @@ async fn test_cancel_during_tool_execution() {
 async fn paste_multiline_creates_temp_attachment() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.handle_paste("line one\nline two\nline three".to_string())
         .await;
@@ -2501,7 +2501,7 @@ async fn paste_multiline_creates_temp_attachment() {
 async fn paste_multiline_with_cr_creates_temp_attachment() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     // Some terminals send \r instead of \n for newlines in paste
     tui.handle_paste("line one\rline two\rline three".to_string())
@@ -2525,7 +2525,7 @@ async fn paste_multiline_with_cr_creates_temp_attachment() {
 async fn paste_multiline_with_crlf_creates_temp_attachment() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     // Windows-style line endings
     tui.handle_paste("line one\r\nline two\r\nline three".to_string())
@@ -2550,7 +2550,7 @@ async fn paste_multiline_with_crlf_creates_temp_attachment() {
 async fn paste_single_line_inserts_inline() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.handle_paste("single line text".to_string()).await;
 
@@ -2566,7 +2566,7 @@ async fn paste_single_line_inserts_inline() {
 async fn paste_then_erase_then_paste_different_text() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     // First paste (single-line)
     tui.handle_paste("first paste".to_string()).await;
@@ -2588,7 +2588,7 @@ async fn paste_then_erase_then_paste_different_text() {
 async fn detach_cleans_up_temp_dir() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     // Paste multi-line to create a temp attachment
     tui.handle_paste("line one\nline two".to_string()).await;
@@ -2639,7 +2639,7 @@ async fn attachment_footer_shows_attached_files() {
 async fn paste_appends_to_existing_text() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.set_input_text("before ");
     tui.handle_paste("pasted text".to_string()).await;
@@ -2652,7 +2652,7 @@ async fn paste_appends_to_existing_text() {
 async fn attach_command_adds_attachment() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let tmp = std::env::temp_dir().join("harnx_test_attach.txt");
     std::fs::write(&tmp, "test content").unwrap();
@@ -2680,7 +2680,7 @@ async fn attach_command_adds_attachment() {
 async fn attach_command_preserves_draft_text() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let tmp = std::env::temp_dir().join("harnx_test_attach2.txt");
     std::fs::write(&tmp, "test").unwrap();
@@ -2711,7 +2711,7 @@ async fn direct_submit_with_attachments_renders_attachment_entries_in_transcript
     // Agent + session required since #451 enforces both before prompt submission.
     let config = test_config_with_mock_client_and_agent("test-agent", Some("test-session"));
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.attachments = vec![Attachment {
         path: PathBuf::from("/tmp/example.txt"),
@@ -2749,7 +2749,7 @@ async fn dot_command_with_attachments_renders_attachment_entries_in_transcript()
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.attachments = vec![Attachment {
         path: PathBuf::from("/tmp/example.txt"),
@@ -2784,7 +2784,7 @@ async fn dot_command_with_attachments_renders_attachment_entries_in_transcript()
 async fn attach_nonexistent_file_shows_error() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.set_input_text(".attach /nonexistent/file.txt");
     tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -2807,7 +2807,7 @@ async fn detach_clears_all_attachments() {
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/a.txt"),
@@ -2832,7 +2832,7 @@ async fn detach_by_name_removes_specific_attachment() {
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let temp_dir =
         std::env::temp_dir().join(format!("harnx-detach-by-name-{}", uuid::Uuid::new_v4()));
@@ -2883,7 +2883,7 @@ async fn submit_drains_attachments() {
             .build(),
     );
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
 
     let temp_dir = std::env::temp_dir().join(format!("harnx-submit-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
@@ -2931,7 +2931,7 @@ async fn submit_attachments_only_with_empty_text() {
             .build(),
     );
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
 
     let temp_dir = std::env::temp_dir().join(format!("harnx-submit-only-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
@@ -2970,7 +2970,7 @@ async fn queued_message_keeps_attachments_visible_while_busy() {
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.llm_busy = true;
     tui.app.attachments.push(Attachment {
@@ -3014,7 +3014,7 @@ async fn test_recovery_after_cancellation() {
 
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
     harness.tui().clear_transcript();
 
     // Send first message
@@ -3112,7 +3112,7 @@ async fn test_recovery_after_cancellation() {
 async fn attach_completes_file_paths() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let tmp_dir = std::env::temp_dir();
     let tmp_file = tmp_dir.join("harnx_completion_test.txt");
@@ -3139,7 +3139,7 @@ async fn detach_completes_attachment_names() {
 
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.attachments.push(Attachment {
         path: PathBuf::from("/tmp/photo.png"),
@@ -3432,7 +3432,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
 fn make_tui_with_history(entries: &[&str]) -> (crate::types::Tui, GlobalConfig) {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
     for entry in entries.iter().rev() {
         tui.app.history.insert(0, entry.to_string());
     }
@@ -3910,7 +3910,7 @@ async fn test_ctrl_c_interrupts_in_flight_streaming() {
 
     let _guard = TestStateGuard::new(Some(mock_client)).await;
 
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
     harness.tui().app.transcript.push(TranscriptItem::UserText {
         timestamp: None,
         text: "Long request".to_string(),
@@ -4011,7 +4011,7 @@ async fn ctrl_c_during_in_flight_task_does_not_clear_llm_busy_or_spawn_new_task(
     );
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
 
     // Start Task A and let it wedge on the gate.
     harness
@@ -4166,7 +4166,7 @@ async fn ctrl_c_resubmit_does_not_consume_a_second_mock_turn_while_task_a_is_in_
     );
     let _guard = TestStateGuard::new(Some(mock_client.clone())).await;
 
-    let mut harness = TuiTestHarness::with_config(config.clone());
+    let mut harness = TuiTestHarness::with_config(config.clone()).await;
 
     // Task A: mock returns a tool_call, then wedges on the gate so
     // execute_tool_round can't write its tool_results yet.
@@ -5934,7 +5934,7 @@ async fn test_picker_not_shown_when_agent_specified() {
     // When an agent is already set (--agent flag), AgentPicker must NOT appear.
     // SessionPicker may appear if sessions exist for that agent, but AgentPicker must not.
     let config = test_config_with_mock_client_and_agent("test-agent", None);
-    let modal = Tui::resolve_initial_modal(&config);
+    let modal = Tui::resolve_initial_modal(&config).await;
     assert!(
         !matches!(modal, Some(crate::types::ModalState::AgentPicker { .. })),
         "AgentPicker must not appear when agent is already specified"
@@ -5948,7 +5948,7 @@ async fn test_picker_shown_when_no_agent_and_agents_exist() {
     // - If no agents exist: no AgentPicker (None or SessionPicker if sessions exist)
     // This test verifies that the function runs without panic and returns a consistent type.
     let config = test_config();
-    let modal = Tui::resolve_initial_modal(&config);
+    let modal = Tui::resolve_initial_modal(&config).await;
     // The modal is either None, AgentPicker (when agents exist), or SessionPicker
     // All three are valid outcomes — the key invariant is it doesn't panic.
     let is_valid = modal.is_none()
@@ -6078,7 +6078,7 @@ async fn agent_picker_typing_filters_list() {
 
     let config = picker_test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     // Manually set up AgentPicker with all three agents.
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
@@ -6152,7 +6152,7 @@ async fn agent_picker_backspace_removes_char_and_resets_selection() {
 
     let config = picker_test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
         agents: vec!["apollo".into(), "argus".into()],
@@ -6183,7 +6183,7 @@ async fn agent_picker_down_bounded_by_filtered_count() {
 
     let config = picker_test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     // query "a" filters to ["apollo","argus"] — 2 items.
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
@@ -6222,7 +6222,7 @@ async fn agent_picker_enter_on_empty_filter_does_nothing() {
 
     let config = picker_test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
         agents: vec!["apollo".into()],
@@ -6260,7 +6260,7 @@ async fn agent_picker_enter_activates_agent_immediately() {
 
     let config = picker_test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
         agents: vec!["hermes".into()],
@@ -6297,7 +6297,7 @@ async fn agent_picker_enter_with_no_sessions_starts_new_session() {
             Some(tmp.path().join("agents").join("hermes").join("sessions"));
     }
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
         agents: vec!["hermes".into()],
@@ -6346,7 +6346,7 @@ async fn agent_picker_enter_with_sessions_shows_session_picker() {
             Some(tmp.path().join("agents").join("hermes").join("sessions"));
     }
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
         agents: vec!["hermes".into()],
@@ -6398,7 +6398,7 @@ async fn session_picker_esc_without_prior_session_goes_back_to_agent_picker() {
         guard.agent = Some(agent);
     }
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::SessionPicker {
         sessions: vec![],
@@ -6449,7 +6449,7 @@ async fn session_picker_esc_with_agent_origin_but_no_session_exits() {
         guard.agent = Some(agent);
     }
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::SessionPicker {
         sessions: vec![],
@@ -6478,7 +6478,7 @@ async fn agent_picker_esc_exits_when_no_agent_active() {
 
     let config = picker_test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     // No active agent in config.
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
@@ -6510,7 +6510,7 @@ async fn picker_ctrl_d_exits_from_agent_picker() {
 
     let config = picker_test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
         agents: vec!["hermes".into()],
@@ -6538,7 +6538,7 @@ async fn picker_ctrl_c_exits_from_agent_picker() {
 
     let config = picker_test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
         agents: vec!["hermes".into()],
@@ -6565,7 +6565,7 @@ async fn picker_ctrl_d_exits_from_session_picker() {
 
     let config = picker_test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::SessionPicker {
         sessions: vec![],
@@ -6593,7 +6593,7 @@ async fn picker_ctrl_c_exits_from_session_picker() {
 
     let config = picker_test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::SessionPicker {
         sessions: vec![],
@@ -6630,7 +6630,7 @@ async fn agent_picker_esc_dismisses_when_agent_already_active() {
         guard.agent = Some(agent);
     }
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     tui.app.modal = Some(crate::types::ModalState::AgentPicker {
         agents: vec!["apollo".into()],
@@ -6675,7 +6675,7 @@ async fn session_picker_enter_loads_selected_session() {
         guard.agent = Some(agent);
     }
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     let meta = harnx_runtime::config::SessionMeta {
         id: "my-session".into(),
@@ -6749,7 +6749,7 @@ async fn session_picker_enter_reconciles_from_origin_not_current_agent() {
         guard.agent = Some(agent);
     }
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     // Seed the transcript with a sentinel item so we can detect if it was cleared.
     tui.app.transcript.push(TranscriptItem::SystemText(
@@ -6824,7 +6824,7 @@ async fn session_picker_esc_restores_origin() {
         guard.agent = Some(agent);
     }
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
-    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).unwrap();
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent).await.unwrap();
 
     // Start in SessionPicker with origin set to apollo + old-session
     tui.app.modal = Some(crate::types::ModalState::SessionPicker {
