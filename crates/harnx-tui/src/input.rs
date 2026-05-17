@@ -456,7 +456,7 @@ impl Tui {
                             };
                             if needs_picker {
                                 if let Some(modal) =
-                                    crate::types::Tui::resolve_initial_modal(&self.config)
+                                    crate::types::Tui::resolve_initial_modal(&self.config).await
                                 {
                                     self.app.modal = Some(modal);
                                     return Ok(());
@@ -1574,7 +1574,7 @@ impl Tui {
         if completions.is_empty() {
             match picker_command {
                 Some(PickerCommand::Agent) => {
-                    self.open_agent_picker();
+                    self.open_agent_picker().await;
                     return;
                 }
                 Some(PickerCommand::Session) => {
@@ -1720,16 +1720,25 @@ impl Tui {
                 return vec![];
             }
 
-            let filter = args.last().copied().unwrap_or("");
-            return self.config.read().command_complete(cmd, &args, filter);
+            // Fetch agents async outside the config lock to avoid holding a
+            // parking_lot read guard across an await point.
+            let precomputed_agents = if cmd == ".agent" && args.len() == 1 {
+                list_assistant_agents().await
+            } else {
+                Vec::new()
+            };
+            return self
+                .config
+                .read()
+                .command_complete(cmd, &args, precomputed_agents);
         }
 
         vec![]
     }
 
-    fn open_agent_picker(&mut self) {
+    async fn open_agent_picker(&mut self) {
         self.app.modal = Some(crate::types::ModalState::AgentPicker {
-            agents: list_assistant_agents(),
+            agents: list_assistant_agents().await,
             selected: 0,
             query: String::new(),
         });
@@ -1759,7 +1768,7 @@ impl Tui {
         });
     }
 
-    fn maybe_open_picker_after_command(
+    async fn maybe_open_picker_after_command(
         &mut self,
         outcome: harnx_runtime::commands::CommandOutcome,
         prev_agent: Option<String>,
@@ -1778,7 +1787,7 @@ impl Tui {
                 self.app.should_quit = true;
             }
             harnx_runtime::commands::CommandOutcome::OpenAgentPicker => {
-                self.open_agent_picker();
+                self.open_agent_picker().await;
             }
             harnx_runtime::commands::CommandOutcome::OpenSessionPicker => {
                 self.open_session_picker();
@@ -1869,7 +1878,8 @@ impl Tui {
 
         match result {
             Ok(outcome) => {
-                self.maybe_open_picker_after_command(outcome, prev_agent.clone());
+                self.maybe_open_picker_after_command(outcome, prev_agent.clone())
+                    .await;
                 let llm_busy = self.app.llm_busy;
                 let pending_message = self.app.pending_message.is_some();
                 Self::refresh_input_chrome_from_state(
@@ -2187,7 +2197,7 @@ impl Tui {
                 if should_show_agent_picker {
                     // Replace the SessionPicker with a fresh AgentPicker so the user can
                     // pick a different agent (or the same one again).
-                    let agents = harnx_runtime::config::list_assistant_agents();
+                    let agents = harnx_runtime::config::list_assistant_agents().await;
                     self.app.modal = Some(crate::types::ModalState::AgentPicker {
                         agents,
                         selected: 0,

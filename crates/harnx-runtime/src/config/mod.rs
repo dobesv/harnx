@@ -2450,7 +2450,7 @@ impl Config {
         &self,
         cmd: &str,
         args: &[&str],
-        _line: &str,
+        precomputed_agents: Vec<String>,
     ) -> Vec<(String, Option<String>)> {
         let mut values: Vec<(String, Option<String>)> = vec![];
         let filter = args.last().unwrap_or(&"");
@@ -2462,7 +2462,7 @@ impl Config {
                     .collect(),
                 ".session" => map_completion_values(self.list_sessions()),
                 ".rag" => map_completion_values(Self::list_rags()),
-                ".agent" => map_completion_values(list_assistant_agents()),
+                ".agent" => map_completion_values(precomputed_agents),
                 ".macro" => map_completion_values(Self::list_macros()),
                 ".info" => map_completion_values(vec!["session", "agent", "rag", "tools"]),
                 ".mcp" => map_completion_values(vec![

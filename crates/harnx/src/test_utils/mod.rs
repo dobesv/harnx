@@ -36,7 +36,7 @@
 //! ```ignore
 //! use harnx::test_utils::TuiTestHarness;
 //!
-//! let mut harness = TuiTestHarness::with_size(80, 24);
+//! let mut harness = TuiTestHarness::with_size(80, 24).await;
 //! harness.render();
 //! let screen = harness.screen_contents();
 //! assert!(screen.contains("Input"));

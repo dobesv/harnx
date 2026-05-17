@@ -69,12 +69,12 @@ impl Tui {
         Ok(())
     }
 
-    pub fn init(
+    pub async fn init(
         config: &GlobalConfig,
         async_manager: AsyncHookManager,
         persistent_manager: Arc<Mutex<PersistentHookManager>>,
     ) -> Result<Self> {
-        let agents = list_assistant_agents();
+        let agents = list_assistant_agents().await;
         // Skip agents check in tests: test configs use a bare `Config::default()`
         // with no agents directory populated, but the production check is covered
         // by direct unit tests of `check_agents_available`.
@@ -139,7 +139,7 @@ impl Tui {
         };
 
         if !cfg!(test) {
-            app.modal = Self::resolve_initial_modal(config);
+            app.modal = Self::resolve_initial_modal(config).await;
         }
 
         Ok(Self {
@@ -158,8 +158,8 @@ impl Tui {
         })
     }
 
-    pub(crate) fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState> {
-        let agents = list_assistant_agents();
+    pub(crate) async fn resolve_initial_modal(config: &GlobalConfig) -> Option<ModalState> {
+        let agents = list_assistant_agents().await;
         if config.read().agent.is_none() {
             if agents.is_empty() {
                 return None;
