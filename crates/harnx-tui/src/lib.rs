@@ -18,6 +18,7 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
+pub use types::TranscriptItem;
 pub use types::Tui;
 
 /// Strip ANSI escape sequences from a string for safe display in the TUI.

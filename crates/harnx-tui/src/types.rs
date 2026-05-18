@@ -152,7 +152,7 @@ pub(super) fn cleanup_attachment_dir(dir: &std::path::Path) {
 /// markdown styling). Mutually exclusive — a tool call has exactly one or
 /// no body, never both.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ToolCallBody {
+pub enum ToolCallBody {
     /// YAML rendering of the raw tool-call arguments. Displayed verbatim.
     Yaml(String),
     /// Rendered MCP `call_template` output. Each line is treated as inline
@@ -211,7 +211,7 @@ impl ModalState {
 pub(crate) type RenderedCache = Option<(u16, bool, bool, bool, RenderedEntry)>;
 
 #[derive(Clone, Debug)]
-pub(crate) enum TranscriptItem {
+pub enum TranscriptItem {
     SourceHeading(AgentSource),
     SystemText(String),
     UserText {

@@ -247,6 +247,11 @@ impl Tui {
         &self.async_manager
     }
 
+    /// Returns a reference to the transcript items collected during the session.
+    pub fn transcript(&self) -> &[TranscriptItem] {
+        &self.app.transcript
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         let _panic_terminal_hook = PanicTerminalHookGuard::install();
         let mut terminal = Self::setup_terminal()?;
