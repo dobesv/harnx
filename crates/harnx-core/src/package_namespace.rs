@@ -60,6 +60,29 @@ pub fn namespace_use_tools_entry(pkg: &str, entry: &str) -> String {
     }
 }
 
+/// Resolves a potentially bare agent/client/model name relative to a package context.
+///
+/// Rules:
+///   - `/foo`        → `"foo"` (explicit top-level, strip leading slash)
+///   - `other/foo`   → `"other/foo"` (already qualified, unchanged)
+///   - `foo` + Some("pkg") → `"pkg/foo"` (relative to current package)
+///   - `foo` + None  → `"foo"` (top-level context, unchanged)
+pub fn resolve_package_relative_name(name: &str, pkg_context: Option<&str>) -> String {
+    if let Some(stripped) = name.strip_prefix('/') {
+        // Leading slash = explicit top-level escape
+        stripped.to_string()
+    } else if name.contains('/') {
+        // Already qualified (cross-package or explicit)
+        name.to_string()
+    } else if let Some(pkg) = pkg_context {
+        // Bare name in a package context → qualify it
+        format!("{pkg}/{name}")
+    } else {
+        // Bare name at top level → unchanged
+        name.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +139,45 @@ mod tests {
         assert_eq!(
             namespace_use_tools_entry("mypkg", "fs_{read_file,write_file}"),
             "mypkg__fs_{read_file,write_file}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_package_relative_bare_with_context() {
+        assert_eq!(
+            resolve_package_relative_name("foo", Some("mypkg")),
+            "mypkg/foo"
+        );
+    }
+
+    #[test]
+    fn test_resolve_package_relative_bare_no_context() {
+        assert_eq!(resolve_package_relative_name("foo", None), "foo");
+    }
+
+    #[test]
+    fn test_resolve_package_relative_leading_slash_with_context() {
+        assert_eq!(resolve_package_relative_name("/foo", Some("mypkg")), "foo");
+    }
+
+    #[test]
+    fn test_resolve_package_relative_leading_slash_no_context() {
+        assert_eq!(resolve_package_relative_name("/foo", None), "foo");
+    }
+
+    #[test]
+    fn test_resolve_package_relative_qualified_with_context() {
+        assert_eq!(
+            resolve_package_relative_name("other/foo", Some("mypkg")),
+            "other/foo"
+        );
+    }
+
+    #[test]
+    fn test_resolve_package_relative_qualified_no_context() {
+        assert_eq!(
+            resolve_package_relative_name("other/foo", None),
+            "other/foo"
         );
     }
 }

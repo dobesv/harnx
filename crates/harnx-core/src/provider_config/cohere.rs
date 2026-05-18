@@ -16,4 +16,9 @@ pub struct CohereConfig {
     pub extra: Option<ExtraConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<Vec<String>>,
+
+    /// Runtime-only: the package this client was loaded from, if any.
+    /// Not persisted to YAML (serde skip).
+    #[serde(skip)]
+    pub package: Option<String>,
 }
