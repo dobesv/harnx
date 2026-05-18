@@ -20,13 +20,14 @@ use crate::config::{
     list_agents, list_assistant_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
     WorkingMode,
 };
-use crate::tui::Tui;
+use crate::tui::{TranscriptItem, Tui};
+use harnx_core::event::AgentSource;
 use harnx_hooks::{
     dispatch_hooks_with_count_and_manager, dispatch_hooks_with_managers, drain_async_results,
     inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
     PersistentHookManager,
 };
-use harnx_render::render_error;
+use harnx_render::{render_error, MarkdownRender, RenderOptions};
 use harnx_runtime::utils::*;
 
 use anyhow::{bail, Result};
@@ -352,6 +353,92 @@ fn session_resume_command(config: &GlobalConfig) -> Option<String> {
     Some(shell_words::join(args))
 }
 
+fn source_heading(source: &AgentSource) -> String {
+    match &source.session_id {
+        Some(session_id) if !session_id.is_empty() => {
+            format!("> {} ▸ {}", source.agent, session_id)
+        }
+        _ => format!("> {}", source.agent),
+    }
+}
+
+struct BreakdownSections<'a> {
+    first_user: &'a str,
+    last_user: Option<&'a str>,
+    final_response: Vec<&'a str>,
+}
+
+fn transcript_item_text(item: &TranscriptItem) -> Option<&str> {
+    match item {
+        TranscriptItem::UserText { text, .. }
+        | TranscriptItem::AssistantText { text, .. }
+        | TranscriptItem::ThoughtText(text) => Some(text),
+        _ => None,
+    }
+}
+
+fn select_breakdown_sections(transcript: &[TranscriptItem]) -> Option<BreakdownSections<'_>> {
+    let first_user_idx = transcript
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::UserText { .. }))?;
+    let last_user_idx = transcript
+        .iter()
+        .rposition(|item| matches!(item, TranscriptItem::UserText { .. }))?;
+
+    let first_user = transcript_item_text(&transcript[first_user_idx])?;
+    let last_user = (last_user_idx != first_user_idx)
+        .then(|| transcript_item_text(&transcript[last_user_idx]))
+        .flatten();
+    let final_response = transcript
+        .iter()
+        .skip(last_user_idx + 1)
+        .filter_map(|item| match item {
+            TranscriptItem::AssistantText { text, .. } | TranscriptItem::ThoughtText(text) => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+
+    Some(BreakdownSections {
+        first_user,
+        last_user,
+        final_response,
+    })
+}
+
+fn render_markdown_to_stderr(render: &mut MarkdownRender, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    eprintln!("{}", render.render(text));
+}
+
+fn print_session_breakdown(transcript: &[TranscriptItem], source: &AgentSource) {
+    let Some(sections) = select_breakdown_sections(transcript) else {
+        return;
+    };
+
+    let Ok(mut render) = MarkdownRender::init(RenderOptions::default()) else {
+        return;
+    };
+
+    eprintln!("{}", source_heading(source));
+    render_markdown_to_stderr(&mut render, sections.first_user);
+
+    if let Some(last_user) = sections.last_user {
+        eprintln!("---");
+        render_markdown_to_stderr(&mut render, last_user);
+    }
+
+    if !sections.final_response.is_empty() {
+        eprintln!("---");
+        for text in sections.final_response {
+            render_markdown_to_stderr(&mut render, text);
+        }
+    }
+}
+
 async fn exit_session_with_hook(
     config: &GlobalConfig,
     async_manager: &AsyncHookManager,
@@ -667,6 +754,16 @@ async fn start_interactive(config: &GlobalConfig) -> Result<()> {
     dispatch_session_start(config, "tui", &async_manager, &persistent_manager).await;
     let mut tui: Tui = Tui::init(config, async_manager, persistent_manager.clone()).await?;
     let result = tui.run().await;
+    let source = AgentSource {
+        agent: config
+            .read()
+            .agent
+            .as_ref()
+            .map(|a| a.name().to_string())
+            .unwrap_or_default(),
+        session_id: config.read().session.as_ref().map(|s| s.id().to_string()),
+    };
+    print_session_breakdown(tui.transcript(), &source);
     let async_manager = tui.async_manager().lock().await;
     exit_session_with_hook(config, &async_manager, &persistent_manager).await?;
     persistent_manager.lock().await.shutdown();
@@ -698,6 +795,108 @@ async fn create_input(
 }
 
 use harnx_runtime::bootstrap::setup_logger;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_text(text: &str) -> TranscriptItem {
+        TranscriptItem::UserText {
+            text: text.to_string(),
+            seq: None,
+            timestamp: None,
+        }
+    }
+
+    fn assistant_text(text: &str) -> TranscriptItem {
+        TranscriptItem::AssistantText {
+            text: text.to_string(),
+            seq: None,
+            timestamp: None,
+            rendered_cache: None,
+        }
+    }
+
+    fn thought_text(text: &str) -> TranscriptItem {
+        TranscriptItem::ThoughtText(text.to_string())
+    }
+
+    fn system_text(text: &str) -> TranscriptItem {
+        TranscriptItem::SystemText(text.to_string())
+    }
+
+    #[test]
+    fn select_breakdown_sections_returns_none_for_empty_transcript() {
+        assert!(select_breakdown_sections(&[]).is_none());
+    }
+
+    #[test]
+    fn select_breakdown_sections_with_single_user_message_has_no_last_or_final_response() {
+        let transcript = vec![user_text("hello")];
+
+        let sections = select_breakdown_sections(&transcript).unwrap();
+
+        assert_eq!(sections.first_user, "hello");
+        assert_eq!(sections.last_user, None);
+        assert!(sections.final_response.is_empty());
+    }
+
+    #[test]
+    fn select_breakdown_sections_with_multiple_user_messages_sets_first_and_last() {
+        let transcript = vec![
+            user_text("first"),
+            assistant_text("mid-response"),
+            user_text("last"),
+        ];
+
+        let sections = select_breakdown_sections(&transcript).unwrap();
+
+        assert_eq!(sections.first_user, "first");
+        assert_eq!(sections.last_user, Some("last"));
+        assert!(sections.final_response.is_empty());
+    }
+
+    #[test]
+    fn select_breakdown_sections_collects_trailing_assistant_and_thought_text() {
+        let transcript = vec![
+            user_text("question"),
+            user_text("follow-up"),
+            assistant_text("answer"),
+            thought_text("thinking"),
+        ];
+
+        let sections = select_breakdown_sections(&transcript).unwrap();
+
+        assert_eq!(sections.final_response, vec!["answer", "thinking"]);
+    }
+
+    #[test]
+    fn select_breakdown_sections_excludes_non_response_items_from_final_response() {
+        let transcript = vec![
+            user_text("question"),
+            user_text("last prompt"),
+            system_text("noise"),
+            assistant_text("answer"),
+            system_text("more noise"),
+            thought_text("thinking"),
+        ];
+
+        let sections = select_breakdown_sections(&transcript).unwrap();
+
+        assert_eq!(sections.final_response, vec!["answer", "thinking"]);
+    }
+
+    #[test]
+    fn select_breakdown_sections_with_immediate_exit_has_empty_final_response() {
+        let transcript = vec![user_text("first"), user_text("last")];
+
+        let sections = select_breakdown_sections(&transcript).unwrap();
+
+        assert_eq!(sections.first_user, "first");
+        assert_eq!(sections.last_user, Some("last"));
+        assert!(sections.final_response.is_empty());
+    }
+}
 
 #[cfg(test)]
 mod resume_tests {
