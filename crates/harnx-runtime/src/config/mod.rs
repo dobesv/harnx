@@ -3017,12 +3017,15 @@ impl Config {
         // Qualify client names with package prefix after patching.
         // Must be after patching because apply_client_patch round-trips through
         // serde_json and resets #[serde(skip)] fields like `package`.
+        // Always call set_name_and_package (not just for bare names) so the
+        // `package` field is restored even for explicitly-named clients whose
+        // name already contains '/'.
         for client in &mut clients {
-            let bare_name = client.effective_name().to_string();
-            if !bare_name.contains('/') {
-                let qualified = format!("{pkg_name}/{bare_name}");
-                client.set_name_and_package(qualified, pkg_name.to_string());
-            }
+            let resolved_name = harnx_core::package_namespace::resolve_package_relative_name(
+                client.effective_name(),
+                Some(pkg_name),
+            );
+            client.set_name_and_package(resolved_name, pkg_name.to_string());
         }
         clients
     }

@@ -210,6 +210,6 @@ Each LLM provider (`openai.rs`, `claude.rs`, etc.) has its own struct in `crates
 
 ## Related Issues
 
-- **GitHub Issue:** [#585](https://github.com/example/harnx/issues/585) — Agents in a package should use models/clients defined in that package by default
-- **GitHub Issue:** [#586](https://github.com/example/harnx/issues/586) — Compaction agent references in a packaged agent should resolve within the package by default
+- **GitHub Issue:** [#585](https://github.com/dobesv/harnx/issues/585) — Agents in a package should use models/clients defined in that package by default
+- **GitHub Issue:** [#586](https://github.com/dobesv/harnx/issues/586) — Compaction agent references in a packaged agent should resolve within the package by default
 - **Changeset:** `.changesets/package-scoped-resolution.md` — Breaking change documentation with migration guide
