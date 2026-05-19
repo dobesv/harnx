@@ -153,28 +153,28 @@ async fn pre_tool_use_block() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn pre_tool_use_mutation() {
+struct MutationTestCase<'a> {
+    hook_flag: &'a str,
+    hook_script: &'a str,
+    original_command: &'a str,
+    expected_in_output: &'a str,
+    not_expected_in_output: &'a str,
+}
+
+async fn run_mutation_test(test_name: &str, tc: MutationTestCase<'_>) {
     let Some(proxy_bin) = proxy_binary_path() else {
-        eprintln!("SKIP pre_tool_use_mutation: harnx-mcp-hooks-proxy binary not found; build package first");
+        eprintln!("SKIP {test_name}: harnx-mcp-hooks-proxy binary not found; build package first");
         return;
     };
     let Some(bash_bin) = mcp_bash_binary_path() else {
-        eprintln!("SKIP pre_tool_use_mutation: harnx-mcp-bash binary not found; build package first");
+        eprintln!("SKIP {test_name}: harnx-mcp-bash binary not found; build package first");
         return;
     };
 
     let repo_root = repo_root();
     let temp_dir = TempDir::new().expect("temp dir");
-    let script_path = temp_dir.path().join("pre-mutation-hook.sh");
-    std::fs::write(
-        &script_path,
-        format!(
-            "#!/bin/sh\necho '{{\"hookSpecificOutput\": {{\"toolInput\": {{\"command\": \"echo mutated-by-hook\", \"working_dir\": \"{}\"}}}}}}'\n",
-            repo_root.to_string_lossy()
-        ),
-    )
-    .expect("write hook script");
+    let script_path = temp_dir.path().join("mutation-hook.sh");
+    std::fs::write(&script_path, tc.hook_script).expect("write hook script");
     chmod_script(&script_path);
 
     let hook_arg = format!("claude-command {}", shell_escape_path(&script_path));
@@ -182,17 +182,17 @@ async fn pre_tool_use_mutation() {
         &proxy_bin,
         &bash_bin,
         &repo_root,
-        &[("--pre-tool-use", hook_arg.as_str())],
+        &[(tc.hook_flag, hook_arg.as_str())],
     )
     .await
-    .expect("spawn proxy with pre-tool-use mutation hook and connect MCP client");
+    .expect("spawn proxy with mutation hook and connect MCP client");
     let peer = service.peer().clone();
 
     let result = peer
         .call_tool(
             CallToolRequestParams::new("exec").with_arguments(
                 json!({
-                    "command": "echo original-command",
+                    "command": tc.original_command,
                     "working_dir": repo_root.to_string_lossy()
                 })
                 .as_object()
@@ -203,91 +203,60 @@ async fn pre_tool_use_mutation() {
         .await;
 
     let Ok(result) = result else {
-        eprintln!("SKIP pre_tool_use_mutation: tool call failed in environment: {result:?}");
+        eprintln!("SKIP {test_name}: tool call failed in environment: {result:?}");
         return;
     };
 
     let text = text_content(&result.content);
     if result.is_error == Some(true) {
-        eprintln!("SKIP pre_tool_use_mutation: proxy returned error result: {text}");
+        eprintln!("SKIP {test_name}: proxy returned error result: {text}");
         return;
     }
 
     assert!(
-        text.contains("mutated-by-hook"),
-        "expected hook-mutated command output, got: {text}"
+        text.contains(tc.expected_in_output),
+        "expected hook-mutated output, got: {text}"
     );
     assert!(
-        !text.contains("original-command"),
-        "expected original command to be replaced by hook mutation, got: {text}"
+        !text.contains(tc.not_expected_in_output),
+        "expected original output to be replaced by hook mutation, got: {text}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn post_tool_use_mutation() {
-    let Some(proxy_bin) = proxy_binary_path() else {
-        eprintln!("SKIP post_tool_use_mutation: harnx-mcp-hooks-proxy binary not found; build package first");
-        return;
-    };
-    let Some(bash_bin) = mcp_bash_binary_path() else {
-        eprintln!("SKIP post_tool_use_mutation: harnx-mcp-bash binary not found; build package first");
-        return;
-    };
-
+async fn pre_tool_use_mutation() {
     let repo_root = repo_root();
-    let temp_dir = TempDir::new().expect("temp dir");
-    let script_path = temp_dir.path().join("post-mutation-hook.sh");
-    std::fs::write(
-        &script_path,
-        "#!/bin/sh\necho '{\"hookSpecificOutput\": {\"toolResponse\": {\"content\": [{\"type\": \"text\", \"text\": \"response-mutated-by-hook\"}]}}}'\n",
-    )
-    .expect("write hook script");
-    chmod_script(&script_path);
-
-    let hook_arg = format!("claude-command {}", shell_escape_path(&script_path));
-    let service = spawn_proxy(
-        &proxy_bin,
-        &bash_bin,
-        &repo_root,
-        &[("--post-tool-use", hook_arg.as_str())],
-    )
-    .await
-    .expect("spawn proxy with post-tool-use mutation hook and connect MCP client");
-    let peer = service.peer().clone();
-
-    let result = peer
-        .call_tool(
-            CallToolRequestParams::new("exec").with_arguments(
-                json!({
-                    "command": "echo original-response",
-                    "working_dir": repo_root.to_string_lossy()
-                })
-                .as_object()
-                .expect("object")
-                .clone(),
-            ),
-        )
-        .await;
-
-    let Ok(result) = result else {
-        eprintln!("SKIP post_tool_use_mutation: tool call failed in environment: {result:?}");
-        return;
-    };
-
-    let text = text_content(&result.content);
-    if result.is_error == Some(true) {
-        eprintln!("SKIP post_tool_use_mutation: proxy returned error result: {text}");
-        return;
-    }
-
-    assert!(
-        text.contains("response-mutated-by-hook"),
-        "expected hook-mutated response, got: {text}"
+    let hook_script = format!(
+        "#!/bin/sh\necho '{{\"hookSpecificOutput\": {{\"toolInput\": {{\"command\": \"echo mutated-by-hook\", \"working_dir\": \"{}\"}}}}}}'\n",
+        repo_root.to_string_lossy()
     );
-    assert!(
-        !text.contains("original-response"),
-        "expected original response to be replaced by hook mutation, got: {text}"
-    );
+    run_mutation_test(
+        "pre_tool_use_mutation",
+        MutationTestCase {
+            hook_flag: "--pre-tool-use",
+            hook_script: &hook_script,
+            original_command: "echo original-command",
+            expected_in_output: "mutated-by-hook",
+            not_expected_in_output: "original-command",
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_tool_use_mutation() {
+    let hook_script = "#!/bin/sh\necho '{\"hookSpecificOutput\": {\"toolResponse\": {\"content\": [{\"type\": \"text\", \"text\": \"response-mutated-by-hook\"}]}}}'\n";
+    run_mutation_test(
+        "post_tool_use_mutation",
+        MutationTestCase {
+            hook_flag: "--post-tool-use",
+            hook_script,
+            original_command: "echo original-response",
+            expected_in_output: "response-mutated-by-hook",
+            not_expected_in_output: "original-response",
+        },
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -297,7 +266,9 @@ async fn post_tool_use_failure() {
         return;
     };
     let Some(bash_bin) = mcp_bash_binary_path() else {
-        eprintln!("SKIP post_tool_use_failure: harnx-mcp-bash binary not found; build package first");
+        eprintln!(
+            "SKIP post_tool_use_failure: harnx-mcp-bash binary not found; build package first"
+        );
         return;
     };
 
@@ -396,24 +367,27 @@ fn repo_root() -> PathBuf {
 }
 
 fn proxy_binary_path() -> Option<PathBuf> {
-    if let Some(path) = std::option_env!("CARGO_BIN_EXE_harnx-mcp-hooks-proxy") {
-        let p = PathBuf::from(path);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let candidate = target_dir().join(binary_name("harnx-mcp-hooks-proxy"));
-    candidate.is_file().then_some(candidate)
+    find_binary(
+        std::option_env!("CARGO_BIN_EXE_harnx-mcp-hooks-proxy"),
+        "harnx-mcp-hooks-proxy",
+    )
 }
 
 fn mcp_bash_binary_path() -> Option<PathBuf> {
-    if let Some(path) = std::option_env!("CARGO_BIN_EXE_harnx-mcp-bash") {
+    find_binary(
+        std::option_env!("CARGO_BIN_EXE_harnx-mcp-bash"),
+        "harnx-mcp-bash",
+    )
+}
+
+fn find_binary(env_path: Option<&str>, name: &str) -> Option<PathBuf> {
+    if let Some(path) = env_path {
         let p = PathBuf::from(path);
         if p.is_file() {
             return Some(p);
         }
     }
-    let candidate = target_dir().join(binary_name("harnx-mcp-bash"));
+    let candidate = target_dir().join(binary_name(name));
     candidate.is_file().then_some(candidate)
 }
 

@@ -123,18 +123,21 @@ impl HooksProxyServer {
     }
 
     fn value_to_call_tool_result(v: Value) -> CallToolResult {
-        if let Some(items) = v.get("content").and_then(Value::as_array) {
-            let mut content = Vec::new();
-            for item in items {
-                if item.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        content.push(Content::text(text.to_string()));
-                    }
-                }
-            }
-            if !content.is_empty() {
-                return CallToolResult::success(content);
-            }
+        let content = v
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|item| item.get("text").and_then(Value::as_str))
+                    .map(|text| Content::text(text.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|c: &Vec<_>| !c.is_empty());
+
+        if let Some(content) = content {
+            return CallToolResult::success(content);
         }
 
         let text = match v {
