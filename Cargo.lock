@@ -3696,6 +3696,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "harnx-mcp-hooks-proxy"
+version = "0.32.0"
+dependencies = [
+ "anyhow",
+ "harnx-core",
+ "harnx-hooks",
+ "parking_lot",
+ "process-wrap",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "harnx-mcp-plans"
 version = "0.32.0"
 dependencies = [

@@ -1,0 +1,31 @@
+[package]
+name = "harnx-mcp-hooks-proxy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP proxy that runs harnx hooks around every tool call"
+
+[dependencies]
+rmcp = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+harnx-hooks = { path = "../harnx-hooks" }
+uuid = { workspace = true }
+process-wrap = { workspace = true }
+parking_lot = { workspace = true }
+
+[[bin]]
+name = "harnx-mcp-hooks-proxy"
+path = "src/main.rs"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+process-wrap = { workspace = true }
+rmcp = { workspace = true }
+tempfile = "3"
+serde_json = { workspace = true }

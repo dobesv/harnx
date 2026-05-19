@@ -12,6 +12,7 @@ members = [
     "crates/harnx-hooks",
     "crates/harnx-mcp",
     "crates/harnx-mcp-bash",
+    "crates/harnx-mcp-hooks-proxy",
     "crates/harnx-mcp-fs",
     "crates/harnx-mcp-time",
     "crates/harnx-mcp-plans",
