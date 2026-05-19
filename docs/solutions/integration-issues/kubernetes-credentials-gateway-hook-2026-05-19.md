@@ -179,22 +179,25 @@ fn write_synthetic_kubeconfig(state: &AppState, port: u16) -> Result<TempPath> {
 Injects synthetic `KUBECONFIG` into `bash_exec`/`bash_spawn`:
 
 ```rust
-fn handle_hook_line(line: &str, kubeconfig_path: &str) -> Option<Value> {
+fn handle_hook_line(line: &str, kubeconfig_path: KubeconfigPath<'_>) -> Option<Value> {
     let input: Value = serde_json::from_str(line).ok()?;
-    
-    if input["hook_event_name"] != "PreToolUse" { return None; }
-    if !matches!(input["tool_name"].as_str(), Some("bash_exec" | "bash_spawn")) {
-        return None;
+    let id = input.get("id")?.clone();
+    let hook_event_name = input.get("hook_event_name").and_then(Value::as_str);
+    let tool_name = input.get("tool_name").and_then(Value::as_str);
+
+    if hook_event_name == Some("PreToolUse")
+        && matches!(tool_name, Some("bash_exec") | Some("bash_spawn"))
+    {
+        if let Some(tool_input) = input.get("tool_input") {
+            if let Ok(mutated) = mutate_tool_input(tool_input, kubeconfig_path) {
+                return Some(json!({
+                    "id": id,
+                    "hookSpecificOutput": { "toolInput": mutated }
+                }));
+            }
+        }
     }
-    
-    let tool_input = input.get("tool_input")?.as_object()?;
-    let env = tool_input.entry("env").or_insert_with(|| json!({}));
-    env["KUBECONFIG"] = json!(kubeconfig_path);
-    
-    Some(json!({
-        "id": input["id"],
-        "hookSpecificOutput": { "toolInput": tool_input }
-    }))
+    Some(json!({ "id": id }))
 }
 ```
 
