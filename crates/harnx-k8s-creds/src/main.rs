@@ -747,47 +747,56 @@ mod tests {
         assert!(err.to_string().contains("no supported auth type"));
     }
 
-    fn echo_exec(args: &[&str]) -> ExecConfig {
-        serde_json::from_value(json!({
-            "command": "echo",
-            "args": args,
-            "apiVersion": "client.authentication.k8s.io/v1",
-            "provideClusterInfo": false
-        }))
-        .unwrap()
-    }
+    // exec plugin tests spawn external processes and are Unix-only:
+    // `echo` is a shell built-in on Windows with no standalone binary,
+    // and exec credential plugins (aws-iam-authenticator, gke-gcloud-auth-plugin)
+    // are not supported on Windows anyway.
+    #[cfg(not(windows))]
+    mod exec_plugin_tests {
+        use super::*;
 
-    #[test]
-    fn run_exec_plugin_success() {
-        let exec = echo_exec(&[
-            r#"{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"exec-token"}}"#,
-        ]);
-        let result = run_exec_plugin(&exec).unwrap();
-        assert_eq!(result.status.token, "exec-token");
-    }
+        fn echo_exec(json_output: &str) -> ExecConfig {
+            serde_json::from_value(json!({
+                "command": "echo",
+                "args": [json_output],
+                "apiVersion": "client.authentication.k8s.io/v1",
+                "provideClusterInfo": false
+            }))
+            .unwrap()
+        }
 
-    #[test]
-    fn run_exec_plugin_failure_returns_error() {
-        let exec: ExecConfig =
-            serde_json::from_value(json!({"command": "false", "provideClusterInfo": false}))
-                .unwrap();
-        assert!(run_exec_plugin(&exec).is_err());
-    }
+        #[test]
+        fn run_exec_plugin_success() {
+            let exec = echo_exec(
+                r#"{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"exec-token"}}"#,
+            );
+            let result = run_exec_plugin(&exec).unwrap();
+            assert_eq!(result.status.token, "exec-token");
+        }
 
-    #[test]
-    fn resolve_token_exec_plugin_path() {
-        let mut config = kube::Config::new("https://127.0.0.1:6443".parse().unwrap());
-        config.auth_info.exec = Some(echo_exec(&[
-            r#"{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"exec-resolved-token"}}"#,
-        ]));
+        #[test]
+        fn run_exec_plugin_failure_returns_error() {
+            let exec: ExecConfig =
+                serde_json::from_value(json!({"command": "false", "provideClusterInfo": false}))
+                    .unwrap();
+            assert!(run_exec_plugin(&exec).is_err());
+        }
 
-        let entry = ContextEntry {
-            name: "ctx".to_string(),
-            config,
-            cached: Mutex::new(None),
-        };
+        #[test]
+        fn resolve_token_exec_plugin_path() {
+            let mut config = kube::Config::new("https://127.0.0.1:6443".parse().unwrap());
+            config.auth_info.exec = Some(echo_exec(
+                r#"{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"exec-resolved-token"}}"#,
+            ));
 
-        let result = resolve_token(&entry).unwrap();
-        assert_eq!(result.token, "exec-resolved-token");
+            let entry = ContextEntry {
+                name: "ctx".to_string(),
+                config,
+                cached: Mutex::new(None),
+            };
+
+            let result = resolve_token(&entry).unwrap();
+            assert_eq!(result.token, "exec-resolved-token");
+        }
     }
 }
