@@ -139,7 +139,11 @@ fn run_exec_plugin(exec: &ExecConfig) -> Result<ExecCredential> {
     cmd.env("KUBERNETES_EXEC_INFO", exec_info);
     
     let output = cmd.output()?;
-    serde_json::from_slice(&output.stdout)
+    if !output.status.success() {
+        bail!("exec plugin failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim()).context("failed to parse exec plugin output")
 }
 ```
 
@@ -159,7 +163,7 @@ fn write_synthetic_kubeconfig(state: &AppState, port: u16) -> Result<TempPath> {
                     "args": [
                         "--silent", "--fail",
                         "--header", format!("Authorization: Bearer {}", state.bearer_token),
-                        format!("http://127.0.0.1:{port}/token/{}", ctx.name)
+                        format!("http://127.0.0.1:{port}/token/{}", urlencoding::encode(&ctx.name))
                     ],
                     "interactiveMode": "Never"
                 }

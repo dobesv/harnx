@@ -15,6 +15,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tempfile::TempPath;
+use urlencoding::encode as pct_encode;
 
 /// Newtype for the path of the synthetic kubeconfig file.
 /// Avoids passing a raw `&str` through every hook-loop function.
@@ -289,7 +290,7 @@ fn build_user_entry(ctx: &ContextEntry, state: &AppState, port: u16) -> Value {
                 "args": [
                     "--silent", "--fail", "--header",
                     format!("Authorization: Bearer {}", state.bearer_token),
-                    format!("http://127.0.0.1:{port}/token/{}", ctx.name)
+                    format!("http://127.0.0.1:{port}/token/{}", pct_encode(&ctx.name))
                 ],
                 "interactiveMode": "Never"
             }
