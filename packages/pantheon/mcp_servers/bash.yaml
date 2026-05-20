@@ -73,11 +73,21 @@ args:
   # Tell puppeteer not to use sandbox
   - --env
   - "PUPPETEER_NO_SANDBOX=1"
-  # Passthrough GITHUB_TOKEN and GH_TOKEN so the agent can do remote git operations
-  - --env
-  - GITHUB_TOKEN
-  - --env
-  - GH_TOKEN
-  # --- prevent interactive editor prompts ---
-  - --env
-  - EDITOR=true
+
+hooks:
+  entries:
+  # Inject auth headers for GitHub and Atlassian (acli/Jira/Confluence) via MITM proxy.
+  # Filters are conditional — if the env var is unset the header is not injected,
+  # so this hook is safe to include even if you only use one service.
+  # See docs/hooks-guide.md for setup instructions.
+  - event: PreToolUse
+    type: claude-command-persistent
+    matcher: "exec|spawn"
+    command: >-
+      harnx-proxy-auth
+      --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null
+          then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
+          end'
+      --hook 'if (.host | endswith(".atlassian.net")) and env.ATLASSIAN_API_TOKEN != null
+          then .headers.authorization = "Basic \([(env.ATLASSIAN_EMAIL // ""), (env.ATLASSIAN_API_TOKEN // "")] | join(":") | @base64)"
+          end'
