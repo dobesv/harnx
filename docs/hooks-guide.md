@@ -242,7 +242,7 @@ hooks:
       async: true
 ```
 
-## 11. GitHub Auth Proxy (`harnx-proxy-auth`)
+## 11. Auth Proxy (`harnx-proxy-auth`)
 
 The `harnx-proxy-auth` binary is a specialized persistent hook that solves the problem of injecting authentication headers into HTTPS requests made by tools like `curl`, `git`, or custom scripts, without having to manually rewrite every command.
 
@@ -320,6 +320,91 @@ hooks:
       harnx-proxy-auth
       --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
           then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
+          end'
+```
+
+### Atlassian CLI (`acli`) Example
+
+`acli` (the Atlassian CLI for Jira, Confluence, etc.) stores API tokens in the OS keyring, which may not be accessible inside the bash birdcage. The solution is to set up `acli` on the host once, then use `harnx-proxy-auth` to transparently replace the `Authorization: Basic` header on every request to `*.atlassian.net` with credentials from environment variables.
+
+#### Step 1 — Log in with your real token (once, on the host)
+
+Run `acli jira auth login` **outside of a harnx session** (on the host) with your real Atlassian API token. This is the only time the real token is used — after this, the proxy takes over inside harnx:
+
+```sh
+echo "<your-real-api-token>" | acli jira auth login \
+  --site <your-site>.atlassian.net \
+  --email <your-email@example.com> \
+  --token
+```
+
+This writes profile metadata (site, email, cloud ID) to `~/.config/acli/jira_config.yaml` and stores the token in the OS keyring. Inside the harnx birdcage, `acli` will attempt requests using keyring credentials — but the proxy intercepts each request and replaces the `Authorization` header with one built from your environment variables, so the keyring value is never actually sent to Atlassian.
+
+The same command applies to other `acli` products: replace `jira` with `confluence`, `assets`, etc.
+
+> **Birdcage access:** `acli` reads its config from `~/.config/acli/`. Ensure that directory is in the allowed read paths for your bash MCP server (the example config already includes this).
+
+#### Step 2 — Store the real token in an environment variable
+
+Add your Atlassian credentials to the harnx `.env` file so they are available every session. You can pull the token directly from the OS keyring where `acli` stored it.
+
+**Linux** (libsecret / `secret-tool`):
+```sh
+echo "ATLASSIAN_API_TOKEN=$(secret-tool search service acli 2>/dev/null | awk '/^secret/{print $3}')" >> ~/.config/harnx/.env
+echo "ATLASSIAN_EMAIL=<your-email@example.com>" >> ~/.config/harnx/.env
+```
+
+**macOS** (Keychain / `security`):
+```sh
+echo "ATLASSIAN_API_TOKEN=$(security find-generic-password -s acli -w)" >> ~/.config/harnx/.env
+echo "ATLASSIAN_EMAIL=<your-email@example.com>" >> ~/.config/harnx/.env
+```
+
+Or set them manually if you prefer:
+
+```sh
+echo "ATLASSIAN_API_TOKEN=<your-real-api-token>" >> ~/.config/harnx/.env
+echo "ATLASSIAN_EMAIL=<your-email@example.com>" >> ~/.config/harnx/.env
+```
+
+The harnx `.env` file uses plain `KEY=value` lines (no `export`). See [Environment Variables](environment-variables.md) for details.
+
+#### Step 3 — Configure the proxy hook
+
+Add the following to your `config.yaml`. The filter builds the correct `Basic` header from `ATLASSIAN_EMAIL` and `ATLASSIAN_API_TOKEN`, then injects it on any request to `*.atlassian.net`.
+
+> **If either variable is unset**, the filter produces `Authorization: Basic Og==` (base64 of `:`), which is invalid and will be rejected with `401 Unauthorized`. Set both variables before running harnx.
+
+```yaml
+hooks:
+  entries:
+  - event: PreToolUse
+    type: claude-command-persistent
+    matcher: "bash_exec|bash_spawn"
+    command: >-
+      harnx-proxy-auth
+      --hook 'if (.host | endswith(".atlassian.net"))
+          then .headers.authorization = "Basic \([(env.ATLASSIAN_EMAIL // ""), (env.ATLASSIAN_API_TOKEN // "")] | join(":") | @base64)"
+          end'
+```
+
+> **Security note:** `endswith(".atlassian.net")` prevents DNS-level spoofing — `"evilatlassian.net"` does not match because of the leading dot. However, credentials will be forwarded to **any** `*.atlassian.net` tenant, including ones owned by third parties. To scope injection to your own workspace only, use explicit equality: `.host == "mysite.atlassian.net"`.
+
+You can combine Atlassian and GitHub auth in a single `harnx-proxy-auth` invocation using multiple `--hook` flags:
+
+```yaml
+hooks:
+  entries:
+  - event: PreToolUse
+    type: claude-command-persistent
+    matcher: "bash_exec|bash_spawn"
+    command: >-
+      harnx-proxy-auth
+      --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
+          then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
+          end'
+      --hook 'if (.host | endswith(".atlassian.net"))
+          then .headers.authorization = "Basic \([(env.ATLASSIAN_EMAIL // ""), (env.ATLASSIAN_API_TOKEN // "")] | join(":") | @base64)"
           end'
 ```
 
