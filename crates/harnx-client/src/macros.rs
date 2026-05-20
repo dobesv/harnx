@@ -230,7 +230,13 @@ macro_rules! impl_client_trait {
 macro_rules! config_get_fn {
     ($field_name:ident, $fn_name:ident) => {
         fn $fn_name(&self) -> anyhow::Result<String> {
-            let env_prefix = Self::name(&self.config);
+            let full_name = Self::name(&self.config);
+            // Strip package namespace prefix (e.g. "pantheon/claude" → "claude")
+            // so package clients look for the same env vars as root clients,
+            // e.g. CLAUDE_API_KEY rather than the invalid PANTHEON/CLAUDE_API_KEY.
+            let env_prefix = full_name
+                .rsplit_once('/')
+                .map_or(full_name, |(_, bare)| bare);
             let env_name =
                 format!("{}_{}", env_prefix, stringify!($field_name)).to_ascii_uppercase();
             std::env::var(&env_name)

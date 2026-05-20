@@ -1179,4 +1179,23 @@ system_prompt_prefix:
         // saturating_add: overflow saturates to u64::MAX rather than panicking
         assert_eq!(add_opt_u64(Some(u64::MAX), Some(1)), Some(u64::MAX));
     }
+
+    /// Package-namespaced clients (e.g. "pantheon/claude") must look up
+    /// CLAUDE_API_KEY, not the invalid PANTHEON/CLAUDE_API_KEY.
+    #[test]
+    fn package_client_uses_bare_name_for_env_var() {
+        let config: ClaudeConfig =
+            serde_yaml::from_str("name: \"pantheon/claude\"").expect("parse config");
+        let client = ClaudeClient {
+            config,
+            model: Model::new("pantheon/claude", "claude-3-5-sonnet"),
+        };
+
+        // Set CLAUDE_API_KEY (bare name, no package prefix).
+        unsafe { std::env::set_var("CLAUDE_API_KEY", "test-key-bare") };
+        let result = client.get_api_key();
+        unsafe { std::env::remove_var("CLAUDE_API_KEY") };
+
+        assert_eq!(result.unwrap(), "test-key-bare");
+    }
 }
