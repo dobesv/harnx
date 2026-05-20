@@ -255,8 +255,15 @@ impl ServerHandler for HooksProxyServer {
                     tool_input: final_input,
                     error: message.clone(),
                 };
-                let _ = self.dispatch_event(&failure_event).await;
-                Ok(Self::error_result(message))
+                let failure_outcome = self.dispatch_event(&failure_event).await;
+                // If the failure hook provided a mutated response, use it;
+                // otherwise return the original error message.
+                let result = failure_outcome
+                    .result
+                    .mutated_tool_response
+                    .map(Self::value_to_call_tool_result)
+                    .unwrap_or_else(|| Self::error_result(message));
+                Ok(result)
             }
         }
     }

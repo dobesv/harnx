@@ -26,7 +26,7 @@ Building a transparent stdio MCP proxy that wraps a child subprocess MCP server 
 
 ## Symptoms
 
-```
+```text
 - Child process exits immediately after handshake completes
 - Proxy returns empty tool list despite child having tools
 - Child MCP server ignores CLI `--root` flags and uses empty roots

@@ -248,6 +248,8 @@ jobs:
             --pattern "harnx-pkg-$V-x86_64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-proxy-auth-$V-x86_64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-hooks-proxy-$V-x86_64-unknown-linux-musl.tar.gz" || true
           # Download aarch64 (arm64) archives
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-$V-aarch64-unknown-linux-musl.tar.gz" || true
@@ -269,6 +271,8 @@ jobs:
             --pattern "harnx-pkg-$V-aarch64-unknown-linux-musl.tar.gz" || true
           gh release download "$GITHUB_REF_NAME" \
             --pattern "harnx-proxy-auth-$V-aarch64-unknown-linux-musl.tar.gz" || true
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "harnx-mcp-hooks-proxy-$V-aarch64-unknown-linux-musl.tar.gz" || true
 
       - name: Extract archives
         run: |

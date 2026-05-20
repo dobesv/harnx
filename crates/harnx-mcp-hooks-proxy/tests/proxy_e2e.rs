@@ -310,13 +310,17 @@ async fn post_tool_use_failure() {
         "expected error content for unknown child tool, got empty: {text}"
     );
 
-    // Give the async hook a moment to complete writing the marker file.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    assert!(
-        marker_path.exists(),
-        "PostToolUseFailure hook did not fire (marker file not created at {marker_str})"
-    );
+    // Poll for the marker file with a bounded timeout instead of a fixed sleep.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if marker_path.exists() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("PostToolUseFailure hook did not fire within 5s (marker file not created at {marker_str})");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 async fn spawn_proxy(
