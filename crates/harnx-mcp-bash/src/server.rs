@@ -374,6 +374,68 @@ struct BashServerInner {
 }
 
 // ---------------------------------------------------------------------------
+// Home boundary guard
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `path` is `$HOME` itself or an ancestor of `$HOME`
+/// (e.g. `/home` or `/`). Returns `false` when `$HOME` is unset or when
+/// `path` is a child of `$HOME` (e.g. `$HOME/projects`).
+///
+/// Used to prevent over-broad roots from granting sandbox write/exec access.
+#[cfg(unix)]
+fn is_home_or_ancestor(path: &Path) -> bool {
+    let home_os = match std::env::var_os("HOME") {
+        Some(h) => h,
+        None => return false,
+    };
+    let home = std::fs::canonicalize(&home_os)
+        .unwrap_or_else(|_| std::path::Path::new(&home_os).to_path_buf());
+    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // path IS $HOME, or path is a strict ancestor of $HOME (home.starts_with(candidate))
+    home.starts_with(&candidate)
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox arg push helpers (used by build_sandbox_args)
+// ---------------------------------------------------------------------------
+
+/// Push `--write` and `--exec` args for `root`, unless it is `$HOME` or an ancestor.
+#[cfg(unix)]
+fn push_root_write_exec(root: &Path, args: &mut Vec<OsString>, writable: &mut Vec<PathBuf>) {
+    if is_home_or_ancestor(root) {
+        return;
+    }
+    args.push(OsString::from("--write"));
+    args.push(root.as_os_str().to_os_string());
+    args.push(OsString::from("--exec"));
+    args.push(root.as_os_str().to_os_string());
+    writable.push(root.to_path_buf());
+}
+
+/// Push `--read` and `--exec` args for `root`, unless it is `$HOME` or an ancestor.
+#[cfg(unix)]
+fn push_root_read_exec(root: &Path, args: &mut Vec<OsString>, readable: &mut Vec<PathBuf>) {
+    if is_home_or_ancestor(root) {
+        return;
+    }
+    args.push(OsString::from("--read"));
+    args.push(root.as_os_str().to_os_string());
+    args.push(OsString::from("--exec"));
+    args.push(root.as_os_str().to_os_string());
+    readable.push(root.to_path_buf());
+}
+
+/// Push `--exec` arg for `root`, unless it is `$HOME` or an ancestor.
+#[cfg(unix)]
+fn push_root_exec_only(root: &Path, args: &mut Vec<OsString>) {
+    if is_home_or_ancestor(root) {
+        return;
+    }
+    args.push(OsString::from("--exec"));
+    args.push(root.as_os_str().to_os_string());
+}
+
+// ---------------------------------------------------------------------------
 // BashServer
 // ---------------------------------------------------------------------------
 
@@ -910,21 +972,13 @@ impl BashServer {
         match outputs {
             None => {
                 for root in roots {
-                    args.push(OsString::from("--write"));
-                    args.push(root.clone().into_os_string());
-                    args.push(OsString::from("--exec"));
-                    args.push(root.clone().into_os_string());
-                    writable_paths.push(root.clone());
+                    push_root_write_exec(root, &mut args, &mut writable_paths);
                 }
             }
             Some([]) => {
                 if !inputs_explicit_empty {
                     for root in roots {
-                        args.push(OsString::from("--read"));
-                        args.push(root.clone().into_os_string());
-                        args.push(OsString::from("--exec"));
-                        args.push(root.clone().into_os_string());
-                        readable_paths.push(root.clone());
+                        push_root_read_exec(root, &mut args, &mut readable_paths);
                     }
                 }
             }
@@ -935,8 +989,7 @@ impl BashServer {
                     writable_paths.push(path.clone());
                 }
                 for root in roots {
-                    args.push(OsString::from("--exec"));
-                    args.push(root.clone().into_os_string());
+                    push_root_exec_only(root, &mut args);
                 }
             }
         }
@@ -4531,6 +4584,118 @@ mod tests {
         assert!(
             text.contains("custom_pager"),
             "Should override base env: {text}"
+        );
+    }
+    // ── Tests for is_home_or_ancestor and build_sandbox_args HOME filtering ──
+
+    #[cfg(unix)]
+    #[test]
+    fn test_home_itself_is_sensitive() {
+        let _env_guard = env_lock();
+        let _home = EnvVar::set("HOME", "/tmp/harnx-test-home");
+        assert!(
+            super::is_home_or_ancestor(std::path::Path::new("/tmp/harnx-test-home")),
+            "$HOME itself must be sensitive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_home_parent_is_sensitive() {
+        let _env_guard = env_lock();
+        // Use a real temp subdir so canonicalize works cross-platform (macOS
+        // maps /tmp -> /private/tmp; both sides canonicalize, so they match).
+        let tmp = std::env::temp_dir();
+        let fake_home = tmp.join("harnx-test-home-parent-check");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let _home = EnvVar::set("HOME", fake_home.as_os_str());
+        assert!(
+            super::is_home_or_ancestor(&tmp),
+            "Parent of $HOME must be sensitive"
+        );
+        assert!(
+            super::is_home_or_ancestor(std::path::Path::new("/")),
+            "Root / must be sensitive when HOME is set"
+        );
+        std::fs::remove_dir_all(&fake_home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_home_subdir_is_not_sensitive() {
+        let _env_guard = env_lock();
+        let _home = EnvVar::set("HOME", "/tmp/harnx-test-home");
+        assert!(
+            !super::is_home_or_ancestor(std::path::Path::new("/tmp/harnx-test-home/projects")),
+            "$HOME/projects must NOT be sensitive"
+        );
+        assert!(
+            !super::is_home_or_ancestor(std::path::Path::new("/other")),
+            "Unrelated path must NOT be sensitive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_no_home_env_returns_false() {
+        let _env_guard = env_lock();
+        let _no_home = EnvVar::unset("HOME");
+        assert!(
+            !super::is_home_or_ancestor(std::path::Path::new("/")),
+            "With HOME unset, is_home_or_ancestor must return false"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_home_root_excluded_from_sandbox_args() {
+        let _env_guard = env_lock();
+        let _home = EnvVar::set("HOME", "/tmp/harnx-test-sandbox-home");
+        let home_root = PathBuf::from("/tmp/harnx-test-sandbox-home");
+        let server =
+            BashServer::new_with_sandbox(vec![home_root.clone()], enabled_sandbox_config());
+        let args = server.build_sandbox_args(
+            std::path::Path::new("/tmp/harnx-test-sandbox-home/work"),
+            None,
+            None,
+            &[home_root],
+        );
+        let pairs = collect_arg_pairs(&args);
+        assert!(
+            !pairs
+                .iter()
+                .any(|(flag, val)| flag == "--write" && val == "/tmp/harnx-test-sandbox-home"),
+            "$HOME must not appear as --write arg: {pairs:?}"
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|(flag, val)| flag == "--exec" && val == "/tmp/harnx-test-sandbox-home"),
+            "$HOME must not appear as --exec arg: {pairs:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_home_subdir_root_included_in_sandbox_args() {
+        let _env_guard = env_lock();
+        let _home = EnvVar::set("HOME", "/tmp/harnx-test-sandbox-home2");
+        let subdir_root = PathBuf::from("/tmp/harnx-test-sandbox-home2/projects");
+        let server =
+            BashServer::new_with_sandbox(vec![subdir_root.clone()], enabled_sandbox_config());
+        let args = server.build_sandbox_args(
+            std::path::Path::new("/tmp/harnx-test-sandbox-home2/projects"),
+            None,
+            None,
+            &[subdir_root],
+        );
+        let pairs = collect_arg_pairs(&args);
+        assert!(
+            pairs
+                .iter()
+                .any(|(flag, val)| flag == "--write"
+                    && val == "/tmp/harnx-test-sandbox-home2/projects"),
+            "$HOME/projects must appear as --write arg: {pairs:?}"
         );
     }
 }
