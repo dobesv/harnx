@@ -1,5 +1,3 @@
-mod mcp;
-
 use anyhow::{anyhow, Result};
 use aws_credential_types::provider::ProvideCredentials;
 use aws_credential_types::Credentials;
@@ -18,7 +16,7 @@ use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRe
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-pub(crate) struct AppState {
+struct AppState {
     bearer_token: String,
     creds_provider: Arc<dyn ProvideCredentials>,
     region: String,
@@ -28,9 +26,6 @@ pub(crate) struct AppState {
 struct Args {
     #[arg(long)]
     profile: Option<String>,
-
-    #[arg(long)]
-    mcp: bool,
 }
 
 #[derive(Serialize)]
@@ -45,7 +40,7 @@ struct CredsResponse {
     expiration: Option<String>,
 }
 
-pub(crate) async fn build_app_state(args: &Args) -> Result<Arc<AppState>> {
+async fn build_app_state(args: &Args) -> Result<Arc<AppState>> {
     let mut builder = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(profile) = &args.profile {
         builder = builder.profile_name(profile);
@@ -104,7 +99,7 @@ fn format_expiration(expiry: SystemTime) -> Option<String> {
     Some(datetime.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
-pub(crate) async fn start_server(state: Arc<AppState>, listener: TcpListener) -> Result<u16> {
+async fn start_server(state: Arc<AppState>, listener: TcpListener) -> Result<u16> {
     let port = listener.local_addr()?.port();
     let router = Router::new()
         .route("/creds", get(creds_handler))
@@ -225,19 +220,16 @@ fn mutate_tool_input(tool_input: &Value, state: &AppState, port: u16) -> Result<
 async fn main() -> Result<()> {
     let args = Args::parse();
     let state = build_app_state(&args).await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = start_server(Arc::clone(&state), listener).await?;
 
-    if args.mcp {
-        mcp::run(state).await
-    } else {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let port = start_server(Arc::clone(&state), listener).await?;
-        eprintln!("harnx-aws-creds: listening on http://127.0.0.1:{port}/creds");
-        eprintln!(
-            "harnx-aws-creds: authorization token: {}",
-            state.bearer_token
-        );
-        run_hook_loop(&state, port).await
-    }
+    eprintln!("harnx-aws-creds: listening on http://127.0.0.1:{port}/creds");
+    eprintln!(
+        "harnx-aws-creds: authorization token: {}",
+        state.bearer_token
+    );
+
+    run_hook_loop(&state, port).await
 }
 
 #[cfg(test)]
@@ -267,7 +259,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn test_state() -> Arc<AppState> {
+    fn test_state() -> Arc<AppState> {
         Arc::new(AppState {
             bearer_token: "testtoken".to_string(),
             creds_provider: Arc::new(MockProvider),

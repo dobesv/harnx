@@ -9,14 +9,6 @@ pub struct Args {
     /// Example: 'if .host == "github.com" then .headers.authorization = "Bearer \(env.GITHUB_TOKEN)" else . end'
     #[arg(long, value_name = "JQ_FILTER")]
     pub hook: Vec<String>,
-
-    #[arg(long)]
-    pub mcp: bool,
-
-    /// Human-readable list of services this proxy provides access to, e.g. "GitHub, Jira".
-    /// Used in the MCP tool description and response message.
-    #[arg(long)]
-    pub services: Option<String>,
 }
 
 impl Args {
@@ -36,11 +28,7 @@ mod tests {
 
     #[test]
     fn combined_filter_defaults_to_identity() {
-        let args = Args {
-            hook: Vec::new(),
-            mcp: false,
-            services: None,
-        };
+        let args = Args { hook: Vec::new() };
         assert_eq!(args.combined_filter(), ".");
     }
 
@@ -48,8 +36,6 @@ mod tests {
     fn combined_filter_pipes_multiple_hooks() {
         let args = Args {
             hook: vec![".foo = 1".into(), ".bar = 2".into()],
-            mcp: false,
-            services: None,
         };
         assert_eq!(args.combined_filter(), ".foo = 1 | .bar = 2");
     }

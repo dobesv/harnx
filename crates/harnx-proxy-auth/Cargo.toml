@@ -29,7 +29,6 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 jaq-all.workspace = true
-rmcp.workspace = true
 
 [dev-dependencies]
 harnx-core = { path = "../harnx-core" }
