@@ -3,14 +3,11 @@ use super::*;
 
 pub use harnx_core::session::{Session, SessionLogEntry};
 
-use crate::client::{
-    render_message_input, CompletionTokenUsage, Message, MessageContent, MessageRole,
-};
+use crate::client::{CompletionTokenUsage, Message, MessageContent, MessageRole};
 use harnx_core::{
     event::{AgentEvent, SessionEvent},
     sink::emit_agent_event,
 };
-use harnx_render::MarkdownRender;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -542,11 +539,7 @@ pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
     }
 }
 
-pub fn render(
-    session: &Session,
-    render: &mut MarkdownRender,
-    agent_info: &Option<(String, Vec<String>)>,
-) -> Result<String> {
+pub fn render(session: &Session) -> Result<String> {
     let mut items = vec![];
 
     if let Some(path) = &session.path {
@@ -582,47 +575,21 @@ pub fn render(
         items.push(("max_input_tokens", max_input_tokens.to_string()));
     }
 
-    let mut lines: Vec<String> = items
+    let (tokens, percent) = session.tokens_usage();
+    let tokens_str = if percent > 0.0 {
+        format!("{tokens} ({percent}%)")
+    } else {
+        tokens.to_string()
+    };
+    items.push(("tokens", tokens_str));
+
+    let message_count = session.messages.iter().filter(|m| m.role.is_user()).count();
+    items.push(("turns", message_count.to_string()));
+
+    let lines: Vec<String> = items
         .iter()
         .map(|(name, value)| format!("{name:<20}{value}"))
         .collect();
-
-    lines.push(String::new());
-
-    if !session.is_empty() {
-        let resolve_url_fn = |url: &str| resolve_data_url(&session.data_urls, url.to_string());
-
-        for message in &session.messages {
-            match message.role {
-                MessageRole::System => {
-                    lines.push(render.render(&render_message_input(
-                        &message.content,
-                        resolve_url_fn,
-                        agent_info,
-                    )));
-                }
-                MessageRole::Assistant => {
-                    if let MessageContent::Text(text) = &message.content {
-                        lines.push(render.render(text));
-                    }
-                    lines.push("".into());
-                }
-                MessageRole::User => {
-                    lines.push(format!(
-                        ">> {}",
-                        render_message_input(&message.content, resolve_url_fn, agent_info)
-                    ));
-                }
-                MessageRole::Tool => {
-                    lines.push(render_message_input(
-                        &message.content,
-                        resolve_url_fn,
-                        agent_info,
-                    ));
-                }
-            }
-        }
-    }
 
     Ok(lines.join("\n"))
 }
@@ -2123,18 +2090,13 @@ content: second
 
     #[test]
     fn render_shows_model_fallbacks() {
-        use harnx_render::{MarkdownRender, RenderOptions};
-
         let mut session = test_session();
         session.set_model_fallbacks(vec![
             "anthropic:claude".to_string(),
             "google:gemini".to_string(),
         ]);
 
-        let options = RenderOptions::default();
-        let mut md_render = MarkdownRender::init(options).unwrap();
-        let agent_info: Option<(String, Vec<String>)> = None;
-        let output = super::render(&session, &mut md_render, &agent_info).unwrap();
+        let output = super::render(&session).unwrap();
 
         assert!(
             output.contains("model_fallbacks"),
@@ -2143,6 +2105,28 @@ content: second
         assert!(
             output.contains("anthropic:claude,google:gemini"),
             "render output should contain comma-separated fallback values: {output}"
+        );
+    }
+
+    #[test]
+    fn render_shows_turns_count_for_user_messages() {
+        use harnx_core::message::MessageRole;
+
+        let mut session = test_session();
+        session.push_message_for_test(MessageRole::User, "hello".to_string());
+        session.push_message_for_test(MessageRole::Assistant, "hi there".to_string());
+        session.push_message_for_test(MessageRole::User, "thanks".to_string());
+        session.update_tokens();
+
+        let output = super::render(&session).unwrap();
+
+        assert!(
+            output.contains("turns               2"),
+            "render output should show 2 user turns: {output}"
+        );
+        assert!(
+            output.contains("tokens"),
+            "render output should show tokens line: {output}"
         );
     }
 
