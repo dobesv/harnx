@@ -1,5 +1,6 @@
 ---
 source: crates/harnx-tui/src/tests.rs
+assertion_line: 652
 expression: rendered
 ---
 Welcome to harnx [VERSION]  •  Type .help for commands, Tab to
@@ -7,8 +8,8 @@ complete.
 💬  info-session-with-session-test
 model               mock:mock-model
 save_session        true
-
-
+tokens              0
+turns               0
 
 
 
