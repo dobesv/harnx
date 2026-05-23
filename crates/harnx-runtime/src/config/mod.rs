@@ -2443,16 +2443,9 @@ impl Config {
                 if let Some(active_agent) = &self.agent {
                     let existing_names: HashSet<String> =
                         functions.iter().map(|v| v.name.to_string()).collect();
-                    functions.extend(
-                        active_agent
-                            .tools()
-                            .declarations()
-                            .into_iter()
-                            .filter(|v| {
-                                tool_names.contains(&v.name)
-                                    && !existing_names.contains(&v.name)
-                            }),
-                    );
+                    functions.extend(active_agent.tools().declarations().into_iter().filter(|v| {
+                        tool_names.contains(&v.name) && !existing_names.contains(&v.name)
+                    }));
                 }
             }
         };
@@ -4977,8 +4970,10 @@ mod tests {
     fn select_tools_returns_none_without_use_tools() {
         use harnx_core::{agent_config::AgentConfig, tool::Tools};
 
-        let mut config = Config::default();
-        config.tools = Tools::init_from_mcp(Some(vec![make_tool_decl("fs_read")]));
+        let config = Config {
+            tools: Tools::init_from_mcp(Some(vec![make_tool_decl("fs_read")])),
+            ..Config::default()
+        };
 
         let agent_config = AgentConfig::from_prompt("no tools");
         // use_tools is not set
