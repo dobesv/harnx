@@ -156,26 +156,116 @@ mod tests {
 }
 
 pub async fn start_proxy(filter: CompiledFilter, ca: CaSetup) -> Result<u16> {
+    start_proxy_inner(filter, ca, false).await
+}
+
+/// Like [`start_proxy`] but skips TLS certificate verification for upstream
+/// connections. Only for use in integration tests with self-signed server certs.
+#[doc(hidden)]
+pub async fn start_proxy_danger_accept_invalid_certs(
+    filter: CompiledFilter,
+    ca: CaSetup,
+) -> Result<u16> {
+    start_proxy_inner(filter, ca, true).await
+}
+
+async fn start_proxy_inner(
+    filter: CompiledFilter,
+    ca: CaSetup,
+    danger_accept_invalid_certs: bool,
+) -> Result<u16> {
+    use hudsucker::rustls::client::danger::{
+        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    };
+    use hudsucker::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use hudsucker::rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
+    use hyper_util::client::legacy::connect::HttpConnector;
+
     let issuer = Issuer::from_ca_cert_pem(&ca.cert.pem(), ca.key_pair)?;
     let issuer = RcgenAuthority::new(issuer, 256, aws_lc_rs::default_provider());
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
-    let proxy = Proxy::builder()
-        .with_listener(listener)
-        .with_ca(issuer)
-        .with_rustls_connector(aws_lc_rs::default_provider())
-        .with_http_handler(AuthHandler {
-            filter: Arc::new(filter),
-        })
-        .build()?;
+    let handler = AuthHandler {
+        filter: Arc::new(filter),
+    };
 
-    tokio::spawn(async move {
-        if let Err(err) = proxy.start().await {
-            tracing::error!(error = %err, "Proxy error");
+    if danger_accept_invalid_certs {
+        // Build a custom rustls ClientConfig that accepts any server cert.
+        #[derive(Debug)]
+        struct AcceptAny;
+        impl ServerCertVerifier for AcceptAny {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, TlsError> {
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self, _msg: &[u8], _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, TlsError> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self, _msg: &[u8], _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, TlsError> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![
+                    SignatureScheme::ECDSA_NISTP256_SHA256,
+                    SignatureScheme::ECDSA_NISTP384_SHA384,
+                    SignatureScheme::RSA_PSS_SHA256,
+                    SignatureScheme::RSA_PSS_SHA384,
+                    SignatureScheme::RSA_PSS_SHA512,
+                    SignatureScheme::ED25519,
+                ]
+            }
         }
-    });
+        let tls_config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAny))
+            .with_no_client_auth();
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http);
+
+        let proxy = Proxy::builder()
+            .with_listener(listener)
+            .with_ca(issuer)
+            .with_http_connector(https)
+            .with_http_handler(handler)
+            .build()?;
+        tokio::spawn(async move {
+            if let Err(err) = proxy.start().await {
+                tracing::error!(error = %err, "Proxy error");
+            }
+        });
+    } else {
+        let proxy = Proxy::builder()
+            .with_listener(listener)
+            .with_ca(issuer)
+            .with_rustls_connector(aws_lc_rs::default_provider())
+            .with_http_handler(handler)
+            .build()?;
+        tokio::spawn(async move {
+            if let Err(err) = proxy.start().await {
+                tracing::error!(error = %err, "Proxy error");
+            }
+        });
+    }
 
     Ok(port)
 }
