@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     let (ca_setup, _ca_temp_dir) = ca::setup()?;
     let ca_cert_path = ca_setup.cert_pem_path.clone();
     let ca_cert_pem = std::fs::read_to_string(&ca_cert_path)?;
-    let port = proxy::start_proxy(filter, ca_setup).await?;
+    let port = proxy::start_proxy_with_log(filter, ca_setup, args.log_file).await?;
 
     // Write readiness lines then explicitly drop the lock before entering the
     // async JSONL loop. Holding a std::io::StdoutLock across an .await would

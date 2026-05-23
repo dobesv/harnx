@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -18,6 +19,7 @@ use crate::filter::{self, CompiledFilter};
 #[derive(Clone)]
 struct AuthHandler {
     filter: Arc<CompiledFilter>,
+    log_file: Option<PathBuf>,
 }
 
 impl HttpHandler for AuthHandler {
@@ -28,7 +30,7 @@ impl HttpHandler for AuthHandler {
     ) -> RequestOrResponse {
         let req_json = request_json(&req);
 
-        match filter::apply_filter(&self.filter, req_json) {
+        match filter::apply_filter(&self.filter, req_json.clone()) {
             Ok(result) => {
                 // If the filter sets `.block` to a truthy value, return a 403 response
                 // instead of forwarding the request.
@@ -49,17 +51,107 @@ impl HttpHandler for AuthHandler {
                     return response.into();
                 }
 
-                if let Some(headers) = result.get("headers").and_then(Value::as_object) {
-                    replace_headers(req.headers_mut(), headers);
+                let changed_headers = if let Some(headers) = result.get("headers").and_then(Value::as_object) {
+                    replace_headers(req.headers_mut(), headers)
+                } else {
+                    vec![]
+                };
+
+                // Log every request when --log-file is specified.
+                if let Some(log_path) = &self.log_file {
+                    let auth_after = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let host = result.get("host").and_then(Value::as_str).unwrap_or("");
+                    let method = result.get("method").and_then(Value::as_str).unwrap_or("");
+                    let path = result.get("path").and_then(Value::as_str).unwrap_or("");
+                    append_log(log_path, host, method, path, auth_after, &changed_headers);
                 }
             }
             Err(error) => {
                 tracing::warn!(error = %error, "request hook filter failed; passing through unchanged");
+                // Still log the request even if the filter failed.
+                if let Some(log_path) = &self.log_file {
+                    let host = req_json.get("host").and_then(Value::as_str).unwrap_or("");
+                    let method = req_json.get("method").and_then(Value::as_str).unwrap_or("");
+                    let path = req_json.get("path").and_then(Value::as_str).unwrap_or("");
+                    let auth = req_json
+                        .get("headers")
+                        .and_then(|h| h.get("authorization"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    append_log(log_path, host, method, path, auth, &["filter-error".to_string()]);
+                }
             }
         }
 
         req.into()
     }
+}
+
+/// Append one JSON log line per request to the log file.
+/// Truncates the Authorization header to avoid leaking full tokens:
+/// - Bearer → shows first 20 chars of the token
+/// - Basic  → decodes and shows username + first 12 chars of password
+fn append_log(
+    path: &std::path::Path,
+    host: &str,
+    method: &str,
+    req_path: &str,
+    auth: &str,
+    changed: &[String],
+) {
+    let auth_summary = truncate_auth(auth);
+    // Escape path for JSON (replace " and \ to avoid breaking the JSON line)
+    let path_safe = req_path.replace('\\', "\\\\").replace('"', "\\\"");
+    // Render changed headers as a JSON array of quoted strings
+    let changed_json = format!(
+        "[{}]",
+        changed
+            .iter()
+            .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let line = format!(
+        r#"{{"host":"{host}","method":"{method}","path":"{path_safe}","auth":"{auth_summary}","changed":{changed_json}}}"#,
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Return a safe summary of an Authorization header value — never the full token.
+fn truncate_auth(auth: &str) -> String {
+    if auth.is_empty() {
+        return "(none)".to_string();
+    }
+    if let Some(token) = auth.strip_prefix("Bearer ") {
+        return format!("Bearer {}...", &token[..token.len().min(12)]);
+    }
+    if let Some(b64) = auth.strip_prefix("Basic ") {
+        use base64::Engine as _;
+        if let Some(decoded) = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+        {
+            let (user, tok) = decoded.split_once(':').unwrap_or(("", &decoded));
+            return format!("Basic {}:{}...", user, &tok[..tok.len().min(12)]);
+        }
+    }
+    // Unknown scheme — show scheme only
+    auth.split_whitespace()
+        .next()
+        .map(|s| format!("{s} (...)"))
+        .unwrap_or_else(|| "(unknown)".to_string())
 }
 
 fn request_json(req: &Request<Body>) -> Value {
@@ -98,7 +190,10 @@ fn request_json(req: &Request<Body>) -> Value {
     })
 }
 
-fn replace_headers(headers: &mut http::HeaderMap, new_headers: &Map<String, Value>) {
+/// Apply header patches from the filter output.
+/// Returns a list of header names that were actually changed (added, updated, or removed).
+fn replace_headers(headers: &mut http::HeaderMap, new_headers: &Map<String, Value>) -> Vec<String> {
+    let mut changed = Vec::new();
     // Patch semantics: only touch keys present in new_headers.
     // null value → remove the header; string value → upsert; anything else → skip.
     // This preserves headers the filter didn't mention (e.g. Host, Content-Length).
@@ -107,13 +202,21 @@ fn replace_headers(headers: &mut http::HeaderMap, new_headers: &Map<String, Valu
             continue;
         };
         if value.is_null() {
-            headers.remove(&name);
+            if headers.remove(&name).is_some() {
+                changed.push(name.as_str().to_string());
+            }
         } else if let Some(s) = value.as_str() {
             if let Ok(v) = HeaderValue::from_str(s) {
-                headers.insert(name, v);
+                let old = headers.get(&name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+                let new_str = s.to_owned();
+                headers.insert(name.clone(), v);
+                if old.as_deref() != Some(&new_str) {
+                    changed.push(name.as_str().to_string());
+                }
             }
         }
     }
+    changed
 }
 
 #[cfg(test)]
@@ -156,7 +259,15 @@ mod tests {
 }
 
 pub async fn start_proxy(filter: CompiledFilter, ca: CaSetup) -> Result<u16> {
-    start_proxy_inner(filter, ca, false).await
+    start_proxy_inner(filter, ca, None, false).await
+}
+
+pub async fn start_proxy_with_log(
+    filter: CompiledFilter,
+    ca: CaSetup,
+    log_file: Option<PathBuf>,
+) -> Result<u16> {
+    start_proxy_inner(filter, ca, log_file, false).await
 }
 
 /// Like [`start_proxy`] but skips TLS certificate verification for upstream
@@ -166,12 +277,13 @@ pub async fn start_proxy_danger_accept_invalid_certs(
     filter: CompiledFilter,
     ca: CaSetup,
 ) -> Result<u16> {
-    start_proxy_inner(filter, ca, true).await
+    start_proxy_inner(filter, ca, None, true).await
 }
 
 async fn start_proxy_inner(
     filter: CompiledFilter,
     ca: CaSetup,
+    log_file: Option<PathBuf>,
     danger_accept_invalid_certs: bool,
 ) -> Result<u16> {
     use hudsucker::rustls::client::danger::{
@@ -189,6 +301,7 @@ async fn start_proxy_inner(
 
     let handler = AuthHandler {
         filter: Arc::new(filter),
+        log_file,
     };
 
     if danger_accept_invalid_certs {
