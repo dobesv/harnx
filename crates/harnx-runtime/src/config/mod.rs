@@ -2435,18 +2435,18 @@ impl Config {
                         }
                     })
                     .collect();
-            }
 
-            if let Some(agent) = &self.agent {
-                let mut agent_functions = agent.tools().declarations();
-                let tool_names: HashSet<String> =
-                    agent_functions.iter().map(|v| v.name.to_string()).collect();
-                agent_functions.extend(
-                    functions
-                        .into_iter()
-                        .filter(|v| !tool_names.contains(&v.name)),
-                );
-                functions = agent_functions;
+                // Merge in any agent-owned tool declarations (e.g. handoff tools, builtins)
+                // that are permitted by use_tools but not already present in `functions`.
+                // We apply the same `tool_names` whitelist so agent.tools() cannot smuggle
+                // in tools that use_tools did not request.
+                if let Some(active_agent) = &self.agent {
+                    let existing_names: HashSet<String> =
+                        functions.iter().map(|v| v.name.to_string()).collect();
+                    functions.extend(active_agent.tools().declarations().into_iter().filter(|v| {
+                        tool_names.contains(&v.name) && !existing_names.contains(&v.name)
+                    }));
+                }
             }
         };
         if functions.is_empty() {
@@ -4903,6 +4903,84 @@ mod tests {
         assert!(
             roots.contains(&cwd_str),
             "CWD below $HOME should be added as root, but not found in: {roots:?}"
+        );
+    }
+
+    // ── select_tools whitelist tests (#624) ──────────────────────────────────
+
+    fn make_tool_decl(name: &str) -> harnx_core::tool::ToolDeclaration {
+        harnx_core::tool::ToolDeclaration {
+            name: name.to_string(),
+            description: format!("tool {name}"),
+            parameters: Default::default(),
+            mcp_tool_name: None,
+            mcp_server_name: None,
+            call_template: None,
+            result_template: None,
+        }
+    }
+
+    /// Regression test for #624: when an agent has a `use_tools` whitelist and
+    /// `self.agent` is populated with all MCP tools, `select_tools` must return
+    /// only the whitelisted subset — not every tool known to the agent.
+    #[test]
+    fn select_tools_respects_use_tools_whitelist() {
+        use harnx_core::{agent_config::AgentConfig, tool::Tools};
+
+        // Set up config with three available tools (tool_use defaults to true).
+        let mut config = Config {
+            tools: Tools::init_from_mcp(Some(vec![
+                make_tool_decl("fs_read"),
+                make_tool_decl("fs_write"),
+                make_tool_decl("bash_exec"),
+            ])),
+            ..Config::default()
+        };
+
+        // Active agent also has all three tools (as happens at runtime via init_from_mcp).
+        let mut agent_config = AgentConfig::from_prompt("test agent");
+        agent_config.set_tools(Tools::init_from_mcp(Some(vec![
+            make_tool_decl("fs_read"),
+            make_tool_decl("fs_write"),
+            make_tool_decl("bash_exec"),
+        ])));
+        config.agent = Some(crate::config::agent::Agent::new(agent_config));
+
+        // Agent's use_tools only requests fs_read.
+        let mut agent_config2 = AgentConfig::from_prompt("test");
+        agent_config2.set_use_tools(Some(vec!["fs_read".to_string()]));
+
+        let result = config.select_tools(&agent_config2);
+
+        let names: Vec<String> = result
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["fs_read".to_string()],
+            "select_tools should honour use_tools and not leak fs_write or bash_exec: got {names:?}"
+        );
+    }
+
+    /// When use_tools is not set, select_tools should return None (no tools).
+    #[test]
+    fn select_tools_returns_none_without_use_tools() {
+        use harnx_core::{agent_config::AgentConfig, tool::Tools};
+
+        let config = Config {
+            tools: Tools::init_from_mcp(Some(vec![make_tool_decl("fs_read")])),
+            ..Config::default()
+        };
+
+        let agent_config = AgentConfig::from_prompt("no tools");
+        // use_tools is not set
+        let result = config.select_tools(&agent_config);
+        assert!(
+            result.is_none(),
+            "select_tools should return None when use_tools is unset"
         );
     }
 }
