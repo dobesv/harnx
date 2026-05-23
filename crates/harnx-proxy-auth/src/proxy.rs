@@ -77,9 +77,22 @@ fn request_json(req: &Request<Body>) -> Value {
         .collect::<Map<_, _>>();
 
     let uri = req.uri();
+    // For tunnelled HTTPS requests (after CONNECT), the URI is path-only and
+    // uri.host() returns "". Fall back to the Host header so jq filters can
+    // match on the actual target hostname.
+    let host = uri.host().unwrap_or_default();
+    let host = if host.is_empty() {
+        headers
+            .get("host")
+            .and_then(|v| v.as_str())
+            .map(|h| h.split(':').next().unwrap_or(h))
+            .unwrap_or_default()
+    } else {
+        host
+    };
     serde_json::json!({
         "method": req.method().as_str(),
-        "host": uri.host().unwrap_or_default(),
+        "host": host,
         "path": uri.path_and_query().map_or("/", |value| value.as_str()),
         "headers": headers,
     })
@@ -100,6 +113,45 @@ fn replace_headers(headers: &mut http::HeaderMap, new_headers: &Map<String, Valu
                 headers.insert(name, v);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hudsucker::hyper::Request;
+
+    fn make_request(uri: &str, host_header: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(h) = host_header {
+            builder = builder.header("host", h);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    /// For tunnelled HTTPS (CONNECT), the inner request URI is path-only.
+    /// request_json must fall back to the Host header so jq host filters work.
+    #[test]
+    fn request_json_uses_host_header_when_uri_has_no_host() {
+        let req = make_request("/dobesv/harnx.git/info/refs", Some("github.com"));
+        let json = request_json(&req);
+        assert_eq!(json["host"], "github.com");
+    }
+
+    /// Port suffix in Host header should be stripped.
+    #[test]
+    fn request_json_strips_port_from_host_header() {
+        let req = make_request("/", Some("github.com:443"));
+        let json = request_json(&req);
+        assert_eq!(json["host"], "github.com");
+    }
+
+    /// When URI has a host (plain HTTP or absolute-form), use it directly.
+    #[test]
+    fn request_json_uses_uri_host_when_present() {
+        let req = make_request("http://api.github.com/user", None);
+        let json = request_json(&req);
+        assert_eq!(json["host"], "api.github.com");
     }
 }
 
