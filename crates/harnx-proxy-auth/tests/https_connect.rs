@@ -19,7 +19,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_rustls::rustls::{self, pki_types};
 use tokio_rustls::TlsAcceptor;
 
@@ -66,9 +66,7 @@ async fn spawn_https_server(
     Ok((port, shutdown_tx))
 }
 
-async fn echo_headers(
-    req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn echo_headers(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let headers: BTreeMap<String, String> = req
         .headers()
         .iter()
@@ -91,11 +89,16 @@ async fn echo_headers(
 /// is empty, so `.host == "localhost"` matches correctly.
 #[tokio::test]
 async fn header_injection_works_through_https_connect_tunnel() {
+    // Workspace builds pull in both `aws-lc-rs` and `ring` rustls providers
+    // transitively, so rustls' process-level auto-detect panics. Pin one here.
+    // `.ok()` tolerates a provider already installed by an earlier test.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     timeout(Duration::from_secs(20), async {
         // Set up the proxy CA — keep the TempDir alive for the duration.
         let (ca_setup, _ca_temp_dir) = ca::setup().expect("proxy CA setup");
-        let ca_cert_pem = std::fs::read_to_string(&ca_setup.cert_pem_path)
-            .expect("read CA cert PEM");
+        let ca_cert_pem =
+            std::fs::read_to_string(&ca_setup.cert_pem_path).expect("read CA cert PEM");
 
         // Generate a self-signed server cert for "localhost".
         let server_key = rcgen::KeyPair::generate().expect("gen server key");
@@ -105,10 +108,9 @@ async fn header_injection_works_through_https_connect_tunnel() {
         let server_key_der = server_cert.signing_key.serialize_der();
 
         // Spawn an HTTPS server using the self-signed cert.
-        let (server_port, _server_shutdown) =
-            spawn_https_server(server_cert_der, server_key_der)
-                .await
-                .expect("spawn HTTPS server");
+        let (server_port, _server_shutdown) = spawn_https_server(server_cert_der, server_key_der)
+            .await
+            .expect("spawn HTTPS server");
 
         // Compile the jq filter that injects a test header for localhost.
         let filter_expr =
@@ -117,10 +119,9 @@ async fn header_injection_works_through_https_connect_tunnel() {
 
         // Start the proxy with danger_accept_invalid_certs so it can connect
         // upstream to our self-signed test server.
-        let proxy_port =
-            proxy::start_proxy_danger_accept_invalid_certs(compiled, ca_setup)
-                .await
-                .expect("start proxy");
+        let proxy_port = proxy::start_proxy_danger_accept_invalid_certs(compiled, ca_setup)
+            .await
+            .expect("start proxy");
         let _ = server_key; // keep alive
 
         sleep(Duration::from_millis(100)).await;

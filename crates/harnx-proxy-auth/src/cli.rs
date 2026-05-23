@@ -10,10 +10,12 @@ pub struct Args {
     #[arg(long, value_name = "JQ_FILTER")]
     pub hook: Vec<String>,
 
-    /// Write a diagnostic log line for every request that matches a hook filter
-    /// (i.e. where the output differs from the input). Each line is a JSON
-    /// object: {"host", "method", "path", "authorization_prefix"}.
-    /// Useful for debugging auth injection without exposing full tokens.
+    /// Write a JSON log line for every proxied request. Each line is a JSON
+    /// object with fields: host, method, path, auth, changed.
+    /// `auth` is a truncated summary of the outgoing Authorization header
+    /// (never the full token) and `changed` lists header names the hook
+    /// added, replaced, or removed. Useful for debugging auth injection
+    /// without exposing full tokens.
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<std::path::PathBuf>,
 }

@@ -7,10 +7,17 @@ use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper::{body::Bytes, Request},
     rcgen::Issuer,
-    rustls::crypto::aws_lc_rs,
+    rustls::{
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        crypto::aws_lc_rs,
+        pki_types::{CertificateDer, ServerName, UnixTime},
+        ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme,
+    },
     Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
 };
+use hyper_util::client::legacy::connect::HttpConnector;
 use serde_json::{Map, Value};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 
 use crate::ca::CaSetup;
@@ -51,11 +58,12 @@ impl HttpHandler for AuthHandler {
                     return response.into();
                 }
 
-                let changed_headers = if let Some(headers) = result.get("headers").and_then(Value::as_object) {
-                    replace_headers(req.headers_mut(), headers)
-                } else {
-                    vec![]
-                };
+                let changed_headers =
+                    if let Some(headers) = result.get("headers").and_then(Value::as_object) {
+                        replace_headers(req.headers_mut(), headers)
+                    } else {
+                        vec![]
+                    };
 
                 // Log every request when --log-file is specified.
                 if let Some(log_path) = &self.log_file {
@@ -64,25 +72,33 @@ impl HttpHandler for AuthHandler {
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("");
-                    let host = result.get("host").and_then(Value::as_str).unwrap_or("");
-                    let method = result.get("method").and_then(Value::as_str).unwrap_or("");
-                    let path = result.get("path").and_then(Value::as_str).unwrap_or("");
-                    append_log(log_path, host, method, path, auth_after, &changed_headers);
+                    let entry = serde_json::json!({
+                        "host": result.get("host").and_then(Value::as_str).unwrap_or(""),
+                        "method": result.get("method").and_then(Value::as_str).unwrap_or(""),
+                        "path": result.get("path").and_then(Value::as_str).unwrap_or(""),
+                        "auth": truncate_auth(auth_after),
+                        "changed": changed_headers,
+                    });
+                    append_log(log_path, &entry).await;
                 }
             }
             Err(error) => {
                 tracing::warn!(error = %error, "request hook filter failed; passing through unchanged");
                 // Still log the request even if the filter failed.
                 if let Some(log_path) = &self.log_file {
-                    let host = req_json.get("host").and_then(Value::as_str).unwrap_or("");
-                    let method = req_json.get("method").and_then(Value::as_str).unwrap_or("");
-                    let path = req_json.get("path").and_then(Value::as_str).unwrap_or("");
                     let auth = req_json
                         .get("headers")
                         .and_then(|h| h.get("authorization"))
                         .and_then(Value::as_str)
                         .unwrap_or("");
-                    append_log(log_path, host, method, path, auth, &["filter-error".to_string()]);
+                    let entry = serde_json::json!({
+                        "host": req_json.get("host").and_then(Value::as_str).unwrap_or(""),
+                        "method": req_json.get("method").and_then(Value::as_str).unwrap_or(""),
+                        "path": req_json.get("path").and_then(Value::as_str).unwrap_or(""),
+                        "auth": truncate_auth(auth),
+                        "changed": ["filter-error"],
+                    });
+                    append_log(log_path, &entry).await;
                 }
             }
         }
@@ -91,40 +107,22 @@ impl HttpHandler for AuthHandler {
     }
 }
 
-/// Append one JSON log line per request to the log file.
-/// Truncates the Authorization header to avoid leaking full tokens:
-/// - Bearer → shows first 20 chars of the token
-/// - Basic  → decodes and shows username + first 12 chars of password
-fn append_log(
-    path: &std::path::Path,
-    host: &str,
-    method: &str,
-    req_path: &str,
-    auth: &str,
-    changed: &[String],
-) {
-    let auth_summary = truncate_auth(auth);
-    // Escape path for JSON (replace " and \ to avoid breaking the JSON line)
-    let path_safe = req_path.replace('\\', "\\\\").replace('"', "\\\"");
-    // Render changed headers as a JSON array of quoted strings
-    let changed_json = format!(
-        "[{}]",
-        changed
-            .iter()
-            .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    let line = format!(
-        r#"{{"host":"{host}","method":"{method}","path":"{path_safe}","auth":"{auth_summary}","changed":{changed_json}}}"#,
-    );
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        use std::io::Write as _;
-        let _ = writeln!(f, "{line}");
+/// Append one JSON log line per request to the log file. Errors are logged
+/// but do not interrupt request handling.
+async fn append_log(path: &std::path::Path, entry: &Value) {
+    let mut line = entry.to_string();
+    line.push('\n');
+    let write = async {
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        f.write_all(line.as_bytes()).await?;
+        anyhow::Ok(())
+    };
+    if let Err(err) = write.await {
+        tracing::warn!(error = %err, "failed to write auth log line");
     }
 }
 
@@ -207,7 +205,10 @@ fn replace_headers(headers: &mut http::HeaderMap, new_headers: &Map<String, Valu
             }
         } else if let Some(s) = value.as_str() {
             if let Ok(v) = HeaderValue::from_str(s) {
-                let old = headers.get(&name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+                let old = headers
+                    .get(&name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
                 let new_str = s.to_owned();
                 headers.insert(name.clone(), v);
                 if old.as_deref() != Some(&new_str) {
@@ -217,6 +218,132 @@ fn replace_headers(headers: &mut http::HeaderMap, new_headers: &Map<String, Valu
         }
     }
     changed
+}
+
+pub async fn start_proxy(filter: CompiledFilter, ca: CaSetup) -> Result<u16> {
+    start_proxy_inner(filter, ca, None, false).await
+}
+
+pub async fn start_proxy_with_log(
+    filter: CompiledFilter,
+    ca: CaSetup,
+    log_file: Option<PathBuf>,
+) -> Result<u16> {
+    start_proxy_inner(filter, ca, log_file, false).await
+}
+
+/// Like [`start_proxy`] but skips TLS certificate verification for upstream
+/// connections. Only for use in integration tests with self-signed server certs.
+#[doc(hidden)]
+pub async fn start_proxy_danger_accept_invalid_certs(
+    filter: CompiledFilter,
+    ca: CaSetup,
+) -> Result<u16> {
+    start_proxy_inner(filter, ca, None, true).await
+}
+
+fn build_danger_https_connector() -> Result<hyper_rustls::HttpsConnector<HttpConnector>> {
+    // Nested so the trait impl is not visible at module scope.
+    // Used only when accepting self-signed upstream certs in integration tests.
+    #[derive(Debug)]
+    struct AcceptAny;
+    impl ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _msg: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _msg: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    let tls_config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny))
+        .with_no_client_auth();
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    Ok(hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http))
+}
+
+async fn start_proxy_inner(
+    filter: CompiledFilter,
+    ca: CaSetup,
+    log_file: Option<PathBuf>,
+    danger_accept_invalid_certs: bool,
+) -> Result<u16> {
+    let issuer = Issuer::from_ca_cert_pem(&ca.cert.pem(), ca.key_pair)?;
+    let issuer = RcgenAuthority::new(issuer, 256, aws_lc_rs::default_provider());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+
+    let handler = AuthHandler {
+        filter: Arc::new(filter),
+        log_file,
+    };
+
+    if danger_accept_invalid_certs {
+        let proxy = Proxy::builder()
+            .with_listener(listener)
+            .with_ca(issuer)
+            .with_http_connector(build_danger_https_connector()?)
+            .with_http_handler(handler)
+            .build()?;
+        tokio::spawn(async move {
+            if let Err(err) = proxy.start().await {
+                tracing::error!(error = %err, "Proxy error");
+            }
+        });
+    } else {
+        let proxy = Proxy::builder()
+            .with_listener(listener)
+            .with_ca(issuer)
+            .with_rustls_connector(aws_lc_rs::default_provider())
+            .with_http_handler(handler)
+            .build()?;
+        tokio::spawn(async move {
+            if let Err(err) = proxy.start().await {
+                tracing::error!(error = %err, "Proxy error");
+            }
+        });
+    }
+
+    Ok(port)
 }
 
 #[cfg(test)]
@@ -256,129 +383,4 @@ mod tests {
         let json = request_json(&req);
         assert_eq!(json["host"], "api.github.com");
     }
-}
-
-pub async fn start_proxy(filter: CompiledFilter, ca: CaSetup) -> Result<u16> {
-    start_proxy_inner(filter, ca, None, false).await
-}
-
-pub async fn start_proxy_with_log(
-    filter: CompiledFilter,
-    ca: CaSetup,
-    log_file: Option<PathBuf>,
-) -> Result<u16> {
-    start_proxy_inner(filter, ca, log_file, false).await
-}
-
-/// Like [`start_proxy`] but skips TLS certificate verification for upstream
-/// connections. Only for use in integration tests with self-signed server certs.
-#[doc(hidden)]
-pub async fn start_proxy_danger_accept_invalid_certs(
-    filter: CompiledFilter,
-    ca: CaSetup,
-) -> Result<u16> {
-    start_proxy_inner(filter, ca, None, true).await
-}
-
-async fn start_proxy_inner(
-    filter: CompiledFilter,
-    ca: CaSetup,
-    log_file: Option<PathBuf>,
-    danger_accept_invalid_certs: bool,
-) -> Result<u16> {
-    use hudsucker::rustls::client::danger::{
-        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-    };
-    use hudsucker::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use hudsucker::rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
-    use hyper_util::client::legacy::connect::HttpConnector;
-
-    let issuer = Issuer::from_ca_cert_pem(&ca.cert.pem(), ca.key_pair)?;
-    let issuer = RcgenAuthority::new(issuer, 256, aws_lc_rs::default_provider());
-
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-
-    let handler = AuthHandler {
-        filter: Arc::new(filter),
-        log_file,
-    };
-
-    if danger_accept_invalid_certs {
-        // Build a custom rustls ClientConfig that accepts any server cert.
-        #[derive(Debug)]
-        struct AcceptAny;
-        impl ServerCertVerifier for AcceptAny {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &CertificateDer<'_>,
-                _intermediates: &[CertificateDer<'_>],
-                _server_name: &ServerName<'_>,
-                _ocsp: &[u8],
-                _now: UnixTime,
-            ) -> Result<ServerCertVerified, TlsError> {
-                Ok(ServerCertVerified::assertion())
-            }
-            fn verify_tls12_signature(
-                &self, _msg: &[u8], _cert: &CertificateDer<'_>,
-                _dss: &DigitallySignedStruct,
-            ) -> Result<HandshakeSignatureValid, TlsError> {
-                Ok(HandshakeSignatureValid::assertion())
-            }
-            fn verify_tls13_signature(
-                &self, _msg: &[u8], _cert: &CertificateDer<'_>,
-                _dss: &DigitallySignedStruct,
-            ) -> Result<HandshakeSignatureValid, TlsError> {
-                Ok(HandshakeSignatureValid::assertion())
-            }
-            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-                vec![
-                    SignatureScheme::ECDSA_NISTP256_SHA256,
-                    SignatureScheme::ECDSA_NISTP384_SHA384,
-                    SignatureScheme::RSA_PSS_SHA256,
-                    SignatureScheme::RSA_PSS_SHA384,
-                    SignatureScheme::RSA_PSS_SHA512,
-                    SignatureScheme::ED25519,
-                ]
-            }
-        }
-        let tls_config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
-            .with_safe_default_protocol_versions()?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAny))
-            .with_no_client_auth();
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(http);
-
-        let proxy = Proxy::builder()
-            .with_listener(listener)
-            .with_ca(issuer)
-            .with_http_connector(https)
-            .with_http_handler(handler)
-            .build()?;
-        tokio::spawn(async move {
-            if let Err(err) = proxy.start().await {
-                tracing::error!(error = %err, "Proxy error");
-            }
-        });
-    } else {
-        let proxy = Proxy::builder()
-            .with_listener(listener)
-            .with_ca(issuer)
-            .with_rustls_connector(aws_lc_rs::default_provider())
-            .with_http_handler(handler)
-            .build()?;
-        tokio::spawn(async move {
-            if let Err(err) = proxy.start().await {
-                tracing::error!(error = %err, "Proxy error");
-            }
-        });
-    }
-
-    Ok(port)
 }
