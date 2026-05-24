@@ -85,7 +85,10 @@ hooks:
     matcher: "exec|spawn"
     command: >-
       harnx-proxy-auth
-      --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null
+      --hook 'if .host == "github.com" and (env.GITHUB_TOKEN // env.GH_TOKEN) != null
+          then .headers.authorization = "Basic \(["x-access-token", (env.GITHUB_TOKEN // env.GH_TOKEN)] | join(":") | @base64)"
+          end'
+      --hook 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null
           then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
           end'
       --hook 'if (.host | endswith(".atlassian.net")) and env.ATLASSIAN_API_TOKEN != null

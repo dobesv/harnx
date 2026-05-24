@@ -226,6 +226,149 @@ async fn handle_test_request(
     Ok(response)
 }
 
+/// NOTE: The HTTPS CONNECT tunnel regression test lives in tests/https_connect.rs
+/// (header_injection_works_through_https_connect_tunnel). It uses the proxy
+/// library directly so it can configure a custom outbound TLS connector for
+/// the self-signed test server cert. The binary-based test below is removed
+/// because the binary's outbound connector cannot be reconfigured for test certs.
+#[tokio::test]
+#[ignore = "superseded by tests/https_connect.rs which tests the same scenario via the library API"]
+async fn test_header_injection_through_https_connect_tunnel() {
+    timeout(Duration::from_secs(15), async {
+        let mut proxy = spawn_proxy("localhost").await.expect("spawn proxy");
+
+        let test_result = async {
+            let readiness = read_proxy_readiness(&mut proxy).await?;
+            sleep(Duration::from_millis(200)).await;
+
+            // Spawn a TLS test server with a self-signed cert.
+            let server = spawn_tls_test_server().await?;
+
+            // Build a reqwest client that routes HTTPS through the proxy.
+            // The proxy intercepts the TLS (MITM) and re-encrypts using its CA.
+            // We trust the proxy CA for the client-side TLS.
+            // We use danger_accept_invalid_hostnames=false but need the proxy CA
+            // trusted; the proxy's outbound connector handles upstream TLS separately.
+            let proxy_ca = reqwest::tls::Certificate::from_pem(&readiness.ca_cert_pem)
+                .context("parse proxy CA cert")?;
+
+            let client = reqwest::Client::builder()
+                .proxy(reqwest::Proxy::https(format!(
+                    "http://127.0.0.1:{}",
+                    readiness.proxy_port
+                ))?)
+                .add_root_certificate(proxy_ca)
+                // The proxy's outbound TLS connector sees our self-signed server
+                // cert; accept it so the proxy can forward the request upstream.
+                .danger_accept_invalid_certs(true)
+                .build()?;
+
+            let response = client
+                .get(format!("https://localhost:{}/", server.port))
+                .send()
+                .await?;
+
+            let status = response.status();
+            let body_bytes = response.bytes().await?;
+            let body_str = String::from_utf8_lossy(&body_bytes);
+
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "proxy HTTPS request failed: status={status}, body={body_str}"
+                ));
+            }
+            let body: Value = serde_json::from_slice(&body_bytes)
+                .map_err(|e| anyhow!("JSON parse error: {e}, body={body_str:?}"))?;
+
+            // The proxy hook matches `.host == "localhost"` and injects
+            // `x-test-header`. If host resolution from the Host header is
+            // broken, the header won't be present.
+            let injected = body
+                .get("x-test-header")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "missing x-test-header — proxy did not inject header for tunnelled HTTPS request. \
+                         echoed headers: {body}"
+                    )
+                })?;
+
+            assert_eq!(injected, "hello-world");
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        shutdown_proxy(&mut proxy).await;
+        test_result.expect("HTTPS CONNECT tunnel integration flow")
+    })
+    .await
+    .expect("test timed out");
+}
+
+struct TlsTestServer {
+    port: u16,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for TlsTestServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+async fn spawn_tls_test_server() -> Result<TlsTestServer> {
+    use tokio_rustls::rustls::{self, pki_types};
+    use tokio_rustls::TlsAcceptor;
+
+    // Generate a fresh self-signed cert for "localhost".
+    let server_key = rcgen::KeyPair::generate().context("generate server key")?;
+    let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .context("build server cert params")?;
+    server_params.is_ca = rcgen::IsCa::NoCa;
+    let server_cert = server_params
+        .self_signed(&server_key)
+        .context("self-sign server cert")?;
+    let cert_der = pki_types::CertificateDer::from(server_cert.der().to_vec());
+    let key_der = pki_types::PrivateKeyDer::try_from(server_key.serialize_der())
+        .map_err(|e| anyhow::anyhow!("wrap server key: {e}"))?;
+
+    let tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .context("build TLS server config")?;
+    let acceptor = TlsAcceptor::from(std::sync::Arc::new(tls_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accept_result = listener.accept() => {
+                    let Ok((stream, _addr)) = accept_result else { break; };
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        let Ok(tls_stream) = acceptor.accept(stream).await else { return; };
+                        let service = service_fn(handle_test_request);
+                        let _ = http1::Builder::new()
+                            .serve_connection(TokioIo::new(tls_stream), service)
+                            .await;
+                    });
+                }
+            }
+        }
+    });
+
+    Ok(TlsTestServer {
+        port,
+        shutdown: Some(shutdown_tx),
+    })
+}
+
 fn proxy_binary_path() -> PathBuf {
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_harnx-proxy-auth") {
         return PathBuf::from(path);
