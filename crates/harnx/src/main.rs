@@ -27,7 +27,7 @@ use harnx_hooks::{
     inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
     PersistentHookManager,
 };
-use harnx_render::{render_error, MarkdownRender, RenderOptions};
+use harnx_render::{render_error, MarkdownRender};
 use harnx_runtime::utils::*;
 
 use anyhow::{bail, Result};
@@ -393,9 +393,7 @@ fn select_breakdown_sections(transcript: &[TranscriptItem]) -> Option<BreakdownS
         .iter()
         .skip(last_user_idx + 1)
         .filter_map(|item| match item {
-            TranscriptItem::AssistantText { text, .. } | TranscriptItem::ThoughtText(text) => {
-                Some(text.as_str())
-            }
+            TranscriptItem::AssistantText { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -414,12 +412,17 @@ fn render_markdown_to_stderr(render: &mut MarkdownRender, text: &str) {
     eprintln!("{}", render.render(text));
 }
 
-fn print_session_breakdown(transcript: &[TranscriptItem], source: &AgentSource) {
+fn print_session_breakdown(
+    transcript: &[TranscriptItem],
+    source: &AgentSource,
+    config: &GlobalConfig,
+) {
     let Some(sections) = select_breakdown_sections(transcript) else {
         return;
     };
 
-    let Ok(mut render) = MarkdownRender::init(RenderOptions::default()) else {
+    let render_options = config.read().render_options().unwrap_or_default();
+    let Ok(mut render) = MarkdownRender::init(render_options) else {
         return;
     };
 
@@ -763,7 +766,7 @@ async fn start_interactive(config: &GlobalConfig) -> Result<()> {
             .unwrap_or_default(),
         session_id: config.read().session.as_ref().map(|s| s.id().to_string()),
     };
-    print_session_breakdown(tui.transcript(), &source);
+    print_session_breakdown(tui.transcript(), &source, config);
     let async_manager = tui.async_manager().lock().await;
     exit_session_with_hook(config, &async_manager, &persistent_manager).await?;
     persistent_manager.lock().await.shutdown();
@@ -857,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn select_breakdown_sections_collects_trailing_assistant_and_thought_text() {
+    fn select_breakdown_sections_collects_trailing_assistant_text_only() {
         let transcript = vec![
             user_text("question"),
             user_text("follow-up"),
@@ -867,7 +870,7 @@ mod tests {
 
         let sections = select_breakdown_sections(&transcript).unwrap();
 
-        assert_eq!(sections.final_response, vec!["answer", "thinking"]);
+        assert_eq!(sections.final_response, vec!["answer"]);
     }
 
     #[test]
@@ -883,7 +886,7 @@ mod tests {
 
         let sections = select_breakdown_sections(&transcript).unwrap();
 
-        assert_eq!(sections.final_response, vec!["answer", "thinking"]);
+        assert_eq!(sections.final_response, vec!["answer"]);
     }
 
     #[test]
