@@ -14,6 +14,7 @@ tags:
   - pure-function
   - accessor-design
 plan_ref: "harnx-573-tui-exit-session-breakdown"
+last_updated: 2026-05-24
 ---
 
 ## Problem
@@ -128,9 +129,29 @@ All implementations are identical. Future refactor should move to shared locatio
 
 ### Minor Issues (Non-blocking)
 
-- `RenderOptions::default()` used instead of config-derived options
+- ~~`RenderOptions::default()` used instead of config-derived options~~ — **Fixed 2026-05-24** (see Follow-up Fixes below)
 - Single `MarkdownRender` instance reused across items (state carry risk for malformed markdown)
 - Double `config.read()` in `start_interactive()` when building `AgentSource`
+
+## Follow-up Fixes (2026-05-24)
+
+Two bugs reported after PR #595 merge, addressed in plan `harnx-573-tui-exit-session-breakdown-fixes`:
+
+### Bug 1: Markdown Not Rendered on TUI Exit
+
+**Problem**: `print_session_breakdown` initialized `MarkdownRender` with `RenderOptions::default()` (theme: None). Without a theme, `MarkdownRender::highlight_line` returns lines unchanged — raw markdown displayed to user.
+
+**Fix**: Pass `&GlobalConfig` to `print_session_breakdown` and use `config.read().render_options().unwrap_or_default()`. Matches pattern used elsewhere (`main.rs:228`, `cli_event_sink.rs`).
+
+**Pattern**: `MarkdownRender` with `RenderOptions::default()` silently produces unformatted output. Always use `config.read().render_options().unwrap_or_default()` for user-facing rendering.
+
+### Bug 2: ThoughtText Dumped in Final Response
+
+**Problem**: `select_breakdown_sections` collected both `TranscriptItem::AssistantText` and `TranscriptItem::ThoughtText` into `final_response`. Owner reported too much output.
+
+**Fix**: Filter to `AssistantText` only. Unit tests in `main.rs` directly test transcript item filtering — straightforward to extend.
+
+**Key insight**: `ThoughtText` contains internal reasoning, not user-facing responses. Include only `AssistantText` in session breakdown output.
 
 ## Prevention Strategies
 
@@ -153,8 +174,12 @@ All implementations are identical. Future refactor should move to shared locatio
 - [ ] Does accessor return read-only reference for external consumers?
 - [ ] Are iterator methods (`position`/`rposition`) used over manual indexing?
 - [ ] Is there a test asserting empty collection handling?
+- [ ] Does `MarkdownRender` use config-derived `RenderOptions` (not `default()`)?
+- [ ] Are only user-facing transcript items included in output (exclude `ThoughtText`)?
 
 ## Related Issues
 
 - **Issue:** [#573](https://github.com/dobesv/harnx/issues/573) — On exit print some excerpts from session
+- **PR:** [#595](https://github.com/dobesv/harnx/pull/595) — Print session breakdown on TUI exit (initial implementation)
+- **Plan:** `harnx-573-tui-exit-session-breakdown-fixes` — Follow-up bug fixes (2026-05-24)
 - **Related:** `logic-errors/session-resume-hint-on-exit-2026-05-05.md` — Similar stderr output pattern on TUI exit
