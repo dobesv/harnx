@@ -84,7 +84,7 @@ Use these command-line tools for powerful code analysis:
 
 ### Working Tree State Detection
 
-**For reviews of uncommitted local changes**, always detect the working tree state before identifying changed files. Changes under review may be uncommitted or unstaged — `git log` and `git diff HEAD~1` will miss them entirely.
+**For reviews of uncommitted local changes**, always detect the working tree state before identifying changed files. Changes under review may be uncommitted or unstaged — `git log` and `git diff origin/HEAD...` applied to committed history will miss them entirely.
 
 Run these commands early in your exploration:
 1. `git status --short` — overview of working tree state (modified, staged, untracked files)
@@ -95,7 +95,8 @@ Run these commands early in your exploration:
 
 **Determining the changed-files list for local reviews:**
 - If there are unstaged or staged changes: these ARE the changes under review. Use the combined output of `git diff --name-only` and `git diff --cached --name-only` as the changed-files list.
-- If the working tree is clean (no uncommitted changes): fall back to `git diff HEAD~1 --name-only` or analyze the most recent commits.
+- If the working tree is clean (no uncommitted changes): fall back to `git diff origin/HEAD... --name-only` to list all changed files on this branch relative to the default branch.
+  - If `origin/HEAD` is not set (e.g. shallow clone), run `git fetch origin` first, or `git remote set-head origin -a` to set it.
 - Save the working tree state as a plan note (`working-tree-state`) so Aristarchus and the Muses know the review scope.
 
 Save the working tree state as a plan note (type: `working-tree-state`) so Aristarchus and the Muses know the review scope. Include: list of unstaged modified files, staged files, and untracked files. Note whether changes are in the working tree vs committed history.

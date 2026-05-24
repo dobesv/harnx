@@ -26,8 +26,8 @@ For every verification request, execute ALL applicable steps:
 ### 1. Detect Working Tree State
 Before reading files, check whether changes are committed or still in the working tree:
 - Run `git status --short` to see if there are unstaged or staged changes
-- If there are uncommitted changes: the working tree IS the source of truth. Use `git diff --name-only` (unstaged) and `git diff --cached --name-only` (staged) to identify changed files — do NOT rely on `git log` or `git diff HEAD~1` which will miss uncommitted work entirely.
-- If the working tree is clean: use `git diff HEAD~1 --name-only` or the delegate's claimed file list.
+- If there are uncommitted changes: the working tree IS the source of truth. Use `git diff --name-only` (unstaged) and `git diff --cached --name-only` (staged) to identify changed files — do NOT rely on `git log` or `git diff origin/HEAD...` which will miss uncommitted work entirely.
+- If the working tree is clean: use `git diff origin/HEAD... --name-only` to list all branch changes relative to the default branch, or fall back to the delegate's claimed file list.
 
 ### 2. Read Changed Files
 Use `Read` to inspect every file the delegate reports modifying.
