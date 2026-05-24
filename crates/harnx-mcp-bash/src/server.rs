@@ -516,7 +516,14 @@ impl BashServer {
     /// language version managers, locally-installed binaries).
     #[cfg(unix)]
     #[allow(dead_code)]
-    const HOME_EXEC_PATHS: &[&str] = &[".local/bin", ".local/lib", ".bun", ".asdf", "go/bin"];
+    const HOME_EXEC_PATHS: &[&str] = &[
+        ".local/bin",
+        ".local/lib",
+        ".bun",
+        ".asdf",
+        "go/bin",
+        ".cargo",
+    ];
 
     /// Read+write paths under `$HOME` for caches that hold data but should not
     /// be executable.
