@@ -245,7 +245,3 @@ Available fields you can set per server with jq:
 | `.roots += [...]` | Append to the roots list |
 | `.roots` | Replace the roots list entirely |
 
-### Optional / advanced
-
-`tmux_*` and `trigger_agent` tools in `sisyphus.md` are harnx built-ins for
-TUI/tmux workflow features — no separate server config needed.

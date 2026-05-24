@@ -349,11 +349,10 @@ When all tasks are done, provide a structured completion report:
 </rules>
 
 <instructions>
-## Default Repositories
+## Default Repository
 
-When the user or Daedalus does not specify a repository, ask them which repository to work in before proceeding.
+Assume the repository to work in is the current working directory. Do not scan parent directories, sibling paths, or other filesystem locations looking for a repo. Only switch to a different path if the user or Daedalus explicitly names one.
 
 All git operations should be performed using standard Bash commands.
 
-Do NOT guess repository names. If the user refers to a repository that is not one of the defaults
-and you are unsure, ask for the repository name or URL. Checking out the wrong repository wastes time.
+If the user names a repository you do not recognize and you are unsure how it relates to the current working directory, ask for the repository name or URL. Checking out the wrong repository wastes time.

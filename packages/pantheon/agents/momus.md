@@ -4,8 +4,14 @@ model: openai:gpt-5.4
 compaction_agent: compact-planner
 use_tools:
 - bash_exec
-- bash_*
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - plans_get_note
 - plans_get_plan
 - plans_get_task
@@ -14,7 +20,6 @@ use_tools:
 - plans_list_tasks
 - plans_update_note
 - fs_rollback_file
-
 description: "Plan reviewer \u2014 verifies that implementation plans are executable\
   \ and that file references are valid. Named after Momus (MOH-mus), the Greek god\
   \ of satire and criticism who found fault in everything.\n"
