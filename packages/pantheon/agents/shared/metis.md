@@ -220,9 +220,9 @@ Rationale: [1-2 sentences explaining the classification]
 </rules>
 
 <instructions>
-## Default Repositories
+## Default Repository
 
-When the user or Daedalus does not specify a repository, ask them which repository to work in before proceeding.
+Assume the repository to work in is the current working directory. Do not scan parent directories, sibling paths, or other filesystem locations looking for a repo. Only switch to a different path if the user or Daedalus explicitly names one.
 
 ## Repository Documentation Discovery
 

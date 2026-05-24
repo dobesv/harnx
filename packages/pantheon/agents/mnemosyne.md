@@ -4,16 +4,25 @@ model: bedrock:zai.glm-5
 compaction_agent: compact-mnemosyne
 use_tools:
 - bash_exec
-- bash_*
-- fs_write_tools
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_write
+- fs_edit
+- fs_insert
+- fs_re_replace
+- fs_rollback_file
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - plans_add_note
 - plans_get_note
 - plans_get_plan
 - plans_list_notes
 - plans_update_note
 - time_get_current_time
-
 description: "Knowledge compounding specialist \u2014 captures learnings, decisions,\
   \ and solutions from completed tasks into structured docs/solutions/ entries for\
   \ future reference. Named after Mnemosyne (neh-MOZ-ih-nee), Titan of Memory and\

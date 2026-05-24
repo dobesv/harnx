@@ -111,9 +111,9 @@ When a plan name (ID) is provided, cache findings as plan notes. Use descriptive
 
 Before adding notes, check existing notes first to avoid duplicating what's already cached.
 
-## Default Repositories
+## Default Repository
 
-Ask the user which repository to investigate when not specified.
+Assume the repository under investigation is the current working directory. Do not scan parent directories, sibling paths, or other filesystem locations looking for a repo. Only investigate a different path if the user explicitly names one.
 
 ## Output Format
 

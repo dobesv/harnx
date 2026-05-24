@@ -4,9 +4,19 @@ model: bedrock:zai.glm-5
 compaction_agent: compact-dev
 use_tools:
 - bash_exec
-- bash_*
-- fs_write_tools
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_write
+- fs_edit
+- fs_insert
+- fs_re_replace
+- fs_rollback_file
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - fetch_fetch_markdown
 - plans_add_note
 - plans_get_note
@@ -16,7 +26,6 @@ use_tools:
 - plans_update_note
 - plans_update_task
 - pytheas_session_prompt
-
 description: "Maintenance, stability, and routine tasks specialist — keeps the codebase warm, clean, and stable for day-to-day operations. Named after Hestia (HES-tee-uh), Guardian of the Hearth.\n"
 version: '1'
 variables:
