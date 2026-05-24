@@ -242,7 +242,7 @@ async fn test_header_injection_through_https_connect_tunnel() {
             sleep(Duration::from_millis(200)).await;
 
             // Spawn a TLS test server with a self-signed cert.
-            let server = spawn_tls_test_server(&readiness.ca_cert_pem).await?;
+            let server = spawn_tls_test_server().await?;
 
             // Build a reqwest client that routes HTTPS through the proxy.
             // The proxy intercepts the TLS (MITM) and re-encrypts using its CA.
@@ -318,7 +318,7 @@ impl Drop for TlsTestServer {
     }
 }
 
-async fn spawn_tls_test_server(_ca_cert_pem: &[u8]) -> Result<TlsTestServer> {
+async fn spawn_tls_test_server() -> Result<TlsTestServer> {
     use tokio_rustls::rustls::{self, pki_types};
     use tokio_rustls::TlsAcceptor;
 

@@ -101,7 +101,6 @@ async fn header_injection_works_through_https_connect_tunnel() {
             std::fs::read_to_string(&ca_setup.cert_pem_path).expect("read CA cert PEM");
 
         // Generate a self-signed server cert for "localhost".
-        let server_key = rcgen::KeyPair::generate().expect("gen server key");
         let server_cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("gen server cert");
         let server_cert_der = server_cert.cert.der().to_vec();
@@ -122,7 +121,6 @@ async fn header_injection_works_through_https_connect_tunnel() {
         let proxy_port = proxy::start_proxy_danger_accept_invalid_certs(compiled, ca_setup)
             .await
             .expect("start proxy");
-        let _ = server_key; // keep alive
 
         sleep(Duration::from_millis(100)).await;
 
