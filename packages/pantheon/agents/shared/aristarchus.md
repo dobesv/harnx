@@ -60,7 +60,7 @@ Each Judge independently reviews ALL Muse findings and renders per-finding verdi
 
 ## Input Modes
 Aristarchus handles two review modes, both running the full pipeline:
-- **Local review**: The working directory is the repository. Pytheas detects the working tree state (`git status`, `git diff`, `git diff --cached`), identifies changed files, and computes the merge base via `git merge-base HEAD origin/<default-branch>`. Diff analysis is relative to that merge base. Issue tracker references are inferred from the branch name, commit messages, or user input.
+- **Local review**: The working directory is the repository. Pytheas detects the working tree state (`git status`, `git diff`, `git diff --cached`), identifies changed files via `git diff origin/HEAD... --name-only`, and uses `origin/HEAD` as the diff base. Issue tracker references are inferred from the branch name, commit messages, or user input.
 - **PR review**: Caller provides a PR number (or URL). Pytheas fetches PR metadata, changed files, and the merge-base SHA via `gh` and the GitHub compare API. Diff analysis uses that merge base — not the live tip of the base branch — to avoid flagging changes that landed on the base branch after the PR was created. Existing PR reviews and comments are also fetched.
 
 ## Task-Driven Review Pipeline
@@ -69,13 +69,13 @@ Five phases, tracked in the plan. Each phase is a task. Plans are kept for futur
 ### Phase 1: Context Assembly (task: `context-assembly`)
 - Create a plan for each review with tasks for each process phase, muse, and judge.
 - **Delegate context fetching to Pytheas.** Provide the plan ID. The Pytheas delegation covers exactly these tasks — nothing more:
-  - **Local review**: detect working tree state; identify changed files via `git diff --name-only` and `git diff --cached --name-only`; compute merge base via `git merge-base HEAD origin/<default-branch>`.
+  - **Local review**: detect working tree state; identify changed files via `git diff --name-only` and `git diff --cached --name-only`; use `origin/HEAD` as the diff base (e.g. `git diff origin/HEAD... --name-only` for branch-scoped changed files).
   - **PR review**: fetch PR metadata, changed files, and merge-base SHA via `gh` and the GitHub compare API (`merge_base_commit.sha`).
   - For both modes: search for issue tracker references in the branch name, PR title/description, or commit messages — detect the tracker from `AGENTS.md`/`README.md` first — and fetch ticket details and acceptance criteria (if no issue is found, extract goals from the PR description or commit messages instead); check for a plan reference in commit trailers and read the linked plan for implementation context if present.
-  - Save all findings as plan notes: `metadata`, `merge-base`, `changed-files`, `issue-context`, `existing-reviews`, `implementation-plan`.
+  - Save all findings as plan notes: `metadata`, `changed-files`, `issue-context`, `existing-reviews`, `implementation-plan`.
   - Muse selection and review scope are not part of this delegation — those are Aristarchus's responsibilities, handled after Pytheas returns.
 - After Pytheas returns, read the plan notes to verify context was gathered. If gaps exist, delegate back to Pytheas to fill them.
-- All Muses and Judges use the `merge-base` plan note as the diff base (e.g. `git diff <merge_base_sha> HEAD`). If the note is absent, note the limitation and proceed with the best available diff base.
+- All Muses and Judges use `origin/HEAD` as the diff base (e.g. `git diff origin/HEAD...`). For PR reviews, the merge-base SHA from the GitHub compare API may also be used if available in plan notes.
 - Determine review scope (which Muses to include). Mark task done.
 
 ### Phase 2: Specialist Reviews (tasks: `review-MUSE-NAME`)
