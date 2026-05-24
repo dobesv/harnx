@@ -59,13 +59,13 @@ env:
 
 ### 3. Dotfile (`.env.bash`)
 
-You can create a `.env.bash` file in your Harnx configuration directory (typically `~/.config/harnx/.env.bash`). This file uses a plain `KEY=VALUE` format.
+You can create a `.env.bash` file in your Harnx data directory (typically `~/.local/share/harnx/.env.bash`). This path is overridable via the `HARNX_BASH_ENV_FILE` environment variable. This file uses a plain `KEY=VALUE` format.
 
 - `#` comments and blank lines are ignored.
 - The first `=` separates the key from the value (e.g., `KEY=a=b` produces value `a=b`).
 - No shell substitution is performed.
 
-**Example `~/.config/harnx/.env.bash`:**
+**Example `~/.local/share/harnx/.env.bash`:**
 
 ```text
 # GitHub Token
@@ -163,7 +163,7 @@ Pass `GH_TOKEN` or `GITHUB_TOKEN`:
 args: ["-e", "GITHUB_TOKEN"]
 ```
 
-Alternatively, you can persist these in `~/.config/harnx/.env.bash`.
+Alternatively, you can persist these in `~/.local/share/harnx/.env.bash`.
 
 #### Non-interactive Editor
 

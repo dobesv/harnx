@@ -3550,14 +3550,22 @@ pub fn load_env_file() -> Result<()> {
         Err(_) => return Ok(()),
     };
     debug!("Use env file '{}'", env_file_path.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::prelude::PermissionsExt;
+        let _ = std::fs::set_permissions(&env_file_path, std::fs::Permissions::from_mode(0o600));
+    }
     for line in contents.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
         if let Some((key, value)) = line.split_once('=') {
-            unsafe {
-                env::set_var(key.trim(), value.trim());
+            let key = key.trim();
+            if !key.is_empty() {
+                unsafe {
+                    env::set_var(key, value.trim());
+                }
             }
         }
     }

@@ -7,7 +7,7 @@ description: >-
   research and fact-finding.
 
 # Requires: Node.js / npx and an Exa API key.
-# Set EXA_API_KEY in ~/.config/harnx/.env
+# Set EXA_API_KEY in ~/.local/share/harnx/.env
 # Sign up at https://exa.ai to get a key.
 env:
   EXA_API_KEY: "$EXA_API_KEY"

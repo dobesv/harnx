@@ -19,7 +19,7 @@ Install from GHCR (replace `v0.1.0` with the current release):
 harnx-pkg add ghcr.io/dobesv/harnx-packages/coding v0.1.0
 ```
 
-Set your API keys in `~/.config/harnx/.env`:
+Set your API keys in `~/.local/share/harnx/.env`:
 
 ```sh
 CLAUDE_API_KEY=sk-ant-...
@@ -91,7 +91,7 @@ or symlink anything.
 | `context7.yaml` | `context7_*` | Node.js / npx | Library docs lookup. No API key. |
 | `grep.yaml` | `grep_*` | uv / uvx | GitHub code search via grep.app. No API key. |
 
-Add your Exa key to `~/.config/harnx/.env`:
+Add your Exa key to `~/.local/share/harnx/.env`:
 
 ```sh
 EXA_API_KEY=...
