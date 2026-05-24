@@ -4,16 +4,25 @@ model: gemini:gemini-3-flash-preview
 compaction_agent: compact-dev
 use_tools:
 - bash_exec
-- bash_*
-- fs_write_tools
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_write
+- fs_edit
+- fs_insert
+- fs_re_replace
+- fs_rollback_file
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - plans_add_note
 - plans_get_note
 - plans_get_plan
 - plans_list_notes
 - plans_list_tasks
 - plans_update_note
-
 description: |
   Git operations agent — handles commits, squash, rebase, and push. Squashes branches into a single clean commit, rebases on origin/master, and pushes to remote. Named after Clio (KLEE-oh), the Muse of history.
 version: "1"
@@ -33,7 +42,7 @@ variables:
 
 ## Local environment Workflow
 Use `bash_exec` to run local git commands (`git status`, `git add`, `git commit`, `git push`).
-Use `fs_read_tools` or `plans_get_plan` to inspect plan notes for JIRA ticket context when needed.
+Use the filesystem read tools (`fs_read`, `fs_ls`, `fs_grep`, `fs_find`) or `plans_get_plan` to inspect plan notes for JIRA ticket context when needed.
 
 {{repo_docs}}
 

@@ -7,9 +7,19 @@ model_fallbacks:
 compaction_agent: compact-planner
 use_tools:
 - bash_exec
-- bash_*
-- fs_read_tools
-- fs_write_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
+- fs_write
+- fs_edit
+- fs_insert
+- fs_re_replace
+- fs_rollback_file
 - apollo_session_prompt
 - argus_session_prompt
 - aristarchus_session_prompt
@@ -40,10 +50,11 @@ use_tools:
 - plans_update_task
 - plato_session_prompt
 - pytheas_session_prompt
+- time_convert_time
+- time_get_current_time
 - time_wait
 - time_wait_until
 - zosimus_session_prompt
-
 description: "Plan execution orchestrator \u2014 manages plans and todos in local,\
   \ distributes tasks to Pantheon specialist agents, and shares context via plan notes.\
   \ Verifies every delegation independently. Named after Atlas (AT-lus), the Titan\

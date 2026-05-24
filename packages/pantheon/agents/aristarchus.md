@@ -3,13 +3,23 @@ model: openai:gpt-5.4
 compaction_agent: compact-reviewer
 use_tools:
   - aeacus_session_prompt
-  - bash_*
   - bash_exec
+  - bash_read_exec_log
+  - bash_spawn
+  - bash_wait
+  - bash_terminate
   - calliope_session_prompt
   - erato_session_prompt
   - euterpe_session_prompt
-  - fs_read_tools
-  - fs_write_tools
+  - fs_read
+  - fs_ls
+  - fs_grep
+  - fs_find
+  - fs_write
+  - fs_edit
+  - fs_insert
+  - fs_re_replace
+  - fs_rollback_file
   - librarian_session_prompt
   - melpomene_session_prompt
   - minos_session_prompt
@@ -36,7 +46,6 @@ use_tools:
   - thalia_session_prompt
   - tyche_session_prompt
   - urania_session_prompt
-
 description: "Code review coordinator \u2014 orchestrates multi-agent code review\
   \ of pull requests and codebases, aggregating specialist findings into structured\
   \ verdicts. Named after Aristarchus (ar-ih-STAR-kus) of Samothrace, the greatest\

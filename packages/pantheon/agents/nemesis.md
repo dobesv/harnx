@@ -4,15 +4,20 @@ model: bedrock:zai.glm-5
 compaction_agent: compact-reliability
 use_tools:
 - bash_exec
-- bash_*
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - plans_add_note
 - plans_get_note
 - plans_get_plan
 - plans_list_notes
 - plans_update_note
 - fs_rollback_file
-
 description: "Reliability specialist \u2014 reviews error handling, retry logic, circuit\
   \ breakers, timeouts, health checks, graceful degradation, and async handler safety.\
   \ Named after Nemesis (NEM-uh-sis), goddess of retribution who ensures hubris does\

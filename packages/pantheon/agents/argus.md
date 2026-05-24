@@ -3,8 +3,15 @@ role: subagent
 model: gemini:gemini-3-flash-preview
 compaction_agent: compact-argus
 use_tools:
-- bash_*
-- fs_read_tools
+- bash_exec
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - plans_add_note
 - plans_get_note
 - plans_get_plan
@@ -13,7 +20,6 @@ use_tools:
 - plans_list_tasks
 - plans_update_note
 - plans_update_task
-
 description: "Task verification agent — independently verifies work completed by other agents by reading changed files, running tests and diagnostics, and cross-checking claims against actual results. Returns structured PASS/FAIL verdicts with evidence. Named after Argus (AR-gus) Panoptes, the hundred-eyed giant who never slept.\n"
 version: '1'
 variables:

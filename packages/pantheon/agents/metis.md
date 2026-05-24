@@ -4,12 +4,17 @@ model: bedrock:zai.glm-5
 compaction_agent: compact-planner
 use_tools:
 - bash_exec
-- bash_*
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - librarian_session_prompt
 - pytheas_session_prompt
 - fs_rollback_file
-
 description: "Pre-planning consultant \u2014 analyzes user requests before Daedalus\
   \ generates plans, identifying hidden intentions, ambiguities, and AI failure points.\
   \ Produces directives that guide the planner. Named after Metis (MEE-tis), the Greek\

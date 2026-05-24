@@ -4,8 +4,14 @@ model: openai:gpt-5.4
 compaction_agent: compact-reviewer
 use_tools:
 - bash_exec
-- bash_*
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - plans_add_note
 - plans_get_note
 - plans_get_plan
@@ -14,7 +20,6 @@ use_tools:
 - plans_list_tasks
 - plans_update_note
 - fs_rollback_file
-
 description: "Pragmatic engineer \u2014 evaluates code review findings through the\
   \ lens of real-world production impact, blast radius, and failure modes. Named after\
   \ Aeacus (EE-uh-kus), keeper of the Underworld's records who ensured completeness.\n"
