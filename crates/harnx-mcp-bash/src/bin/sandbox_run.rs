@@ -137,10 +137,6 @@ fn add_path_exception(
     make_exception: fn(PathBuf) -> Exception,
 ) -> Result<(), String> {
     if !path.exists() {
-        eprintln!(
-            "sandbox-run: skipping non-existent path: {}",
-            path.display()
-        );
         return Ok(());
     }
 
@@ -307,7 +303,7 @@ mod tests {
         );
         // If the ancestor walk were still present, $HOME would have been added.
         // We can't inspect Birdcage internals, but if it didn't add it the function
-        // must have taken the early-return path (the warning + Ok(()) branch).
+        // must have taken the early-return path (the Ok(()) branch).
         // The test above verifies that the function returns Ok without erroring,
         // which is the correct post-fix behavior (previously it would walk to $HOME).
     }
