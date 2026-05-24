@@ -126,10 +126,12 @@ async fn header_injection_works_through_https_connect_tunnel() {
 
         sleep(Duration::from_millis(100)).await;
 
-        // Build a reqwest client that:
-        // 1. routes HTTPS through the proxy (CONNECT tunnel)
-        // 2. trusts the proxy CA (for the MITM interception AND the server cert,
-        //    since both are signed by the same CA)
+        // Build a reqwest client that routes HTTPS through the proxy (CONNECT
+        // tunnel). `danger_accept_invalid_certs` is required because the
+        // MITM leaf certs hudsucker generates have no Extended Key Usage,
+        // which the macOS Security framework (used by rustls-platform-verifier
+        // on Darwin) rejects with EkuError. The proxy CA is still pinned so
+        // any verifier that *does* honour it sees a trusted chain.
         let proxy_ca = reqwest::tls::Certificate::from_pem(ca_cert_pem.as_bytes())
             .expect("parse proxy CA cert");
 
@@ -139,6 +141,7 @@ async fn header_injection_works_through_https_connect_tunnel() {
                     .expect("build proxy"),
             )
             .add_root_certificate(proxy_ca)
+            .danger_accept_invalid_certs(true)
             .build()
             .expect("build reqwest client");
 
