@@ -4,15 +4,20 @@ model: bedrock:zai.glm-5
 compaction_agent: compact-deploy
 use_tools:
 - bash_exec
-- bash_*
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - plans_add_note
 - plans_get_note
 - plans_get_plan
 - plans_list_notes
 - plans_update_note
 - fs_rollback_file
-
 description: "Deployment verification specialist \u2014 produces Go/No-Go deployment\
   \ checklists with pre-deployment checks, migration verification, rollback procedures,\
   \ and monitoring plans. Named after Tyche (TY-kee), goddess of fortune who determines\

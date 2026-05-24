@@ -4,8 +4,14 @@ model: bedrock:zai.glm-5
 compaction_agent: compact-reviewer
 use_tools:
 - bash_exec
-- bash_*
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - oracle_session_prompt
 - plans_add_note
 - plans_get_note
@@ -14,7 +20,6 @@ use_tools:
 - plans_update_note
 - pytheas_session_prompt
 - fs_rollback_file
-
 description: "Architecture and big picture specialist \u2014 evaluates cross-cutting\
   \ concerns, dependency direction, design pattern adherence, API contract consistency,\
   \ and system-wide impact. Named after Urania (yoo-RAY-nee-uh), the Muse of astronomy\

@@ -4,9 +4,19 @@ model: gemini:gemini-3.1-pro-preview
 compaction_agent: compact-dev
 use_tools:
 - bash_exec
-- bash_*
-- fs_write_tools
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_write
+- fs_edit
+- fs_insert
+- fs_re_replace
+- fs_rollback_file
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - fetch_fetch_markdown
 - plans_add_note
 - plans_get_note
@@ -16,7 +26,6 @@ use_tools:
 - plans_update_note
 - plans_update_task
 - pytheas_session_prompt
-
 description: "Visual engineering, frontend, and UI/UX specialist — bridges the gap between the invisible code and the visible UI. Named after Iris (EYE-ris), Goddess of the Rainbow.\n"
 version: '1'
 variables:

@@ -4,9 +4,19 @@ model: gemini:gemini-3.1-pro-preview
 compaction_agent: compact-dev
 use_tools:
 - bash_exec
-- bash_*
-- fs_write_tools
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_write
+- fs_edit
+- fs_insert
+- fs_re_replace
+- fs_rollback_file
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - fetch_fetch_markdown
 - plans_add_note
 - plans_get_note
@@ -17,7 +27,6 @@ use_tools:
 - plans_update_note
 - plans_update_task
 - pytheas_session_prompt
-
 description: "Creative coding and innovative solutions specialist — provides the creative spark for novel UX and 'out-of-the-box' logic. Named after Apollo (uh-POL-oh), God of the Arts.\n"
 version: '1'
 variables:

@@ -4,8 +4,14 @@ model: openai:gpt-5.4
 compaction_agent: compact-reviewer
 use_tools:
 - bash_exec
-- bash_*
-- fs_read_tools
+- bash_read_exec_log
+- bash_spawn
+- bash_wait
+- bash_terminate
+- fs_read
+- fs_ls
+- fs_grep
+- fs_find
 - librarian_session_prompt
 - plans_add_note
 - plans_get_note
@@ -13,7 +19,6 @@ use_tools:
 - plans_list_notes
 - plans_update_note
 - fs_rollback_file
-
 description: "Privacy and compliance specialist \u2014 evaluates PII handling, data\
   \ protection patterns, consent flows, data retention, logging practices, and regulatory\
   \ compliance. Named after Polyhymnia (pol-ee-HIM-nee-uh), the Muse of sacred poetry\

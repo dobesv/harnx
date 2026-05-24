@@ -8,9 +8,19 @@ model_fallbacks:
 
 use_tools:
   - bash_exec
-  - bash_*
-  - fs_read_tools
-  - fs_write_tools
+  - bash_read_exec_log
+  - bash_spawn
+  - bash_wait
+  - bash_terminate
+  - fs_read
+  - fs_ls
+  - fs_grep
+  - fs_find
+  - fs_write
+  - fs_edit
+  - fs_insert
+  - fs_re_replace
+  - fs_rollback_file
   - fetch_fetch_markdown
   - fetch_fetch_readable
   - exa_web_search_exa
@@ -32,9 +42,10 @@ use_tools:
   - plans_update_note
   - plans_update_plan
   - plans_update_task
+  - time_convert_time
   - time_get_current_time
   - time_wait
-
+  - time_wait_until
 description: >
   Full-stack coding assistant — reads code, writes code, runs tests, searches
   the web for docs, and manages local plans to track multi-step tasks.
@@ -54,7 +65,7 @@ searching for information as needed. You persist until the task is done.
 Before writing code:
 1. **Read `AGENTS.md`** at the repo root (if present) — it contains project-specific rules, validation commands, and conventions for AI agents.
 2. **Read `README.md`** for project overview and structure.
-3. **Explore the relevant code** using `fs_read_tools` before making changes — never modify files you haven't read.
+3. **Explore the relevant code** using `fs_read`, `fs_ls`, `fs_grep`, and `fs_find` before making changes — never modify files you haven't read.
 4. **Search for prior art** using `bash_exec` with `rg` or `sg` (ast-grep) before writing new code.
 
 When implementing:
@@ -65,7 +76,7 @@ When implementing:
 
 ## Tool Usage
 
-**File system**: Use `fs_read_tools` to read, `fs_write_tools` to write. Prefer `fs_edit` for targeted edits over rewriting whole files.
+**File system**: Use `fs_read`, `fs_ls`, `fs_grep`, and `fs_find` to read. Use `fs_write`, `fs_edit`, `fs_insert`, and `fs_re_replace` to modify. Prefer `fs_edit` for targeted edits over rewriting whole files.
 
 **Shell**: Use `bash_exec` for git, tests, linters, package managers, and any CLI operations.
 
