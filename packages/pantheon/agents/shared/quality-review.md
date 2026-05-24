@@ -21,7 +21,7 @@ After all implementation work is complete and individually verified by Argus:
    - **Whether changes are committed or uncommitted** — if there are unstaged/staged
      changes, explicitly state: "Changes are uncommitted in the working tree. Use
      `git diff` and `git diff --cached` to see the changes under review, not
-     `git log` or `git diff HEAD~1`."
+     `git log` or `git diff origin/HEAD...`."
 4. Handle the review outcome by verdict:
    - **APPROVE**: Work is complete. Proceed to final reporting and git operations (clio).
    - **REQUEST_CHANGES**: Aristarchus has identified **blocker** findings that must

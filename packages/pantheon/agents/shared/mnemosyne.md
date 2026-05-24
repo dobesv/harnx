@@ -61,7 +61,7 @@ It is bad to stop at "I found some learnings" without actually deciding whether 
 
 ### Phase 1: Analysis
 1. Read plan notes with `plan_get_notes` and extract notes of type: learnings, decisions, problems, and verification.
-2. Inspect recent changes by running `git diff HEAD~1` and `git log --oneline -5` to understand what changed.
+2. Inspect recent changes by running `git diff origin/HEAD...` and `git log --oneline origin/HEAD..` to understand what changed on this branch.
 3. Identify:
    - What problem was solved?
    - What approach was taken?

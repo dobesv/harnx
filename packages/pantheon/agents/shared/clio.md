@@ -62,24 +62,24 @@ Adds retry logic for 401 responses during the refresh window.
 
 ## Squash Base Rule
 
-**Always use `git merge-base` as the squash base — NEVER the default branch directly.**
+**Always use `origin/HEAD` as the squash base — NEVER `git merge-base`.**
 
-When squashing commits before a push, the base must be the point where the branch actually
-diverged from the default branch — not the current tip of the default branch. When a branch
-hasn't been rebased recently, those two are different commits. Using the branch tip as the
-base bundles all of master's advancement (potentially thousands of unrelated files) into the
-squashed commit.
+When squashing commits before a push, use `origin/HEAD` as the base. It always resolves to
+the current tip of the default branch on the remote, which is the correct boundary for what
+belongs in this PR.
+
+> **Prerequisite**: `origin/HEAD` must be set. If in doubt, run `git fetch origin` before
+> squashing. If `origin/HEAD` is not set (rare in some shallow clones), set it explicitly:
+> `git remote set-head origin -a`.
+
+Using `git merge-base` is unreliable: when the default branch has been merged *into* the
+feature branch (common in merge-workflow teams), the merge-base drifts forward and captures
+too little history — the squash misses commits that should be included.
 
 **Correct:**
 ```
-git reset --soft $(git merge-base HEAD origin/<default-branch>)
+git reset --soft origin/HEAD
 git commit -m "..."
-```
-
-**Never:**
-```
-git reset --soft origin/<default-branch>   # WRONG — picks up all master advancement
-git rebase -i origin/<default-branch>      # WRONG — same problem
 ```
 
 ### Mandatory File-Count Sanity Check
@@ -87,16 +87,16 @@ git rebase -i origin/<default-branch>      # WRONG — same problem
 After squashing and before rebasing or pushing, verify the squash captured only this PR's changes:
 
 ```
-git diff $(git merge-base HEAD origin/<default-branch>)..HEAD --name-only | wc -l
+git diff origin/HEAD... --name-only | wc -l
 ```
 
 **If the count exceeds 200 files, STOP immediately.** Do NOT rebase or push.
-This almost certainly means the wrong squash base was used — the squash captured
-master's advancement in addition to the PR's actual changes.
+This almost certainly means something is wrong with the squash — verify the branch is
+not accidentally including unrelated commits.
 
 Report to the caller:
 - The file count observed
-- That the squash base appears incorrect
+- That the squash result appears incorrect
 - That they should investigate and retry
 
 Only proceed with rebase and push if the file count is plausible for the PR.
@@ -111,7 +111,7 @@ When asked to squash without pushing, perform only up through the squash step.
 
 ## Branch Management
 
-**NEVER commit to main or master.** Before any commit, verify you are
+**NEVER commit to the default branch.** Before any commit, verify you are
 on a feature branch. If you are on the default branch or in a detached
 HEAD state, STOP and ask the caller how to proceed.
 
