@@ -106,6 +106,13 @@
 #  - https://ai.google.dev/api/rest/v1beta/models/streamGenerateContent
 - provider: gemini
   models:
+    - name: gemini-3.5-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 1.5
+      output_price: 9
+      supports_vision: true
+      supports_tool_use: true
     - name: gemini-2.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -129,6 +136,13 @@
       supports_tool_use: true
     - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-3.1-flash-lite
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.25
+      output_price: 1.5
       supports_vision: true
       supports_tool_use: true
     - name: gemini-3.1-flash-lite-preview
@@ -527,6 +541,13 @@
 #  - https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/gemini
 - provider: vertexai
   models:
+    - name: gemini-3.5-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 1.5
+      output_price: 9
+      supports_vision: true
+      supports_tool_use: true
     - name: gemini-2.5-flash
       max_input_tokens: 1048576
       max_output_tokens: 65536
@@ -550,6 +571,13 @@
       supports_tool_use: true
     - name: gemini-3.1-pro-preview
       max_input_tokens: 1048576
+      supports_vision: true
+      supports_tool_use: true
+    - name: gemini-3.1-flash-lite
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.25
+      output_price: 1.5
       supports_vision: true
       supports_tool_use: true
     - name: gemini-3.1-flash-lite-preview
@@ -1273,6 +1301,20 @@
       max_input_tokens: 131072
       input_price: 0.04
       output_price: 0.16
+      supports_tool_use: true
+    - name: google/gemini-3.5-flash
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 1.5
+      output_price: 9
+      supports_vision: true
+      supports_tool_use: true
+    - name: google/gemini-3.1-flash-lite
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+      input_price: 0.25
+      output_price: 1.5
+      supports_vision: true
       supports_tool_use: true
     - name: google/gemini-2.5-flash
       max_input_tokens: 1048576
