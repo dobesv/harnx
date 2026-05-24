@@ -28,6 +28,9 @@ pub const PACKAGE_METADATA_FILE_NAME: &str = "package.yaml";
 /// Shell env file loaded by `load_env_file`, relative to the config dir.
 pub const ENV_FILE_NAME: &str = ".env";
 
+/// Bash env file loaded by the bash MCP server.
+pub const BASH_ENV_FILE_NAME: &str = ".env.bash";
+
 /// Default name for the persisted "last messages" file.
 pub const MESSAGES_FILE_NAME: &str = "messages.md";
 
@@ -227,7 +230,15 @@ pub fn macro_file(name: &str) -> PathBuf {
 pub fn env_file() -> PathBuf {
     match env::var(get_env_name("env_file")) {
         Ok(value) if !value.is_empty() => PathBuf::from(value),
-        _ => local_path(ENV_FILE_NAME),
+        _ => data_path(ENV_FILE_NAME),
+    }
+}
+
+/// Path to the `.env.bash` file loaded by the bash MCP server. Overridable via `HARNX_BASH_ENV_FILE`.
+pub fn bash_env_file() -> PathBuf {
+    match env::var(get_env_name("bash_env_file")) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => data_path(BASH_ENV_FILE_NAME),
     }
 }
 
@@ -719,6 +730,76 @@ mod tests {
             got.ends_with("packages/mypkg.patch.yaml"),
             "package_patch_file('mypkg') should end with 'packages/mypkg.patch.yaml', got: {}",
             got.display()
+        );
+    }
+
+    #[test]
+    fn env_file_default_returns_data_dir_env() {
+        let test_dir = "/tmp/harnx_env_file_test_a1b2";
+        let got = with_envs(
+            &[("HARNX_ENV_FILE", None), ("HARNX_DATA_DIR", Some(test_dir))],
+            env_file,
+        );
+        assert_eq!(
+            got,
+            PathBuf::from(test_dir).join(".env"),
+            "env_file() should return data_dir().join('.env') when HARNX_ENV_FILE unset"
+        );
+    }
+
+    #[test]
+    fn env_file_override_works() {
+        let test_path = "/tmp/custom_env_file_c3d4";
+        let got = with_env("HARNX_ENV_FILE", test_path, env_file);
+        assert_eq!(
+            got,
+            PathBuf::from(test_path),
+            "env_file() should return the HARNX_ENV_FILE override"
+        );
+    }
+
+    #[test]
+    fn bash_env_file_default_returns_data_dir_env_bash() {
+        let test_dir = "/tmp/harnx_bash_env_file_test_e5f6";
+        let got = with_envs(
+            &[
+                ("HARNX_BASH_ENV_FILE", None),
+                ("HARNX_DATA_DIR", Some(test_dir)),
+            ],
+            bash_env_file,
+        );
+        assert_eq!(
+            got,
+            PathBuf::from(test_dir).join(".env.bash"),
+            "bash_env_file() should return data_dir().join('.env.bash') when unset"
+        );
+    }
+
+    #[test]
+    fn bash_env_file_override_works() {
+        let test_path = "/tmp/custom_bash_env_file_g7h8";
+        let got = with_env("HARNX_BASH_ENV_FILE", test_path, bash_env_file);
+        assert_eq!(
+            got,
+            PathBuf::from(test_path),
+            "bash_env_file() should return the HARNX_BASH_ENV_FILE override"
+        );
+    }
+
+    #[test]
+    fn bash_env_file_empty_falls_back_to_default() {
+        let test_dir = "/tmp/harnx_bash_env_empty_test_i9j0";
+        let got = with_envs(
+            &[
+                ("HARNX_BASH_ENV_FILE", Some("")),
+                ("HARNX_DATA_DIR", Some(test_dir)),
+            ],
+            bash_env_file,
+        );
+        assert_eq!(
+            got,
+            PathBuf::from(test_dir).join(".env.bash"),
+            "empty HARNX_BASH_ENV_FILE should fall back to default"
         );
     }
 }

@@ -3690,6 +3690,7 @@ dependencies = [
  "birdcage",
  "fancy-regex 0.18.0",
  "gix",
+ "harnx-core",
  "harnx-mcp",
  "harnx-mcp-history",
  "libc",

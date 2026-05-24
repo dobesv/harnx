@@ -2377,24 +2377,15 @@ fn parse_validated_path_list(
 }
 
 fn load_bash_env_file() -> Vec<(String, String)> {
-    fn bash_config_dir() -> PathBuf {
-        if let Ok(v) = std::env::var("HARNX_CONFIG_DIR") {
-            return PathBuf::from(v);
-        }
-        if let Ok(v) = std::env::var("XDG_CONFIG_HOME") {
-            return PathBuf::from(v).join("harnx");
-        }
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(".config/harnx");
-        }
-        PathBuf::from(".config/harnx")
-    }
-
-    let env_file = bash_config_dir().join(".env.bash");
-    let Ok(contents) = std::fs::read_to_string(env_file) else {
+    let env_file = harnx_core::config_paths::bash_env_file();
+    let Ok(contents) = std::fs::read_to_string(&env_file) else {
         return vec![];
     };
-
+    #[cfg(unix)]
+    {
+        use std::os::unix::prelude::PermissionsExt;
+        let _ = std::fs::set_permissions(&env_file, std::fs::Permissions::from_mode(0o600));
+    }
     contents
         .lines()
         .filter_map(|line| {
@@ -3338,8 +3329,9 @@ mod tests {
 
         // .env.bash overrides NO_COLOR.
         let temp_dir = TestDir::new();
-        std::fs::write(temp_dir.path().join(".env.bash"), "NO_COLOR=0\n").unwrap();
-        let _config_dir = EnvVar::set("HARNX_CONFIG_DIR", temp_dir.path().as_os_str());
+        let env_file_path = temp_dir.path().join(".env.bash");
+        std::fs::write(&env_file_path, "NO_COLOR=0\n").unwrap();
+        let _bash_env_file = EnvVar::set("HARNX_BASH_ENV_FILE", env_file_path.as_os_str());
 
         // env_overrides wins for GIT_PAGER.
         let mut cfg = enabled_sandbox_config();
@@ -3383,12 +3375,9 @@ mod tests {
 
         // Point dotfile at a tempdir whose .env.bash sets a different value.
         let temp_dir = TestDir::new();
-        std::fs::write(
-            temp_dir.path().join(".env.bash"),
-            "HARNX_TEST_PRECEDENCE_VAR=from_dotfile\n",
-        )
-        .unwrap();
-        let _config_dir = EnvVar::set("HARNX_CONFIG_DIR", temp_dir.path().as_os_str());
+        let env_file_path = temp_dir.path().join(".env.bash");
+        std::fs::write(&env_file_path, "HARNX_TEST_PRECEDENCE_VAR=from_dotfile\n").unwrap();
+        let _bash_env_file = EnvVar::set("HARNX_BASH_ENV_FILE", env_file_path.as_os_str());
 
         // Case 1: dotfile only (no passthrough, no override).
         // Expect dotfile value to win over (absent) default allowlist value.
@@ -3427,12 +3416,13 @@ mod tests {
     fn env_bash_dotfile_loaded() {
         let _env_guard = env_lock();
         let temp_dir = TestDir::new();
+        let env_file_path = temp_dir.path().join(".env.bash");
         std::fs::write(
-            temp_dir.path().join(".env.bash"),
+            &env_file_path,
             "# comment line\n\nHARNX_TEST_INJECT_4_3=s3cr3t\nHARNX_TEST_INJECT_KV_4_3=a=b\n",
         )
         .unwrap();
-        let _config_dir = EnvVar::set("HARNX_CONFIG_DIR", temp_dir.path().as_os_str());
+        let _bash_env_file = EnvVar::set("HARNX_BASH_ENV_FILE", env_file_path.as_os_str());
 
         let env_vars = load_bash_env_file();
 

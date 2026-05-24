@@ -350,21 +350,21 @@ Add your Atlassian credentials to the harnx `.env` file so they are available ev
 
 **Linux** (libsecret / `secret-tool`):
 ```sh
-echo "ATLASSIAN_API_TOKEN=$(secret-tool search service acli 2>/dev/null | awk '/^secret/{print $3}')" >> ~/.config/harnx/.env
-echo "ATLASSIAN_EMAIL=<your-email@example.com>" >> ~/.config/harnx/.env
+echo "ATLASSIAN_API_TOKEN=$(secret-tool search service acli 2>/dev/null | awk '/^secret/{print $3}')" >> ~/.local/share/harnx/.env
+echo "ATLASSIAN_EMAIL=<your-email@example.com>" >> ~/.local/share/harnx/.env
 ```
 
 **macOS** (Keychain / `security`):
 ```sh
-echo "ATLASSIAN_API_TOKEN=$(security find-generic-password -s acli -w)" >> ~/.config/harnx/.env
-echo "ATLASSIAN_EMAIL=<your-email@example.com>" >> ~/.config/harnx/.env
+echo "ATLASSIAN_API_TOKEN=$(security find-generic-password -s acli -w)" >> ~/.local/share/harnx/.env
+echo "ATLASSIAN_EMAIL=<your-email@example.com>" >> ~/.local/share/harnx/.env
 ```
 
 Or set them manually if you prefer:
 
 ```sh
-echo "ATLASSIAN_API_TOKEN=<your-real-api-token>" >> ~/.config/harnx/.env
-echo "ATLASSIAN_EMAIL=<your-email@example.com>" >> ~/.config/harnx/.env
+echo "ATLASSIAN_API_TOKEN=<your-real-api-token>" >> ~/.local/share/harnx/.env
+echo "ATLASSIAN_EMAIL=<your-email@example.com>" >> ~/.local/share/harnx/.env
 ```
 
 The harnx `.env` file uses plain `KEY=value` lines (no `export`). See [Environment Variables](environment-variables.md) for details.

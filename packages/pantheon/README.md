@@ -59,7 +59,7 @@ Install from GHCR (replace `v0.1.0` with the current release):
 harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.1.0
 ```
 
-Then set your API keys in `~/.config/harnx/.env`:
+Then set your API keys in `~/.local/share/harnx/.env`:
 
 ```sh
 CLAUDE_API_KEY=sk-ant-...
@@ -93,7 +93,7 @@ The package ships four client configs:
 | `clients/gemini.yaml` | Google Gemini API | argus, clio, pytheas, compaction agents, … |
 | `clients/bedrock.yaml` | AWS Bedrock | hermes, hestia, athena, metis, oracle, mnemosyne, nemesis, rhadamanthus, tyche, urania |
 
-API keys are loaded from `~/.config/harnx/.env` (recommended) or from the
+API keys are loaded from `~/.local/share/harnx/.env` (recommended) or from the
 environment. Variable names: `CLAUDE_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `BEDROCK_API_KEY`.
 
 ---
@@ -138,7 +138,7 @@ Several agents (hermes, hestia, athena, metis, oracle, mnemosyne, nemesis,
 rhadamanthus, tyche, urania) use `bedrock:zai.glm-5`. The Bedrock client config
 is included in the package (`clients/bedrock.yaml`) — no manual setup needed.
 
-Set your Bedrock API key in `~/.config/harnx/.env`:
+Set your Bedrock API key in `~/.local/share/harnx/.env`:
 
 ```sh
 BEDROCK_API_KEY=...
@@ -206,7 +206,7 @@ or symlink anything.
 | `context7.yaml` | `context7_*` | Node.js / npx | Library docs lookup. No API key. |
 | `grep.yaml` | `grep_*` | uv / uvx | GitHub code search via grep.app. No API key. |
 
-Add your Exa key to `~/.config/harnx/.env`:
+Add your Exa key to `~/.local/share/harnx/.env`:
 
 ```sh
 EXA_API_KEY=...

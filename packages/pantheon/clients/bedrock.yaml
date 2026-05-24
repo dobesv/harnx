@@ -9,7 +9,7 @@ models:
     max_input_tokens: 200000
     max_output_tokens: 128000
 
-# Authentication: set BEDROCK_API_KEY in ~/.config/harnx/.env
+# Authentication: set BEDROCK_API_KEY in ~/.local/share/harnx/.env
 # This should be an AWS SigV4-signed token or API key configured for your
 # Bedrock endpoint. The standard AWS credential chain is not currently
 # supported — the key must be provided explicitly.

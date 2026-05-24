@@ -1,4 +1,4 @@
-# Note: set EXA_API_KEY in .env in the config folder
+# Note: set EXA_API_KEY in ~/.local/share/harnx/.env
 command: npx
 args:
   - "-y"

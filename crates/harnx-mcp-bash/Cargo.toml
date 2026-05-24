@@ -11,6 +11,7 @@ description = "MCP server that exposes bash/subprocess execution with safety gua
 anyhow = { workspace = true }
 fancy-regex = { workspace = true }
 gix = { workspace = true }
+harnx-core = { path = "../harnx-core" }
 harnx-mcp = { path = "../harnx-mcp" }
 harnx-mcp-history = { workspace = true }
 libc = { workspace = true }

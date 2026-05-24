@@ -2,7 +2,7 @@
 
 ## Env file
 
-Harnx can load environment variables from a `.env` file located in the configuration directory: `<harnx-config-dir>/.env`.
+Harnx can load environment variables from a `.env` file located in the data directory: `~/.local/share/harnx/.env`.
 
 ## Config-Related Envs
 
@@ -41,7 +41,8 @@ Harnx can load environment variables from a `.env` file located in the configura
 ## Files/Dirs Envs
 
 - **HARNX_CONFIG_DIR**: The directory for configuration files.
-- **HARNX_ENV_FILE**: The path to the environment file.
+- **HARNX_ENV_FILE**: Path to the `.env` credentials file. Defaults to `~/.local/share/harnx/.env`.
+- **HARNX_BASH_ENV_FILE**: Path to the `.env.bash` credentials file used by the bash MCP server. Defaults to `~/.local/share/harnx/.env.bash`.
 - **HARNX_CONFIG_FILE**: The path to the configuration file.
 - **HARNX_SESSIONS_DIR**: The directory for sessions.
 - **HARNX_RAGS_DIR**: The directory for RAG data.
