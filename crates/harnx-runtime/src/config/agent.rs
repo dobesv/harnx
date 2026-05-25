@@ -163,7 +163,8 @@ fn apply_agent_patch(
     }
     let input = serde_json::to_value(&*config)
         .with_context(|| "Failed to serialize AgentConfig for jaq patch")?;
-    let output = harnx_core::jaq::eval_filters(&patch.agents, input);
+    let output = harnx_core::jaq::eval_filters_strict(&patch.agents, input)
+        .with_context(|| "jq patch expression failed for agent config")?;
     *config = serde_json::from_value(output)
         .with_context(|| "Failed to deserialize AgentConfig after jaq patch")?;
     Ok(())
@@ -1250,7 +1251,7 @@ mod patch_tests {
     }
 
     #[test]
-    fn apply_agent_patch_with_invalid_jq_expression_skips_and_leaves_config_unchanged() {
+    fn apply_agent_patch_with_invalid_jq_expression_returns_err() {
         let mut config = make_agent_config("test-agent", "openai:gpt-4o");
         let original_model = config.model_id().map(String::from);
 
@@ -1259,10 +1260,7 @@ mod patch_tests {
         let patch = make_patch(vec![r#".model = "unclosed"#]);
         let result = apply_agent_patch(&mut config, "test-agent", &patch);
 
-        // The function should return Ok but the config should be unchanged
-        // (jaq logs a warning and skips invalid expressions)
-        assert!(result.is_ok());
-        // On invalid expression, jaq eval_filters returns the input unchanged
+        assert!(result.is_err());
         assert_eq!(config.model_id(), original_model.as_deref());
     }
 }

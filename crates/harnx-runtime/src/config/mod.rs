@@ -317,48 +317,32 @@ fn load_package_mcp_patch(pkg_name: &str) -> Option<harnx_core::package::Package
     }
 }
 
-fn apply_mcp_server_patch(server: &mut McpServerConfig, patches: &[String]) {
+fn apply_mcp_server_patch(server: &mut McpServerConfig, patches: &[String]) -> Result<()> {
     if patches.is_empty() {
-        return;
+        return Ok(());
     }
-    // Save fields marked #[serde(skip)] that are not included in JSON serialization.
     let saved_package = server.package.clone();
-    let input = match serde_json::to_value(&*server) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("Failed to serialize McpServerConfig for jaq patch: {e}");
-            return;
-        }
-    };
-    let output = harnx_core::jaq::eval_filters(patches, input);
-    match serde_json::from_value(output) {
-        Ok(patched) => {
-            *server = patched;
-            // Restore #[serde(skip)] fields that are not preserved by JSON round-trip.
-            server.package = saved_package;
-        }
-        Err(e) => log::warn!("Failed to deserialize McpServerConfig after jaq patch: {e}"),
-    }
+    let input = serde_json::to_value(&*server)
+        .with_context(|| "Failed to serialize McpServerConfig for jaq patch")?;
+    let output = harnx_core::jaq::eval_filters_strict(patches, input)
+        .with_context(|| "jq patch expression failed for MCP server config")?;
+    *server = serde_json::from_value(output)
+        .with_context(|| "Failed to deserialize McpServerConfig after jaq patch")?;
+    server.package = saved_package;
+    Ok(())
 }
 
-fn apply_client_patch(client: &mut ClientConfig, patches: &[String]) {
+fn apply_client_patch(client: &mut ClientConfig, patches: &[String]) -> Result<()> {
     if patches.is_empty() {
-        return;
+        return Ok(());
     }
-    let input = match serde_json::to_value(&*client) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("Failed to serialize ClientConfig for jaq patch: {e}");
-            return;
-        }
-    };
-    let output = harnx_core::jaq::eval_filters(patches, input);
-    match serde_json::from_value(output) {
-        Ok(patched) => {
-            *client = patched;
-        }
-        Err(e) => log::warn!("Failed to deserialize ClientConfig after jaq patch: {e}"),
-    }
+    let input = serde_json::to_value(&*client)
+        .with_context(|| "Failed to serialize ClientConfig for jaq patch")?;
+    let output = harnx_core::jaq::eval_filters_strict(patches, input)
+        .with_context(|| "jq patch expression failed for client config")?;
+    *client = serde_json::from_value(output)
+        .with_context(|| "Failed to deserialize ClientConfig after jaq patch")?;
+    Ok(())
 }
 
 ///
@@ -2980,7 +2964,13 @@ impl Config {
             for mut server in Self::load_mcp_servers_from_dir(&pkg_mcp_dir).unwrap_or_default() {
                 server.package = Some(pkg_name.to_string());
                 if let Some(patch) = &patch {
-                    apply_mcp_server_patch(&mut server, &patch.mcp_servers);
+                    if let Err(e) = apply_mcp_server_patch(&mut server, &patch.mcp_servers) {
+                        log::error!(
+                            "Package patch failed for MCP server '{}': {e:#}",
+                            server.name
+                        );
+                        continue;
+                    }
                 }
                 config.mcp_servers.push(server);
             }
@@ -3013,9 +3003,16 @@ impl Config {
         }
         let mut clients = Self::load_clients_from_dir(&pkg_clients_dir).unwrap_or_default();
         if let Some(patch) = patch {
-            for client in &mut clients {
-                apply_client_patch(client, &patch.clients);
-            }
+            clients.retain_mut(|client| match apply_client_patch(client, &patch.clients) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::error!(
+                        "Package patch failed for client '{}': {e:#}",
+                        client.effective_name()
+                    );
+                    false
+                }
+            });
         }
         // Qualify client names with package prefix after patching.
         // Must be after patching because apply_client_patch round-trips through
@@ -5020,8 +5017,9 @@ mod mcp_patch_tests {
         let original_name = server.name.clone();
         let original_command = server.command.clone();
 
-        apply_mcp_server_patch(&mut server, &[".".to_string()]);
+        let result = apply_mcp_server_patch(&mut server, &[".".to_string()]);
 
+        assert!(result.is_ok());
         assert_eq!(server.name, original_name);
         assert_eq!(server.command, original_command);
     }
@@ -5030,7 +5028,7 @@ mod mcp_patch_tests {
     fn apply_mcp_server_patch_sets_field_via_jq_expression() {
         let mut server = make_server("test-server", "mcp-original");
 
-        apply_mcp_server_patch(
+        let result = apply_mcp_server_patch(
             &mut server,
             &[
                 r#".command = "mcp-patched""#.to_string(),
@@ -5038,6 +5036,7 @@ mod mcp_patch_tests {
             ],
         );
 
+        assert!(result.is_ok());
         assert_eq!(server.command, "mcp-patched");
         assert_eq!(server.args, vec!["--verbose"]);
     }
@@ -5047,8 +5046,9 @@ mod mcp_patch_tests {
         let mut server = make_server("test-server", "mcp-test");
         let original_name = server.name.clone();
 
-        apply_mcp_server_patch(&mut server, &[]);
+        let result = apply_mcp_server_patch(&mut server, &[]);
 
+        assert!(result.is_ok());
         assert_eq!(server.name, original_name);
     }
 
@@ -5058,14 +5058,28 @@ mod mcp_patch_tests {
         assert_eq!(server.package, Some("mypkg".to_string()));
 
         // Apply a patch that would serialize and deserialize
-        apply_mcp_server_patch(
+        let result = apply_mcp_server_patch(
             &mut server,
             &[r#".description = "Updated description""#.to_string()],
         );
 
+        assert!(result.is_ok());
         // The package field should be preserved even though it has #[serde(skip)]
         assert_eq!(server.package, Some("mypkg".to_string()));
         assert_eq!(server.description, Some("Updated description".to_string()));
+    }
+
+    #[test]
+    fn apply_mcp_server_patch_with_invalid_jq_expression_returns_err() {
+        let mut server = make_server("test-server", "mcp-test");
+        let original_command = server.command.clone();
+
+        // Invalid expression — unclosed string
+        let result = apply_mcp_server_patch(&mut server, &[r#".command = "unclosed"#.to_string()]);
+
+        assert!(result.is_err());
+        // Server should be unchanged
+        assert_eq!(server.command, original_command);
     }
 }
 
@@ -5083,8 +5097,9 @@ mod client_patch_tests {
     fn apply_client_patch_with_identity_expression_leaves_config_unchanged() {
         let mut client = make_openai_client();
         let before = serde_json::to_value(&client).expect("serialize");
-        apply_client_patch(&mut client, &[".".to_string()]);
+        let result = apply_client_patch(&mut client, &[".".to_string()]);
         let after = serde_json::to_value(&client).expect("serialize");
+        assert!(result.is_ok());
         assert_eq!(before, after);
     }
 
@@ -5092,15 +5107,17 @@ mod client_patch_tests {
     fn apply_client_patch_with_empty_patches_is_noop() {
         let mut client = make_openai_client();
         let before = serde_json::to_value(&client).expect("serialize");
-        apply_client_patch(&mut client, &[]);
+        let result = apply_client_patch(&mut client, &[]);
         let after = serde_json::to_value(&client).expect("serialize");
+        assert!(result.is_ok());
         assert_eq!(before, after);
     }
 
     #[test]
     fn apply_client_patch_sets_field_via_jq_expression() {
         let mut client = make_openai_client();
-        apply_client_patch(&mut client, &[r#".api_key = "sk-patched""#.to_string()]);
+        let result = apply_client_patch(&mut client, &[r#".api_key = "sk-patched""#.to_string()]);
+        assert!(result.is_ok());
         if let ClientConfig::OpenAIConfig(c) = &client {
             assert_eq!(c.api_key.as_deref(), Some("sk-patched"));
         } else {
@@ -5109,12 +5126,12 @@ mod client_patch_tests {
     }
 
     #[test]
-    fn apply_client_patch_with_invalid_jq_expression_leaves_config_unchanged() {
+    fn apply_client_patch_with_invalid_jq_expression_returns_err() {
         let mut client = make_openai_client();
         let before = serde_json::to_value(&client).expect("serialize");
-        // Unclosed string — jaq will skip this expression
-        apply_client_patch(&mut client, &[r#".api_key = "unclosed"#.to_string()]);
+        let result = apply_client_patch(&mut client, &[r#".api_key = "unclosed"#.to_string()]);
         let after = serde_json::to_value(&client).expect("serialize");
+        assert!(result.is_err());
         assert_eq!(before, after);
     }
 }
