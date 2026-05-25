@@ -101,6 +101,66 @@ pub struct ToolDeclaration {
     pub result_template: Option<String>,
 }
 
+/// Map a shebang interpreter name to a Markdown code-fence language label.
+///
+/// Handles both `#!/usr/bin/env INTERP` and `#!/path/to/INTERP` forms.
+/// Returns `"sh"` for plain (non-shebang) commands and unknown interpreters.
+pub fn shebang_fence_lang(command: &str) -> &'static str {
+    let Some(shebang_line) = command
+        .strip_prefix("#!")
+        .and_then(|rest| rest.lines().next())
+    else {
+        return "sh";
+    };
+
+    let mut parts = shebang_line.split_whitespace();
+    let Some(first) = parts.next() else {
+        return "sh";
+    };
+
+    // Resolve `#!/usr/bin/env [flags...] INTERP` — the real interpreter is the
+    // first non-flag token after `env` (flags start with `-`).
+    let interp_name = if first == "/usr/bin/env" {
+        parts.find(|t| !t.starts_with('-')).unwrap_or("")
+    } else {
+        // Extract the last path component of a direct path.
+        first.rsplit('/').next().unwrap_or(first)
+    };
+
+    match interp_name {
+        "python" | "python3" => "python",
+        "node" | "nodejs" => "javascript",
+        "ruby" => "ruby",
+        "perl" => "perl",
+        "bash" => "bash",
+        "sh" => "sh",
+        "deno" => "typescript",
+        "bun" => "javascript",
+        "php" => "php",
+        _ => "sh",
+    }
+}
+
+/// Strip the shebang line (and any immediately following blank line) from a command string.
+///
+/// Returns the command unchanged if it does not start with `#!`.
+pub fn strip_shebang_line(command: &str) -> &str {
+    let Some(rest) = command.strip_prefix("#!") else {
+        return command;
+    };
+    // Skip the rest of the shebang line.
+    let after_shebang = match rest.find('\n') {
+        Some(pos) => &rest[pos + 1..],
+        None => return "",
+    };
+    // Also skip a single immediately-following blank line.
+    if let Some(stripped) = after_shebang.strip_prefix('\n') {
+        stripped
+    } else {
+        after_shebang
+    }
+}
+
 fn make_template_env<'a>() -> Environment<'a> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Lenient);
@@ -125,6 +185,14 @@ fn make_template_env<'a>() -> Environment<'a> {
             }
         },
     );
+    // `shebang_lang`: maps a command string to the appropriate Markdown fence language.
+    env.add_filter("shebang_lang", |value: &str| -> &'static str {
+        shebang_fence_lang(value)
+    });
+    // `strip_shebang`: removes the leading shebang line from a command string.
+    env.add_filter("strip_shebang", |value: &str| -> String {
+        strip_shebang_line(value).to_string()
+    });
     env
 }
 
@@ -735,5 +803,90 @@ mod tests {
             out.contains("[>1]"),
             "outputs count in extended output: {out:?}"
         );
+    }
+
+    #[test]
+    fn test_shebang_lang_filter_python() {
+        assert_eq!(
+            shebang_fence_lang("#!/usr/bin/env python3\nprint('hi')"),
+            "python"
+        );
+        assert_eq!(
+            shebang_fence_lang("#!/usr/bin/python3\nprint('hi')"),
+            "python"
+        );
+    }
+
+    #[test]
+    fn test_shebang_lang_filter_node() {
+        assert_eq!(
+            shebang_fence_lang("#!/usr/bin/env node\nconsole.log('hi')"),
+            "javascript"
+        );
+        assert_eq!(
+            shebang_fence_lang("#!/usr/bin/env bun\nconsole.log('hi')"),
+            "javascript"
+        );
+    }
+
+    #[test]
+    fn test_shebang_lang_filter_sh_fallback() {
+        assert_eq!(shebang_fence_lang("echo hello"), "sh");
+        assert_eq!(shebang_fence_lang("ls -la"), "sh");
+    }
+
+    #[test]
+    fn test_shebang_lang_filter_unknown_interp() {
+        assert_eq!(shebang_fence_lang("#!/usr/bin/env myweirdlang\ncode"), "sh");
+    }
+
+    #[test]
+    fn test_shebang_lang_known_interpreters() {
+        assert_eq!(shebang_fence_lang("#!/usr/bin/env ruby\nputs 1"), "ruby");
+        assert_eq!(shebang_fence_lang("#!/usr/bin/env perl\nprint 1"), "perl");
+        assert_eq!(shebang_fence_lang("#!/bin/bash\necho hi"), "bash");
+        assert_eq!(shebang_fence_lang("#!/bin/sh\necho hi"), "sh");
+        assert_eq!(shebang_fence_lang("#!/usr/bin/env deno\n"), "typescript");
+        assert_eq!(shebang_fence_lang("#!/usr/bin/env php\n"), "php");
+    }
+
+    #[test]
+    fn test_strip_shebang_filter() {
+        assert_eq!(
+            strip_shebang_line("#!/usr/bin/env python3\nprint('hi')"),
+            "print('hi')"
+        );
+        // blank line after shebang is also stripped
+        assert_eq!(
+            strip_shebang_line("#!/usr/bin/env python3\n\nprint('hi')"),
+            "print('hi')"
+        );
+    }
+
+    #[test]
+    fn test_strip_shebang_no_shebang() {
+        assert_eq!(strip_shebang_line("echo hello"), "echo hello");
+    }
+
+    #[test]
+    fn test_shebang_lang_env_s_flag() {
+        // #!/usr/bin/env -S python3 should still map to "python"
+        assert_eq!(
+            shebang_fence_lang("#!/usr/bin/env -S python3\nprint('hi')"),
+            "python"
+        );
+    }
+
+    #[test]
+    fn test_shebang_filters_via_template() {
+        // Verify both filters are actually registered and callable from MiniJinja.
+        let out = render_tool_call_template(
+            "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }}\n```",
+            &serde_json::json!({"command": "#!/usr/bin/env python3\nprint('hi')"}),
+            "",
+        )
+        .unwrap();
+        assert!(out.starts_with("```python\n"), "fence lang: {out:?}");
+        assert!(out.contains("print('hi')"), "body: {out:?}");
     }
 }

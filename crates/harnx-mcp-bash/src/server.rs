@@ -79,7 +79,7 @@ impl JsonSchema for ExecCommandParams {
         let env = generator.subschema_for::<Option<HashMap<String, String>>>();
         object_schema_with_desc(
             vec![
-                ("command", "Bash command to execute. Avoid shell pipes like | head, | tail, | grep — use head_lines, tail_lines, max_output_bytes instead.", command),
+                ("command", "Bash command to execute. Avoid shell pipes like | head, | tail, | grep — use head_lines, tail_lines, max_output_bytes instead. For multi-line Python/Node/Ruby/etc. scripts, start the command with a shebang line (e.g. #!/usr/bin/env python3) and write the script body on subsequent lines — the correct interpreter will be used automatically.", command),
                 ("working_dir", "Working directory for the command. Defaults to the project root.", working_dir),
                 ("timeout_secs", "Kill the command after this many seconds. Default: no timeout.", timeout_secs),
                 ("head_lines", "Return only the first N lines of combined output. Prefer this over `| head -N` in the command.", head_lines),
@@ -185,7 +185,7 @@ impl JsonSchema for SpawnCommandParams {
         let env = generator.subschema_for::<Option<HashMap<String, String>>>();
         object_schema_with_desc(
             vec![
-                ("command", "Bash command to run in the background.", command),
+                ("command", "Bash command to run in the background. Supports shebang lines: start the command with #!/usr/bin/env python3 (or node, ruby, etc.) to run a multi-line script with the correct interpreter instead of wrapping it in bash -c.", command),
                 (
                     "working_dir",
                     "Working directory. Defaults to the project root.",
@@ -1168,9 +1168,37 @@ impl BashServer {
                     }
                 }
                 sb_args.push(OsString::from("--"));
-                sb_args.push(OsString::from("bash"));
-                sb_args.push(OsString::from("-c"));
-                sb_args.push(OsString::from(&params.command));
+                if let Some((interp, shebang_args)) = parse_shebang(&params.command) {
+                    let ext = shebang_script_ext(&params.command);
+                    let script_path = exec_dir.join(format!("script.{ext}"));
+                    std::fs::write(&script_path, params.command.as_bytes())
+                        .map_err(|e| internal_error(format!("failed to write script file: {e}")))?;
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
+                    // If the interpreter is an absolute path outside SYSTEM_EXEC_PATHS, allow it.
+                    if interp.is_absolute() {
+                        if let Some(interp_dir) = interp.parent() {
+                            let dir_str = interp_dir.to_string_lossy();
+                            if !Self::SYSTEM_EXEC_PATHS
+                                .iter()
+                                .any(|p| *p == dir_str.as_ref())
+                            {
+                                sb_args.push(OsString::from("--exec"));
+                                sb_args.push(interp_dir.as_os_str().to_owned());
+                            }
+                        }
+                    }
+                    sb_args.push(interp.as_os_str().to_owned());
+                    for arg in shebang_args {
+                        sb_args.push(OsString::from(arg));
+                    }
+                    sb_args.push(script_path.as_os_str().to_owned());
+                } else {
+                    sb_args.push(OsString::from("bash"));
+                    sb_args.push(OsString::from("-c"));
+                    sb_args.push(OsString::from(&params.command));
+                }
                 drop(roots_guard);
                 let sandbox_run_path = self.inner.sandbox_config.sandbox_run_path.clone();
                 CommandWrap::with_new(sandbox_run_path, |command| {
@@ -1187,16 +1215,40 @@ impl BashServer {
         } else {
             let child_env = self.build_child_env();
             let extra_env = params.env.clone().unwrap_or_default();
-            CommandWrap::with_new("bash", |command| {
-                command
-                    .args(["-c", &params.command])
-                    .current_dir(&working_dir)
-                    .stdin(Stdio::null());
-                command.env_clear();
-                command.envs(child_env.iter().map(|(k, v)| (k, v)));
-                command.envs(extra_env.iter());
-                command.stdout(Stdio::piped()).stderr(Stdio::piped());
-            })
+            if let Some((interp, shebang_args)) = parse_shebang(&params.command) {
+                let ext = shebang_script_ext(&params.command);
+                let script_path = exec_dir.join(format!("script.{ext}"));
+                std::fs::write(&script_path, params.command.as_bytes())
+                    .map_err(|e| internal_error(format!("failed to write script file: {e}")))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
+                }
+                CommandWrap::with_new(&interp, |command| {
+                    command
+                        .args(&shebang_args)
+                        .arg(&script_path)
+                        .current_dir(&working_dir)
+                        .stdin(Stdio::null());
+                    command.env_clear();
+                    command.envs(child_env.iter().map(|(k, v)| (k, v)));
+                    command.envs(extra_env.iter());
+                    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                })
+            } else {
+                CommandWrap::with_new("bash", |command| {
+                    command
+                        .args(["-c", &params.command])
+                        .current_dir(&working_dir)
+                        .stdin(Stdio::null());
+                    command.env_clear();
+                    command.envs(child_env.iter().map(|(k, v)| (k, v)));
+                    command.envs(extra_env.iter());
+                    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                })
+            }
         };
         command.wrap(KillOnDrop);
         #[cfg(unix)]
@@ -1658,9 +1710,37 @@ impl BashServer {
                     }
                 }
                 sb_args.push(OsString::from("--"));
-                sb_args.push(OsString::from("bash"));
-                sb_args.push(OsString::from("-c"));
-                sb_args.push(OsString::from(&params.command));
+                if let Some((interp, shebang_args)) = parse_shebang(&params.command) {
+                    let ext = shebang_script_ext(&params.command);
+                    let script_path = exec_dir.join(format!("script.{ext}"));
+                    std::fs::write(&script_path, params.command.as_bytes())
+                        .map_err(|e| internal_error(format!("failed to write script file: {e}")))?;
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
+                    // If the interpreter is an absolute path outside SYSTEM_EXEC_PATHS, allow it.
+                    if interp.is_absolute() {
+                        if let Some(interp_dir) = interp.parent() {
+                            let dir_str = interp_dir.to_string_lossy();
+                            if !Self::SYSTEM_EXEC_PATHS
+                                .iter()
+                                .any(|p| *p == dir_str.as_ref())
+                            {
+                                sb_args.push(OsString::from("--exec"));
+                                sb_args.push(interp_dir.as_os_str().to_owned());
+                            }
+                        }
+                    }
+                    sb_args.push(interp.as_os_str().to_owned());
+                    for arg in shebang_args {
+                        sb_args.push(OsString::from(arg));
+                    }
+                    sb_args.push(script_path.as_os_str().to_owned());
+                } else {
+                    sb_args.push(OsString::from("bash"));
+                    sb_args.push(OsString::from("-c"));
+                    sb_args.push(OsString::from(&params.command));
+                }
                 drop(roots_guard);
                 let sandbox_run_path = self.inner.sandbox_config.sandbox_run_path.clone();
                 CommandWrap::with_new(sandbox_run_path, |command| {
@@ -1677,18 +1757,44 @@ impl BashServer {
         } else {
             let child_env = self.build_child_env();
             let extra_env = params.env.clone().unwrap_or_default();
-            CommandWrap::with_new("bash", |command| {
-                command
-                    .args(["-c", &params.command])
-                    .current_dir(&working_dir)
-                    .stdin(Stdio::null());
-                command.env_clear();
-                command.envs(child_env.iter().map(|(k, v)| (k, v)));
-                command.envs(extra_env.iter());
-                command
-                    .stdout(Stdio::from(stdout_file))
-                    .stderr(Stdio::from(stderr_file));
-            })
+            if let Some((interp, shebang_args)) = parse_shebang(&params.command) {
+                let ext = shebang_script_ext(&params.command);
+                let script_path = exec_dir.join(format!("script.{ext}"));
+                std::fs::write(&script_path, params.command.as_bytes())
+                    .map_err(|e| internal_error(format!("failed to write script file: {e}")))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
+                }
+                CommandWrap::with_new(&interp, |command| {
+                    command
+                        .args(&shebang_args)
+                        .arg(&script_path)
+                        .current_dir(&working_dir)
+                        .stdin(Stdio::null());
+                    command.env_clear();
+                    command.envs(child_env.iter().map(|(k, v)| (k, v)));
+                    command.envs(extra_env.iter());
+                    command
+                        .stdout(Stdio::from(stdout_file))
+                        .stderr(Stdio::from(stderr_file));
+                })
+            } else {
+                CommandWrap::with_new("bash", |command| {
+                    command
+                        .args(["-c", &params.command])
+                        .current_dir(&working_dir)
+                        .stdin(Stdio::null());
+                    command.env_clear();
+                    command.envs(child_env.iter().map(|(k, v)| (k, v)));
+                    command.envs(extra_env.iter());
+                    command
+                        .stdout(Stdio::from(stdout_file))
+                        .stderr(Stdio::from(stderr_file));
+                })
+            }
         };
         #[cfg(unix)]
         command.wrap(ProcessGroup::leader());
@@ -2190,12 +2296,12 @@ impl ServerHandler for BashServer {
             tools: vec![
                 Tool::new(
                     "exec",
-                    "Execute a local bash command and return truncated combined stdout/stderr. When output is cropped, stdout/stderr temp log files are included for later retrieval. Prefer head_lines/tail_lines/max_output_bytes params over piping to head/tail in the command string.",
+                    "Execute a local bash command and return truncated combined stdout/stderr. When output is cropped, stdout/stderr temp log files are included for later retrieval. Prefer head_lines/tail_lines/max_output_bytes params over piping to head/tail in the command string. Supports shebang lines: if the command starts with #!, the script is written to a temp file and executed with the named interpreter (python3, node, ruby, etc.) — prefer this over python3 -c or node -e for multi-line scripts.",
                     Map::new(),
                 )
                 .with_input_schema::<ExecCommandParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "```sh\n$ {{ args.command }}\n```{% if args.working_dir or args.timeout_secs or args.head_lines or args.tail_lines or args.max_output_bytes or args.inputs or args.outputs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.timeout_secs %}[{{ args.timeout_secs }}s] {% endif %}{% if args.head_lines is not none %}[head:{{ args.head_lines }}] {% endif %}{% if args.tail_lines is not none %}[tail_lines:{{ args.tail_lines }}] {% endif %}{% if args.max_output_bytes is not none %}[:{{ args.max_output_bytes }}b] {% endif %}{% if args.inputs %}[<{{ args.inputs | length }}] {% endif %}{% if args.outputs %}[>{{ args.outputs | length }}]{% endif %}{% endif %}",
+                    "call_template": "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }}\n```{% if args.working_dir or args.timeout_secs or args.head_lines or args.tail_lines or args.max_output_bytes or args.inputs or args.outputs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.timeout_secs %}[{{ args.timeout_secs }}s] {% endif %}{% if args.head_lines is not none %}[head:{{ args.head_lines }}] {% endif %}{% if args.tail_lines is not none %}[tail_lines:{{ args.tail_lines }}] {% endif %}{% if args.max_output_bytes is not none %}[:{{ args.max_output_bytes }}b] {% endif %}{% if args.inputs %}[<{{ args.inputs | length }}] {% endif %}{% if args.outputs %}[>{{ args.outputs | length }}]{% endif %}{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "read_exec_log",
@@ -2208,12 +2314,12 @@ impl ServerHandler for BashServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "spawn",
-                    "Spawn a background bash command. Returns an execution_id and log file paths immediately without waiting for the command to finish. Output is written to separate stdout.log and stderr.log files. Use 'wait' to check for completion and 'terminate' to stop it.",
+                    "Spawn a background bash command. Returns an execution_id and log file paths immediately without waiting for the command to finish. Output is written to separate stdout.log and stderr.log files. Use 'wait' to check for completion and 'terminate' to stop it. Supports shebang lines: if the command starts with #!, the script is executed with the named interpreter automatically.",
                     Map::new(),
                 )
                 .with_input_schema::<SpawnCommandParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "```sh\n$ {{ args.command }} &\n```{% if args.working_dir or args.inputs or args.outputs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.inputs %}[<{{ args.inputs | length }}] {% endif %}{% if args.outputs %}[>{{ args.outputs | length }}]{% endif %}{% endif %}",
+                    "call_template": "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }} &\n```{% if args.working_dir or args.inputs or args.outputs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.inputs %}[<{{ args.inputs | length }}] {% endif %}{% if args.outputs %}[>{{ args.outputs | length }}]{% endif %}{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "wait",
@@ -2310,6 +2416,55 @@ impl ServerHandler for BashServer {
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
+
+/// Parse a shebang line from the first line of `command`.
+///
+/// Returns `None` if the command does not start with `#!`.
+/// Returns `Some((interpreter_path, extra_args))` where:
+/// - `interpreter_path` is a bare name (for `#!/usr/bin/env INTERP`) or absolute path
+/// - `extra_args` are any additional arguments on the shebang line (e.g. `-u`)
+fn parse_shebang(command: &str) -> Option<(PathBuf, Vec<String>)> {
+    let first_line = command.lines().next()?;
+    let shebang_rest = first_line.strip_prefix("#!")?;
+
+    let mut parts = shebang_rest.split_whitespace();
+    let interpreter = parts.next()?;
+
+    if interpreter == "/usr/bin/env" {
+        // `#!/usr/bin/env [-flags...] INTERP [args...]` — skip any env flags (e.g. -S)
+        // and use the first non-flag token as the interpreter name.
+        let env_interp = parts.find(|t| !t.starts_with('-'))?;
+        // Remaining tokens after the interpreter are extra args.
+        let extra_args: Vec<String> = parts.map(str::to_string).collect();
+        Some((PathBuf::from(env_interp), extra_args))
+    } else {
+        // `#!/path/to/INTERP [args...]` — use literal path
+        Some((
+            PathBuf::from(interpreter),
+            parts.map(str::to_string).collect(),
+        ))
+    }
+}
+
+/// Return the file extension (without dot) for the temp script file based on the shebang interpreter.
+fn shebang_script_ext(command: &str) -> &'static str {
+    let Some((interp, _)) = parse_shebang(command) else {
+        return "sh";
+    };
+    match interp
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+    {
+        "python" | "python3" => "py",
+        "node" | "nodejs" | "bun" => "js",
+        "ruby" => "rb",
+        "perl" => "pl",
+        "deno" => "ts",
+        "php" => "php",
+        _ => "sh",
+    }
+}
 
 fn parse_arguments<T: DeserializeOwned>(
     arguments: Option<Map<String, Value>>,
@@ -4693,6 +4848,235 @@ mod tests {
                 .any(|(flag, val)| flag == "--write"
                     && val == "/tmp/harnx-test-sandbox-home2/projects"),
             "$HOME/projects must appear as --write arg: {pairs:?}"
+        );
+    }
+
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn node_available() -> bool {
+        std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn test_exec_python_shebang() {
+        if !python3_available() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "#!/usr/bin/env python3\nprint(\"hello from python\")".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(10),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("hello from python"),
+            "expected python output, got: {text:?}"
+        );
+        assert!(text.contains("exit_code: 0"), "expected success: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn test_exec_node_shebang() {
+        if !node_available() {
+            eprintln!("skipping: node not available");
+            return;
+        }
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "#!/usr/bin/env node\nconsole.log(\"hello from node\")".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(10),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("hello from node"),
+            "expected node output, got: {text:?}"
+        );
+        assert!(text.contains("exit_code: 0"), "expected success: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_python_shebang() {
+        if !python3_available() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let spawn_result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "#!/usr/bin/env python3\nprint(\"hello from spawn python\")".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        let spawn_text = text_content(&spawn_result);
+        assert!(
+            spawn_text.contains("status: spawned"),
+            "expected spawned status: {spawn_text:?}"
+        );
+        let execution_id = extract_field(&spawn_text, "execution_id");
+
+        let wait_result = server
+            .wait_impl(WaitParams {
+                execution_id,
+                timeout_secs: Some(10),
+                head_lines: None,
+                tail_lines: Some(20),
+                max_output_bytes: None,
+                grep: None,
+            })
+            .await
+            .unwrap();
+
+        let wait_text = text_content(&wait_result);
+        assert!(
+            wait_text.contains("hello from spawn python"),
+            "expected python output in wait, got: {wait_text:?}"
+        );
+        assert!(
+            wait_text.contains("exit_code: 0"),
+            "expected success: {wait_text:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_shebang_none_for_plain_command() {
+        assert_eq!(parse_shebang("echo hello"), None);
+    }
+
+    #[test]
+    fn test_parse_shebang_env_python3() {
+        assert_eq!(
+            parse_shebang("#!/usr/bin/env python3\nprint(\"hi\")"),
+            Some((PathBuf::from("python3"), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_parse_shebang_direct_path() {
+        assert_eq!(
+            parse_shebang("#!/usr/bin/python3\nprint(\"hi\")"),
+            Some((PathBuf::from("/usr/bin/python3"), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_parse_shebang_with_args() {
+        assert_eq!(
+            parse_shebang("#!/usr/bin/python3 -u\nprint(\"hi\")"),
+            Some((PathBuf::from("/usr/bin/python3"), vec!["-u".to_string()]))
+        );
+    }
+
+    #[test]
+    fn test_parse_shebang_node() {
+        assert_eq!(
+            parse_shebang("#!/usr/bin/env node\nconsole.log(\"hi\")"),
+            Some((PathBuf::from("node"), vec![]))
+        );
+    }
+
+    #[test]
+    fn test_shebang_script_ext_values() {
+        assert_eq!(shebang_script_ext("#!/usr/bin/env python3\n"), "py");
+        assert_eq!(shebang_script_ext("#!/usr/bin/env node\n"), "js");
+        assert_eq!(shebang_script_ext("#!/usr/bin/env ruby\n"), "rb");
+        assert_eq!(shebang_script_ext("#!/usr/bin/env perl\n"), "pl");
+        assert_eq!(shebang_script_ext("#!/usr/bin/env deno\n"), "ts");
+        assert_eq!(shebang_script_ext("#!/usr/bin/env php\n"), "php");
+        assert_eq!(shebang_script_ext("echo hello"), "sh");
+    }
+
+    #[test]
+    fn test_parse_shebang_env_s_flag() {
+        // #!/usr/bin/env -S python3 -u should skip -S and use python3 as interpreter
+        assert_eq!(
+            parse_shebang("#!/usr/bin/env -S python3 -u\nprint(\"hi\")"),
+            Some((PathBuf::from("python3"), vec!["-u".to_string()]))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_sandbox_exec_python_shebang() {
+        if !python3_available() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let temp_dir = TestDir::new();
+        let server = sandboxed_server(vec![temp_dir.path().to_path_buf()]);
+
+        if !sandbox_runtime_works() {
+            eprintln!("skipping: sandbox runtime not available");
+            return;
+        }
+
+        let result = server
+            .exec_command_impl(ExecCommandParams {
+                command: "#!/usr/bin/env python3\nprint(\"hello from sandboxed python\")"
+                    .to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                timeout_secs: Some(10),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                inputs: None,
+                outputs: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("hello from sandboxed python"),
+            "expected python output in sandbox, got: {text:?}"
+        );
+        assert!(
+            text.contains("exit_code: 0"),
+            "expected success in sandbox: {text:?}"
         );
     }
 }
