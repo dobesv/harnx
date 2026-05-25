@@ -17,6 +17,7 @@ use similar::{ChangeTag, TextDiff};
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TaskFrontMatter {
@@ -1948,6 +1949,109 @@ fn plan_dirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+fn plan_last_activity(plan_dir: &Path) -> std::io::Result<std::time::SystemTime> {
+    let mut latest = None;
+
+    let plan_file = plan_dir.join("plan.md");
+    if let Ok(metadata) = std::fs::metadata(&plan_file) {
+        latest = Some(metadata.modified()?);
+    }
+
+    for subdir in ["tasks", "notes"] {
+        let dir = plan_dir.join(subdir);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+
+        for entry in entries {
+            let path = entry?.path();
+            if !path.is_file() || path.extension().and_then(OsStr::to_str) != Some("md") {
+                continue;
+            }
+
+            let modified = std::fs::metadata(&path)?.modified()?;
+            latest = Some(match latest {
+                Some(current) => current.max(modified),
+                None => modified,
+            });
+        }
+    }
+
+    match latest {
+        Some(modified) => Ok(modified),
+        None => plan_dir.metadata()?.modified(),
+    }
+}
+
+async fn run_cleanup_pass(dir: &Path, retention: Duration) {
+    let dir_owned = dir.to_owned();
+    let dirs = match tokio::task::spawn_blocking(move || plan_dirs(&dir_owned)).await {
+        Ok(dirs) => dirs,
+        Err(e) => {
+            eprintln!("[cleanup] error listing plans: {e}");
+            return;
+        }
+    };
+
+    for plan_dir in dirs {
+        let name = plan_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let plan_dir_for_activity = plan_dir.clone();
+        let last_activity =
+            match tokio::task::spawn_blocking(move || plan_last_activity(&plan_dir_for_activity))
+                .await
+            {
+                Ok(Ok(last_activity)) => last_activity,
+                Ok(Err(e)) => {
+                    eprintln!("[cleanup] error checking plan {name}: {e}");
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[cleanup] error checking plan {name}: {e}");
+                    continue;
+                }
+            };
+
+        let age = std::time::SystemTime::now()
+            .duration_since(last_activity)
+            .unwrap_or_default();
+        if age <= retention {
+            continue;
+        }
+
+        let plan_dir_for_delete = plan_dir.clone();
+        match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(plan_dir_for_delete))
+            .await
+        {
+            Ok(Ok(())) => {
+                eprintln!(
+                    "[cleanup] deleted inactive plan {name} (inactive for {} days)",
+                    age.as_secs() / 86_400
+                );
+            }
+            Ok(Err(e)) => eprintln!("[cleanup] error deleting plan {name}: {e}"),
+            Err(e) => eprintln!("[cleanup] error deleting plan {name}: {e}"),
+        }
+    }
+}
+
+pub async fn cleanup_loop(dir: PathBuf, retention_days: u64) {
+    let retention = Duration::from_secs(retention_days.saturating_mul(86_400));
+
+    run_cleanup_pass(&dir, retention).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(86_400));
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+        run_cleanup_pass(&dir, retention).await;
+    }
+}
+
 fn list_note_ids(dir: &Path, plan_name: &str) -> Vec<String> {
     let notes = notes_dir(dir, plan_name);
     let Ok(entries) = std::fs::read_dir(notes) else {
@@ -1992,13 +2096,16 @@ impl ServerHandler for PlansServer {
                     .with_meta(Meta(json!({"call_template": "list plans", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("add_plan", "Create a new plan with optional metadata. Keep body content under 1000 words per call; use update_plan with replace_in_content for targeted edits.", Map::new())
                     .with_input_schema::<AddPlanParams>()
-                    .with_meta(Meta(json!({"call_template": "create plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "create plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.body %}
+{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_plan", "Read plan metadata, body, and list task/note IDs.", Map::new())
                     .with_input_schema::<GetPlanParams>()
                     .with_meta(Meta(json!({"call_template": "read plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("update_plan", "Update plan body and metadata. Creates plan if it doesn't exist. Use replace_content to rewrite body, append_content to extend it, or replace_in_content for surgical edits. Optionally batch-create tasks. Keep each write under 1000 words.", Map::new())
                     .with_input_schema::<UpdatePlanParams>()
-                    .with_meta(Meta(json!({"call_template": "update plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.tasks %} [{{ args.tasks | length }} tasks]{% endif %}{% if args.replace_content %}\n{{ args.replace_content | truncate(80) }}{% endif %}{% if args.append_content %}\n+{{ args.append_content | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "update plan {{ args.name }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.git_branch %} [{{ args.git_branch }}]{% endif %}{% if args.github_owner_repo %} ({{ args.github_owner_repo }}){% endif %}{% if args.tasks %} [{{ args.tasks | length }} tasks]{% endif %}{% if args.replace_content %}
+{{ args.replace_content | truncate(80) }}{% endif %}{% if args.append_content %}
++{{ args.append_content | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("delete_plan", "Delete an entire plan and all its tasks and notes.", Map::new())
                     .with_input_schema::<DeletePlanParams>()
                     .with_meta(Meta(json!({"call_template": "delete plan {{ args.name }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
@@ -2007,13 +2114,16 @@ impl ServerHandler for PlansServer {
                     .with_meta(Meta(json!({"call_template": "list tasks {{ args.plan }}{% if args.filter and args.filter != 'open' %} [{{ args.filter }}]{% endif %}{% if args.tag %} #{{ args.tag }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("add_task", "Create a task in a plan. Keep body under 1000 words; use update_task with replace_in_body for targeted edits.", Map::new())
                     .with_input_schema::<AddTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "create task {{ args.plan }}/{{ args.title }}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "create task {{ args.plan }}/{{ args.title }}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.body %}
+{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_task", "Read a task by ID within a plan.", Map::new())
                     .with_input_schema::<GetTaskParams>()
                     .with_meta(Meta(json!({"call_template": "read task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("update_task", "Update a task within its plan. Use replace_body to rewrite body, append_body to extend it, or replace_in_body for surgical edits. Keep each write under 1000 words.", Map::new())
                     .with_input_schema::<UpdateTaskParams>()
-                    .with_meta(Meta(json!({"call_template": "update task {{ args.plan }}/{{ args.id }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.replace_body %}\n{{ args.replace_body | truncate(80) }}{% endif %}{% if args.append_body %}\n+{{ args.append_body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "update task {{ args.plan }}/{{ args.id }}{% if args.title %} — {{ args.title | truncate(40) }}{% endif %}{% if args.status %} [{{ args.status }}]{% endif %}{% if args.assignee %} @{{ args.assignee }}{% endif %}{% if args.executor %} ▶{{ args.executor }}{% endif %}{% if args.tags %} #{{ args.tags | join(' #') }}{% endif %}{% if args.replace_body %}
+{{ args.replace_body | truncate(80) }}{% endif %}{% if args.append_body %}
++{{ args.append_body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("delete_task", "Delete a task by ID.", Map::new())
                     .with_input_schema::<DeleteTaskParams>()
                     .with_meta(Meta(json!({"call_template": "delete task {{ args.plan }}/{{ args.id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
@@ -2022,7 +2132,8 @@ impl ServerHandler for PlansServer {
                     .with_meta(Meta(json!({"call_template": "list notes {{ args.plan }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("add_note", "Add a note to a plan. Keep body under 1000 words; use update_note with replace_in_body for targeted edits.", Map::new())
                     .with_input_schema::<AddNoteParams>()
-                    .with_meta(Meta(json!({"call_template": "add note {{ args.plan }}{% if args.summary %} — {{ args.summary | truncate(60) }}{% endif %}{% if args.author %} by {{ args.author }}{% endif %}{% if args.body %}\n{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
+                    .with_meta(Meta(json!({"call_template": "add note {{ args.plan }}{% if args.summary %} — {{ args.summary | truncate(60) }}{% endif %}{% if args.author %} by {{ args.author }}{% endif %}{% if args.body %}
+{{ args.body | truncate(80) }}{% endif %}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
                 Tool::new("get_note", "Read a note from a plan.", Map::new())
                     .with_input_schema::<GetNoteParams>()
                     .with_meta(Meta(json!({"call_template": "read note {{ args.plan }}/{{ args.note_id }}", "result_template": "{{ result.content[0].text | default('') }}"}).as_object().unwrap().clone())),
@@ -2118,6 +2229,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use std::fs;
+    use std::time::Duration;
 
     fn temp_test_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("harnx-mcp-plans-{}-{}", label, gen_id()));
@@ -2135,6 +2247,62 @@ mod tests {
 
     fn extract_id(summary: &str) -> String {
         summary.split_whitespace().nth(2).unwrap().to_string()
+    }
+
+    #[test]
+    fn plan_last_activity_uses_latest_file_mtime_not_dir_mtime() {
+        let dir = temp_test_dir("plan-last-activity-latest-file");
+        let plan_dir = dir.join("plan-a");
+        fs::create_dir_all(&plan_dir).unwrap();
+
+        let dir_mtime = plan_dir.metadata().unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        fs::write(plan_dir.join("plan.md"), "plan").unwrap();
+        let plan_mtime = plan_dir
+            .join("plan.md")
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        fs::create_dir_all(plan_dir.join("tasks")).unwrap();
+        fs::write(plan_dir.join("tasks/task-1.md"), "task").unwrap();
+        let task_mtime = plan_dir
+            .join("tasks/task-1.md")
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        fs::create_dir_all(plan_dir.join("notes")).unwrap();
+        fs::write(plan_dir.join("notes/note-1.md"), "note").unwrap();
+        let note_mtime = plan_dir
+            .join("notes/note-1.md")
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let actual = plan_last_activity(&plan_dir).unwrap();
+        let expected = plan_mtime.max(task_mtime).max(note_mtime);
+
+        assert_eq!(actual, expected);
+        assert!(actual > dir_mtime);
+    }
+
+    #[test]
+    fn plan_last_activity_falls_back_to_dir_mtime_for_empty_plan() {
+        let dir = temp_test_dir("plan-last-activity-empty-plan");
+        let plan_dir = dir.join("plan-a");
+        fs::create_dir_all(&plan_dir).unwrap();
+
+        let expected = plan_dir.metadata().unwrap().modified().unwrap();
+        let actual = plan_last_activity(&plan_dir).unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -4081,6 +4249,24 @@ line2"
             "expected 'not found' in: {}",
             err.message
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_stale_plan_but_keeps_fresh_plan() {
+        let dir = temp_test_dir("cleanup-stale-plan");
+        let stale_plan = dir.join("stale-plan");
+        let fresh_plan = dir.join("fresh-plan");
+
+        fs::create_dir_all(&stale_plan).unwrap();
+        fs::write(stale_plan.join("plan.md"), "stale").unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        fs::create_dir_all(&fresh_plan).unwrap();
+        fs::write(fresh_plan.join("plan.md"), "fresh").unwrap();
+
+        run_cleanup_pass(&dir, Duration::from_millis(10)).await;
+
+        assert!(!stale_plan.exists(), "stale plan should be deleted");
+        assert!(fresh_plan.exists(), "fresh plan should be kept");
     }
 
     #[test]
