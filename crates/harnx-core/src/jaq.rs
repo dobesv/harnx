@@ -81,9 +81,24 @@ pub fn eval_filters(exprs: &[String], input: Value) -> Value {
     })
 }
 
+/// Like eval_filters, but returns Err on any expression parse/compile/runtime error.
+pub fn eval_filters_strict(exprs: &[String], input: Value) -> anyhow::Result<Value> {
+    exprs
+        .iter()
+        .try_fold(input, |current, expr| eval_filter_strict(expr, current))
+}
+
+/// Like eval_filter, but returns Err instead of None on failure.
+fn eval_filter_strict(expr: &str, input: Value) -> anyhow::Result<Value> {
+    let filter = compile_filter(expr)
+        .map_err(|e| anyhow::anyhow!("jq compile error in {:?}: {}", expr, e))?;
+    run_filter(&filter, input)
+        .ok_or_else(|| anyhow::anyhow!("jq runtime error in {:?}: no output", expr))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{eval_filter, eval_filters};
+    use super::{eval_filter, eval_filters, eval_filters_strict};
     use serde_json::json;
 
     #[test]
@@ -113,6 +128,20 @@ mod tests {
         // invalid expression should be skipped; output = input unchanged
         let chained = eval_filters(&[".a = ".to_string()], input.clone());
         assert_eq!(chained, input);
+    }
+
+    #[test]
+    fn eval_filters_strict_returns_err_on_invalid_expression() {
+        let input = json!({"a": 1});
+        let result = eval_filters_strict(&[".a = ".to_string()], input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn eval_filters_strict_applies_valid_expressions() {
+        let input = json!({"a": 1});
+        let result = eval_filters_strict(&[".a = 2".to_string(), ".b = 3".to_string()], input);
+        assert_eq!(result.unwrap(), json!({"a": 2, "b": 3}));
     }
 
     #[test]
