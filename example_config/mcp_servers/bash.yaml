@@ -8,20 +8,23 @@ rename_tools:
 
 # Sandbox configuration examples (uncomment as needed):
 #
+# NOTE: Many home-directory paths are already whitelisted by default and do NOT
+# need to be added here. See docs/bash-mcp-server.md for the full list, which
+# includes: ~/.gitconfig, ~/.gitignore, ~/.gitignore_global, ~/.tool-versions
+# (read), ~/.local/bin, ~/.local/lib, ~/.bun, ~/.asdf, ~/go/bin, ~/.cargo
+# (read+exec), ~/.cache, ~/go/pkg (read+write), ~/.npm, ~/.yarn, ~/.nvm,
+# ~/.cargo/bin, ~/.cargo/registry, ~/.cargo/git, ~/.mono, ~/.bun/install/cache,
+# ~/.pyenv, ~/.rye (read+write+exec).
+#
 args:
 #   - --no-sandbox                                          # Disable sandboxing entirely
-  # Allow access to asdf installed binaries
+  # Allow access to rustup-managed toolchains
   - --extra-exec
-  - ~/.asdf
-  # Allow access to bun binaries and cache
-  - --extra-exec
-  - ~/.bun
-  - --extra-write
-  - ~/.bun/install/cache
-  # Allow access to various caches
-  - --extra-write
-  - ~/.cache
-  # Alllow access to various config files
+  - ~/.rustup
+  # Allow access to ruff's cache
+  - --extra-rwx
+  - ~/.ruff_cache
+  # Allow access to various config files
   - --extra-read
   - ~/.config/acli
   - --extra-write
@@ -30,40 +33,13 @@ args:
   - ~/.config/dcg
   - --extra-read
   - ~/.config/git
-  - --extra-write
+  - --extra-rwx
   - ~/.config/go
   - --extra-read
   - ~/.config/rtk
   # Allow access to codescene config/license
   - --extra-write
   - ~/.codescene
-  # Git config
-  - --extra-read
-  - ~/.gitconfig
-  - --extra-read
-  - ~/.gitignore
-  - --extra-read
-  - ~/.gitignore_global
-  # Allow access to user-local binaries
-  - --extra-exec
-  - ~/.local/bin
-  # Allow access to mono
-  - --extra-exec
-  - ~/.mono
-  - --extra-write
-  - ~/.mono
-  # Allow access to npm config and cache
-  - --extra-write
-  - ~/.npm
-  # Allow access to npm config and cache
-  - --extra-write
-  - ~/.nvm
-  - --extra-write
-  - ~/.ruff_cache
-  - --extra-exec
-  - ~/.rustup
-  - --extra-write
-  - ~/.yarn
   # Disable interactive editor
   - --env
   - EDITOR=true
