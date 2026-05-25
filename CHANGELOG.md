@@ -11,6 +11,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.32.1 (2026-05-25)
+
+### Features
+
+- add env parameter to bash_exec and bash_spawn (#534)
+- add hook mutation support for tool calls (#537)
+- add scripted GIF rendering for TUI and web UIs (#541)
+- support pulling packages from private OCI registries (#543)
+- add AWS credential chain support to Bedrock provider (#545)
+- support show_timestamps and show_sequence_numbers in config.yaml (#555)
+- add pantheon and coding example agent packages (#547)
+- add harnx-aws-creds for AWS container credential injection (#560)
+- add harnx-proxy-auth persistent hook for GitHub authentication (#567)
+- Add hooks configuration to MCP server configs (#578)
+- support client patching from packages (#583)
+- add Kubernetes credentials gateway hook (#598)
+- add stdio MCP proxy with tool hook interception (#607)
+- add MCP server mode to harnx-aws-creds and harnx-proxy-auth (#617)
+- add gemini-3.5-flash and gemini-3.1-flash-lite to model registry (#645)
+
+### Fixes
+
+- grant write access to /dev/shm on Linux for Chrome/Puppeteer (#529)
+- change bash_spawn display from `> command` to `$ command &` (#552)
+- include package agents in picker and add harnx-pkg binary (#574)
+- CodeRabbit auto-fixes for PR #574 (#576)
+- preserve package-scoped qualifier when loading agents from CLI (#584)
+- strip package namespace prefix from env var lookup (#614)
+- prevent $HOME exposure via write-path ancestor walk and over-broad roots (#619, #503) (#620)
+- .info session no longer dumps session transcript (#627)
+- use_tools whitelist bypassed in select_tools (#624) (#631)
+- proxy auth hook misses host for tunnelled HTTPS requests (#629)
+- list individual tools instead of toolset aliases and wildcards in package agents (#638)
+- suppress noisy sandbox-run log for non-existent paths (#643)
+- extract knope sync command to a shell script (#650)
+
 ## 0.32.0 (2026-05-13)
 
 ### Breaking Changes

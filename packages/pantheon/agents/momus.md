@@ -23,7 +23,7 @@ use_tools:
 description: "Plan reviewer \u2014 verifies that implementation plans are executable\
   \ and that file references are valid. Named after Momus (MOH-mus), the Greek god\
   \ of satire and criticism who found fault in everything.\n"
-version: '1'
+version: '0.2.0'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

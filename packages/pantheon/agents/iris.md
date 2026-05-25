@@ -27,7 +27,7 @@ use_tools:
 - plans_update_task
 - pytheas_session_prompt
 description: "Visual engineering, frontend, and UI/UX specialist — bridges the gap between the invisible code and the visible UI. Named after Iris (EYE-ris), Goddess of the Rainbow.\n"
-version: '1'
+version: '0.2.0'
 variables:
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep

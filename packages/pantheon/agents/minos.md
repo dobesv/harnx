@@ -21,7 +21,7 @@ use_tools:
 description: "Methodical auditor \u2014 systematically verifies code review findings\
   \ by tracing evidence chains, checking cited code, and rendering verdicts. Named\
   \ after Minos (MY-nos), judge of the Underworld who weighed the deeds of the deceased.\n"
-version: '1'
+version: '0.2.0'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
