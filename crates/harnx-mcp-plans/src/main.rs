@@ -14,10 +14,11 @@ mod server;
 use rmcp::ServiceExt;
 use server::PlansServer;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (plans_dir, retention_days) = parse_args();
+    let (plans_dir, retention_days) = parse_args()?;
 
     eprintln!(
         "harnx-mcp-plans v{}: starting (dir: {}, retention: {} days)",
@@ -38,6 +39,13 @@ async fn main() -> anyhow::Result<()> {
         let mut cleanup_handle = tokio::spawn(server::cleanup_loop(plans_dir, retention_days));
         let service_handle = tokio::spawn(async move { service.waiting().await });
         tokio::pin!(service_handle);
+
+        // Exponential backoff state for cleanup task restarts.
+        // Reset to base on a clean exit; doubles on each panic up to MAX_BACKOFF.
+        const BASE_BACKOFF: Duration = Duration::from_secs(1);
+        const MAX_BACKOFF: Duration = Duration::from_secs(300); // 5 min cap
+        let mut backoff = BASE_BACKOFF;
+
         loop {
             tokio::select! {
                 result = &mut *service_handle => {
@@ -46,11 +54,18 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 }
                 result = &mut cleanup_handle => {
-                    // Cleanup task exited (e.g. panicked) — log and restart
-                    if let Err(e) = result {
-                        eprintln!("[cleanup] task failed: {e}");
+                    match result {
+                        Err(e) => {
+                            // Task panicked — log, back off, restart
+                            eprintln!("[cleanup] task failed: {e}");
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
+                        }
+                        Ok(()) => {
+                            // Clean exit (shouldn't happen in normal operation) — restart immediately
+                            backoff = BASE_BACKOFF;
+                        }
                     }
-                    // Restart cleanup loop so periodic cleanup continues
                     cleanup_handle = tokio::spawn(server::cleanup_loop(cleanup_dir.clone(), retention_days));
                 }
             }
@@ -60,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_args() -> (PathBuf, u64) {
+fn parse_args() -> anyhow::Result<(PathBuf, u64)> {
     let args: Vec<String> = std::env::args().collect();
     let mut plans_dir: Option<PathBuf> = None;
     let mut retention_days: Option<u64> = None;
@@ -73,8 +88,7 @@ fn parse_args() -> (PathBuf, u64) {
                     plans_dir = Some(PathBuf::from(&args[i + 1]));
                     i += 2;
                 } else {
-                    eprintln!("harnx-mcp-plans: --dir requires a path argument");
-                    std::process::exit(1);
+                    anyhow::bail!("harnx-mcp-plans: --dir requires a path argument");
                 }
             }
             "--retention-days" | "-r" => {
@@ -85,16 +99,14 @@ fn parse_args() -> (PathBuf, u64) {
                             i += 2;
                         }
                         Err(_) => {
-                            eprintln!(
+                            anyhow::bail!(
                                 "harnx-mcp-plans: --retention-days requires a non-negative integer (got: {})",
                                 args[i + 1]
                             );
-                            std::process::exit(1);
                         }
                     }
                 } else {
-                    eprintln!("harnx-mcp-plans: --retention-days requires a number argument");
-                    std::process::exit(1);
+                    anyhow::bail!("harnx-mcp-plans: --retention-days requires a number argument");
                 }
             }
             "--help" | "-h" => {
@@ -117,9 +129,9 @@ fn parse_args() -> (PathBuf, u64) {
                 std::process::exit(0);
             }
             other => {
-                eprintln!("harnx-mcp-plans: unknown argument: {}", other);
-                eprintln!("Try: harnx-mcp-plans --help");
-                std::process::exit(1);
+                anyhow::bail!(
+                    "harnx-mcp-plans: unknown argument: {other}\nTry: harnx-mcp-plans --help"
+                );
             }
         }
     }
@@ -131,11 +143,10 @@ fn parse_args() -> (PathBuf, u64) {
         match env_days.trim().parse::<u64>() {
             Ok(days) => days,
             Err(_) => {
-                eprintln!(
+                anyhow::bail!(
                     "harnx-mcp-plans: AGENT_PLANS_RETENTION_DAYS must be a non-negative integer (got: {})",
                     env_days.trim()
                 );
-                std::process::exit(1);
             }
         }
     } else {
@@ -155,5 +166,5 @@ fn parse_args() -> (PathBuf, u64) {
         PathBuf::from(".agent/plans")
     };
 
-    (plans_dir, retention_days)
+    Ok((plans_dir, retention_days))
 }

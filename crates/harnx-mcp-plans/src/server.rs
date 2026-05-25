@@ -1984,7 +1984,16 @@ fn plan_last_activity(plan_dir: &Path) -> std::io::Result<std::time::SystemTime>
 }
 
 async fn run_cleanup_pass(dir: &Path, retention: Duration) {
-    for plan_dir in plan_dirs(dir) {
+    let dir_owned = dir.to_owned();
+    let dirs = match tokio::task::spawn_blocking(move || plan_dirs(&dir_owned)).await {
+        Ok(dirs) => dirs,
+        Err(e) => {
+            eprintln!("[cleanup] error listing plans: {e}");
+            return;
+        }
+    };
+
+    for plan_dir in dirs {
         let name = plan_dir
             .file_name()
             .unwrap_or_default()
