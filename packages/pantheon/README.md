@@ -46,7 +46,7 @@ results, and a multi-agent code review pipeline.
 ### Compaction Agents
 `compact-dev`, `compact-researcher`, `compact-planner`, `compact-reviewer`,
 `compact-argus`, `compact-mnemosyne`, `compact-reliability`, `compact-deploy` —
-lightweight context-compression agents (gemini-3.1-flash-lite-preview) used to keep
+lightweight context-compression agents (gemini-3.1-flash-lite) used to keep
 long conversations within token limits.
 
 ---

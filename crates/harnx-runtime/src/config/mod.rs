@@ -4475,7 +4475,7 @@ mod tests {
         let agents_dir = temp.path().join("agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
 
-        let agent_content = "---\nmodel: gemini:gemini-3.1-flash-lite-preview\n---\nYou are a specialized compaction agent. Produce a concise summary.\n";
+        let agent_content = "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are a specialized compaction agent. Produce a concise summary.\n";
         let mut f = std::fs::File::create(agents_dir.join("my-compactor.md")).unwrap();
         f.write_all(agent_content.as_bytes()).unwrap();
 
@@ -4483,12 +4483,9 @@ mod tests {
         // compaction_agent = "my-compactor".
         let mut main_agent = Agent::new(AgentConfig::from_markdown(
             "main",
-            "---\nmodel: gemini:gemini-3.1-flash-lite-preview\ncompaction_agent: my-compactor\n---\nYou are the main agent.",
+            "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_agent: my-compactor\n---\nYou are the main agent.",
         ).unwrap());
-        main_agent.set_model(crate::client::Model::new(
-            "gemini",
-            "gemini-3.1-flash-lite-preview",
-        ));
+        main_agent.set_model(crate::client::Model::new("gemini", "gemini-3.1-flash-lite"));
 
         let mut config = Config {
             data: ConfigData {
@@ -4601,14 +4598,14 @@ mod tests {
 
         // Use /gemini (leading slash) to escape to top-level so the model
         // reference is not rewritten to mypkg/gemini by apply_package_agent_transforms.
-        let package_compactor = "---\nmodel: /gemini:gemini-3.1-flash-lite-preview\n---\nYou are the PACKAGE compactor. Produce a concise summary.\n";
+        let package_compactor = "---\nmodel: /gemini:gemini-3.1-flash-lite\n---\nYou are the PACKAGE compactor. Produce a concise summary.\n";
         let mut package_file =
             std::fs::File::create(package_agents_dir.join("compactor.md")).unwrap();
         package_file
             .write_all(package_compactor.as_bytes())
             .unwrap();
 
-        let top_level_compactor = "---\nmodel: gemini:gemini-3.1-flash-lite-preview\n---\nYou are the TOP-LEVEL compactor. Produce a concise summary.\n";
+        let top_level_compactor = "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are the TOP-LEVEL compactor. Produce a concise summary.\n";
         let mut top_level_file =
             std::fs::File::create(top_level_agents_dir.join("compactor.md")).unwrap();
         top_level_file
@@ -4618,15 +4615,12 @@ mod tests {
         let mut main_agent = Agent::new(
             AgentConfig::from_markdown(
                 "mypkg/main",
-                "---\nmodel: gemini:gemini-3.1-flash-lite-preview\n---\nYou are the main package agent.",
+                "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are the main package agent.",
             )
             .unwrap(),
         );
         main_agent.set_compaction_agent(Some("compactor".to_string()));
-        main_agent.set_model(crate::client::Model::new(
-            "gemini",
-            "gemini-3.1-flash-lite-preview",
-        ));
+        main_agent.set_model(crate::client::Model::new("gemini", "gemini-3.1-flash-lite"));
 
         let mut config = Config {
             data: ConfigData {
