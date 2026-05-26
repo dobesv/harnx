@@ -1171,11 +1171,16 @@ impl BashServer {
                 if let Some((interp, shebang_args)) = parse_shebang(&params.command) {
                     let ext = shebang_script_ext(&params.command);
                     let script_path = exec_dir.join(format!("script.{ext}"));
-                    std::fs::write(&script_path, params.command.as_bytes())
+                    tokio::fs::write(&script_path, params.command.as_bytes())
+                        .await
                         .map_err(|e| internal_error(format!("failed to write script file: {e}")))?;
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
+                    tokio::fs::set_permissions(
+                        &script_path,
+                        std::fs::Permissions::from_mode(0o755),
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
                     // If the interpreter is an absolute path outside SYSTEM_EXEC_PATHS, allow it.
                     if interp.is_absolute() {
                         if let Some(interp_dir) = interp.parent() {
@@ -1218,13 +1223,18 @@ impl BashServer {
             if let Some((interp, shebang_args)) = parse_shebang(&params.command) {
                 let ext = shebang_script_ext(&params.command);
                 let script_path = exec_dir.join(format!("script.{ext}"));
-                std::fs::write(&script_path, params.command.as_bytes())
+                tokio::fs::write(&script_path, params.command.as_bytes())
+                    .await
                     .map_err(|e| internal_error(format!("failed to write script file: {e}")))?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
+                    tokio::fs::set_permissions(
+                        &script_path,
+                        std::fs::Permissions::from_mode(0o755),
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
                 }
                 CommandWrap::with_new(&interp, |command| {
                     command
@@ -1713,11 +1723,16 @@ impl BashServer {
                 if let Some((interp, shebang_args)) = parse_shebang(&params.command) {
                     let ext = shebang_script_ext(&params.command);
                     let script_path = exec_dir.join(format!("script.{ext}"));
-                    std::fs::write(&script_path, params.command.as_bytes())
+                    tokio::fs::write(&script_path, params.command.as_bytes())
+                        .await
                         .map_err(|e| internal_error(format!("failed to write script file: {e}")))?;
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
+                    tokio::fs::set_permissions(
+                        &script_path,
+                        std::fs::Permissions::from_mode(0o755),
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
                     // If the interpreter is an absolute path outside SYSTEM_EXEC_PATHS, allow it.
                     if interp.is_absolute() {
                         if let Some(interp_dir) = interp.parent() {
@@ -1760,13 +1775,18 @@ impl BashServer {
             if let Some((interp, shebang_args)) = parse_shebang(&params.command) {
                 let ext = shebang_script_ext(&params.command);
                 let script_path = exec_dir.join(format!("script.{ext}"));
-                std::fs::write(&script_path, params.command.as_bytes())
+                tokio::fs::write(&script_path, params.command.as_bytes())
+                    .await
                     .map_err(|e| internal_error(format!("failed to write script file: {e}")))?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
+                    tokio::fs::set_permissions(
+                        &script_path,
+                        std::fs::Permissions::from_mode(0o755),
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("failed to chmod script: {e}")))?;
                 }
                 CommandWrap::with_new(&interp, |command| {
                     command

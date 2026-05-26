@@ -22,7 +22,7 @@ The `harnx-mcp-bash` exec and spawn tools previously executed all commands via `
 
 ## Symptoms
 
-```
+```text
 - Behavior: Python/Node/Ruby scripts with shebangs fail with bash syntax errors
 - Error example: `syntax error near unexpected token 'print'` for `#!/usr/bin/env python3\nprint("hi")`
 - Impact: Feature request #655 — users could not pass multi-line scripts in different languages
