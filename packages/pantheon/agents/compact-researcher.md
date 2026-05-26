@@ -1,6 +1,6 @@
 ---
 role: compaction
-model: gemini:gemini-3.1-flash-lite-preview
+model: gemini:gemini-3.1-flash-lite
 version: '0.2.0'
 ---
 You are summarizing a conversation between a user and an AI strategic planner that interviews users, researches codebases, and creates implementation plans.

@@ -145,7 +145,7 @@
       output_price: 1.5
       supports_vision: true
       supports_tool_use: true
-    - name: gemini-3.1-flash-lite-preview
+    - name: gemini-3.1-flash-lite
       max_input_tokens: 1048576
       supports_vision: true
       supports_tool_use: true
@@ -580,7 +580,7 @@
       output_price: 1.5
       supports_vision: true
       supports_tool_use: true
-    - name: gemini-3.1-flash-lite-preview
+    - name: gemini-3.1-flash-lite
       max_input_tokens: 1048576
       supports_vision: true
       supports_tool_use: true
