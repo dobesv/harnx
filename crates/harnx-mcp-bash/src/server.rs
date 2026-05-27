@@ -2302,7 +2302,7 @@ impl ServerHandler for BashServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Local shell command MCP server with output truncation and retrievable temp logs.",
+                "Shell command MCP server with output truncation and retrievable temp logs.",
             )
     }
 
@@ -2316,7 +2316,7 @@ impl ServerHandler for BashServer {
             tools: vec![
                 Tool::new(
                     "exec",
-                    "Execute a local bash command and return truncated combined stdout/stderr. When output is cropped, stdout/stderr temp log files are included for later retrieval. Prefer head_lines/tail_lines/max_output_bytes params over piping to head/tail in the command string. Supports shebang lines: if the command starts with #!, the script is written to a temp file and executed with the named interpreter (python3, node, ruby, etc.) — prefer this over python3 -c or node -e for multi-line scripts.",
+                    "Execute a command and return truncated combined stdout/stderr. When output is cropped, stdout/stderr temp log files are included for later retrieval. Prefer head_lines/tail_lines/max_output_bytes params over piping to head/tail in the command string. Supports shebang lines: if the command starts with #!, the script is written to a temp file and executed with the named interpreter (python3, node, ruby, etc.) — prefer this over python3 -c or node -e for multi-line scripts.",
                     Map::new(),
                 )
                 .with_input_schema::<ExecCommandParams>()
@@ -2334,7 +2334,7 @@ impl ServerHandler for BashServer {
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "spawn",
-                    "Spawn a background bash command. Returns an execution_id and log file paths immediately without waiting for the command to finish. Output is written to separate stdout.log and stderr.log files. Use 'wait' to check for completion and 'terminate' to stop it. Supports shebang lines: if the command starts with #!, the script is executed with the named interpreter automatically.",
+                    "Spawn a background command. Returns an execution_id and log file paths immediately without waiting for the command to finish. Output is written to separate stdout.log and stderr.log files. Use 'wait' to check for completion and 'terminate' to stop it. Supports shebang lines: if the command starts with #!, the script is executed with the named interpreter automatically.",
                     Map::new(),
                 )
                 .with_input_schema::<SpawnCommandParams>()
