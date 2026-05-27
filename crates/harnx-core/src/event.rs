@@ -251,6 +251,23 @@ impl AgentEventSink for NullSink {
     fn emit(&self, _event: AgentEvent, _source: Option<AgentSource>) {}
 }
 
+impl AgentSource {
+    pub fn heading(&self) -> String {
+        let mut parts = vec![self.agent.as_str()];
+        if let Some(model) = &self.model {
+            if !model.is_empty() {
+                parts.push(model);
+            }
+        }
+        if let Some(session_id) = &self.session_id {
+            if !session_id.is_empty() {
+                parts.push(session_id);
+            }
+        }
+        format!("> {}", parts.join(" ▸ "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,22 +332,5 @@ mod tests {
         };
         sink.emit(AgentEvent::Turn(TurnEvent::Started), Some(source));
         sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
-    }
-}
-
-impl AgentSource {
-    pub fn heading(&self) -> String {
-        let mut parts = vec![self.agent.as_str()];
-        if let Some(model) = &self.model {
-            if !model.is_empty() {
-                parts.push(model);
-            }
-        }
-        if let Some(session_id) = &self.session_id {
-            if !session_id.is_empty() {
-                parts.push(session_id);
-            }
-        }
-        format!("> {}", parts.join(" ▸ "))
     }
 }

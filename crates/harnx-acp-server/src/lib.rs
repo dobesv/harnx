@@ -570,9 +570,7 @@ impl HarnxAgent {
 /// reads on the client side to reconstruct `AgentSource`. Keys must match
 /// `agent_from_meta_value` / `session_from_meta_value` / `model_from_meta_value`
 /// in `harnx-acp::client`.
-fn meta_from_source(
-    source: &AgentSource,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
+fn meta_from_source(source: &AgentSource) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut map = serde_json::Map::new();
     map.insert(
         "agent".to_string(),

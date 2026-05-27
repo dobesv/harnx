@@ -1053,7 +1053,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
-                model: None,
+            model: None,
         }),
     ))
     .await
@@ -1065,7 +1065,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
-                model: None,
+            model: None,
         }),
     ))
     .await
@@ -1080,7 +1080,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
-                model: None,
+            model: None,
         }),
     ))
     .await
@@ -1101,7 +1101,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
-                model: None,
+            model: None,
         }),
     ))
     .await
@@ -1116,7 +1116,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
-                model: None,
+            model: None,
         }),
     ))
     .await
