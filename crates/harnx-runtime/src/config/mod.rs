@@ -4192,8 +4192,10 @@ mod tests {
 
     #[test]
     fn test_render_status_line() {
-        let mut config = Config::default();
-        config.model = harnx_client::Model::new("test", "test-model");
+        let mut config = Config {
+            model: harnx_client::Model::new("test", "test-model"),
+            ..Default::default()
+        };
         
         // When agent and session are missing:
         assert_eq!(config.render_status_line(true), "");
