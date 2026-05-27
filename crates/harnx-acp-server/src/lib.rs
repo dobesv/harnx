@@ -309,22 +309,6 @@ impl HarnxAgent {
         // `harnx-acp::client` read `agent` and `session` keys (no
         // namespace prefix). Match those exactly so the parent recovers
         // sub-agent identity.
-        fn meta_from_source(
-            source: &AgentSource,
-        ) -> Option<serde_json::Map<String, serde_json::Value>> {
-            let mut map = serde_json::Map::new();
-            map.insert(
-                "agent".to_string(),
-                serde_json::Value::String(source.agent.clone()),
-            );
-            if let Some(session_id) = &source.session_id {
-                map.insert(
-                    "session".to_string(),
-                    serde_json::Value::String(session_id.clone()),
-                );
-            }
-            Some(map)
-        }
 
         fn spawn_notify_text(
             conn: &Option<acp::ConnectionTo<acp::Client>>,
@@ -580,6 +564,31 @@ impl HarnxAgent {
         session.cancel_notify.notify_one();
         Ok(())
     }
+}
+
+/// Build the `meta` map that `AcpNotificationClient::resolve_notification_source`
+/// reads on the client side to reconstruct `AgentSource`. Keys must match
+/// `agent_from_meta_value` / `session_from_meta_value` / `model_from_meta_value`
+/// in `harnx-acp::client`.
+fn meta_from_source(source: &AgentSource) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "agent".to_string(),
+        serde_json::Value::String(source.agent.clone()),
+    );
+    if let Some(session_id) = &source.session_id {
+        map.insert(
+            "session".to_string(),
+            serde_json::Value::String(session_id.clone()),
+        );
+    }
+    if let Some(model) = &source.model {
+        map.insert(
+            "harnx:model".to_string(),
+            serde_json::Value::String(model.clone()),
+        );
+    }
+    Some(map)
 }
 
 fn content_block_to_text(content: &ContentBlock) -> String {

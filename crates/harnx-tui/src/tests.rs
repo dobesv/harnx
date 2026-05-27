@@ -449,6 +449,7 @@ async fn ui_output_inserts_heading_when_source_changes() {
     let source = AgentSource {
         agent: "argus".to_string(),
         session_id: Some("session-1".to_string()),
+        model: None,
     };
 
     tui.handle_tui_event(TuiEvent::Agent(
@@ -466,6 +467,7 @@ async fn ui_output_inserts_heading_when_source_changes() {
     tui.handle_tui_event(TuiEvent::Agent(
         AgentEvent::Notice(NoticeEvent::Info("other chunk".to_string())),
         Some(AgentSource {
+            model: None,
             agent: "hephaestus".to_string(),
             session_id: Some("session-2".to_string()),
         }),
@@ -677,6 +679,7 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
         .handle_tui_event(TuiEvent::Agent(
             AgentEvent::Notice(NoticeEvent::Info("sub-agent tool call".to_string())),
             Some(AgentSource {
+                model: None,
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
             }),
@@ -688,6 +691,7 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
         .handle_tui_event(TuiEvent::Agent(
             AgentEvent::Notice(NoticeEvent::Info("sub-agent follow-up output".to_string())),
             Some(AgentSource {
+                model: None,
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
             }),
@@ -699,6 +703,7 @@ async fn sub_agent_heading_transitions_render_in_tui_snapshot() {
         .handle_tui_event(TuiEvent::Agent(
             AgentEvent::Notice(NoticeEvent::Info("other sub-agent output".to_string())),
             Some(AgentSource {
+                model: None,
                 agent: "hephaestus".to_string(),
                 session_id: Some("session-2".to_string()),
             }),
@@ -745,6 +750,7 @@ async fn structured_system_entries_do_not_insert_blank_lines_between_each_line()
                 locations: vec![],
             }),
             Some(AgentSource {
+                model: None,
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
             }),
@@ -758,6 +764,7 @@ async fn structured_system_entries_do_not_insert_blank_lines_between_each_line()
                 blocks: vec![ContentBlock::Text("thinking hard\nstep two".to_string())],
             }),
             Some(AgentSource {
+                model: None,
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
             }),
@@ -858,6 +865,7 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
     let source = Some(AgentSource {
         agent: "argus".to_string(),
         session_id: Some("session-1".to_string()),
+        model: None,
     });
 
     for chunk in ["thinking ", "before ", "tool"] {
@@ -975,6 +983,7 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
                 }),
                 Some(AgentSource {
+                    model: None,
                     agent: "argus".to_string(),
                     session_id: Some("session-1".to_string()),
                 }),
@@ -994,6 +1003,7 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
                 locations: vec![],
             }),
             Some(AgentSource {
+                model: None,
                 agent: "argus".to_string(),
                 session_id: Some("session-1".to_string()),
             }),
@@ -1008,6 +1018,7 @@ async fn thinking_stream_coalescing_around_tool_calls_snapshot() {
                     blocks: vec![ContentBlock::Text(chunk.to_string())],
                 }),
                 Some(AgentSource {
+                    model: None,
                     agent: "argus".to_string(),
                     session_id: Some("session-1".to_string()),
                 }),
@@ -1042,6 +1053,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
+            model: None,
         }),
     ))
     .await
@@ -1053,6 +1065,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
+            model: None,
         }),
     ))
     .await
@@ -1067,6 +1080,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
+            model: None,
         }),
     ))
     .await
@@ -1087,6 +1101,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
+            model: None,
         }),
     ))
     .await
@@ -1101,6 +1116,7 @@ async fn structured_ui_output_variants_render_in_transcript() {
         Some(AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
+            model: None,
         }),
     ))
     .await
@@ -1192,6 +1208,7 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
         Some(AgentSource {
             agent: "pytheas".to_string(),
             session_id: Some("session-nested".to_string()),
+            model: None,
         }),
     ))
     .await
@@ -1207,6 +1224,7 @@ async fn nested_subagent_tool_call_renders_with_heading_and_usage() {
         Some(AgentSource {
             agent: "pytheas".to_string(),
             session_id: Some("session-nested".to_string()),
+            model: None,
         }),
     ))
     .await
@@ -1248,6 +1266,7 @@ async fn consecutive_usage_updates_replace_previous_usage_row_for_same_source() 
     let source = AgentSource {
         agent: "pytheas".to_string(),
         session_id: Some("session-1".to_string()),
+        model: None,
     };
 
     tui.handle_tui_event(TuiEvent::Agent(
@@ -1322,6 +1341,7 @@ async fn acp_message_chunks_coalesce_like_direct_llm_streaming() {
     let source = AgentSource {
         agent: "aristarchus".to_string(),
         session_id: Some("session-1".to_string()),
+        model: None,
     };
 
     for chunk in [
@@ -3276,6 +3296,7 @@ async fn sub_agent_activity_no_duplicates_snapshot() {
     let sub_source = Some(AgentSource {
         agent: "researcher".to_string(),
         session_id: Some("research-session-1".to_string()),
+        model: None,
     });
 
     // ── Phase 1: Top-level agent streams opening message ─────────────

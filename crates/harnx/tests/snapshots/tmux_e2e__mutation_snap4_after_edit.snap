@@ -11,7 +11,7 @@ FIRST_RESPONSE_SENTINEL
 
 EDITED_RESPONSE_SENTINEL
 
-🤖 mutation-test-agent ▸ mutation-e2e-session
+🤖 mutation-test-agent ▸ mock-llm:test ▸ mutation-e2e-session
 
 
 
@@ -39,7 +39,7 @@ EDITED_RESPONSE_SENTINEL
 
 
 
-* 🤖 mutation-test-agent ▸ mutation-e2e-session   Context: 42(0%)
+* 🤖 mutation-test-agent ▸ mock-llm:test ▸ mutation-e2e-session   Context: 42(0%)
 
 
 # snap: 4-after-edit

@@ -866,7 +866,7 @@ impl Tui {
     }
 
     async fn render_agent_event(&mut self, event: AgentEvent, source: Option<AgentSource>) {
-        use harnx_core::event::{ModelEvent, NoticeEvent, SessionEvent, ToolEvent};
+        use harnx_core::event::{ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent};
 
         let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
         let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
@@ -916,6 +916,22 @@ impl Tui {
             return;
         }
 
+        if let AgentEvent::Turn(TurnEvent::ModelFallback { ref to, .. }) = event {
+            let new_source = self.app.last_ui_output_source.clone().map(|mut s| {
+                s.model = Some(to.clone());
+                s
+            });
+            self.render_ui_output_heading(new_source.as_ref(), false);
+            return;
+        }
+        if let AgentEvent::Session(SessionEvent::ModelChanged { ref to, .. }) = event {
+            let new_source = self.app.last_ui_output_source.clone().map(|mut s| {
+                s.model = Some(to.clone());
+                s
+            });
+            self.render_ui_output_heading(new_source.as_ref(), false);
+            return;
+        }
         if !is_thought {
             self.flush_pending_thought();
         }

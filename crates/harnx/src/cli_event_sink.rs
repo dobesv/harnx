@@ -38,12 +38,7 @@ fn is_model_output_event(event: &AgentEvent) -> bool {
 }
 
 fn source_heading(source: &AgentSource) -> String {
-    match &source.session_id {
-        Some(session_id) if !session_id.is_empty() => {
-            format!("> {} ▸ {}", source.agent, session_id)
-        }
-        _ => format!("> {}", source.agent),
-    }
+    source.heading()
 }
 
 struct CliSinkState {
@@ -769,6 +764,7 @@ mod tests {
         state.last_ui_output_source = Some(AgentSource {
             agent: "test-agent".to_string(),
             session_id: None,
+            model: None,
         });
         state.cleanup().unwrap();
         assert!(
@@ -796,6 +792,7 @@ mod tests {
         let source = AgentSource {
             agent: "my-agent".to_string(),
             session_id: Some("s1".to_string()),
+            model: None,
         };
         sink.emit(
             AgentEvent::Model(ModelEvent::MessageChunk {
@@ -823,6 +820,7 @@ mod tests {
         let source = AgentSource {
             agent: "my-agent".to_string(),
             session_id: Some("s1".to_string()),
+            model: None,
         };
         // Send a chunk to establish source.
         sink.emit(
@@ -857,6 +855,7 @@ mod tests {
         let source = AgentSource {
             agent: "my-agent".to_string(),
             session_id: Some("s1".to_string()),
+            model: None,
         };
         // Push two partial chunks without newline.  Buffer should hold both.
         sink.emit(

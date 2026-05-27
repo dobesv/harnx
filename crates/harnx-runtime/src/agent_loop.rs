@@ -397,6 +397,7 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
                 let source = harnx_core::event::AgentSource {
                     agent: switch.agent.clone(),
                     session_id: switch.session_id.clone(),
+                    model: ctx.config.read().current_model_id(),
                 };
                 harnx_core::sink::emit_agent_event_with_source(
                     harnx_core::event::AgentEvent::Turn(harnx_core::event::TurnEvent::Started),

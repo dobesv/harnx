@@ -4,7 +4,7 @@ expression: normalized
 ---
 Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
 retry-agent v
-🤖 retry-agent ▸ [SID]
+🤖 retry-agent ▸ mock-llm:primary ▸ [SID]
 > hello
 
 ⚠ Retryable error (status 500, Primary down (type: server_error)), attempt 1/2. Retrying in 10ms...
@@ -49,4 +49,4 @@ FALLBACK_SUCCESS: The fallback model handled it!
 
 
 
-* 🤖 retry-agent ▸ [SID]   Context: 27(0%)
+* 🤖 retry-agent ▸ mock-llm:primary ▸ [SID]   Context: 27(0%)

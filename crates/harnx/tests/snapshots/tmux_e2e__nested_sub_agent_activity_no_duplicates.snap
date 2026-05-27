@@ -4,7 +4,7 @@ expression: normalized
 ---
 Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
 nested-parent v
-🤖 nested-parent ▸ [SID]
+🤖 nested-parent ▸ mock-llm:test ▸ [SID]
 > do nested delegation
 
 Parent delegating to researcher.
@@ -79,4 +79,4 @@ Nested task complete
 
 
 
-* 🤖 nested-parent ▸ [SID]   Context: [N](0%)
+* 🤖 nested-parent ▸ mock-llm:test ▸ [SID]   Context: [N](0%)

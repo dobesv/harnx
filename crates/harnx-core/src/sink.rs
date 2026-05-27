@@ -185,6 +185,7 @@ mod tests {
             Some(AgentSource {
                 agent: "argus".into(),
                 session_id: None,
+                model: None,
             }),
         );
 
@@ -261,6 +262,7 @@ mod tests {
             Some(AgentSource {
                 agent: "argus".into(),
                 session_id: Some("s1".into()),
+                model: None,
             }),
         );
 

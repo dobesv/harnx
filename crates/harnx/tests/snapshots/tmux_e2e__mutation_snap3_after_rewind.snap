@@ -7,7 +7,7 @@ Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
 
 FIRST_RESPONSE_SENTINEL
 
-🤖 mutation-test-agent ▸ mutation-e2e-session
+🤖 mutation-test-agent ▸ mock-llm:test ▸ mutation-e2e-session
 ↩ Rewound session to entry 3.
 
 
@@ -39,7 +39,7 @@ FIRST_RESPONSE_SENTINEL
 
 
 
-* 🤖 mutation-test-agent ▸ mutation-e2e-session   Context: 27(0%)
+* 🤖 mutation-test-agent ▸ mock-llm:test ▸ mutation-e2e-session   Context: 27(0%)
 
 
 # snap: 3-after-rewind

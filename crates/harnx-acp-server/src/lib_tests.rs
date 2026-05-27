@@ -187,4 +187,49 @@ mod tests {
             _ => panic!("expected ToolUpdate"),
         }
     }
+
+    #[test]
+    fn meta_from_source_includes_model_when_present() {
+        use harnx_core::event::AgentSource;
+
+        // Case 1: model present
+        let source_with_model = AgentSource {
+            agent: "test-agent".to_string(),
+            session_id: Some("session-123".to_string()),
+            model: Some("gpt-4o".to_string()),
+        };
+        let meta = crate::meta_from_source(&source_with_model).expect("should return Some");
+        assert_eq!(
+            meta.get("agent"),
+            Some(&serde_json::Value::String("test-agent".to_string()))
+        );
+        assert_eq!(
+            meta.get("session"),
+            Some(&serde_json::Value::String("session-123".to_string()))
+        );
+        assert_eq!(
+            meta.get("harnx:model"),
+            Some(&serde_json::Value::String("gpt-4o".to_string()))
+        );
+
+        // Case 2: model absent
+        let source_without_model = AgentSource {
+            agent: "test-agent".to_string(),
+            session_id: Some("session-456".to_string()),
+            model: None,
+        };
+        let meta = crate::meta_from_source(&source_without_model).expect("should return Some");
+        assert_eq!(
+            meta.get("agent"),
+            Some(&serde_json::Value::String("test-agent".to_string()))
+        );
+        assert_eq!(
+            meta.get("session"),
+            Some(&serde_json::Value::String("session-456".to_string()))
+        );
+        assert!(
+            !meta.contains_key("harnx:model"),
+            "harnx:model should not be present when model is None"
+        );
+    }
 }
