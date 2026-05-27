@@ -1164,6 +1164,17 @@ impl Tui {
                     if i < self.app.transcript.len() {
                         let entry = &self.app.transcript[i];
                         entries.push(Self::render_entry_detail(entry));
+                        // When the selected range is a single ToolCall with no
+                        // adjacent result in the range, peek at the next item so
+                        // the fallback view includes the paired result.
+                        if matches!(entry, TranscriptItem::ToolCall { .. }) && i + 1 > to {
+                            if let Some(next) = self.app.transcript.get(i + 1) {
+                                if matches!(next, TranscriptItem::ToolResultMarkdown { .. }) {
+                                    entries.push(vec![Line::from("")]);
+                                    entries.push(Self::render_entry_detail(next));
+                                }
+                            }
+                        }
                         if i < to {
                             entries.push(vec![Line::from("")]);
                         }
