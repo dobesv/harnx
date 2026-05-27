@@ -11,6 +11,7 @@ use harnx_client::{retrieve_model, Client, ClientConfig};
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::api_types::CompletionTokenUsage;
 use harnx_core::error::LlmError;
+use harnx_core::event::{AgentEvent, TurnEvent};
 use harnx_core::input::Input;
 use harnx_core::model::ModelType;
 use harnx_core::retry_config::{ModelCooldownMap, RetryConfig};
@@ -49,6 +50,10 @@ pub type InitClientFn = Arc<
 /// fallback exhaustion, etc.) — harnx supplies a callback that routes
 /// into the TUI transcript or stderr.
 ///
+/// `event_fn` is invoked to emit structured `AgentEvent`s (e.g.
+/// `TurnEvent::ModelFallback`) — harnx wires this to the global
+/// `emit_agent_event` sink so the TUI can react.
+///
 /// `init_client_fn` is the client-constructor callback. harnx injects a
 /// wrapper that honours its test-client override; production callers can
 /// pass a plain `harnx_client::init_client` reference.
@@ -57,12 +62,17 @@ pub struct TurnContext {
     pub clients: Vec<ClientConfig>,
     pub model_cooldowns: Arc<Mutex<ModelCooldownMap>>,
     pub warn_fn: Arc<dyn Fn(&str) + Send + Sync>,
+    pub event_fn: Arc<dyn Fn(AgentEvent) + Send + Sync>,
     pub init_client_fn: InitClientFn,
 }
 
 impl TurnContext {
     pub fn warn(&self, msg: &str) {
         (self.warn_fn)(msg);
+    }
+
+    pub fn emit(&self, event: AgentEvent) {
+        (self.event_fn)(event);
     }
 
     fn init_client(&self, model: &harnx_core::model::Model) -> Result<Box<dyn Client>> {
@@ -173,11 +183,24 @@ where
     }
 
     let mut last_error: Option<anyhow::Error> = None;
+    // Tracks the last model we actually attempted (not just validated/skipped),
+    // so we can emit `TurnEvent::ModelFallback` when switching to a new one.
+    let mut prev_tried_model: Option<String> = None;
 
     for (idx, model_id) in model_ids.iter().enumerate() {
         // Skip models on cooldown
         if ctx.model_cooldowns.lock().is_on_cooldown(model_id) {
             continue;
+        }
+
+        // Emit ModelFallback when we switch to a different model after a failure.
+        if let Some(ref prev) = prev_tried_model {
+            if prev != model_id {
+                ctx.emit(AgentEvent::Turn(TurnEvent::ModelFallback {
+                    from: prev.clone(),
+                    to: model_id.clone(),
+                }));
+            }
         }
 
         // For the primary model (idx 0), use the already-resolved model from
@@ -246,6 +269,7 @@ where
                 last_error = Some(err);
             }
         }
+        prev_tried_model = Some(model_id.clone());
     }
 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All models are on cooldown")))

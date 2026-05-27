@@ -39,12 +39,7 @@ pub(crate) fn render_status_line(markdown: Option<&str>, status: Option<&str>) -
 }
 
 pub(crate) fn source_heading(source: &AgentSource) -> String {
-    match &source.session_id {
-        Some(session_id) if !session_id.is_empty() => {
-            format!("> {} ▸ {}", source.agent, session_id)
-        }
-        _ => format!("> {}", source.agent),
-    }
+    source.heading()
 }
 
 pub(crate) fn render_usage_line(
@@ -342,5 +337,23 @@ mod markdown_tests {
             !texts.iter().any(|t| t.trim().starts_with("```")),
             "fence markers leaked: {texts:?}"
         );
+    }
+    #[test]
+    fn test_source_heading() {
+        let mut source = AgentSource {
+            agent: "bot".to_string(),
+            session_id: None,
+            model: None,
+        };
+        assert_eq!(super::source_heading(&source), "> bot");
+
+        source.session_id = Some("s1".to_string());
+        assert_eq!(super::source_heading(&source), "> bot ▸ s1");
+
+        source.model = Some("m1".to_string());
+        assert_eq!(super::source_heading(&source), "> bot ▸ m1 ▸ s1");
+
+        source.session_id = None;
+        assert_eq!(super::source_heading(&source), "> bot ▸ m1");
     }
 }

@@ -213,7 +213,15 @@ pub async fn run_command_with_output(
             },
             ".model" => match args {
                 Some(name) => {
+                    let from_model = config.read().current_model().id().to_string();
                     config.write().set_model(name)?;
+                    let to_model = config.read().current_model().id().to_string();
+                    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+                        harnx_core::event::SessionEvent::ModelChanged {
+                            from: from_model,
+                            to: to_model,
+                        },
+                    ));
                 }
                 None => writeln!(output, "Usage: .model <name>")?,
             },

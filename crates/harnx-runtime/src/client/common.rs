@@ -211,9 +211,11 @@ pub async fn call_chat_completions_streaming(
         use harnx_core::event::{AgentEvent, AgentSource, TurnEvent};
         let agent_source = {
             let cfg = config.read();
-            let agent = cfg.extract_agent().name().to_string();
-            let session_id = cfg.session.as_ref().map(|s| s.id().to_string());
-            AgentSource { agent, session_id }
+            AgentSource {
+                agent: cfg.extract_agent().name().to_string(),
+                session_id: cfg.session.as_ref().map(|s| s.id().to_string()),
+                model: cfg.current_model_id(),
+            }
         };
         harnx_core::sink::emit_agent_event_with_source(
             AgentEvent::Turn(TurnEvent::Started),

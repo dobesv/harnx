@@ -954,6 +954,14 @@ fn session_from_meta_value(value: &serde_json::Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn model_from_meta_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("harnx:model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn markdown_from_meta_value(value: &serde_json::Value) -> Option<String> {
     value
         .get("harnx:markdown")
@@ -967,12 +975,13 @@ fn resolve_notification_source(
     notification: &SessionNotification,
 ) -> AgentSource {
     let session_id = notification.session_id.0.to_string();
-    let (update_agent, update_session) = match &notification.update {
+    let (update_agent, update_session, update_model) = match &notification.update {
         SessionUpdate::AgentMessageChunk(chunk) => {
             let meta = chunk.meta.as_ref().map(|meta| json!(meta));
             (
                 meta.as_ref().and_then(agent_from_meta_value),
                 meta.as_ref().and_then(session_from_meta_value),
+                meta.as_ref().and_then(model_from_meta_value),
             )
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
@@ -980,6 +989,7 @@ fn resolve_notification_source(
             (
                 meta.as_ref().and_then(agent_from_meta_value),
                 meta.as_ref().and_then(session_from_meta_value),
+                meta.as_ref().and_then(model_from_meta_value),
             )
         }
         SessionUpdate::ToolCall(call) => {
@@ -987,6 +997,7 @@ fn resolve_notification_source(
             (
                 meta.as_ref().and_then(agent_from_meta_value),
                 meta.as_ref().and_then(session_from_meta_value),
+                meta.as_ref().and_then(model_from_meta_value),
             )
         }
         SessionUpdate::ToolCallUpdate(update) => {
@@ -994,6 +1005,7 @@ fn resolve_notification_source(
             (
                 meta.as_ref().and_then(agent_from_meta_value),
                 meta.as_ref().and_then(session_from_meta_value),
+                meta.as_ref().and_then(model_from_meta_value),
             )
         }
         SessionUpdate::Plan(plan) => {
@@ -1001,6 +1013,7 @@ fn resolve_notification_source(
             (
                 meta.as_ref().and_then(agent_from_meta_value),
                 meta.as_ref().and_then(session_from_meta_value),
+                meta.as_ref().and_then(model_from_meta_value),
             )
         }
         SessionUpdate::SessionInfoUpdate(info) => {
@@ -1024,14 +1037,24 @@ fn resolve_notification_source(
                             .and_then(|meta| meta.get("harnx:usage"))
                             .and_then(session_from_meta_value)
                     }),
+                direct_meta
+                    .as_ref()
+                    .and_then(model_from_meta_value)
+                    .or_else(|| {
+                        info.meta
+                            .as_ref()
+                            .and_then(|meta| meta.get("harnx:usage"))
+                            .and_then(model_from_meta_value)
+                    }),
             )
         }
-        _ => (None, None),
+        _ => (None, None, None),
     };
 
     AgentSource {
         agent: update_agent.unwrap_or_else(|| fallback_agent.to_string()),
         session_id: Some(update_session.unwrap_or(session_id)),
+        model: update_model,
     }
 }
 
@@ -1066,12 +1089,7 @@ fn parse_tool_status_str(status: &str) -> Option<ToolStatus> {
 }
 
 fn source_heading(source: &AgentSource) -> String {
-    match &source.session_id {
-        Some(session_id) if !session_id.is_empty() => {
-            format!("> {} ▸ {}", source.agent, session_id)
-        }
-        _ => format!("> {}", source.agent),
-    }
+    source.heading()
 }
 
 fn chunk_text(content: &AcpContentBlock) -> String {
@@ -1111,6 +1129,7 @@ mod tests {
             AgentSource {
                 agent: "fallback-agent".to_string(),
                 session_id: Some("outer-session-1".to_string()),
+                model: None,
             },
         )
         .expect("usage event");

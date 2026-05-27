@@ -1,5 +1,5 @@
 ---
-source: src/tests.rs
+source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
 > Test message
@@ -23,4 +23,4 @@ Hello from the mock client!
 
 
 
-• 🤖  test-agent
+• 🤖  test-agent ▸ mock:mock-model

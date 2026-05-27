@@ -66,6 +66,7 @@ mod tests {
                 blocks: vec![ContentBlock::Text("hello".into())],
             }),
             Some(AgentSource {
+                model: None,
                 agent: "argus".into(),
                 session_id: Some("session-1".into()),
             }),
@@ -115,6 +116,7 @@ mod tests {
             Some(AgentSource {
                 agent: "hephaestus".into(),
                 session_id: None,
+                model: None,
             }),
         );
         let ev = rx.try_recv().expect("tui event");

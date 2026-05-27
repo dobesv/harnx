@@ -37,6 +37,11 @@ fn build_turn_context(config: &GlobalConfig) -> TurnContext {
         clients: cfg.clients.clone(),
         model_cooldowns: cfg.model_cooldowns.clone(),
         warn_fn: Arc::new(|msg: &str| emit_retry_warning(msg)),
+        // Emit structured AgentEvents (e.g. TurnEvent::ModelFallback) through
+        // the global sink so the TUI can react to model changes.
+        event_fn: Arc::new(|event: harnx_core::event::AgentEvent| {
+            harnx_core::sink::emit_agent_event(event);
+        }),
         // Route through harnx's `crate::client::init_client` wrapper so
         // the test-client override installed by `TestStateGuard` is
         // honoured. In production this delegates to
