@@ -1652,12 +1652,12 @@ async fn live_log_seq_assignment_patches_latest_unsequenced_transcript_items() {
     tui.app.show_sequence_numbers = true;
 
     tui.app.transcript.push(TranscriptItem::UserText {
-        timestamp: None,
+        timestamp: Some(chrono::Utc::now()),
         text: "older user".to_string(),
         seq: Some(1),
     });
     tui.app.transcript.push(TranscriptItem::UserText {
-        timestamp: None,
+        timestamp: Some(chrono::Utc::now()),
         text: "live user".to_string(),
         seq: None,
     });
@@ -1670,7 +1670,7 @@ async fn live_log_seq_assignment_patches_latest_unsequenced_transcript_items() {
     .unwrap();
 
     tui.app.transcript.push(TranscriptItem::AssistantText {
-        timestamp: None,
+        timestamp: Some(chrono::Utc::now()),
         text: "live assistant".to_string(),
         seq: None,
         rendered_cache: None,
@@ -1699,6 +1699,141 @@ async fn live_log_seq_assignment_patches_latest_unsequenced_transcript_items() {
         .collect();
 
     assert_eq!(pairs, vec![("user", Some(2)), ("assistant", Some(3))]);
+}
+
+#[tokio::test]
+async fn live_log_seq_assignment_applies_to_tool_calls_started_after_seq_event() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 5 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "call-1".into(),
+            name: "bash_exec".into(),
+            kind: ToolKind::Other,
+            markdown: None,
+            input: yaml_to_json("command: echo hi"),
+            locations: vec![],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let tool_call_idx = tui
+        .app
+        .transcript
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::ToolCall { tool_name, .. } if tool_name == "bash_exec"))
+        .expect("expected ToolCall transcript item");
+
+    match &tui.app.transcript[tool_call_idx] {
+        TranscriptItem::ToolCall { seq, .. } => assert_eq!(*seq, Some(5)),
+        other => panic!("expected ToolCall transcript item, got {other:?}"),
+    }
+
+    // Verify pending_tool_seq is still set: multiple tool calls in the same round
+    // share the same log_seq, so we intentionally do NOT clear it after first use.
+    // It will be cleared when the next LogSeqAssigned arrives (for a different round)
+    // and successfully backfills a UserText or AssistantText item, or overwritten by
+    // the next tool round's LogSeqAssigned.
+    assert_eq!(
+        tui.app.pending_tool_seq,
+        Some(5),
+        "pending_tool_seq should remain set so subsequent ToolCalls in same round share seq"
+    );
+}
+
+#[tokio::test]
+async fn log_seq_backfill_clears_pending_tool_seq() {
+    // When LogSeqAssigned arrives and backfills an EXISTING transcript item,
+    // pending_tool_seq must be cleared (not left set for the next ToolCall).
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // First add an AssistantText with seq=None so backfill can find it.
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("assistant reply".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Now LogSeqAssigned should backfill the AssistantText and NOT set pending_tool_seq.
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 3 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Backfill succeeded — pending should be None.
+    assert_eq!(
+        tui.app.pending_tool_seq, None,
+        "pending_tool_seq must be None after backfill consumed the seq"
+    );
+}
+
+#[tokio::test]
+async fn live_log_seq_assignment_applies_to_blocked_tool_calls() {
+    // ToolEvent::Blocked also uses pending_tool_seq, same as ToolEvent::Started.
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 7 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Tool(ToolEvent::Blocked {
+            id: "call-2".into(),
+            name: "dangerous_tool".into(),
+            input: yaml_to_json("target: /etc"),
+            reason: "hook denied".into(),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let blocked_call = tui
+        .app
+        .transcript
+        .iter()
+        .find(|item| matches!(item, TranscriptItem::ToolCall { tool_name, .. } if tool_name == "dangerous_tool"))
+        .expect("expected ToolCall for blocked tool");
+
+    match blocked_call {
+        TranscriptItem::ToolCall { seq, .. } => {
+            assert_eq!(
+                *seq,
+                Some(7),
+                "blocked ToolCall should inherit pending_tool_seq"
+            );
+        }
+        other => panic!("expected ToolCall, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

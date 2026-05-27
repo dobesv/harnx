@@ -76,6 +76,7 @@ pub(super) struct App {
     pub(super) last_usage_transcript_idx: Option<usize>,
     pub(super) pending_thought_source: Option<AgentSource>,
     pub(super) pending_thought_text: String,
+    pub(super) pending_tool_seq: Option<usize>,
     pub(super) pending_message: Option<PendingMessage>,
     pub(super) completions: Vec<(String, Option<String>)>,
     pub(super) completion_index: usize,
