@@ -844,6 +844,15 @@ impl Config {
         }
     }
 
+    pub fn current_model_id(&self) -> Option<String> {
+        let id = self.current_model().id();
+        if id.is_empty() {
+            None
+        } else {
+            Some(id)
+        }
+    }
+
     pub fn extract_agent(&self) -> Agent {
         // When an explicit agent is active, prefer it over the session-derived
         // agent. The in-memory agent has the full configuration from the agent
@@ -2713,14 +2722,24 @@ impl Config {
             }
         };
         let session_name = self.session.as_ref().map(|s| s.id().to_string());
-        match (agent_name, session_name, use_icons) {
-            (Some(agent), Some(session), true) => format!("🤖 {} ▸ {}", agent, session),
-            (Some(agent), Some(session), false) => format!("{} ▸ {}", agent, session),
-            (Some(agent), None, true) => format!("🤖 {}", agent),
-            (Some(agent), None, false) => agent,
-            (None, Some(session), true) => format!("💬 {}", session),
-            (None, Some(session), false) => session,
-            (None, None, _) => String::new(),
+        let model_id = self.current_model_id();
+
+        match (agent_name, model_id, session_name, use_icons) {
+            (Some(agent), Some(model), Some(session), true) => {
+                format!("🤖 {} ▸ {} ▸ {}", agent, model, session)
+            }
+            (Some(agent), Some(model), Some(session), false) => {
+                format!("{} ▸ {} ▸ {}", agent, model, session)
+            }
+            (Some(agent), Some(model), None, true) => format!("🤖 {} ▸ {}", agent, model),
+            (Some(agent), Some(model), None, false) => format!("{} ▸ {}", agent, model),
+            (Some(agent), None, Some(session), true) => format!("🤖 {} ▸ {}", agent, session),
+            (Some(agent), None, Some(session), false) => format!("{} ▸ {}", agent, session),
+            (Some(agent), None, None, true) => format!("🤖 {}", agent),
+            (Some(agent), None, None, false) => agent,
+            (None, _, Some(session), true) => format!("💬 {}", session),
+            (None, _, Some(session), false) => session,
+            (None, _, None, _) => String::new(),
         }
     }
 
@@ -4174,6 +4193,73 @@ mod tests {
         assert!(would_orphan);
     }
 
+    #[test]
+    fn test_render_status_line() {
+        let mut config = Config {
+            model: harnx_client::Model::new("test", "test-model"),
+            ..Default::default()
+        };
+
+        // When agent and session are missing:
+        assert_eq!(config.render_status_line(true), "");
+
+        let mut agent = Agent::new(AgentConfig::from_markdown("my-agent", "prompt").unwrap());
+        agent.set_model(crate::client::Model::new("test", "agent-model"));
+        config.agent = Some(agent);
+
+        // Agent + Model (no session)
+        assert_eq!(
+            config.render_status_line(true),
+            "🤖 my-agent ▸ test:agent-model"
+        );
+        assert_eq!(
+            config.render_status_line(false),
+            "my-agent ▸ test:agent-model"
+        );
+
+        let session = super::session::new(&config, "my-session").unwrap();
+        let session_id = session.id().to_string();
+        config.session = Some(session);
+
+        // Agent + Model + Session
+        assert_eq!(
+            config.render_status_line(true),
+            format!("🤖 my-agent ▸ test:agent-model ▸ {}", session_id)
+        );
+        assert_eq!(
+            config.render_status_line(false),
+            format!("my-agent ▸ test:agent-model ▸ {}", session_id)
+        );
+
+        // Agent + Session (No Model ID)
+        let mut config3 = Config::default();
+        let mut agent3 = Agent::new(AgentConfig::from_markdown("agent3", "prompt").unwrap());
+        agent3.set_model(crate::client::Model::new("", ""));
+        config3.agent = Some(agent3);
+        let session3 = super::session::new(&config3, "session3").unwrap();
+        let session_id3 = session3.id().to_string();
+        config3.session = Some(session3);
+
+        assert_eq!(
+            config3.render_status_line(true),
+            format!("🤖 agent3 ▸ {}", session_id3)
+        );
+        assert_eq!(
+            config3.render_status_line(false),
+            format!("agent3 ▸ {}", session_id3)
+        );
+
+        // Session only (create a session without an agent)
+        let mut config2 = Config::default();
+        let session_no_agent = super::session::new(&config2, "my-session2").unwrap();
+        let session_id2 = session_no_agent.id().to_string();
+        config2.session = Some(session_no_agent);
+        assert_eq!(
+            config2.render_status_line(true),
+            format!("💬 {}", session_id2)
+        );
+        assert_eq!(config2.render_status_line(false), session_id2);
+    }
     #[test]
     fn test_split_tool_selectors_simple() {
         assert_eq!(split_tool_selectors("a,b,c"), vec!["a", "b", "c"]);

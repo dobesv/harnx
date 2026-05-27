@@ -585,7 +585,11 @@ mod tests {
         match event {
             (
                 AgentEvent::Model(ModelEvent::Error(msg)),
-                Some(AgentSource { agent, session_id }),
+                Some(AgentSource {
+                    agent,
+                    session_id,
+                    model: _,
+                }),
             ) => {
                 for fragment in expected_fragments {
                     assert!(
@@ -843,6 +847,7 @@ enabled: false
             Some(AgentSource {
                 agent: "sub-agent".to_string(),
                 session_id: Some("session-1".to_string()),
+                model: None,
             }),
         ))
         .expect("send tool completed event");
@@ -856,6 +861,7 @@ enabled: false
             Some(AgentSource {
                 agent: "sub-agent".to_string(),
                 session_id: Some("session-1".to_string()),
+                model: None,
             }),
         ))
         .expect("send tool update event");
@@ -921,6 +927,7 @@ enabled: false
             Some(AgentSource {
                 agent: "argus".to_string(),
                 session_id: Some("sub-session-1".to_string()),
+                model: None,
             }),
         ))
         .unwrap();
@@ -986,6 +993,7 @@ enabled: false
         let source = AgentSource {
             agent: "pytheas".to_string(),
             session_id: Some("sub-session-error".to_string()),
+            model: None,
         };
 
         tx.send(NestedAcpEvent::Agent(

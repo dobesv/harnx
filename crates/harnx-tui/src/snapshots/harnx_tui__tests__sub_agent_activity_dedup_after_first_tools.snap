@@ -29,4 +29,4 @@ path: /data/results.csv
 
 
 
-• 🤖  coordinator ▸ dedup-test-session
+• 🤖  coordinator ▸ mock:mock-model ▸ dedup-test-session

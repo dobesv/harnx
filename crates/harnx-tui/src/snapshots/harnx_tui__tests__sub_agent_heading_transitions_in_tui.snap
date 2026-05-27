@@ -17,4 +17,4 @@ Top-level assistant closes response.
 
 
 
-• 🤖  main-agent ▸ main-session
+• 🤖  main-agent ▸ mock:mock-model ▸ main-session

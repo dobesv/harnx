@@ -354,12 +354,7 @@ fn session_resume_command(config: &GlobalConfig) -> Option<String> {
 }
 
 fn source_heading(source: &AgentSource) -> String {
-    match &source.session_id {
-        Some(session_id) if !session_id.is_empty() => {
-            format!("> {} ▸ {}", source.agent, session_id)
-        }
-        _ => format!("> {}", source.agent),
-    }
+    source.heading()
 }
 
 struct BreakdownSections<'a> {
@@ -757,14 +752,13 @@ async fn start_interactive(config: &GlobalConfig) -> Result<()> {
     dispatch_session_start(config, "tui", &async_manager, &persistent_manager).await;
     let mut tui: Tui = Tui::init(config, async_manager, persistent_manager.clone()).await?;
     let result = tui.run().await;
-    let source = AgentSource {
-        agent: config
-            .read()
-            .agent
-            .as_ref()
-            .map(|a| a.name().to_string())
-            .unwrap_or_default(),
-        session_id: config.read().session.as_ref().map(|s| s.id().to_string()),
+    let source = {
+        let cfg = config.read();
+        AgentSource {
+            agent: cfg.extract_agent().name().to_string(),
+            session_id: cfg.session.as_ref().map(|s| s.id().to_string()),
+            model: cfg.current_model_id(),
+        }
     };
     print_session_breakdown(tui.transcript(), &source, config);
     let async_manager = tui.async_manager().lock().await;

@@ -208,6 +208,8 @@ pub struct StatusLine {
 pub struct AgentSource {
     pub agent: String,
     pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -247,6 +249,23 @@ pub struct NullSink;
 
 impl AgentEventSink for NullSink {
     fn emit(&self, _event: AgentEvent, _source: Option<AgentSource>) {}
+}
+
+impl AgentSource {
+    pub fn heading(&self) -> String {
+        let mut parts = vec![self.agent.as_str()];
+        if let Some(model) = &self.model {
+            if !model.is_empty() {
+                parts.push(model);
+            }
+        }
+        if let Some(session_id) = &self.session_id {
+            if !session_id.is_empty() {
+                parts.push(session_id);
+            }
+        }
+        format!("> {}", parts.join(" ▸ "))
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +314,7 @@ mod tests {
         let source = AgentSource {
             agent: "argus".to_string(),
             session_id: Some("session-1".to_string()),
+            model: None,
         };
         let json = serde_json::to_string(&source).unwrap();
         let decoded: AgentSource = serde_json::from_str(&json).unwrap();
@@ -308,6 +328,7 @@ mod tests {
         let source = AgentSource {
             agent: "argus".to_string(),
             session_id: None,
+            model: None,
         };
         sink.emit(AgentEvent::Turn(TurnEvent::Started), Some(source));
         sink.emit(AgentEvent::Turn(TurnEvent::Started), None);

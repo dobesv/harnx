@@ -17,4 +17,4 @@ message: delegate
 
 
 
-• 🤖  coordinator ▸ coalescing-test
+• 🤖  coordinator ▸ mock:mock-model ▸ coalescing-test
