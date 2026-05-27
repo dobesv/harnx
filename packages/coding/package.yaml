@@ -1,5 +1,5 @@
 name: coding
-version: v0.2.0
+version: v0.2.1
 description: >
   A capable, self-contained coding assistant for harnx. Reads code, writes code,
   runs tests, searches the web, and manages local plans. A lightweight alternative

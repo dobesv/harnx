@@ -27,7 +27,7 @@ description: "Knowledge compounding specialist \u2014 captures learnings, decisi
   \ and solutions from completed tasks into structured docs/solutions/ entries for\
   \ future reference. Named after Mnemosyne (neh-MOZ-ih-nee), Titan of Memory and\
   \ mother of the Muses.\n"
-version: '0.2.0'
+version: '0.2.1'
 variables:
 - name: mnemosyne_core
   description: Core identity and instructions for Mnemosyne

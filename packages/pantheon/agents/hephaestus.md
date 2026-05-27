@@ -27,7 +27,7 @@ use_tools:
 - plans_update_task
 - pytheas_session_prompt
 description: "Deep work and complex refactoring specialist — grinds through autonomous, heavy-duty problem-solving at the forge. Named after Hephaestus (heh-FES-tus), the Divine Blacksmith.\n"
-version: '0.2.0'
+version: '0.2.1'
 variables:
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep

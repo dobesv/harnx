@@ -24,7 +24,7 @@ description: "Architecture and big picture specialist \u2014 evaluates cross-cut
   \ concerns, dependency direction, design pattern adherence, API contract consistency,\
   \ and system-wide impact. Named after Urania (yoo-RAY-nee-uh), the Muse of astronomy\
   \ \u2014 seeing the codebase from above.\n"
-version: '0.2.0'
+version: '0.2.1'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

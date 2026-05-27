@@ -27,7 +27,7 @@ use_tools:
 - plans_update_task
 - pytheas_session_prompt
 description: "Complex multi-faceted strategy and execution specialist — commands the field when a high-effort task is too complex for a specialist. Named after Athena (uh-THEE-nuh), Goddess of Strategic Warfare.\n"
-version: '0.2.0'
+version: '0.2.1'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

@@ -19,7 +19,7 @@ description: "Pre-planning consultant \u2014 analyzes user requests before Daeda
   \ generates plans, identifying hidden intentions, ambiguities, and AI failure points.\
   \ Produces directives that guide the planner. Named after Metis (MEE-tis), the Greek\
   \ goddess of wisdom, prudence, and deep counsel.\n"
-version: '0.2.0'
+version: '0.2.1'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

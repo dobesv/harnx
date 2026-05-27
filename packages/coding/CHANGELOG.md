@@ -1,6 +1,18 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.2.1 (2026-05-27)
+
+### Features
+
+- add automatic background cleanup of inactive plans (#656)
+- add shebang support for non-bash interpreters (#659)
+
+### Fixes
+
+- propagate errors for invalid jq expressions in package patches (#651)
+- remove duplicate gemini-3.1-flash-lite entries in provider catalogs (#663)
+
 ## 0.2.0 (2026-05-25)
 
 ### Breaking Changes
