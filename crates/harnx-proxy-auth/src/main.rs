@@ -1,9 +1,10 @@
 use std::io::Write;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
 
-use harnx_proxy_auth::{ca, cli, filter, hook, proxy};
+use harnx_proxy_auth::{ca, cli, filter, hook, proxy, sentinel};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,11 +17,13 @@ async fn main() -> Result<()> {
     let args = <cli::Args as Parser>::parse();
     let filter_expr = args.combined_filter();
     let filter = filter::compile(&filter_expr)?;
+    let sentinels = Arc::new(sentinel::Sentinels::generate());
+    let extra_env = filter::eval_env_scripts(&args.env, &sentinels)?;
 
     let (ca_setup, _ca_temp_dir) = ca::setup()?;
     let ca_cert_path = ca_setup.cert_pem_path.clone();
     let ca_cert_pem = std::fs::read_to_string(&ca_cert_path)?;
-    let port = proxy::start_proxy_with_log(filter, ca_setup, args.log_file).await?;
+    let port = proxy::start_proxy_with_log(filter, ca_setup, sentinels, args.log_file).await?;
 
     // Write readiness lines then explicitly drop the lock before entering the
     // async JSONL loop. Holding a std::io::StdoutLock across an .await would
@@ -36,5 +39,5 @@ async fn main() -> Result<()> {
         stdout.flush()?;
     } // lock dropped here
 
-    hook::run_jsonl_loop(port, ca_cert_path).await
+    hook::run_jsonl_loop(port, ca_cert_path, extra_env).await
 }

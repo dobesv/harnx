@@ -115,12 +115,14 @@ async fn header_injection_works_through_https_connect_tunnel() {
         let filter_expr =
             r#"if .host == "localhost" then .headers["x-test-header"] = "hello-world" end"#;
         let compiled = filter::compile(filter_expr).expect("compile filter");
+        let sentinels = Arc::new(harnx_proxy_auth::sentinel::Sentinels::generate());
 
         // Start the proxy with danger_accept_invalid_certs so it can connect
         // upstream to our self-signed test server.
-        let proxy_port = proxy::start_proxy_danger_accept_invalid_certs(compiled, ca_setup)
-            .await
-            .expect("start proxy");
+        let proxy_port =
+            proxy::start_proxy_danger_accept_invalid_certs(compiled, ca_setup, sentinels)
+                .await
+                .expect("start proxy");
 
         sleep(Duration::from_millis(100)).await;
 
@@ -162,6 +164,95 @@ async fn header_injection_works_through_https_connect_tunnel() {
             Some("hello-world"),
             "proxy did not inject x-test-header for tunnelled HTTPS — \
              host was not resolved from Host header. Full echoed headers: {body}"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Test that hook filters can use sentinel jaq variables directly.
+///
+/// This covers hook-side sentinel interpolation without exporting sentinels into
+/// process env. The filter matches a sentinel-backed Authorization header and
+/// replaces it before forwarding request upstream.
+#[tokio::test]
+async fn hook_filter_can_use_sentinel_variables() {
+    use harnx_proxy_auth::sentinel::Sentinels;
+
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    timeout(Duration::from_secs(20), async {
+        // Set up the proxy CA — keep the TempDir alive for the duration.
+        let (ca_setup, _ca_temp_dir) = ca::setup().expect("proxy CA setup");
+        let ca_cert_pem =
+            std::fs::read_to_string(&ca_setup.cert_pem_path).expect("read CA cert PEM");
+
+        // Generate a self-signed server cert for "localhost".
+        let server_cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("gen server cert");
+        let server_cert_der = server_cert.cert.der().to_vec();
+        let server_key_der = server_cert.signing_key.serialize_der();
+
+        // Spawn an HTTPS server using the self-signed cert.
+        let (server_port, _server_shutdown) = spawn_https_server(server_cert_der, server_key_der)
+            .await
+            .expect("spawn HTTPS server");
+
+        // Generate sentinels and pre-compute the sentinel-backed header value.
+        let sentinels = Arc::new(Sentinels::generate());
+        let sentinel_value = format!("ghs_{}", sentinels.base64_key);
+
+        // Compile the jq filter that checks the sentinel jaq variable directly.
+        let filter_expr =
+            r#"if .headers.authorization == "Bearer ghs_\($fake_base64_key)" then .headers.authorization = "Bearer real_token_from_env" else . end"#;
+        let compiled = filter::compile(filter_expr).expect("compile filter");
+
+        // Start the proxy with danger_accept_invalid_certs so it can connect
+        // upstream to our self-signed test server.
+        let proxy_port =
+            proxy::start_proxy_danger_accept_invalid_certs(compiled, ca_setup, sentinels.clone())
+            .await
+            .expect("start proxy");
+
+        sleep(Duration::from_millis(100)).await;
+
+        // Build a reqwest client that routes HTTPS through the proxy (CONNECT
+        // tunnel). `danger_accept_invalid_certs` is required because the
+        // MITM leaf certs hudsucker generates have no Extended Key Usage.
+        let proxy_ca = reqwest::tls::Certificate::from_pem(ca_cert_pem.as_bytes())
+            .expect("parse proxy CA cert");
+
+        let client = reqwest::Client::builder()
+            .proxy(
+                reqwest::Proxy::https(format!("http://127.0.0.1:{proxy_port}"))
+                    .expect("build proxy"),
+            )
+            .add_root_certificate(proxy_ca)
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("build reqwest client");
+
+        // Send a request with the sentinel token in Authorization header.
+        let response = client
+            .get(format!("https://localhost:{server_port}/"))
+            .header("Authorization", format!("Bearer {sentinel_value}"))
+            .send()
+            .await
+            .expect("send request");
+
+        assert!(
+            response.status().is_success(),
+            "expected 200, got {}",
+            response.status()
+        );
+
+        let body: Value = response.json().await.expect("parse JSON body");
+
+        // The proxy filter should have replaced the sentinel token with the real token.
+        assert_eq!(
+            body.get("authorization").and_then(Value::as_str),
+            Some("Bearer real_token_from_env"),
+            "proxy did not replace sentinel token via $fake_base64_key. Full echoed headers: {body}"
         );
     })
     .await

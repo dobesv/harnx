@@ -26,6 +26,7 @@ use crate::filter::{self, CompiledFilter};
 #[derive(Clone)]
 struct AuthHandler {
     filter: Arc<CompiledFilter>,
+    sentinels: Arc<crate::sentinel::Sentinels>,
     log_file: Option<PathBuf>,
 }
 
@@ -37,7 +38,7 @@ impl HttpHandler for AuthHandler {
     ) -> RequestOrResponse {
         let req_json = request_json(&req);
 
-        match filter::apply_filter(&self.filter, req_json.clone()) {
+        match filter::apply_filter(&self.filter, req_json.clone(), &self.sentinels) {
             Ok(result) => {
                 // If the filter sets `.block` to a truthy value, return a 403 response
                 // instead of forwarding the request.
@@ -220,16 +221,39 @@ fn replace_headers(headers: &mut http::HeaderMap, new_headers: &Map<String, Valu
     changed
 }
 
-pub async fn start_proxy(filter: CompiledFilter, ca: CaSetup) -> Result<u16> {
-    start_proxy_inner(filter, ca, None, false).await
+pub async fn start_proxy(
+    filter: CompiledFilter,
+    ca: CaSetup,
+    sentinels: Arc<crate::sentinel::Sentinels>,
+) -> Result<u16> {
+    start_proxy_inner(
+        filter,
+        ProxyConfig {
+            ca,
+            sentinels,
+            log_file: None,
+            danger_accept_invalid_certs: false,
+        },
+    )
+    .await
 }
 
 pub async fn start_proxy_with_log(
     filter: CompiledFilter,
     ca: CaSetup,
+    sentinels: Arc<crate::sentinel::Sentinels>,
     log_file: Option<PathBuf>,
 ) -> Result<u16> {
-    start_proxy_inner(filter, ca, log_file, false).await
+    start_proxy_inner(
+        filter,
+        ProxyConfig {
+            ca,
+            sentinels,
+            log_file,
+            danger_accept_invalid_certs: false,
+        },
+    )
+    .await
 }
 
 /// Like [`start_proxy`] but skips TLS certificate verification for upstream
@@ -238,8 +262,25 @@ pub async fn start_proxy_with_log(
 pub async fn start_proxy_danger_accept_invalid_certs(
     filter: CompiledFilter,
     ca: CaSetup,
+    sentinels: Arc<crate::sentinel::Sentinels>,
 ) -> Result<u16> {
-    start_proxy_inner(filter, ca, None, true).await
+    start_proxy_inner(
+        filter,
+        ProxyConfig {
+            ca,
+            sentinels,
+            log_file: None,
+            danger_accept_invalid_certs: true,
+        },
+    )
+    .await
+}
+
+struct ProxyConfig {
+    ca: CaSetup,
+    sentinels: Arc<crate::sentinel::Sentinels>,
+    log_file: Option<PathBuf>,
+    danger_accept_invalid_certs: bool,
 }
 
 fn build_danger_https_connector() -> Result<hyper_rustls::HttpsConnector<HttpConnector>> {
@@ -300,12 +341,13 @@ fn build_danger_https_connector() -> Result<hyper_rustls::HttpsConnector<HttpCon
         .wrap_connector(http))
 }
 
-async fn start_proxy_inner(
-    filter: CompiledFilter,
-    ca: CaSetup,
-    log_file: Option<PathBuf>,
-    danger_accept_invalid_certs: bool,
-) -> Result<u16> {
+async fn start_proxy_inner(filter: CompiledFilter, config: ProxyConfig) -> Result<u16> {
+    let ProxyConfig {
+        ca,
+        sentinels,
+        log_file,
+        danger_accept_invalid_certs,
+    } = config;
     let issuer = Issuer::from_ca_cert_pem(&ca.cert.pem(), ca.key_pair)?;
     let issuer = RcgenAuthority::new(issuer, 256, aws_lc_rs::default_provider());
 
@@ -314,6 +356,7 @@ async fn start_proxy_inner(
 
     let handler = AuthHandler {
         filter: Arc::new(filter),
+        sentinels,
         log_file,
     };
 

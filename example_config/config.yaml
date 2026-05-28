@@ -51,9 +51,11 @@ toolsets:
 #
 # PreToolUse hooks can return hookSpecificOutput.toolInput to mutate tool arguments.
 # PostToolUse hooks can return hookSpecificOutput.toolResponse to mutate the tool response.
-# Example: Inject GitHub auth headers for HTTPS requests via the harnx-proxy-auth hook.
-# This is a persistent hook process that acts as an HTTPS MITM proxy, injecting auth
-# headers based on URL-matcher rules. It runs once and handles all bash_exec/bash_spawn events.
+#
+# Example: Inject GitHub auth headers via harnx-proxy-auth using --env sentinel technique.
+# The --env script emits real variable names with fake sentinel values. The hook matches
+# the sentinel in outbound requests and replaces it with the real token from the environment.
+# This prevents the real token from appearing in logs or process listings.
 #
 # hooks:
 #   entries:
@@ -62,6 +64,21 @@ toolsets:
 #     matcher: "bash_exec|bash_spawn"
 #     command: >-
 #       harnx-proxy-auth
-#       --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
-#           then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
+#       --env 'if (env.GITHUB_TOKEN // env.GH_TOKEN) then .GITHUB_TOKEN = "ghs_\($fake_base64_key)" else . end'
+#       --hook 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
+#           then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
+#           else . end'
+#
+# Example: Inject Atlassian Basic auth using sentinel email + UUID placeholders.
+#
+# hooks:
+#   entries:
+#   - event: PreToolUse
+#     type: claude-command-persistent
+#     matcher: "bash_exec|bash_spawn"
+#     command: >-
+#       harnx-proxy-auth
+#       --env 'if (env.ATLASSIAN_API_TOKEN and env.ATLASSIAN_EMAIL) then .ATLASSIAN_API_TOKEN = $fake_uuid_key | .ATLASSIAN_EMAIL = $fake_email else . end'
+#       --hook 'if (.host | endswith(".atlassian.net")) and .headers.authorization == "Basic \([$fake_email, $fake_uuid_key] | join(":") | @base64)"
+#           then .headers.authorization = basic(env.ATLASSIAN_EMAIL; env.ATLASSIAN_API_TOKEN)
 #           else . end'
