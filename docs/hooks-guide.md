@@ -323,6 +323,80 @@ hooks:
           end'
 ```
 
+### Sentinel Environment Variable Injection (`--env`)
+
+The `--env '<jaq-script>'` flag allows you to generate fake "sentinel" credentials at startup and inject them into bash tool calls. Hook scripts can then match on those sentinel values and replace them with real credentials — keeping real tokens out of tool call arguments entirely.
+
+#### Purpose
+
+When an agent uses a tool like `curl` or `git`, any credentials passed as arguments (e.g., `-H "Authorization: Bearer $TOKEN"`) are visible in the process list and logs. By using sentinels, you can provide the tool with a unique, session-specific "fake" token. The `harnx-proxy-auth` hook recognizes this fake token as it passes through the proxy and swaps it for the real one just before the request leaves the machine.
+
+#### Execution Model
+
+1. **Startup**: The `--env` script receives `{}` as input and must output a JSON object where keys are environment variable names and values are their sentinel values. **All values must be strings** — non-string values (numbers, booleans, objects) are rejected at startup.
+2. **Order**: Multiple `--env` flags run in order; later keys overwrite earlier ones.
+3. **Validation**: Any compilation, runtime, or type error in an `--env` script will abort startup.
+4. **Precedence**: Injection follows this order (highest priority wins):
+    - `tool_input.env` (user-provided keys always win)
+    - **Sentinel environment variables** (from `--env` flags)
+    - Proxy variables (`HTTP_PROXY`, etc.)
+
+#### Available Sentinel Variables
+
+The following jaq variables are available to each `--env` script to help generate unique keys:
+
+| Variable | Description | Example |
+| :--- | :--- | :--- |
+| `$fake_uuid_key` | UUID string with dashes | `550e8400-e29b-41d4-a716-446655440000` |
+| `$fake_base64_key` | Standard Base64 of the UUID bytes | `VQ6EANKbQdSnbEVmVESAAA==` |
+| `$fake_url_base64_key` | URL-safe no-pad Base64 of the UUID bytes | `VQ6EANKbQdSnbEVmVESAAA` |
+| `$fake_hex_key` | Lowercase hex (32 characters) | `550e8400e29b41d4a716446655440000` |
+| `$fake_email` | UUID with first `-` replaced by `@` | `550e8400@e29b-41d4-a716-446655440000` |
+
+#### Helper Functions
+
+Two helper functions are provided for formatting authentication headers:
+
+- **`bearer(token)`**: Returns `"Bearer <token>"`.
+- **`basic(user; pass)`**: Returns `"Basic <base64(user:pass)>"`.
+
+#### Worked Examples
+
+##### 1. GitHub Token Injection
+
+The `--env` script overrides `GITHUB_TOKEN` in the bash tool's environment with a session-unique sentinel value. The tool sends that sentinel in the `Authorization` header. The `--hook` script sees the sentinel value in the outbound request and swaps in the real `GITHUB_TOKEN` (still in the proxy's own environment) before the request leaves the machine.
+
+```yaml
+hooks:
+  entries:
+  - event: PreToolUse
+    type: claude-command-persistent
+    matcher: "bash_exec|bash_spawn"
+    command: >-
+      harnx-proxy-auth
+      --env 'if (env.GITHUB_TOKEN // env.GH_TOKEN) then .GITHUB_TOKEN = "ghs_\($fake_base64_key)" else . end'
+      --hook 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
+          then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
+          else . end'
+```
+
+##### 2. Atlassian/Jira Basic Auth
+
+```yaml
+hooks:
+  entries:
+  - event: PreToolUse
+    type: claude-command-persistent
+    matcher: "bash_exec|bash_spawn"
+    command: >-
+      harnx-proxy-auth
+      --env 'if (env.ATLASSIAN_API_TOKEN and env.ATLASSIAN_EMAIL) then .ATLASSIAN_API_TOKEN = $fake_uuid_key | .ATLASSIAN_EMAIL = $fake_email else . end'
+      --hook 'if (.host | endswith(".atlassian.net")) and .headers.authorization == "Basic \([$fake_email, $fake_uuid_key] | join(":") | @base64)"
+          then .headers.authorization = basic(env.ATLASSIAN_EMAIL; env.ATLASSIAN_API_TOKEN)
+          else . end'
+
+```
+
 ### Atlassian CLI (`acli`) Example
 
 `acli` (the Atlassian CLI for Jira, Confluence, etc.) stores API tokens in the OS keyring, which may not be accessible inside the bash birdcage. The solution is to set up `acli` on the host once, then use `harnx-proxy-auth` to transparently replace the `Authorization: Basic` header on every request to `*.atlassian.net` with credentials from environment variables.
@@ -371,9 +445,9 @@ The harnx `.env` file uses plain `KEY=value` lines (no `export`). See [Environme
 
 #### Step 3 — Configure the proxy hook
 
-Add the following to your `config.yaml`. The filter builds the correct `Basic` header from `ATLASSIAN_EMAIL` and `ATLASSIAN_API_TOKEN`, then injects it on any request to `*.atlassian.net`.
+Add the following to your `config.yaml`. The `--env` script emits sentinel placeholders for both the email and API token. The hook only rewrites requests whose `Authorization` header exactly matches that sentinel-derived `Basic` value.
 
-> **If either variable is unset**, the filter produces `Authorization: Basic Og==` (base64 of `:`), which is invalid and will be rejected with `401 Unauthorized`. Set both variables before running harnx.
+> **If either variable is unset**, the `--env` script returns `.`, so no Atlassian sentinel vars are injected and the hook condition never matches.
 
 ```yaml
 hooks:
@@ -383,14 +457,15 @@ hooks:
     matcher: "bash_exec|bash_spawn"
     command: >-
       harnx-proxy-auth
-      --hook 'if (.host | endswith(".atlassian.net"))
-          then .headers.authorization = "Basic \([(env.ATLASSIAN_EMAIL // ""), (env.ATLASSIAN_API_TOKEN // "")] | join(":") | @base64)"
-          end'
+      --env 'if (env.ATLASSIAN_API_TOKEN and env.ATLASSIAN_EMAIL) then .ATLASSIAN_API_TOKEN = $fake_uuid_key | .ATLASSIAN_EMAIL = $fake_email else . end'
+      --hook 'if (.host | endswith(".atlassian.net")) and .headers.authorization == "Basic \([$fake_email, $fake_uuid_key] | join(":") | @base64)"
+          then .headers.authorization = basic(env.ATLASSIAN_EMAIL; env.ATLASSIAN_API_TOKEN)
+          else . end'
 ```
 
 > **Security note:** `endswith(".atlassian.net")` prevents DNS-level spoofing — `"evilatlassian.net"` does not match because of the leading dot. However, credentials will be forwarded to **any** `*.atlassian.net` tenant, including ones owned by third parties. To scope injection to your own workspace only, use explicit equality: `.host == "mysite.atlassian.net"`.
 
-You can combine Atlassian and GitHub auth in a single `harnx-proxy-auth` invocation using multiple `--hook` flags:
+You can combine Atlassian and GitHub auth in a single `harnx-proxy-auth` invocation using multiple `--env` and `--hook` flags:
 
 ```yaml
 hooks:
@@ -400,12 +475,14 @@ hooks:
     matcher: "bash_exec|bash_spawn"
     command: >-
       harnx-proxy-auth
-      --hook 'if (.host == "github.com" or .host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
-          then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
-          end'
-      --hook 'if (.host | endswith(".atlassian.net"))
-          then .headers.authorization = "Basic \([(env.ATLASSIAN_EMAIL // ""), (env.ATLASSIAN_API_TOKEN // "")] | join(":") | @base64)"
-          end'
+      --env 'if (env.GITHUB_TOKEN // env.GH_TOKEN) then .GITHUB_TOKEN = "ghs_\($fake_base64_key)" else . end'
+      --hook 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
+          then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
+          else . end'
+      --env 'if (env.ATLASSIAN_API_TOKEN and env.ATLASSIAN_EMAIL) then .ATLASSIAN_API_TOKEN = $fake_uuid_key | .ATLASSIAN_EMAIL = $fake_email else . end'
+      --hook 'if (.host | endswith(".atlassian.net")) and .headers.authorization == "Basic \([$fake_email, $fake_uuid_key] | join(":") | @base64)"
+          then .headers.authorization = basic(env.ATLASSIAN_EMAIL; env.ATLASSIAN_API_TOKEN)
+          else . end'
 ```
 
 ### Injected Environment Variables

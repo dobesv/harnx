@@ -18,6 +18,14 @@ pub struct Args {
     /// without exposing full tokens.
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<std::path::PathBuf>,
+
+    /// jq/jaq filter that receives sentinel values as jaq variables:
+    /// `$fake_uuid_key`, `$fake_base64_key`, `$fake_url_base64_key`,
+    /// `$fake_hex_key`, `$fake_email`. Must output a JSON object.
+    /// Multiple `--env` flags run in order and merge (later keys win).
+    /// Error aborts startup.
+    #[arg(long, value_name = "JQ_FILTER")]
+    pub env: Vec<String>,
 }
 
 impl Args {
@@ -40,6 +48,7 @@ mod tests {
         let args = Args {
             hook: Vec::new(),
             log_file: None,
+            env: Vec::new(),
         };
         assert_eq!(args.combined_filter(), ".");
     }
@@ -49,6 +58,7 @@ mod tests {
         let args = Args {
             hook: vec![".foo = 1".into(), ".bar = 2".into()],
             log_file: None,
+            env: Vec::new(),
         };
         assert_eq!(args.combined_filter(), ".foo = 1 | .bar = 2");
     }

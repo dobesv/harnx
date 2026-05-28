@@ -28,7 +28,11 @@ struct HookSpecificOutput {
     tool_input: Value,
 }
 
-pub async fn run_jsonl_loop(proxy_port: u16, ca_cert_path: PathBuf) -> Result<()> {
+pub async fn run_jsonl_loop(
+    proxy_port: u16,
+    ca_cert_path: PathBuf,
+    extra_env: Map<String, Value>,
+) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut lines = BufReader::new(stdin).lines();
@@ -54,7 +58,12 @@ pub async fn run_jsonl_loop(proxy_port: u16, ca_cert_path: PathBuf) -> Result<()
             HookResponse {
                 id: request.id,
                 hook_specific_output: Some(HookSpecificOutput {
-                    tool_input: augment_tool_input(request.tool_input, proxy_port, &ca_cert_path),
+                    tool_input: augment_tool_input(
+                        request.tool_input,
+                        proxy_port,
+                        &ca_cert_path,
+                        &extra_env,
+                    ),
                 }),
             }
         } else {
@@ -73,7 +82,12 @@ pub async fn run_jsonl_loop(proxy_port: u16, ca_cert_path: PathBuf) -> Result<()
     Ok(())
 }
 
-fn augment_tool_input(tool_input: Option<Value>, proxy_port: u16, ca_cert_path: &str) -> Value {
+fn augment_tool_input(
+    tool_input: Option<Value>,
+    proxy_port: u16,
+    ca_cert_path: &str,
+    extra_env: &Map<String, Value>,
+) -> Value {
     let mut tool_input = match tool_input {
         Some(Value::Object(map)) => map,
         _ => Map::new(),
@@ -83,6 +97,10 @@ fn augment_tool_input(tool_input: Option<Value>, proxy_port: u16, ca_cert_path: 
         Some(Value::Object(map)) => map,
         _ => Map::new(),
     };
+
+    for (key, value) in extra_env {
+        env.entry(key.clone()).or_insert_with(|| value.clone());
+    }
 
     for (key, value) in [
         ("HTTP_PROXY", format!("http://127.0.0.1:{proxy_port}")),
@@ -124,7 +142,7 @@ mod tests {
     fn bash_exec_injects_proxy_env_vars() {
         let input = Some(json!({"command": "echo hi", "env": {"FOO": "bar"}}));
 
-        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH);
+        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &Map::new());
 
         assert_eq!(
             actual,
@@ -148,7 +166,7 @@ mod tests {
     fn bash_spawn_injects_proxy_env_vars() {
         let input = Some(json!({"command": "sleep 1", "inputs": ["/tmp/in"]}));
 
-        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH);
+        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &Map::new());
 
         assert_eq!(
             actual,
@@ -183,7 +201,7 @@ mod tests {
             }
         }));
 
-        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH);
+        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &Map::new());
 
         assert_eq!(
             actual["env"]["HTTPS_PROXY"],
@@ -197,9 +215,58 @@ mod tests {
     fn missing_env_field_creates_env_with_proxy_vars() {
         let input = Some(json!({"command": "git fetch"}));
 
-        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH);
+        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &Map::new());
 
         assert_eq!(actual["env"], expected_proxy_env());
+    }
+
+    #[test]
+    fn extra_env_is_injected_when_missing_from_tool_input_env() {
+        let input = Some(json!({"command": "echo hi"}));
+        let extra_env = Map::from_iter([(String::from("FOO"), json!("from-script"))]);
+
+        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &extra_env);
+
+        assert_eq!(actual["env"]["FOO"], json!("from-script"));
+        assert_eq!(
+            actual["env"]["HTTPS_PROXY"],
+            json!(format!("http://127.0.0.1:{PROXY_PORT}"))
+        );
+    }
+
+    #[test]
+    fn tool_input_env_takes_precedence_over_extra_env() {
+        let input = Some(json!({
+            "command": "echo hi",
+            "env": {
+                "FOO": "from-user"
+            }
+        }));
+        let extra_env = Map::from_iter([(String::from("FOO"), json!("from-script"))]);
+
+        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &extra_env);
+
+        assert_eq!(actual["env"]["FOO"], json!("from-user"));
+    }
+
+    #[test]
+    fn extra_env_takes_precedence_over_proxy_defaults() {
+        let input = Some(json!({"command": "echo hi"}));
+        let extra_env = Map::from_iter([(
+            String::from("HTTPS_PROXY"),
+            json!("http://script-proxy:7777"),
+        )]);
+
+        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &extra_env);
+
+        assert_eq!(
+            actual["env"]["HTTPS_PROXY"],
+            json!("http://script-proxy:7777")
+        );
+        assert_eq!(
+            actual["env"]["HTTP_PROXY"],
+            json!(format!("http://127.0.0.1:{PROXY_PORT}"))
+        );
     }
 
     #[test]
@@ -210,7 +277,12 @@ mod tests {
         let response = HookResponse {
             id: request.id,
             hook_specific_output: Some(HookSpecificOutput {
-                tool_input: augment_tool_input(request.tool_input, PROXY_PORT, CA_CERT_PATH),
+                tool_input: augment_tool_input(
+                    request.tool_input,
+                    PROXY_PORT,
+                    CA_CERT_PATH,
+                    &Map::new(),
+                ),
             }),
         };
 

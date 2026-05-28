@@ -107,11 +107,95 @@ async fn hook_dispatch_does_not_mutate_non_bash_tools() {
     );
 }
 
+/// Verify that `--env` sentinel variables are injected into bash tool call env maps.
+///
+/// This test uses the `--env` flag to pass a custom environment variable template
+/// with a sentinel value, and verifies that the resulting env map contains the
+/// resolved sentinel variable.
+#[tokio::test(flavor = "multi_thread")]
+async fn hook_env_sentinel_is_injected_into_bash_tool_input() {
+    let Some(proxy_bin) = proxy_binary_path() else {
+        eprintln!(
+            "SKIP hook_env_sentinel_is_injected_into_bash_tool_input: harnx-proxy-auth not found"
+        );
+        return;
+    };
+
+    // The --env arg contains JSON with a sentinel variable using jaq string interpolation.
+    // The jaq `\($fake_base64_key)` is literal inside the shell single-quoted string.
+    let env_arg = r#"{"FAKE_TOKEN": "ghs_\($fake_base64_key)"}"#;
+
+    let outcome = dispatch_one_hook_with_env(
+        &proxy_bin,
+        Some(env_arg),
+        HookEvent::PreToolUse {
+            tool_name: "bash_exec".to_string(),
+            tool_input: json!({ "command": "echo hi" }),
+            tool_use_id: "toolu_hook_e2e_env".to_string(),
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(outcome.control, HookResultControl::Continue),
+        "hook should continue, not block"
+    );
+
+    let mutated = outcome
+        .result
+        .mutated_tool_input
+        .expect("persistent hook must mutate tool_input for bash_exec");
+    let env = mutated
+        .get("env")
+        .and_then(Value::as_object)
+        .expect("mutated tool_input must contain an 'env' object");
+
+    let fake_token = env
+        .get("FAKE_TOKEN")
+        .and_then(Value::as_str)
+        .expect("FAKE_TOKEN must be injected");
+
+    assert!(
+        fake_token.starts_with("ghs_"),
+        "FAKE_TOKEN should start with sentinel prefix 'ghs_', got: {fake_token}"
+    );
+    // Verify jaq interpolation actually resolved: no raw template markers should remain.
+    assert!(
+        !fake_token.contains("($") && !fake_token.contains('$'),
+        "FAKE_TOKEN contains unresolved jaq template marker, interpolation failed: {fake_token}"
+    );
+    // The suffix should be base64 characters only (the fake_base64_key encoding).
+    let suffix = fake_token.trim_start_matches("ghs_");
+    assert!(
+        !suffix.is_empty()
+            && suffix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='),
+        "FAKE_TOKEN suffix is not valid base64, got: {suffix}"
+    );
+}
+
 async fn dispatch_one_hook(proxy_bin: &Path, event: HookEvent) -> HookOutcome {
+    dispatch_one_hook_with_env(proxy_bin, None, event).await
+}
+
+async fn dispatch_one_hook_with_env(
+    proxy_bin: &Path,
+    env_arg: Option<&str>,
+    event: HookEvent,
+) -> HookOutcome {
+    let command = match env_arg {
+        Some(env) => format!(
+            r#"{} --env '{}' --hook '.'"#,
+            shell_escape_path(proxy_bin),
+            env
+        ),
+        None => format!("{} --hook '.'", shell_escape_path(proxy_bin)),
+    };
     let hooks = vec![HookConfig {
         event: "PreToolUse".to_string(),
         matcher: Some("bash_exec".to_string()),
-        command: format!("{} --hook '.'", shell_escape_path(proxy_bin)),
+        command,
         timeout: None, // use framework default (30s); proxy startup can be slow on CI
         status_message: None,
         async_hook: None,

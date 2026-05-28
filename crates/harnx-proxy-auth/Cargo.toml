@@ -30,7 +30,10 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 jaq-all.workspace = true
+jaq-core.workspace = true
+jaq-std.workspace = true
 
 [dev-dependencies]
 harnx-core = { path = "../harnx-core" }

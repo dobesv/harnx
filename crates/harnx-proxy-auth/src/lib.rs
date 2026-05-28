@@ -3,6 +3,7 @@ pub mod cli;
 pub mod filter;
 pub mod hook;
 pub mod proxy;
+pub mod sentinel;
 
 /// Decode a standard base64 string to bytes.
 /// Used by integration tests to decode the CA cert from the `CA_CERT_PEM_B64` readiness line.
