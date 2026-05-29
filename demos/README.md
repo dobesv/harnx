@@ -16,14 +16,19 @@ Two pipelines:
 ```
 demos/
 ├── agent.tape                  TUI tape — agent demo
+├── tool-confirm.tape           TUI tape — tool confirmation demo
 ├── render.sh                   TUI orchestrator: mock-llm → vhs → cleanup
 ├── render-web.sh               Web orchestrator: mock-llm → harnx --serve → playwright → ffmpeg
 ├── config/                     Self-contained HARNX_CONFIG_DIR (shared by both)
 │   ├── config.yaml
 │   ├── agents/demo-agent.md
+│   ├── agents/tool-confirm-agent.md
+│   ├── ask-confirm-hook.sh     Hook script returning "ask" for all tools
+│   ├── mcp_servers/time.yaml   Time MCP server (used by tool-confirm demo)
 │   └── clients/mock.yaml       openai-compatible client pointed at :3829
 ├── scripts/                    Mock-LLM response scripts (one entry per request)
 │   ├── agent-flow.yaml
+│   ├── tool-confirm-flow.yaml
 │   ├── playground-flow.yaml
 │   └── arena-flow.yaml
 ├── web/                        Playwright scripts
@@ -76,6 +81,7 @@ palette filter for size + colour quality. Everything is torn down on exit.
 | README image            | Pipeline      | Script                           |
 |-------------------------|---------------|----------------------------------|
 | `harnx-agent`           | TUI           | `demos/agent.tape`               |
+| `harnx-tool-confirm`    | TUI           | `demos/tool-confirm.tape`        |
 | `harnx-llm-playground`  | Web           | `demos/web/playground.mjs`       |
 | `harnx-llm-arena`       | Web           | `demos/web/arena.mjs`            |
 | `harnx-themes`          | TUI (no demo yet) | swap in custom `.tmTheme` files; see `docs/custom-theme.md` |
