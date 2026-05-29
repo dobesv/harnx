@@ -15,6 +15,7 @@ Harnx ships as three binaries, each installable independently:
 | `harnx` | Full CLI — TUI + Cmd + HTTP (`--serve`) + ACP (`--acp=<agent>`) | ~18 MB |
 | `harnx-serve` | HTTP-only server, no TUI deps | ~10 MB |
 | `harnx-acp-server` | ACP-only headless agent over stdio, no TUI deps | ~11 MB |
+| `harnx-sandbox-run` | Standalone sandbox wrapper with hook support | ~10 MB |
 
 Install whichever you need. Most users want just `harnx`; headless server
 deployments can skip the TUI deps by picking `harnx-serve` or
@@ -26,6 +27,7 @@ deployments can skip the TUI deps by picking `harnx-serve` or
 cargo install --git https://github.com/dobesv/harnx harnx
 cargo install --git https://github.com/dobesv/harnx harnx-serve
 cargo install --git https://github.com/dobesv/harnx harnx-acp-server
+cargo install --git https://github.com/dobesv/harnx harnx-sandbox-run
 ```
 
 The package name after `--git <url>` picks which workspace member to install.

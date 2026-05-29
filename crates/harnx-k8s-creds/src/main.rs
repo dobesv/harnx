@@ -334,11 +334,10 @@ fn handle_hook_line(line: &str, kubeconfig_path: KubeconfigPath<'_>) -> Option<V
     let input: Value = serde_json::from_str(line).ok()?;
     let id = input.get("id")?.clone();
     let hook_event_name = input.get("hook_event_name").and_then(Value::as_str);
-    let tool_name = input.get("tool_name").and_then(Value::as_str);
 
-    if hook_event_name == Some("PreToolUse")
-        && matches!(tool_name, Some("bash_exec") | Some("bash_spawn"))
-    {
+    // Respond to any PreToolUse event with a tool_input — tool name filtering
+    // is the caller's responsibility (configured via the hook's matcher field).
+    if hook_event_name == Some("PreToolUse") {
         if let Some(tool_input) = input.get("tool_input") {
             if let Ok(tool_input) = mutate_tool_input(tool_input, kubeconfig_path) {
                 return Some(json!({
@@ -549,7 +548,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hook_non_bash_tool_emits_noop() {
+    async fn hook_non_pretooluse_event_emits_noop() {
+        // PostToolUse events are always ignored regardless of tool name.
         assert_noop(
             &json!({"id":"1","hook_event_name":"PostToolUse","tool_name":"bash_exec","tool_input":{"command":"ls"}}),
             1,
@@ -591,7 +591,7 @@ mod tests {
     async fn hook_malformed_json_skipped_continues_loop() {
         assert_skipped_continues(
             "this is not json\n",
-            "{\"id\":\"2\",\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"fs_read\",\"tool_input\":{}}\n",
+            "{\"id\":\"2\",\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"bash_exec\"}\n",
             2,
         )
         .await;
