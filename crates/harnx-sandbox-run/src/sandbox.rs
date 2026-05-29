@@ -14,7 +14,9 @@
 //! process argument list, preventing secrets from leaking into `ps`/`/proc`.
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -279,7 +281,7 @@ pub fn setup_and_spawn(
 
     #[cfg(not(unix))]
     {
-        let _ = (env_keys, use_defaults);
+        let _ = (sandbox_exec, env_pairs, env_keys, use_defaults);
         anyhow::bail!("harnx-sandbox-run is only supported on Unix platforms");
     }
 

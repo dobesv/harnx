@@ -25,11 +25,13 @@ mod cli;
 mod hooks;
 mod sandbox;
 
+#[cfg(unix)]
 use std::path::PathBuf;
 
 use anyhow::Result;
 
 /// Expand a leading `~` to `$HOME`. Matches the behaviour in `harnx-mcp-bash`.
+#[cfg(unix)]
 fn expand_tilde(raw: &str) -> String {
     if !raw.starts_with('~') {
         return raw.to_string();
