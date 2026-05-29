@@ -222,9 +222,9 @@ Common types:
 - `chore`: Changes to the build process or auxiliary tools and libraries such as documentation generation
 
 ### Changeset Files
-When you make a change that should be included in the changelog, please create a "changeset" file in the `.changesets/` directory. These are Markdown files that describe the change.
+When you make a change that should be included in the changelog, please create a "changeset" file in the `.changeset/` directory. These are Markdown files that describe the change.
 
-Example `.changesets/new-feature.md`:
+Example `.changeset/new-feature.md`:
 ```markdown
 ---
 harnx: minor
@@ -233,6 +233,8 @@ Added a new feature to the CLI.
 ```
 
 The YAML front matter specifies the package and the type of version bump (`patch`, `minor`, or `major`).
+
+The package key must be one of the three that knope versions: `harnx`, `pantheon`, or `coding`. Use `harnx` for any change to the Rust workspace — all `harnx-*` crates share a single version, so individual crate names (e.g. `harnx-core`) are **not** valid keys and will cause `knope release` to error.
 
 ### Releasing
 To trigger a new release:
