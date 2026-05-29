@@ -7,3 +7,8 @@ queue_rules:
     update_method: rebase
     batch_max_wait_time: 15 m 34 s
     batch_max_failure_resolution_attempts: 10
+    queue_conditions:
+      - conflict = false
+      - or:
+          - author = renovate
+          - label = automerge
