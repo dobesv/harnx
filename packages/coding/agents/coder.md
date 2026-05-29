@@ -3,7 +3,7 @@ role: assistant
 model: claude:claude-sonnet-4-6
 compaction_agent: compact-coder
 model_fallbacks:
-  - claude:claude-opus-4-7
+  - claude:claude-opus-4-8
   - openai:gpt-5.4
 
 use_tools:

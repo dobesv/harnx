@@ -59,7 +59,7 @@ To use Claude Opus for harder problems:
 
 ```yaml
 agents:
-  - 'if .name == "coder" then .model = "claude:claude-opus-4-7" end'
+  - 'if .name == "coder" then .model = "claude:claude-opus-4-8" end'
 ```
 
 ## MCP servers
