@@ -117,7 +117,7 @@ entries (the `else .` is implicit when omitted).
 
 ```yaml
 agents:
-  - '.model = "claude:claude-opus-4-7"'   # override model for every agent
+  - '.model = "claude:claude-opus-4-8"'   # override model for every agent
   - 'if .name == "hephaestus" then .model = "openai:o3" end'
   - 'if .name == "zosimus" then .model = "openai:o3" end'
 ```
