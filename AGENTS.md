@@ -53,7 +53,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 ├── docs/                       # User-facing documentation
 ├── scripts/                    # Shell completions and shell-integration scripts
 ├── Argcfile.sh                 # Developer task runner (argc-based)
-├── .changesets/                # Changeset files for release notes
+├── .changeset/                 # Changeset files for release notes
 ├── knope.toml                  # Release automation config
 ├── renovate.json               # Dependency update bot config
 └── .github/workflows/          # CI (ci.yaml) and release (release.yaml) workflows
@@ -101,7 +101,7 @@ chore(deps): update rust crate syntect to v5.3.0
 
 ## Changeset Files
 
-When making a user-visible change, create a changeset file in `.changesets/`:
+When making a user-visible change, create a changeset file in `.changeset/`:
 
 ```markdown
 ---
@@ -111,6 +111,17 @@ Brief description of the change.
 ```
 
 The YAML front matter specifies the version bump: `patch`, `minor`, or `major`.
+
+The key on the left must be one of the three packages knope versions:
+
+- `harnx` — the entire Rust workspace. All `harnx-*` crates share one version
+  (`version.workspace = true`), so use `harnx` even for a change scoped to a
+  single crate like `harnx-proxy-auth` or `harnx-core`.
+- `pantheon` — the `packages/pantheon` agent package.
+- `coding` — the `packages/coding` agent package.
+
+Individual crate names are **not** valid keys; `knope release` will error on
+them.
 
 ## Key Patterns
 

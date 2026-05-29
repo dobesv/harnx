@@ -57,7 +57,7 @@ jobs:
           # changesets. Detect that ahead of time so the workflow exits 0
           # with a friendly status instead of a confusing failure.
           shopt -s nullglob
-          changesets=( .changesets/*.md )
+          changesets=( .changeset/*.md )
           # Strip the `.gitkeep` placeholder if present.
           actual=()
           for c in "${changesets[@]}"; do
