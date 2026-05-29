@@ -7,8 +7,10 @@
 //! containers without unprivileged user namespaces), tests gracefully
 //! skip rather than fail.
 
+#[cfg(unix)]
 use std::fs;
 use std::process::Command;
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Path to the sandbox binary, set by cargo's CARGO_BIN_EXE_ env var.
