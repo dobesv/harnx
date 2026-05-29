@@ -16,6 +16,7 @@ fn binary_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_harnx-sandbox-run"))
 }
 
+#[cfg(unix)]
 fn temp_test_dir(name: &str) -> std::path::PathBuf {
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
