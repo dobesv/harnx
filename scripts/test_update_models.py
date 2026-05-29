@@ -61,10 +61,40 @@ class TestProviderMapping(unittest.TestCase):
         self.assertEqual(set(um.LITELLM_TO_HARNX_PROVIDER.keys()), expected)
 
 
+class TestOpusVersionDetection(unittest.TestCase):
+    def test_opus_minor_version_parsed(self) -> None:
+        self.assertEqual(um.opus_minor_version("claude-opus-4-8"), 8)
+        self.assertEqual(um.opus_minor_version("claude-opus-4-7-20260416"), 7)
+        self.assertEqual(um.opus_minor_version("claude-opus-4-1"), 1)
+
+    def test_opus_minor_version_none_for_non_opus(self) -> None:
+        self.assertIsNone(um.opus_minor_version("claude-sonnet-4-6"))
+        # Old `claude-4-opus` ordering is not matched (it predates adaptive-only).
+        self.assertIsNone(um.opus_minor_version("claude-4-opus-20250514"))
+
+    def test_adaptive_only_threshold(self) -> None:
+        self.assertTrue(um.is_adaptive_only_opus("claude-opus-4-7"))
+        self.assertTrue(um.is_adaptive_only_opus("claude-opus-4-8"))
+        self.assertTrue(um.is_adaptive_only_opus("claude-opus-4-8@default"))
+        self.assertFalse(um.is_adaptive_only_opus("claude-opus-4-6"))
+        self.assertFalse(um.is_adaptive_only_opus("claude-opus-4-5"))
+        self.assertFalse(um.is_adaptive_only_opus("claude-sonnet-4-6"))
+
+    def test_is_variant_name(self) -> None:
+        self.assertTrue(um.is_variant_name("claude-opus-4-6:thinking"))
+        self.assertTrue(um.is_variant_name("claude-opus-4-8:xhigh"))
+        self.assertTrue(um.is_variant_name("claude-opus-4-8@default:max"))
+        self.assertFalse(um.is_variant_name("claude-opus-4-8"))
+        self.assertFalse(um.is_variant_name("claude-opus-4-8@default"))
+
+
 class TestThinkingVariant(unittest.TestCase):
+    """Manual `:thinking` variants for models that still support manual extended
+    thinking (Opus 4.6 and earlier, Sonnet, Haiku)."""
+
     def _base_claude_model(self) -> dict:
         return {
-            "name": "claude-opus-4-7",
+            "name": "claude-opus-4-6",
             "max_input_tokens": 1000000,
             "max_output_tokens": 128000,
             "input_price": 5,
@@ -74,84 +104,136 @@ class TestThinkingVariant(unittest.TestCase):
         }
 
     def test_claude_thinking_variant_created(self) -> None:
-        base = self._base_claude_model()
-        variant = um.thinking_variant(base, "claude")
-        self.assertIsNotNone(variant)
-        assert variant is not None
-        self.assertEqual(variant["name"], "claude-opus-4-7:thinking")
-        self.assertEqual(variant["real_name"], "claude-opus-4-7")
+        variants = um.thinking_variants(self._base_claude_model(), "claude")
+        self.assertEqual(len(variants), 1)
+        self.assertEqual(variants[0]["name"], "claude-opus-4-6:thinking")
+        self.assertEqual(variants[0]["real_name"], "claude-opus-4-6")
 
     def test_thinking_variant_has_correct_patch(self) -> None:
-        base = self._base_claude_model()
-        variant = um.thinking_variant(base, "claude")
-        assert variant is not None
-        self.assertIn("patches", variant)
+        variant = um.thinking_variants(self._base_claude_model(), "claude")[0]
         self.assertEqual(len(variant["patches"]), 1)
-        self.assertIn("budget_tokens\":16000", variant["patches"][0])
+        self.assertIn('budget_tokens":16000', variant["patches"][0])
 
     def test_thinking_variant_preserves_supports_tool_use(self) -> None:
-        base = self._base_claude_model()
-        variant = um.thinking_variant(base, "claude")
-        assert variant is not None
+        variant = um.thinking_variants(self._base_claude_model(), "claude")[0]
         self.assertTrue(variant.get("supports_tool_use"))
 
     def test_thinking_variant_preserves_supports_vision(self) -> None:
-        base = self._base_claude_model()
-        variant = um.thinking_variant(base, "claude")
-        assert variant is not None
+        variant = um.thinking_variants(self._base_claude_model(), "claude")[0]
         self.assertTrue(variant.get("supports_vision"))
 
     def test_thinking_variant_has_require_max_tokens(self) -> None:
-        base = self._base_claude_model()
-        variant = um.thinking_variant(base, "claude")
-        assert variant is not None
+        variant = um.thinking_variants(self._base_claude_model(), "claude")[0]
         self.assertTrue(variant.get("require_max_tokens"))
 
-    def test_already_thinking_returns_none(self) -> None:
-        base = {"name": "claude-opus-4-7:thinking"}
-        self.assertIsNone(um.thinking_variant(base, "claude"))
+    def test_already_variant_returns_empty(self) -> None:
+        self.assertEqual(um.thinking_variants({"name": "claude-opus-4-6:thinking"}, "claude"), [])
+        self.assertEqual(um.thinking_variants({"name": "claude-opus-4-8:xhigh"}, "claude"), [])
 
     def test_non_claude_model_no_variant_for_claude_provider(self) -> None:
-        base = {"name": "gpt-4o"}
-        self.assertIsNone(um.thinking_variant(base, "claude"))
+        self.assertEqual(um.thinking_variants({"name": "gpt-4o"}, "claude"), [])
 
     def test_bedrock_claude_gets_bedrock_patch(self) -> None:
         base = {
-            "name": "us.anthropic.claude-opus-4-7",
+            "name": "us.anthropic.claude-opus-4-6",
             "max_input_tokens": 200000,
             "supports_vision": True,
             "supports_tool_use": True,
         }
-        variant = um.thinking_variant(base, "bedrock")
-        assert variant is not None
-        self.assertIn("additionalModelRequestFields", variant["patches"][0])
+        variants = um.thinking_variants(base, "bedrock")
+        self.assertEqual(len(variants), 1)
+        self.assertIn("additionalModelRequestFields", variants[0]["patches"][0])
 
     def test_non_us_bedrock_model_no_variant(self) -> None:
-        base = {"name": "ap-northeast-1/anthropic.claude-v2"}
-        self.assertIsNone(um.thinking_variant(base, "bedrock"))
+        self.assertEqual(um.thinking_variants({"name": "ap-northeast-1/anthropic.claude-v2"}, "bedrock"), [])
 
     def test_thinking_variant_real_name_uses_base_real_name_for_aliases(self) -> None:
-        # If the base model has a real_name (alias), thinking variant should route to that
         base = {
             "name": "claude-opus-latest",
-            "real_name": "claude-opus-4-7",  # alias that points to a versioned model
+            "real_name": "claude-opus-4-6",  # alias that points to a versioned model
             "max_input_tokens": 1000000,
             "supports_tool_use": True,
         }
-        variant = um.thinking_variant(base, "claude")
-        assert variant is not None
-        # Should route to the underlying model, not the alias name
-        self.assertEqual(variant["real_name"], "claude-opus-4-7")
+        variant = um.thinking_variants(base, "claude")[0]
+        self.assertEqual(variant["real_name"], "claude-opus-4-6")
         self.assertEqual(variant["name"], "claude-opus-latest:thinking")
 
     def test_thinking_variant_real_name_defaults_to_name_when_no_alias(self) -> None:
-        base = {
-            "name": "claude-opus-4-7",
+        base = {"name": "claude-opus-4-6", "max_input_tokens": 1000000}
+        variant = um.thinking_variants(base, "claude")[0]
+        self.assertEqual(variant["real_name"], "claude-opus-4-6")
+
+
+class TestAdaptiveEffortVariants(unittest.TestCase):
+    """Adaptive-only Opus (4.7+) gets effort-level variants instead of
+    `:thinking`, and adaptive thinking baked into the base model."""
+
+    def _base(self, name: str = "claude-opus-4-8") -> dict:
+        return {
+            "name": name,
             "max_input_tokens": 1000000,
+            "max_output_tokens": 128000,
+            "input_price": 5,
+            "output_price": 25,
+            "supports_vision": True,
+            "supports_tool_use": True,
         }
-        variant = um.thinking_variant(base, "claude")
-        assert variant is not None
-        self.assertEqual(variant["real_name"], "claude-opus-4-7")
+
+    def test_effort_variants_instead_of_thinking(self) -> None:
+        for provider in ("claude", "vertexai"):
+            variants = um.thinking_variants(self._base(), provider)
+            names = [v["name"] for v in variants]
+            self.assertEqual(names, ["claude-opus-4-8:xhigh", "claude-opus-4-8:max"])
+
+    def test_no_manual_thinking_variant(self) -> None:
+        names = [v["name"] for v in um.thinking_variants(self._base(), "claude")]
+        self.assertNotIn("claude-opus-4-8:thinking", names)
+
+    def test_effort_variant_patch_is_adaptive_with_effort(self) -> None:
+        variants = um.thinking_variants(self._base(), "claude")
+        xhigh = next(v for v in variants if v["name"].endswith(":xhigh"))
+        patch = xhigh["patches"][0]
+        self.assertIn('"type":"adaptive"', patch)
+        self.assertIn('.body.output_config.effort = "xhigh"', patch)
+        self.assertIn("del(.body.temperature)", patch)
+        self.assertNotIn("budget_tokens", patch)
+
+    def test_effort_variant_requires_max_tokens(self) -> None:
+        # Adaptive-only Opus rejects requests without an explicit max_tokens.
+        variant = um.thinking_variants(self._base(), "claude")[0]
+        self.assertTrue(variant.get("require_max_tokens"))
+        self.assertEqual(variant["max_output_tokens"], 128000)
+
+    def test_effort_variant_routes_via_real_name(self) -> None:
+        base = self._base("claude-opus-4-8@default")
+        base["real_name"] = "claude-opus-4-8@default"
+        variants = um.thinking_variants(base, "vertexai")
+        self.assertEqual(variants[0]["name"], "claude-opus-4-8@default:xhigh")
+        self.assertEqual(variants[0]["real_name"], "claude-opus-4-8@default")
+
+    def test_bedrock_adaptive_only_gets_no_variant(self) -> None:
+        # Manual thinking 400s and adaptive+effort on Bedrock is unconfirmed.
+        base = self._base("us.anthropic.claude-opus-4-8")
+        self.assertEqual(um.thinking_variants(base, "bedrock"), [])
+
+    def test_apply_base_thinking_patches_adaptive_only(self) -> None:
+        for provider in ("claude", "vertexai"):
+            model = self._base()
+            um.apply_base_thinking(model, provider)
+            self.assertEqual(len(model["patches"]), 1)
+            self.assertIn('"type":"adaptive"', model["patches"][0])
+            self.assertIn('.body.output_config.effort = "high"', model["patches"][0])
+            self.assertTrue(model.get("require_max_tokens"))
+
+    def test_apply_base_thinking_skips_manual_models(self) -> None:
+        model = {"name": "claude-opus-4-6", "max_input_tokens": 1000}
+        um.apply_base_thinking(model, "claude")
+        self.assertNotIn("patches", model)
+
+    def test_apply_base_thinking_skips_bedrock(self) -> None:
+        model = self._base("us.anthropic.claude-opus-4-8")
+        um.apply_base_thinking(model, "bedrock")
+        self.assertNotIn("patches", model)
 
 
 class TestIsValidBedrockModelName(unittest.TestCase):
