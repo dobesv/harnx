@@ -16,7 +16,6 @@
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::ffi::OsString;
-#[cfg(unix)]
 use std::path::PathBuf;
 
 use anyhow::Result;
