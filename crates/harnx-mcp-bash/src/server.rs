@@ -5,6 +5,7 @@ use harnx_mcp::safety::{
 
 use fancy_regex::Regex;
 use gix::ObjectId;
+use harnx_mcp::peer::peer_supports_roots;
 use harnx_mcp::schema::object_schema_with_desc;
 use harnx_mcp_history::classify::{classify_command, SnapshotDecision};
 use harnx_mcp_history::HistoryManager;
@@ -734,6 +735,14 @@ impl BashServer {
     }
 
     async fn refresh_roots(&self, peer: &rmcp::service::Peer<RoleServer>) -> Result<(), ErrorData> {
+        if !peer_supports_roots(peer) {
+            // The client never advertised the `roots` capability, so it can't
+            // answer a `roots/list` request. Keep the CLI-provided roots and
+            // mark initialization done so we don't keep retrying.
+            self.inner.roots_initialized.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+
         let result = peer.list_roots().await.map_err(|err| {
             ErrorData::internal_error(format!("failed to fetch roots from peer: {err}"), None)
         })?;
@@ -2952,6 +2961,76 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A client that does NOT advertise the `roots` capability.
+    #[derive(Clone)]
+    struct NoRootsClientHandler {
+        list_roots_called: Arc<AtomicBool>,
+    }
+
+    impl ClientHandler for NoRootsClientHandler {
+        fn get_info(&self) -> InitializeRequestParams {
+            // Deliberately no `.enable_roots()` — this client cannot answer
+            // a `roots/list` request.
+            InitializeRequestParams::new(
+                ClientCapabilities::builder().build(),
+                Implementation::new("test-no-roots", "0.1"),
+            )
+        }
+
+        async fn list_roots(
+            &self,
+            _cx: RequestContext<RoleClient>,
+        ) -> Result<ListRootsResult, ErrorData> {
+            self.list_roots_called.store(true, Ordering::SeqCst);
+            Ok(ListRootsResult::new(vec![]))
+        }
+    }
+
+    /// When the client never advertised `roots`, the server must not send it
+    /// a `roots/list` request; it keeps the CLI-provided roots instead.
+    #[tokio::test]
+    async fn does_not_request_roots_when_client_lacks_capability() {
+        let temp_dir = TestDir::new();
+        let initial_root = temp_dir.path().to_path_buf();
+        let server = BashServer::new(vec![initial_root.clone()]);
+        let server_clone = server.clone();
+
+        let (client_transport, server_transport) = duplex(65_536);
+        let list_roots_called = Arc::new(AtomicBool::new(false));
+        let client_handler = NoRootsClientHandler {
+            list_roots_called: list_roots_called.clone(),
+        };
+        let server_fut = serve_server(server, server_transport);
+        let client_fut = serve_client(client_handler, client_transport);
+        let (server_res, client_res) = tokio::join!(server_fut, client_fut);
+        let server_service = server_res.unwrap();
+        let client_service = client_res.unwrap();
+
+        let server_peer = server_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        server_clone
+            .ensure_roots_initialized(&server_peer)
+            .await
+            .expect("initialization succeeds without roots support");
+
+        assert!(
+            !list_roots_called.load(Ordering::SeqCst),
+            "server must not request roots from a client lacking the roots capability"
+        );
+        assert_eq!(
+            *server_clone.inner.roots.read().await,
+            vec![initial_root],
+            "CLI-provided roots must be retained"
+        );
+        assert!(
+            server_clone.inner.roots_initialized.load(Ordering::SeqCst),
+            "roots should be marked initialized so we don't retry every tool call"
+        );
     }
 
     #[tokio::test]
