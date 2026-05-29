@@ -364,11 +364,23 @@ def parse_date(value: Any) -> dt.date | None:
         return None
 
 
-def provider_prefix_and_model_name(key: str) -> tuple[str, str] | None:
-    if key == "sample_spec" or "/" not in key:
+def provider_prefix_and_model_name(
+    key: str, payload: dict[str, Any]
+) -> tuple[str, str] | None:
+    if key == "sample_spec":
         return None
-    prefix, model_name = key.split("/", 1)
-    return prefix, model_name
+    if "/" in key:
+        # An explicit `provider/model` prefix is authoritative.
+        prefix, model_name = key.split("/", 1)
+        return prefix, model_name
+    # Bare keys (no `provider/` prefix) are how LiteLLM lists many providers'
+    # first-party models, e.g. `claude-opus-4-8` or `gpt-4o`. Recover the
+    # provider from the `litellm_provider` field so these still get ingested;
+    # without it there's nothing to map against.
+    litellm_provider = payload.get("litellm_provider")
+    if isinstance(litellm_provider, str) and litellm_provider:
+        return litellm_provider, key
+    return None
 
 
 def is_valid_bedrock_model_name(model_name: str) -> bool:
@@ -607,7 +619,7 @@ def main() -> int:
     warnings: list[str] = []
 
     for key, payload in litellm.items():
-        parsed = provider_prefix_and_model_name(key)
+        parsed = provider_prefix_and_model_name(key, payload)
         if parsed is None:
             continue
         prefix, model_name = parsed
