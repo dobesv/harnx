@@ -1,0 +1,22 @@
+chunk_delay_ms: 35
+turns:
+  - text_chunks:
+      - "I'll check the current time in UTC for you now."
+    tool_calls:
+      - id: call_utc_time
+        name: time_get_current_time
+        arguments:
+          timezone: UTC
+  - text_chunks:
+      - "Time retrieved successfully after approval. "
+      - "I was able to run the UTC time tool and get current time."
+  - text_chunks:
+      - "I'll check the current time in New York next."
+    tool_calls:
+      - id: call_new_york_time
+        name: time_get_current_time
+        arguments:
+          timezone: America/New_York
+  - text_chunks:
+      - "No problem — tool use was denied, so I didn't check New York time."
+fallback_text: "(demo complete)"

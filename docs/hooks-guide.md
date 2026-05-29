@@ -229,7 +229,42 @@ hooks:
       status_message: "Blocking bash_exec for safety"
 ```
 
-### 4. Audit Logger (Async PostToolUse)
+### 4. Manual Tool Confirmation (Ask)
+
+Requires user approval before any tool runs. See the [Tool Confirmation Guide](tool-confirmation-guide.md) for a full walkthrough.
+
+```yaml
+hooks:
+  entries:
+    - event: PreToolUse
+      type: claude-command
+      command: >-
+        printf '%s\n' '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"Manual approval required"}}'
+```
+
+When the agent calls a tool, Harnx pauses and shows a confirmation prompt:
+
+```text
+Hook requires confirmation for tool 'bash_exec'
+Reason: Manual approval required
+Input: {
+  "command": "ls -la"
+}
+Allow this tool call? (y/N)
+```
+
+The default is **No** (deny). Use `matcher` to limit confirmation to specific tools:
+
+```yaml
+hooks:
+  entries:
+    - event: PreToolUse
+      type: claude-command
+      matcher: "bash_exec|bash_spawn"
+      command: "/path/to/ask-confirm.sh"
+```
+
+### 5. Audit Logger (Async PostToolUse)
 
 Logs all tool results to a file in the background.
 
