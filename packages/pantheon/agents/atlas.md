@@ -1,8 +1,8 @@
 ---
 role: assistant
-model: claude:claude-sonnet-4-6
+model: claude:claude-opus-4-8
 model_fallbacks:
-- claude:claude-opus-4-7
+- claude:claude-sonnet-4-6
 - openai:gpt-5.4
 compaction_agent: compact-planner
 use_tools:
