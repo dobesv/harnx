@@ -61,9 +61,12 @@ pub fn build_default_sandbox_args(config: &SandboxConfig) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use anyhow::Result;
+    #[cfg(unix)]
     use std::path::PathBuf;
 
+    #[cfg(unix)]
     fn test_config() -> SandboxConfig {
         SandboxConfig {
             enabled: true,
@@ -77,6 +80,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn ensure_anyhow_is_linked() -> Result<()> {
         Ok(())
     }
