@@ -25,7 +25,7 @@ use_tools:
 - plans_update_note
 description: |
   Git operations agent — handles commits, squash, rebase, and push. Squashes branches into a single clean commit, rebases on origin/HEAD, and pushes to remote. Named after Clio (KLEE-oh), the Muse of history.
-version: '0.2.1'
+version: '0.2.2'
 variables:
 - name: clio_core
   description: Core identity and instructions for Clio

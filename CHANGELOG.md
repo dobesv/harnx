@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.32.3 (2026-05-29)
+
+### Features
+
+- add --env sentinel env vars for bash tool calls (#672)
+- automate models.yaml updates via LiteLLM registry (#678)
+
+### Fixes
+
+- rename .changesets to .changeset so knope consumes them (#688)
+- don't request roots from clients lacking the capability (#692)
+- ingest LiteLLM bare-keyed first-party models (#696)
+- MCP servers (`harnx-mcp-fs`, `harnx-mcp-bash`) no longer send `roots/list` requests to clients that did not advertise the `roots` capability (#690). Such clients can't answer the request, so the servers now keep their CLI-provided roots instead.
+
 ## 0.32.2 (2026-05-27)
 
 ### Features

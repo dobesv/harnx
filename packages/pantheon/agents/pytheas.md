@@ -22,7 +22,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 description: "Reconnaissance and research agent — explores codebases, fetches GitHub PR/issue context (Jira and GitHub Issues), and caches findings as plan notes for other agents. Performs fast code analysis using ripgrep, ast-grep, and file inspection. Named after Pytheas (pih-THEE-us) of Massalia, the Greek explorer who sailed beyond the known world.\n"
-version: '0.2.1'
+version: '0.2.2'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

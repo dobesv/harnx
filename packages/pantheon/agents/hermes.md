@@ -27,7 +27,7 @@ use_tools:
 - plans_update_task
 - pytheas_session_prompt
 description: "Quick tasks and minor bugs specialist — handles the small, fast, 'blink-and-you-miss-it' fixes with rapid turnaround. Named after Hermes (HER-meez), the Winged Messenger.\n"
-version: '0.2.1'
+version: '0.2.2'
 variables:
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep
