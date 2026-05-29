@@ -7,3 +7,24 @@ queue_rules:
     update_method: rebase
     batch_max_wait_time: 15 m 34 s
     batch_max_failure_resolution_attempts: 10
+    # The batch is only merged once every required check is green.
+    merge_conditions:
+      - check-success=All (ubuntu-latest)
+      - check-success=All (macos-latest)
+      - check-success=All (windows-latest)
+      - check-success=Lint Dockerfiles
+
+pull_request_rules:
+  - name: Automerge passing Renovate PRs
+    conditions:
+      - author=renovate[bot]
+    actions:
+      queue:
+        name: main
+
+  - name: Automerge PRs labeled automerge
+    conditions:
+      - label=automerge
+    actions:
+      queue:
+        name: main
