@@ -9,10 +9,10 @@ use harnx_mcp::schema::object_schema_with_desc;
 use harnx_mcp_history::classify::{classify_command, SnapshotDecision};
 use harnx_mcp_history::HistoryManager;
 #[cfg(unix)]
-use harnx_sandbox_common::SYSTEM_EXEC_PATHS;
-#[cfg(unix)]
 use harnx_sandbox_common::build_default_sandbox_args;
 use harnx_sandbox_common::SandboxConfig;
+#[cfg(unix)]
+use harnx_sandbox_common::SYSTEM_EXEC_PATHS;
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
