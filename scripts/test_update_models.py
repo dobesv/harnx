@@ -198,9 +198,10 @@ class TestAdaptiveEffortVariants(unittest.TestCase):
         self.assertIn("del(.body.temperature)", patch)
         self.assertNotIn("budget_tokens", patch)
 
-    def test_effort_variant_no_require_max_tokens(self) -> None:
+    def test_effort_variant_requires_max_tokens(self) -> None:
+        # Adaptive-only Opus rejects requests without an explicit max_tokens.
         variant = um.thinking_variants(self._base(), "claude")[0]
-        self.assertNotIn("require_max_tokens", variant)
+        self.assertTrue(variant.get("require_max_tokens"))
         self.assertEqual(variant["max_output_tokens"], 128000)
 
     def test_effort_variant_routes_via_real_name(self) -> None:
@@ -222,6 +223,7 @@ class TestAdaptiveEffortVariants(unittest.TestCase):
             self.assertEqual(len(model["patches"]), 1)
             self.assertIn('"type":"adaptive"', model["patches"][0])
             self.assertIn('.body.output_config.effort = "high"', model["patches"][0])
+            self.assertTrue(model.get("require_max_tokens"))
 
     def test_apply_base_thinking_skips_manual_models(self) -> None:
         model = {"name": "claude-opus-4-6", "max_input_tokens": 1000}

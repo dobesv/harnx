@@ -527,12 +527,7 @@ def merge_old_fields(new_model: dict[str, Any], old_model: dict[str, Any] | None
 
 
 def _variant_from_base(
-    base_model: dict[str, Any],
-    suffix: str,
-    patch: str,
-    *,
-    max_output_tokens: int | None,
-    require_max_tokens: bool,
+    base_model: dict[str, Any], suffix: str, patch: str, *, max_output_tokens: int | None
 ) -> dict[str, Any]:
     name = base_model["name"]
     variant: dict[str, Any] = {
@@ -540,12 +535,11 @@ def _variant_from_base(
         # Use the base model's real_name if it has one (aliased model), otherwise
         # the name. This routes the variant to the correct provider-side model ID.
         "real_name": base_model.get("real_name", name),
+        # Both thinking and effort variants reject requests without max_tokens.
+        "max_output_tokens": max_output_tokens,
+        "require_max_tokens": True,
         "patches": [patch],
     }
-    if max_output_tokens is not None:
-        variant["max_output_tokens"] = max_output_tokens
-    if require_max_tokens:
-        variant["require_max_tokens"] = True
     for field in (
         "max_input_tokens",
         "input_price",
@@ -567,6 +561,8 @@ def apply_base_thinking(model: dict[str, Any], provider: str) -> None:
         return
     if name.startswith("claude-") and is_adaptive_only_opus(name):
         model["patches"] = [claude_adaptive_patch(BASE_EFFORT)]
+        # These models reject requests without an explicit max_tokens.
+        model["require_max_tokens"] = True
 
 
 def thinking_variants(base_model: dict[str, Any], provider: str) -> list[dict[str, Any]]:
@@ -586,7 +582,6 @@ def thinking_variants(base_model: dict[str, Any], provider: str) -> list[dict[st
                     effort,
                     claude_adaptive_patch(effort),
                     max_output_tokens=base_model.get("max_output_tokens"),
-                    require_max_tokens=False,
                 )
                 for effort in ADAPTIVE_EFFORT_VARIANTS
             ]
@@ -609,7 +604,6 @@ def thinking_variants(base_model: dict[str, Any], provider: str) -> list[dict[st
             "thinking",
             patch,
             max_output_tokens=24000,
-            require_max_tokens=True,
         )
     ]
 
