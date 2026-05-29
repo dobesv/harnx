@@ -1,5 +1,6 @@
 mod server;
 
+use harnx_sandbox_common::SandboxConfig;
 use rmcp::ServiceExt;
 use server::BashServer;
 #[cfg(unix)]
@@ -116,17 +117,17 @@ fn push_root(roots: &mut Vec<PathBuf>, raw: &str) {
 }
 
 #[cfg(unix)]
-fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
+fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
     let args: Vec<String> = std::env::args().collect();
     let mut roots = Vec::new();
     let mut sandbox_enabled = true;
-    let mut sandbox_config = server::SandboxConfig {
+    let mut sandbox_config = SandboxConfig {
         enabled: true,
         extra_exec: parse_env_paths("HARNX_BASH_EXTRA_EXEC"),
         extra_readable: parse_env_paths("HARNX_BASH_EXTRA_READABLE"),
         extra_writable: parse_env_paths("HARNX_BASH_EXTRA_WRITABLE"),
         extra_rwx: parse_env_paths("HARNX_BASH_EXTRA_RWX"),
-        sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
+        sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
         extra_env_passthrough: parse_env_passthrough(),
         env_overrides: vec![],
     };
@@ -277,15 +278,13 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
     }
 
     let resolved_sandbox_run_path = sandbox_run_override.clone().or_else(|| {
-        std::env::current_exe().ok().and_then(|path| {
-            path.parent()
-                .map(|dir| dir.join("harnx-mcp-bash-sandbox-run"))
-        })
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|dir| dir.join("harnx-sandbox-exec")))
     });
 
     if sandbox_enabled {
-        let path = resolved_sandbox_run_path
-            .unwrap_or_else(|| PathBuf::from("harnx-mcp-bash-sandbox-run"));
+        let path = resolved_sandbox_run_path.unwrap_or_else(|| PathBuf::from("harnx-sandbox-exec"));
         if path_is_executable(&path) {
             sandbox_config.sandbox_run_path = path;
         } else if sandbox_run_override.is_some() {
@@ -295,14 +294,14 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
             );
         } else {
             anyhow::bail!(
-                "harnx-mcp-bash: error: sandbox helper at {} does not exist or is not executable; place harnx-mcp-bash-sandbox-run next to harnx-mcp-bash, use --sandbox-run <path>, or pass --no-sandbox to disable sandboxing explicitly",
+                "harnx-mcp-bash: error: sandbox helper at {} does not exist or is not executable; place harnx-sandbox-exec next to harnx-mcp-bash, use --sandbox-run <path>, or pass --no-sandbox to disable sandboxing explicitly",
                 path.display()
             );
         }
     } else {
         sandbox_config.enabled = false;
-        sandbox_config.sandbox_run_path = resolved_sandbox_run_path
-            .unwrap_or_else(|| PathBuf::from("harnx-mcp-bash-sandbox-run"));
+        sandbox_config.sandbox_run_path =
+            resolved_sandbox_run_path.unwrap_or_else(|| PathBuf::from("harnx-sandbox-exec"));
     }
 
     Ok((roots, sandbox_config))
@@ -320,17 +319,17 @@ fn parse_env_passthrough() -> Vec<String> {
 }
 
 #[cfg(not(unix))]
-fn parse_args() -> anyhow::Result<(Vec<PathBuf>, server::SandboxConfig)> {
+fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
     let args: Vec<String> = std::env::args().collect();
     let mut roots = Vec::new();
-    let mut sandbox_config = server::SandboxConfig {
+    let mut sandbox_config = SandboxConfig {
         // Sandbox itself is Unix-only; on Windows these fields are unused.
         enabled: false,
         extra_exec: vec![],
         extra_readable: vec![],
         extra_writable: vec![],
         extra_rwx: vec![],
-        sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
+        sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
         extra_env_passthrough: parse_env_passthrough(),
         env_overrides: vec![],
     };

@@ -17,3 +17,5 @@ COPY linux-${TARGETARCH}/harnx-mcp-time /usr/local/bin/harnx-mcp-time
 COPY linux-${TARGETARCH}/harnx-aws-creds /usr/local/bin/harnx-aws-creds
 COPY linux-${TARGETARCH}/harnx-pkg /usr/local/bin/harnx-pkg
 COPY linux-${TARGETARCH}/harnx-proxy-auth /usr/local/bin/harnx-proxy-auth
+COPY linux-${TARGETARCH}/harnx-sandbox-run /usr/local/bin/harnx-sandbox-run
+COPY linux-${TARGETARCH}/harnx-sandbox-exec /usr/local/bin/harnx-sandbox-exec

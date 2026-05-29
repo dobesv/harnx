@@ -1,0 +1,28 @@
+[package]
+name = "harnx-sandbox-run"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Run commands inside the birdcage sandbox with hook support"
+
+[dependencies]
+harnx-sandbox-common = { path = "../harnx-sandbox-common" }
+harnx-hooks = { path = "../harnx-hooks" }
+harnx-core = { path = "../harnx-core" }
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+log = { workspace = true }
+env_logger = "0.11"
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "harnx-sandbox-run"
+path = "src/main.rs"

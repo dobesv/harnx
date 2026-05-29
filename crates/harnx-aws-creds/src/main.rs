@@ -141,12 +141,13 @@ fn handle_hook_line(line: &str, state: &AppState, port: u16) -> Option<Value> {
         }
     };
 
+    // Respond to any PreToolUse event with a tool_input — tool name filtering
+    // is the caller's responsibility (configured via the hook's matcher field).
     let response = match (
         request.get("hook_event_name").and_then(Value::as_str),
-        request.get("tool_name").and_then(Value::as_str),
         request.get("tool_input"),
     ) {
-        (Some("PreToolUse"), Some("bash_exec" | "bash_spawn"), Some(tool_input)) => {
+        (Some("PreToolUse"), Some(tool_input)) => {
             match mutate_tool_input(tool_input, state, port) {
                 Ok(mutated) => json!({
                     "id": id,
@@ -414,15 +415,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hook_noop_other_tool() {
-        let output = run_hook_once(
-            "{\"id\":\"1\",\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"fs_read\",\"tool_input\":{\"path\":\"/tmp/file\"}}\n",
-            12345,
-        )
-        .await;
-
-        let response: Value = serde_json::from_str(output.trim()).unwrap();
-        assert_eq!(response, json!({ "id": "1" }));
+    async fn hook_injects_any_pretooluse_with_tool_input() {
+        // Tool name is ignored — caller is responsible for filtering via matcher.
+        // Any PreToolUse event with a tool_input gets credential injection.
+        let env = hook_injected_env(r#"{"command":"ls","env":{}}"#).await;
+        assert_eq!(env["AWS_REGION"], "us-east-1");
     }
 
     #[tokio::test]

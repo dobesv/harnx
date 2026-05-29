@@ -3665,6 +3665,7 @@ dependencies = [
  "harnx-core",
  "harnx-mcp",
  "harnx-mcp-history",
+ "harnx-sandbox-common",
  "libc",
  "log",
  "process-wrap",
@@ -3921,6 +3922,33 @@ dependencies = [
  "unicode-width 0.2.2",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "harnx-sandbox-common"
+version = "0.32.2"
+dependencies = [
+ "anyhow",
+ "birdcage",
+ "log",
+ "tempfile",
+]
+
+[[package]]
+name = "harnx-sandbox-run"
+version = "0.32.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "harnx-core",
+ "harnx-hooks",
+ "harnx-sandbox-common",
+ "log",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
