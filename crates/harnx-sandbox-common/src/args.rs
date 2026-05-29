@@ -82,6 +82,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn appends_extra_paths_to_defaults() {
         ensure_anyhow_is_linked().expect("anyhow helper should succeed");
 
