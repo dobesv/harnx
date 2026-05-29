@@ -52,10 +52,28 @@ toolsets:
 # PreToolUse hooks can return hookSpecificOutput.toolInput to mutate tool arguments.
 # PostToolUse hooks can return hookSpecificOutput.toolResponse to mutate the tool response.
 #
-# Example: Inject GitHub auth headers via harnx-proxy-auth using --env sentinel technique.
-# The --env script emits real variable names with fake sentinel values. The hook matches
-# the sentinel in outbound requests and replaces it with the real token from the environment.
-# This prevents the real token from appearing in logs or process listings.
+# ---- harnx-proxy-auth: credential injection via HTTPS MITM proxy ----
+#
+# harnx-proxy-auth intercepts outbound HTTPS requests and injects auth headers.
+# It uses a sentinel technique: --env scripts inject fake placeholder tokens into
+# the child bash environment (so the LLM never sees real credentials), then --hook
+# filters match those sentinels in outgoing requests and replace them with real tokens.
+#
+# Available jaq helpers in --hook filters:
+#   bearer(token)         =>  "Bearer <token>"
+#   basic(user; password) =>  "Basic <base64(user:password)>"
+#
+# Available sentinel variables in --env and --hook scripts:
+#   $fake_uuid_key        random UUID (matches typical API key format)
+#   $fake_base64_key      random base64 string
+#   $fake_url_base64_key  random URL-safe base64 string
+#   $fake_hex_key         random 32-char hex string
+#   $fake_email           random fake email address
+#
+# `if COND then EXPR end` — omitting `else` passes the input through unchanged when
+# the condition is false (equivalent to `else .` in jaq but cleaner).
+#
+# Example: GitHub auth injection (git over HTTPS + GitHub API + uploads)
 #
 # hooks:
 #   entries:
@@ -64,12 +82,23 @@ toolsets:
 #     matcher: "bash_exec|bash_spawn"
 #     command: >-
 #       harnx-proxy-auth
-#       --env 'if (env.GITHUB_TOKEN // env.GH_TOKEN) then .GITHUB_TOKEN = "ghs_\($fake_base64_key)" else . end'
-#       --hook 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
-#           then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
-#           else . end'
+#       --env 'if env.GITHUB_TOKEN then .GITHUB_TOKEN = "ghp_\($fake_base64_key)" end'
+#       --hook 'if .host == "github.com"
+#               and .headers.authorization == basic("x-access-token"; "ghp_\($fake_base64_key)")
+#           then .headers.authorization = basic("x-access-token"; env.GITHUB_TOKEN)
+#           end'
+#       --hook 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com")
+#               and (.headers.authorization == bearer("ghp_\($fake_base64_key)")
+#                    or .headers.authorization == "token ghp_\($fake_base64_key)")
+#           then .headers.authorization = bearer(env.GITHUB_TOKEN)
+#           end'
 #
-# Example: Inject Atlassian Basic auth using sentinel email + UUID placeholders.
+# The --env script injects a fake ghp_<sentinel> token into the sandbox so tools
+# like `gh` see GITHUB_TOKEN set and consider themselves authenticated. The real
+# token never enters the sandbox — harnx-proxy-auth reads it from the host env
+# and injects it into outbound HTTP auth headers.
+#
+# Example: Atlassian (Jira/Confluence) auth injection
 #
 # hooks:
 #   entries:
@@ -78,7 +107,14 @@ toolsets:
 #     matcher: "bash_exec|bash_spawn"
 #     command: >-
 #       harnx-proxy-auth
-#       --env 'if (env.ATLASSIAN_API_TOKEN and env.ATLASSIAN_EMAIL) then .ATLASSIAN_API_TOKEN = $fake_uuid_key | .ATLASSIAN_EMAIL = $fake_email else . end'
-#       --hook 'if (.host | endswith(".atlassian.net")) and .headers.authorization == "Basic \([$fake_email, $fake_uuid_key] | join(":") | @base64)"
+#       --env 'if env.ATLASSIAN_API_TOKEN and env.ATLASSIAN_EMAIL
+#           then .ATLASSIAN_API_TOKEN = $fake_uuid_key | .ATLASSIAN_EMAIL = $fake_email
+#           end'
+#       --hook 'if (.host | endswith(".atlassian.net"))
+#               and .headers.authorization == basic($fake_email; $fake_uuid_key)
 #           then .headers.authorization = basic(env.ATLASSIAN_EMAIL; env.ATLASSIAN_API_TOKEN)
-#           else . end'
+#           end'
+#
+# Both can be combined into a single harnx-proxy-auth invocation with multiple
+# --env and --hook flags. See docs/sandbox-run.md for full claude-sb / gemini-sb
+# wrapper script examples.

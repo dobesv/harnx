@@ -19,7 +19,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 description: "Code quality specialist — identifies code smells, DRY violations, complexity issues, naming problems, and SOLID principle adherence. Named after Calliope (kuh-LY-uh-pee), the Muse of epic poetry and eloquence.\n"
-version: '0.2.1'
+version: '0.2.2'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

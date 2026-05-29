@@ -9,8 +9,6 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 struct HookRequest {
     id: String,
     #[serde(default)]
-    tool_name: Option<String>,
-    #[serde(default)]
     tool_input: Option<Value>,
 }
 
@@ -51,10 +49,9 @@ pub async fn run_jsonl_loop(
                 continue;
             }
         };
-        let response = if matches!(
-            request.tool_name.as_deref(),
-            Some("bash_exec") | Some("bash_spawn")
-        ) {
+        // Respond to any PreToolUse event with a tool_input — tool name filtering
+        // is the caller's responsibility (configured via the hook's matcher field).
+        let response = if request.tool_input.is_some() {
             HookResponse {
                 id: request.id,
                 hook_specific_output: Some(HookSpecificOutput {

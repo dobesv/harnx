@@ -27,7 +27,7 @@ use_tools:
 - plans_update_task
 - pytheas_session_prompt
 description: "Peitho (PY-thoh) - Goddess of Persuasion. She turns technical jargon into eloquent, human-readable documentation. Specialist in documentation, release notes, and user communication.\n"
-version: '0.2.1'
+version: '0.2.2'
 variables:
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep

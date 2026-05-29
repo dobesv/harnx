@@ -13,6 +13,8 @@ members = [
     "crates/harnx-hooks",
     "crates/harnx-mcp",
     "crates/harnx-mcp-bash",
+    "crates/harnx-sandbox-common",
+    "crates/harnx-sandbox-run",
     "crates/harnx-mcp-hooks-proxy",
     "crates/harnx-mcp-fs",
     "crates/harnx-mcp-time",
@@ -31,7 +33,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.32.2"
+version = "0.32.3"
 edition = "2021"
 authors = ["sigoden <sigoden@gmail.com>"]
 description = "All-in-one LLM CLI Tool"
@@ -144,6 +146,7 @@ harnx-acp = { path = "crates/harnx-acp" }
 harnx-acp-server = { path = "crates/harnx-acp-server" }
 minijinja = { version = "2.19.0", default-features = false, features = ["builtins", "debug", "serde"] }
 harnx-mcp-history = { path = "crates/harnx-mcp-history" }
+harnx-sandbox-common = { path = "crates/harnx-sandbox-common" }
 similar = "3"
 jaq-core = "3.0.0"
 jaq-std = "3.0.0"

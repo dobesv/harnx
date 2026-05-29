@@ -5,9 +5,15 @@ use harnx_mcp::safety::{
 
 use fancy_regex::Regex;
 use gix::ObjectId;
+use harnx_mcp::peer::peer_supports_roots;
 use harnx_mcp::schema::object_schema_with_desc;
 use harnx_mcp_history::classify::{classify_command, SnapshotDecision};
 use harnx_mcp_history::HistoryManager;
+#[cfg(unix)]
+use harnx_sandbox_common::build_default_sandbox_args;
+use harnx_sandbox_common::SandboxConfig;
+#[cfg(unix)]
+use harnx_sandbox_common::SYSTEM_EXEC_PATHS;
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
 #[cfg(unix)]
@@ -331,35 +337,6 @@ struct SpawnedProcess {
     output_paths: Option<Vec<PathBuf>>,
 }
 
-/// Configuration for the bash MCP server's sandboxing and child env handling.
-///
-/// The sandboxing fields (`enabled`, `extra_exec`, `extra_readable`,
-/// `sandbox_run_path`) are honoured only on Unix; on other platforms they
-/// are accepted for API compatibility and ignored.
-///
-/// The env-control fields (`extra_env_passthrough`, `env_overrides`) are
-/// honoured on every platform — even when sandboxing is unavailable, the
-/// child bash process receives only the curated environment.
-#[derive(Clone, Debug)]
-pub struct SandboxConfig {
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub enabled: bool,
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub extra_exec: Vec<PathBuf>,
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub extra_readable: Vec<PathBuf>,
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub extra_writable: Vec<PathBuf>,
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub extra_rwx: Vec<PathBuf>,
-    /// Extra var names to pass through from host (allowlist additions).
-    pub extra_env_passthrough: Vec<String>,
-    /// Explicit overrides: KEY → VALUE (highest precedence).
-    pub env_overrides: Vec<(String, String)>,
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub sandbox_run_path: PathBuf,
-}
-
 struct BashServerInner {
     roots: RwLock<Vec<PathBuf>>,
     roots_initialized: AtomicBool,
@@ -384,15 +361,7 @@ struct BashServerInner {
 /// Used to prevent over-broad roots from granting sandbox write/exec access.
 #[cfg(unix)]
 fn is_home_or_ancestor(path: &Path) -> bool {
-    let home_os = match std::env::var_os("HOME") {
-        Some(h) => h,
-        None => return false,
-    };
-    let home = std::fs::canonicalize(&home_os)
-        .unwrap_or_else(|_| std::path::Path::new(&home_os).to_path_buf());
-    let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    // path IS $HOME, or path is a strict ancestor of $HOME (home.starts_with(candidate))
-    home.starts_with(&candidate)
+    harnx_sandbox_common::is_home_or_ancestor(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -445,200 +414,6 @@ pub struct BashServer {
 }
 
 impl BashServer {
-    #[cfg(target_os = "linux")]
-    #[allow(dead_code)]
-    const SYSTEM_EXEC_PATHS: &[&str] = &[
-        "/usr/bin",
-        "/bin",
-        "/usr/local/bin",
-        "/usr/sbin",
-        "/sbin",
-        "/usr/lib",
-        "/usr/lib64",
-        "/lib",
-        "/lib64",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/libexec",
-        "/proc",
-        "/dev",
-        "/sys",
-        "/etc",
-        "/tmp",
-        "/run",
-        "/var/run",
-        "/usr/share",
-    ];
-    #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
-    const SYSTEM_EXEC_PATHS: &[&str] = &[
-        "/usr/bin",
-        "/bin",
-        "/usr/local/bin",
-        "/usr/sbin",
-        "/sbin",
-        "/usr/lib",
-        "/usr/local/lib",
-        "/Library",
-        "/System",
-        "/private/tmp",
-        "/private/var",
-        "/dev",
-    ];
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-    #[allow(dead_code)]
-    const SYSTEM_EXEC_PATHS: &[&str] = &["/usr/bin", "/bin", "/tmp", "/etc"];
-
-    /// Read-only system paths needed for compiling C/C++ code (e.g. `cc`, `bindgen`,
-    /// crates with native build scripts like `onig_sys`). These hold headers, not
-    /// executables, so they are granted as `--read` rather than `--exec`.
-    #[cfg(target_os = "linux")]
-    #[allow(dead_code)]
-    const SYSTEM_READ_PATHS: &[&str] = &["/usr/include", "/usr/include/x86_64-linux-gnu"];
-    #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
-    const SYSTEM_READ_PATHS: &[&str] = &[];
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-    #[allow(dead_code)]
-    const SYSTEM_READ_PATHS: &[&str] = &["/usr/include"];
-
-    /// Read-only paths under `$HOME` for git/tool-version configuration that
-    /// most commands consult but should never modify.
-    #[cfg(unix)]
-    #[allow(dead_code)]
-    const HOME_READ_PATHS: &[&str] = &[
-        ".gitconfig",
-        ".gitignore",
-        ".gitignore_global",
-        ".tool-versions",
-    ];
-
-    /// Read+execute paths under `$HOME` for tool installations (asdf, bun,
-    /// language version managers, locally-installed binaries).
-    #[cfg(unix)]
-    #[allow(dead_code)]
-    const HOME_EXEC_PATHS: &[&str] = &[
-        ".local/bin",
-        ".local/lib",
-        ".bun",
-        ".asdf",
-        "go/bin",
-        ".cargo",
-    ];
-
-    /// Read+write paths under `$HOME` for caches that hold data but should not
-    /// be executable.
-    #[cfg(unix)]
-    #[allow(dead_code)]
-    const HOME_WRITE_PATHS: &[&str] = &[".cache", "go/pkg"];
-
-    /// Read+write+execute paths under `$HOME` for tooling that installs and
-    /// runs binaries (npm, yarn, nvm, cargo, mono, bun cache, pyenv, rye).
-    /// `pyenv`/`rye` are Python version managers that install Pythons under
-    /// these directories and run them in place — needed for any project that
-    /// builds native Python packages outside the system Python.
-    #[cfg(unix)]
-    #[allow(dead_code)]
-    const HOME_RWX_PATHS: &[&str] = &[
-        ".npm",
-        ".yarn",
-        ".nvm",
-        ".cargo/bin",
-        ".cargo/registry",
-        ".cargo/git",
-        ".mono",
-        ".bun/install/cache",
-        ".pyenv",
-        ".rye",
-    ];
-
-    #[cfg(unix)]
-    fn push_home_relative_defaults(args: &mut Vec<OsString>, home: &Path) {
-        for sub in Self::HOME_READ_PATHS {
-            args.push(OsString::from("--read"));
-            args.push(home.join(sub).into_os_string());
-        }
-        for sub in Self::HOME_EXEC_PATHS {
-            args.push(OsString::from("--exec"));
-            args.push(home.join(sub).into_os_string());
-        }
-        for sub in Self::HOME_WRITE_PATHS {
-            let path = home.join(sub);
-            args.push(OsString::from("--read"));
-            args.push(path.clone().into_os_string());
-            args.push(OsString::from("--write"));
-            args.push(path.into_os_string());
-        }
-        for sub in Self::HOME_RWX_PATHS {
-            let path = home.join(sub);
-            args.push(OsString::from("--read"));
-            args.push(path.clone().into_os_string());
-            args.push(OsString::from("--write"));
-            args.push(path.clone().into_os_string());
-            args.push(OsString::from("--exec"));
-            args.push(path.into_os_string());
-        }
-    }
-
-    /// Honour toolchain-locating environment variables so users with non-default
-    /// install locations don't have to set `HARNX_BASH_EXTRA_*` themselves.
-    ///
-    /// - `CARGO_HOME` — Rust toolchain. Adds `$CARGO_HOME/bin` as exec.
-    /// - `GOROOT`     — Go installation. Adds `$GOROOT` as exec (toolchain binaries live in `$GOROOT/bin` and runtime in `$GOROOT/pkg`).
-    /// - `GOPATH`     — Go workspace. Adds `$GOPATH/bin` as exec and `$GOPATH/pkg` as read+write.
-    /// - `GOBIN`      — `go install` output dir. Adds `$GOBIN` as exec.
-    #[cfg(unix)]
-    fn push_env_relative_defaults(args: &mut Vec<OsString>) {
-        if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
-            args.push(OsString::from("--exec"));
-            args.push(PathBuf::from(cargo_home).join("bin").into_os_string());
-        }
-        if let Some(goroot) = std::env::var_os("GOROOT") {
-            args.push(OsString::from("--exec"));
-            args.push(PathBuf::from(goroot).into_os_string());
-        }
-        if let Some(gopath) = std::env::var_os("GOPATH") {
-            let gopath = PathBuf::from(gopath);
-            args.push(OsString::from("--exec"));
-            args.push(gopath.join("bin").into_os_string());
-            let pkg = gopath.join("pkg");
-            args.push(OsString::from("--read"));
-            args.push(pkg.clone().into_os_string());
-            args.push(OsString::from("--write"));
-            args.push(pkg.into_os_string());
-        }
-        if let Some(gobin) = std::env::var_os("GOBIN") {
-            args.push(OsString::from("--exec"));
-            args.push(PathBuf::from(gobin).into_os_string());
-        }
-    }
-
-    #[cfg(unix)]
-    fn system_writable_paths() -> Vec<PathBuf> {
-        #[cfg(target_os = "linux")]
-        {
-            // /dev/shm is a tmpfs used by Chrome/Puppeteer for inter-process
-            // shared memory.  Without write access the browser crashes on
-            // startup inside the sandbox (issue #528).  /tmp is included as
-            // the standard temporary-file directory.
-            vec![PathBuf::from("/tmp"), PathBuf::from("/dev/shm")]
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let mut paths = vec![PathBuf::from("/private/tmp")];
-            if let Ok(tmpdir) = std::env::var("TMPDIR") {
-                let path = PathBuf::from(&tmpdir);
-                if path != Path::new("/private/tmp") {
-                    paths.push(path);
-                }
-            }
-            paths
-        }
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-        {
-            vec![PathBuf::from("/tmp")]
-        }
-    }
-
     /// Safe defaults for non-interactive child processes: (key, fallback).
     ///
     /// Each entry is seeded as the host-env value when set, otherwise the
@@ -710,7 +485,7 @@ impl BashServer {
                 extra_rwx: vec![],
                 extra_env_passthrough: vec![],
                 env_overrides: vec![],
-                sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
+                sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
             },
         )
     }
@@ -734,6 +509,14 @@ impl BashServer {
     }
 
     async fn refresh_roots(&self, peer: &rmcp::service::Peer<RoleServer>) -> Result<(), ErrorData> {
+        if !peer_supports_roots(peer) {
+            // The client never advertised the `roots` capability, so it can't
+            // answer a `roots/list` request. Keep the CLI-provided roots and
+            // mark initialization done so we don't keep retrying.
+            self.inner.roots_initialized.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+
         let result = peer.list_roots().await.map_err(|err| {
             ErrorData::internal_error(format!("failed to fetch roots from peer: {err}"), None)
         })?;
@@ -922,59 +705,10 @@ impl BashServer {
         outputs: Option<&[PathBuf]>,
         roots: &[PathBuf],
     ) -> Vec<OsString> {
-        let mut args = Vec::new();
+        let mut args = build_default_sandbox_args(&self.inner.sandbox_config);
         let mut readable_paths = Vec::new();
         let mut writable_paths = Vec::new();
         let inputs_explicit_empty = matches!(inputs, Some([]));
-
-        for path in Self::SYSTEM_EXEC_PATHS {
-            args.push(OsString::from("--exec"));
-            args.push(OsString::from(path));
-        }
-
-        for path in Self::SYSTEM_READ_PATHS {
-            args.push(OsString::from("--read"));
-            args.push(OsString::from(path));
-        }
-
-        for path in Self::system_writable_paths() {
-            args.push(OsString::from("--write"));
-            args.push(path.into_os_string());
-        }
-
-        if let Some(home) = std::env::var_os("HOME") {
-            Self::push_home_relative_defaults(&mut args, &PathBuf::from(home));
-        }
-
-        Self::push_env_relative_defaults(&mut args);
-
-        for path in &self.inner.sandbox_config.extra_exec {
-            args.push(OsString::from("--exec"));
-            args.push(path.clone().into_os_string());
-        }
-
-        for path in &self.inner.sandbox_config.extra_readable {
-            args.push(OsString::from("--read"));
-            args.push(path.clone().into_os_string());
-            readable_paths.push(path.clone());
-        }
-
-        for path in &self.inner.sandbox_config.extra_writable {
-            args.push(OsString::from("--write"));
-            args.push(path.clone().into_os_string());
-            writable_paths.push(path.clone());
-        }
-
-        for path in &self.inner.sandbox_config.extra_rwx {
-            args.push(OsString::from("--read"));
-            args.push(path.clone().into_os_string());
-            args.push(OsString::from("--write"));
-            args.push(path.clone().into_os_string());
-            args.push(OsString::from("--exec"));
-            args.push(path.clone().into_os_string());
-            readable_paths.push(path.clone());
-            writable_paths.push(path.clone());
-        }
 
         match outputs {
             None => {
@@ -1185,10 +919,7 @@ impl BashServer {
                     if interp.is_absolute() {
                         if let Some(interp_dir) = interp.parent() {
                             let dir_str = interp_dir.to_string_lossy();
-                            if !Self::SYSTEM_EXEC_PATHS
-                                .iter()
-                                .any(|p| *p == dir_str.as_ref())
-                            {
+                            if !SYSTEM_EXEC_PATHS.iter().any(|p| *p == dir_str.as_ref()) {
                                 sb_args.push(OsString::from("--exec"));
                                 sb_args.push(interp_dir.as_os_str().to_owned());
                             }
@@ -1737,10 +1468,7 @@ impl BashServer {
                     if interp.is_absolute() {
                         if let Some(interp_dir) = interp.parent() {
                             let dir_str = interp_dir.to_string_lossy();
-                            if !Self::SYSTEM_EXEC_PATHS
-                                .iter()
-                                .any(|p| *p == dir_str.as_ref())
-                            {
+                            if !SYSTEM_EXEC_PATHS.iter().any(|p| *p == dir_str.as_ref()) {
                                 sb_args.push(OsString::from("--exec"));
                                 sb_args.push(interp_dir.as_os_str().to_owned());
                             }
@@ -2507,7 +2235,7 @@ fn internal_error(msg: impl Into<Cow<'static, str>>) -> ErrorData {
 
 #[cfg(all(test, target_os = "linux"))]
 fn sandbox_run_test_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/harnx-mcp-bash-sandbox-run")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/harnx-sandbox-exec")
 }
 
 #[cfg(unix)]
@@ -2954,6 +2682,76 @@ mod tests {
             .join("\n")
     }
 
+    /// A client that does NOT advertise the `roots` capability.
+    #[derive(Clone)]
+    struct NoRootsClientHandler {
+        list_roots_called: Arc<AtomicBool>,
+    }
+
+    impl ClientHandler for NoRootsClientHandler {
+        fn get_info(&self) -> InitializeRequestParams {
+            // Deliberately no `.enable_roots()` — this client cannot answer
+            // a `roots/list` request.
+            InitializeRequestParams::new(
+                ClientCapabilities::builder().build(),
+                Implementation::new("test-no-roots", "0.1"),
+            )
+        }
+
+        async fn list_roots(
+            &self,
+            _cx: RequestContext<RoleClient>,
+        ) -> Result<ListRootsResult, ErrorData> {
+            self.list_roots_called.store(true, Ordering::SeqCst);
+            Ok(ListRootsResult::new(vec![]))
+        }
+    }
+
+    /// When the client never advertised `roots`, the server must not send it
+    /// a `roots/list` request; it keeps the CLI-provided roots instead.
+    #[tokio::test]
+    async fn does_not_request_roots_when_client_lacks_capability() {
+        let temp_dir = TestDir::new();
+        let initial_root = temp_dir.path().to_path_buf();
+        let server = BashServer::new(vec![initial_root.clone()]);
+        let server_clone = server.clone();
+
+        let (client_transport, server_transport) = duplex(65_536);
+        let list_roots_called = Arc::new(AtomicBool::new(false));
+        let client_handler = NoRootsClientHandler {
+            list_roots_called: list_roots_called.clone(),
+        };
+        let server_fut = serve_server(server, server_transport);
+        let client_fut = serve_client(client_handler, client_transport);
+        let (server_res, client_res) = tokio::join!(server_fut, client_fut);
+        let server_service = server_res.unwrap();
+        let client_service = client_res.unwrap();
+
+        let server_peer = server_service.peer().clone();
+        let _client_task = tokio::spawn(async move {
+            let _ = client_service.waiting().await;
+        });
+
+        server_clone
+            .ensure_roots_initialized(&server_peer)
+            .await
+            .expect("initialization succeeds without roots support");
+
+        assert!(
+            !list_roots_called.load(Ordering::SeqCst),
+            "server must not request roots from a client lacking the roots capability"
+        );
+        assert_eq!(
+            *server_clone.inner.roots.read().await,
+            vec![initial_root],
+            "CLI-provided roots must be retained"
+        );
+        assert!(
+            server_clone.inner.roots_initialized.load(Ordering::SeqCst),
+            "roots should be marked initialized so we don't retry every tool call"
+        );
+    }
+
     #[tokio::test]
     async fn bash_tools_advertise_call_template_only() {
         // Each tool ships a `_meta.call_template` for the TUI's call header.
@@ -3068,7 +2866,7 @@ mod tests {
             extra_rwx: vec![],
             extra_env_passthrough: vec![],
             env_overrides: vec![],
-            sandbox_run_path: PathBuf::from("harnx-mcp-bash-sandbox-run"),
+            sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
         }
     }
 
