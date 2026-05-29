@@ -192,14 +192,46 @@ class TestShouldSkipModel(unittest.TestCase):
 
 class TestProviderPrefixParsing(unittest.TestCase):
     def test_standard_format_parsed(self) -> None:
-        result = um.provider_prefix_and_model_name("anthropic/claude-3-5-sonnet-20241022")
+        result = um.provider_prefix_and_model_name(
+            "anthropic/claude-3-5-sonnet-20241022", {}
+        )
         self.assertEqual(result, ("anthropic", "claude-3-5-sonnet-20241022"))
 
     def test_sample_spec_returns_none(self) -> None:
-        self.assertIsNone(um.provider_prefix_and_model_name("sample_spec"))
+        self.assertIsNone(um.provider_prefix_and_model_name("sample_spec", {}))
 
-    def test_no_slash_returns_none(self) -> None:
-        self.assertIsNone(um.provider_prefix_and_model_name("gpt-4o"))
+    def test_sample_spec_returns_none_even_with_provider(self) -> None:
+        self.assertIsNone(
+            um.provider_prefix_and_model_name(
+                "sample_spec", {"litellm_provider": "openai"}
+            )
+        )
+
+    def test_bare_key_uses_litellm_provider(self) -> None:
+        # Anthropic's first-party models are keyed bare (no `provider/` prefix);
+        # the provider must be recovered from the litellm_provider field.
+        result = um.provider_prefix_and_model_name(
+            "claude-opus-4-8", {"litellm_provider": "anthropic"}
+        )
+        self.assertEqual(result, ("anthropic", "claude-opus-4-8"))
+
+    def test_bare_openai_key_uses_litellm_provider(self) -> None:
+        result = um.provider_prefix_and_model_name(
+            "gpt-4o", {"litellm_provider": "openai"}
+        )
+        self.assertEqual(result, ("openai", "gpt-4o"))
+
+    def test_explicit_prefix_wins_over_litellm_provider(self) -> None:
+        # When a `provider/` prefix is present it is authoritative, even if the
+        # litellm_provider field names a different (sub-)provider.
+        result = um.provider_prefix_and_model_name(
+            "vertex_ai/claude-opus-4-8",
+            {"litellm_provider": "vertex_ai-anthropic_models"},
+        )
+        self.assertEqual(result, ("vertex_ai", "claude-opus-4-8"))
+
+    def test_bare_key_without_litellm_provider_returns_none(self) -> None:
+        self.assertIsNone(um.provider_prefix_and_model_name("gpt-4o", {}))
 
 
 class TestBuildModelFromLiteLLM(unittest.TestCase):
