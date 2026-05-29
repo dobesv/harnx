@@ -149,7 +149,7 @@ Harnx ships with several built-in MCP servers ready to enable in your config. Se
 
 AI Agent = Instructions (Prompt) + Tools (Function Callings) + Documents (RAG).
 
-<img width="1100" height="520" alt="agent" src="https://github.com/user-attachments/assets/6bbdc451-a7ed-4f90-ad2d-1f6f1250c8eb" />
+<img width="1100" height="520" alt="Image" src="https://github.com/user-attachments/assets/81690302-fb9c-468b-b212-f06042d584ac" />
 
 ### Local Server Capabilities
 
