@@ -9,6 +9,7 @@ description = "MCP server that exposes time and timezone utilities"
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 iana-time-zone = { workspace = true }
@@ -17,6 +18,8 @@ rmcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+tower = { workspace = true }
 
 [[bin]]
 name = "harnx-mcp-time"
