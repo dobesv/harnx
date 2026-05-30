@@ -9,12 +9,15 @@ description = "MCP server that exposes a file-based plan/task/note management sy
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true }
 chrono = { workspace = true }
 rmcp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["fs", "time"] }
+tokio-util = { workspace = true }
+tower = { workspace = true }
 schemars = { workspace = true }
 similar = { workspace = true }
 
