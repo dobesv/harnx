@@ -4897,4 +4897,346 @@ mod tests {
             "expected success in sandbox: {text:?}"
         );
     }
+
+    // --- Issue #365: wait grep/truncation params + concurrent isolation ---
+
+    /// `wait` with `grep` filters each stream independently: stdout keeps only
+    /// matching lines, stderr keeps only its matching lines.
+    #[tokio::test]
+    async fn test_wait_grep_filters_per_stream() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "printf 'keep-out\\ndrop-out\\n'; printf 'keep-err\\ndrop-err\\n' >&2"
+                    .to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+        let execution_id = extract_field(&text_content(&result), "execution_id");
+
+        let result = server
+            .wait_impl(WaitParams {
+                execution_id,
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                grep: Some("keep".to_string()),
+            })
+            .await
+            .unwrap();
+
+        // Inspect only the rendered stream blocks; the metadata header echoes
+        // the literal command (which contains "drop-*"), so assert against the
+        // stdout/stderr block bodies, not the full text.
+        let text = text_content(&result);
+        let blocks = &text[text.find("===== stdout =====").expect("stdout marker")..];
+        assert!(blocks.contains("keep-out"), "stdout match kept: {text}");
+        assert!(blocks.contains("keep-err"), "stderr match kept: {text}");
+        assert!(
+            !blocks.contains("drop-out"),
+            "stdout non-match removed: {text}"
+        );
+        assert!(
+            !blocks.contains("drop-err"),
+            "stderr non-match removed: {text}"
+        );
+    }
+
+    /// `wait` truncation: a large output with `head_lines`/`tail_lines`/
+    /// `max_output_bytes` triggers actual truncation and a truncation hint.
+    #[tokio::test]
+    async fn test_wait_truncation_triggers_and_mentions_log_path() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "for i in $(seq 1 200); do echo \"stdout-line-$i\"; done".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+        let execution_id = extract_field(&text_content(&result), "execution_id");
+
+        let result = server
+            .wait_impl(WaitParams {
+                execution_id: execution_id.clone(),
+                timeout_secs: Some(5),
+                head_lines: Some(2),
+                tail_lines: Some(2),
+                max_output_bytes: None,
+                grep: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        // Truncation happened: hint present and points back at read_exec_log.
+        assert!(
+            text.contains("stdout truncated from"),
+            "expected truncation hint: {text}"
+        );
+        assert!(text.contains("full log via read_exec_log"));
+        assert!(text.contains(&execution_id));
+        // Head/tail boundaries retained; middle dropped.
+        assert!(text.contains("stdout-line-1"), "head kept: {text}");
+        assert!(text.contains("stdout-line-200"), "tail kept: {text}");
+        assert!(!text.contains("stdout-line-100"), "middle dropped: {text}");
+    }
+
+    /// `wait` with `max_output_bytes` truncates the stream to the byte budget.
+    #[tokio::test]
+    async fn test_wait_max_output_bytes_truncates() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "for i in $(seq 1 200); do echo \"line-$i\"; done".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+        let execution_id = extract_field(&text_content(&result), "execution_id");
+
+        let result = server
+            .wait_impl(WaitParams {
+                execution_id,
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: Some(32),
+                grep: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("stdout truncated from"),
+            "expected byte truncation hint: {text}"
+        );
+    }
+
+    /// Stream markers appear in `wait` output: opening/closing markers for a
+    /// non-empty stream, and the `(empty)` form for a stream with no output.
+    #[tokio::test]
+    async fn test_wait_stream_markers() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        // stdout has content, stderr is empty.
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "echo only-stdout".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+        let execution_id = extract_field(&text_content(&result), "execution_id");
+
+        let result = server
+            .wait_impl(WaitParams {
+                execution_id,
+                timeout_secs: Some(5),
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+                grep: None,
+            })
+            .await
+            .unwrap();
+
+        let text = text_content(&result);
+        assert!(
+            text.contains("===== stdout ====="),
+            "stdout open marker: {text}"
+        );
+        assert!(
+            text.contains("===== /stdout ====="),
+            "stdout close marker: {text}"
+        );
+        assert!(text.contains("only-stdout"));
+        assert!(
+            text.contains("===== stderr (empty) ====="),
+            "empty stderr marker: {text}"
+        );
+    }
+
+    /// Concurrent executions get separate UUID log directories: two processes
+    /// spawned simultaneously must not collide, and each `read_exec_log`
+    /// returns only that execution's output.
+    #[tokio::test]
+    async fn test_concurrent_execution_log_isolation() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+        let wd = temp_dir.path().to_string_lossy().to_string();
+
+        let (res_a, res_b) = tokio::join!(
+            server.spawn_impl(SpawnCommandParams {
+                command: "echo alpha-out; echo alpha-err >&2; sleep 0.3".to_string(),
+                working_dir: Some(wd.clone()),
+                inputs: None,
+                outputs: None,
+                env: None,
+            }),
+            server.spawn_impl(SpawnCommandParams {
+                command: "echo bravo-out; echo bravo-err >&2; sleep 0.3".to_string(),
+                working_dir: Some(wd.clone()),
+                inputs: None,
+                outputs: None,
+                env: None,
+            }),
+        );
+
+        let text_a = text_content(&res_a.unwrap());
+        let text_b = text_content(&res_b.unwrap());
+        let id_a = extract_field(&text_a, "execution_id");
+        let id_b = extract_field(&text_b, "execution_id");
+        assert_ne!(id_a, id_b, "execution ids must differ");
+
+        let log_a = PathBuf::from(extract_field(&text_a, "stdout_log_path"));
+        let log_b = PathBuf::from(extract_field(&text_b, "stdout_log_path"));
+        assert_ne!(
+            log_a.parent(),
+            log_b.parent(),
+            "concurrent executions must use separate log dirs: {log_a:?} vs {log_b:?}"
+        );
+
+        // Drain both before inspecting logs.
+        for id in [&id_a, &id_b] {
+            server
+                .wait_impl(WaitParams {
+                    execution_id: id.clone(),
+                    timeout_secs: Some(5),
+                    head_lines: None,
+                    tail_lines: None,
+                    max_output_bytes: None,
+                    grep: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let read = |id: String, stream: &str| {
+            server.read_exec_log_impl(ReadExecLogParams {
+                execution_id: id,
+                stream: stream.to_string(),
+                offset: None,
+                limit: None,
+                tail: None,
+                grep: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+            })
+        };
+
+        let a_out = text_content(&read(id_a.clone(), "stdout").await.unwrap());
+        let a_err = text_content(&read(id_a.clone(), "stderr").await.unwrap());
+        let b_out = text_content(&read(id_b.clone(), "stdout").await.unwrap());
+        let b_err = text_content(&read(id_b.clone(), "stderr").await.unwrap());
+
+        assert!(a_out.contains("alpha-out") && !a_out.contains("bravo-out"));
+        assert!(a_err.contains("alpha-err") && !a_err.contains("bravo-err"));
+        assert!(b_out.contains("bravo-out") && !b_out.contains("alpha-out"));
+        assert!(b_err.contains("bravo-err") && !b_err.contains("alpha-err"));
+    }
+
+    /// Parallel to the existing exec -> read_exec_log truncation test: spawn ->
+    /// wait (truncated) -> read_exec_log returns the full, untruncated log.
+    #[tokio::test]
+    async fn test_spawn_wait_read_exec_log_returns_full_output() {
+        let temp_dir = TestDir::new();
+        let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
+
+        let result = server
+            .spawn_impl(SpawnCommandParams {
+                command: "printf 'out1\\nout2\\nout3\\n'; printf 'err1\\nerr2\\n' >&2".to_string(),
+                working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
+                inputs: None,
+                outputs: None,
+                env: None,
+            })
+            .await
+            .unwrap();
+        let execution_id = extract_field(&text_content(&result), "execution_id");
+
+        // Truncated wait: only boundaries visible.
+        let result = server
+            .wait_impl(WaitParams {
+                execution_id: execution_id.clone(),
+                timeout_secs: Some(5),
+                head_lines: Some(1),
+                tail_lines: Some(1),
+                max_output_bytes: None,
+                grep: None,
+            })
+            .await
+            .unwrap();
+        // Scope to the stdout block: the metadata header echoes the literal
+        // command, which contains "out2".
+        let wait_text = text_content(&result);
+        let wait_blocks =
+            &wait_text[wait_text.find("===== stdout =====").expect("stdout marker")..];
+        assert!(wait_blocks.contains("out1"));
+        assert!(
+            !wait_blocks.contains("out2"),
+            "middle truncated in wait: {wait_text}"
+        );
+
+        // read_exec_log returns the complete stdout log.
+        let stdout_read = server
+            .read_exec_log_impl(ReadExecLogParams {
+                execution_id: execution_id.clone(),
+                stream: "stdout".to_string(),
+                offset: None,
+                limit: None,
+                tail: None,
+                grep: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+        let stdout_text = text_content(&stdout_read);
+        assert!(stdout_text.contains("1: out1"));
+        assert!(stdout_text.contains("2: out2"));
+        assert!(stdout_text.contains("3: out3"));
+
+        let stderr_read = server
+            .read_exec_log_impl(ReadExecLogParams {
+                execution_id,
+                stream: "stderr".to_string(),
+                offset: None,
+                limit: None,
+                tail: None,
+                grep: None,
+                head_lines: None,
+                tail_lines: None,
+                max_output_bytes: None,
+            })
+            .await
+            .unwrap();
+        let stderr_text = text_content(&stderr_read);
+        assert!(stderr_text.contains("1: err1"));
+        assert!(stderr_text.contains("2: err2"));
+    }
 }
