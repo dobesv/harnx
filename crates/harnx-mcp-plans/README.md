@@ -32,5 +32,5 @@ The server automatically cleans up inactive plans to manage disk space.
 The server provides a comprehensive set of tools for managing the lifecycle of plans and their components:
 
 - **Plans**: `list_plans`, `add_plan`, `get_plan`, `update_plan`, `delete_plan`
-- **Tasks**: `list_tasks`, `add_task`, `get_task`, `update_task`, `append_task`, `delete_task`
-- **Notes**: `list_notes`, `add_note`, `get_note`, `delete_note`
+- **Tasks**: `list_tasks`, `add_task`, `get_task`, `update_task`, `delete_task`
+- **Notes**: `list_notes`, `add_note`, `get_note`, `update_note`, `delete_note`

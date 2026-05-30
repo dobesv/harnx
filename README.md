@@ -8,18 +8,35 @@ usable with other harnesses.
 
 ## Install
 
-Harnx ships as three binaries, each installable independently:
+Harnx ships as a family of independently installable binaries. Each release
+publishes a separate archive per binary per target, so you can install only
+what you need:
 
-| Binary | What it does | Release size |
+| Binary | What it does | Docs |
 |---|---|---|
-| `harnx` | Full CLI — TUI + Cmd + HTTP (`--serve`) + ACP (`--acp=<agent>`) | ~18 MB |
-| `harnx-serve` | HTTP-only server, no TUI deps | ~10 MB |
-| `harnx-acp-server` | ACP-only headless agent over stdio, no TUI deps | ~11 MB |
-| `harnx-sandbox-run` | Standalone sandbox wrapper with hook support | ~10 MB |
+| `harnx` | Full CLI — TUI + Cmd + HTTP (`--serve`) + ACP (`--acp=<agent>`) | [Command-Line Guide](docs/command-line-guide.md) |
+| `harnx-serve` | HTTP-only server, no TUI deps | [README](crates/harnx-serve/README.md) |
+| `harnx-acp-server` | ACP-only headless agent over stdio, no TUI deps | [README](crates/harnx-acp-server/README.md) |
+| `harnx-pkg` | Package manager for harnx agent configurations | [Package System](docs/packages.md) |
+| `harnx-mcp-bash` | MCP server exposing bash/subprocess execution with safety guards | [Bash MCP Server](docs/bash-mcp-server.md) |
+| `harnx-mcp-fs` | MCP server exposing filesystem operations with safety guards | [README](crates/harnx-mcp-fs/README.md) |
+| `harnx-mcp-plans` | MCP server exposing file-based plan/task/note management | [README](crates/harnx-mcp-plans/README.md) |
+| `harnx-mcp-time` | MCP server exposing time and timezone utilities | [README](crates/harnx-mcp-time/README.md) |
+| `harnx-mcp-hooks-proxy` | MCP proxy that runs harnx hooks around every tool call | [README](crates/harnx-mcp-hooks-proxy/README.md) |
+| `harnx-sandbox-run` | Run commands inside the birdcage sandbox with hook support | [Sandbox Run](docs/sandbox-run.md) |
+| `harnx-sandbox-exec` | Low-level birdcage sandbox wrapper with explicit path allow-lists | [README](crates/harnx-sandbox-common/README.md) |
+| `harnx-aws-creds` | Bearer-protected helper that serves AWS credentials to tools | [AWS Creds](docs/aws-creds.md) |
+| `harnx-k8s-creds` | Persistent hook that injects scoped Kubernetes credentials into sandboxed tools | [README](crates/harnx-k8s-creds/README.md) |
+| `harnx-proxy-auth` | TLS-intercepting auth proxy that injects credentials and runs hooks | [README](crates/harnx-proxy-auth/README.md) |
+
+One helper binary ships bundled alongside its parent rather than as its own
+archive: `harnx-mcp-bash-sandbox-run` is included in the `harnx-mcp-bash`
+archive.
 
 Install whichever you need. Most users want just `harnx`; headless server
 deployments can skip the TUI deps by picking `harnx-serve` or
-`harnx-acp-server` directly.
+`harnx-acp-server` directly. The MCP server binaries (`harnx-mcp-*`) are only
+needed if you wire them up as external MCP servers.
 
 ### Install from Git (Rust developers)
 
@@ -39,13 +56,12 @@ track an in-progress branch.
 Clone the repo, then:
 
 ```sh
-# Install all three at once via the project's argc task runner:
+# Install all harnx binaries at once via the project's argc task runner:
 argc install
 
-# ...or pick one:
+# ...or pick one or more:
 argc install harnx
-argc install harnx-serve
-argc install harnx-acp-server
+argc install harnx-serve harnx-acp-server
 
 # Raw cargo also works:
 cargo install --path crates/harnx
@@ -54,8 +70,9 @@ cargo install --path crates/harnx-acp-server
 ```
 
 The `argc install` helper accepts `--debug` (build unoptimized for faster
-compile), `--force` (overwrite existing bins), and `--locked` (use the
-committed `Cargo.lock` for a reproducible install).
+compile) and an optional list of bin names to restrict the install. It always
+builds with the committed `Cargo.lock` for a reproducible result and overwrites
+any existing bins.
 
 ### Pre-built Binaries
 

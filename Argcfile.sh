@@ -9,11 +9,11 @@ set -e
 # rebuilds that `cargo install --path` does. Release profile by default; pass --debug for
 # a faster build with slower runtime.
 # @flag --debug Install debug build instead of the default release build
-# @arg bins*[harnx|harnx-serve|harnx-acp-server|harnx-mcp-bash|harnx-mcp-fs|harnx-mcp-time|harnx-mcp-plans|harnx-mcp-hooks-proxy|harnx-aws-creds|harnx-pkg|harnx-proxy-auth|harnx-sandbox-run|harnx-sandbox-exec] Restrict the install to one or more bins (default: all)
+# @arg bins*[harnx|harnx-serve|harnx-acp-server|harnx-mcp-bash|harnx-mcp-fs|harnx-mcp-time|harnx-mcp-plans|harnx-mcp-hooks-proxy|harnx-aws-creds|harnx-k8s-creds|harnx-pkg|harnx-proxy-auth|harnx-sandbox-run|harnx-sandbox-exec] Restrict the install to one or more bins (default: all)
 install() {
     bins=("${argc_bins[@]}")
     if [[ ${#bins[@]} -eq 0 ]]; then
-        bins=(harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-fs harnx-mcp-time harnx-mcp-plans harnx-mcp-hooks-proxy harnx-aws-creds harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec)
+        bins=(harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-fs harnx-mcp-time harnx-mcp-plans harnx-mcp-hooks-proxy harnx-aws-creds harnx-k8s-creds harnx-pkg harnx-proxy-auth harnx-sandbox-run harnx-sandbox-exec)
     fi
 
     build_args=(--locked)
