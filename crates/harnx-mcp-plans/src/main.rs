@@ -6,8 +6,8 @@
 //! Layout: `<dir>/<plan>/plan.md`, `<dir>/<plan>/tasks/<id>.md`, `<dir>/<plan>/notes/<id>.md`
 //!
 //! Provides: list_plans, add_plan, get_plan, update_plan, delete_plan,
-//! list_tasks, add_task, get_task, update_task, append_task, delete_task,
-//! list_notes, add_note, get_note, delete_note
+//! list_tasks, add_task, get_task, update_task, delete_task,
+//! list_notes, add_note, get_note, update_note, delete_note
 
 mod server;
 
