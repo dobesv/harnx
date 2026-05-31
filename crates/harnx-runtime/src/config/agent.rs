@@ -283,76 +283,107 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
 
     resolve_file_backed_variables(agent.config.variables_mut(), &agent_dir)?;
 
-    let rag = if rag_path.exists() {
-        Some(Arc::new(Rag::load(
-            &config.read().clients,
-            DEFAULT_AGENT_NAME,
-            &rag_path,
-        )?))
-    } else if !agent.documents().is_empty() && !config.read().info_flag {
-        let mut ans = false;
-        if *IS_STDOUT_TERMINAL {
-            ans = Confirm::new("The agent has the documents, init RAG?")
-                .with_default(true)
-                .prompt()?;
-        }
-        if ans {
-            let mut document_paths = vec![];
-            for path in agent.documents() {
-                if is_url(path) {
-                    document_paths.push(path.to_string());
-                } else {
-                    let new_path = safe_join_path(&agent_dir, path)
-                        .ok_or_else(|| anyhow!("Invalid document path: '{path}'"))?;
-                    document_paths.push(new_path.display().to_string())
-                }
-            }
-            let (
-                clients_owned,
-                loaders_owned,
-                rag_embedding_model_owned,
-                rag_reranker_model,
-                rag_top_k,
-                rag_chunk_size,
-                rag_chunk_overlap,
-                user_agent_owned,
-                dry_run,
-            ) = {
-                let cfg = config.read();
-                (
-                    cfg.clients.clone(),
-                    cfg.document_loaders.clone(),
-                    cfg.rag_embedding_model.clone(),
-                    cfg.rag_reranker_model.clone(),
-                    cfg.rag_top_k,
-                    cfg.rag_chunk_size,
-                    cfg.rag_chunk_overlap,
-                    cfg.user_agent.clone(),
-                    cfg.dry_run,
-                )
-            };
-            let init_ctx = harnx_rag::RagInitContext {
-                clients: &clients_owned,
-                document_loaders: &loaders_owned,
-                rag_embedding_model: rag_embedding_model_owned.as_deref(),
-                rag_reranker_model,
-                rag_top_k,
-                rag_chunk_size,
-                rag_chunk_overlap,
-                user_agent: user_agent_owned.as_deref(),
-                dry_run,
-            };
-            let rag = Rag::init(&init_ctx, "rag", &rag_path, &document_paths, abort_signal).await?;
-            Some(Arc::new(rag))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    agent.rag = rag;
+    agent.rag = resolve_agent_rag(config, &agent, &rag_path, &agent_dir, abort_signal).await?;
 
     Ok(agent)
+}
+
+/// Resolve the RAG store for an agent during [`init`]: load an existing store
+/// if present, otherwise optionally build one from the agent's documents
+/// (prompting in interactive mode). Returns `None` when there is no RAG.
+async fn resolve_agent_rag(
+    config: &GlobalConfig,
+    agent: &Agent,
+    rag_path: &Path,
+    agent_dir: &Path,
+    abort_signal: AbortSignal,
+) -> Result<Option<Arc<Rag>>> {
+    if rag_path.exists() {
+        let rag = Rag::load(&config.read().clients, DEFAULT_AGENT_NAME, rag_path)?;
+        return Ok(Some(Arc::new(rag)));
+    }
+
+    if agent.documents().is_empty() || config.read().info_flag || !confirm_init_rag()? {
+        return Ok(None);
+    }
+
+    let document_paths = collect_agent_document_paths(agent, agent_dir)?;
+    let rag = build_agent_rag(config, rag_path, &document_paths, abort_signal).await?;
+    Ok(Some(Arc::new(rag)))
+}
+
+/// Prompt the user (only on a TTY) to confirm building a RAG store from the
+/// agent's documents. Returns `false` without prompting in non-interactive use.
+fn confirm_init_rag() -> Result<bool> {
+    if !*IS_STDOUT_TERMINAL {
+        return Ok(false);
+    }
+    Confirm::new("The agent has the documents, init RAG?")
+        .with_default(true)
+        .prompt()
+        .map_err(Into::into)
+}
+
+/// Resolve the agent's document references to concrete paths/URLs, rejecting
+/// any local path that escapes `agent_dir`.
+fn collect_agent_document_paths(agent: &Agent, agent_dir: &Path) -> Result<Vec<String>> {
+    let mut document_paths = vec![];
+    for path in agent.documents() {
+        if is_url(path) {
+            document_paths.push(path.to_string());
+        } else {
+            let new_path = safe_join_path(agent_dir, path)
+                .ok_or_else(|| anyhow!("Invalid document path: '{path}'"))?;
+            document_paths.push(new_path.display().to_string());
+        }
+    }
+    Ok(document_paths)
+}
+
+/// Build a fresh RAG store from `document_paths` using the current config's
+/// embedding/reranker settings.
+async fn build_agent_rag(
+    config: &GlobalConfig,
+    rag_path: &Path,
+    document_paths: &[String],
+    abort_signal: AbortSignal,
+) -> Result<Rag> {
+    let (
+        clients_owned,
+        loaders_owned,
+        rag_embedding_model_owned,
+        rag_reranker_model,
+        rag_top_k,
+        rag_chunk_size,
+        rag_chunk_overlap,
+        user_agent_owned,
+        dry_run,
+    ) = {
+        let cfg = config.read();
+        (
+            cfg.clients.clone(),
+            cfg.document_loaders.clone(),
+            cfg.rag_embedding_model.clone(),
+            cfg.rag_reranker_model.clone(),
+            cfg.rag_top_k,
+            cfg.rag_chunk_size,
+            cfg.rag_chunk_overlap,
+            cfg.user_agent.clone(),
+            cfg.dry_run,
+        )
+    };
+    let init_ctx = harnx_rag::RagInitContext {
+        clients: &clients_owned,
+        document_loaders: &loaders_owned,
+        rag_embedding_model: rag_embedding_model_owned.as_deref(),
+        rag_reranker_model,
+        rag_top_k,
+        rag_chunk_size,
+        rag_chunk_overlap,
+        user_agent: user_agent_owned.as_deref(),
+        dry_run,
+    };
+    Rag::init(&init_ctx, "rag", rag_path, document_paths, abort_signal).await
 }
 
 pub fn init_agent_variables(
@@ -368,102 +399,141 @@ pub fn init_agent_variables(
     let mut unset_variables = vec![];
     for agent_variable in agent_variables {
         let key = agent_variable.name.clone();
-        match variables.get(&key) {
-            Some(value) => {
-                output.insert(key, value.clone());
-            }
-            None => {
-                if let Some(value) = agent_variable.default.clone() {
-                    output.insert(key, value);
-                    continue;
-                }
-                if no_interaction {
-                    continue;
-                }
-                if *IS_STDOUT_TERMINAL {
-                    if !printed {
-                        crate::utils::emit_info("⚙ Init agent variables...".to_string());
-                        printed = true;
-                    }
-                    let value = Text::new(&format!(
-                        "{} ({}):",
-                        agent_variable.name, agent_variable.description
-                    ))
-                    .with_validator(|input: &str| {
-                        if input.trim().is_empty() {
-                            Ok(Validation::Invalid("This field is required".into()))
-                        } else {
-                            Ok(Validation::Valid)
-                        }
-                    })
-                    .prompt()?;
-                    output.insert(key, value);
-                } else {
-                    unset_variables.push(agent_variable)
-                }
-            }
+        if let Some(value) =
+            resolve_agent_variable(agent_variable, variables, no_interaction, &mut printed)?
+        {
+            output.insert(key, value);
+        } else if !no_interaction && !*IS_STDOUT_TERMINAL {
+            unset_variables.push(agent_variable);
         }
     }
-    if !unset_variables.is_empty() {
-        bail!(
-            "The following agent variables are required:\n{}",
-            unset_variables
-                .iter()
-                .map(|v| format!("  - {}: {}", v.name, v.description))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    }
+    ensure_no_unset_variables(&unset_variables)?;
     Ok(output)
 }
 
-pub fn list_agents() -> Vec<String> {
-    let mut output: Vec<String> = match read_dir(Config::agents_config_dir()) {
-        Ok(entries) => entries
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let path = entry.path();
-                match path.extension().and_then(|value| value.to_str()) {
-                    Some("md") => path
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .map(|value| value.to_string()),
-                    _ => None,
-                }
-            })
-            .collect(),
-        Err(_) => vec![],
-    };
-
-    // Also include package agents with qualified names (pkg/stem)
-    let packages_dir = harnx_core::config_paths::packages_dir();
-    if let Ok(pkg_entries) = read_dir(&packages_dir) {
-        for pkg_entry in pkg_entries.filter_map(|e| e.ok()) {
-            let pkg_path = pkg_entry.path();
-            if !pkg_path.is_dir() {
-                continue;
-            }
-            let pkg_name = match pkg_path.file_name().and_then(|n| n.to_str()) {
-                Some(n) if !n.starts_with('.') => n.to_string(),
-                _ => continue,
-            };
-            let agents_dir = pkg_path.join(harnx_core::config_paths::AGENTS_DIR_NAME);
-            if let Ok(agent_entries) = read_dir(&agents_dir) {
-                for agent_entry in agent_entries.filter_map(|e| e.ok()) {
-                    let path = agent_entry.path();
-                    if path.extension().and_then(|x| x.to_str()) == Some("md") {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            output.push(format!("{pkg_name}/{stem}"));
-                        }
-                    }
-                }
-            }
-        }
+/// Resolve a single agent variable's value: explicit override, then default,
+/// then an interactive prompt (TTY only). Returns `None` when the value is
+/// still unresolved (no value available in a non-interactive context).
+fn resolve_agent_variable(
+    agent_variable: &AgentVariable,
+    variables: &AgentVariables,
+    no_interaction: bool,
+    printed: &mut bool,
+) -> Result<Option<String>> {
+    if let Some(value) = variables.get(&agent_variable.name) {
+        return Ok(Some(value.clone()));
     }
+    if let Some(value) = agent_variable.default.clone() {
+        return Ok(Some(value));
+    }
+    if no_interaction || !*IS_STDOUT_TERMINAL {
+        return Ok(None);
+    }
+    Ok(Some(prompt_agent_variable(agent_variable, printed)?))
+}
 
+/// Interactively prompt for a required agent variable, emitting the
+/// "Init agent variables" banner exactly once.
+fn prompt_agent_variable(agent_variable: &AgentVariable, printed: &mut bool) -> Result<String> {
+    if !*printed {
+        crate::utils::emit_info("⚙ Init agent variables...".to_string());
+        *printed = true;
+    }
+    Text::new(&format!(
+        "{} ({}):",
+        agent_variable.name, agent_variable.description
+    ))
+    .with_validator(|input: &str| {
+        if input.trim().is_empty() {
+            Ok(Validation::Invalid("This field is required".into()))
+        } else {
+            Ok(Validation::Valid)
+        }
+    })
+    .prompt()
+    .map_err(Into::into)
+}
+
+/// Bail with a descriptive error listing all required variables that were left
+/// unset in a non-interactive context.
+fn ensure_no_unset_variables(unset_variables: &[&AgentVariable]) -> Result<()> {
+    if unset_variables.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "The following agent variables are required:\n{}",
+        unset_variables
+            .iter()
+            .map(|v| format!("  - {}: {}", v.name, v.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+pub fn list_agents() -> Vec<String> {
+    let mut output = list_local_agent_names();
+    output.extend(list_package_agent_names());
     output.sort();
     output.dedup();
     output
+}
+
+/// Markdown agent stems in the top-level agents config dir.
+fn list_local_agent_names() -> Vec<String> {
+    let Ok(entries) = read_dir(Config::agents_config_dir()) else {
+        return vec![];
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| markdown_stem(&entry.path()))
+        .collect()
+}
+
+/// Package agents discovered under `packages/<pkg>/agents`, returned as
+/// qualified `pkg/stem` names.
+fn list_package_agent_names() -> Vec<String> {
+    let packages_dir = harnx_core::config_paths::packages_dir();
+    let Ok(pkg_entries) = read_dir(&packages_dir) else {
+        return vec![];
+    };
+    let mut names = vec![];
+    for pkg_entry in pkg_entries.filter_map(|e| e.ok()) {
+        let pkg_path = pkg_entry.path();
+        let Some(pkg_name) = package_name(&pkg_path) else {
+            continue;
+        };
+        let agents_dir = pkg_path.join(harnx_core::config_paths::AGENTS_DIR_NAME);
+        let Ok(agent_entries) = read_dir(&agents_dir) else {
+            continue;
+        };
+        for agent_entry in agent_entries.filter_map(|e| e.ok()) {
+            if let Some(stem) = markdown_stem(&agent_entry.path()) {
+                names.push(format!("{pkg_name}/{stem}"));
+            }
+        }
+    }
+    names
+}
+
+/// File stem of a markdown (`.md`) file, or `None` for other files.
+fn markdown_stem(path: &Path) -> Option<String> {
+    if path.extension().and_then(|x| x.to_str()) != Some("md") {
+        return None;
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+}
+
+/// Package directory name, skipping non-directories and hidden entries.
+fn package_name(pkg_path: &Path) -> Option<String> {
+    if !pkg_path.is_dir() {
+        return None;
+    }
+    match pkg_path.file_name().and_then(|n| n.to_str()) {
+        Some(n) if !n.starts_with('.') => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// If `path` is a markdown agent file whose role matches [`AgentRole::Assistant`],
@@ -565,702 +635,5 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::client::MessageRole;
-    use crate::config::GlobalConfig;
-    use crate::utils::create_abort_signal;
-    use std::{
-        fs,
-        path::Path,
-        path::PathBuf,
-        sync::{LazyLock, Mutex},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    static TEST_CONFIG_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    fn unique_test_config_dir() -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "harnx-agent-test-{}-{timestamp}",
-            std::process::id()
-        ))
-    }
-
-    fn with_test_config_dir<T>(f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
-        let _guard = TEST_CONFIG_DIR_LOCK.lock().unwrap();
-        let config_dir = unique_test_config_dir();
-        let data_dir = config_dir.with_file_name(format!(
-            "{}-data",
-            config_dir.file_name().unwrap().to_string_lossy()
-        ));
-        let state_dir = config_dir.with_file_name(format!(
-            "{}-state",
-            config_dir.file_name().unwrap().to_string_lossy()
-        ));
-        let agents_dir = config_dir.join("agents");
-        fs::create_dir_all(&agents_dir)?;
-        fs::create_dir_all(&data_dir)?;
-        fs::create_dir_all(&state_dir)?;
-
-        unsafe {
-            std::env::set_var("HARNX_CONFIG_DIR", &config_dir);
-            std::env::set_var("HARNX_DATA_DIR", &data_dir);
-            std::env::set_var("HARNX_STATE_DIR", &state_dir);
-        }
-        let result = f(&config_dir);
-        unsafe {
-            std::env::remove_var("HARNX_CONFIG_DIR");
-            std::env::remove_var("HARNX_DATA_DIR");
-            std::env::remove_var("HARNX_STATE_DIR");
-        }
-
-        let _ = fs::remove_dir_all(&data_dir);
-        let _ = fs::remove_dir_all(&state_dir);
-        let cleanup_result = fs::remove_dir_all(&config_dir);
-        match (result, cleanup_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(err)) => Err(err.into()),
-            (Err(err), Ok(())) => Err(err),
-            (Err(err), Err(cleanup_err)) => Err(err.context(format!(
-                "Additionally failed to clean up test config dir '{}': {cleanup_err}",
-                config_dir.display()
-            ))),
-        }
-    }
-
-    fn init_test_agent(agent_name: &str, content: &str, files: &[(&str, &str)]) -> Result<Agent> {
-        with_test_config_dir(|config_dir| {
-            let agents_dir = config_dir.join("agents");
-            fs::write(agents_dir.join(format!("{agent_name}.md")), content)?;
-
-            for (relative_path, file_content) in files {
-                let path = agents_dir.join(relative_path);
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(path, file_content)?;
-            }
-
-            let config = GlobalConfig::default();
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(super::init(&config, agent_name, create_abort_signal()))
-        })
-    }
-
-    fn make_tool_declaration(name: &str, description: &str) -> crate::tool::ToolDeclaration {
-        crate::tool::ToolDeclaration {
-            name: name.to_string(),
-            description: description.to_string(),
-            parameters: Default::default(),
-            mcp_tool_name: None,
-            mcp_server_name: None,
-            call_template: None,
-            result_template: None,
-        }
-    }
-
-    fn make_agent_with_tools(prompt: &str, tools: Vec<crate::tool::ToolDeclaration>) -> Agent {
-        let mut agent = Agent::new(AgentConfig::from_markdown("test", prompt).unwrap());
-        agent
-            .config
-            .set_tools(crate::tool::Tools::init_from_mcp(if tools.is_empty() {
-                None
-            } else {
-                Some(tools)
-            }));
-        agent
-    }
-
-    #[test]
-    fn test_agent_from_markdown_full() {
-        let content = "---\nmodel: openai:gpt-4o\ntemperature: 0.7\ntop_p: 0.9\nuse_tools: fs,web_search\ndescription: A test agent\nversion: '1.0'\n---\nYou are a helpful test agent.";
-        let agent = AgentConfig::from_markdown("test-agent", content).unwrap();
-        assert_eq!(agent.name(), "test-agent");
-        assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
-        assert_eq!(agent.temperature(), Some(0.7));
-        assert_eq!(agent.top_p(), Some(0.9));
-        assert_eq!(
-            agent.use_tools(),
-            Some(vec!["fs".to_string(), "web_search".to_string()])
-        );
-        assert!(agent
-            .interpolated_instructions()
-            .unwrap()
-            .contains("You are a helpful test agent"));
-    }
-
-    #[test]
-    fn test_agent_from_markdown_minimal() {
-        let content = "Just instructions, no front-matter.";
-        let agent = AgentConfig::from_markdown("minimal", content).unwrap();
-        assert_eq!(agent.name(), "minimal");
-        assert!(agent.model_id().is_none());
-        assert!(agent.temperature().is_none());
-        assert_eq!(
-            agent.interpolated_instructions().unwrap(),
-            "Just instructions, no front-matter."
-        );
-    }
-
-    #[test]
-    fn test_agent_from_markdown_empty_body() {
-        let content = "---\nmodel: openai:gpt-4o\ntemperature: 0.5\n---\n";
-        let agent = AgentConfig::from_markdown("empty-body", content).unwrap();
-        assert_eq!(agent.name(), "empty-body");
-        assert_eq!(agent.model_id(), Some("openai:gpt-4o"));
-        assert!(agent.interpolated_instructions().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_agent_set_name() {
-        let mut agent = AgentConfig::from_prompt("You are a test agent.");
-        assert_eq!(agent.name(), "%%");
-        agent.set_name("new-name");
-        assert_eq!(agent.name(), "new-name");
-    }
-
-    #[test]
-    fn test_agent_from_prompt() {
-        let agent = AgentConfig::from_prompt("You are a pirate");
-        assert_eq!(agent.name(), "%%");
-        assert!(agent
-            .interpolated_instructions()
-            .unwrap()
-            .contains("You are a pirate"));
-        assert!(agent.model_id().is_none());
-        assert!(agent.temperature().is_none());
-    }
-
-    #[test]
-    fn test_agent_builtin_create_title() {
-        let agent = super::builtin("%create-title%").unwrap();
-        assert_eq!(agent.name(), "%create-title%");
-        assert!(!agent.interpolated_instructions().unwrap().is_empty());
-        assert!(agent
-            .interpolated_instructions()
-            .unwrap()
-            .contains("concise"));
-    }
-
-    #[test]
-    fn test_agent_builtin_unknown() {
-        let result = super::builtin("unknown-agent");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_agent_from_markdown_with_use_tools() {
-        let content = "---\nuse_tools: fs_*,bash_exec\n---\nHelp with files.";
-        let agent = AgentConfig::from_markdown("tools-agent", content).unwrap();
-        assert_eq!(
-            agent.use_tools(),
-            Some(vec!["fs_*".to_string(), "bash_exec".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_agent_compaction_agent_set() {
-        let content = "---\ncompaction_agent: my-compactor\n---\nYou are a test agent.";
-        let agent = AgentConfig::from_markdown("test-agent", content).unwrap();
-        assert_eq!(agent.compaction_agent(), Some("my-compactor"));
-    }
-
-    #[test]
-    fn test_agent_compaction_agent_unset() {
-        let content = "---\nmodel: openai:gpt-4o\n---\nYou are a test agent.";
-        let agent = AgentConfig::from_markdown("test-agent", content).unwrap();
-        assert!(agent.compaction_agent().is_none());
-    }
-
-    #[test]
-    fn test_agent_compaction_agent_roundtrip() {
-        let content =
-            "---\ncompaction_agent: my-compactor\nmodel: openai:gpt-4o\n---\nYou are a test agent.";
-        let agent = AgentConfig::from_markdown("test-agent", content).unwrap();
-
-        // Export and re-parse
-        let exported = agent.export().unwrap();
-        let reparsed = AgentConfig::from_markdown("test-agent", &exported).unwrap();
-
-        assert_eq!(reparsed.compaction_agent(), Some("my-compactor"));
-        assert_eq!(reparsed.model_id(), Some("openai:gpt-4o"));
-    }
-
-    #[test]
-    fn test_tools_text_with_tools() {
-        let agent = make_agent_with_tools(
-            "prompt",
-            vec![
-                make_tool_declaration("tool_a", "Description A"),
-                make_tool_declaration("tool_b", "Description B"),
-            ],
-        );
-
-        let text = agent.tools_text();
-
-        assert_eq!(
-            text,
-            Some("1. tool_a: Description A\n2. tool_b: Description B".to_string())
-        );
-    }
-
-    #[test]
-    fn test_tools_text_without_tools() {
-        let agent = make_agent_with_tools("prompt", vec![]);
-
-        assert_eq!(agent.tools_text(), None);
-    }
-
-    #[test]
-    fn test_tools_text_multiline_description() {
-        let agent = make_agent_with_tools(
-            "prompt",
-            vec![make_tool_declaration(
-                "tool_x",
-                "First line\nSecond line\nThird line",
-            )],
-        );
-
-        let text = agent.tools_text();
-
-        assert_eq!(text, Some("1. tool_x: First line".to_string()));
-    }
-
-    #[test]
-    fn test_export_does_not_contain_tool_text() {
-        let agent = make_agent_with_tools(
-            "You are a helpful assistant.",
-            vec![make_tool_declaration("my_tool", "Tool description")],
-        );
-
-        let exported = agent.export().unwrap();
-
-        assert!(!exported.contains("my_tool"));
-        assert!(!exported.contains("Tool description"));
-        assert!(exported.contains("You are a helpful assistant."));
-    }
-
-    #[test]
-    fn test_build_messages_always_uses_system_and_user_format() {
-        let config = GlobalConfig::default();
-        let agent = Agent::new(AgentConfig::from_prompt(
-            "System message\n__INPUT__\n\n### INPUT:\nExample input\n### OUTPUT:\nExample output",
-        ));
-        let input = crate::config::input::from_str(&config, "Real input", Some(agent));
-
-        let messages = input.agent().build_messages(&input).unwrap();
-
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, MessageRole::System);
-        assert_eq!(messages[1].role, MessageRole::User);
-        assert_eq!(
-            messages[0].content.to_text(),
-            "System message\n__INPUT__\n\n### INPUT:\nExample input\n### OUTPUT:\nExample output"
-        );
-        assert_eq!(messages[1].content.to_text(), "Real input");
-    }
-
-    #[test]
-    fn test_agent_variable_path_deserialization() {
-        let yaml = r#"name: prompt
-description: Shared prompt
-path: shared/prompt.md
-"#;
-
-        let variable: AgentVariable = serde_yaml::from_str(yaml).unwrap();
-
-        assert_eq!(variable.name, "prompt");
-        assert_eq!(variable.description, "Shared prompt");
-        assert_eq!(variable.path.as_deref(), Some("shared/prompt.md"));
-        assert!(variable.default.is_none());
-        assert!(variable.value.is_empty());
-    }
-
-    #[test]
-    fn test_agent_variable_path_serialization() {
-        let variable = AgentVariable {
-            name: "prompt".to_string(),
-            description: "Shared prompt".to_string(),
-            default: None,
-            path: Some("shared/prompt.md".to_string()),
-            value: "runtime-only".to_string(),
-        };
-
-        let yaml = serde_yaml::to_string(&variable).unwrap();
-        let round_trip: AgentVariable = serde_yaml::from_str(&yaml).unwrap();
-
-        assert!(yaml.contains("path: shared/prompt.md"));
-        assert!(!yaml.contains("value:"));
-        assert_eq!(round_trip.name, "prompt");
-        assert_eq!(round_trip.description, "Shared prompt");
-        assert_eq!(round_trip.path.as_deref(), Some("shared/prompt.md"));
-        assert!(round_trip.default.is_none());
-        assert!(round_trip.value.is_empty());
-    }
-
-    #[test]
-    fn test_agent_variable_without_path() {
-        let yaml = r#"name: prompt
-description: Shared prompt
-"#;
-
-        let variable: AgentVariable = serde_yaml::from_str(yaml).unwrap();
-
-        assert_eq!(variable.name, "prompt");
-        assert_eq!(variable.description, "Shared prompt");
-        assert!(variable.path.is_none());
-        assert!(variable.default.is_none());
-        assert!(variable.value.is_empty());
-    }
-
-    #[test]
-    fn test_agent_variable_with_path() {
-        let agent = init_test_agent(
-            "path-variable",
-            r#"---
-variables:
-  - name: prompt
-    description: Shared prompt
-    path: shared/prompt.md
----
-You are a test agent.
-"#,
-            &[("shared/prompt.md", "Loaded prompt")],
-        )
-        .unwrap();
-
-        assert_eq!(
-            agent.defined_variables()[0].default.as_deref(),
-            Some("Loaded prompt")
-        );
-    }
-
-    #[test]
-    fn test_agent_variable_path_missing_file() {
-        let error = init_test_agent(
-            "missing-path-variable",
-            r#"---
-variables:
-  - name: prompt
-    description: Shared prompt
-    path: shared/missing.md
----
-You are a test agent.
-"#,
-            &[],
-        )
-        .unwrap_err();
-
-        let message = format!("{error:#}");
-        assert!(message.contains("prompt"));
-        assert!(message.contains("shared/missing.md"));
-    }
-
-    #[test]
-    fn test_agent_variable_path_traversal_rejected() {
-        let error = init_test_agent(
-            "traversal-path-variable",
-            r#"---
-variables:
-  - name: prompt
-    description: Shared prompt
-    path: ../../../etc/passwd
----
-You are a test agent.
-"#,
-            &[],
-        )
-        .unwrap_err();
-
-        let message = format!("{error:#}");
-        assert!(message.contains("prompt"));
-        assert!(message.contains("../../../etc/passwd"));
-        assert!(message.contains("not allowed"));
-    }
-
-    #[test]
-    fn test_agent_variable_path_absolute_rejected() {
-        let error = init_test_agent(
-            "absolute-path-variable",
-            r#"---
-variables:
-  - name: prompt
-    description: Shared prompt
-    path: /etc/passwd
----
-You are a test agent.
-"#,
-            &[],
-        )
-        .unwrap_err();
-
-        let message = format!("{error:#}");
-        assert!(message.contains("prompt"));
-        assert!(message.contains("/etc/passwd"));
-        assert!(message.contains("not allowed"));
-    }
-
-    #[test]
-    fn test_agent_variable_path_empty_file() {
-        let agent = init_test_agent(
-            "empty-path-variable",
-            r#"---
-variables:
-  - name: prompt
-    description: Shared prompt
-    path: shared/empty.md
----
-You are a test agent.
-"#,
-            &[("shared/empty.md", "")],
-        )
-        .unwrap();
-
-        assert_eq!(agent.defined_variables()[0].default.as_deref(), Some(""));
-    }
-
-    #[test]
-    fn test_agent_variable_path_and_default_uses_path() {
-        let agent = init_test_agent(
-            "path-and-default-variable",
-            r#"---
-variables:
-  - name: prompt
-    description: Shared prompt
-    default: Inline prompt
-    path: shared/prompt.md
----
-You are a test agent.
-"#,
-            &[("shared/prompt.md", "Loaded from file")],
-        )
-        .unwrap();
-
-        assert_eq!(
-            agent.defined_variables()[0].default.as_deref(),
-            Some("Loaded from file")
-        );
-    }
-
-    #[test]
-    fn test_agent_variable_path_nested_relative_file() {
-        let agent = init_test_agent(
-            "nested-relative-path-variable",
-            r#"---
-variables:
-  - name: prompt
-    description: Shared prompt
-    path: shared/nested/prompt.md
----
-You are a test agent.
-"#,
-            &[("shared/nested/prompt.md", "Nested prompt")],
-        )
-        .unwrap();
-
-        assert_eq!(
-            agent.defined_variables()[0].default.as_deref(),
-            Some("Nested prompt")
-        );
-    }
-
-    /// Regression for: `harnx -a pkg/agent` and `.agent pkg/agent` would load
-    /// the file at `packages/<pkg>/agents/<stem>.md` but call `load(path)` —
-    /// which derives the agent name from the file stem alone, dropping the
-    /// `<pkg>/` qualifier. As a result the loaded agent reported its name as
-    /// the bare stem (so it looked like a top-level agent had been selected),
-    /// `pkg_from_qualified(agent.name())` returned `None`, and the package
-    /// transforms (patches, namespaced managers) were never applied.
-    #[test]
-    fn test_init_preserves_qualified_name_for_package_agent() {
-        with_test_config_dir(|config_dir| {
-            let pkg_agents_dir = config_dir.join("packages/pantheon/agents");
-            fs::create_dir_all(&pkg_agents_dir)?;
-            fs::write(
-                pkg_agents_dir.join("sisyphus.md"),
-                "---\nrole: assistant\n---\nPackage-scoped agent.",
-            )?;
-            let config = GlobalConfig::default();
-            let runtime = tokio::runtime::Runtime::new()?;
-            let agent = runtime.block_on(super::init(
-                &config,
-                "pantheon/sisyphus",
-                create_abort_signal(),
-            ))?;
-            assert_eq!(agent.name(), "pantheon/sisyphus");
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn test_list_assistant_agents_filters_by_role() {
-        with_test_config_dir(|config_dir| {
-            let agents_dir = config_dir.join("agents");
-            fs::write(
-                agents_dir.join("alpha.md"),
-                "---\nrole: assistant\nmodel: openai:gpt-4o\n---\nAssistant agent.",
-            )?;
-            fs::write(
-                agents_dir.join("beta.md"),
-                "---\nrole: subagent\nmodel: openai:gpt-4o\n---\nSub-agent.",
-            )?;
-            fs::write(
-                agents_dir.join("gamma.md"),
-                "---\nrole: compaction\nmodel: openai:gpt-4o\n---\nCompaction agent.",
-            )?;
-            let runtime = tokio::runtime::Runtime::new()?;
-            let result = runtime.block_on(list_assistant_agents());
-            assert_eq!(result, vec!["alpha"]);
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn test_list_assistant_agents_includes_no_role_field() {
-        with_test_config_dir(|config_dir| {
-            let agents_dir = config_dir.join("agents");
-            fs::write(
-                agents_dir.join("no-role.md"),
-                "---\nmodel: openai:gpt-4o\n---\nNo role field.",
-            )?;
-            fs::write(
-                agents_dir.join("explicit-subagent.md"),
-                "---\nrole: subagent\n---\nSub-agent.",
-            )?;
-            let runtime = tokio::runtime::Runtime::new()?;
-            let result = runtime.block_on(list_assistant_agents());
-            assert_eq!(result, vec!["no-role"]);
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn test_list_assistant_agents_empty_dir() {
-        with_test_config_dir(|_config_dir| {
-            let runtime = tokio::runtime::Runtime::new()?;
-            let result = runtime.block_on(list_assistant_agents());
-            assert!(result.is_empty());
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn test_list_assistant_agents_skips_malformed() {
-        with_test_config_dir(|config_dir| {
-            let agents_dir = config_dir.join("agents");
-            fs::write(
-                agents_dir.join("broken.md"),
-                "---\nmodel: [unclosed bracket\n---\nBroken agent.",
-            )?;
-            fs::write(
-                agents_dir.join("good.md"),
-                "---\nmodel: openai:gpt-4o\n---\nGood agent.",
-            )?;
-            let runtime = tokio::runtime::Runtime::new()?;
-            let result = runtime.block_on(list_assistant_agents());
-            assert_eq!(result, vec!["good"]);
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn test_list_assistant_agents_sorted() {
-        with_test_config_dir(|config_dir| {
-            let agents_dir = config_dir.join("agents");
-            fs::write(agents_dir.join("zebra.md"), "You are zebra.")?;
-            fs::write(agents_dir.join("apple.md"), "You are apple.")?;
-            fs::write(agents_dir.join("mango.md"), "You are mango.")?;
-            let runtime = tokio::runtime::Runtime::new()?;
-            let result = runtime.block_on(list_assistant_agents());
-            assert_eq!(result, vec!["apple", "mango", "zebra"]);
-            Ok(())
-        })
-        .unwrap();
-    }
-}
-
-#[cfg(test)]
-mod patch_tests {
-    use super::apply_agent_patch;
-    use harnx_core::package::PackagePatch;
-
-    fn make_patch(agents: Vec<&str>) -> PackagePatch {
-        PackagePatch {
-            agents: agents.into_iter().map(String::from).collect(),
-            clients: vec![],
-            mcp_servers: vec![],
-        }
-    }
-
-    fn make_agent_config(name: &str, model: &str) -> super::AgentConfig {
-        let content = format!("---\nmodel: {}\n---\nYou are a test agent.", model);
-        super::AgentConfig::from_markdown(name, &content).expect("should parse agent config")
-    }
-
-    #[test]
-    fn apply_agent_patch_with_identity_expression_leaves_config_unchanged() {
-        let mut config = make_agent_config("test-agent", "openai:gpt-4o");
-        let original_model = config.model_id().map(String::from);
-        let original_temperature = config.temperature();
-
-        let patch = make_patch(vec!["."]);
-        let result = apply_agent_patch(&mut config, "test-agent", &patch);
-
-        assert!(result.is_ok());
-        assert_eq!(config.model_id(), original_model.as_deref());
-        assert_eq!(config.temperature(), original_temperature);
-    }
-
-    #[test]
-    fn apply_agent_patch_with_model_setting_expression_updates_config() {
-        let mut config = make_agent_config("test-agent", "openai:gpt-4o");
-        assert_eq!(config.model_id(), Some("openai:gpt-4o"));
-
-        // Note: AgentConfig serializes model_id as "model" in JSON
-        let patch = make_patch(vec![
-            r#".model = "anthropic:claude-3-5-sonnet""#,
-            r#".temperature = 0.7"#,
-        ]);
-        let result = apply_agent_patch(&mut config, "test-agent", &patch);
-
-        assert!(result.is_ok());
-        assert_eq!(config.model_id(), Some("anthropic:claude-3-5-sonnet"));
-        assert_eq!(config.temperature(), Some(0.7));
-    }
-
-    #[test]
-    fn apply_agent_patch_with_empty_patches_is_noop() {
-        let mut config = make_agent_config("test-agent", "openai:gpt-4o");
-        let original_model = config.model_id().map(String::from);
-
-        let patch = make_patch(vec![]);
-        let result = apply_agent_patch(&mut config, "test-agent", &patch);
-
-        assert!(result.is_ok());
-        assert_eq!(config.model_id(), original_model.as_deref());
-    }
-
-    #[test]
-    fn apply_agent_patch_with_invalid_jq_expression_returns_err() {
-        let mut config = make_agent_config("test-agent", "openai:gpt-4o");
-        let original_model = config.model_id().map(String::from);
-
-        // Invalid expression - unclosed string
-        // Note: The field name in JSON is "model", not "model_id"
-        let patch = make_patch(vec![r#".model = "unclosed"#]);
-        let result = apply_agent_patch(&mut config, "test-agent", &patch);
-
-        assert!(result.is_err());
-        assert_eq!(config.model_id(), original_model.as_deref());
-    }
-}
+#[path = "agent_tests.rs"]
+mod agent_tests;

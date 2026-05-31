@@ -1,0 +1,178 @@
+// Auto-split from server.rs for cohesion. See server/mod.rs.
+use super::*;
+
+/// Accumulator for sandbox CLI args plus the readable/writable path sets used
+/// to decide whether the working directory still needs an explicit `--read`.
+#[cfg(unix)]
+pub(crate) struct SandboxAcc {
+    pub(crate) args: Vec<OsString>,
+    pub(crate) readable: Vec<PathBuf>,
+    pub(crate) writable: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+impl SandboxAcc {
+    pub(crate) fn new(args: Vec<OsString>) -> Self {
+        Self {
+            args,
+            readable: Vec::new(),
+            writable: Vec::new(),
+        }
+    }
+
+    pub(crate) fn into_args(self) -> Vec<OsString> {
+        self.args
+    }
+
+    pub(crate) fn add_reads(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            self.args.push(OsString::from("--read"));
+            self.args.push(path.clone().into_os_string());
+            self.readable.push(path.clone());
+        }
+    }
+
+    pub(crate) fn apply_outputs(
+        &mut self,
+        outputs: Option<&[PathBuf]>,
+        roots: &[PathBuf],
+        inputs_explicit_empty: bool,
+    ) {
+        match outputs {
+            None => {
+                for root in roots {
+                    push_root_write_exec(root, &mut self.args, &mut self.writable);
+                }
+            }
+            Some([]) => {
+                if !inputs_explicit_empty {
+                    for root in roots {
+                        push_root_read_exec(root, &mut self.args, &mut self.readable);
+                    }
+                }
+            }
+            Some(paths) => {
+                for path in paths {
+                    self.args.push(OsString::from("--write"));
+                    self.args.push(path.clone().into_os_string());
+                    self.writable.push(path.clone());
+                }
+                for root in roots {
+                    push_root_exec_only(root, &mut self.args);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn ensure_working_dir_readable(&mut self, working_dir: &Path) {
+        let covered = self
+            .writable
+            .iter()
+            .chain(self.readable.iter())
+            .any(|path| working_dir.starts_with(path));
+        if !covered {
+            self.args.push(OsString::from("--read"));
+            self.args.push(working_dir.as_os_str().to_os_string());
+        }
+    }
+}
+
+/// Inputs for building a sandboxed child command. Groups the parameters
+/// shared by `build_sandbox_command` to keep its argument count manageable.
+#[cfg(unix)]
+pub(crate) struct SandboxCommandSpec<'a> {
+    pub(crate) working_dir: &'a Path,
+    pub(crate) exec_dir: &'a Path,
+    pub(crate) command: &'a str,
+    pub(crate) inputs: Option<&'a [PathBuf]>,
+    pub(crate) outputs: Option<&'a [PathBuf]>,
+    pub(crate) roots: &'a [PathBuf],
+    pub(crate) extra_env: Option<&'a HashMap<String, String>>,
+}
+
+pub(crate) struct TimeoutResultCtx<'a> {
+    pub(crate) command: &'a str,
+    pub(crate) working_dir: &'a Path,
+    pub(crate) execution_id: &'a str,
+    pub(crate) timeout_secs: u64,
+    pub(crate) total_lines: usize,
+    pub(crate) total_bytes: usize,
+    pub(crate) stdout: &'a str,
+    pub(crate) stderr: &'a str,
+    pub(crate) truncate_opts: &'a TruncateOpts,
+    pub(crate) stdout_log_path: &'a Path,
+    pub(crate) stderr_log_path: &'a Path,
+}
+
+pub(crate) struct SpawnResultCtx<'a> {
+    pub(crate) execution_id: &'a str,
+    pub(crate) command: &'a str,
+    pub(crate) working_dir: &'a Path,
+    pub(crate) stdout_log_path: &'a Path,
+    pub(crate) stderr_log_path: &'a Path,
+}
+
+/// Per-execution temp directory, log paths, id, and opened log file handles.
+pub(crate) struct ExecLog {
+    pub(crate) exec_dir: PathBuf,
+    pub(crate) stdout_log_path: PathBuf,
+    pub(crate) stderr_log_path: PathBuf,
+    pub(crate) execution_id: String,
+    pub(crate) stdout_file: TokioFile,
+    pub(crate) stderr_file: TokioFile,
+}
+
+/// Log file handles + their paths, passed to `run_to_completion`.
+pub(crate) struct LogTargets<'a> {
+    pub(crate) stdout_file: TokioFile,
+    pub(crate) stderr_file: TokioFile,
+    pub(crate) stdout_log_path: &'a Path,
+    pub(crate) stderr_log_path: &'a Path,
+}
+
+/// Result of running a command to completion (exec path).
+pub(crate) struct RunOutcome {
+    pub(crate) status: Option<std::process::ExitStatus>,
+    pub(crate) timed_out: bool,
+    pub(crate) stdout_str: String,
+    pub(crate) stderr_str: String,
+}
+
+/// Inputs for building a child command (shared by exec + spawn) before
+/// the per-tool stdout/stderr `Stdio` destinations are supplied.
+pub(crate) struct CommandBuildCtx<'a> {
+    pub(crate) command: &'a str,
+    pub(crate) working_dir: &'a Path,
+    pub(crate) exec_dir: &'a Path,
+    #[cfg(unix)]
+    pub(crate) inputs: &'a Option<Vec<String>>,
+    #[cfg(unix)]
+    pub(crate) outputs: &'a Option<Vec<String>>,
+    pub(crate) env: Option<&'a HashMap<String, String>>,
+}
+
+/// Inputs for assembling an "exited" tool result (shared by exec + wait).
+pub(crate) struct ExitResultCtx<'a> {
+    pub(crate) execution_id: &'a str,
+    pub(crate) command: &'a str,
+    pub(crate) working_dir: &'a Path,
+    pub(crate) stdout_log_path: &'a Path,
+    pub(crate) stderr_log_path: &'a Path,
+    pub(crate) total_lines: usize,
+    pub(crate) total_bytes: usize,
+    pub(crate) exit_code: i32,
+    pub(crate) streams_block: String,
+    pub(crate) before_snaps: &'a [(PathBuf, gix::ObjectId)],
+    pub(crate) snapshot_decision: &'a SnapshotDecision,
+}
+
+pub(crate) struct ReadExecLogSelection {
+    pub(crate) lines: Vec<(usize, String)>,
+    pub(crate) notices: Vec<String>,
+}
+
+pub(crate) struct ExecPreparation {
+    pub(crate) working_dir: PathBuf,
+    pub(crate) snapshot_decision: SnapshotDecision,
+    pub(crate) before_snap_ids: Vec<(PathBuf, gix::ObjectId)>,
+}

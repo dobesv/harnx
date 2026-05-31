@@ -1,0 +1,983 @@
+//! Tests for the config module (extracted from mod.rs for code health).
+#![cfg(test)]
+
+/// RAII guard that sets an env var for a test and restores the prior value on
+/// drop. Test-only; callers must hold the global test lock while it is alive to
+/// prevent concurrent env mutation.
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+impl EnvGuard {
+    fn new(key: &'static str, value: &std::path::Path) -> Self {
+        let prev = std::env::var_os(key);
+        // SAFETY: test-only; concurrent env mutation is prevented by the
+        // global test lock held by the caller while the guard is alive.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, prev }
+    }
+}
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => unsafe { std::env::set_var(self.key, v) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+use super::*;
+use harnx_core::message::{MessageContent, MessageRole};
+
+#[test]
+fn test_render_status_line() {
+    let mut config = Config {
+        model: harnx_client::Model::new("test", "test-model"),
+        ..Default::default()
+    };
+
+    // When agent and session are missing:
+    assert_eq!(config.render_status_line(true), "");
+
+    let mut agent = Agent::new(AgentConfig::from_markdown("my-agent", "prompt").unwrap());
+    agent.set_model(crate::client::Model::new("test", "agent-model"));
+    config.agent = Some(agent);
+
+    // Agent + Model (no session)
+    assert_eq!(
+        config.render_status_line(true),
+        "🤖 my-agent ▸ test:agent-model"
+    );
+    assert_eq!(
+        config.render_status_line(false),
+        "my-agent ▸ test:agent-model"
+    );
+
+    let session = super::session::new(&config, "my-session").unwrap();
+    let session_id = session.id().to_string();
+    config.session = Some(session);
+
+    // Agent + Model + Session
+    assert_eq!(
+        config.render_status_line(true),
+        format!("🤖 my-agent ▸ test:agent-model ▸ {}", session_id)
+    );
+    assert_eq!(
+        config.render_status_line(false),
+        format!("my-agent ▸ test:agent-model ▸ {}", session_id)
+    );
+
+    // Agent + Session (No Model ID)
+    let mut config3 = Config::default();
+    let mut agent3 = Agent::new(AgentConfig::from_markdown("agent3", "prompt").unwrap());
+    agent3.set_model(crate::client::Model::new("", ""));
+    config3.agent = Some(agent3);
+    let session3 = super::session::new(&config3, "session3").unwrap();
+    let session_id3 = session3.id().to_string();
+    config3.session = Some(session3);
+
+    assert_eq!(
+        config3.render_status_line(true),
+        format!("🤖 agent3 ▸ {}", session_id3)
+    );
+    assert_eq!(
+        config3.render_status_line(false),
+        format!("agent3 ▸ {}", session_id3)
+    );
+
+    // Session only (create a session without an agent)
+    let mut config2 = Config::default();
+    let session_no_agent = super::session::new(&config2, "my-session2").unwrap();
+    let session_id2 = session_no_agent.id().to_string();
+    config2.session = Some(session_no_agent);
+    assert_eq!(
+        config2.render_status_line(true),
+        format!("💬 {}", session_id2)
+    );
+    assert_eq!(config2.render_status_line(false), session_id2);
+}
+#[test]
+fn test_split_tool_selectors_simple() {
+    assert_eq!(split_tool_selectors("a,b,c"), vec!["a", "b", "c"]);
+}
+
+#[test]
+fn test_split_tool_selectors_braces() {
+    assert_eq!(
+        split_tool_selectors("fs_{read_file,write_file},bash_exec"),
+        vec!["fs_{read_file,write_file}", "bash_exec"]
+    );
+}
+
+#[test]
+fn test_split_tool_selectors_single() {
+    assert_eq!(split_tool_selectors("*"), vec!["*"]);
+}
+
+#[test]
+fn test_split_tool_selectors_nested_braces() {
+    assert_eq!(
+        split_tool_selectors("a_{b_{c,d},e},f"),
+        vec!["a_{b_{c,d},e}", "f"]
+    );
+}
+
+#[test]
+fn test_split_tool_selectors_empty() {
+    assert_eq!(split_tool_selectors(""), vec![""]);
+}
+
+#[test]
+fn test_init_mcp_manager_with_roots() {
+    let mut config = Config::default();
+    let server = McpServerConfig {
+        name: "test".to_string(),
+        command: "ls".to_string(),
+        args: vec![],
+        env: HashMap::new(),
+        roots: vec!["/existing".to_string()],
+        enabled: true,
+        description: None,
+        rename_tools: HashMap::new(),
+        tool_templates: HashMap::new(),
+        package: None,
+        hooks: None,
+    };
+    config.mcp_servers = vec![server];
+    config.mcp_root = vec!["/extra".to_string()];
+
+    config.init_mcp_manager();
+
+    let manager = config.mcp_manager.expect("Manager should be initialized");
+    let client = manager.get_client("test").expect("Client should exist");
+    let roots = client.get_roots();
+
+    // Roots should be: [cwd, /extra, /existing]
+    assert_eq!(roots.len(), 3);
+    let cwd = env::current_dir()
+        .unwrap()
+        .into_os_string()
+        .into_string()
+        .unwrap();
+    assert_eq!(roots[0], cwd);
+    assert_eq!(roots[1], "/extra");
+    assert_eq!(roots[2], "/existing");
+}
+
+// ── handoff session emptying tests ─────────────────────────────────────
+
+/// Verify that empty_session clears messages from a session that was loaded
+/// with an existing name (simulating the handoff path with session_id).
+/// This is the unit-level guarantee behind the #291 fix: after handoff the
+/// new agent starts with a blank session even when a session_id was provided.
+#[test]
+fn test_new_session_has_session_id() {
+    let config = Config::default();
+    let session = self::session::new(&config, "metadata-check").unwrap();
+
+    assert!(session.session_id.is_some());
+}
+
+#[test]
+fn test_new_session_has_short_id_filename() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config = Config {
+        sessions_dir_override: Some(tmp.path().to_path_buf()),
+        ..Config::default()
+    };
+
+    config.use_session(None).unwrap();
+
+    let session = config.session.as_ref().unwrap();
+    assert_eq!(
+        session.id.len(),
+        6,
+        "anonymous session ID should be 6-char short ID"
+    );
+    assert!(
+        crate::utils::session_name::decode_timestamp_session_id(&session.id).is_some(),
+        "anonymous session ID should be a valid base64url timestamp short ID"
+    );
+    assert_eq!(
+        session
+            .sessions_dir
+            .as_ref()
+            .unwrap()
+            .join(format!("{}.yaml", session.id)),
+        tmp.path().join(format!("{}.yaml", session.id))
+    );
+    // Claim stub file must exist immediately after use_session returns
+    assert!(
+        tmp.path().join(format!("{}.yaml", session.id)).exists(),
+        "claim stub file should exist on disk immediately after use_session(None)"
+    );
+}
+
+#[test]
+fn test_anonymous_session_id_collision_retries() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config1 = Config {
+        sessions_dir_override: Some(tmp.path().to_path_buf()),
+        ..Config::default()
+    };
+    let mut config2 = Config {
+        sessions_dir_override: Some(tmp.path().to_path_buf()),
+        ..Config::default()
+    };
+
+    config1.use_session(None).unwrap();
+    config2.use_session(None).unwrap();
+
+    let id1 = config1.session.as_ref().unwrap().id.clone();
+    let id2 = config2.session.as_ref().unwrap().id.clone();
+    assert_ne!(
+        id1, id2,
+        "concurrent anonymous sessions must get unique IDs"
+    );
+    assert_eq!(id1.len(), 6);
+    assert_eq!(id2.len(), 6);
+}
+
+#[test]
+fn empty_session_clears_named_session_with_messages() {
+    let mut config = Config::default();
+    let mut session = self::session::new(&config, "handoff-target").unwrap();
+    session.push_message_for_test(MessageRole::System, "You are agent A.".to_string());
+    session.push_message_for_test(MessageRole::User, "Hello from old session".to_string());
+    session.push_message_for_test(MessageRole::Assistant, "Response from agent A".to_string());
+    assert!(!session.is_empty());
+    config.session = Some(session);
+
+    config.empty_session().unwrap();
+
+    let session = config.session.as_ref().unwrap();
+    assert!(
+        session.is_empty(),
+        "session should be empty after empty_session"
+    );
+}
+
+// ── after_chat_completion incremental persistence tests ─────────────────
+
+/// Verify that after_chat_completion persists intermediate rounds
+/// (non-empty tool_results) to the session, not just the final round.
+#[test]
+fn after_chat_completion_saves_intermediate_tool_rounds() {
+    use crate::tool::{ToolCall, ToolResult};
+    use serde_json::json;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut config = Config {
+        data: ConfigData {
+            stream: false,
+            save_session: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut session = self::session::new(&config, "test-intermediate").unwrap();
+    session.set_sessions_dir(tmp.path().to_path_buf());
+    config.session = Some(session);
+
+    let _agent = config.extract_agent();
+    let global_config: GlobalConfig = Arc::new(RwLock::new(config));
+    let input = crate::config::input::from_str(&global_config, "do something", None);
+
+    let tool_results = vec![ToolResult::new(
+        ToolCall {
+            name: "my_tool".to_string(),
+            arguments: json!({"key": "val"}),
+            id: Some("tc1".to_string()),
+            thought_signature: None,
+        },
+        json!("tool output"),
+    )];
+
+    // Call after_chat_completion with non-empty tool_results.
+    // Previously this returned early without saving; now it should persist.
+    global_config
+        .write()
+        .after_chat_completion(
+            &input,
+            "intermediate output",
+            None,
+            &tool_results,
+            &Default::default(),
+        )
+        .unwrap();
+
+    let config_guard = global_config.read();
+    let session = config_guard.session.as_ref().unwrap();
+    assert!(
+        !session.is_empty(),
+        "session should have messages after intermediate round"
+    );
+    // Verify content via the session's export (which serializes messages).
+    let export = session.export().unwrap();
+    assert!(
+        export.contains("intermediate output"),
+        "session export should contain assistant output; got:\n{export}"
+    );
+    assert!(
+        export.contains("my_tool"),
+        "session export should contain tool call info; got:\n{export}"
+    );
+}
+
+// ── compact_session tests ────────────────────────────────────────────────
+
+/// Helper: create a GlobalConfig with a session that already has one user
+/// message in it, suitable for compaction tests.
+fn make_config_with_session() -> GlobalConfig {
+    let mut config = Config {
+        data: ConfigData {
+            stream: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut session = self::session::new(&config, "test-session").unwrap();
+    session.push_message_for_test(
+        MessageRole::User,
+        "Tell me about the Rust ownership model.".to_string(),
+    );
+    config.session = Some(session);
+    Arc::new(RwLock::new(config))
+}
+
+/// compact_session (no compaction_agent) must send the session history to
+/// the LLM — i.e. the user message from the conversation must appear in
+/// the ChatCompletionsData that the mock receives.
+#[tokio::test]
+async fn test_compact_session_default_includes_session_history() {
+    use crate::client::TestStateGuard;
+    use crate::test_utils::{MockClient, MockTurnBuilder};
+
+    let mock = Arc::new(
+        MockClient::builder()
+            .add_turn(MockTurnBuilder::new().add_text_chunk("Summary.").build())
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(mock.clone())).await;
+    let config = make_config_with_session();
+
+    Config::compact_session(&config).await.unwrap();
+
+    let history = mock.conversation_history();
+    assert_eq!(
+        history.conversation_history.len(),
+        1,
+        "expected exactly one LLM call"
+    );
+    let messages = &history.conversation_history[0].messages;
+    let has_history = messages.iter().any(|m| {
+        if let MessageContent::Text(t) = &m.content {
+            t.contains("Rust ownership model")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_history,
+        "session history must be forwarded to the compaction LLM; messages: {messages:?}"
+    );
+}
+
+/// compact_session with a compaction_agent must also send the session
+/// history — `set_agent` must not drop `with_session`.
+#[tokio::test]
+async fn test_compact_session_with_compaction_agent_includes_session_history() {
+    use crate::client::TestStateGuard;
+    use crate::test_utils::{MockClient, MockTurnBuilder};
+    use std::io::Write as _;
+
+    // Write a minimal compaction agent file to a temp dir and point the
+    // config's agents directory at it via HARNX_CONFIG_DIR.
+    let temp = tempfile::TempDir::new().unwrap();
+    let agents_dir = temp.path().join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+
+    let agent_content = "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are a specialized compaction agent. Produce a concise summary.\n";
+    let mut f = std::fs::File::create(agents_dir.join("my-compactor.md")).unwrap();
+    f.write_all(agent_content.as_bytes()).unwrap();
+
+    // Build a config where the current (non-session) agent has
+    // compaction_agent = "my-compactor".
+    let mut main_agent = Agent::new(AgentConfig::from_markdown(
+            "main",
+            "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_agent: my-compactor\n---\nYou are the main agent.",
+        ).unwrap());
+    main_agent.set_model(crate::client::Model::new("gemini", "gemini-3.1-flash-lite"));
+
+    let mut config = Config {
+        data: ConfigData {
+            stream: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // Point Config::agent_file() at the temp dir via HARNX_CONFIG_DIR.
+    // Use an RAII guard so the env var is restored even on panic.  The
+    // guard is created *after* `TestStateGuard` acquires the global test
+    // lock so concurrent tests cannot race on the env var.
+    config.agent = Some(main_agent);
+
+    let mut session = self::session::new(&config, "test-session").unwrap();
+    session.push_message_for_test(
+        MessageRole::User,
+        "Tell me about the Rust ownership model.".to_string(),
+    );
+    config.session = Some(session);
+    let config = Arc::new(RwLock::new(config));
+
+    let mock = Arc::new(
+        MockClient::builder()
+            .add_turn(MockTurnBuilder::new().add_text_chunk("Compacted.").build())
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(mock.clone())).await;
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+
+    Config::compact_session(&config).await.unwrap();
+
+    let history = mock.conversation_history();
+    assert_eq!(
+        history.conversation_history.len(),
+        1,
+        "expected exactly one LLM call"
+    );
+    let messages = &history.conversation_history[0].messages;
+
+    // The session history must be present.
+    let has_history = messages.iter().any(|m| {
+        if let MessageContent::Text(t) = &m.content {
+            t.contains("Rust ownership model")
+        } else {
+            false
+        }
+    });
+    assert!(
+            has_history,
+            "session history must be forwarded even when a compaction_agent is configured; messages: {messages:?}"
+        );
+
+    // The compaction agent's system prompt must also be present.
+    let has_system = messages.iter().any(|m| {
+        m.role == MessageRole::System
+            && if let MessageContent::Text(t) = &m.content {
+                t.contains("specialized compaction agent")
+            } else {
+                false
+            }
+    });
+    assert!(
+        has_system,
+        "compaction agent's system prompt must be in the messages; messages: {messages:?}"
+    );
+}
+
+/// compact_session with a package-scoped compaction_agent bare name must
+/// resolve to the same-package compactor, not a top-level agent of the same name.
+#[tokio::test]
+async fn test_compact_session_package_bare_compaction_agent_resolves_within_package() {
+    use crate::client::TestStateGuard;
+    use crate::test_utils::{MockClient, MockTurnBuilder};
+    use std::io::Write as _;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let package_agents_dir = temp.path().join("packages/mypkg/agents");
+    std::fs::create_dir_all(&package_agents_dir).unwrap();
+    let top_level_agents_dir = temp.path().join("agents");
+    std::fs::create_dir_all(&top_level_agents_dir).unwrap();
+
+    std::fs::write(
+            temp.path().join("packages/mypkg/manifest.yaml"),
+            "name: mypkg\nsource:\n  type: git\n  url: file:///fake\n  tag: v1.0.0\n  commit: abc123\ninstalled_at: \"2025-01-01T00:00:00Z\"\n",
+        )
+        .unwrap();
+
+    // Use /gemini (leading slash) to escape to top-level so the model
+    // reference is not rewritten to mypkg/gemini by apply_package_agent_transforms.
+    let package_compactor = "---\nmodel: /gemini:gemini-3.1-flash-lite\n---\nYou are the PACKAGE compactor. Produce a concise summary.\n";
+    let mut package_file = std::fs::File::create(package_agents_dir.join("compactor.md")).unwrap();
+    package_file
+        .write_all(package_compactor.as_bytes())
+        .unwrap();
+
+    let top_level_compactor = "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are the TOP-LEVEL compactor. Produce a concise summary.\n";
+    let mut top_level_file =
+        std::fs::File::create(top_level_agents_dir.join("compactor.md")).unwrap();
+    top_level_file
+        .write_all(top_level_compactor.as_bytes())
+        .unwrap();
+
+    let mut main_agent = Agent::new(
+        AgentConfig::from_markdown(
+            "mypkg/main",
+            "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are the main package agent.",
+        )
+        .unwrap(),
+    );
+    main_agent.set_compaction_agent(Some("compactor".to_string()));
+    main_agent.set_model(crate::client::Model::new("gemini", "gemini-3.1-flash-lite"));
+
+    let mut config = Config {
+        data: ConfigData {
+            stream: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.agent = Some(main_agent);
+
+    let mut session = self::session::new(&config, "test-session").unwrap();
+    session.push_message_for_test(
+        MessageRole::User,
+        "Tell me about package-local compaction.".to_string(),
+    );
+    config.session = Some(session);
+    let config = Arc::new(RwLock::new(config));
+
+    let mock = Arc::new(
+        MockClient::builder()
+            .add_turn(MockTurnBuilder::new().add_text_chunk("Compacted.").build())
+            .build(),
+    );
+    let _guard = TestStateGuard::new(Some(mock.clone())).await;
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+
+    Config::compact_session(&config).await.unwrap();
+
+    let history = mock.conversation_history();
+    assert_eq!(
+        history.conversation_history.len(),
+        1,
+        "expected exactly one LLM call"
+    );
+    let messages = &history.conversation_history[0].messages;
+
+    let has_package_system = messages.iter().any(|m| {
+        m.role == MessageRole::System
+            && if let MessageContent::Text(t) = &m.content {
+                t.contains("PACKAGE compactor")
+            } else {
+                false
+            }
+    });
+    assert!(
+        has_package_system,
+        "package compactor system prompt must be used; messages: {messages:?}"
+    );
+
+    let has_top_level_system = messages.iter().any(|m| {
+        m.role == MessageRole::System
+            && if let MessageContent::Text(t) = &m.content {
+                t.contains("TOP-LEVEL compactor")
+            } else {
+                false
+            }
+    });
+    assert!(
+        !has_top_level_system,
+        "top-level compactor system prompt must not be used; messages: {messages:?}"
+    );
+}
+/// Regression test for the ACP-server failure where `use_agent_by_name`
+/// followed by `use_session` bailed with "agent variables are required"
+/// for an agent whose variables use `path:` (file-backed defaults).  The
+/// async `agent::init` resolves these defaults, but the synchronous
+/// `retrieve_agent` does not — `use_agent_by_name` must do so itself,
+/// otherwise `init_agent_session_variables` (called from `use_session`)
+/// finds no defaults and bails in non-interactive contexts like ACP.
+#[tokio::test]
+async fn test_use_agent_by_name_resolves_file_backed_variable_defaults() {
+    use crate::client::TestStateGuard;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let agents_dir = temp.path().join("agents");
+    std::fs::create_dir_all(agents_dir.join("shared")).unwrap();
+    std::fs::write(
+            agents_dir.join("file-backed-vars.md"),
+            "---\nvariables:\n  - name: prompt_body\n    description: Shared prompt\n    path: shared/prompt.md\n---\n{{prompt_body}}\n",
+        )
+        .unwrap();
+    std::fs::write(agents_dir.join("shared/prompt.md"), "Loaded body").unwrap();
+
+    // Hold the global test lock so concurrent tests can't race on the
+    // shared HARNX_CONFIG_DIR env var.
+    let _guard = TestStateGuard::new(None).await;
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+
+    // Drive use_session in non-interactive mode so the inquire prompt
+    // that would otherwise hang in CI is suppressed.  The fix must still
+    // produce populated shared_variables under no_interaction.
+    let mut config = Config {
+        info_flag: true,
+        ..Default::default()
+    };
+    config
+        .use_agent_by_name("file-backed-vars")
+        .expect("use_agent_by_name must resolve path-backed variable defaults");
+    config
+        .use_session(Some("file-backed-vars-session"))
+        .expect("use_session must succeed once defaults are resolved");
+
+    let agent = config.agent.as_ref().expect("agent should be set");
+    assert_eq!(
+        agent
+            .shared_variables()
+            .get("prompt_body")
+            .map(String::as_str),
+        Some("Loaded body"),
+        "shared_variables should be populated from the file-backed default"
+    );
+}
+// ── Tests for HOME boundary guard in reinit_managers_for_agent ──
+
+#[cfg(unix)]
+/// Helper: make a minimal MCP server config for testing roots.
+fn make_test_mcp_server(name: &str) -> McpServerConfig {
+    McpServerConfig {
+        name: name.to_string(),
+        command: "echo".to_string(),
+        args: vec![],
+        env: HashMap::new(),
+        roots: vec![],
+        enabled: true,
+        description: None,
+        rename_tools: HashMap::new(),
+        tool_templates: HashMap::new(),
+        hooks: None,
+        package: None,
+    }
+}
+
+#[cfg(unix)]
+/// Serialize env-mutating tests to prevent HOME from racing.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    match LOCK.get_or_init(|| std::sync::Mutex::new(())).lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
+#[cfg(unix)]
+/// Helper: RAII guard for HOME env var (holds the env_lock while alive).
+struct HomeGuard {
+    prev: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+#[cfg(unix)]
+impl HomeGuard {
+    fn set(value: &str) -> Self {
+        let _lock = env_lock();
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", value) };
+        Self { prev, _lock }
+    }
+}
+#[cfg(unix)]
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cwd_equals_home_not_added_as_root() {
+    // Set HOME to the actual CWD so they match.
+    let cwd = env::current_dir().unwrap();
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let _home = HomeGuard::set(&cwd_str);
+
+    let mut config = Config::default();
+    let server = make_test_mcp_server("test_eq");
+    config.mcp_servers = vec![server];
+    config.mcp_root = vec![];
+    config.init_mcp_manager();
+
+    let manager = config.mcp_manager.expect("Manager should be initialized");
+    let client = manager.get_client("test_eq").expect("Client should exist");
+    let roots = client.get_roots();
+    assert!(
+        !roots.contains(&cwd_str),
+        "CWD = $HOME must not appear as MCP root, but got: {roots:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cwd_above_home_not_added_as_root() {
+    // Set HOME to CWD/subdir — making CWD an ancestor of $HOME.
+    // CWD must not be added as a root.
+    let cwd = env::current_dir().unwrap();
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let fake_home = format!("{cwd_str}/harnx-test-fake-home-above");
+    let _home = HomeGuard::set(&fake_home);
+
+    let mut config = Config::default();
+    let server = make_test_mcp_server("test_above");
+    config.mcp_servers = vec![server];
+    config.mcp_root = vec![];
+    config.init_mcp_manager();
+
+    let manager = config.mcp_manager.expect("Manager should be initialized");
+    let client = manager
+        .get_client("test_above")
+        .expect("Client should exist");
+    let roots = client.get_roots();
+    assert!(
+        !roots.contains(&cwd_str),
+        "CWD that is ancestor of $HOME must not appear as root, but got: {roots:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_cwd_below_home_added_as_root() {
+    // Set HOME to parent of CWD so CWD is a child of $HOME — should be allowed.
+    let cwd = env::current_dir().unwrap();
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let parent = cwd.parent().unwrap_or(&cwd);
+    let parent_str = parent.to_string_lossy().to_string();
+    let _home = HomeGuard::set(&parent_str);
+
+    let mut config = Config::default();
+    let server = make_test_mcp_server("test_below");
+    config.mcp_servers = vec![server];
+    config.mcp_root = vec![];
+    config.init_mcp_manager();
+
+    let manager = config.mcp_manager.expect("Manager should be initialized");
+    let client = manager
+        .get_client("test_below")
+        .expect("Client should exist");
+    let roots = client.get_roots();
+    assert!(
+        roots.contains(&cwd_str),
+        "CWD below $HOME should be added as root, but not found in: {roots:?}"
+    );
+}
+
+// ── select_tools whitelist tests (#624) ──────────────────────────────────
+
+fn make_tool_decl(name: &str) -> harnx_core::tool::ToolDeclaration {
+    harnx_core::tool::ToolDeclaration {
+        name: name.to_string(),
+        description: format!("tool {name}"),
+        parameters: Default::default(),
+        mcp_tool_name: None,
+        mcp_server_name: None,
+        call_template: None,
+        result_template: None,
+    }
+}
+
+/// Regression test for #624: when an agent has a `use_tools` whitelist and
+/// `self.agent` is populated with all MCP tools, `select_tools` must return
+/// only the whitelisted subset — not every tool known to the agent.
+#[test]
+fn select_tools_respects_use_tools_whitelist() {
+    use harnx_core::{agent_config::AgentConfig, tool::Tools};
+
+    // Set up config with three available tools (tool_use defaults to true).
+    let mut config = Config {
+        tools: Tools::init_from_mcp(Some(vec![
+            make_tool_decl("fs_read"),
+            make_tool_decl("fs_write"),
+            make_tool_decl("bash_exec"),
+        ])),
+        ..Config::default()
+    };
+
+    // Active agent also has all three tools (as happens at runtime via init_from_mcp).
+    let mut agent_config = AgentConfig::from_prompt("test agent");
+    agent_config.set_tools(Tools::init_from_mcp(Some(vec![
+        make_tool_decl("fs_read"),
+        make_tool_decl("fs_write"),
+        make_tool_decl("bash_exec"),
+    ])));
+    config.agent = Some(crate::config::agent::Agent::new(agent_config));
+
+    // Agent's use_tools only requests fs_read.
+    let mut agent_config2 = AgentConfig::from_prompt("test");
+    agent_config2.set_use_tools(Some(vec!["fs_read".to_string()]));
+
+    let result = config.select_tools(&agent_config2);
+
+    let names: Vec<String> = result
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+
+    assert_eq!(
+        names,
+        vec!["fs_read".to_string()],
+        "select_tools should honour use_tools and not leak fs_write or bash_exec: got {names:?}"
+    );
+}
+
+/// When use_tools is not set, select_tools should return None (no tools).
+#[test]
+fn select_tools_returns_none_without_use_tools() {
+    use harnx_core::{agent_config::AgentConfig, tool::Tools};
+
+    let config = Config {
+        tools: Tools::init_from_mcp(Some(vec![make_tool_decl("fs_read")])),
+        ..Config::default()
+    };
+
+    let agent_config = AgentConfig::from_prompt("no tools");
+    // use_tools is not set
+    let result = config.select_tools(&agent_config);
+    assert!(
+        result.is_none(),
+        "select_tools should return None when use_tools is unset"
+    );
+}
+
+use super::apply_mcp_server_patch;
+use harnx_mcp::McpServerConfig;
+
+fn make_server(name: &str, command: &str) -> McpServerConfig {
+    McpServerConfig {
+        name: name.to_string(),
+        command: command.to_string(),
+        args: vec![],
+        env: Default::default(),
+        roots: vec![],
+        enabled: true,
+        description: None,
+        rename_tools: Default::default(),
+        tool_templates: Default::default(),
+        package: Some("mypkg".to_string()), // Important: test that this is preserved
+        hooks: None,
+    }
+}
+
+#[test]
+fn apply_mcp_server_patch_with_identity_expression_leaves_config_unchanged() {
+    let mut server = make_server("test-server", "mcp-test");
+    let original_name = server.name.clone();
+    let original_command = server.command.clone();
+
+    let result = apply_mcp_server_patch(&mut server, &[".".to_string()]);
+
+    assert!(result.is_ok());
+    assert_eq!(server.name, original_name);
+    assert_eq!(server.command, original_command);
+}
+
+#[test]
+fn apply_mcp_server_patch_sets_field_via_jq_expression() {
+    let mut server = make_server("test-server", "mcp-original");
+
+    let result = apply_mcp_server_patch(
+        &mut server,
+        &[
+            r#".command = "mcp-patched""#.to_string(),
+            r#".args = ["--verbose"]"#.to_string(),
+        ],
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(server.command, "mcp-patched");
+    assert_eq!(server.args, vec!["--verbose"]);
+}
+
+#[test]
+fn apply_mcp_server_patch_with_empty_patches_is_noop() {
+    let mut server = make_server("test-server", "mcp-test");
+    let original_name = server.name.clone();
+
+    let result = apply_mcp_server_patch(&mut server, &[]);
+
+    assert!(result.is_ok());
+    assert_eq!(server.name, original_name);
+}
+
+#[test]
+fn apply_mcp_server_patch_preserves_server_package_field() {
+    let mut server = make_server("test-server", "mcp-test");
+    assert_eq!(server.package, Some("mypkg".to_string()));
+
+    // Apply a patch that would serialize and deserialize
+    let result = apply_mcp_server_patch(
+        &mut server,
+        &[r#".description = "Updated description""#.to_string()],
+    );
+
+    assert!(result.is_ok());
+    // The package field should be preserved even though it has #[serde(skip)]
+    assert_eq!(server.package, Some("mypkg".to_string()));
+    assert_eq!(server.description, Some("Updated description".to_string()));
+}
+
+#[test]
+fn apply_mcp_server_patch_with_invalid_jq_expression_returns_err() {
+    let mut server = make_server("test-server", "mcp-test");
+    let original_command = server.command.clone();
+
+    // Invalid expression — unclosed string
+    let result = apply_mcp_server_patch(&mut server, &[r#".command = "unclosed"#.to_string()]);
+
+    assert!(result.is_err());
+    // Server should be unchanged
+    assert_eq!(server.command, original_command);
+}
+
+use super::apply_client_patch;
+use harnx_client::ClientConfig;
+
+fn make_openai_client() -> ClientConfig {
+    serde_yaml::from_str("type: openai\napi_key: sk-original\n")
+        .expect("should parse openai client config")
+}
+
+#[test]
+fn apply_client_patch_with_identity_expression_leaves_config_unchanged() {
+    let mut client = make_openai_client();
+    let before = serde_json::to_value(&client).expect("serialize");
+    let result = apply_client_patch(&mut client, &[".".to_string()]);
+    let after = serde_json::to_value(&client).expect("serialize");
+    assert!(result.is_ok());
+    assert_eq!(before, after);
+}
+
+#[test]
+fn apply_client_patch_with_empty_patches_is_noop() {
+    let mut client = make_openai_client();
+    let before = serde_json::to_value(&client).expect("serialize");
+    let result = apply_client_patch(&mut client, &[]);
+    let after = serde_json::to_value(&client).expect("serialize");
+    assert!(result.is_ok());
+    assert_eq!(before, after);
+}
+
+#[test]
+fn apply_client_patch_sets_field_via_jq_expression() {
+    let mut client = make_openai_client();
+    let result = apply_client_patch(&mut client, &[r#".api_key = "sk-patched""#.to_string()]);
+    assert!(result.is_ok());
+    if let ClientConfig::OpenAIConfig(c) = &client {
+        assert_eq!(c.api_key.as_deref(), Some("sk-patched"));
+    } else {
+        panic!("expected OpenAI client, got: {client:?}");
+    }
+}
+
+#[test]
+fn apply_client_patch_with_invalid_jq_expression_returns_err() {
+    let mut client = make_openai_client();
+    let before = serde_json::to_value(&client).expect("serialize");
+    let result = apply_client_patch(&mut client, &[r#".api_key = "unclosed"#.to_string()]);
+    let after = serde_json::to_value(&client).expect("serialize");
+    assert!(result.is_err());
+    assert_eq!(before, after);
+}
