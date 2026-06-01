@@ -10,8 +10,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.12.1"
-source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=2e8c815284a27348f46306a8ffefa2b01e1bdb8d#2e8c815284a27348f46306a8ffefa2b01e1bdb8d"
+version = "0.13.1"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=817f76c6381d44d2eb5a1c796b42974251ebdb90#817f76c6381d44d2eb5a1c796b42974251ebdb90"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -20,22 +20,19 @@ dependencies = [
  "futures",
  "futures-concurrency",
  "jsonrpcmsg",
- "rmcp",
  "rustc-hash",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "shell-words",
- "tokio",
- "tokio-util",
  "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "agent-client-protocol-derive"
-version = "0.11.1"
-source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=2e8c815284a27348f46306a8ffefa2b01e1bdb8d#2e8c815284a27348f46306a8ffefa2b01e1bdb8d"
+version = "0.13.1"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=817f76c6381d44d2eb5a1c796b42974251ebdb90#817f76c6381d44d2eb5a1c796b42974251ebdb90"
 dependencies = [
  "quote",
  "syn 2.0.117",
@@ -43,9 +40,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "0.13.2"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b957d8391ac3933e2a940446171c508d2b8ffc386d8fa7d0b9c936a2575b463e"
+checksum = "0d419a87e28240978e4bfdf2a5b91bccb95ae8d5b06e10721bb07c449b9f43dd"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -8163,7 +8160,6 @@ checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
 dependencies = [
  "bytes",
  "futures-core",
- "futures-io",
  "futures-sink",
  "futures-util",
  "pin-project-lite",
