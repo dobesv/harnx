@@ -1762,6 +1762,17 @@ async fn test_spawn_and_terminate() {
         &text,
         &["status: terminated", "command: sleep 30", "signal: SIGTERM"],
     );
+    // The YAML metadata fence must close on its own line, followed by a blank
+    // line, then the `signal:` line as plain text. Guards against the closing
+    // fence and signal text being mashed onto the same line (e.g. "```signal:").
+    assert!(
+        text.contains("```\n\nsignal: SIGTERM"),
+        "terminate output must separate the closing yaml fence from the signal line: {text:?}"
+    );
+    assert!(
+        !text.contains("```signal:"),
+        "signal line must not be mashed onto the closing yaml fence: {text:?}"
+    );
 }
 
 #[tokio::test]
@@ -2415,7 +2426,7 @@ async fn test_wait_grep_filters_per_stream() {
     // the literal command (which contains "drop-*"), so assert against the
     // stdout/stderr block bodies, not the full text.
     let text = text_content(&result);
-    let blocks = &text[text.find("===== stdout =====").expect("stdout marker")..];
+    let blocks = &text[text.find("<!-- start stdout -->").expect("stdout marker")..];
     assert!(blocks.contains("keep-out"), "stdout match kept: {text}");
     assert!(blocks.contains("keep-err"), "stderr match kept: {text}");
     assert!(
@@ -2510,8 +2521,8 @@ async fn test_wait_max_output_bytes_truncates() {
     );
 }
 
-/// Stream markers appear in `wait` output: opening/closing markers for a
-/// non-empty stream, and the `(empty)` form for a stream with no output.
+/// Stream markers appear in `wait` output: opening/closing HTML-comment markers
+/// for streams. Empty streams emit start/end markers with an empty fenced code block.
 #[tokio::test]
 async fn test_wait_stream_markers() {
     let temp_dir = TestDir::new();
@@ -2544,17 +2555,21 @@ async fn test_wait_stream_markers() {
 
     let text = text_content(&result);
     assert!(
-        text.contains("===== stdout ====="),
+        text.contains("<!-- start stdout -->"),
         "stdout open marker: {text}"
     );
     assert!(
-        text.contains("===== /stdout ====="),
+        text.contains("<!-- end stdout -->"),
         "stdout close marker: {text}"
     );
     assert!(text.contains("only-stdout"));
     assert!(
-        text.contains("===== stderr (empty) ====="),
-        "empty stderr marker: {text}"
+        text.contains("<!-- start stderr -->"),
+        "empty stderr start marker: {text}"
+    );
+    assert!(
+        text.contains("<!-- end stderr -->"),
+        "empty stderr end marker: {text}"
     );
 }
 
@@ -2672,7 +2687,9 @@ async fn test_spawn_wait_read_exec_log_returns_full_output() {
     // Scope to the stdout block: the metadata header echoes the literal
     // command, which contains "out2".
     let wait_text = text_content(&result);
-    let wait_blocks = &wait_text[wait_text.find("===== stdout =====").expect("stdout marker")..];
+    let wait_blocks = &wait_text[wait_text
+        .find("<!-- start stdout -->")
+        .expect("stdout marker")..];
     assert!(wait_blocks.contains("out1"));
     assert!(
         !wait_blocks.contains("out2"),

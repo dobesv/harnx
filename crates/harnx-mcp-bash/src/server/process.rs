@@ -233,10 +233,7 @@ impl BashServer {
                     "execution_id '{}' still running after {}s",
                     params.execution_id, timeout_secs
                 );
-                Ok(CallToolResult::success(vec![
-                    Content::text(output).with_audience(vec![Role::Assistant]),
-                    Content::text(summary).with_audience(vec![Role::User]),
-                ]))
+                Ok(Self::build_success_result(output, summary, vec![]))
             }
         }
     }
@@ -372,12 +369,9 @@ impl BashServer {
                 total_bytes: None,
             },
         );
-        let _ = write!(output, "signal: {}", signal);
+        let _ = write!(output, "\n\nsignal: {}", signal);
         let summary = format!("sent {} to {}", signal, execution_id);
-        CallToolResult::success(vec![
-            Content::text(output).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
-        ])
+        Self::build_success_result(output, summary, vec![])
     }
 
     pub(crate) async fn build_wait_exit_result(
@@ -407,7 +401,6 @@ impl BashServer {
                 total_bytes: None,
             },
         );
-        output.pop();
         let summary = format!("spawned {}", ctx.execution_id);
         Self::build_success_result(output, summary, vec![])
     }
