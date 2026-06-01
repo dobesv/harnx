@@ -341,10 +341,13 @@ impl BashServer {
     }
 
     pub(crate) fn build_success_result(
-        output: String,
+        mut output: String,
         summary: String,
         diff_parts: Vec<String>,
     ) -> CallToolResult {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
         let mut contents = vec![
             Content::text(output).with_audience(vec![Role::Assistant]),
             Content::text(summary).with_audience(vec![Role::User]),

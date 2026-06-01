@@ -197,7 +197,7 @@ pub(crate) fn count_lines(s: &str) -> usize {
     }
 }
 
-/// Render one stream's output block with `===== stdout =====` / `===== /stdout =====` markers.
+/// Render one stream's output block inside markdown fences with HTML markers.
 /// Each stream is truncated independently using `truncate_opts`.
 /// Returns the rendered block string (no trailing newline).
 pub(crate) fn render_stream_block(
@@ -207,12 +207,9 @@ pub(crate) fn render_stream_block(
     log_hint: Option<(&str, &Path)>, // (execution_id, log_path) for truncation hint
 ) -> String {
     let sanitized = sanitize_output_text(content);
-    if sanitized.is_empty() {
-        return format!("===== {name} (empty) =====");
-    }
     let truncated = truncate_output(&sanitized, truncate_opts);
     let was_truncated = truncated != sanitized;
-    let mut block = format!("===== {name} =====\n{truncated}");
+    let mut block = format!("<!-- start {name} -->\n```\n{truncated}");
     if was_truncated {
         if let Some((execution_id, log_path)) = log_hint {
             let _ = write!(
@@ -231,7 +228,9 @@ pub(crate) fn render_stream_block(
             );
         }
     }
-    let _ = write!(block, "\n===== /{name} =====");
+    // Known limitation: embedded ``` in stream content can break fence parsing;
+    // HTML comment markers provide structural fallback for downstream consumers.
+    let _ = write!(block, "\n```\n<!-- end {name} -->");
     block
 }
 
@@ -284,7 +283,7 @@ pub(crate) fn render_streams_block(
         Some((execution_id, stderr_log_path)),
     );
 
-    let rendered = format!("{stdout_block}\n{stderr_block}");
+    let rendered = format!("{stdout_block}\n\n{stderr_block}");
     (
         rendered,
         stdout_lines,
@@ -294,62 +293,50 @@ pub(crate) fn render_streams_block(
     )
 }
 
+#[derive(serde::Serialize)]
 pub(crate) struct MetadataHeader<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) execution_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) command: Option<&'a str>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_path"
+    )]
     pub(crate) working_dir: Option<&'a Path>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_path"
+    )]
     pub(crate) stdout_log_path: Option<&'a Path>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_path"
+    )]
     pub(crate) stderr_log_path: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) total_lines: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) total_bytes: Option<usize>,
 }
 
-pub(crate) fn render_metadata_header(output: &mut String, metadata: MetadataHeader<'_>) {
-    let MetadataHeader {
-        execution_id,
-        status,
-        exit_code,
-        command,
-        working_dir,
-        stdout_log_path,
-        stderr_log_path,
-        total_lines,
-        total_bytes,
-    } = metadata;
+fn serialize_optional_path<S>(path: &Option<&Path>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match path {
+        Some(path) => serializer.serialize_str(&path.display().to_string()),
+        None => serializer.serialize_none(),
+    }
+}
 
-    if let Some(execution_id) = execution_id {
-        let _ = writeln!(output, "execution_id: {execution_id}");
-    }
-    if let Some(status) = status {
-        let _ = writeln!(output, "status: {status}");
-    }
-    if let Some(exit_code) = exit_code {
-        let _ = writeln!(output, "exit_code: {exit_code}");
-    }
-    if let Some(command) = command {
-        let _ = writeln!(output, "command: {command}");
-    }
-    if let Some(working_dir) = working_dir {
-        let _ = writeln!(output, "working_dir: {}", working_dir.display());
-    }
-    if let Some(stdout_log_path) = stdout_log_path {
-        let _ = writeln!(output, "stdout_log_path: {}", stdout_log_path.display());
-    }
-    if let Some(stderr_log_path) = stderr_log_path {
-        let _ = writeln!(output, "stderr_log_path: {}", stderr_log_path.display());
-    }
-    if let Some(total_lines) = total_lines {
-        let _ = writeln!(output, "total_lines: {total_lines}");
-    }
-    if let Some(total_bytes) = total_bytes {
-        let _ = writeln!(
-            output,
-            "total_bytes: {total_bytes} ({})",
-            format_size(total_bytes)
-        );
-    }
+pub(crate) fn render_metadata_header(output: &mut String, metadata: MetadataHeader<'_>) {
+    let yaml = serde_yaml::to_string(&metadata).expect("MetadataHeader should serialize to YAML");
+    let _ = write!(output, "```yaml\n{yaml}```");
 }
 
 pub(crate) struct TimeoutRenderContext<'a> {
