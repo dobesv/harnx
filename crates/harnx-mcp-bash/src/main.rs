@@ -1,4 +1,6 @@
 mod server;
+#[cfg(test)]
+mod test_support;
 
 use harnx_sandbox_common::SandboxConfig;
 use rmcp::ServiceExt;
@@ -51,12 +53,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn parse_env_paths(var_name: &str) -> Vec<PathBuf> {
+fn parse_env_paths(var_name: &str, cwd: &Path) -> Vec<PathBuf> {
     std::env::var_os(var_name)
         .map(|value| {
             std::env::split_paths(&value)
                 .filter(|path| !path.as_os_str().is_empty())
-                .map(|path| PathBuf::from(expand_tilde(&path.to_string_lossy())))
+                .filter_map(|path| {
+                    harnx_sandbox_common::expand_path_var(&path.to_string_lossy(), cwd)
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -82,27 +86,8 @@ fn path_is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn expand_tilde(raw: &str) -> String {
-    if !raw.starts_with('~') {
-        return raw.to_string();
-    }
-
-    let home = match std::env::var("HOME") {
-        Ok(home) => home,
-        Err(_) => return raw.to_string(),
-    };
-
-    if raw == "~" {
-        home
-    } else if let Some(suffix) = raw.strip_prefix("~/") {
-        format!("{home}/{suffix}")
-    } else {
-        raw.to_string()
-    }
-}
-
 fn push_root(roots: &mut Vec<PathBuf>, raw: &str) {
-    let raw = expand_tilde(raw);
+    let raw = harnx_sandbox_common::expand_tilde(raw);
     let path = PathBuf::from(&raw);
     if path.exists() {
         match path.canonicalize() {
@@ -119,14 +104,15 @@ fn push_root(roots: &mut Vec<PathBuf>, raw: &str) {
 #[cfg(unix)]
 fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
     let args: Vec<String> = std::env::args().collect();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut roots = Vec::new();
     let mut sandbox_enabled = true;
     let mut sandbox_config = SandboxConfig {
         enabled: true,
-        extra_exec: parse_env_paths("HARNX_BASH_EXTRA_EXEC"),
-        extra_readable: parse_env_paths("HARNX_BASH_EXTRA_READABLE"),
-        extra_writable: parse_env_paths("HARNX_BASH_EXTRA_WRITABLE"),
-        extra_rwx: parse_env_paths("HARNX_BASH_EXTRA_RWX"),
+        extra_exec: parse_env_paths("HARNX_BASH_EXTRA_EXEC", &cwd),
+        extra_readable: parse_env_paths("HARNX_BASH_EXTRA_READABLE", &cwd),
+        extra_writable: parse_env_paths("HARNX_BASH_EXTRA_WRITABLE", &cwd),
+        extra_rwx: parse_env_paths("HARNX_BASH_EXTRA_RWX", &cwd),
         sandbox_run_path: PathBuf::from("harnx-sandbox-exec"),
         extra_env_passthrough: parse_env_passthrough(),
         env_overrides: vec![],
@@ -152,9 +138,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
             }
             "--extra-read" => {
                 if i + 1 < args.len() {
-                    sandbox_config
-                        .extra_readable
-                        .push(PathBuf::from(expand_tilde(&args[i + 1])));
+                    if let Some(path) = harnx_sandbox_common::expand_path_var(&args[i + 1], &cwd) {
+                        sandbox_config.extra_readable.push(path);
+                    }
                     i += 2;
                 } else {
                     eprintln!("harnx-mcp-bash: --extra-read requires a path argument");
@@ -163,9 +149,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
             }
             "--extra-exec" => {
                 if i + 1 < args.len() {
-                    sandbox_config
-                        .extra_exec
-                        .push(PathBuf::from(expand_tilde(&args[i + 1])));
+                    if let Some(path) = harnx_sandbox_common::expand_path_var(&args[i + 1], &cwd) {
+                        sandbox_config.extra_exec.push(path);
+                    }
                     i += 2;
                 } else {
                     eprintln!("harnx-mcp-bash: --extra-exec requires a path argument");
@@ -174,9 +160,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
             }
             "--extra-write" => {
                 if i + 1 < args.len() {
-                    sandbox_config
-                        .extra_writable
-                        .push(PathBuf::from(expand_tilde(&args[i + 1])));
+                    if let Some(path) = harnx_sandbox_common::expand_path_var(&args[i + 1], &cwd) {
+                        sandbox_config.extra_writable.push(path);
+                    }
                     i += 2;
                 } else {
                     eprintln!("harnx-mcp-bash: --extra-write requires a path argument");
@@ -185,9 +171,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
             }
             "--extra-rwx" => {
                 if i + 1 < args.len() {
-                    sandbox_config
-                        .extra_rwx
-                        .push(PathBuf::from(expand_tilde(&args[i + 1])));
+                    if let Some(path) = harnx_sandbox_common::expand_path_var(&args[i + 1], &cwd) {
+                        sandbox_config.extra_rwx.push(path);
+                    }
                     i += 2;
                 } else {
                     eprintln!("harnx-mcp-bash: --extra-rwx requires a path argument");
@@ -196,7 +182,9 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
             }
             "--sandbox-run" => {
                 if i + 1 < args.len() {
-                    sandbox_run_override = Some(PathBuf::from(expand_tilde(&args[i + 1])));
+                    sandbox_run_override = Some(PathBuf::from(harnx_sandbox_common::expand_tilde(
+                        &args[i + 1],
+                    )));
                     i += 2;
                 } else {
                     eprintln!("harnx-mcp-bash: --sandbox-run requires a path argument");
@@ -262,6 +250,8 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
                 eprintln!(
                     "  HARNX_BASH_ENV_PASSTHROUGH  Comma-separated extra env var names to pass through"
                 );
+                eprintln!();
+                eprintln!("  $GIT_ROOT, $GIT_COMMON_DIR, $NODE_PROJECT_ROOT, $CARGO_ROOT, $GO_ROOT supported; resolved vs cwd, dropped if absent");
                 eprintln!();
                 eprintln!("Sandboxing is enabled by default on Unix. Use --no-sandbox to disable it explicitly.");
                 eprintln!("The server communicates via stdio using the MCP protocol.");
@@ -453,52 +443,93 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_tilde;
-    use std::ffi::{OsStr, OsString};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        match LOCK.get_or_init(|| Mutex::new(())).lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-
-    struct EnvVar {
-        key: String,
-        prev: Option<OsString>,
-    }
-
-    impl EnvVar {
-        fn set(key: &str, value: impl AsRef<OsStr>) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value.as_ref()) };
-            Self {
-                key: key.to_string(),
-                prev,
-            }
-        }
-    }
-
-    impl Drop for EnvVar {
-        fn drop(&mut self) {
-            unsafe {
-                match self.prev.take() {
-                    Some(value) => std::env::set_var(&self.key, value),
-                    None => std::env::remove_var(&self.key),
-                }
-            }
-        }
-    }
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use crate::test_support::CwdGuard;
+    use crate::test_support::{env_lock, EnvVar};
 
     #[test]
     fn test_expand_tilde_replaces_prefix() {
         let _env_guard = env_lock();
         let _home = EnvVar::set("HOME", "/tmp/test-home");
 
-        assert_eq!(expand_tilde("~/foo"), "/tmp/test-home/foo");
-        assert_eq!(expand_tilde("~"), "/tmp/test-home");
-        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(
+            harnx_sandbox_common::expand_tilde("~/foo"),
+            "/tmp/test-home/foo"
+        );
+        assert_eq!(harnx_sandbox_common::expand_tilde("~"), "/tmp/test-home");
+        assert_eq!(harnx_sandbox_common::expand_tilde("/abs/path"), "/abs/path");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_extra_rwx_git_root_resolves_inside_repo() {
+        let _env_guard = env_lock();
+        let _clear_read = EnvVar::unset("HARNX_BASH_EXTRA_READABLE");
+        let _clear_write = EnvVar::unset("HARNX_BASH_EXTRA_WRITABLE");
+        let _clear_exec = EnvVar::unset("HARNX_BASH_EXTRA_EXEC");
+        let _clear_rwx = EnvVar::unset("HARNX_BASH_EXTRA_RWX");
+        let manifest_dir =
+            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
+        let _cwd = CwdGuard::set(&manifest_dir);
+        let _extra = EnvVar::set("HARNX_BASH_EXTRA_RWX", "$GIT_ROOT");
+        let repo_root = harnx_sandbox_common::detect_project_root(
+            harnx_sandbox_common::RootKind::GitRoot,
+            &manifest_dir,
+        )
+        .expect("git root");
+
+        assert_eq!(
+            parse_env_paths("HARNX_BASH_EXTRA_RWX", &manifest_dir),
+            vec![repo_root]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_extra_git_root_is_dropped_outside_repo() {
+        let _env_guard = env_lock();
+        let _clear_read = EnvVar::unset("HARNX_BASH_EXTRA_READABLE");
+        let _clear_write = EnvVar::unset("HARNX_BASH_EXTRA_WRITABLE");
+        let _clear_exec = EnvVar::unset("HARNX_BASH_EXTRA_EXEC");
+        let _clear_rwx = EnvVar::unset("HARNX_BASH_EXTRA_RWX");
+        let temp = tempfile::tempdir().expect("tempdir");
+        if harnx_sandbox_common::detect_project_root(
+            harnx_sandbox_common::RootKind::GitRoot,
+            temp.path().parent().unwrap_or(temp.path()),
+        )
+        .is_some()
+        {
+            return;
+        }
+        let _cwd = CwdGuard::set(temp.path());
+        let _extra = EnvVar::set("HARNX_BASH_EXTRA_RWX", "$GIT_ROOT");
+
+        assert!(parse_env_paths("HARNX_BASH_EXTRA_RWX", temp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_extra_paths_keep_tilde_and_literal_behavior() {
+        let _env_guard = env_lock();
+        let _clear_read = EnvVar::unset("HARNX_BASH_EXTRA_READABLE");
+        let _clear_write = EnvVar::unset("HARNX_BASH_EXTRA_WRITABLE");
+        let _clear_exec = EnvVar::unset("HARNX_BASH_EXTRA_EXEC");
+        let _clear_rwx = EnvVar::unset("HARNX_BASH_EXTRA_RWX");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let _cwd = CwdGuard::set(temp.path());
+        let _home = EnvVar::set("HOME", &home);
+        let _read = EnvVar::set(
+            "HARNX_BASH_EXTRA_READABLE",
+            std::ffi::OsString::from(format!("{}:{}", "~/foo", "/abs")),
+        );
+
+        assert_eq!(
+            parse_env_paths("HARNX_BASH_EXTRA_READABLE", temp.path()),
+            vec![home.join("foo"), PathBuf::from("/abs")]
+        );
     }
 }

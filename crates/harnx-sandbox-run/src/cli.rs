@@ -83,19 +83,19 @@ pub fn pre_parse_hooks(raw: Vec<String>) -> anyhow::Result<(Vec<HookDef>, Vec<St
 #[command(name = "harnx-sandbox-run")]
 #[command(about = "Run commands inside the birdcage sandbox with hook support")]
 pub struct Cli {
-    /// Add sandbox read-only path (may be repeated).
+    /// Add sandbox read-only path (may be repeated). Supports project-root pseudo-vars like $GIT_ROOT (see docs).
     #[arg(long, value_name = "path")]
     pub extra_read: Vec<PathBuf>,
 
-    /// Add sandbox writable path (may be repeated).
+    /// Add sandbox writable path (may be repeated). Supports project-root pseudo-vars like $GIT_ROOT (see docs).
     #[arg(long, value_name = "path")]
     pub extra_write: Vec<PathBuf>,
 
-    /// Add sandbox execute path (may be repeated).
+    /// Add sandbox execute path (may be repeated). Supports project-root pseudo-vars like $GIT_ROOT (see docs).
     #[arg(long, value_name = "path")]
     pub extra_exec: Vec<PathBuf>,
 
-    /// Add sandbox read/write/exec path (may be repeated).
+    /// Add sandbox read/write/exec path (may be repeated). Supports project-root pseudo-vars like $GIT_ROOT (see docs).
     #[arg(long, value_name = "path")]
     pub extra_rwx: Vec<PathBuf>,
 

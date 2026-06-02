@@ -155,7 +155,7 @@ These match the `harnx-mcp-bash` environment variables, so the same shell profil
 | `HARNX_BASH_EXTRA_RWX` | Colon-separated paths | Extra sandbox read/write/exec paths |
 | `HARNX_BASH_ENV_PASSTHROUGH` | Comma-separated names | Extra host env var names to pass through |
 
-Paths support `~` expansion. CLI flags and env vars both accumulate — they are not mutually exclusive.
+Paths support `~` expansion and project-root pseudo-variables. CLI flags and env vars both accumulate — they are not mutually exclusive.
 
 > **Note:** The `<COMMAND>` must come after `--` or at the very end of the arguments.
 
@@ -328,6 +328,35 @@ If a tool needs access to paths not in the default whitelist, use the access fla
 
 ```bash
 harnx-sandbox-run --extra-rwx ~/.custom-tool-cache -- my-tool
+```
+
+## Project-Root Pseudo-Variables
+
+Sandbox path flags (`--extra-read/-write/-exec/-rwx`) and environment variables (`HARNX_BASH_EXTRA_READABLE/EXEC/WRITABLE/RWX`) accept project-root pseudo-variables. These are resolved at startup against the current working directory:
+
+| Pseudo-variable | Resolves to |
+| :--- | :--- |
+| `$GIT_ROOT` | git worktree root (`gix discover` workdir) |
+| `$GIT_COMMON_DIR` | primary worktree's `.git` data dir (handles linked worktrees) |
+| `$NODE_PROJECT_ROOT` | highest ancestor containing `package.json` (workspace root) |
+| `$CARGO_ROOT` | highest ancestor containing `Cargo.toml` (workspace root) |
+| `$GO_ROOT` | nearest ancestor containing `go.mod` |
+
+### Semantics
+
+- **Silent skip**: If the current directory is not inside a matching project, the path is silently dropped. This allows you to set global environment variables like `HARNX_BASH_EXTRA_RWX='$GIT_ROOT'` that only take effect when you are actually in a git repository.
+- **Security**: Any pseudo-variable that resolves to `$HOME` or an ancestor of `$HOME` is dropped. The sandbox never grants access to your entire home directory via root detection.
+- **Prefix match**: A pseudo-variable only triggers on an exact prefix-boundary match. `$GIT_ROOT` or `$GIT_ROOT/subdir` will be expanded, but `$GIT_ROOTX` or `/foo/$GIT_ROOT` will be treated as literal strings.
+- **No escaping**: There is no mechanism to escape these variables. A directory literally named `$GIT_ROOT` cannot be targeted.
+- **Shell quoting**: Use single quotes in your shell (e.g., `'$GIT_ROOT'`) to prevent the shell from attempting to expand them as shell variables.
+- **Unix-only**: Project-root detection is currently supported on Unix systems only. On other platforms, these strings are ignored.
+
+### Linked Worktrees
+
+`$GIT_COMMON_DIR` is particularly useful for git history in linked worktrees. It resolves to the primary worktree's `.git` data directory, which is required for many git operations to function correctly from a linked worktree.
+
+```bash
+harnx-sandbox-run --extra-rwx '$GIT_ROOT' --extra-rwx '$GIT_COMMON_DIR' -- yarn install
 ```
 
 ## Network Access

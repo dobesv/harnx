@@ -30,33 +30,13 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-/// Expand a leading `~` to `$HOME`. Matches the behaviour in `harnx-mcp-bash`.
-#[cfg(unix)]
-fn expand_tilde(raw: &str) -> String {
-    if !raw.starts_with('~') {
-        return raw.to_string();
-    }
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return raw.to_string(),
-    };
-    if raw == "~" {
-        home
-    } else if let Some(suffix) = raw.strip_prefix("~/") {
-        format!("{home}/{suffix}")
-    } else {
-        raw.to_string()
-    }
-}
-
-/// Read a colon-separated path list from an env var, expanding tildes.
+/// Read a colon-separated path list from an env var.
 #[cfg(unix)]
 fn env_paths(var: &str) -> Vec<PathBuf> {
     std::env::var_os(var)
         .map(|val| {
             std::env::split_paths(&val)
                 .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| PathBuf::from(expand_tilde(&p.to_string_lossy())))
                 .collect()
         })
         .unwrap_or_default()

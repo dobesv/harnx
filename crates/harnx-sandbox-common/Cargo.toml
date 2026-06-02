@@ -13,6 +13,7 @@ log = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 birdcage = { workspace = true }
+gix = { workspace = true }
 tempfile = "3"
 
 [[bin]]
