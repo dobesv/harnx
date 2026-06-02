@@ -4,6 +4,11 @@ pub mod config;
 pub mod defaults;
 #[cfg(unix)]
 pub mod home_guard;
+pub mod path_expand;
+#[cfg(unix)]
+pub mod root_detection;
+#[cfg(all(test, unix))]
+pub(crate) mod test_support;
 
 pub use args::build_default_sandbox_args;
 pub use config::SandboxConfig;
@@ -16,3 +21,6 @@ pub use defaults::{
 };
 #[cfg(unix)]
 pub use home_guard::{is_home_or_ancestor, resolve_path};
+pub use path_expand::{expand_path_var, expand_tilde};
+#[cfg(unix)]
+pub use root_detection::{detect_project_root, RootKind};

@@ -1,9 +1,7 @@
 use super::*;
 
 #[cfg(unix)]
-use std::ffi::{OsStr, OsString};
-#[cfg(unix)]
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::ffi::OsString;
 
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{ClientCapabilities, InitializeRequestParams, ListRootsResult, Root};
@@ -230,52 +228,7 @@ fn collect_arg_pairs(args: &[OsString]) -> Vec<(String, String)> {
 }
 
 #[cfg(unix)]
-fn env_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    match LOCK.get_or_init(|| Mutex::new(())).lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-#[cfg(unix)]
-struct EnvVar {
-    key: String,
-    prev: Option<OsString>,
-}
-
-#[cfg(unix)]
-impl EnvVar {
-    fn set(key: &str, value: impl AsRef<OsStr>) -> Self {
-        let prev = std::env::var_os(key);
-        unsafe { std::env::set_var(key, value.as_ref()) };
-        Self {
-            key: key.to_string(),
-            prev,
-        }
-    }
-
-    fn unset(key: &str) -> Self {
-        let prev = std::env::var_os(key);
-        unsafe { std::env::remove_var(key) };
-        Self {
-            key: key.to_string(),
-            prev,
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for EnvVar {
-    fn drop(&mut self) {
-        unsafe {
-            match self.prev.take() {
-                Some(value) => std::env::set_var(&self.key, value),
-                None => std::env::remove_var(&self.key),
-            }
-        }
-    }
-}
+use crate::test_support::{env_lock, EnvVar};
 
 #[cfg(unix)]
 fn enabled_sandbox_config() -> SandboxConfig {
@@ -547,6 +500,9 @@ mod sandbox_args {
     #[cfg(unix)]
     #[test]
     fn test_sandbox_args_defaults() {
+        // Reads process-global $HOME to derive expected home-relative defaults,
+        // so serialize against tests that mutate HOME via the shared env lock.
+        let _env_guard = env_lock();
         let root = Path::new("/test/root");
         let pairs = sandbox_arg_pairs(root, Path::new("/test/root/workdir"), None, None);
 

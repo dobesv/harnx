@@ -132,6 +132,7 @@ You can grant additional filesystem access using CLI flags or environment variab
 **Notes:**
 - CLI flags can be repeated to add multiple paths.
 - Environment variables accept a colon-separated list of paths (e.g., `HARNX_BASH_EXTRA_RWX=/path/one:/path/two`). This applies to all `HARNX_BASH_EXTRA_*` variables.
+- All path flags and environment variables support **project-root pseudo-variables** (e.g., `$GIT_ROOT`, `$GIT_COMMON_DIR`, `$NODE_PROJECT_ROOT`, `$CARGO_ROOT`, `$GO_ROOT`). These are resolved at startup against the current working directory and are silently dropped if the current directory is not in a matching project, or if they would expose your home directory. See the [harnx-sandbox-run documentation](sandbox-run.md#project-root-pseudo-variables) for the full list of variables and their semantics.
 
 ### Disabling Sandboxing
 

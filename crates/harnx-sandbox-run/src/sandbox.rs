@@ -42,11 +42,12 @@ fn find_sandbox_exec() -> PathBuf {
 #[cfg(unix)]
 fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Vec<OsString> {
     use harnx_sandbox_common::{
-        is_home_or_ancestor, resolve_path, system_writable_paths, HOME_EXEC_PATHS, HOME_READ_PATHS,
-        HOME_RWX_PATHS, HOME_WRITE_PATHS, SYSTEM_EXEC_PATHS, SYSTEM_READ_PATHS,
+        expand_path_var, is_home_or_ancestor, resolve_path, system_writable_paths, HOME_EXEC_PATHS,
+        HOME_READ_PATHS, HOME_RWX_PATHS, HOME_WRITE_PATHS, SYSTEM_EXEC_PATHS, SYSTEM_READ_PATHS,
     };
 
     let mut args: Vec<OsString> = Vec::new();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Default whitelist — same paths that harnx-mcp-bash uses
     if use_defaults {
@@ -146,7 +147,11 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
 
     // CLI-provided extra paths
     for path in &cli.extra_read {
-        let resolved = resolve_path(path);
+        let raw = path.to_string_lossy();
+        let Some(expanded) = expand_path_var(&raw, &cwd) else {
+            continue;
+        };
+        let resolved = resolve_path(&expanded);
         if is_home_or_ancestor(&resolved) {
             eprintln!(
                 "harnx-sandbox-run: warning: ignoring --extra-read {}: would expose home directory",
@@ -158,7 +163,11 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         args.push(resolved.into_os_string());
     }
     for path in &cli.extra_write {
-        let resolved = resolve_path(path);
+        let raw = path.to_string_lossy();
+        let Some(expanded) = expand_path_var(&raw, &cwd) else {
+            continue;
+        };
+        let resolved = resolve_path(&expanded);
         if is_home_or_ancestor(&resolved) {
             eprintln!(
                 "harnx-sandbox-run: warning: ignoring --extra-write {}: would expose home directory",
@@ -170,7 +179,11 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         args.push(resolved.into_os_string());
     }
     for path in &cli.extra_exec {
-        let resolved = resolve_path(path);
+        let raw = path.to_string_lossy();
+        let Some(expanded) = expand_path_var(&raw, &cwd) else {
+            continue;
+        };
+        let resolved = resolve_path(&expanded);
         if is_home_or_ancestor(&resolved) {
             eprintln!(
                 "harnx-sandbox-run: warning: ignoring --extra-exec {}: would expose home directory",
@@ -182,7 +195,11 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         args.push(resolved.into_os_string());
     }
     for path in &cli.extra_rwx {
-        let resolved = resolve_path(path);
+        let raw = path.to_string_lossy();
+        let Some(expanded) = expand_path_var(&raw, &cwd) else {
+            continue;
+        };
+        let resolved = resolve_path(&expanded);
         if is_home_or_ancestor(&resolved) {
             eprintln!(
                 "harnx-sandbox-run: warning: ignoring --extra-rwx {}: would expose home directory",
@@ -306,6 +323,36 @@ pub fn setup_and_spawn(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        saved_home: Option<std::ffi::OsString>,
+        saved_cwd: PathBuf,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            Self {
+                saved_home: std::env::var_os("HOME"),
+                saved_cwd: std::env::current_dir().expect("current_dir"),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.saved_cwd);
+            match &self.saved_home {
+                Some(home) => unsafe { std::env::set_var("HOME", home) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
 
     #[test]
     fn collect_env_hook_overrides_cli() {
@@ -350,6 +397,8 @@ mod tests {
 
     #[test]
     fn build_exec_args_filters_home_and_resolves_allowed_paths() {
+        let _lock = env_lock().lock().expect("lock poisoned");
+        let _env = EnvGuard::new();
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = temp.path().join("cwd");
         let home = temp.path().join("home");
@@ -357,7 +406,6 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("create cwd");
         std::fs::create_dir_all(&child).expect("create child");
 
-        let old_cwd = std::env::current_dir().expect("current_dir");
         std::env::set_current_dir(&cwd).expect("set cwd");
         unsafe { std::env::set_var("HOME", &home) };
 
@@ -401,7 +449,87 @@ mod tests {
                 "--".to_string(),
             ]
         );
+    }
 
-        std::env::set_current_dir(old_cwd).expect("restore cwd");
+    #[test]
+    fn build_exec_args_expands_git_root_rwx_inside_repo() {
+        let _lock = env_lock().lock().expect("lock poisoned");
+        let _env = EnvGuard::new();
+        let manifest_dir =
+            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+        std::env::set_current_dir(&manifest_dir).expect("set cwd");
+        let repo_root = harnx_sandbox_common::detect_project_root(
+            harnx_sandbox_common::RootKind::GitRoot,
+            &manifest_dir,
+        )
+        .expect("git root");
+        let expected = harnx_sandbox_common::resolve_path(&repo_root)
+            .to_string_lossy()
+            .into_owned();
+
+        let cli = Cli {
+            env_vars: vec![],
+            extra_read: vec![],
+            extra_write: vec![],
+            extra_exec: vec![],
+            extra_rwx: vec![PathBuf::from("$GIT_ROOT")],
+            no_network: false,
+            working_dir: None,
+            no_defaults: false,
+            command: vec![],
+        };
+
+        let args: Vec<String> = build_exec_args(&cli, &[], false)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "--read".to_string(),
+                expected.clone(),
+                "--write".to_string(),
+                expected.clone(),
+                "--exec".to_string(),
+                expected,
+                "--".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_exec_args_skips_git_root_rwx_outside_repo() {
+        let _lock = env_lock().lock().expect("lock poisoned");
+        let _env = EnvGuard::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        if harnx_sandbox_common::detect_project_root(
+            harnx_sandbox_common::RootKind::GitRoot,
+            temp.path().parent().unwrap_or(temp.path()),
+        )
+        .is_some()
+        {
+            return;
+        }
+        std::env::set_current_dir(temp.path()).expect("set cwd");
+
+        let cli = Cli {
+            env_vars: vec![],
+            extra_read: vec![],
+            extra_write: vec![],
+            extra_exec: vec![],
+            extra_rwx: vec![PathBuf::from("$GIT_ROOT")],
+            no_network: false,
+            working_dir: None,
+            no_defaults: false,
+            command: vec![],
+        };
+
+        let args: Vec<String> = build_exec_args(&cli, &[], false)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, vec!["--".to_string()]);
     }
 }

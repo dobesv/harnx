@@ -46,45 +46,11 @@ pub fn is_home_or_ancestor(path: &Path) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
-
-    /// Serialise all tests that mutate process-global HOME / cwd.
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    /// RAII guard: snapshots HOME and cwd on creation, restores both on drop.
-    struct EnvGuard {
-        saved_home: Option<std::ffi::OsString>,
-        saved_cwd: PathBuf,
-    }
-
-    impl EnvGuard {
-        fn new() -> Self {
-            Self {
-                saved_home: std::env::var_os("HOME"),
-                saved_cwd: std::env::current_dir().expect("current_dir"),
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // Restore cwd first so that any relative-path lookups during HOME
-            // restoration happen against the original directory.
-            let _ = std::env::set_current_dir(&self.saved_cwd);
-            match &self.saved_home {
-                Some(h) => unsafe { std::env::set_var("HOME", h) },
-                None => unsafe { std::env::remove_var("HOME") },
-            }
-        }
-    }
+    use crate::test_support::{env_lock, EnvGuard};
 
     #[test]
     fn home_path_matches() {
-        let _lock = env_lock().lock().expect("lock poisoned");
+        let _lock = env_lock();
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
@@ -96,7 +62,7 @@ mod tests {
 
     #[test]
     fn ancestor_of_home_matches() {
-        let _lock = env_lock().lock().expect("lock poisoned");
+        let _lock = env_lock();
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir().expect("tempdir");
         let parent = temp.path().join("parent");
@@ -109,7 +75,7 @@ mod tests {
 
     #[test]
     fn child_of_home_does_not_match() {
-        let _lock = env_lock().lock().expect("lock poisoned");
+        let _lock = env_lock();
         let _env = EnvGuard::new();
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
@@ -122,7 +88,7 @@ mod tests {
 
     #[test]
     fn relative_path_resolves_against_cwd() {
-        let _lock = env_lock().lock().expect("lock poisoned");
+        let _lock = env_lock();
         let _env = EnvGuard::new(); // restores HOME and cwd on drop
         let temp = tempfile::tempdir().expect("tempdir");
         let cwd = temp.path().join("cwd");

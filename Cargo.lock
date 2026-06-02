@@ -3934,6 +3934,7 @@ version = "0.32.3"
 dependencies = [
  "anyhow",
  "birdcage",
+ "gix",
  "log",
  "tempfile",
 ]
