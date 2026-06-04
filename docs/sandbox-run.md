@@ -28,34 +28,129 @@ harnx-sandbox-run -- bash -c "echo hello"
 
 The primary use case for `harnx-sandbox-run` is running AI coding agents with bypassed permissions. Since the sandbox provides the actual safety boundary (preventing writes outside the project, network calls to unexpected hosts, etc.), the agent's own interactive permission prompts become redundant.
 
-### Claude Code (`claude-sb`)
+You can transparently sandbox your existing tools with a "shim directory." You place scripts named after the real commands (`claude`, `gemini`, `node`, `yarn`, …) in a directory that is first on your `PATH`, so typing the normal command runs it inside the sandbox — no need to remember a special wrapper name.
 
-Create a script named `claude-sb`. This example shows the full setup with AWS credentials, GitHub auth (git over HTTPS + API), and Atlassian (Jira/Confluence) — remove any sections you don't need:
+### Shim directory setup
 
 ```bash
+# Create the shim directory
+mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/harnx/sandbox-bin"
+```
+
+Prepend this directory to your `PATH` in your shell profile (e.g., `~/.bashrc`, `~/.zshrc`):
+
+```bash
+export PATH="${XDG_DATA_HOME:-$HOME/.local/share}/harnx/sandbox-bin:$PATH"
+```
+
+The shim directory must be **first** on your `PATH` so the shims shadow the real tools. For the installation commands below, we'll use a `SHIM_DIR` variable:
+
+```bash
+SHIM_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/harnx/sandbox-bin"
+```
+
+### How the shims work
+
+Each shim script identifies its own location and strips that directory from the `PATH` before executing the real tool inside the sandbox. This is necessary because `harnx-sandbox-run` passes your `PATH` through to the sandboxed process, and `birdcage` resolves the target command against that `PATH`. If the shim directory remained first, the shim would re-invoke itself and recurse on the host. Stripping the directory (and the fact that the shim directory is not on the sandbox's execution whitelist) prevents this.
+
+For project access, the shims use [Project-Root Pseudo-Variables](#project-root-pseudo-variables) like `$GIT_ROOT` to automatically grant access to the current project's roots. These are silently skipped if you are not in a matching project.
+
+### Node, Yarn, npm, npx, pnpm (`node`)
+
+A single dispatcher script can handle the entire Node family by detecting which name it was called with. Common Node caches are already whitelisted by default, and project roots are granted automatically.
+```bash
 #!/usr/bin/env bash
-# claude-sb — run Claude Code inside the birdcage sandbox
+set -euo pipefail
+
+# Node-family sandbox shim.
+# Save this file as "node", then symlink or copy it to yarn, npm, npx, and pnpm.
+# It detects which real tool to run from its own basename, so one script covers all five.
+# Common Node caches are already in harnx-sandbox-run's default whitelist, so no extra cache flags are needed.
+# Project roots are auto-detected by harnx-sandbox-run's pseudo-vars and silently skipped when absent.
+
+tool="$(basename "$0")"
+self_dir="$(cd "$(dirname "$0")" && pwd -P)"
+PATH="$({
+  old_ifs=$IFS
+  IFS=:
+  for path_entry in $PATH; do
+    if [ "$path_entry" != "$self_dir" ]; then
+      if [ -n "${new_path-}" ]; then
+        new_path="${new_path}:$path_entry"
+      else
+        new_path="$path_entry"
+      fi
+    fi
+  done
+  IFS=$old_ifs
+  printf '%s' "${new_path-}"
+})" # Drop shim dir from PATH by exact element match to prevent harnx-sandbox-run -- "$tool" from resolving back to shim and recursing.
+export PATH
+
+# shellcheck disable=SC2016 -- '$GIT_ROOT' style args are harnx-sandbox-run pseudo-vars; shell must pass them through literally.
+# Caches like ~/.npm, ~/.yarn, ~/.nvm, ~/.bun, ~/.cache, ~/.cargo, go/bin, go/pkg, and ~/.local/share/pnpm are pre-whitelisted.
+exec harnx-sandbox-run \
+  --extra-rwx '$GIT_ROOT' \
+  --extra-rwx '$NODE_PROJECT_ROOT' \
+  --extra-rwx '$GIT_COMMON_DIR' \
+  -- "$tool" "$@"
+```
+Installation:
+
+```bash
+SHIM_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/harnx/sandbox-bin"
+# Save the script above as "$SHIM_DIR/node", then:
+chmod +x "$SHIM_DIR/node"
+for t in yarn npm npx pnpm; do ln -sf node "$SHIM_DIR/$t"; done
+```
+
+### Claude Code (`claude`)
+
+Claude Code requires access to its own configuration and credentials, along with credential hooks for AWS, GitHub, and Atlassian.
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# claude — run Claude Code inside birdcage sandbox
 #
 # --dangerously-skip-permissions bypasses Claude's own permission prompts;
-# the sandbox is the actual safety boundary.
+# sandbox is actual safety boundary.
 #
-# Credentials are injected via hooks — real tokens never enter the sandbox:
-#   - harnx-aws-creds: resolves AWS credentials from the host and exposes
-#     them via the container credentials protocol (no raw keys in env)
+# Credentials are injected via hooks — real tokens never enter sandbox:
+#   - harnx-aws-creds: resolves AWS credentials from host and exposes
+#     them via container credentials protocol (no raw keys in env)
 #   - harnx-proxy-auth: HTTPS MITM proxy that intercepts outbound requests
 #     and injects auth headers; --env scripts put fake sentinel tokens into
-#     the sandbox env so the LLM never sees real credentials
+#     sandbox env so LLM never sees real credentials
+
+self_dir="$(cd "$(dirname "$0")" && pwd -P)"
+PATH="$({
+  old_ifs=$IFS
+  IFS=:
+  for path_entry in $PATH; do
+    if [ "$path_entry" != "$self_dir" ]; then
+      if [ -n "${new_path-}" ]; then
+        new_path="${new_path}:$path_entry"
+      else
+        new_path="$path_entry"
+      fi
+    fi
+  done
+  IFS=$old_ifs
+  printf '%s' "${new_path-}"
+})" # Drop shim dir from PATH by exact element match to prevent harnx-sandbox-run -- claude from resolving back to shim and recursing.
+export PATH
+
+# shellcheck disable=SC2016 -- '$GIT_ROOT' style args are harnx-sandbox-run pseudo-vars; shell must pass them through literally.
+# ~/.local/share/claude is already default-whitelisted, so intentionally not listed here.
 exec harnx-sandbox-run \
-  \
-  --extra-rwx ~/projects \
-  \
+  --extra-rwx '$GIT_ROOT' \
+  --extra-rwx '$NODE_PROJECT_ROOT' \
+  --extra-rwx '$GIT_COMMON_DIR' \
   --extra-rwx ~/.claude \
-  --extra-rwx ~/.local/share/claude \
   --extra-write ~/.claude.json \
-  \
   --env "EDITOR=true" \
   --env "PUPPETEER_NO_SANDBOX=1" \
-  \
   --hook claude-command-persistent harnx-aws-creds --profile my-profile \; \
   \
   --hook claude-command-persistent harnx-proxy-auth \
@@ -81,52 +176,69 @@ exec harnx-sandbox-run \
         then .headers.authorization = basic(env.ATLASSIAN_EMAIL; env.ATLASSIAN_API_TOKEN)
         end' \
   \; \
-  \
-  -- \
-  claude --dangerously-skip-permissions "$@"
+  -- claude --dangerously-skip-permissions "$@"
 ```
-
 **Key points:**
-- Replace `~/projects` with a folder where you have files the agent needs to work on, and `my-profile` with your AWS profile name (omit `--hook ... harnx-aws-creds ...` entirely if you don't need AWS).
+- Replace `my-profile` with your AWS profile name (omit `--hook ... harnx-aws-creds ...` entirely if you don't need AWS). Project access now uses harnx-sandbox-run pseudo-vars, so current git root / node project root / git common dir are granted automatically when present; add `--extra-rwx /path` for any extra directories the agent should access.
 - The `--env` scripts inject fake sentinel tokens (e.g. `ghp_<random>`) into the sandbox so `gh` sees `GITHUB_TOKEN` set and considers itself authenticated. The real token never enters the sandbox — `harnx-proxy-auth` reads it from the host env and injects it into outbound HTTP headers.
 - Remove the Atlassian block if you don't use Jira/Confluence.
 - `if COND then EXPR end` — omitting `else` passes the input through unchanged (jaq default).
 
-### Gemini CLI (`gemini-sb`)
-
-Create a script named `gemini-sb`:
-
+### Gemini CLI (`gemini`)
 ```bash
 #!/usr/bin/env bash
-# gemini-sb — run Gemini CLI inside the birdcage sandbox
+set -euo pipefail
+
+# gemini — run Gemini CLI inside birdcage sandbox
 #
 # --yolo bypasses Gemini's own permission prompts;
-# the sandbox is the actual safety boundary.
+# sandbox is actual safety boundary.
 #
 # ~/.gemini        — global settings, OAuth credentials, commands, skills
 # ~/.config/gemini — XDG config fallback (used on some systems)
-# .                — the project directory you want the agent to work in
-#                    (the sandbox does NOT whitelist the current directory
-#                    automatically — you must grant access explicitly;
-#                    passing . is safe: harnx-sandbox-run resolves it and
-#                    refuses to grant access if it would expose $HOME)
+# Project roots are auto-detected via $GIT_ROOT / $NODE_PROJECT_ROOT /
+# $GIT_COMMON_DIR and silently skipped when absent.
+
+self_dir="$(cd "$(dirname "$0")" && pwd -P)"
+PATH="$({
+  old_ifs=$IFS
+  IFS=:
+  for path_entry in $PATH; do
+    if [ "$path_entry" != "$self_dir" ]; then
+      if [ -n "${new_path-}" ]; then
+        new_path="${new_path}:$path_entry"
+      else
+        new_path="$path_entry"
+      fi
+    fi
+  done
+  IFS=$old_ifs
+  printf '%s' "${new_path-}"
+})" # Drop shim dir from PATH by exact element match to prevent harnx-sandbox-run -- gemini from resolving back to shim and recursing.
+export PATH
+
+# shellcheck disable=SC2016 -- '$GIT_ROOT' style args are harnx-sandbox-run pseudo-vars; shell must pass them through literally.
 exec harnx-sandbox-run \
   --extra-rwx ~/.gemini \
   --extra-rwx ~/.config/gemini \
-  --extra-rwx . \
-  -- \
-  gemini --yolo "$@"
+  --extra-rwx '$GIT_ROOT' \
+  --extra-rwx '$NODE_PROJECT_ROOT' \
+  --extra-rwx '$GIT_COMMON_DIR' \
+  -- gemini --yolo "$@"
+```
+If the agent needs access to additional directories, grant them with `--extra-rwx /path/to/dir` in the shim script.
+
+### Installing the shims
+
+Make all shims executable and verify that the shims appear first on your `PATH`:
+
+```bash
+chmod +x "$SHIM_DIR"/*
+command -v node      # should print the shim path under sandbox-bin
+which -a node         # confirm the shim appears before the real tool
 ```
 
-> **Note:** Pass `--extra-rwx` for each additional project directory you want Gemini to access. The sandbox restricts writes to only the paths you explicitly grant.
-
-### Installation
-
-1. Save the scripts to a directory in your `PATH` (e.g., `~/.local/bin/`).
-2. Make them executable:
-   ```bash
-   chmod +x ~/.local/bin/claude-sb ~/.local/bin/gemini-sb
-   ```
+*Note: This replaces the older `claude-sb` / `gemini-sb` scripts — users can delete those and use the shim directory instead.*
 
 ## CLI Reference
 
@@ -173,7 +285,7 @@ For the full list of default paths, see the [Bash MCP Server documentation](bash
 harnx-sandbox-run --extra-rwx . -- my-tool
 ```
 
-Passing `.` is safe: `harnx-sandbox-run` resolves it to an absolute path before use. If the resolved path is `$HOME` itself or an ancestor of `$HOME` (e.g. `/`), the path is silently skipped and a warning is printed to stderr — so running `gemini-sb` from your home directory won't accidentally expose all of `~`.
+Passing `.` is safe: `harnx-sandbox-run` resolves it to an absolute path before use. If the resolved path is `$HOME` itself or an ancestor of `$HOME` (e.g. `/`), the path is silently skipped and a warning is printed to stderr — so running the `gemini` shim from your home directory won't accidentally expose all of `~`.
 
 The `--working-dir <path>` flag changes where the sandboxed command starts, but it also does not automatically grant filesystem access to that path — you still need a matching `--extra-rwx` (or `--extra-read` / `--extra-write`) for it.
 
@@ -315,7 +427,7 @@ harnx-sandbox-run \
   -- my-tool
 ```
 
-See the `claude-sb` wrapper script above for a complete working example combining AWS credentials, GitHub, and Atlassian in one invocation.
+See the `claude` shim in [AI Agent Wrapper Scripts](#ai-agent-wrapper-scripts) above for a complete working example combining AWS credentials, GitHub, and Atlassian in one invocation.
 
 ## Extra Path Access
 
