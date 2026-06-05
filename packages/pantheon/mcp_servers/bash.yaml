@@ -16,9 +16,17 @@ roots:
 # ~/.pyenv, ~/.rye (read+write+exec).
 
 args:
-  # Allow access to dev certificates
-  - --extra-read
-  - ~/dev_cert
+  # Allow access to detected project root (when run in a subdirectory) and git metadata (when in a git worktree)
+  - --extra-rwx
+  - $GIT_ROOT
+  - --extra-write
+  - $GIT_COMMON_DIR
+  - --extra-rwx
+  - $NODE_PROJECT_ROOT
+  - --extra-rwx
+  - $CARGO_ROOT
+  - --extra-rwx
+  - $GO_ROOT
   # Allow access to various config files
   - --extra-read
   - ~/.config/acli
