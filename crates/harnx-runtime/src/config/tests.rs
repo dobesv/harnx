@@ -981,3 +981,55 @@ fn apply_client_patch_with_invalid_jq_expression_returns_err() {
     assert!(result.is_err());
     assert_eq!(before, after);
 }
+
+#[test]
+fn handoff_tool_declarations_are_package_aware_and_valid() {
+    let fixture_agents = [
+        "pantheon/atlas".to_string(),
+        "otherpkg/helper".to_string(),
+        "global".to_string(),
+    ];
+
+    let declarations = fixture_agents
+        .iter()
+        .map(|agent_name| {
+            let display_name =
+                harnx_core::package_namespace::handoff_display_name(agent_name, Some("pantheon"));
+            (
+                format!("{display_name}_session_handoff"),
+                display_name,
+                agent_name.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let declaration_names: std::collections::HashSet<String> = declarations
+        .iter()
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    let handoff_targets: std::collections::HashMap<String, String> = declarations
+        .iter()
+        .map(|(_, display_name, agent_name)| (display_name.clone(), agent_name.clone()))
+        .collect();
+
+    assert!(declaration_names.iter().all(|name| !name.contains('/')));
+    assert!(declaration_names.iter().all(|name| name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')));
+
+    assert!(declaration_names.contains("atlas_session_handoff"));
+    assert!(declaration_names.contains("otherpkg__helper_session_handoff"));
+    assert!(declaration_names.contains("__global_session_handoff"));
+
+    assert_eq!(
+        handoff_targets.get("atlas").map(String::as_str),
+        Some("pantheon/atlas")
+    );
+    assert_eq!(
+        handoff_targets.get("otherpkg__helper").map(String::as_str),
+        Some("otherpkg/helper")
+    );
+    assert_eq!(
+        handoff_targets.get("__global").map(String::as_str),
+        Some("global")
+    );
+}

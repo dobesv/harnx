@@ -53,7 +53,16 @@ pub async fn execute_tool_round(
         )?;
     }
     let agent_use_tools = input.agent().use_tools().map(|v| v.join(","));
-    let eval_ctx = build_tool_eval_context(config, agent_use_tools.as_deref(), persistent_manager);
+    // Derive the active agent's package (e.g. `pantheon` for `pantheon/daedalus`)
+    // so bare `_session_handoff` targets resolve to the same package (#709).
+    let current_agent_package =
+        harnx_core::package_namespace::pkg_from_qualified(input.agent().name()).map(str::to_string);
+    let eval_ctx = build_tool_eval_context(
+        config,
+        agent_use_tools.as_deref(),
+        current_agent_package,
+        persistent_manager,
+    );
     let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal).await {
         Ok(results) => results,
         Err(err) => {
@@ -194,12 +203,14 @@ fn build_emit_fns(
 pub fn build_tool_eval_context(
     config: &GlobalConfig,
     agent_use_tools: Option<&str>,
+    current_agent_package: Option<String>,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
 ) -> ToolEvalContext {
     let guard = config.read();
+    let (tool_declarations, handoff_targets) =
+        guard.tool_declarations_for_use_tools(agent_use_tools, current_agent_package.as_deref());
     let decl_map: Arc<HashMap<String, ToolDeclaration>> = Arc::new(
-        guard
-            .tool_declarations_for_use_tools(agent_use_tools)
+        tool_declarations
             .into_iter()
             .map(|d| (d.name.clone(), d))
             .collect(),
@@ -264,6 +275,8 @@ pub fn build_tool_eval_context(
         providers,
         session_name,
         allowed_tool_names,
+        current_agent_package,
+        handoff_targets,
         emit_tool_call_fn,
         emit_tool_result_fn,
         emit_tool_blocked_fn,
@@ -480,7 +493,7 @@ mod tests {
             harnx_hooks::PersistentHookManager::new(),
         ));
         let result = eval_tool_calls(
-            &build_tool_eval_context(&config, None, &persistent_manager),
+            &build_tool_eval_context(&config, None, None, &persistent_manager),
             calls,
             &abort_signal,
         )
@@ -494,6 +507,32 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("No tool provider configured"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_tool_eval_context_stores_current_agent_package() {
+        // The package derived from a qualified agent name in `execute_tool_round`
+        // must be threaded into `ToolEvalContext` so the engine can resolve
+        // same-package handoff targets (#709).
+        let _guard = crate::client::TestStateGuard::new(None).await;
+        let config = Arc::new(RwLock::new(Config::default()));
+        let persistent_manager = std::sync::Arc::new(tokio::sync::Mutex::new(
+            harnx_hooks::PersistentHookManager::new(),
+        ));
+
+        // Mirror the derivation done in `execute_tool_round`.
+        let pkg = harnx_core::package_namespace::pkg_from_qualified("pantheon/daedalus")
+            .map(str::to_string);
+        assert_eq!(pkg.as_deref(), Some("pantheon"));
+        let ctx = build_tool_eval_context(&config, None, pkg, &persistent_manager);
+        assert_eq!(ctx.current_agent_package.as_deref(), Some("pantheon"));
+
+        // A bare (top-level) agent name yields no package context.
+        let bare =
+            harnx_core::package_namespace::pkg_from_qualified("daedalus").map(str::to_string);
+        assert_eq!(bare, None);
+        let ctx = build_tool_eval_context(&config, None, bare, &persistent_manager);
+        assert_eq!(ctx.current_agent_package, None);
     }
 
     #[test]

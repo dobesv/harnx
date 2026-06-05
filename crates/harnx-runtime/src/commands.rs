@@ -180,7 +180,12 @@ pub async fn run_command_with_output(
                 }
                 Some("tools") => {
                     let conf = config.read();
-                    let declarations = conf.tool_declarations_for_use_tools(Some("*"));
+                    // Spell handoff tool names relative to the active agent's
+                    // package so they match the active-tool whitelist below and
+                    // what the agent actually sees (#709).
+                    let active_pkg = conf.active_package();
+                    let (declarations, _) =
+                        conf.tool_declarations_for_use_tools(Some("*"), active_pkg.as_deref());
                     let active_tools = conf.active_tool_names();
                     if declarations.is_empty() {
                         writeln!(output, "No tools available")?;

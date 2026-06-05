@@ -502,8 +502,12 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
         Some(s) if !s.is_empty() => s,
         _ => return vec![],
     };
-    let decl_map: HashMap<String, ToolDeclaration> = cfg
-        .tool_declarations_for_use_tools(Some("*"))
+    // Spell handoff tool declaration names relative to the active agent's
+    // package so the transcript matches what the agent actually saw (#709).
+    let active_pkg = cfg.active_package();
+    let (declarations, _handoff_targets) =
+        cfg.tool_declarations_for_use_tools(Some("*"), active_pkg.as_deref());
+    let decl_map: HashMap<String, ToolDeclaration> = declarations
         .into_iter()
         .map(|d| (d.name.clone(), d))
         .collect();

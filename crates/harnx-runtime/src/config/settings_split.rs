@@ -160,7 +160,8 @@ impl Config {
         if value
             && config
                 .read()
-                .tool_declarations_for_use_tools(Some("*"))
+                .tool_declarations_for_use_tools(Some("*"), None)
+                .0
                 .is_empty()
         {
             bail!("Tool use cannot be enabled because no tools are installed.")
