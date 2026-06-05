@@ -59,6 +59,10 @@ pub const HOME_READ_PATHS: &[&str] = &[
 ];
 
 #[cfg(unix)]
+// Security hardening: writable + executable directories on PATH, or directories
+// that hold host-executed binaries, let sandboxed code plant trojans that user
+// may later run on host. Default to exec-only or write-only instead; users opt
+// into write with --extra-rwx/--extra-write for installs and self-updates.
 pub const HOME_EXEC_PATHS: &[&str] = &[
     ".local/bin",
     ".local/lib",
@@ -66,21 +70,9 @@ pub const HOME_EXEC_PATHS: &[&str] = &[
     ".asdf",
     "go/bin",
     ".cargo",
-];
-
-#[cfg(unix)]
-pub const HOME_WRITE_PATHS: &[&str] = &[".cache", "go/pkg"];
-
-#[cfg(unix)]
-pub const HOME_RWX_PATHS: &[&str] = &[
-    ".npm",
-    ".yarn",
     ".nvm",
     ".cargo/bin",
-    ".cargo/registry",
-    ".cargo/git",
     ".mono",
-    ".bun/install/cache",
     ".pyenv",
     ".rye",
     // AI coding agents whose self-updaters install versioned binaries under
@@ -89,9 +81,23 @@ pub const HOME_RWX_PATHS: &[&str] = &[
     ".local/share/opencode", // OpenCode
     // Python/JS package managers that install executables here:
     ".local/share/pipx", // pipx (installs aider, etc.)
+];
+
+#[cfg(unix)]
+pub const HOME_WRITE_PATHS: &[&str] = &[
+    ".cache",
+    "go/pkg",
+    ".npm",
+    ".yarn",
+    ".cargo/registry",
+    ".cargo/git",
+    ".bun/install/cache",
     ".local/share/pnpm", // pnpm store
     ".local/share/uv",   // uv (Python package manager)
 ];
+
+#[cfg(unix)]
+pub const HOME_RWX_PATHS: &[&str] = &[];
 
 #[cfg(unix)]
 pub fn push_home_relative_defaults(args: &mut Vec<OsString>, home: &Path) {
@@ -126,8 +132,23 @@ pub fn push_home_relative_defaults(args: &mut Vec<OsString>, home: &Path) {
 #[cfg(unix)]
 pub fn push_env_relative_defaults(args: &mut Vec<OsString>) {
     if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+        let cargo_home = PathBuf::from(cargo_home);
+        // Root: read-only so config.toml / credentials are visible, matching the
+        // default ~/.cargo (which is in HOME_EXEC_PATHS and thus readable).
+        args.push(OsString::from("--read"));
+        args.push(cargo_home.clone().into_os_string());
+        // Binaries: read+exec only (same as the default ~/.cargo/bin).
         args.push(OsString::from("--exec"));
-        args.push(PathBuf::from(cargo_home).join("bin").into_os_string());
+        args.push(cargo_home.join("bin").into_os_string());
+        // Download caches: read+write (mirror the default ~/.cargo/registry and
+        // ~/.cargo/git so a custom CARGO_HOME keeps the same cache-write access).
+        for sub in ["registry", "git"] {
+            let path = cargo_home.join(sub);
+            args.push(OsString::from("--read"));
+            args.push(path.clone().into_os_string());
+            args.push(OsString::from("--write"));
+            args.push(path.into_os_string());
+        }
     }
     if let Some(goroot) = std::env::var_os("GOROOT") {
         args.push(OsString::from("--exec"));

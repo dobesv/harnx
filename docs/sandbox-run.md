@@ -88,7 +88,7 @@ PATH="$({
 export PATH
 
 # shellcheck disable=SC2016 -- '$GIT_ROOT' style args are harnx-sandbox-run pseudo-vars; shell must pass them through literally.
-# Caches like ~/.npm, ~/.yarn, ~/.nvm, ~/.bun, ~/.cache, ~/.cargo, go/bin, go/pkg, and ~/.local/share/pnpm are pre-whitelisted.
+# Common tool and cache paths (like ~/.npm, ~/.cargo, ~/.cache) are pre-whitelisted.
 exec harnx-sandbox-run \
   --extra-rwx '$GIT_ROOT' \
   --extra-rwx '$NODE_PROJECT_ROOT' \
@@ -296,9 +296,10 @@ The `--working-dir <path>` flag changes where the sandboxed command starts, but 
 | Access | Paths |
 | :----- | :---- |
 | Read | `~/.gitconfig`, `~/.gitignore`, `~/.gitignore_global`, `~/.tool-versions` |
-| Read/Write | `~/.cache`, `~/go/pkg` |
-| Read/Write/Exec | `~/.npm`, `~/.yarn`, `~/.nvm`, `~/.cargo`, `~/.pyenv`, `~/.rye`, `~/.bun`, `~/.local/share/claude`, `~/.local/share/uv`, `~/.local/share/pnpm`, `~/.local/share/pipx`, `~/.local/share/opencode` |
-| Exec | `~/.local/bin`, `~/.local/lib`, `~/.asdf`, `~/.bun`, `~/go/bin` |
+| Read/Write | `~/.cache`, `~/go/pkg`, `~/.npm`, `~/.yarn`, `~/.cargo/registry`, `~/.cargo/git`, `~/.bun/install/cache`, `~/.local/share/pnpm`, `~/.local/share/uv` |
+| Exec | `~/.local/bin`, `~/.local/lib`, `~/.bun`, `~/.asdf`, `~/go/bin`, `~/.cargo`, `~/.nvm`, `~/.cargo/bin`, `~/.mono`, `~/.pyenv`, `~/.rye`, `~/.local/share/claude`, `~/.local/share/opencode`, `~/.local/share/pipx` |
+
+Tool-install and self-update operations (such as `cargo install`, `nvm install`, etc.) require explicit write access; grant with `--extra-rwx` or perform them outside the sandbox.
 
 Any other `$HOME` subdirectory (e.g. `~/.gemini`, `~/.config`, `~/.ssh`) is **blocked** unless you add it with `--extra-read`, `--extra-write`, or `--extra-rwx`. This is intentional — it prevents the sandboxed process from reading credentials or config files it doesn't need.
 

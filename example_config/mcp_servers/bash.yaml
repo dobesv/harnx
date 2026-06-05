@@ -11,17 +11,20 @@ rename_tools:
 # NOTE: Many home-directory paths are already whitelisted by default and do NOT
 # need to be added here. See docs/bash-mcp-server.md for the full list, which
 # includes: ~/.gitconfig, ~/.gitignore, ~/.gitignore_global, ~/.tool-versions
-# (read), ~/.local/bin, ~/.local/lib, ~/.bun, ~/.asdf, ~/go/bin, ~/.cargo
-# (read+exec), ~/.cache, ~/go/pkg (read+write), ~/.npm, ~/.yarn, ~/.nvm,
-# ~/.cargo/bin, ~/.cargo/registry, ~/.cargo/git, ~/.mono, ~/.bun/install/cache,
-# ~/.pyenv, ~/.rye (read+write+exec).
+# (read), ~/.local/bin, ~/.local/lib, ~/.bun, ~/.asdf, ~/go/bin, ~/.cargo,
+# ~/.nvm, ~/.cargo/bin, ~/.pyenv, ~/.rye, ~/.local/share/claude (read+exec),
+# ~/.cache, ~/go/pkg, ~/.npm, ~/.yarn, ~/.cargo/registry, ~/.cargo/git,
+# ~/.bun/install/cache (read+write). Tool-install directories (~/.cargo/bin,
+# ~/.nvm, ~/.pyenv, ~/.rye, etc.) are read+exec only — use --extra-rwx to
+# grant write access for operations like cargo install, nvm install, pyenv
+# install, rye sync, or claude update.
 #
 args:
 #   - --no-sandbox                                          # Disable sandboxing entirely
   # Allow access to rustup-managed toolchains
   - --extra-exec
   - ~/.rustup
-  # Allow access to ruff's cache
+  # Allow ruff to write to its cache (not a default-writable path)
   - --extra-rwx
   - ~/.ruff_cache
   # Allow access to various config files
@@ -33,6 +36,7 @@ args:
   - ~/.config/dcg
   - --extra-read
   - ~/.config/git
+  # Allow go to write to its config dir (not a default-writable path)
   - --extra-rwx
   - ~/.config/go
   - --extra-read

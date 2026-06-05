@@ -97,14 +97,14 @@ On Linux and macOS, `harnx-mcp-bash` uses [birdcage](https://github.com/phylum-d
   - The path in the `$TMPDIR` environment variable, if set.
 - **Readable/Executable**:
   - Standard system directories required for bash and common utilities (e.g., `/usr/bin`, `/bin`, `/lib`).
-  - Tool installation directories under `$HOME`: `~/.local/bin`, `~/.local/lib`, `~/.bun`, `~/.asdf`, `~/go/bin`, `~/.cargo`.
+  - Tool installation directories under `$HOME`: `~/.local/bin`, `~/.local/lib`, `~/.bun`, `~/.asdf`, `~/go/bin`, `~/.cargo`, `~/.nvm`, `~/.cargo/bin`, `~/.mono`, `~/.pyenv`, `~/.rye`, `~/.local/share/claude`, `~/.local/share/opencode`, `~/.local/share/pipx`.
 - **Readable**:
   - System C/C++ header directories needed by `cc`, `bindgen`, and crates with native build scripts (Linux: `/usr/include`, `/usr/include/x86_64-linux-gnu`).
   - Common config files under `$HOME`: `~/.gitconfig`, `~/.gitignore`, `~/.gitignore_global`, `~/.tool-versions`.
 - **Read+Write**:
-  - Cache and module directories under `$HOME`: `~/.cache`, `~/go/pkg`.
-- **Read+Write+Execute**:
-  - Package-manager and version-manager directories under `$HOME`: `~/.npm`, `~/.yarn`, `~/.nvm`, `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, `~/.mono`, `~/.bun/install/cache`, `~/.pyenv`, `~/.rye`.
+  - Cache and module directories under `$HOME`: `~/.cache`, `~/go/pkg`, `~/.npm`, `~/.yarn`, `~/.cargo/registry`, `~/.cargo/git`, `~/.bun/install/cache`, `~/.local/share/pnpm`, `~/.local/share/uv`.
+
+> **Security note:** Tool-install and self-update operations (such as `cargo install`, `nvm install`, `pyenv install`, `rye sync`, `pipx install`, `claude update`, or `opencode self-update`) require explicit write access because these directories are no longer writable by default. You can grant temporary write access using the `--extra-rwx` flag (or the `HARNX_BASH_EXTRA_RWX` environment variable for the bash MCP server), or perform these operations outside the sandbox.
 
 These `$HOME`-relative defaults exist regardless of whether the directory is present on the host (sandbox-run silently skips non-existent paths).
 
@@ -112,7 +112,7 @@ Toolchain-locating environment variables are honoured automatically when set:
 
 | Variable | Effect on sandbox |
 |----------|-------------------|
-| `CARGO_HOME` | `$CARGO_HOME/bin` added as executable. |
+| `CARGO_HOME` | `$CARGO_HOME` added as readable; `$CARGO_HOME/bin` added as executable; `$CARGO_HOME/registry` and `$CARGO_HOME/git` added as read+write. |
 | `GOROOT` | `$GOROOT` added as executable (Go install). |
 | `GOPATH` | `$GOPATH/bin` added as executable; `$GOPATH/pkg` added as read+write. |
 | `GOBIN` | `$GOBIN` added as executable. |
@@ -178,7 +178,7 @@ args: ["-e", "EDITOR=true"]
 
 Allow tools to use home-directory caches or persistent configuration:
 
-> **Note:** `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, and `~/.npm` are already included in the default allowlist with read+write+execute permissions. The examples below are only needed if you override the defaults or need additional paths.
+> **Note:** `~/.cargo/bin` is already included in the default allowlist with read+execute permissions, while `~/.cargo/registry`, `~/.cargo/git`, and `~/.npm` are included with read+write permissions. The examples below are only needed if you override the defaults, need additional paths, or require write access for tool installation.
 
 #### Allow pip to cache
 ```yaml
@@ -186,13 +186,13 @@ args: ["--extra-write", "~/.cache/pip"]
 ```
 
 #### Allow full cargo directory (non-default example)
-If you've removed the default cargo paths and want to grant broader access:
+If you need broader access than the defaults (e.g., for `cargo install` or updates):
 ```yaml
 args: ["--extra-rwx", "~/.cargo"]
 ```
 
 #### Allow full npm directory (non-default example)
-If you've removed the default npm path and want to grant broader access:
+If you need broader access than the default (e.g., for global installs or updates):
 ```yaml
 args: ["--extra-rwx", "~/.npm"]
 ```
