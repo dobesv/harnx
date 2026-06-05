@@ -243,7 +243,7 @@ async fn hook_injected_env_reaches_bash_exec_command() {
     let persistent_manager = Arc::new(Mutex::new(PersistentHookManager::new()));
     // Pass Some("*") so tool_declarations_for_use_tools connects to MCP servers
     // and populates their tool lists; None skips MCP entirely.
-    let ctx = build_tool_eval_context(&config, Some("*"), &persistent_manager);
+    let ctx = build_tool_eval_context(&config, Some("*"), None, &persistent_manager);
 
     // Skip if the MCP server failed to connect (e.g. sandbox execution restrictions).
     if !ctx.allowed_tool_names.contains("bash_exec") {
