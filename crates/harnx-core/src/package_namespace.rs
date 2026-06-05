@@ -32,6 +32,30 @@ pub fn agent_tool_prefix(qualified_agent_name: &str) -> String {
     sanitize_for_tool_name(qualified_agent_name)
 }
 
+/// Compute package-aware handoff display name for a target agent.
+///
+/// The returned name is always sanitized to the tool-name charset
+/// (`[A-Za-z0-9_-]`, see [`sanitize_for_tool_name`]) so it is valid for LLM
+/// provider function-name schemas regardless of what characters the source
+/// agent filename/package contains.
+///
+/// Rules:
+/// - same-package peer from within a package → bare stem (`atlas`)
+/// - cross-package peer → namespaced form (`otherpkg__atlas`)
+/// - top-level peer from within a package → explicit top-level (`__reviewer`)
+/// - top-level context → bare top-level peers, namespaced package peers
+pub fn handoff_display_name(target_agent_name: &str, active_pkg: Option<&str>) -> String {
+    match (pkg_from_qualified(target_agent_name), active_pkg) {
+        (Some(target_pkg), Some(active_pkg)) if target_pkg == active_pkg => target_agent_name
+            .split_once('/')
+            .map(|(_, stem)| sanitize_for_tool_name(stem))
+            .unwrap_or_else(|| sanitize_for_tool_name(target_agent_name)),
+        (Some(_), _) => agent_tool_prefix(target_agent_name),
+        (None, Some(_)) => format!("__{}", sanitize_for_tool_name(target_agent_name)),
+        (None, None) => sanitize_for_tool_name(target_agent_name),
+    }
+}
+
 /// Given a package name and MCP server name, return cross-package tool prefix.
 /// ("mypkg", "fs") → "mypkg__fs"
 /// So tool "read_file" becomes "mypkg__fs_read_file" from outside package.
@@ -105,6 +129,67 @@ mod tests {
     #[test]
     fn test_agent_tool_prefix() {
         assert_eq!(agent_tool_prefix("mypkg/coder"), "mypkg__coder");
+    }
+
+    #[test]
+    fn test_handoff_display_name_same_package_peer() {
+        assert_eq!(
+            handoff_display_name("pantheon/atlas", Some("pantheon")),
+            "atlas"
+        );
+    }
+
+    #[test]
+    fn test_handoff_display_name_cross_package_peer() {
+        assert_eq!(
+            handoff_display_name("otherpkg/helper", Some("pantheon")),
+            "otherpkg__helper"
+        );
+    }
+
+    #[test]
+    fn test_handoff_display_name_top_level_from_package() {
+        assert_eq!(
+            handoff_display_name("reviewer", Some("pantheon")),
+            "__reviewer"
+        );
+    }
+
+    #[test]
+    fn test_handoff_display_name_top_level_context() {
+        assert_eq!(handoff_display_name("reviewer", None), "reviewer");
+        assert_eq!(
+            handoff_display_name("pantheon/atlas", None),
+            "pantheon__atlas"
+        );
+    }
+
+    #[test]
+    fn test_handoff_display_name_sanitizes_invalid_chars() {
+        // Provider-invalid characters (e.g. spaces) in agent filenames must
+        // never leak into the tool name, for every branch.
+        assert_eq!(handoff_display_name("my agent", None), "my_agent");
+        assert_eq!(
+            handoff_display_name("my agent", Some("pantheon")),
+            "__my_agent"
+        );
+        assert_eq!(
+            handoff_display_name("pantheon/my agent", Some("pantheon")),
+            "my_agent"
+        );
+        // Resulting names are always within the tool-name charset.
+        for name in [
+            handoff_display_name("a b", None),
+            handoff_display_name("a b", Some("p")),
+            handoff_display_name("p/a b", Some("p")),
+            handoff_display_name("other/a b", Some("p")),
+        ] {
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "unsanitized display name: {name}"
+            );
+        }
     }
 
     #[test]
