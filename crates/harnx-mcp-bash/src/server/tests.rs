@@ -520,10 +520,19 @@ mod sandbox_args {
             assert_arg_pair_present(&pairs, "--exec", path_str(".local/bin"));
             assert_arg_pair_present(&pairs, "--read", path_str(".cache"));
             assert_arg_pair_present(&pairs, "--write", path_str(".cache"));
-            assert_arg_pair_present(&pairs, "--read", path_str(".pyenv"));
-            assert_arg_pair_present(&pairs, "--write", path_str(".pyenv"));
+            // .pyenv is exec-only (read+exec, no write): the EXEC defaults emit
+            // only --exec, so neither --read nor --write should be present.
+            assert_arg_pair_absent(&pairs, "--read", path_str(".pyenv"));
+            assert_arg_pair_absent(&pairs, "--write", path_str(".pyenv"));
             assert_arg_pair_present(&pairs, "--exec", path_str(".pyenv"));
             assert_arg_pair_present(&pairs, "--exec", path_str(".cargo/bin"));
+            assert_arg_pair_present(&pairs, "--read", path_str(".npm"));
+            assert_arg_pair_present(&pairs, "--write", path_str(".npm"));
+            assert_arg_pair_absent(&pairs, "--exec", path_str(".npm"));
+            // .local/share/claude is exec-only: --exec only, no --read/--write.
+            assert_arg_pair_absent(&pairs, "--read", path_str(".local/share/claude"));
+            assert_arg_pair_absent(&pairs, "--write", path_str(".local/share/claude"));
+            assert_arg_pair_present(&pairs, "--exec", path_str(".local/share/claude"));
         }
     }
 
@@ -543,7 +552,15 @@ mod sandbox_args {
             None,
         );
 
+        // Custom CARGO_HOME root is readable so config.toml/credentials work.
+        assert_arg_pair_present(&pairs, "--read", "/opt/cargo-custom");
         assert_arg_pair_present(&pairs, "--exec", "/opt/cargo-custom/bin");
+        // Custom CARGO_HOME keeps cache-write parity with the default ~/.cargo.
+        assert_arg_pair_present(&pairs, "--read", "/opt/cargo-custom/registry");
+        assert_arg_pair_present(&pairs, "--write", "/opt/cargo-custom/registry");
+        assert_arg_pair_absent(&pairs, "--exec", "/opt/cargo-custom/registry");
+        assert_arg_pair_present(&pairs, "--read", "/opt/cargo-custom/git");
+        assert_arg_pair_present(&pairs, "--write", "/opt/cargo-custom/git");
         assert_arg_pair_present(&pairs, "--exec", "/opt/go");
         assert_arg_pair_present(&pairs, "--exec", "/srv/go-workspace/bin");
         assert_arg_pair_present(&pairs, "--read", "/srv/go-workspace/pkg");

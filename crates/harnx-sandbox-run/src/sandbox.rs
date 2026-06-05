@@ -90,6 +90,10 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
             for sub in HOME_WRITE_PATHS {
                 let p = home.join(sub);
                 if p.exists() {
+                    // Emit --read alongside --write to match the shared default
+                    // logic in harnx-sandbox-common::push_home_relative_defaults.
+                    args.push("--read".into());
+                    args.push(p.clone().into_os_string());
                     args.push("--write".into());
                     args.push(p.into_os_string());
                 }
@@ -108,10 +112,29 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
         }
         // CARGO_HOME, GOROOT, GOPATH, GOBIN
         if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
-            let bin = std::path::PathBuf::from(cargo_home).join("bin");
+            let cargo_home = std::path::PathBuf::from(cargo_home);
+            // Root: read-only so config.toml / credentials are visible, matching
+            // the default ~/.cargo (readable via HOME_EXEC_PATHS).
+            if cargo_home.exists() {
+                args.push("--read".into());
+                args.push(cargo_home.clone().into_os_string());
+            }
+            // Binaries: read+exec only (same as the default ~/.cargo/bin).
+            let bin = cargo_home.join("bin");
             if bin.exists() {
                 args.push("--exec".into());
                 args.push(bin.into_os_string());
+            }
+            // Download caches: read+write (mirror the default ~/.cargo/registry
+            // and ~/.cargo/git so a custom CARGO_HOME keeps cache-write access).
+            for sub in ["registry", "git"] {
+                let path = cargo_home.join(sub);
+                if path.exists() {
+                    args.push("--read".into());
+                    args.push(path.clone().into_os_string());
+                    args.push("--write".into());
+                    args.push(path.into_os_string());
+                }
             }
         }
         if let Some(goroot) = std::env::var_os("GOROOT") {
