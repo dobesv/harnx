@@ -13,5 +13,5 @@ rust-version = "1.89"
 version = "0.1.0"
 
 [dependencies]
-ratatui-core = { version = "0.1.0", default-features = false, features = ["layout-cache"] }
-ratatui-widgets = { version = "0.3.0", default-features = false }
+ratatui-core = { version = "0.1.1", default-features = false, features = ["layout-cache"] }
+ratatui-widgets = { version = "0.3.1", default-features = false }
