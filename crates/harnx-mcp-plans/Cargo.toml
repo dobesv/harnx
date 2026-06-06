@@ -21,6 +21,9 @@ tower = { workspace = true }
 schemars = { workspace = true }
 similar = { workspace = true }
 
+[dev-dependencies]
+filetime = "0.2"
+
 [[bin]]
 name = "harnx-mcp-plans"
 path = "src/main.rs"

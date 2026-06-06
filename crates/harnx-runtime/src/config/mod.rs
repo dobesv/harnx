@@ -153,10 +153,17 @@ fn matches_tool_glob(pattern: &str, name: &str) -> bool {
 
 /// Extract a valid package name from a directory path entry.
 /// Returns None for non-directories and hidden directories (starting with '.').
-fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
-    crate::config::agent::list_agents()
+fn handoff_tool_declarations_for_agents(
+    active_pkg: Option<&str>,
+) -> (Vec<ToolDeclaration>, HashMap<String, String>) {
+    let mut handoff_targets = HashMap::new();
+    let declarations = crate::config::agent::list_agents()
         .into_iter()
         .map(|agent_name| {
+            let display_name =
+                harnx_core::package_namespace::handoff_display_name(&agent_name, active_pkg);
+            handoff_targets.insert(display_name.clone(), agent_name.clone());
+
             let mut properties = IndexMap::new();
             properties.insert(
                 "prompt".to_string(),
@@ -177,7 +184,7 @@ fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
                 },
             );
             ToolDeclaration {
-                name: format!("{agent_name}_session_handoff"),
+                name: format!("{display_name}_session_handoff"),
                 description: format!(
                     "Exit the current interactive agent session and hand off to the '{agent_name}' agent. Resolves the target session internally (reusing session_id when provided, otherwise the current session), then continues interaction in that agent session with the supplied prompt."
                 ),
@@ -193,7 +200,9 @@ fn handoff_tool_declarations_for_agents() -> Vec<ToolDeclaration> {
                 result_template: None,
             }
         })
-        .collect()
+        .collect();
+
+    (declarations, handoff_targets)
 }
 
 pub struct Config {
@@ -476,6 +485,16 @@ impl Config {
         }
     }
 
+    /// Package of the currently active agent (e.g. `Some("pantheon")` for
+    /// `pantheon/daedalus`, `None` for a top-level agent). Used to spell
+    /// package-aware handoff tool declarations consistently across the engine
+    /// allow-list, the tool list sent to the LLM, CLI listings, and shell
+    /// completion (#709).
+    pub fn active_package(&self) -> Option<String> {
+        harnx_core::package_namespace::pkg_from_qualified(self.extract_agent().name())
+            .map(str::to_string)
+    }
+
     pub fn resolved_hooks(&self) -> HooksConfig {
         let global = self.hooks.clone().unwrap_or_default();
         if let Some(agent) = &self.agent {
@@ -680,7 +699,13 @@ impl Config {
             None => return HashSet::new(),
         };
         let use_tools_str = use_tools.join(",");
-        let declarations = self.tool_declarations_for_use_tools(Some(&use_tools_str));
+        // Generate handoff declarations relative to the active agent's package
+        // so their names match the package-aware spelling exposed to the agent
+        // and decoded by the engine (#709).
+        let active_pkg =
+            harnx_core::package_namespace::pkg_from_qualified(agent.name()).map(str::to_string);
+        let (declarations, _) =
+            self.tool_declarations_for_use_tools(Some(&use_tools_str), active_pkg.as_deref());
         let declaration_names: HashSet<String> =
             declarations.iter().map(|d| d.name.clone()).collect();
         let mut names = HashSet::new();
@@ -721,7 +746,13 @@ impl Config {
         }
         let use_tools = agent.use_tools()?;
         let use_tools_str = use_tools.join(",");
-        let declarations = self.tool_declarations_for_use_tools(Some(&use_tools_str));
+        // Handoff declarations must be spelled relative to this agent's package
+        // so the tool names sent to the LLM match what the engine can decode
+        // and what `build_tool_eval_context` allow-lists (#709).
+        let active_pkg =
+            harnx_core::package_namespace::pkg_from_qualified(agent.name()).map(str::to_string);
+        let (declarations, _) =
+            self.tool_declarations_for_use_tools(Some(&use_tools_str), active_pkg.as_deref());
         let tool_names = self.collect_selected_tool_names(&use_tools, &declarations);
 
         let mut functions: Vec<ToolDeclaration> = declarations
@@ -1050,8 +1081,13 @@ impl Config {
         Ok(())
     }
 
-    pub fn tool_declarations_for_use_tools(&self, use_tools: Option<&str>) -> Vec<ToolDeclaration> {
+    pub fn tool_declarations_for_use_tools(
+        &self,
+        use_tools: Option<&str>,
+        active_pkg: Option<&str>,
+    ) -> (Vec<ToolDeclaration>, HashMap<String, String>) {
         let mut declarations = self.tools.declarations();
+        let mut handoff_targets = HashMap::new();
         if let Some(use_tools) = use_tools {
             if self.needs_mcp_tools() {
                 if let Some(manager) = &self.mcp_manager {
@@ -1069,13 +1105,16 @@ impl Config {
                 let v = v.trim();
                 v.ends_with("_session_handoff") || v == "*"
             }) {
-                declarations.extend(handoff_tool_declarations_for_agents());
+                let (handoff_declarations, targets) =
+                    handoff_tool_declarations_for_agents(active_pkg);
+                declarations.extend(handoff_declarations);
+                handoff_targets.extend(targets);
             }
         }
 
         let mut seen = HashSet::new();
         declarations.retain(|declaration| seen.insert(declaration.name.clone()));
-        declarations
+        (declarations, handoff_targets)
     }
 }
 

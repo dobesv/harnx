@@ -12,7 +12,7 @@ use harnx_core::abort::{wait_abort_signal, AbortSignal};
 use harnx_core::hooks::{HookEvent, HookOutcome, HookResult, HookResultControl};
 use harnx_core::tool::{SwitchAgentData, ToolCall, ToolError, ToolProvider, ToolResult};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -39,9 +39,19 @@ pub struct ToolEvalContext {
     /// results and the call omitted `session_id`.
     pub session_name: Option<String>,
     /// Allow-list of synthetic tool names that do not come from a real
-    /// provider but are handled directly in `eval_tool_call_mcp`
+    /// provider but are handled directly in `dispatch_tool_call`
     /// (currently `_session_handoff`).
     pub allowed_tool_names: HashSet<String>,
+    /// Package of the currently active agent (e.g. `Some("pantheon")` for
+    /// `pantheon/daedalus`, `None` for a top-level agent). Used to resolve
+    /// bare `_session_handoff` targets relative to the current package so a
+    /// same-package handoff (`atlas_session_handoff`) lands on
+    /// `pantheon/atlas` rather than top-level `atlas` (#709).
+    pub current_agent_package: Option<String>,
+    /// Exact decode table for package-aware handoff display names.
+    /// Maps tool display name without `_session_handoff` suffix to
+    /// qualified-or-bare target agent name.
+    pub handoff_targets: HashMap<String, String>,
     /// Called when a tool is about to be dispatched. Receives the tool
     /// call and the parsed arguments JSON. Harnx's default emits an
     /// `AgentEvent::Tool(Started { .. })` via the unified AgentEvent
@@ -293,7 +303,27 @@ async fn dispatch_tool_call(
                 call.name
             )));
         }
-        let agent = call.name.trim_end_matches("_session_handoff");
+        // Strip exactly one `_session_handoff` suffix (not all repeats, which
+        // `trim_end_matches` would do) so an agent named `*_session_handoff`
+        // resolves correctly.
+        let bare_target = call
+            .name
+            .strip_suffix("_session_handoff")
+            .unwrap_or(&call.name);
+        // Resolve package-aware display names through the exact lookup table
+        // first. Map values are already the canonical agent name ("pkg/stem"
+        // for package agents, bare "stem" for top-level agents), so they are
+        // used verbatim — re-resolving a bare top-level value against the
+        // current package would wrongly qualify it (e.g. `global` →
+        // `pantheon/global`). Only the legacy fallback path (no map entry,
+        // e.g. test/no-context contexts) applies package-relative resolution.
+        let agent = match ctx.handoff_targets.get(bare_target) {
+            Some(mapped) => mapped.clone(),
+            None => harnx_core::package_namespace::resolve_package_relative_name(
+                bare_target,
+                ctx.current_agent_package.as_deref(),
+            ),
+        };
         let prompt = json_data["prompt"].as_str().ok_or_else(|| {
             ToolError::Recoverable(anyhow!("Missing 'prompt' argument for session handoff"))
         })?;
@@ -485,6 +515,8 @@ mod tests {
             providers,
             session_name: None,
             allowed_tool_names: HashSet::new(),
+            current_agent_package: None,
+            handoff_targets: HashMap::new(),
             emit_tool_call_fn: Arc::new(emit_tool_call),
             emit_tool_result_fn: Arc::new(emit_tool_result),
             emit_tool_blocked_fn: Arc::new(emit_tool_blocked),
@@ -799,5 +831,202 @@ mod tests {
                 .as_slice(),
             &[json!({"injected": true})]
         );
+    }
+
+    /// Build a minimal context for handoff-resolution tests with a given
+    /// active-agent package, allow-listed handoff tool name, and optional
+    /// package-aware decode map.
+    fn handoff_context(
+        package: Option<&str>,
+        allowed: &str,
+        handoff_targets: HashMap<String, String>,
+    ) -> ToolEvalContext {
+        let mut ctx = test_context(vec![], |_| continue_hook_outcome());
+        ctx.current_agent_package = package.map(str::to_string);
+        ctx.allowed_tool_names = HashSet::from([allowed.to_string()]);
+        ctx.handoff_targets = handoff_targets;
+        ctx
+    }
+
+    async fn dispatched_handoff_agent(ctx: &ToolEvalContext, tool_name: &str) -> String {
+        let call = ToolCall::new(tool_name.to_string(), json!({ "prompt": "go" }), None, None);
+        let abort_signal = create_abort_signal();
+        let result =
+            match dispatch_tool_call(call, json!({ "prompt": "go" }), ctx, &abort_signal).await {
+                Ok(result) => result,
+                Err(ToolError::Recoverable(err) | ToolError::Fatal(err)) => {
+                    panic!("handoff dispatch should succeed: {err:#}")
+                }
+            };
+        result["agent"]
+            .as_str()
+            .expect("handoff result should carry an agent")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn handoff_bare_target_resolves_to_current_package() {
+        // #709: `pantheon/daedalus` handing off to bare `atlas` must land on
+        // same-package `pantheon/atlas`, not top-level `atlas`.
+        let ctx = handoff_context(Some("pantheon"), "atlas_session_handoff", HashMap::new());
+        let agent = dispatched_handoff_agent(&ctx, "atlas_session_handoff").await;
+        assert_eq!(agent, "pantheon/atlas");
+    }
+
+    #[tokio::test]
+    async fn handoff_bare_target_top_level_unchanged() {
+        // No package context (top-level agent) → bare target stays bare.
+        let ctx = handoff_context(None, "atlas_session_handoff", HashMap::new());
+        let agent = dispatched_handoff_agent(&ctx, "atlas_session_handoff").await;
+        assert_eq!(agent, "atlas");
+    }
+
+    #[tokio::test]
+    async fn handoff_leading_slash_escapes_to_top_level() {
+        // `/atlas` explicitly escapes the package to top-level even when a
+        // package context is present.
+        let ctx = handoff_context(Some("pantheon"), "/atlas_session_handoff", HashMap::new());
+        let agent = dispatched_handoff_agent(&ctx, "/atlas_session_handoff").await;
+        assert_eq!(agent, "atlas");
+    }
+
+    #[tokio::test]
+    async fn handoff_qualified_target_unchanged() {
+        // Cross-package qualified target is left untouched.
+        let ctx = handoff_context(
+            Some("pantheon"),
+            "other/atlas_session_handoff",
+            HashMap::new(),
+        );
+        let agent = dispatched_handoff_agent(&ctx, "other/atlas_session_handoff").await;
+        assert_eq!(agent, "other/atlas");
+    }
+
+    #[tokio::test]
+    async fn handoff_uses_exact_map_for_same_package_display_name() {
+        let ctx = handoff_context(
+            Some("pantheon"),
+            "atlas_session_handoff",
+            HashMap::from([("atlas".to_string(), "pantheon/atlas".to_string())]),
+        );
+        let agent = dispatched_handoff_agent(&ctx, "atlas_session_handoff").await;
+        assert_eq!(agent, "pantheon/atlas");
+    }
+
+    #[tokio::test]
+    async fn handoff_uses_exact_map_for_cross_package_display_name() {
+        let ctx = handoff_context(
+            Some("pantheon"),
+            "otherpkg__helper_session_handoff",
+            HashMap::from([(
+                "otherpkg__helper".to_string(),
+                "otherpkg/helper".to_string(),
+            )]),
+        );
+        let agent = dispatched_handoff_agent(&ctx, "otherpkg__helper_session_handoff").await;
+        assert_eq!(agent, "otherpkg/helper");
+    }
+
+    #[tokio::test]
+    async fn handoff_uses_exact_map_for_top_level_from_package() {
+        // A top-level agent targeted from within a package is spelled `__stem`
+        // and maps to the BARE top-level name. It must NOT be re-qualified into
+        // the active package (would be `pantheon/global` — wrong).
+        let ctx = handoff_context(
+            Some("pantheon"),
+            "__global_session_handoff",
+            HashMap::from([("__global".to_string(), "global".to_string())]),
+        );
+        let agent = dispatched_handoff_agent(&ctx, "__global_session_handoff").await;
+        assert_eq!(agent, "global");
+    }
+
+    #[tokio::test]
+    async fn handoff_legacy_fallback_still_resolves_bare_target() {
+        let ctx = handoff_context(Some("pantheon"), "atlas_session_handoff", HashMap::new());
+        let agent = dispatched_handoff_agent(&ctx, "atlas_session_handoff").await;
+        assert_eq!(agent, "pantheon/atlas");
+    }
+    #[tokio::test]
+    async fn handoff_strips_only_one_suffix() {
+        // An agent literally named `worker_session_handoff` must keep its name:
+        // only the trailing `_session_handoff` tool suffix is stripped, not the
+        // repeated occurrence in the agent name.
+        let ctx = handoff_context(
+            None,
+            "worker_session_handoff_session_handoff",
+            HashMap::new(),
+        );
+        let agent = dispatched_handoff_agent(&ctx, "worker_session_handoff_session_handoff").await;
+        assert_eq!(agent, "worker_session_handoff");
+    }
+
+    #[tokio::test]
+    async fn handoff_propagates_prompt() {
+        // The supplied prompt must flow through to the switch_agent result.
+        let ctx = handoff_context(Some("pantheon"), "atlas_session_handoff", HashMap::new());
+        let call = ToolCall::new(
+            "atlas_session_handoff".to_string(),
+            json!({ "prompt": "do the thing" }),
+            None,
+            None,
+        );
+        let abort_signal = create_abort_signal();
+        let result = match dispatch_tool_call(
+            call,
+            json!({ "prompt": "do the thing" }),
+            &ctx,
+            &abort_signal,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(ToolError::Recoverable(err) | ToolError::Fatal(err)) => {
+                panic!("handoff dispatch should succeed: {err:#}")
+            }
+        };
+        assert_eq!(result["action"].as_str(), Some("switch_agent"));
+        assert_eq!(result["agent"].as_str(), Some("pantheon/atlas"));
+        assert_eq!(result["prompt"].as_str(), Some("do the thing"));
+    }
+
+    #[tokio::test]
+    async fn handoff_missing_prompt_is_recoverable_error() {
+        // A handoff call without the required `prompt` argument must return a
+        // Recoverable error (so the LLM can retry), not panic or switch.
+        let ctx = handoff_context(Some("pantheon"), "atlas_session_handoff", HashMap::new());
+        let call = ToolCall::new("atlas_session_handoff".to_string(), json!({}), None, None);
+        let abort_signal = create_abort_signal();
+        match dispatch_tool_call(call, json!({}), &ctx, &abort_signal).await {
+            Ok(_) => panic!("missing prompt must error"),
+            Err(ToolError::Recoverable(e)) => {
+                assert!(e.to_string().contains("prompt"), "unexpected error: {e:#}");
+            }
+            Err(ToolError::Fatal(e)) => panic!("expected Recoverable, got Fatal: {e:#}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_unallowed_tool_is_recoverable_error() {
+        // A handoff tool not present in `allowed_tool_names` must be rejected
+        // (no provider configured) rather than silently switching agents.
+        let ctx = handoff_context(Some("pantheon"), "atlas_session_handoff", HashMap::new());
+        let call = ToolCall::new(
+            "unlisted_session_handoff".to_string(),
+            json!({ "prompt": "go" }),
+            None,
+            None,
+        );
+        let abort_signal = create_abort_signal();
+        match dispatch_tool_call(call, json!({ "prompt": "go" }), &ctx, &abort_signal).await {
+            Ok(_) => panic!("unallowed handoff tool must error"),
+            Err(ToolError::Recoverable(e)) => {
+                assert!(
+                    e.to_string().contains("unlisted_session_handoff"),
+                    "unexpected error: {e:#}"
+                );
+            }
+            Err(ToolError::Fatal(e)) => panic!("expected Recoverable, got Fatal: {e:#}"),
+        }
     }
 }

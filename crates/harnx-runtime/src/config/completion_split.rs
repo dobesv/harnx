@@ -92,9 +92,13 @@ impl Config {
                         values.push("*".to_string());
                     }
                     values.extend(
-                        self.tool_declarations_for_use_tools(Some("*"))
-                            .iter()
-                            .map(|v| v.name.clone()),
+                        self.tool_declarations_for_use_tools(
+                            Some("*"),
+                            self.active_package().as_deref(),
+                        )
+                        .0
+                        .iter()
+                        .map(|v| v.name.clone()),
                     );
                     values.extend(self.toolsets.keys().map(|v| v.to_string()));
                     values
@@ -121,7 +125,8 @@ impl Config {
             values = candidates.into_iter().map(|v| (v, None)).collect();
         } else if cmd == ".use" && args.len() == 2 && args[0] == "tool" {
             let mut candidates: Vec<String> = self
-                .tool_declarations_for_use_tools(Some("*"))
+                .tool_declarations_for_use_tools(Some("*"), self.active_package().as_deref())
+                .0
                 .iter()
                 .map(|v| v.name.clone())
                 .collect();

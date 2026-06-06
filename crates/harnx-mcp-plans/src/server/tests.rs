@@ -2025,17 +2025,27 @@ async fn delete_note_wrong_plan_fails() {
 
 #[tokio::test]
 async fn cleanup_deletes_stale_plan_but_keeps_fresh_plan() {
+    use filetime::set_file_mtime;
+    use std::time::SystemTime;
+
     let dir = temp_test_dir("cleanup-stale-plan");
     let stale_plan = dir.join("stale-plan");
     let fresh_plan = dir.join("fresh-plan");
 
+    // Create stale plan with mtime far in the past
     fs::create_dir_all(&stale_plan).unwrap();
-    fs::write(stale_plan.join("plan.md"), "stale").unwrap();
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    let stale_plan_md = stale_plan.join("plan.md");
+    fs::write(&stale_plan_md, "stale").unwrap();
+    let stale_time =
+        filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3600));
+    set_file_mtime(&stale_plan_md, stale_time).unwrap();
+
+    // Create fresh plan with mtime ~now
     fs::create_dir_all(&fresh_plan).unwrap();
     fs::write(fresh_plan.join("plan.md"), "fresh").unwrap();
 
-    run_cleanup_pass(&dir, Duration::from_millis(10)).await;
+    // Retention of 60s: stale (hour old) should be deleted, fresh should be kept
+    run_cleanup_pass(&dir, Duration::from_secs(60)).await;
 
     assert!(!stale_plan.exists(), "stale plan should be deleted");
     assert!(fresh_plan.exists(), "fresh plan should be kept");
