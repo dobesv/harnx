@@ -3,6 +3,21 @@ use std::ffi::OsString;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 
+/// Linux `/run` audit for the least-privilege replacement of the
+/// temporary blanket `/run` and `/var/run` exec entries below:
+/// - `/run/systemd/resolve`: systemd-resolved resolv.conf symlink target.
+/// - `/run/resolvconf`: resolvconf-generated resolv.conf on Debian/Ubuntu.
+/// - `/run/NetworkManager`: NetworkManager-generated resolver files.
+/// - `/run/current-system`: NixOS active system profile/wrapper symlink root.
+/// - `/run/opengl-driver`: NixOS OpenGL/Mesa/Vulkan driver symlink farm.
+/// - `/run/opengl-driver-32`: NixOS 32-bit OpenGL driver compatibility path.
+/// - `/run/udev`: libudev/Mesa device metadata for GPU/device discovery.
+///
+/// `/run/user` is deliberately excluded: it contains the per-user DBus
+/// session bus (`/run/user/<uid>/bus`) used by Secret Service/keyrings.
+/// `/run/dbus` is deliberately excluded: it exposes the host system bus.
+/// Modern Linux makes `/var/run` a symlink to `/run`; allow canonical
+/// `/run/...` subpaths instead of re-adding top-level `/var/run`.
 #[cfg(target_os = "linux")]
 pub const SYSTEM_EXEC_PATHS: &[&str] = &[
     "/usr/bin",
@@ -21,8 +36,13 @@ pub const SYSTEM_EXEC_PATHS: &[&str] = &[
     "/sys",
     "/etc",
     "/tmp",
-    "/run",
-    "/var/run",
+    "/run/systemd/resolve",
+    "/run/resolvconf",
+    "/run/NetworkManager",
+    "/run/current-system",
+    "/run/opengl-driver",
+    "/run/opengl-driver-32",
+    "/run/udev",
     "/usr/share",
 ];
 #[cfg(target_os = "macos")]
@@ -192,3 +212,19 @@ pub fn system_writable_paths() -> Vec<PathBuf> {
         vec![PathBuf::from("/tmp")]
     }
 }
+
+/// XDG Base Directory Specification variables that are safe to pass through
+/// to sandboxed processes. Deny-by-default whitelist: only these XDG vars are
+/// forwarded. Notably EXCLUDES `XDG_RUNTIME_DIR` (locates the DBus session bus
+/// / keyring — a credential-leak vector) and all desktop-session/seat vars
+/// (`XDG_SESSION_*`, `XDG_SEAT*`, `XDG_VTNR`, `XDG_CURRENT_DESKTOP`, etc.),
+/// which sandboxed CLI tools do not need.
+pub const SAFE_XDG_VARS: &[&str] = &[
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_BIN_HOME",
+    "XDG_DATA_DIRS",
+    "XDG_CONFIG_DIRS",
+];

@@ -26,6 +26,26 @@ pub struct Args {
     /// Error aborts startup.
     #[arg(long, value_name = "JQ_FILTER")]
     pub env: Vec<String>,
+
+    /// Load YAML file at startup and expose parsed value as jaq variable `$<name>`.
+    #[arg(long, value_name = "NAME=PATH")]
+    pub load_yaml: Vec<String>,
+
+    /// Load JSON file at startup and expose parsed value as jaq variable `$<name>`.
+    #[arg(long, value_name = "NAME=PATH")]
+    pub load_json: Vec<String>,
+
+    /// Load raw UTF-8 file at startup and expose contents as jaq variable `$<name>`.
+    #[arg(long, value_name = "NAME=PATH")]
+    pub load_raw: Vec<String>,
+
+    /// jq/jaq transformer that builds files under `$temp_file_root`.
+    #[arg(long, value_name = "JQ_FILTER")]
+    pub fs: Vec<String>,
+
+    /// Run shell command at startup and expose stdout as jaq variable `$<name>`.
+    #[arg(long, value_name = "NAME=COMMAND")]
+    pub load_exec: Vec<String>,
 }
 
 impl Args {
@@ -49,6 +69,11 @@ mod tests {
             hook: Vec::new(),
             log_file: None,
             env: Vec::new(),
+            load_yaml: Vec::new(),
+            load_json: Vec::new(),
+            load_raw: Vec::new(),
+            fs: Vec::new(),
+            load_exec: Vec::new(),
         };
         assert_eq!(args.combined_filter(), ".");
     }
@@ -59,6 +84,11 @@ mod tests {
             hook: vec![".foo = 1".into(), ".bar = 2".into()],
             log_file: None,
             env: Vec::new(),
+            load_yaml: Vec::new(),
+            load_json: Vec::new(),
+            load_raw: Vec::new(),
+            fs: Vec::new(),
+            load_exec: Vec::new(),
         };
         assert_eq!(args.combined_filter(), ".foo = 1 | .bar = 2");
     }

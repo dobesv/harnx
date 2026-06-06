@@ -26,6 +26,7 @@ http.workspace = true
 rcgen.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
@@ -50,4 +51,5 @@ reqwest = { workspace = true, features = ["json", "rustls"] }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 serde_json.workspace = true
+serde_yaml.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "time", "io-util"] }

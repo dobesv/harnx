@@ -24,6 +24,14 @@ use tokio_rustls::rustls::{self, pki_types};
 use tokio_rustls::TlsAcceptor;
 
 use harnx_proxy_auth::{ca, filter, proxy};
+fn jaq_vars(
+    sentinels: &Arc<harnx_proxy_auth::sentinel::Sentinels>,
+) -> Arc<harnx_proxy_auth::filter::JaqVars> {
+    Arc::new(
+        harnx_proxy_auth::filter::JaqVars::new(sentinels, String::new(), Vec::new())
+            .expect("jaq vars"),
+    )
+}
 
 /// Starts an HTTPS test server using the provided cert+key (DER-encoded).
 async fn spawn_https_server(
@@ -119,10 +127,13 @@ async fn header_injection_works_through_https_connect_tunnel() {
 
         // Start the proxy with danger_accept_invalid_certs so it can connect
         // upstream to our self-signed test server.
-        let proxy_port =
-            proxy::start_proxy_danger_accept_invalid_certs(compiled, ca_setup, sentinels)
-                .await
-                .expect("start proxy");
+        let proxy_port = proxy::start_proxy_danger_accept_invalid_certs(
+            compiled,
+            ca_setup,
+            jaq_vars(&sentinels),
+        )
+        .await
+        .expect("start proxy");
 
         sleep(Duration::from_millis(100)).await;
 
@@ -210,7 +221,7 @@ async fn hook_filter_can_use_sentinel_variables() {
         // Start the proxy with danger_accept_invalid_certs so it can connect
         // upstream to our self-signed test server.
         let proxy_port =
-            proxy::start_proxy_danger_accept_invalid_certs(compiled, ca_setup, sentinels.clone())
+            proxy::start_proxy_danger_accept_invalid_certs(compiled, ca_setup, jaq_vars(&sentinels))
             .await
             .expect("start proxy");
 
