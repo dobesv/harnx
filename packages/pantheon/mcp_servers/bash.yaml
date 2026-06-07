@@ -80,19 +80,17 @@ hooks:
       --fs '$acli_cfg.current_profile as $cp |
           (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
           if $p and $atlassian_token then
-            . + {
-              "acli/jira_config.yaml": ({
-                version: 1,
-                current_profile: $cp,
-                profiles: [{
-                  site: $p.site,
-                  cloud_id: $p.cloud_id,
-                  account_id: $p.account_id,
-                  auth_type: "api_token",
-                  token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY="
-                }]
-              } | tojson)
-            }
+            . + { "acli/jira_config.yaml": (
+              "version: 1\n" +
+              "current_profile: \($cp)\n" +
+              "profiles:\n" +
+              "    - site: \($p.site)\n" +
+              "      cloud_id: \($p.cloud_id)\n" +
+              "      account_id: \($p.account_id)\n" +
+              "      email: \($p.email // env.ATLASSIAN_EMAIL // "")\n" +
+              "      auth_type: api_token\n" +
+              "      token: !!binary AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=\n"
+            ) }
           end'
       --env '$acli_cfg.current_profile as $cp |
           (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
