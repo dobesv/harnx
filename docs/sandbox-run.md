@@ -170,17 +170,20 @@ exec harnx-sandbox-run \
         end' \
     --load-yaml acli_cfg=~/.config/acli/jira_config.yaml \
     --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"' \
-    --fs 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then
-          $acli_cfg.profiles[0] as $p |
-          . + { "acli/jira_config.yaml": ({ version: 1,
-            current_profile: "\($p.cloud_id):\($p.account_id)",
+    --fs '$acli_cfg.current_profile as $cp |
+        (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+        if $p and $atlassian_token then
+          . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
             profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
-              token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }]
-          } | tojson) }
+              token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
         end' \
-    --env 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end' \
-    --hook 'if (.host == "api.atlassian.com" or (.host | endswith(".atlassian.net"))) and $atlassian_token
-          then .headers.authorization = basic($acli_cfg.profiles[0].email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end' \
+    --env '$acli_cfg.current_profile as $cp |
+        (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+        if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end' \
+    --hook '$acli_cfg.current_profile as $cp |
+        (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+        if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
+        then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end' \
   \; \
   -- claude --dangerously-skip-permissions "$@"
 ```
@@ -395,17 +398,20 @@ harnx-sandbox-run \
   --hook claude-command-persistent harnx-proxy-auth \
     --load-yaml acli_cfg=~/.config/acli/jira_config.yaml \
     --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"' \
-    --fs 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then
-          $acli_cfg.profiles[0] as $p |
-          . + { "acli/jira_config.yaml": ({ version: 1,
-            current_profile: "\($p.cloud_id):\($p.account_id)",
+    --fs '$acli_cfg.current_profile as $cp |
+        (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+        if $p and $atlassian_token then
+          . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
             profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
-              token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }]
-          } | tojson) }
+              token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
         end' \
-    --env 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end' \
-    --hook 'if (.host == "api.atlassian.com" or (.host | endswith(".atlassian.net"))) and $atlassian_token
-          then .headers.authorization = basic($acli_cfg.profiles[0].email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end' \
+    --env '$acli_cfg.current_profile as $cp |
+        (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+        if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end' \
+    --hook '$acli_cfg.current_profile as $cp |
+        (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+        if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
+        then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end' \
   \; \
   -- acli jira workitem search --jql "assignee = currentUser() AND resolution = Unresolved"
 ```
@@ -433,17 +439,20 @@ harnx-sandbox-run \
         end' \
     --load-yaml acli_cfg=~/.config/acli/jira_config.yaml \
     --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"' \
-    --fs 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then
-          $acli_cfg.profiles[0] as $p |
-          . + { "acli/jira_config.yaml": ({ version: 1,
-            current_profile: "\($p.cloud_id):\($p.account_id)",
+    --fs '$acli_cfg.current_profile as $cp |
+        (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+        if $p and $atlassian_token then
+          . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
             profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
-              token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }]
-          } | tojson) }
+              token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
         end' \
-    --env 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end' \
-    --hook 'if (.host == "api.atlassian.com" or (.host | endswith(".atlassian.net"))) and $atlassian_token
-          then .headers.authorization = basic($acli_cfg.profiles[0].email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end' \
+    --env '$acli_cfg.current_profile as $cp |
+        (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+        if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end' \
+    --hook '$acli_cfg.current_profile as $cp |
+        (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+        if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
+        then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end' \
   \; \
   -- my-tool
 ```

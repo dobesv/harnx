@@ -55,7 +55,7 @@ fn run_fs_script(script: &str, vars: &crate::filter::JaqVars, input: Value) -> R
     )
     .map_err(|errors| anyhow!("jaq fs script compile error: {errors:?}"))?;
 
-    let input = fmts::read::json::parse_single(input.to_string().as_bytes())
+    let jaq_input = fmts::read::json::parse_single(input.to_string().as_bytes())
         .map_err(|error| anyhow!("fs script input conversion: {error}"))?;
     let runner = data::Runner::default();
     let mut output = None;
@@ -64,7 +64,7 @@ fn run_fs_script(script: &str, vars: &crate::filter::JaqVars, input: Value) -> R
         &runner,
         &filter,
         vars.runtime_vars()?,
-        std::iter::once(Ok::<_, String>(input)),
+        std::iter::once(Ok::<_, String>(jaq_input)),
         |value| Ok::<_, String>(Some(value)),
         |result| {
             output = Some(result);
@@ -76,7 +76,9 @@ fn run_fs_script(script: &str, vars: &crate::filter::JaqVars, input: Value) -> R
     match output {
         Some(Ok(value)) => crate::filter::jaq_value_to_json(value),
         Some(Err(error)) => bail!("jaq fs script runtime error: {error}"),
-        None => Ok(Value::Object(serde_json::Map::new())),
+        // No output (e.g. the filter is `empty`): pass the current fs-map
+        // through unchanged rather than discarding accumulated state.
+        None => Ok(input),
     }
 }
 
@@ -242,6 +244,24 @@ mod tests {
         )
         .unwrap();
         assert!(!dir.path().join("a.txt").exists());
+    }
+
+    #[test]
+    fn empty_output_preserves_prior_fs_map() {
+        // A script that produces no output (`empty`) must pass the accumulated
+        // fs-map through unchanged rather than discarding it.
+        let dir = tempdir().unwrap();
+        let vars = vars(dir.path().to_str().unwrap());
+        eval_and_write_files(
+            &[r#". + {"keep.txt": "kept"}"#.to_owned(), "empty".to_owned()],
+            &vars,
+            dir.path().to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
+            "kept"
+        );
     }
 
     #[test]

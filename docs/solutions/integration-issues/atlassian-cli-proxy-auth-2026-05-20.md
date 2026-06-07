@@ -77,40 +77,31 @@ To support this without `acli`-specific logic in the Rust proxy, `harnx-proxy-au
 The following configuration in `packages/coding/mcp_servers/bash.yaml` sources the API token from the host OS keyring and synthesizes a private `jira_config.yaml` for `acli` to use:
 
 ```yaml
-# Load host config to extract site/cloud_id
+# Load host config to extract current_profile
 --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
 
 # Fetch the real token from the host keyring (Linux example)
 --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
 
 # Create synthetic config in a private temp dir
---fs 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then
-    $acli_cfg.profiles[0] as $p |
-    . + {
-      "acli/jira_config.yaml": ({
-        version: 1,
-        current_profile: "\($p.cloud_id):\($p.account_id)",
-        profiles: [{
-          site: $p.site,
-          cloud_id: $p.cloud_id,
-          account_id: $p.account_id,
-          auth_type: "api_token",
-          token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY="
-        }]
-      } | tojson)
-    }
-  end'
+--fs '$acli_cfg.current_profile as $cp |
+    (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+    if $p and $atlassian_token then
+      . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
+        profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
+          token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
+    end'
 
 # Point acli to the synthetic config
---env 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then
-    .ACLI_CONFIG_DIR = $temp_file_root
-  end'
+--env '$acli_cfg.current_profile as $cp |
+    (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+    if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
 
 # Replace the sentinel token with real credentials
---hook 'if (.host == "api.atlassian.com" or (.host | endswith(".atlassian.net")))
-    and $atlassian_token
-    then .headers.authorization = basic($acli_cfg.profiles[0].email // env.ATLASSIAN_EMAIL // ""; $atlassian_token)
-    end'
+--hook '$acli_cfg.current_profile as $cp |
+    (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+    if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
+    then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
 ```
 
 *Note: The `--load-exec` command uses `sed` to extract the `current_profile` from the host config and `secret-tool` (Linux) or `security` (macOS) to fetch the token. The macOS variant is: `security find-generic-password -s acli -a "jira:$p" -w`.*
@@ -130,7 +121,7 @@ By providing a valid `SecretStore` blob (a sentinel token) in a private `jira_co
 3.  **Local Decryption**: `acli` decrypts the sentinel token locally (since the key is in the blob, it requires no keyring/DBus).
 4.  **Header Construction**: `acli` builds an `Authorization: Basic base64(email:sentinel)` header.
 5.  **MITM Interception**: The request is routed through `HTTPS_PROXY` to `harnx-proxy-auth`.
-6.  **Credential Swap**: The proxy replaces the `Authorization` header with the real token (sourced from the host keyring) before forwarding the request to Atlassian. The real token never enters the sandbox.
+6.  **Credential Swap**: The proxy replaces the `Authorization` header with the real token (sourced from the host keyring) before forwarding the request to Atlassian. The proxy matches only the site in your active `acli` profile (plus `api.atlassian.com`), ensuring credentials are never sent to third-party tenants. The real token never enters the sandbox.
 
 ## Why This Works
 

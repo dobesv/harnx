@@ -78,11 +78,10 @@ async fn main() -> Result<()> {
     } // lock dropped here
 
     if let Some(temp_dir) = fs_temp_dir {
-        let root = temp_dir.path().to_path_buf();
         tokio::select! {
             result = hook::run_jsonl_loop(port, ca_cert_path, extra_env) => result,
             _ = shutdown_signal() => {
-                let _ = std::fs::remove_dir_all(&root);
+                // `TempDir`'s Drop removes the directory on the way out.
                 drop(temp_dir);
                 Ok(())
             }

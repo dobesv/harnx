@@ -45,6 +45,8 @@ fn acli_synthetic_config_written_from_host_yaml() {
     let parsed: Value =
         serde_json::from_str(&rendered_contents).expect("synthetic config should be JSON");
 
+    // The proxy must select the profile matching `current_profile`, NOT
+    // `profiles[0]` (which is the unrelated `othercloud` tenant in the fixture).
     assert_eq!(parsed["current_profile"], "realcloud123:realacct456");
     assert_eq!(parsed["profiles"][0]["cloud_id"], "realcloud123");
     assert_eq!(parsed["profiles"][0]["site"], "mycompany.atlassian.net");
@@ -52,6 +54,11 @@ fn acli_synthetic_config_written_from_host_yaml() {
     assert!(
         !rendered_contents.contains(HOST_TOKEN),
         "synthetic config leaked host token: {rendered_contents}"
+    );
+    // The wrong (non-active) profile must not have been selected.
+    assert!(
+        !rendered_contents.contains("othercloud") && !rendered_contents.contains("OTHER_PROFILE"),
+        "synthetic config used the wrong (non-active) profile: {rendered_contents}"
     );
 
     kill_child(&mut child);
@@ -100,42 +107,77 @@ fn acli_status_smoke_test_with_real_binary_and_creds() {
     assert!(status.success(), "acli status exit code: {status:?}");
 }
 
+/// Token the fake keyring command emits — stands in for the real
+/// `secret-tool` / `security` lookup so the test exercises the `--load-exec`
+/// self-sourcing path without a real keyring.
+const KEYRING_TOKEN: &str = "TOKEN_FROM_FAKE_KEYRING";
+
+/// Write an executable that emits [`KEYRING_TOKEN`] only when invoked with the
+/// expected `jira:<current_profile>` lookup key, mirroring how the shipped
+/// `--load-exec` command calls `secret-tool`. Returns its path.
+fn write_credential_script(home: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = home.join("fake-secret.sh");
+    // Match the active profile's key (realcloud123:realacct456). Any other
+    // lookup exits non-zero, so the proxy must derive the right key.
+    let script = format!(
+        "#!/usr/bin/env sh\ncase \"$*\" in\n  *\"jira:realcloud123:realacct456\"*) printf '%s' '{KEYRING_TOKEN}' ;;\n  *) exit 1 ;;\nesac\n"
+    );
+    std::fs::write(&path, script).expect("write credential script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod credential script");
+    path
+}
+
 fn spawn_proxy(proxy_bin: &Path, home: &Path) -> Child {
+    let cred_script = write_credential_script(home);
+    // Mirror the shipped bash.yaml wiring: derive the active profile's keyring
+    // key from `current_profile` and fetch the token via `--load-exec`
+    // (here pointed at a fake keyring command), then select the profile whose
+    // `<cloud_id>:<account_id>` equals `current_profile` (NOT `profiles[0]`).
+    let load_exec = format!(
+        "atlassian_token=p=$(sed -n \"s/^current_profile:[[:space:]]*\\\"\\?\\([^\\\"]*\\)\\\"\\?[[:space:]]*$/\\1/p\" ~/.config/acli/jira_config.yaml); test -n \"$p\" && {} \"jira:$p\"",
+        cred_script.display()
+    );
     Command::new(proxy_bin)
         .args([
             "--load-yaml",
             "acli_cfg=~/.config/acli/jira_config.yaml",
+            "--load-exec",
+            &load_exec,
             "--fs",
-            r#"if $acli_cfg and env.ATLASSIAN_API_TOKEN then
-                $acli_cfg.profiles[0] as $p |
-                . + {
-                  "acli/jira_config.yaml": ({
-                    version: 1,
-                    current_profile: "\($p.cloud_id):\($p.account_id)",
-                    profiles: [{
-                      site: $p.site,
-                      cloud_id: $p.cloud_id,
-                      account_id: $p.account_id,
-                      auth_type: "api_token",
-                      token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY="
-                    }]
-                  } | tojson)
-                }
-              end"#,
+            r#"$acli_cfg.current_profile as $cp |
+                (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+                if $p and $atlassian_token then
+                  . + {
+                    "acli/jira_config.yaml": ({
+                      version: 1,
+                      current_profile: $cp,
+                      profiles: [{
+                        site: $p.site,
+                        cloud_id: $p.cloud_id,
+                        account_id: $p.account_id,
+                        auth_type: "api_token",
+                        token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY="
+                      }]
+                    } | tojson)
+                  }
+                end"#,
             "--env",
-            r#"if $acli_cfg and env.ATLASSIAN_API_TOKEN then
-                .ACLI_CONFIG_DIR = $temp_file_root
-              end"#,
+            r#"$acli_cfg.current_profile as $cp |
+                (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+                if $p and $atlassian_token then
+                  .ACLI_CONFIG_DIR = $temp_file_root
+                end"#,
             "--hook",
-            r#"if (.host == "api.atlassian.com" or (.host | endswith(".atlassian.net")))
-                and env.ATLASSIAN_API_TOKEN != null
-                then .headers.authorization = basic(env.ATLASSIAN_EMAIL; env.ATLASSIAN_API_TOKEN)
+            r#"$acli_cfg.current_profile as $cp |
+                (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+                if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
+                then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token)
                 end"#,
         ])
         .env("HOME", home)
         .env("TMPDIR", home)
-        .env("ATLASSIAN_EMAIL", "me@example.com")
-        .env("ATLASSIAN_API_TOKEN", "REALTOKEN")
         .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/nonexistent-harnx-test-bus")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -236,12 +278,22 @@ fn which_acli() -> Result<PathBuf, std::io::Error> {
 }
 
 fn sample_host_config() -> &'static str {
+    // `current_profile` is `<cloud_id>:<account_id>` (acli's convention) and is
+    // the SECOND profile, so the proxy must select by `current_profile` rather
+    // than blindly using `profiles[0]`.
     r#"version: 1
-current_profile: host-profile
+current_profile: realcloud123:realacct456
 profiles:
+  - site: other.atlassian.net
+    cloud_id: othercloud
+    account_id: otheracct
+    email: other@example.com
+    auth_type: api_token
+    token: OTHER_PROFILE_TOKEN
   - site: mycompany.atlassian.net
     cloud_id: realcloud123
     account_id: realacct456
+    email: me@example.com
     auth_type: api_token
     token: REAL_HOST_TOKEN_DO_NOT_LEAK
 "#

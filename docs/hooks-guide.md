@@ -452,22 +452,24 @@ hooks:
       harnx-proxy-auth
       --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
       --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
-      --fs 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then
-          $acli_cfg.profiles[0] as $p |
-          . + { "acli/jira_config.yaml": ({ version: 1,
-            current_profile: "\($p.cloud_id):\($p.account_id)",
-            profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
-              token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }]
-          } | tojson) }
-        end'
-      --env 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
-      --hook 'if (.host == "api.atlassian.com" or (.host | endswith(".atlassian.net"))) and $atlassian_token
-          then .headers.authorization = basic($acli_cfg.profiles[0].email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
+      --fs '$acli_cfg.current_profile as $cp |
+          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+          if $p and $atlassian_token then
+            . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
+              profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
+                token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
+          end'
+      --env '$acli_cfg.current_profile as $cp |
+          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+          if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
+      --hook '$acli_cfg.current_profile as $cp |
+          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+          if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
+          then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
 ```
 
 > **macOS users:** Change the `--load-exec` command for `atlassian_token` to use `security find-generic-password -s acli -a "jira:$p" -w`.
-
-> **Security note:** `endswith(".atlassian.net")` prevents DNS-level spoofing. Credentials will be forwarded to **any** `*.atlassian.net` tenant, including ones owned by third parties. To scope injection to your own workspace only, use explicit equality: `.host == "mysite.atlassian.net"`.
+> **Security note:** The proxy matches only the site in your active `acli` profile (plus `api.atlassian.com`), preventing credentials from being accidentally forwarded to other Atlassian tenants.
 
 You can combine Atlassian and GitHub auth in a single `harnx-proxy-auth` invocation:
 
@@ -485,17 +487,20 @@ hooks:
           else . end'
       --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
       --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
-      --fs 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then
-          $acli_cfg.profiles[0] as $p |
-          . + { "acli/jira_config.yaml": ({ version: 1,
-            current_profile: "\($p.cloud_id):\($p.account_id)",
-            profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
-              token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }]
-          } | tojson) }
-        end'
-      --env 'if ($acli_cfg.profiles[0]? // null) and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
-      --hook 'if (.host == "api.atlassian.com" or (.host | endswith(".atlassian.net"))) and $atlassian_token
-          then .headers.authorization = basic($acli_cfg.profiles[0].email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
+      --fs '$acli_cfg.current_profile as $cp |
+          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+          if $p and $atlassian_token then
+            . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
+              profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
+                token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
+          end'
+      --env '$acli_cfg.current_profile as $cp |
+          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+          if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
+      --hook '$acli_cfg.current_profile as $cp |
+          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+          if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
+          then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
 ```
 
 ### Injected Environment Variables
