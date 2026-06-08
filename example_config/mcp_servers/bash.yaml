@@ -28,8 +28,6 @@ args:
   - --extra-rwx
   - ~/.ruff_cache
   # Allow access to various config files
-  - --extra-read
-  - ~/.config/acli
   - --extra-write
   - ~/.config/chromium
   - --extra-read

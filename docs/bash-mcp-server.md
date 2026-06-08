@@ -27,7 +27,7 @@ By default, only a minimal set of host environment variables is passed through t
 - `TMPDIR`
 - `TMP`
 - `TEMP`
-- All variables prefixed with `XDG_*` (e.g., `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`)
+- The following `XDG_*` Base Directory variables: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `XDG_BIN_HOME`, `XDG_DATA_DIRS`, `XDG_CONFIG_DIRS`.
 
 ## Adding Extra Variables
 
