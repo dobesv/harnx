@@ -117,6 +117,8 @@ pub enum SessionEvent {
         path: PathBuf,
     },
     CompactingStarted,
+    CompactingCompleted,
+    CompactingFailed(String),
     AgentInitializing {
         agent: String,
     },

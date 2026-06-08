@@ -7583,3 +7583,125 @@ async fn test_agent_command_leaves_tui_without_session_gap() {
         "Expected a picker to be open when session is missing!"
     );
 }
+
+#[tokio::test]
+async fn render_agent_event_compacting_started_produces_transcript_entry() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // Emit CompactingStarted event
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::CompactingStarted),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Should produce a SystemText transcript item
+    let has_compacting_msg = tui.app.transcript.iter().any(|item| {
+        matches!(
+            item,
+            TranscriptItem::SystemText(text) if text == "Compacting session…"
+        )
+    });
+    assert!(
+        has_compacting_msg,
+        "Expected 'Compacting session…' in transcript after CompactingStarted event"
+    );
+}
+
+#[tokio::test]
+async fn render_agent_event_compacting_completed_produces_transcript_entry() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // First emit CompactingStarted
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::CompactingStarted),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Then emit CompactingCompleted
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::CompactingCompleted),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Should have both transcript items
+    let items: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::SystemText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        items.contains(&"Compacting session…".to_string()),
+        "Expected 'Compacting session…' in transcript"
+    );
+    assert!(
+        items.contains(&"Session compacted.".to_string()),
+        "Expected 'Session compacted.' in transcript"
+    );
+}
+
+#[tokio::test]
+async fn render_agent_event_compacting_failed_produces_error_transcript_entry() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // First emit CompactingStarted
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::CompactingStarted),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Then emit CompactingFailed
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::CompactingFailed("test error".to_string())),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Should have both transcript items
+    let items: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::SystemText(text) => Some(format!("SystemText: {text}")),
+            TranscriptItem::ErrorText(text) => Some(format!("ErrorText: {text}")),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        items.iter().any(|s| s.contains("Compacting session…")),
+        "Expected 'Compacting session…' in transcript"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|s| s.contains("Compaction failed: test error")),
+        "Expected 'Compaction failed: test error' in transcript"
+    );
+}
