@@ -2277,6 +2277,99 @@ async fn test_submitted_message_with_text_attachment_snapshot() {
     insta::assert_snapshot!("submitted_message_with_text_attachment", rendered);
 }
 
+#[tokio::test]
+async fn render_attachment_preview_crops_from_middle_keeping_first_and_last_lines() {
+    use crate::input::render_attachment_preview;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("big.txt");
+    {
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        // 40 lines — well over the 12-line preview window, so cropping kicks in.
+        for i in 1..=40 {
+            writeln!(f, "line {i}").unwrap();
+        }
+    }
+
+    let preview = render_attachment_preview(&file_path)
+        .await
+        .expect("preview should be produced");
+
+    // First lines are kept.
+    assert!(
+        preview.contains("line 1\n"),
+        "expected first line kept: {preview:?}"
+    );
+    // Last lines are kept (cropped from the middle, not the end).
+    assert!(
+        preview.contains("line 40"),
+        "expected last line kept: {preview:?}"
+    );
+    // A middle line is dropped.
+    assert!(
+        !preview.contains("line 20"),
+        "expected middle line dropped: {preview:?}"
+    );
+    // A truncation marker sits between the kept head and tail.
+    assert!(
+        preview.contains("..."),
+        "expected truncation marker: {preview:?}"
+    );
+}
+
+#[tokio::test]
+async fn render_attachment_preview_short_file_unchanged() {
+    use crate::input::render_attachment_preview;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("short.txt");
+    {
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        write!(f, "alpha\nbeta\ngamma").unwrap();
+    }
+
+    let preview = render_attachment_preview(&file_path)
+        .await
+        .expect("preview should be produced");
+    assert_eq!(preview, "alpha\nbeta\ngamma");
+}
+
+#[tokio::test]
+async fn render_attachment_preview_crops_long_single_line_from_middle() {
+    use crate::input::render_attachment_preview;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("oneline.txt");
+    {
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        // One very long line, well over the 800-byte preview budget.
+        let head = "A".repeat(2000);
+        let tail = "Z".repeat(2000);
+        write!(f, "{head}{tail}").unwrap();
+    }
+
+    let preview = render_attachment_preview(&file_path)
+        .await
+        .expect("preview should be produced");
+
+    // Stays within the byte budget.
+    assert!(
+        preview.len() <= 800,
+        "preview should respect byte budget, got {} bytes",
+        preview.len()
+    );
+    // Keeps content from both the start and end of the line (middle-cropped).
+    assert!(preview.starts_with('A'), "expected head kept: {preview:?}");
+    assert!(preview.ends_with('Z'), "expected tail kept: {preview:?}");
+    assert!(
+        preview.contains("..."),
+        "expected truncation marker: {preview:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_input_word_wraps_long_line() {
     // Use a narrow viewport (30 cols) so a long single-line input must wrap
