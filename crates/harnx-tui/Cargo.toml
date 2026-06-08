@@ -38,7 +38,7 @@ shell-words = { workspace = true }
 sha2 = { workspace = true }
 syntect = { workspace = true }
 textwrap = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 tokio-stream = { workspace = true }
 pulldown-cmark = "0.13.3"
 unicode-width = { workspace = true }

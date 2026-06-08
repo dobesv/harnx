@@ -13,8 +13,17 @@ use harnx_runtime::utils::pretty_yaml_block;
 use ratatui_textarea::{Input as TextInput, Key};
 use std::path::Path;
 
-const ATTACHMENT_PREVIEW_MAX_CHARS: usize = 800;
+/// Byte budget for an attachment preview. Applied via `truncate_output`'s
+/// `max_output_bytes` (and split across per-line head/tail byte limits), so it
+/// is measured in bytes rather than characters — multibyte text may crop a
+/// little earlier than an ASCII-only equivalent.
+const ATTACHMENT_PREVIEW_MAX_BYTES: usize = 800;
 const ATTACHMENT_PREVIEW_MAX_LINES: usize = 12;
+/// Lines kept from the start of a cropped attachment preview.
+const ATTACHMENT_PREVIEW_HEAD_LINES: usize = ATTACHMENT_PREVIEW_MAX_LINES / 2;
+/// Lines kept from the end of a cropped attachment preview.
+const ATTACHMENT_PREVIEW_TAIL_LINES: usize =
+    ATTACHMENT_PREVIEW_MAX_LINES - ATTACHMENT_PREVIEW_HEAD_LINES;
 
 /// How long `start_prompt` waits for a prior prompt task to finish
 /// cooperatively (after signalling its abort) before force-cancelling it
@@ -77,30 +86,30 @@ fn unique_attachment_storage_path(
     dir.join(format!("{}-{}{}", stem, uuid::Uuid::new_v4(), ext))
 }
 
-fn render_attachment_preview(path: &Path) -> Option<String> {
-    let bytes = std::fs::read(path).ok()?;
+pub(crate) async fn render_attachment_preview(path: &Path) -> Option<String> {
+    let bytes = tokio::fs::read(path).await.ok()?;
     let text = std::str::from_utf8(&bytes).ok()?;
-    let mut lines = Vec::new();
-    let mut chars_seen = 0usize;
-
-    for line in text.lines().take(ATTACHMENT_PREVIEW_MAX_LINES) {
-        if chars_seen >= ATTACHMENT_PREVIEW_MAX_CHARS {
-            break;
-        }
-        let remaining = ATTACHMENT_PREVIEW_MAX_CHARS.saturating_sub(chars_seen);
-        let snippet: String = line.chars().take(remaining).collect();
-        chars_seen += snippet.chars().count();
-        lines.push(snippet);
-    }
-
-    if lines.is_empty() {
+    if text.is_empty() {
         return None;
     }
 
-    let truncated = text.chars().count() > chars_seen || text.lines().count() > lines.len();
-    let mut preview = lines.join("\n");
-    if truncated {
-        preview.push_str("\n...");
+    // Reuse the same middle-cropping utility the agent uses so previews keep
+    // the first and last lines instead of cutting off only the head. See
+    // issue #770.
+    let opts = harnx_mcp::safety::TruncateOpts {
+        head_lines: ATTACHMENT_PREVIEW_HEAD_LINES,
+        tail_lines: ATTACHMENT_PREVIEW_TAIL_LINES,
+        // Allow long single lines to be cropped in the middle too.
+        line_head_bytes: ATTACHMENT_PREVIEW_MAX_BYTES / 2,
+        line_tail_bytes: ATTACHMENT_PREVIEW_MAX_BYTES / 2,
+        max_output_bytes: ATTACHMENT_PREVIEW_MAX_BYTES,
+        marker: Some("...".to_string()),
+    };
+
+    let preview = harnx_mcp::safety::truncate_output(text, &opts);
+    let preview = preview.trim_end_matches('\n').to_string();
+    if preview.is_empty() {
+        return None;
     }
     Some(preview)
 }
@@ -438,7 +447,8 @@ impl Tui {
                             seq: None,
                             timestamp: Some(chrono::Utc::now()),
                         });
-                        self.render_submitted_attachments(&attachments_snapshot);
+                        self.render_submitted_attachments(&attachments_snapshot)
+                            .await;
                         self.pin_transcript_to_bottom();
                         self.app.input = Self::new_input();
                         self.run_command(&text).await?;
@@ -469,7 +479,8 @@ impl Tui {
                             seq: None,
                             timestamp: Some(chrono::Utc::now()),
                         });
-                        self.render_submitted_attachments(&attachments_snapshot);
+                        self.render_submitted_attachments(&attachments_snapshot)
+                            .await;
                         self.pin_transcript_to_bottom();
                         self.app.input = Self::new_input();
                         let msg = crate::types::PendingMessage {
@@ -768,7 +779,8 @@ impl Tui {
                     seq: None,
                     timestamp: Some(chrono::Utc::now()),
                 });
-                self.render_submitted_attachments(&pending.attachments);
+                self.render_submitted_attachments(&pending.attachments)
+                    .await;
                 self.pin_transcript_to_bottom();
                 self.refresh_input_chrome();
             }
@@ -802,7 +814,8 @@ impl Tui {
             seq: None,
             timestamp: Some(chrono::Utc::now()),
         });
-        self.render_submitted_attachments(&pending.attachments);
+        self.render_submitted_attachments(&pending.attachments)
+            .await;
         self.pin_transcript_to_bottom();
         if pending.text.trim_start().starts_with('.') {
             self.app.attachments = pending.attachments;
@@ -822,7 +835,7 @@ impl Tui {
         *self.shared_pending_message.lock().await = None;
     }
 
-    fn render_submitted_attachments(&mut self, attachments: &[crate::types::Attachment]) {
+    async fn render_submitted_attachments(&mut self, attachments: &[crate::types::Attachment]) {
         if attachments.is_empty() {
             return;
         }
@@ -839,7 +852,7 @@ impl Tui {
                 attachment.display_name.clone(),
             ));
 
-            if let Some(preview) = render_attachment_preview(&attachment.path) {
+            if let Some(preview) = render_attachment_preview(&attachment.path).await {
                 for line in preview.lines() {
                     self.app
                         .transcript
