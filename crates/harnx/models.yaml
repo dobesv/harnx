@@ -1230,6 +1230,13 @@
       output_price: 0.15
       supports_vision: true
       supports_tool_use: true
+    - name: ministral-8b-latest
+      max_input_tokens: 262144
+      max_output_tokens: 262144
+      input_price: 0.15
+      output_price: 0.15
+      supports_vision: true
+      supports_tool_use: true
     - name: mistral-embed
       max_input_tokens: 8192
       input_price: 0.1
@@ -2492,6 +2499,13 @@
       max_input_tokens: 8192
       input_price: 0.2
       type: embedding
+    - name: google/gemma-4-26b-a4b-it-maas
+      max_input_tokens: 256000
+      max_output_tokens: 128000
+      input_price: 0.15
+      output_price: 0.6
+      supports_vision: true
+      supports_tool_use: true
     - name: jamba-1.5
       max_input_tokens: 256000
       max_output_tokens: 256000
@@ -3603,6 +3617,13 @@
       max_output_tokens: 8192
       input_price: 0.3
       output_price: 2.4
+      supports_tool_use: true
+    - name: MiniMax-M3
+      max_input_tokens: 512000
+      max_output_tokens: 128000
+      input_price: 0.6
+      output_price: 2.4
+      supports_vision: true
       supports_tool_use: true
     - name: minimax-m2.1
       max_input_tokens: 204800
