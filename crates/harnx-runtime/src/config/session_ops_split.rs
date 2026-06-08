@@ -408,21 +408,28 @@ impl Config {
         if !need_compact {
             return;
         }
-        let color = if config.read().light_theme() {
-            nu_ansi_term::Color::LightGray
-        } else {
-            nu_ansi_term::Color::DarkGray
-        };
-        crate::utils::emit_info(format!(
-            "📢 {}",
-            color.italic().paint("Compacting the session.")
+        // Use SessionEvent for consistent TUI/CLI handling.
+        // The TUI will render CompactingStarted/CompactingCompleted as transcript items.
+        harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+            harnx_core::event::SessionEvent::CompactingStarted,
         ));
         tokio::spawn(async move {
-            if let Err(err) = Config::compact_session(&config).await {
-                warn!("Failed to compact the session: {err}");
-            }
+            let result = Config::compact_session(&config).await;
             if let Some(session) = config.write().session.as_mut() {
                 session.set_compressing(false);
+            }
+            match &result {
+                Ok(()) => {
+                    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+                        harnx_core::event::SessionEvent::CompactingCompleted,
+                    ));
+                }
+                Err(err) => {
+                    warn!("Failed to compact the session: {err}");
+                    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
+                        harnx_core::event::SessionEvent::CompactingFailed(err.to_string()),
+                    ));
+                }
             }
         });
     }

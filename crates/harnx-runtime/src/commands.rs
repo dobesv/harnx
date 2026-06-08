@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use crate::config::{macro_execute, AgentVariables, Config, GlobalConfig, Input, LastMessage};
-use crate::utils::{abortable_run_with_spinner, dimmed_text, set_text, AbortSignal};
+use crate::utils::{dimmed_text, set_text, AbortSignal};
 use harnx_hooks::{
     dispatch_hooks_with_managers, AsyncHookManager, HookEvent, HookResultControl,
     PersistentHookManager,
@@ -343,13 +343,74 @@ pub async fn run_command_with_output(
             }
             ".compact" => match args {
                 Some("session") => {
-                    abortable_run_with_spinner(
-                        Config::compact_session(config),
-                        "Compacting",
-                        abort_signal.clone(),
-                    )
-                    .await?;
-                    writeln!(output, "✓ Successfully compacted the session.")?;
+                    // Atomically guard against concurrent compaction (auto or
+                    // manual) and claim the compacting flag under a single write
+                    // lock. The agent loop and auto-compaction both consult
+                    // `is_compacting_session()` (the `compressing` flag), so we
+                    // must set it here for the duration of the manual run.
+                    enum Claim {
+                        Claimed,
+                        AlreadyCompacting,
+                        NoSession,
+                    }
+                    let claim = {
+                        let mut cfg = config.write();
+                        match cfg.session.as_mut() {
+                            None => Claim::NoSession,
+                            Some(session) if session.compressing() => Claim::AlreadyCompacting,
+                            Some(session) => {
+                                session.set_compressing(true);
+                                Claim::Claimed
+                            }
+                        }
+                    };
+                    match claim {
+                        Claim::NoSession => {
+                            writeln!(output, "No active session to compact.")?;
+                            return Ok(CommandOutcome::Continue);
+                        }
+                        Claim::AlreadyCompacting => {
+                            writeln!(output, "Compaction already in progress.")?;
+                            return Ok(CommandOutcome::Continue);
+                        }
+                        Claim::Claimed => {}
+                    }
+                    // Emit start event, run compaction, then emit completion or
+                    // failure. Always clear the compacting flag afterwards. All
+                    // user-visible feedback flows through the SessionEvents
+                    // (rendered by the TUI transcript / CLI spinner sink) so we
+                    // do NOT also write to `output` — that would double-render
+                    // the message in the TUI/CLI.
+                    harnx_core::sink::emit_agent_event(
+                        harnx_core::event::AgentEvent::Session(
+                            harnx_core::event::SessionEvent::CompactingStarted,
+                        ),
+                    );
+                    let result = Config::compact_session(config).await;
+                    if let Some(session) = config.write().session.as_mut() {
+                        session.set_compressing(false);
+                    }
+                    match result {
+                        Ok(()) => {
+                            harnx_core::sink::emit_agent_event(
+                                harnx_core::event::AgentEvent::Session(
+                                    harnx_core::event::SessionEvent::CompactingCompleted,
+                                ),
+                            );
+                        }
+                        Err(err) => {
+                            // Emit the failure event only. Do NOT propagate the
+                            // error or write to `output` — either would render
+                            // the failure a second time.
+                            harnx_core::sink::emit_agent_event(
+                                harnx_core::event::AgentEvent::Session(
+                                    harnx_core::event::SessionEvent::CompactingFailed(
+                                        err.to_string(),
+                                    ),
+                                ),
+                            );
+                        }
+                    }
                 }
                 _ => writeln!(output, r#"Usage: .compact session"#)?,
             },

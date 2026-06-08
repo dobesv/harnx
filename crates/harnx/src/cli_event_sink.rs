@@ -10,8 +10,8 @@ use std::io::{stdout, Write};
 use std::sync::{Arc, Mutex};
 
 use harnx_core::event::{
-    AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, ToolEvent,
-    TurnEvent,
+    AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent,
+    ToolEvent, TurnEvent,
 };
 
 use harnx_render::{MarkdownRender, RenderOptions};
@@ -398,7 +398,31 @@ impl AgentEventSink for CliAgentEventSink {
             // Silent for Progress / Update — they are streamed mid-call
             // updates that would clutter stderr.
             AgentEvent::Tool(_) => {}
-            // Every other variant — Session, Status, Plan — still gets
+            // Compaction lifecycle: start spinner, stop it, or report failure.
+            AgentEvent::Session(SessionEvent::CompactingStarted) => {
+                if state.spinner.is_none() {
+                    state.spinner = Some(spawn_spinner("Compacting"));
+                }
+            }
+            AgentEvent::Session(SessionEvent::CompactingCompleted) => {
+                if let Err(err) = state.cleanup() {
+                    eprintln!(
+                        "{}",
+                        warning_text(&format!("cli-sink cleanup failed: {err}"))
+                    );
+                }
+                eprintln!("{}", dimmed_text("✓ Compacted the session."));
+            }
+            AgentEvent::Session(SessionEvent::CompactingFailed(err)) => {
+                if let Err(cleanup_err) = state.cleanup() {
+                    eprintln!(
+                        "{}",
+                        warning_text(&format!("cli-sink cleanup failed: {cleanup_err}"))
+                    );
+                }
+                eprintln!("{}", warning_text(&format!("compaction failed: {err}")));
+            }
+            // Every other variant — Session (other), Status, Plan — still gets
             // captured so nothing silently disappears. These receive dedicated
             // renderers in a future plan.
             other => eprintln!("{}", dimmed_text(&format!("[event] {other:?}"))),
@@ -878,5 +902,81 @@ mod tests {
             state.last_ui_output_source.is_some(),
             "source should still be set — cleanup must not run between same-source chunks"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Compaction event handling: CLI must handle Started/Completed/Failed
+    // without falling into the debug catch-all.
+    // ----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compacting_started_starts_spinner_without_panic() {
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted), None);
+        // cleanup to close spinner
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compacting_completed_clears_spinner() {
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        // Start spinner first
+        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
+        {
+            let state = sink.state.lock().unwrap();
+            assert!(state.spinner.is_some(), "spinner should be started");
+        }
+        // CompactingStarted should NOT replace an existing spinner
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted), None);
+        {
+            let state = sink.state.lock().unwrap();
+            assert!(state.spinner.is_some(), "spinner should still exist");
+        }
+        // CompactingCompleted clears spinner
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted), None);
+        {
+            let state = sink.state.lock().unwrap();
+            assert!(
+                state.spinner.is_none(),
+                "spinner should be cleared by Completed"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compacting_failed_clears_spinner_and_reports_warning() {
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        // Start spinner
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingStarted), None);
+        {
+            let state = sink.state.lock().unwrap();
+            assert!(state.spinner.is_some(), "spinner should be started");
+        }
+        // Failed clears spinner
+        sink.emit(
+            AgentEvent::Session(SessionEvent::CompactingFailed(
+                "something went wrong".to_string(),
+            )),
+            None,
+        );
+        {
+            let state = sink.state.lock().unwrap();
+            assert!(
+                state.spinner.is_none(),
+                "spinner should be cleared by Failed"
+            );
+        }
     }
 }

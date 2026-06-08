@@ -1199,8 +1199,19 @@ impl Tui {
                     rendered_cache: None,
                 }]
             }
-            // Not rendered by the TUI: Turn, Session, Status, Tool::Progress,
-            // Tool::Failed.
+            AgentEvent::Session(SessionEvent::CompactingStarted) => {
+                vec![TranscriptItem::SystemText(
+                    "Compacting session…".to_string(),
+                )]
+            }
+            AgentEvent::Session(SessionEvent::CompactingCompleted) => {
+                vec![TranscriptItem::SystemText("Session compacted.".to_string())]
+            }
+            AgentEvent::Session(SessionEvent::CompactingFailed(err)) => {
+                vec![TranscriptItem::ErrorText(format!(
+                    "Compaction failed: {err}"
+                ))]
+            }
             _ => vec![],
         };
 
