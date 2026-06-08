@@ -34,18 +34,11 @@ fn acli_synthetic_config_written_from_host_yaml() {
     let (proxy_port, _ca_cert_path) = read_readiness(&mut child);
     assert!(proxy_port > 0, "proxy port should be non-zero");
 
-    let fs_root = find_fs_root(home.path()).expect("find harnx-fs temp dir");
-    assert!(
-        fs_root.exists(),
-        "fs root should exist: {}",
-        fs_root.display()
-    );
-
-    let rendered = wait_for_file(
-        &fs_root.join("acli/jira_config.yaml"),
-        Duration::from_secs(2),
-    )
-    .expect("synthetic config should be written before readiness completes");
+    let rendered = find_rendered_config(home.path(), Duration::from_secs(5)).unwrap_or_else(|details| {
+        panic!(
+            "synthetic config should be written before readiness completes; search details:\n{details}"
+        )
+    });
     let rendered_contents = std::fs::read_to_string(&rendered).expect("read synthetic YAML config");
 
     // The proxy must select profile matching `current_profile`, NOT `profiles[0]`
@@ -103,7 +96,15 @@ fn acli_status_smoke_test_with_real_binary_and_creds() {
 
     let mut child = spawn_proxy(&proxy_bin, home.path());
     let (proxy_port, ca_cert_path) = read_readiness(&mut child);
-    let fs_root = find_fs_root(home.path()).expect("find harnx-fs temp dir");
+    let rendered =
+        find_rendered_config(home.path(), Duration::from_secs(5)).unwrap_or_else(|details| {
+            panic!("find rendered acli config for smoke test; search details:\n{details}")
+        });
+    let fs_root = rendered
+        .parent()
+        .and_then(Path::parent)
+        .expect("rendered config should live under <fs_root>/acli/jira_config.yaml")
+        .to_path_buf();
 
     let status = Command::new(acli_path)
         .args(["jira", "auth", "status"])
@@ -231,38 +232,121 @@ fn read_readiness(child: &mut Child) -> (u16, PathBuf) {
     )
 }
 
-fn find_fs_root(home: &Path) -> Option<PathBuf> {
-    let mut candidates = vec![home.to_path_buf()];
-    if let Ok(canonical_home) = std::fs::canonicalize(home) {
-        if canonical_home != home {
-            candidates.push(canonical_home);
+fn find_rendered_config(home: &Path, timeout: Duration) -> Result<PathBuf, String> {
+    let roots = candidate_roots(home);
+    let deadline = Instant::now() + timeout;
+    let mut last_seen = Vec::new();
+
+    while Instant::now() <= deadline {
+        let mut seen_this_round = Vec::new();
+        for root in &roots {
+            find_rendered_config_under(root, &mut seen_this_round);
         }
+
+        if let Some(found) = seen_this_round.iter().find(|path| file_is_non_empty(path)) {
+            return std::fs::canonicalize(found).map_err(|err| {
+                format!(
+                    "found rendered config at {} but failed to canonicalize: {err}",
+                    found.display()
+                )
+            });
+        }
+
+        last_seen = seen_this_round;
+        thread::sleep(Duration::from_millis(50));
     }
 
-    candidates.into_iter().find_map(|root| {
-        std::fs::read_dir(root)
-            .ok()?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.is_dir()
-                    && path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("harnx-fs-"))
-            })
-    })
+    Err(format_search_diagnostics(&roots, &last_seen))
 }
 
-fn wait_for_file(path: &Path, timeout: Duration) -> Option<PathBuf> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() <= deadline {
-        if path.is_file() {
-            return Some(path.to_path_buf());
+fn candidate_roots(home: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![home.to_path_buf()];
+    if let Ok(canonical_home) = std::fs::canonicalize(home) {
+        if canonical_home != home {
+            roots.push(canonical_home);
         }
-        thread::sleep(Duration::from_millis(25));
     }
-    path.is_file().then(|| path.to_path_buf())
+    roots
+}
+
+fn find_rendered_config_under(root: &Path, matches: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("harnx-fs-"))
+            {
+                let candidate = path.join("acli/jira_config.yaml");
+                if candidate.exists() {
+                    matches.push(candidate);
+                }
+            }
+            find_rendered_config_under(&path, matches);
+        }
+    }
+}
+
+fn file_is_non_empty(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.len() > 0)
+        .unwrap_or(false)
+}
+
+fn format_search_diagnostics(roots: &[PathBuf], last_seen: &[PathBuf]) -> String {
+    let mut details = String::new();
+    if last_seen.is_empty() {
+        details.push_str("No matching acli/jira_config.yaml files found.\n");
+    } else {
+        details.push_str("Matching paths seen but empty/unreadable:\n");
+        for path in last_seen {
+            details.push_str(&format!("- {}\n", path.display()));
+        }
+    }
+
+    for root in roots {
+        details.push_str(&format!("Tree under {}:\n", root.display()));
+        append_tree(root, 0, &mut details);
+    }
+    details
+}
+
+fn append_tree(path: &Path, depth: usize, out: &mut String) {
+    let indent = "  ".repeat(depth);
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let kind = if meta.is_dir() {
+                "/"
+            } else if meta.file_type().is_symlink() {
+                "@"
+            } else {
+                ""
+            };
+            out.push_str(&format!("{indent}{}{}\n", path.display(), kind));
+            if meta.is_dir() {
+                match std::fs::read_dir(path) {
+                    Ok(entries) => {
+                        let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+                        entries.sort_by_key(|entry| entry.path());
+                        for entry in entries {
+                            append_tree(&entry.path(), depth + 1, out);
+                        }
+                    }
+                    Err(err) => {
+                        out.push_str(&format!("{indent}  <read_dir error: {err}>\n"));
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            out.push_str(&format!("{indent}{} <stat error: {err}>\n", path.display()));
+        }
+    }
 }
 
 fn kill_child(child: &mut Child) {
