@@ -28,8 +28,6 @@ args:
   - --extra-rwx
   - $GO_ROOT
   # Allow access to various config files
-  - --extra-read
-  - ~/.config/acli
   - --extra-write
   - ~/.config/chromium
   - --extra-read
@@ -77,6 +75,30 @@ hooks:
       --hook 'if (.host == "api.github.com" or .host == "uploads.github.com" or .host == "objects.githubusercontent.com") and (env.GITHUB_TOKEN // env.GH_TOKEN) != null
           then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
           end'
-      --hook 'if (.host | endswith(".atlassian.net")) and env.ATLASSIAN_API_TOKEN != null
-          then .headers.authorization = "Basic \([(env.ATLASSIAN_EMAIL // ""), (env.ATLASSIAN_API_TOKEN // "")] | join(":") | @base64)"
+      --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
+      --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
+      --fs '$acli_cfg.current_profile as $cp |
+          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+          if $p and $atlassian_token then
+            . + { "acli/jira_config.yaml": (
+              "version: 1\n" +
+              "current_profile: \($cp)\n" +
+              "profiles:\n" +
+              "    - site: \($p.site)\n" +
+              "      cloud_id: \($p.cloud_id)\n" +
+              "      account_id: \($p.account_id)\n" +
+              "      email: \($p.email // env.ATLASSIAN_EMAIL // "")\n" +
+              "      auth_type: api_token\n" +
+              "      token: !!binary AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=\n"
+            ) }
+          end'
+      --env '$acli_cfg.current_profile as $cp |
+          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+          if $p and $atlassian_token then
+            .ACLI_CONFIG_DIR = $temp_file_root
+          end'
+      --hook '$acli_cfg.current_profile as $cp |
+          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+          if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
+          then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token)
           end'

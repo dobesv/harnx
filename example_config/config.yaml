@@ -99,6 +99,7 @@ toolsets:
 # and injects it into outbound HTTP auth headers.
 #
 # Example: Atlassian (Jira/Confluence) auth injection
+# Sources credentials from the host OS keyring using --load-exec.
 #
 # hooks:
 #   entries:
@@ -107,13 +108,22 @@ toolsets:
 #     matcher: "bash_exec|bash_spawn"
 #     command: >-
 #       harnx-proxy-auth
-#       --env 'if env.ATLASSIAN_API_TOKEN and env.ATLASSIAN_EMAIL
-#           then .ATLASSIAN_API_TOKEN = $fake_uuid_key | .ATLASSIAN_EMAIL = $fake_email
+#       --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
+#       --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
+#       --fs '$acli_cfg.current_profile as $cp |
+#           (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+#           if $p and $atlassian_token then
+#             . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
+#               profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
+#                 token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
 #           end'
-#       --hook 'if (.host | endswith(".atlassian.net"))
-#               and .headers.authorization == basic($fake_email; $fake_uuid_key)
-#           then .headers.authorization = basic(env.ATLASSIAN_EMAIL; env.ATLASSIAN_API_TOKEN)
-#           end'
+#       --env '$acli_cfg.current_profile as $cp |
+#           (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+#           if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
+#       --hook '$acli_cfg.current_profile as $cp |
+#           (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
+#           if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
+#           then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
 #
 # Both can be combined into a single harnx-proxy-auth invocation with multiple
 # --env and --hook flags. See docs/sandbox-run.md for full claude-sb / gemini-sb

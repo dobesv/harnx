@@ -26,7 +26,7 @@ use crate::filter::{self, CompiledFilter};
 #[derive(Clone)]
 struct AuthHandler {
     filter: Arc<CompiledFilter>,
-    sentinels: Arc<crate::sentinel::Sentinels>,
+    jaq_vars: Arc<crate::filter::JaqVars>,
     log_file: Option<PathBuf>,
 }
 
@@ -38,7 +38,7 @@ impl HttpHandler for AuthHandler {
     ) -> RequestOrResponse {
         let req_json = request_json(&req);
 
-        match filter::apply_filter(&self.filter, req_json.clone(), &self.sentinels) {
+        match filter::apply_filter_with_vars(&self.filter, req_json.clone(), &self.jaq_vars) {
             Ok(result) => {
                 // If the filter sets `.block` to a truthy value, return a 403 response
                 // instead of forwarding the request.
@@ -224,13 +224,13 @@ fn replace_headers(headers: &mut http::HeaderMap, new_headers: &Map<String, Valu
 pub async fn start_proxy(
     filter: CompiledFilter,
     ca: CaSetup,
-    sentinels: Arc<crate::sentinel::Sentinels>,
+    jaq_vars: Arc<crate::filter::JaqVars>,
 ) -> Result<u16> {
     start_proxy_inner(
         filter,
         ProxyConfig {
             ca,
-            sentinels,
+            jaq_vars,
             log_file: None,
             danger_accept_invalid_certs: false,
         },
@@ -241,14 +241,14 @@ pub async fn start_proxy(
 pub async fn start_proxy_with_log(
     filter: CompiledFilter,
     ca: CaSetup,
-    sentinels: Arc<crate::sentinel::Sentinels>,
+    jaq_vars: Arc<crate::filter::JaqVars>,
     log_file: Option<PathBuf>,
 ) -> Result<u16> {
     start_proxy_inner(
         filter,
         ProxyConfig {
             ca,
-            sentinels,
+            jaq_vars,
             log_file,
             danger_accept_invalid_certs: false,
         },
@@ -262,13 +262,13 @@ pub async fn start_proxy_with_log(
 pub async fn start_proxy_danger_accept_invalid_certs(
     filter: CompiledFilter,
     ca: CaSetup,
-    sentinels: Arc<crate::sentinel::Sentinels>,
+    jaq_vars: Arc<crate::filter::JaqVars>,
 ) -> Result<u16> {
     start_proxy_inner(
         filter,
         ProxyConfig {
             ca,
-            sentinels,
+            jaq_vars,
             log_file: None,
             danger_accept_invalid_certs: true,
         },
@@ -278,7 +278,7 @@ pub async fn start_proxy_danger_accept_invalid_certs(
 
 struct ProxyConfig {
     ca: CaSetup,
-    sentinels: Arc<crate::sentinel::Sentinels>,
+    jaq_vars: Arc<crate::filter::JaqVars>,
     log_file: Option<PathBuf>,
     danger_accept_invalid_certs: bool,
 }
@@ -344,7 +344,7 @@ fn build_danger_https_connector() -> Result<hyper_rustls::HttpsConnector<HttpCon
 async fn start_proxy_inner(filter: CompiledFilter, config: ProxyConfig) -> Result<u16> {
     let ProxyConfig {
         ca,
-        sentinels,
+        jaq_vars,
         log_file,
         danger_accept_invalid_certs,
     } = config;
@@ -356,7 +356,7 @@ async fn start_proxy_inner(filter: CompiledFilter, config: ProxyConfig) -> Resul
 
     let handler = AuthHandler {
         filter: Arc::new(filter),
-        sentinels,
+        jaq_vars,
         log_file,
     };
 

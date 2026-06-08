@@ -277,10 +277,12 @@ fn collect_env(
             env.push((name.to_string(), value));
         }
     }
-    // XDG_*
-    for (name, value) in std::env::vars() {
-        if name.starts_with("XDG_") && !env.iter().any(|(k, _)| k == &name) {
-            env.push((name, value));
+    // Safe XDG Base Directory Specification vars only (deny-by-default whitelist).
+    for name in harnx_sandbox_common::SAFE_XDG_VARS {
+        if let Ok(value) = std::env::var(name) {
+            if !env.iter().any(|(k, _)| k == name) {
+                env.push(((*name).to_string(), value));
+            }
         }
     }
 
@@ -416,6 +418,66 @@ mod tests {
         };
         let (_, keys) = collect_env(&cli, HashMap::new());
         assert!(keys.contains(&"HOME".to_string()));
+    }
+
+    #[test]
+    fn collect_env_whitelists_safe_xdg_vars() {
+        // Serialize against other env-mutating tests in this binary.
+        let _lock = env_lock().lock().expect("lock poisoned");
+
+        // Save + restore the XDG vars this test mutates, regardless of outcome.
+        struct XdgGuard([(&'static str, Option<std::ffi::OsString>); 3]);
+        impl Drop for XdgGuard {
+            fn drop(&mut self) {
+                for (name, saved) in &self.0 {
+                    match saved {
+                        Some(v) => unsafe { std::env::set_var(name, v) },
+                        None => unsafe { std::env::remove_var(name) },
+                    }
+                }
+            }
+        }
+        let _guard = XdgGuard([
+            ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
+            ("XDG_RUNTIME_DIR", std::env::var_os("XDG_RUNTIME_DIR")),
+            ("XDG_SESSION_ID", std::env::var_os("XDG_SESSION_ID")),
+        ]);
+
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-config");
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/9999");
+            std::env::set_var("XDG_SESSION_ID", "c-test");
+        }
+
+        let cli = Cli {
+            env_vars: vec![],
+            extra_read: vec![],
+            extra_write: vec![],
+            extra_exec: vec![],
+            extra_rwx: vec![],
+            no_network: false,
+            working_dir: None,
+            no_defaults: false,
+            command: vec![],
+        };
+        let (env, _keys) = collect_env(&cli, HashMap::new());
+        let has = |k: &str| env.iter().any(|(name, _)| name == k);
+
+        // Base-directory spec var is forwarded.
+        assert!(
+            has("XDG_CONFIG_HOME"),
+            "XDG_CONFIG_HOME should pass through"
+        );
+        // The keyring/DBus-locating runtime dir is NOT forwarded.
+        assert!(
+            !has("XDG_RUNTIME_DIR"),
+            "XDG_RUNTIME_DIR must be excluded from the sandbox env"
+        );
+        // Desktop-session plumbing is NOT forwarded.
+        assert!(
+            !has("XDG_SESSION_ID"),
+            "XDG_SESSION_ID must not be forwarded"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 
-use harnx_proxy_auth::{ca, cli, filter, hook, proxy, sentinel};
+use harnx_proxy_auth::{ca, cli, exec_load, filter, fs_gen, hook, load, proxy, sentinel};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,14 +16,52 @@ async fn main() -> Result<()> {
 
     let args = <cli::Args as Parser>::parse();
     let filter_expr = args.combined_filter();
-    let filter = filter::compile(&filter_expr)?;
     let sentinels = Arc::new(sentinel::Sentinels::generate());
-    let extra_env = filter::eval_env_scripts(&args.env, &sentinels)?;
+    let load_specs = load::parse_load_specs(&args.load_yaml, &args.load_json, &args.load_raw)?;
+    let loaded_vars: Vec<(String, jaq_all::json::Val)> = load_specs
+        .iter()
+        .map(|spec| (spec.name.clone(), load::load_value(spec)))
+        .collect();
+
+    let fs_temp_dir = if args.fs.is_empty() {
+        None
+    } else {
+        Some(tempfile::Builder::new().prefix("harnx-fs-").tempdir()?)
+    };
+    let temp_file_root = fs_temp_dir
+        .as_ref()
+        .map(|dir| dir.path().to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let mut loaded_vars = loaded_vars
+        .into_iter()
+        .map(|(name, value)| Ok((name, filter::jaq_value_to_json(value)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let exec_specs = exec_load::parse_exec_specs(
+        &args.load_exec,
+        &loaded_vars
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    for spec in &exec_specs {
+        let value = exec_load::run_exec_value(spec, &exec_load::ShellRunner);
+        loaded_vars.push((spec.name.clone(), value));
+    }
+
+    let jaq_vars = Arc::new(filter::JaqVars::new_from_values(
+        &sentinels,
+        temp_file_root.clone(),
+        loaded_vars,
+    )?);
+    let filter = filter::compile_with_vars(&filter_expr, &jaq_vars)?;
+    fs_gen::eval_and_write_files(&args.fs, &jaq_vars, &temp_file_root)?;
+    let extra_env = filter::eval_env_scripts(&args.env, &jaq_vars)?;
 
     let (ca_setup, _ca_temp_dir) = ca::setup()?;
     let ca_cert_path = ca_setup.cert_pem_path.clone();
     let ca_cert_pem = std::fs::read_to_string(&ca_cert_path)?;
-    let port = proxy::start_proxy_with_log(filter, ca_setup, sentinels, args.log_file).await?;
+    let port = proxy::start_proxy_with_log(filter, ca_setup, jaq_vars, args.log_file).await?;
 
     // Write readiness lines then explicitly drop the lock before entering the
     // async JSONL loop. Holding a std::io::StdoutLock across an .await would
@@ -39,5 +77,37 @@ async fn main() -> Result<()> {
         stdout.flush()?;
     } // lock dropped here
 
-    hook::run_jsonl_loop(port, ca_cert_path, extra_env).await
+    if let Some(temp_dir) = fs_temp_dir {
+        tokio::select! {
+            result = hook::run_jsonl_loop(port, ca_cert_path, extra_env) => result,
+            _ = shutdown_signal() => {
+                // `TempDir`'s Drop removes the directory on the way out.
+                drop(temp_dir);
+                Ok(())
+            }
+        }
+    } else {
+        hook::run_jsonl_loop(port, ca_cert_path, extra_env).await
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        let _ = sigterm.recv().await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }

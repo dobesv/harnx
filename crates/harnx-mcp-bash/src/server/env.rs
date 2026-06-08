@@ -38,7 +38,11 @@ impl BashServer {
     ///    fallback.  The host environment therefore beats these fallbacks, and
     ///    all later layers beat the host.
     /// 2. Default allowlist values inherited from the host process env.
-    /// 3. `XDG_*` variables inherited from the host process env.
+    /// 3. Safe XDG Base Directory Specification variables inherited from the
+    ///    host process env via a deny-by-default whitelist. This forwards only
+    ///    config/data/cache/state directory vars. `XDG_RUNTIME_DIR` and
+    ///    desktop session/seat vars remain excluded to prevent DBus
+    ///    session-bus discovery and keyring access in the sandbox.
     /// 4. `.env.bash` dotfile values.
     /// 5. `extra_env_passthrough` — host values for explicitly named vars.
     /// 6. `env_overrides` — explicit `KEY=VALUE` overrides, highest
@@ -135,9 +139,9 @@ impl BashServer {
     }
 
     pub(crate) fn insert_xdg_env_vars(env_vars: &mut Vec<(String, String)>) {
-        for (name, value) in std::env::vars() {
-            if name.starts_with("XDG_") {
-                Self::upsert_env_var(env_vars, name, value);
+        for name in harnx_sandbox_common::SAFE_XDG_VARS {
+            if let Ok(value) = std::env::var(name) {
+                Self::upsert_env_var(env_vars, (*name).to_string(), value);
             }
         }
     }
@@ -192,5 +196,39 @@ impl BashServer {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_xdg_env_vars_uses_safe_whitelist() {
+        use crate::test_support::{env_lock, EnvVar};
+        let _guard = env_lock();
+
+        // Set up XDG env vars for testing
+        let _runtime_dir = EnvVar::set("XDG_RUNTIME_DIR", "/run/user/1000");
+        let _config_home = EnvVar::set("XDG_CONFIG_HOME", "/home/test/.config");
+        let _session_id = EnvVar::set("XDG_SESSION_ID", "42");
+
+        let mut env_vars = Vec::new();
+        BashServer::insert_xdg_env_vars(&mut env_vars);
+
+        // XDG_RUNTIME_DIR must NOT be present
+        assert!(
+            !env_vars.iter().any(|(k, _)| k == "XDG_RUNTIME_DIR"),
+            "XDG_RUNTIME_DIR should be excluded from passthrough"
+        );
+
+        assert!(
+            env_vars.iter().any(|(k, _)| k == "XDG_CONFIG_HOME"),
+            "XDG_CONFIG_HOME should be passed through"
+        );
+        assert!(
+            !env_vars.iter().any(|(k, _)| k == "XDG_SESSION_ID"),
+            "XDG_SESSION_ID should be excluded from passthrough"
+        );
     }
 }
