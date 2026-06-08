@@ -7,8 +7,9 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use serde_json::Value;
 use tempfile::tempdir;
 
 const SYNTHETIC_TOKEN_BLOB: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=";
@@ -40,25 +41,39 @@ fn acli_synthetic_config_written_from_host_yaml() {
         fs_root.display()
     );
 
-    let rendered = fs_root.join("acli/jira_config.yaml");
-    let rendered_contents = std::fs::read_to_string(&rendered).expect("read synthetic config");
-    let parsed: Value =
-        serde_json::from_str(&rendered_contents).expect("synthetic config should be JSON");
+    let rendered = wait_for_file(
+        &fs_root.join("acli/jira_config.yaml"),
+        Duration::from_secs(2),
+    )
+    .expect("synthetic config should be written before readiness completes");
+    let rendered_contents = std::fs::read_to_string(&rendered).expect("read synthetic YAML config");
 
-    // The proxy must select the profile matching `current_profile`, NOT
-    // `profiles[0]` (which is the unrelated `othercloud` tenant in the fixture).
-    assert_eq!(parsed["current_profile"], "realcloud123:realacct456");
-    assert_eq!(parsed["profiles"][0]["cloud_id"], "realcloud123");
-    assert_eq!(parsed["profiles"][0]["site"], "mycompany.atlassian.net");
-    assert_eq!(parsed["profiles"][0]["token"], SYNTHETIC_TOKEN_BLOB);
+    // The proxy must select profile matching `current_profile`, NOT `profiles[0]`
+    // (unrelated `othercloud` tenant in fixture), and emit YAML `!!binary`.
+    assert!(
+        rendered_contents
+            .starts_with("version: 1\ncurrent_profile: realcloud123:realacct456\nprofiles:\n"),
+        "synthetic config should start with expected YAML header: {rendered_contents}"
+    );
+    assert!(
+        rendered_contents.contains("    - site: mycompany.atlassian.net\n")
+            && rendered_contents.contains("      cloud_id: realcloud123\n")
+            && rendered_contents.contains("      account_id: realacct456\n")
+            && rendered_contents.contains("      auth_type: api_token\n"),
+        "synthetic config should contain selected active profile fields: {rendered_contents}"
+    );
+    assert!(
+        rendered_contents.contains(&format!("      token: !!binary {SYNTHETIC_TOKEN_BLOB}\n")),
+        "synthetic config should emit YAML !!binary sentinel token: {rendered_contents}"
+    );
     assert!(
         !rendered_contents.contains(HOST_TOKEN),
         "synthetic config leaked host token: {rendered_contents}"
     );
-    // The wrong (non-active) profile must not have been selected.
+    // Wrong (non-active) profile must not have been selected.
     assert!(
         !rendered_contents.contains("othercloud") && !rendered_contents.contains("OTHER_PROFILE"),
-        "synthetic config used the wrong (non-active) profile: {rendered_contents}"
+        "synthetic config used wrong (non-active) profile: {rendered_contents}"
     );
 
     kill_child(&mut child);
@@ -150,17 +165,17 @@ fn spawn_proxy(proxy_bin: &Path, home: &Path) -> Child {
                 (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
                 if $p and $atlassian_token then
                   . + {
-                    "acli/jira_config.yaml": ({
-                      version: 1,
-                      current_profile: $cp,
-                      profiles: [{
-                        site: $p.site,
-                        cloud_id: $p.cloud_id,
-                        account_id: $p.account_id,
-                        auth_type: "api_token",
-                        token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY="
-                      }]
-                    } | tojson)
+                    "acli/jira_config.yaml": (
+                      "version: 1\n" +
+                      "current_profile: \($cp)\n" +
+                      "profiles:\n" +
+                      "    - site: \($p.site)\n" +
+                      "      cloud_id: \($p.cloud_id)\n" +
+                      "      account_id: \($p.account_id)\n" +
+                      "      email: " + ($p.email // env.ATLASSIAN_EMAIL // "") + "\n" +
+                      "      auth_type: api_token\n" +
+                      "      token: !!binary AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=\n"
+                    )
                   }
                 end"#,
             "--env",
@@ -217,17 +232,37 @@ fn read_readiness(child: &mut Child) -> (u16, PathBuf) {
 }
 
 fn find_fs_root(home: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(home)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.is_dir()
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("harnx-fs-"))
-        })
+    let mut candidates = vec![home.to_path_buf()];
+    if let Ok(canonical_home) = std::fs::canonicalize(home) {
+        if canonical_home != home {
+            candidates.push(canonical_home);
+        }
+    }
+
+    candidates.into_iter().find_map(|root| {
+        std::fs::read_dir(root)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("harnx-fs-"))
+            })
+    })
+}
+
+fn wait_for_file(path: &Path, timeout: Duration) -> Option<PathBuf> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() <= deadline {
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    path.is_file().then(|| path.to_path_buf())
 }
 
 fn kill_child(child: &mut Child) {
