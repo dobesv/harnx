@@ -76,7 +76,7 @@ hooks:
           then .headers.authorization = "Bearer \(env.GITHUB_TOKEN // env.GH_TOKEN)"
           end'
       --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
-      --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
+      --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
       --fs '$acli_cfg.current_profile as $cp |
           (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
           if $p and $atlassian_token then

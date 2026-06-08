@@ -152,7 +152,7 @@ fn spawn_proxy(proxy_bin: &Path, home: &Path) -> Child {
     // (here pointed at a fake keyring command), then select the profile whose
     // `<cloud_id>:<account_id>` equals `current_profile` (NOT `profiles[0]`).
     let load_exec = format!(
-        "atlassian_token=p=$(sed -n \"s/^current_profile:[[:space:]]*\\\"\\?\\([^\\\"]*\\)\\\"\\?[[:space:]]*$/\\1/p\" ~/.config/acli/jira_config.yaml); test -n \"$p\" && {} \"jira:$p\"",
+        "atlassian_token=p=$(sed -n \"s/^current_profile:[[:space:]]*\\\"\\{{0,1\\}}\\([^\\\"]*\\)\\\"\\{{0,1\\}}[[:space:]]*$/\\1/p\" ~/.config/acli/jira_config.yaml); test -n \"$p\" && {} \"jira:$p\"",
         cred_script.display()
     );
     Command::new(proxy_bin)
