@@ -500,7 +500,18 @@ impl ToolProvider for AcpManager {
         // Forward chunks either to TUI output sink or stdout.
         let spinner_clone = spinner.clone();
         let spinner_msg = format!("  {} working…", tool_name);
-        let forward_handle = tokio::spawn(forward_acp_chunks(chunk_rx, spinner_clone, spinner_msg));
+        let captured_sink = harnx_core::sink::current_agent_event_sink();
+        let forward_handle = if let Some(sink) = captured_sink {
+            tokio::spawn(async move {
+                harnx_core::sink::with_agent_event_sink(
+                    sink,
+                    forward_acp_chunks(chunk_rx, spinner_clone, spinner_msg),
+                )
+                .await
+            })
+        } else {
+            tokio::spawn(forward_acp_chunks(chunk_rx, spinner_clone, spinner_msg))
+        };
 
         // Plumb the AbortSignal into the inner dispatcher so a TUI Ctrl-C
         // — which never reaches us as SIGINT because crossterm captures

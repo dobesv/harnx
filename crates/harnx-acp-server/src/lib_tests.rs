@@ -1,14 +1,17 @@
 #[cfg(test)]
 mod tests {
     use crate::{AcpChunkSink, AcpForward, HarnxAgent};
-    use agent_client_protocol::schema::{CancelNotification, NewSessionRequest};
+    use agent_client_protocol::schema::{
+        CancelNotification, ContentBlock, NewSessionRequest, PromptRequest, PromptResponse,
+    };
     use harnx_core::event::{AgentEvent, AgentEventSink, ToolEvent, ToolStatus};
     use harnx_runtime::{
         client::{ClientConfig, ModelType, TestStateGuard},
         config::Config,
+        test_utils::{MockClient, MockTurnBuilder},
     };
     use parking_lot::RwLock;
-    use std::sync::{atomic::AtomicBool, Arc};
+    use std::sync::Arc;
     use tokio::sync::mpsc::unbounded_channel;
 
     fn test_config() -> crate::GlobalConfig {
@@ -34,6 +37,8 @@ mod tests {
         )
         .expect("load test model");
         config.save_session = Some(true);
+        let sessions_dir = tempfile::tempdir().expect("create sessions dir");
+        config.sessions_dir_override = Some(sessions_dir.keep());
 
         Arc::new(RwLock::new(config))
     }
@@ -118,6 +123,177 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A created session bound to its agent and on-disk log location. Holding
+    /// the agent handle, id, and log path as typed fields keeps the per-call
+    /// helpers from taking a pile of bare `&str` arguments.
+    struct TestSession {
+        agent: Arc<HarnxAgent>,
+        id: String,
+        log_path: std::path::PathBuf,
+    }
+
+    impl TestSession {
+        /// Create a fresh session on `agent`.
+        async fn create(agent: &Arc<HarnxAgent>, sessions_dir: &std::path::Path) -> Self {
+            let cwd = std::env::current_dir().expect("current dir");
+            let id = agent
+                .new_session(NewSessionRequest::new(cwd))
+                .await
+                .expect("create session")
+                .session_id
+                .0
+                .to_string();
+            let log_path = sessions_dir.join(format!("{id}.yaml"));
+            Self {
+                agent: Arc::clone(agent),
+                id,
+                log_path,
+            }
+        }
+
+        /// Drive a prompt against this session.
+        async fn prompt(&self, text: &str) -> agent_client_protocol::Result<PromptResponse> {
+            let request = PromptRequest::new(
+                agent_client_protocol::schema::SessionId::new(self.id.clone()),
+                vec![ContentBlock::from(text.to_string())],
+            );
+            self.agent.prompt(request).await
+        }
+
+        /// Read the log via async I/O so we never block a runtime worker thread
+        /// inside a `#[tokio::test]`.
+        async fn read_log(&self) -> String {
+            tokio::fs::read_to_string(&self.log_path)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("read session log {} failed: {e}", self.log_path.display())
+                })
+        }
+
+        /// Assert the log is present, non-empty, free of the pending-result
+        /// placeholder, and contains the prompt text it was driven with.
+        async fn assert_intact(&self, expected_prompt: &str) {
+            let log = self.read_log().await;
+            assert!(!log.is_empty(), "session log empty: {}", self.id);
+            assert!(
+                !log.contains("tool response pending"),
+                "placeholder leaked into {}: {log}",
+                self.id
+            );
+            assert!(
+                log.contains(expected_prompt),
+                "session {} lost own prompt {expected_prompt:?}: {log}",
+                self.id
+            );
+        }
+    }
+
+    // Use the multi-thread flavor (as every other `run_agent_loop`-driving
+    // test does): on a current-thread runtime the test future, the inner
+    // `LocalSet`, and the entire agent loop run on one stack frame and
+    // overflow the default 2 MiB thread stack. `spawn_local` inside the
+    // prompt path still works because the body runs under `LocalSet::run_until`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_prompts_isolate_session_scope_and_sink() {
+        let (_temp, _path) = setup_agent_env("test");
+        let config = test_config();
+        let sessions_dir = config
+            .read()
+            .sessions_dir_override
+            .clone()
+            .expect("sessions dir override");
+        let mock = Arc::new(
+            MockClient::builder()
+                .add_turn(MockTurnBuilder::new().add_text_chunk("reply one").build())
+                .add_turn(MockTurnBuilder::new().add_text_chunk("reply two").build())
+                .add_turn(MockTurnBuilder::new().add_text_chunk("reply three").build())
+                .build(),
+        );
+        let _guard = TestStateGuard::new(Some(mock)).await;
+        let agent = Arc::new(HarnxAgent::new("test".to_string(), config.clone()));
+
+        let s1 = TestSession::create(&agent, &sessions_dir).await;
+        let s2 = TestSession::create(&agent, &sessions_dir).await;
+        let s3 = TestSession::create(&agent, &sessions_dir).await;
+
+        let local = tokio::task::LocalSet::new();
+        let (resp1, resp2, resp3) = local
+            .run_until(async {
+                tokio::join!(
+                    s1.prompt("alpha prompt"),
+                    s2.prompt("beta prompt"),
+                    s3.prompt("gamma prompt")
+                )
+            })
+            .await;
+
+        for response in [resp1, resp2, resp3] {
+            assert_eq!(
+                response.expect("prompt should succeed").stop_reason,
+                agent_client_protocol::schema::StopReason::EndTurn
+            );
+        }
+
+        // Each session's log is intact and carries only its own prompt — no
+        // cross-talk from the concurrently-running siblings.
+        s1.assert_intact("alpha prompt").await;
+        s2.assert_intact("beta prompt").await;
+        s3.assert_intact("gamma prompt").await;
+    }
+
+    // Two concurrent prompts to the SAME session_id must serialize on the
+    // per-session `prompt_lock` so neither clobbers the other's on-disk
+    // transcript. Both prompt texts must survive in the single session log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_same_session_concurrent_prompts_do_not_clobber_log() {
+        let (_temp, _path) = setup_agent_env("test");
+        let config = test_config();
+        let sessions_dir = config
+            .read()
+            .sessions_dir_override
+            .clone()
+            .expect("sessions dir override");
+        let mock = Arc::new(
+            MockClient::builder()
+                .add_turn(MockTurnBuilder::new().add_text_chunk("reply one").build())
+                .add_turn(MockTurnBuilder::new().add_text_chunk("reply two").build())
+                .build(),
+        );
+        let _guard = TestStateGuard::new(Some(mock)).await;
+        let agent = Arc::new(HarnxAgent::new("test".to_string(), config.clone()));
+
+        let session = TestSession::create(&agent, &sessions_dir).await;
+
+        let local = tokio::task::LocalSet::new();
+        let (resp1, resp2) = local
+            .run_until(async {
+                tokio::join!(
+                    session.prompt("first message"),
+                    session.prompt("second message"),
+                )
+            })
+            .await;
+        resp1.expect("first prompt should succeed");
+        resp2.expect("second prompt should succeed");
+
+        // Both prompts must survive in the single session log — last-writer-wins
+        // clobbering would drop one of them.
+        let log = session.read_log().await;
+        assert!(!log.is_empty(), "session log empty");
+        assert!(
+            !log.contains("tool response pending"),
+            "placeholder leaked: {log}"
+        );
+        assert!(
+            log.contains("first message"),
+            "first prompt clobbered: {log}"
+        );
+        assert!(
+            log.contains("second message"),
+            "second prompt clobbered: {log}"
+        );
+    }
+
     #[tokio::test]
     async fn test_initialize_echoes_protocol_version_and_reports_capabilities() {
         use agent_client_protocol::schema::{InitializeRequest, ProtocolVersion};
@@ -142,10 +318,7 @@ mod tests {
     #[test]
     fn acp_chunk_sink_forwards_tool_completed_and_update_to_channel() {
         let (tx, mut rx) = unbounded_channel::<AcpForward>();
-        let sink = AcpChunkSink {
-            tx,
-            streamed_text_this_turn: AtomicBool::new(false),
-        };
+        let sink = AcpChunkSink { tx };
 
         sink.emit(
             AgentEvent::Tool(ToolEvent::Completed {
@@ -233,38 +406,6 @@ mod tests {
         assert!(
             !meta.contains_key("harnx:model"),
             "harnx:model should not be present when model is None"
-        );
-    }
-
-    #[test]
-    fn acp_chunk_sink_skips_final_after_streamed_text() {
-        let (tx, mut rx) = unbounded_channel::<AcpForward>();
-        let sink = AcpChunkSink {
-            tx,
-            streamed_text_this_turn: AtomicBool::new(false),
-        };
-
-        sink.emit(
-            AgentEvent::Model(harnx_core::event::ModelEvent::MessageChunk {
-                blocks: vec![harnx_core::event::ContentBlock::Text("Hello ".to_string())],
-            }),
-            None,
-        );
-        sink.emit(
-            AgentEvent::Model(harnx_core::event::ModelEvent::Final {
-                output: "Hello world".to_string(),
-                usage: Default::default(),
-            }),
-            None,
-        );
-
-        match rx.try_recv().expect("message chunk should forward text") {
-            AcpForward::Text(text, None) => assert_eq!(text, "Hello "),
-            _ => panic!("expected text forward"),
-        }
-        assert!(
-            rx.try_recv().is_err(),
-            "final output should be suppressed after streamed chunks"
         );
     }
 }
