@@ -1188,8 +1188,17 @@ impl Tui {
                 (entries, title)
             };
 
-        // Create block with border and title
-        let block = Block::default().borders(Borders::ALL).title(title.as_str());
+        // Create block with horizontal (top + bottom) borders and a title.
+        //
+        // Left/right borders are intentionally omitted: terminal text selection
+        // of multi-line content would otherwise capture the vertical `|` border
+        // glyphs on every line, polluting copied text (issue #710). Horizontal
+        // borders are kept — the top border anchors the title and the bottom
+        // border separates the content from the footer — without affecting
+        // multi-line copy, since they never appear inside the selected lines.
+        let block = Block::default()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .title(title.as_str());
 
         // Get inner area for content
         let inner_area = block.inner(chunks[0]);
