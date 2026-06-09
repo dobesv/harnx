@@ -1006,6 +1006,7 @@ impl Tui {
                 if text.is_empty() {
                     vec![]
                 } else {
+                    self.app.streamed_text_this_turn = true;
                     self.append_streaming_assistant_chunk(&text);
                     self.pin_transcript_to_bottom();
                     vec![]
@@ -1029,7 +1030,7 @@ impl Tui {
                 *self.shared_pending_message.lock().await = None;
                 self.app.last_ui_output_source = None;
                 let usage_str = format_usage(&usage);
-                if !output.is_empty() {
+                if !output.is_empty() && !self.app.streamed_text_this_turn {
                     if let Some(idx) = self.app.streaming_assistant_idx {
                         match self.app.transcript.get_mut(idx) {
                             Some(TranscriptItem::AssistantText {
@@ -1066,6 +1067,7 @@ impl Tui {
                     self.pin_transcript_to_bottom();
                 }
                 self.app.streaming_assistant_idx = None;
+                self.app.streamed_text_this_turn = false;
                 if !usage_str.is_empty() {
                     self.app
                         .transcript
@@ -1093,6 +1095,10 @@ impl Tui {
                 self.current_prompt_abort = None;
                 *self.shared_pending_message.lock().await = None;
                 self.app.streaming_assistant_idx = None;
+                // Symmetric with the Final handler: reset the per-turn
+                // streamed-text flag so a streamed chunk before an error
+                // can't suppress a later turn's final text.
+                self.app.streamed_text_this_turn = false;
                 self.app.last_ui_output_source = None;
                 self.app.transcript.push(TranscriptItem::ErrorText(err));
                 self.pin_transcript_to_bottom();
@@ -1301,6 +1307,8 @@ impl Tui {
         self.current_prompt_abort = Some(new_abort.clone());
 
         self.app.llm_busy = true;
+        self.app.streaming_assistant_idx = None;
+        self.app.streamed_text_this_turn = false;
 
         let event_tx = self.event_tx.clone();
         let ctx = crate::prompt::PromptTaskContext {
@@ -1886,6 +1894,7 @@ impl Tui {
 
         self.app.transcript.clear();
         self.app.streaming_assistant_idx = None;
+        self.app.streamed_text_this_turn = false;
         // Reset scroll state so the widget doesn't subtract-overflow when
         // the rebuilt transcript is shorter than the previous one.
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();

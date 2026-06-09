@@ -70,6 +70,7 @@ pub(super) struct App {
     pub(super) llm_busy: bool,
     pub(super) scroll_state: ratatui_widget_scrolling::ScrollState,
     pub(super) streaming_assistant_idx: Option<usize>,
+    pub(super) streamed_text_this_turn: bool,
     pub(super) cache_valid_width: Option<u16>,
     pub(super) last_ui_output_source: Option<AgentSource>,
     pub(super) last_usage_source: Option<AgentSource>,

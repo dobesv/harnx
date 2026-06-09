@@ -674,6 +674,7 @@ impl Tui {
         self.app.transcript.clear();
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
         self.app.streaming_assistant_idx = None;
+        self.app.streamed_text_this_turn = false;
     }
 
     pub(super) fn build_input_title(&self) -> Line<'static> {
