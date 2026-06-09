@@ -6207,10 +6207,20 @@ async fn test_detail_view_has_no_vertical_side_borders() {
     harness.render();
 
     let buffer = harness.terminal.backend().buffer();
+    // Scan only the detail-view region, not the whole buffer, so unrelated UI
+    // chrome can't affect the result. render_detail_view() clears the full
+    // terminal and splits it vertically into the bordered content area
+    // (chunks[0], all rows except the last) plus a single-row footer
+    // (chunks[1], the bottom row). The detail-view block therefore spans the
+    // full width and every row except the footer.
+    let detail_x_min = 0;
+    let detail_x_max = buffer.area.width;
+    let detail_y_min = 0;
+    let detail_y_max = buffer.area.height.saturating_sub(1); // exclude footer row
     let mut vertical_border_cells = 0;
     let mut horizontal_border_cells = 0;
-    for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width {
+    for y in detail_y_min..detail_y_max {
+        for x in detail_x_min..detail_x_max {
             match buffer[(x, y)].symbol() {
                 "│" | "┌" | "┐" | "└" | "┘" => vertical_border_cells += 1,
                 "─" => horizontal_border_cells += 1,
