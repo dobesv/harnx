@@ -249,8 +249,6 @@ command -v node      # should print the shim path under sandbox-bin
 which -a node         # confirm the shim appears before the real tool
 ```
 
-*Note: This replaces the older `claude-sb` / `gemini-sb` scripts — users can delete those and use the shim directory instead.*
-
 ## CLI Reference
 
 | Option | Description |
