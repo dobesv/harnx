@@ -439,6 +439,83 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
 }
 
 #[tokio::test]
+async fn final_does_not_duplicate_streamed_multiline_assistant_text() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.app.llm_busy = true;
+    tui.app.streamed_text_this_turn = false;
+
+    for chunk in ["Hello\n", "world\n", "Again"] {
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text(chunk.to_string())],
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    }
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Final {
+            output: "Hello\nworld\nAgain".to_string(),
+            usage: Default::default(),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let assistant_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptItem::AssistantText { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_entries, vec!["Hello\n", "world\n", "Again"]);
+    assert!(!tui.app.streamed_text_this_turn);
+}
+
+#[tokio::test]
+async fn final_without_chunks_renders_assistant_text_once() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.app.llm_busy = true;
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Final {
+            output: "Hello\nworld\nAgain".to_string(),
+            usage: Default::default(),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let assistant_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptItem::AssistantText { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_entries, vec!["Hello\nworld\nAgain"]);
+}
+
+#[tokio::test]
 async fn ui_output_inserts_heading_when_source_changes() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));

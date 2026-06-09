@@ -18,7 +18,13 @@ mod test_regression_issue_68;
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::*;
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, ToolEvent};
 use harnx_runtime::config::GlobalConfig;
@@ -64,6 +70,7 @@ enum AcpForward {
 /// and can't be captured in the sink itself.
 struct AcpChunkSink {
     tx: tokio::sync::mpsc::UnboundedSender<AcpForward>,
+    streamed_text_this_turn: AtomicBool,
 }
 
 impl harnx_core::event::AgentEventSink for AcpChunkSink {
@@ -85,10 +92,13 @@ impl harnx_core::event::AgentEventSink for AcpChunkSink {
                     })
                     .collect();
                 if !text.is_empty() {
+                    self.streamed_text_this_turn.store(true, Ordering::Relaxed);
                     let _ = self.tx.send(AcpForward::Text(text, source));
                 }
             }
-            AgentEvent::Model(ModelEvent::Final { output, .. }) if !output.is_empty() => {
+            AgentEvent::Model(ModelEvent::Final { output, .. })
+                if !output.is_empty() && !self.streamed_text_this_turn.load(Ordering::Relaxed) =>
+            {
                 let _ = self.tx.send(AcpForward::Text(output, source));
             }
             AgentEvent::Tool(ToolEvent::Started {
@@ -288,8 +298,10 @@ impl HarnxAgent {
         // nested chunk via `emit_agent_event_with_source` — the global sink
         // is the single point that converts all events to ACP notifications.
         let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<AcpForward>();
-        let sink: Arc<dyn harnx_core::event::AgentEventSink> =
-            Arc::new(AcpChunkSink { tx: chunk_tx });
+        let sink: Arc<dyn harnx_core::event::AgentEventSink> = Arc::new(AcpChunkSink {
+            tx: chunk_tx,
+            streamed_text_this_turn: AtomicBool::new(false),
+        });
         harnx_core::sink::install_agent_event_sink(sink);
 
         // Spawn local task to drain chunk_rx → session_notification.

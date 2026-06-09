@@ -8,7 +8,7 @@ mod tests {
         config::Config,
     };
     use parking_lot::RwLock;
-    use std::sync::Arc;
+    use std::sync::{atomic::AtomicBool, Arc};
     use tokio::sync::mpsc::unbounded_channel;
 
     fn test_config() -> crate::GlobalConfig {
@@ -142,7 +142,10 @@ mod tests {
     #[test]
     fn acp_chunk_sink_forwards_tool_completed_and_update_to_channel() {
         let (tx, mut rx) = unbounded_channel::<AcpForward>();
-        let sink = AcpChunkSink { tx };
+        let sink = AcpChunkSink {
+            tx,
+            streamed_text_this_turn: AtomicBool::new(false),
+        };
 
         sink.emit(
             AgentEvent::Tool(ToolEvent::Completed {
@@ -230,6 +233,38 @@ mod tests {
         assert!(
             !meta.contains_key("harnx:model"),
             "harnx:model should not be present when model is None"
+        );
+    }
+
+    #[test]
+    fn acp_chunk_sink_skips_final_after_streamed_text() {
+        let (tx, mut rx) = unbounded_channel::<AcpForward>();
+        let sink = AcpChunkSink {
+            tx,
+            streamed_text_this_turn: AtomicBool::new(false),
+        };
+
+        sink.emit(
+            AgentEvent::Model(harnx_core::event::ModelEvent::MessageChunk {
+                blocks: vec![harnx_core::event::ContentBlock::Text("Hello ".to_string())],
+            }),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Model(harnx_core::event::ModelEvent::Final {
+                output: "Hello world".to_string(),
+                usage: Default::default(),
+            }),
+            None,
+        );
+
+        match rx.try_recv().expect("message chunk should forward text") {
+            AcpForward::Text(text, None) => assert_eq!(text, "Hello "),
+            _ => panic!("expected text forward"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "final output should be suppressed after streamed chunks"
         );
     }
 }
