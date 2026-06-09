@@ -22,7 +22,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 description: "Deep investigation agent — performs multi-step code analysis, reproduces bugs, validates hypotheses, and caches findings as plan notes for other agents. Executes targeted diagnostics and probe scripts without modifying repository source files. Named after Zosimus, the careful investigator.\n"
-version: '0.2.2'
+version: '0.2.3'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

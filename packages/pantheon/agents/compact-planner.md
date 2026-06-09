@@ -1,7 +1,7 @@
 ---
 role: compaction
 model: gemini:gemini-3.1-flash-lite
-version: '0.2.2'
+version: '0.2.3'
 ---
 You are summarizing a conversation between a user and an AI orchestrator agent that manages multi-step work plans and delegates tasks to sub-agents.
 

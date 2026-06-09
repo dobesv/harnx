@@ -7,7 +7,7 @@ use_tools:
 description: "Architecture and strategy consultant \u2014 provides deep analysis of\
   \ technology trade-offs, scalability concerns, and long-term architectural implications.\
   \ Like consulting the Oracle (OR-uh-kul) at Delphi for complex technical decisions.\n"
-version: '0.2.2'
+version: '0.2.3'
 variables:
 - name: oracle_core
   description: Core identity and instructions for Oracle

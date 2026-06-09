@@ -19,7 +19,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 description: "Testing adequacy specialist — evaluates test coverage, edge case handling, assertion quality, test isolation, and identifies untested code paths. Named after Thalia (thuh-LY-uh), the Muse of comedy — finding what's absurdly untested.\n"
-version: '0.2.2'
+version: '0.2.3'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

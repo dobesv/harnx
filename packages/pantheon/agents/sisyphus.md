@@ -57,7 +57,7 @@ use_tools:
 description: "Task executor \u2014 handles tasks from users. For complex work,\
   \ creates local plans and executes them directly or delegates to Pantheon specialists.\
   \ Writes code directly in the project directory. Named after Sisyphus (SIS-ih-fus).\n"
-version: '0.2.2'
+version: '0.2.3'
 variables:
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep

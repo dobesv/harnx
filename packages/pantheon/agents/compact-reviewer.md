@@ -1,7 +1,7 @@
 ---
 role: compaction
 model: gemini:gemini-3.1-flash-lite
-version: '0.2.2'
+version: '0.2.3'
 ---
 You are summarizing a conversation between a user and an AI code review agent that analyzes pull requests and codebases for quality, security, and correctness issues.
 

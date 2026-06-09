@@ -1,6 +1,21 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.2.3 (2026-06-09)
+
+### Features
+
+- add opt-in Streamable HTTP transport for time and plans MCP servers (#706)
+- improve bash exec output markdown formatting (#716)
+- support project-root pseudo-vars and tilde in paths (#720)
+- isolate Linux sandbox from host keyring and restore acli via proxy (#769)
+
+### Fixes
+
+- harden default whitelist with least-privilege split (#735)
+- make cleanup test deterministic on Windows (#760)
+- show session compaction in transcript instead of stdout spinner (#778)
+
 ## 0.2.2 (2026-05-29)
 
 ### Features
