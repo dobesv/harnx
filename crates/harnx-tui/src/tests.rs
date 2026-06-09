@@ -6189,6 +6189,56 @@ async fn test_detail_view_esc_closes_view_and_preserves_focus() {
     );
 }
 
+/// Regression test for issue #710: the detail viewer must not render vertical
+/// `│` side borders, otherwise terminal text selection of multi-line content
+/// captures the border glyphs and pollutes copied text. Top and bottom
+/// horizontal borders are still expected (title anchor + footer separation).
+#[tokio::test]
+async fn test_detail_view_has_no_vertical_side_borders() {
+    let mut harness = TuiTestHarness::with_size(40, 15).await;
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "first line\nsecond line\nthird line".to_string(),
+        seq: Some(1),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().app.detail_view_open = true;
+    harness.render();
+
+    let buffer = harness.terminal.backend().buffer();
+    // Scan only the detail-view region, not the whole buffer, so unrelated UI
+    // chrome can't affect the result. render_detail_view() clears the full
+    // terminal and splits it vertically into the bordered content area
+    // (chunks[0], all rows except the last) plus a single-row footer
+    // (chunks[1], the bottom row). The detail-view block therefore spans the
+    // full width and every row except the footer.
+    let detail_x_min = 0;
+    let detail_x_max = buffer.area.width;
+    let detail_y_min = 0;
+    let detail_y_max = buffer.area.height.saturating_sub(1); // exclude footer row
+    let mut vertical_border_cells = 0;
+    let mut horizontal_border_cells = 0;
+    for y in detail_y_min..detail_y_max {
+        for x in detail_x_min..detail_x_max {
+            match buffer[(x, y)].symbol() {
+                "│" | "┌" | "┐" | "└" | "┘" => vertical_border_cells += 1,
+                "─" => horizontal_border_cells += 1,
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        vertical_border_cells, 0,
+        "detail view must not render vertical/corner border glyphs (issue #710)"
+    );
+    assert!(
+        horizontal_border_cells > 0,
+        "detail view should still render horizontal (top/bottom) borders"
+    );
+}
+
 #[tokio::test]
 async fn test_detail_view_mutation_shortcuts_work() {
     let mut harness = TuiTestHarness::new().await;
