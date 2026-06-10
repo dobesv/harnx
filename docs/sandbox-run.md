@@ -104,9 +104,26 @@ chmod +x "$SHIM_DIR/node"
 for t in yarn npm npx pnpm; do ln -sf node "$SHIM_DIR/$t"; done
 ```
 
+Validation:
+
+```bash
+# Make sure shims are at the start of PATH
+export PATH="${XDG_DATA_HOME:-$HOME/.local/share}/harnx/sandbox-bin:$PATH"
+for t in yarn npm npx pnpm; do ln -sf node "$SHIM_DIR/$t"; done
+# node should only see a subset of folders in your home directory
+node -e 'console.log(fs.readdirSync(process.env.HOME))'
+# same for yarn either when running node or exec
+# note: you have to run this in a folder with a package.json or yarn errors
+yarn node -e 'console.log(fs.readdirSync(process.env.HOME))'
+yarn exec 'ls -a $HOME'
+```
+
 ### Claude Code (`claude`)
 
-Claude Code requires access to its own configuration and credentials, along with credential hooks for AWS, GitHub, and Atlassian.
+Claude Code requires access to its own configuration and credentials.  You can also provide credential hooks for AWS, GitHub, and Atlassian to
+allow commands run by claude to use those services if appropriate.  Be sure to replace the AWS profile name with the name of an AWS profile with
+the right privilege level you need for your claude use.
+
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -187,6 +204,9 @@ exec harnx-sandbox-run \
   \; \
   -- claude --dangerously-skip-permissions "$@"
 ```
+
+To test it you can run claude and ask it to list files in your home directory, fetch JIRA/GitHub issues/tasks/PRs, or list an S3 bucket.
+
 **Key points:**
 - Replace `my-profile` with your AWS profile name (omit `--hook ... harnx-aws-creds ...` entirely if you don't need AWS). Project access now uses harnx-sandbox-run pseudo-vars, so current git root / node project root / git common dir are granted automatically when present; add `--extra-rwx /path` for any extra directories the agent should access.
 - The `--env` and `--fs` scripts inject fake sentinel tokens into the sandbox (e.g. `ghp_<random>` for GitHub, or a synthetic `jira_config.yaml` for Atlassian) so tools like `gh` or `acli` consider themselves authenticated. The real tokens never enter the sandbox — `harnx-proxy-auth` reads them from the host (environment or OS keyring) and injects them into outbound HTTP headers.
