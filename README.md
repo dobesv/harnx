@@ -38,6 +38,14 @@ deployments can skip the TUI deps by picking `harnx-serve` or
 `harnx-acp-server` directly. The MCP server binaries (`harnx-mcp-*`) are only
 needed if you wire them up as external MCP servers.
 
+### Install using asdf
+
+```sh
+asdf plugin add harnx https://github.com/dobesv/asdf-plugins.git
+asdf install harnx latest
+asdf set -u harnx latest
+```
+
 ### Install from Git (Rust developers)
 
 ```sh
