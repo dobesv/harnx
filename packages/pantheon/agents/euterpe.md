@@ -19,7 +19,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 description: "Coding conventions specialist — validates adherence to project patterns, naming conventions, file organization, import ordering, type safety, and documentation standards. Named after Euterpe (yoo-TUR-pee), the Muse of music and harmony.\n"
-version: '0.2.3'
+version: '0.2.4'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

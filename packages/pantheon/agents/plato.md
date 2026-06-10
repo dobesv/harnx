@@ -27,7 +27,7 @@ use_tools:
 - plans_update_task
 - pytheas_session_prompt
 description: "High-level system design and architecture specialist — designs the perfect architecture that other agents try to replicate. Named after Plato (PLAY-toh), the Master of Ideal Forms.\n"
-version: '0.2.3'
+version: '0.2.4'
 variables:
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep

@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.32.5 (2026-06-10)
+
+### Fixes
+
+- remove side borders from transcript detail viewer (#779)
+- deduplicate streamed text and repeated final message (#784)
+- isolate concurrent sub-agent session prompts (#783) (#787)
+- resolve package-relative agent delegation naming (#788)
+- only initialize MCP servers whose tools match use_tools (#793)
+- fix(acp): isolate concurrent sub-agent session prompts so they no longer clobber each other's active session or event sink (#783)
+- Remove the left/right borders from the transcript detail viewer so copying multi-line content no longer captures vertical `|` border characters. The top and bottom borders are retained for the title and footer separation.
+- Fix duplicated assistant text where streamed message chunks were followed by a repeated full final message (TUI streaming + ACP server hardening). Fixes #671.
+- fix(mcp): only initialize MCP servers whose tools match the agent's `use_tools` selectors, so unused servers no longer connect at startup or emit spurious "failed to connect" warnings (#790)
+- Fix package-relative agent resolution for delegation tools (`_session_prompt`, etc.); tool names now match the slash-free, package-relative scheme used for handoffs. Fixes #709.
+- Replace the argc-based `install` task with a Rust `xtask` crate. Use `cargo xtask install` (optionally with `--debug` or a list of bin names) to build and install harnx binaries from a local checkout. The bin list is discovered automatically from cargo metadata. Fixes #792.
+
 ## 0.32.4 (2026-06-09)
 
 ### Features

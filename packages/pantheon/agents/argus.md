@@ -21,7 +21,7 @@ use_tools:
 - plans_update_note
 - plans_update_task
 description: "Task verification agent — independently verifies work completed by other agents by reading changed files, running tests and diagnostics, and cross-checking claims against actual results. Returns structured PASS/FAIL verdicts with evidence. Named after Argus (AR-gus) Panoptes, the hundred-eyed giant who never slept.\n"
-version: '0.2.3'
+version: '0.2.4'
 variables:
 - name: argus_core
   description: Core verification protocol for argus

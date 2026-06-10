@@ -1,6 +1,16 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.2.4 (2026-06-10)
+
+### Fixes
+
+- remove side borders from transcript detail viewer (#779)
+- deduplicate streamed text and repeated final message (#784)
+- isolate concurrent sub-agent session prompts (#783) (#787)
+- resolve package-relative agent delegation naming (#788)
+- only initialize MCP servers whose tools match use_tools (#793)
+
 ## 0.2.3 (2026-06-09)
 
 ### Features

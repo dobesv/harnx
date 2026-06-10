@@ -19,7 +19,7 @@ use_tools:
 - plans_update_note
 - fs_rollback_file
 description: "Refactoring and completeness specialist — identifies missed simplification opportunities, partial fixes, incomplete implementations, and unaddressed edge cases. Named after Terpsichore (turp-SIK-uh-ree), the Muse of dance — ensuring code moves elegantly.\n"
-version: '0.2.3'
+version: '0.2.4'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

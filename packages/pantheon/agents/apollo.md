@@ -28,7 +28,7 @@ use_tools:
 - plans_update_task
 - pytheas_session_prompt
 description: "Creative coding and innovative solutions specialist — provides the creative spark for novel UX and 'out-of-the-box' logic. Named after Apollo (uh-POL-oh), God of the Arts.\n"
-version: '0.2.3'
+version: '0.2.4'
 variables:
 - name: apollo_core
   description: Core identity and instructions for Apollo

@@ -59,7 +59,7 @@ description: "Plan execution orchestrator \u2014 manages plans and todos in loca
   \ distributes tasks to Pantheon specialist agents, and shares context via plan notes.\
   \ Verifies every delegation independently. Named after Atlas (AT-lus), the Titan\
   \ who carries the world on his shoulders.\n"
-version: '0.2.3'
+version: '0.2.4'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
