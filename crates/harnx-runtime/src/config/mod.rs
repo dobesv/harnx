@@ -1137,9 +1137,23 @@ impl Config {
         let mut declarations = self.tools.declarations();
         let mut handoff_targets = HashMap::new();
         if let Some(use_tools) = use_tools {
+            let selectors = split_tool_selectors(use_tools)
+                .into_iter()
+                .flat_map(|selector| {
+                    let selector = selector.trim();
+                    self.toolsets
+                        .get(selector)
+                        .cloned()
+                        .unwrap_or_else(|| vec![selector.to_string()])
+                })
+                .collect::<Vec<String>>();
             if self.needs_mcp_tools() {
                 if let Some(manager) = &self.mcp_manager {
-                    declarations.extend(manager.get_all_tools_blocking());
+                    if selectors.iter().any(|selector| selector == "*") {
+                        declarations.extend(manager.get_all_tools_blocking());
+                    } else {
+                        declarations.extend(manager.get_tools_for_selectors_blocking(&selectors));
+                    }
                 }
             }
             if let Some(manager) = &self.acp_manager {
@@ -1149,7 +1163,11 @@ impl Config {
             // actually requests a *_session_handoff tool. Generating them
             // unconditionally would inject extra tool declarations into agents
             // that don't need them, changing LLM request payloads (#303).
-            if split_tool_selectors(use_tools).into_iter().any(|v| {
+            //
+            // Use the toolset-expanded `selectors` (not the raw `use_tools`)
+            // so a handoff selector or `*` reached via a toolset is honored,
+            // matching how MCP tools are selected above.
+            if selectors.iter().any(|v| {
                 let v = v.trim();
                 v.ends_with("_session_handoff") || v == "*"
             }) {

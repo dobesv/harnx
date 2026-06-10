@@ -6,6 +6,7 @@ use harnx_core::tool::{ToolDeclaration, ToolError, ToolProvider};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use globset::GlobBuilder;
 use parking_lot::RwLock;
 use process_wrap::tokio::CommandWrap;
 #[cfg(unix)]
@@ -736,6 +737,119 @@ mod tests {
         assert!(manager.find_client_for_tool("noprefix").is_none());
     }
 
+    /// Build a client pre-populated with `tools` (display names) and marked
+    /// as already-failed so tool discovery does NOT try to spawn a real
+    /// process for it. `get_tools_from_clients` skips connecting clients that
+    /// have `connection_failed`, yet still returns their cached `get_tools()`,
+    /// letting us exercise the selector-based server filter without I/O.
+    fn preset_client(name: &str, tools: &[&str]) -> Arc<McpClient> {
+        let client = Arc::new(McpClient::new(test_mcp_config(name)));
+        let declarations = tools
+            .iter()
+            .map(|display| {
+                let server_tool = display.strip_prefix(&format!("{name}_")).unwrap_or(display);
+                mcp_tool_to_declaration(
+                    display,
+                    server_tool,
+                    "desc",
+                    &json!({}),
+                    ToolTemplates::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        *client.tools.write() = declarations;
+        *client.connection_failed.write() = true;
+        client
+    }
+
+    fn tool_names(decls: &[ToolDeclaration]) -> Vec<String> {
+        decls.iter().map(|d| d.name.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn get_tools_for_selectors_filters_unmatched_servers() {
+        let manager = McpManager::new();
+        manager.clients.write().insert(
+            "fs".to_string(),
+            preset_client("fs", &["fs_read", "fs_write"]),
+        );
+        manager.clients.write().insert(
+            "context7".to_string(),
+            preset_client("context7", &["context7_search"]),
+        );
+
+        // Selector only references the `fs` server: context7 tools excluded.
+        let tools = manager
+            .get_tools_for_selectors(&["fs_read".to_string()])
+            .await;
+        assert_eq!(tool_names(&tools), vec!["fs_read", "fs_write"]);
+        assert!(!tool_names(&tools).contains(&"context7_search".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_tools_for_selectors_glob_selects_matching_server_only() {
+        let manager = McpManager::new();
+        manager.clients.write().insert(
+            "fs".to_string(),
+            preset_client("fs", &["fs_read", "fs_write"]),
+        );
+        manager.clients.write().insert(
+            "context7".to_string(),
+            preset_client("context7", &["context7_search"]),
+        );
+
+        let tools = manager
+            .get_tools_for_selectors(&["context7_*".to_string()])
+            .await;
+        assert_eq!(tool_names(&tools), vec!["context7_search"]);
+    }
+
+    #[tokio::test]
+    async fn get_tools_for_selectors_star_includes_all_servers() {
+        let manager = McpManager::new();
+        manager
+            .clients
+            .write()
+            .insert("fs".to_string(), preset_client("fs", &["fs_read"]));
+        manager.clients.write().insert(
+            "context7".to_string(),
+            preset_client("context7", &["context7_search"]),
+        );
+
+        let tools = manager.get_tools_for_selectors(&["*".to_string()]).await;
+        assert_eq!(tool_names(&tools), vec!["context7_search", "fs_read"]);
+    }
+
+    #[tokio::test]
+    async fn get_tools_for_selectors_includes_renamed_tool_server() {
+        let manager = McpManager::new();
+        let mut cfg = test_mcp_config("context7");
+        cfg.rename_tools
+            .insert("search".to_string(), "docs_search".to_string());
+        let client = Arc::new(McpClient::new(cfg));
+        *client.tools.write() = vec![mcp_tool_to_declaration(
+            "docs_search",
+            "search",
+            "desc",
+            &json!({}),
+            ToolTemplates::default(),
+        )
+        .unwrap()];
+        *client.connection_failed.write() = true;
+        manager
+            .clients
+            .write()
+            .insert("context7".to_string(), client);
+
+        // The display name dropped the server prefix; selecting it by its
+        // renamed name must still pick the context7 server.
+        let tools = manager
+            .get_tools_for_selectors(&["docs_search".to_string()])
+            .await;
+        assert_eq!(tool_names(&tools), vec!["docs_search"]);
+    }
+
     #[tokio::test]
     async fn test_mcp_manager_call_tool_routes_prefixed_names() {
         let (client_transport, server_transport) = duplex(1024);
@@ -917,6 +1031,81 @@ mod tests {
     }
 }
 
+/// Check whether a glob pattern matches a name. Returns `false` if the
+/// pattern is invalid (graceful degradation). Mirrors the runtime's
+/// `matches_tool_glob`; duplicated here to keep the dependency direction
+/// (harnx-runtime depends on harnx-mcp, not vice versa).
+fn matches_tool_glob(pattern: &str, name: &str) -> bool {
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .ok()
+        .is_some_and(|g| g.compile_matcher().is_match(name))
+}
+
+/// The leading literal (metachar-free) portion of a selector, i.e. the part
+/// before the first glob metacharacter. For `"fs_*"` this is `"fs_"`, for
+/// `"bash_exec"` it is the whole string, and for `"{a,b}"` it is `""`.
+fn selector_literal_prefix(selector: &str) -> &str {
+    selector
+        .find(['*', '?', '{', '[', ']', '}'])
+        .map_or(selector, |idx| &selector[..idx])
+}
+
+/// Whether any of `selectors` could match a tool contributed by `client`,
+/// without connecting to it.
+fn client_could_match_any_selector(client: &McpClient, selectors: &[String]) -> bool {
+    let rename_targets: Vec<String> = client.config.rename_tools.values().cloned().collect();
+    selectors.iter().any(|selector| {
+        selector_could_match_server(selector.trim(), client.name(), &rename_targets)
+    })
+}
+
+/// Decide whether a single `use_tools` selector could match any tool exposed
+/// by the server named `server_name`. A server's tools are named
+/// `{server_name}_{tool}` unless renamed, in which case the renamed display
+/// names are listed in `rename_targets`.
+///
+/// This is a conservative pre-filter: it must never return `false` for a
+/// selector that would actually select one of the server's tools (a false
+/// negative would hide tools), but it may return `true` for a selector that
+/// ends up matching nothing (a false positive only costs an extra
+/// connection).
+pub fn selector_could_match_server(
+    selector: &str,
+    server_name: &str,
+    rename_targets: &[String],
+) -> bool {
+    if selector == "*" {
+        return true;
+    }
+
+    // A renamed tool's display name no longer carries the server prefix, so
+    // check those explicitly against the selector glob.
+    if rename_targets
+        .iter()
+        .any(|target| matches_tool_glob(selector, target))
+    {
+        return true;
+    }
+
+    let server_prefix = format!("{server_name}_");
+
+    // No glob metacharacters: the selector is an exact tool name and can only
+    // belong to this server if it starts with the server's prefix.
+    if !selector.contains(['*', '?', '{', '[', ']', '}']) {
+        return selector.starts_with(&server_prefix);
+    }
+
+    // Glob selector: compare its literal leading segment against the server
+    // prefix. The selector can only match a `{server}_…` tool if one prefix is
+    // a prefix of the other (e.g. selector `fs_*` vs server `fs`, or selector
+    // `f*` vs server `fs`). Selectors that begin with `*`/`{`/`[` have an
+    // empty literal prefix and conservatively match every server.
+    let literal_prefix = selector_literal_prefix(selector);
+    server_prefix.starts_with(literal_prefix) || literal_prefix.starts_with(&server_prefix)
+}
+
 #[derive(Debug)]
 pub struct McpManager {
     clients: Arc<RwLock<HashMap<String, Arc<McpClient>>>>,
@@ -962,8 +1151,11 @@ impl McpManager {
         client.disconnect().await
     }
 
-    pub async fn get_all_tools(&self) -> Vec<ToolDeclaration> {
-        let clients: Vec<_> = self.clients.read().values().cloned().collect();
+    /// Connect the given clients (best-effort, emitting a warning per
+    /// connection failure) and collect the union of their tools, sorted by
+    /// display name. Clients already connected or previously failed are not
+    /// reconnected.
+    async fn get_tools_from_clients(&self, clients: Vec<Arc<McpClient>>) -> Vec<ToolDeclaration> {
         let connect_futures: Vec<_> = clients
             .iter()
             .filter(|c| !c.is_connected() && !c.connection_failed())
@@ -1006,6 +1198,33 @@ impl McpManager {
         tools
     }
 
+    pub async fn get_all_tools(&self) -> Vec<ToolDeclaration> {
+        let clients: Vec<_> = self.clients.read().values().cloned().collect();
+        self.get_tools_from_clients(clients).await
+    }
+
+    /// Like `get_all_tools`, but only connects to servers whose tools could
+    /// match one of the given `use_tools` selectors. Servers that cannot
+    /// contribute any matching tool are left untouched (never spawned), so
+    /// agents that don't use a server's tools don't pay its startup cost or
+    /// surface its connection errors (#790). Already-connected servers are
+    /// always included.
+    pub async fn get_tools_for_selectors(&self, selectors: &[String]) -> Vec<ToolDeclaration> {
+        if selectors.iter().any(|s| s.trim() == "*") {
+            return self.get_all_tools().await;
+        }
+        let clients: Vec<_> = self
+            .clients
+            .read()
+            .values()
+            .filter(|client| {
+                client.is_connected() || client_could_match_any_selector(client, selectors)
+            })
+            .cloned()
+            .collect();
+        self.get_tools_from_clients(clients).await
+    }
+
     fn invalidate_all_services(&self) {
         for client in self.clients.read().values() {
             if client.is_connected() {
@@ -1014,11 +1233,28 @@ impl McpManager {
         }
     }
 
-    pub fn get_all_tools_blocking(&self) -> Vec<ToolDeclaration> {
+    /// Synchronously run an async tool-discovery future to completion,
+    /// handling the various Tokio runtime contexts (multi-thread, current-
+    /// thread, or none).
+    ///
+    /// On the current-thread and no-runtime paths the discovery future runs on
+    /// a short-lived runtime; `invalidate_all_services()` is called afterwards
+    /// so the now-orphaned services aren't left half-alive and are
+    /// re-established on demand. On the multi-thread path the future runs on
+    /// the caller's persistent runtime, so connections opened during discovery
+    /// stay usable and are intentionally *not* invalidated (avoiding needless
+    /// reconnect churn). This mirrors the original `get_all_tools_blocking`.
+    fn run_tool_discovery_blocking<Fut>(
+        &self,
+        fut: impl FnOnce() -> Fut + Send,
+    ) -> Vec<ToolDeclaration>
+    where
+        Fut: std::future::Future<Output = Vec<ToolDeclaration>>,
+    {
         if let Ok(handle) = Handle::try_current() {
             match handle.runtime_flavor() {
                 RuntimeFlavor::MultiThread => {
-                    tokio::task::block_in_place(|| handle.block_on(self.get_all_tools()))
+                    tokio::task::block_in_place(|| handle.block_on(fut()))
                 }
                 _ => {
                     // On a single-threaded runtime (e.g., the ACP server),
@@ -1030,7 +1266,7 @@ impl McpManager {
                                 .enable_all()
                                 .build()
                                 .expect("create runtime for MCP tool discovery");
-                            let tools = rt.block_on(self.get_all_tools());
+                            let tools = rt.block_on(fut());
                             self.invalidate_all_services();
                             tools
                         })
@@ -1042,7 +1278,7 @@ impl McpManager {
         } else {
             match Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => {
-                    let tools = runtime.block_on(self.get_all_tools());
+                    let tools = runtime.block_on(fut());
                     self.invalidate_all_services();
                     tools
                 }
@@ -1052,6 +1288,15 @@ impl McpManager {
                 }
             }
         }
+    }
+
+    pub fn get_all_tools_blocking(&self) -> Vec<ToolDeclaration> {
+        self.run_tool_discovery_blocking(|| self.get_all_tools())
+    }
+
+    /// Blocking variant of `get_tools_for_selectors`.
+    pub fn get_tools_for_selectors_blocking(&self, selectors: &[String]) -> Vec<ToolDeclaration> {
+        self.run_tool_discovery_blocking(|| self.get_tools_for_selectors(selectors))
     }
 
     pub async fn get_server_tools(&self, server_name: &str) -> Result<Vec<ToolDeclaration>> {
@@ -1136,5 +1381,87 @@ impl ToolProvider for McpManager {
                 Err(ToolError::Fatal(anyhow!("MCP tool call aborted by user")))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod selector_filter_tests {
+    use super::selector_could_match_server;
+
+    #[test]
+    fn star_matches_every_server() {
+        assert!(selector_could_match_server("*", "fs", &[]));
+        assert!(selector_could_match_server("*", "context7", &[]));
+    }
+
+    #[test]
+    fn exact_name_under_prefix_matches() {
+        assert!(selector_could_match_server("fs_read", "fs", &[]));
+        assert!(selector_could_match_server("bash_exec", "bash", &[]));
+    }
+
+    #[test]
+    fn exact_name_for_other_server_does_not_match() {
+        assert!(!selector_could_match_server("bash_exec", "fs", &[]));
+        assert!(!selector_could_match_server("fetch_get", "context7", &[]));
+    }
+
+    #[test]
+    fn server_glob_matches() {
+        assert!(selector_could_match_server("fs_*", "fs", &[]));
+        assert!(selector_could_match_server("context7_*", "context7", &[]));
+    }
+
+    #[test]
+    fn other_server_glob_does_not_match() {
+        assert!(!selector_could_match_server("fs_*", "context7", &[]));
+        assert!(!selector_could_match_server("other_*", "fs", &[]));
+    }
+
+    #[test]
+    fn partial_literal_prefix_glob_matches() {
+        // Selector `f*` should conservatively match server `fs`.
+        assert!(selector_could_match_server("f*", "fs", &[]));
+        // But `x*` should not match `fs`.
+        assert!(!selector_could_match_server("x*", "fs", &[]));
+    }
+
+    #[test]
+    fn leading_metachar_glob_matches_conservatively() {
+        // Empty literal prefix → matches any server (false positive allowed).
+        assert!(selector_could_match_server("*_read", "fs", &[]));
+        assert!(selector_could_match_server(
+            "{fs_read,bash_exec}",
+            "fs",
+            &[]
+        ));
+        assert!(selector_could_match_server(
+            "{fs_read,bash_exec}",
+            "bash",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn renamed_tool_display_name_matches() {
+        // A tool renamed to `docs_search` drops the server prefix; the
+        // server must still be selected by an exact or glob selector.
+        let targets = vec!["docs_search".to_string()];
+        assert!(selector_could_match_server(
+            "docs_search",
+            "context7",
+            &targets
+        ));
+        assert!(selector_could_match_server("docs_*", "context7", &targets));
+    }
+
+    #[test]
+    fn renamed_tool_non_matching_selector_does_not_match() {
+        let targets = vec!["docs_search".to_string()];
+        assert!(!selector_could_match_server(
+            "other_tool",
+            "context7",
+            &targets
+        ));
     }
 }
