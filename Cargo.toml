@@ -30,6 +30,7 @@ members = [
     "crates/harnx-tui",
     "crates/harnx-proxy-auth",
     "crates/ratatui-widget-scrolling",
+    "xtask",
 ]
 
 [workspace.package]
