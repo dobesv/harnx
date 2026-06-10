@@ -99,13 +99,45 @@ fn install(args: InstallArgs) -> Result<()> {
         let source = target_dir.join(profile_dir).join(&executable_name);
         let destination = install_dir.join(&executable_name);
         println!("==> Installing {bin} -> {}", destination.display());
-        fs::copy(&source, &destination).with_context(|| {
+        install_binary(&source, &destination)?;
+    }
+
+    Ok(())
+}
+
+/// Copy `source` over `destination` without failing when the destination is a
+/// currently-running binary.
+///
+/// Writing directly to `destination` (as `fs::copy` does) fails with `ETXTBSY`
+/// ("Text file busy") on Linux when the target is being executed, because the
+/// open-for-truncate touches the in-use inode. Instead we copy to a sibling
+/// temp file and atomically `rename` it over the destination: the rename swaps
+/// the directory entry, leaving any running process pointing at the old, now
+/// unlinked inode. This mirrors the `cp -f` behaviour the old Argcfile task
+/// relied on, so `install` works without stopping existing harnx processes.
+fn install_binary(source: &PathBuf, destination: &PathBuf) -> Result<()> {
+    let file_name = destination.file_name().ok_or_else(|| {
+        anyhow!(
+            "install destination {} has no file name",
+            destination.display()
+        )
+    })?;
+    let mut tmp_name = OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(".new");
+    let tmp = destination.with_file_name(tmp_name);
+
+    fs::copy(source, &tmp)
+        .with_context(|| format!("failed to copy {} to {}", source.display(), tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, destination) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| {
             format!(
-                "failed to copy {} to {}",
-                source.display(),
+                "failed to install {} to {}",
+                tmp.display(),
                 destination.display()
             )
-        })?;
+        });
     }
 
     Ok(())
