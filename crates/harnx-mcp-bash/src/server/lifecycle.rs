@@ -20,6 +20,10 @@ impl BashServer {
         "TMPDIR",
         "TMP",
         "TEMP",
+        // Forward Go cache locations so sandboxed `go` honors custom cache dirs
+        // that are whitelisted from ambient env in sandbox defaults.
+        "GOMODCACHE",
+        "GOCACHE",
         // Windows-specific names. std::env::var returns Err on Unix where
         // these are unset, so listing them here is a no-op on POSIX builds.
         "SYSTEMROOT",

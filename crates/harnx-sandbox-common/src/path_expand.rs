@@ -26,7 +26,11 @@ pub fn expand_tilde(raw: &str) -> String {
 ///    (`$VAR` or `$VAR/...`), run project-root detection against `cwd`.
 ///    - detection `Some(root)` joins any relative remainder onto `root`.
 ///    - detection `None` returns `None`, so caller silently skips path.
-/// 2. Else apply `expand_tilde` and return resulting `PathBuf`.
+/// 2. Else if it begins with `$NAME` at that same prefix boundary, resolve
+///    `NAME` from environment and join any relative remainder onto that value.
+///    Pseudo-vars take precedence; unset env vars stay literal; no mid-path
+///    expansion and no `${...}` syntax.
+/// 3. Else apply `expand_tilde` and return resulting `PathBuf`.
 pub fn expand_path_var(raw: &str, cwd: &Path) -> Option<PathBuf> {
     let pseudo_var = [
         ("$GIT_ROOT", crate::RootKind::GitRoot),
@@ -50,6 +54,33 @@ pub fn expand_path_var(raw: &str, cwd: &Path) -> Option<PathBuf> {
             Some(relative) => root.join(relative),
             None => root,
         });
+    }
+
+    if let Some(stripped) = raw.strip_prefix('$') {
+        let mut chars = stripped.char_indices();
+        let Some((_, first)) = chars.next() else {
+            return Some(PathBuf::from(expand_tilde(raw)));
+        };
+
+        if first.is_ascii_alphabetic() || first == '_' {
+            let name_end = chars
+                .find_map(|(idx, ch)| (!(ch.is_ascii_alphanumeric() || ch == '_')).then_some(idx))
+                .unwrap_or(stripped.len());
+            let name = &stripped[..name_end];
+            let remainder = &stripped[name_end..];
+
+            if remainder.is_empty() || remainder.starts_with('/') {
+                if let Some(value) = std::env::var_os(name) {
+                    let base = PathBuf::from(value);
+                    return Some(match remainder.strip_prefix('/') {
+                        Some(relative) => base.join(relative),
+                        None => base,
+                    });
+                }
+
+                return Some(PathBuf::from(raw));
+            }
+        }
     }
 
     Some(PathBuf::from(expand_tilde(raw)))
@@ -138,6 +169,73 @@ mod tests {
             expand_path_var("pre$GIT_ROOT", cwd),
             Some(PathBuf::from("pre$GIT_ROOT"))
         );
+    }
+
+    #[test]
+    fn env_var_expands_to_value_and_joined_suffix() {
+        let _lock = env_lock();
+        let _env = EnvGuard::new();
+        unsafe { std::env::set_var("HARNX_TEST_VAR_A", "/tmp/harnx-var-a") };
+
+        assert_eq!(
+            expand_path_var("$HARNX_TEST_VAR_A", Path::new("/")),
+            Some(PathBuf::from("/tmp/harnx-var-a"))
+        );
+        assert_eq!(
+            expand_path_var("$HARNX_TEST_VAR_A/sub", Path::new("/")),
+            Some(PathBuf::from("/tmp/harnx-var-a").join("sub"))
+        );
+
+        unsafe { std::env::remove_var("HARNX_TEST_VAR_A") };
+    }
+
+    #[test]
+    fn unset_env_var_stays_literal() {
+        let _lock = env_lock();
+        let _env = EnvGuard::new();
+        unsafe { std::env::remove_var("HARNX_TEST_NONEXISTENT_XYZ") };
+
+        assert_eq!(
+            expand_path_var("$HARNX_TEST_NONEXISTENT_XYZ", Path::new("/")),
+            Some(PathBuf::from("$HARNX_TEST_NONEXISTENT_XYZ"))
+        );
+    }
+
+    #[test]
+    fn env_var_prefix_boundary_negatives_stay_literal() {
+        let _lock = env_lock();
+        let _env = EnvGuard::new();
+        unsafe { std::env::set_var("HARNX_TEST_VAR_A", "/tmp/harnx-var-a") };
+        let cwd = Path::new("/");
+
+        assert_eq!(
+            expand_path_var("$HARNX_TEST_VAR_AX", cwd),
+            Some(PathBuf::from("$HARNX_TEST_VAR_AX"))
+        );
+        assert_eq!(
+            expand_path_var("pre$HARNX_TEST_VAR_A", cwd),
+            Some(PathBuf::from("pre$HARNX_TEST_VAR_A"))
+        );
+        assert_eq!(
+            expand_path_var("$HARNX_TEST_VAR_A-bar", cwd),
+            Some(PathBuf::from("$HARNX_TEST_VAR_A-bar"))
+        );
+
+        unsafe { std::env::remove_var("HARNX_TEST_VAR_A") };
+    }
+
+    #[test]
+    fn tilde_is_not_reexpanded_after_env_var_expansion() {
+        let _lock = env_lock();
+        let _env = EnvGuard::new();
+        unsafe { std::env::set_var("HARNX_TEST_TILDE_VAR", "~/foo") };
+
+        assert_eq!(
+            expand_path_var("$HARNX_TEST_TILDE_VAR", Path::new("/")),
+            Some(PathBuf::from("~/foo"))
+        );
+
+        unsafe { std::env::remove_var("HARNX_TEST_TILDE_VAR") };
     }
 
     #[test]

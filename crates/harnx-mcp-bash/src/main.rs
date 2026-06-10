@@ -251,7 +251,7 @@ fn parse_args() -> anyhow::Result<(Vec<PathBuf>, SandboxConfig)> {
                     "  HARNX_BASH_ENV_PASSTHROUGH  Comma-separated extra env var names to pass through"
                 );
                 eprintln!();
-                eprintln!("  $GIT_ROOT, $GIT_COMMON_DIR, $NODE_PROJECT_ROOT, $CARGO_ROOT, $GO_ROOT supported; resolved vs cwd, dropped if absent");
+                eprintln!("  $GIT_ROOT, $GIT_COMMON_DIR, $NODE_PROJECT_ROOT, $CARGO_ROOT, $GO_ROOT supported; resolved vs cwd, dropped if absent; any other $ENV_VAR resolves from environment, left literal if unset");
                 eprintln!();
                 eprintln!("Sandboxing is enabled by default on Unix. Use --no-sandbox to disable it explicitly.");
                 eprintln!("The server communicates via stdio using the MCP protocol.");

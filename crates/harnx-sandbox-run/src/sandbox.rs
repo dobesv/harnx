@@ -42,8 +42,9 @@ fn find_sandbox_exec() -> PathBuf {
 #[cfg(unix)]
 fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Vec<OsString> {
     use harnx_sandbox_common::{
-        expand_path_var, is_home_or_ancestor, resolve_path, system_writable_paths, HOME_EXEC_PATHS,
-        HOME_READ_PATHS, HOME_RWX_PATHS, HOME_WRITE_PATHS, SYSTEM_EXEC_PATHS, SYSTEM_READ_PATHS,
+        expand_path_var, is_home_or_ancestor, push_env_relative_defaults, resolve_path,
+        system_writable_paths, HOME_EXEC_PATHS, HOME_READ_PATHS, HOME_RWX_PATHS, HOME_WRITE_PATHS,
+        SYSTEM_EXEC_PATHS, SYSTEM_READ_PATHS,
     };
 
     let mut args: Vec<OsString> = Vec::new();
@@ -110,62 +111,7 @@ fn build_exec_args(cli: &Cli, all_env_keys: &[String], use_defaults: bool) -> Ve
                 }
             }
         }
-        // CARGO_HOME, GOROOT, GOPATH, GOBIN
-        if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
-            let cargo_home = std::path::PathBuf::from(cargo_home);
-            // Root: read-only so config.toml / credentials are visible, matching
-            // the default ~/.cargo (readable via HOME_EXEC_PATHS).
-            if cargo_home.exists() {
-                args.push("--read".into());
-                args.push(cargo_home.clone().into_os_string());
-            }
-            // Binaries: read+exec only (same as the default ~/.cargo/bin).
-            let bin = cargo_home.join("bin");
-            if bin.exists() {
-                args.push("--exec".into());
-                args.push(bin.into_os_string());
-            }
-            // Download caches: read+write (mirror the default ~/.cargo/registry
-            // and ~/.cargo/git so a custom CARGO_HOME keeps cache-write access).
-            for sub in ["registry", "git"] {
-                let path = cargo_home.join(sub);
-                if path.exists() {
-                    args.push("--read".into());
-                    args.push(path.clone().into_os_string());
-                    args.push("--write".into());
-                    args.push(path.into_os_string());
-                }
-            }
-        }
-        if let Some(goroot) = std::env::var_os("GOROOT") {
-            let p = std::path::PathBuf::from(goroot);
-            if p.exists() {
-                args.push("--exec".into());
-                args.push(p.into_os_string());
-            }
-        }
-        if let Some(gopath) = std::env::var_os("GOPATH") {
-            let gopath = std::path::PathBuf::from(gopath);
-            let bin = gopath.join("bin");
-            let pkg = gopath.join("pkg");
-            if bin.exists() {
-                args.push("--exec".into());
-                args.push(bin.into_os_string());
-            }
-            if pkg.exists() {
-                args.push("--read".into());
-                args.push(pkg.clone().into_os_string());
-                args.push("--write".into());
-                args.push(pkg.into_os_string());
-            }
-        }
-        if let Some(gobin) = std::env::var_os("GOBIN") {
-            let p = std::path::PathBuf::from(gobin);
-            if p.exists() {
-                args.push("--exec".into());
-                args.push(p.into_os_string());
-            }
-        }
+        push_env_relative_defaults(&mut args);
     }
 
     // CLI-provided extra paths
@@ -266,7 +212,20 @@ fn collect_env(
     hook_env: HashMap<String, String>,
 ) -> (Vec<(String, String)>, Vec<String>) {
     const DEFAULT_PASSTHROUGH: &[&str] = &[
-        "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "PATH", "TMPDIR",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "TMPDIR",
+        // Forward Go cache locations so sandboxed `go` honors custom cache dirs
+        // that were also whitelisted by push_env_relative_defaults().
+        "GOMODCACHE",
+        "GOCACHE",
     ];
 
     let mut env: Vec<(String, String)> = Vec::new();
@@ -534,6 +493,47 @@ mod tests {
                 "--".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn build_exec_args_skips_home_expanded_from_env_var() {
+        let _lock = env_lock().lock().expect("lock poisoned");
+        let _env = EnvGuard::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("cwd");
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&home).expect("create home");
+
+        std::env::set_current_dir(&cwd).expect("set cwd");
+        unsafe { std::env::set_var("HOME", &home) };
+        unsafe { std::env::set_var("HARNX_TEST_HOME_VAR", &home) };
+
+        let cli = Cli {
+            env_vars: vec![],
+            extra_read: vec![],
+            extra_write: vec![PathBuf::from("$HARNX_TEST_HOME_VAR")],
+            extra_exec: vec![],
+            extra_rwx: vec![],
+            no_network: false,
+            working_dir: None,
+            no_defaults: false,
+            command: vec![],
+        };
+
+        let args: Vec<String> = build_exec_args(&cli, &[], false)
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let home = std::fs::canonicalize(&home)
+            .unwrap_or_else(|_| home.clone())
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(!args.windows(2).any(|w| w == ["--write", home.as_str()]));
+        assert_eq!(args, vec!["--".to_string()]);
+
+        unsafe { std::env::remove_var("HARNX_TEST_HOME_VAR") };
     }
 
     #[test]

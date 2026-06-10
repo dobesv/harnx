@@ -188,6 +188,26 @@ pub fn push_env_relative_defaults(args: &mut Vec<OsString>) {
         args.push(OsString::from("--exec"));
         args.push(PathBuf::from(gobin).into_os_string());
     }
+    if let Some(gomodcache) = std::env::var_os("GOMODCACHE") {
+        let gomodcache = PathBuf::from(gomodcache);
+        // Go caches hold source, .a archives, and build logs only; test binaries
+        // link and execute from $TMPDIR instead. Granting exec here would be a
+        // security regression.
+        args.push(OsString::from("--read"));
+        args.push(gomodcache.clone().into_os_string());
+        args.push(OsString::from("--write"));
+        args.push(gomodcache.into_os_string());
+    }
+    if let Some(gocache) = std::env::var_os("GOCACHE") {
+        let gocache = PathBuf::from(gocache);
+        // Go caches hold source, .a archives, and build logs only; test binaries
+        // link and execute from $TMPDIR instead. Granting exec here would be a
+        // security regression.
+        args.push(OsString::from("--read"));
+        args.push(gocache.clone().into_os_string());
+        args.push(OsString::from("--write"));
+        args.push(gocache.into_os_string());
+    }
 }
 
 #[cfg(unix)]
