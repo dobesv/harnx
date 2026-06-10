@@ -570,6 +570,28 @@ mod sandbox_args {
 
     #[cfg(unix)]
     #[test]
+    fn test_sandbox_args_honours_go_cache_env_vars() {
+        let _env_guard = env_lock();
+        let _gomodcache = EnvVar::set("GOMODCACHE", "/srv/go-mod-cache");
+        let _gocache = EnvVar::set("GOCACHE", "/srv/go-build-cache");
+
+        let pairs = sandbox_arg_pairs(
+            Path::new("/test/root"),
+            Path::new("/test/root/workdir"),
+            None,
+            None,
+        );
+
+        assert_arg_pair_present(&pairs, "--read", "/srv/go-mod-cache");
+        assert_arg_pair_present(&pairs, "--write", "/srv/go-mod-cache");
+        assert_arg_pair_absent(&pairs, "--exec", "/srv/go-mod-cache");
+        assert_arg_pair_present(&pairs, "--read", "/srv/go-build-cache");
+        assert_arg_pair_present(&pairs, "--write", "/srv/go-build-cache");
+        assert_arg_pair_absent(&pairs, "--exec", "/srv/go-build-cache");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_sandbox_args_empty_outputs() {
         let pairs = sandbox_arg_pairs(
             Path::new("/test/root"),

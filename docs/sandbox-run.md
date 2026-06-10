@@ -245,10 +245,7 @@ exec harnx-sandbox-run \
   --extra-rwx '$GIT_COMMON_DIR' \
   -- gemini --yolo "$@"
 ```
-If the agent needs access to additional directories, grant them with `--extra-rwx /path/to/dir` in the shim script to add them
-permanently, or use environment variables (see below for the list) to add them temporarily:
-
-    HARNX_BASH_EXTRA_READABLE=~/Projects/some-reference-project claude
+If the agent needs access to additional directories, grant them with `--extra-rwx /path/to/dir` in the shim script.
 
 ### Installing the shims
 
