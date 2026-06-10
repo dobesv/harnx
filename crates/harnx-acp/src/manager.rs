@@ -756,6 +756,104 @@ enabled: false
     }
 
     #[test]
+    fn test_generate_acp_tools_namespaced_server_name_is_slash_free() {
+        let tools = generate_acp_tools("other__helper");
+        let tool_names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+
+        assert_eq!(
+            tool_names,
+            vec![
+                "other__helper_session_new",
+                "other__helper_session_prompt",
+                "other__helper_session_load",
+                "other__helper_session_cancel",
+            ]
+        );
+        assert!(tool_names.iter().all(|name| !name.contains('/')));
+    }
+
+    #[test]
+    fn test_find_client_for_tool_round_trips_namespaced_server_methods() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("other__helper")]);
+
+        for expected_method in [
+            "session_new",
+            "session_prompt",
+            "session_load",
+            "session_cancel",
+        ] {
+            let tool_name = format!("other__helper_{expected_method}");
+            let (client, method) = manager
+                .find_client_for_tool(&tool_name)
+                .expect("matched client for namespaced tool");
+            assert_eq!(client.name(), "other__helper");
+            assert_eq!(method, expected_method);
+        }
+    }
+
+    #[test]
+    fn test_generate_acp_tools_global_server_name_round_trips() {
+        let tools = generate_acp_tools("__global");
+        let tool_names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+
+        assert_eq!(
+            tool_names,
+            vec![
+                "__global_session_new",
+                "__global_session_prompt",
+                "__global_session_load",
+                "__global_session_cancel",
+            ]
+        );
+        assert!(tool_names.iter().all(|name| !name.contains('/')));
+
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("__global")]);
+
+        let (client, method) = manager
+            .find_client_for_tool("__global_session_prompt")
+            .expect("matched client for global tool");
+        assert_eq!(client.name(), "__global");
+        assert_eq!(method, "session_prompt");
+    }
+
+    #[test]
+    fn test_find_client_for_tool_round_trips_server_name_with_underscore() {
+        let tools = generate_acp_tools("my_agent");
+        let tool_names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(
+            tool_names,
+            vec![
+                "my_agent_session_new",
+                "my_agent_session_prompt",
+                "my_agent_session_load",
+                "my_agent_session_cancel",
+            ]
+        );
+        assert!(tool_names.iter().all(|name| !name.contains('/')));
+
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("my_agent")]);
+
+        let (client, method) = manager
+            .find_client_for_tool("my_agent_session_prompt")
+            .expect("matched client for underscore tool");
+        assert_eq!(client.name(), "my_agent");
+        assert_eq!(method, "session_prompt");
+    }
+
+    #[test]
+    fn test_find_client_for_tool_rejects_unknown_namespaced_method() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("other__helper")]);
+
+        assert!(manager
+            .find_client_for_tool("other__helper_session_bogus")
+            .is_none());
+    }
+
+    #[test]
     fn test_find_client_for_tool_no_match() {
         let manager = AcpManager::new();
         manager.initialize(vec![]);
