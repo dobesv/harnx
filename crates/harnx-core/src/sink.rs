@@ -16,10 +16,15 @@
 //! events fall through to ad-hoc `eprintln!` fallbacks and never reach
 //! the TUI transcript (issue #391).
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::event::{AgentEvent, AgentEventSink, AgentSource};
+
+tokio::task_local! {
+    static SCOPED_SINK: Arc<dyn AgentEventSink>;
+}
 
 /// Cap on the pre-install buffer. Large enough to capture a handful of
 /// startup warnings (one per misconfigured MCP server, plus a few
@@ -62,10 +67,24 @@ pub fn install_agent_event_sink(sink: Arc<dyn AgentEventSink>) {
 }
 
 pub fn has_agent_event_sink() -> bool {
+    if SCOPED_SINK.try_with(|_| ()).is_ok() {
+        return true;
+    }
     let guard = AGENT_EVENT_SINK
         .lock()
         .expect("AGENT_EVENT_SINK mutex poisoned");
     guard.sink.is_some()
+}
+
+pub async fn with_agent_event_sink<F, T>(sink: Arc<dyn AgentEventSink>, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    SCOPED_SINK.scope(sink, fut).await
+}
+
+pub fn current_agent_event_sink() -> Option<Arc<dyn AgentEventSink>> {
+    SCOPED_SINK.try_with(|sink| sink.clone()).ok()
 }
 
 pub fn emit_agent_event(event: AgentEvent) -> bool {
@@ -73,6 +92,12 @@ pub fn emit_agent_event(event: AgentEvent) -> bool {
 }
 
 pub fn emit_agent_event_with_source(event: AgentEvent, source: Option<AgentSource>) -> bool {
+    if SCOPED_SINK
+        .try_with(|sink| sink.emit(event.clone(), source.clone()))
+        .is_ok()
+    {
+        return true;
+    }
     let sink = {
         let mut guard = AGENT_EVENT_SINK
             .lock()

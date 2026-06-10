@@ -313,6 +313,54 @@ impl Clone for Config {
     }
 }
 
+impl Config {
+    /// Build an isolated copy of this config for running a single prompt in
+    /// its own session, without disturbing the original.
+    ///
+    /// SHARED (cheap `Arc`/value clones — the fork sees the same underlying
+    /// runtime resources): `mcp_manager`, `acp_manager`, `rag`,
+    /// `model_cooldowns`, plus config data, clients, model, tools, agent, and
+    /// all flags/overrides.
+    ///
+    /// ISOLATED / RESET: `session` is `None` so the caller can attach its own
+    /// session (via `use_session`) without racing the source config's active
+    /// session. The two `tui_*_editor` hooks are dropped to `None` — they are
+    /// non-`Clone` `FnMut` trait objects and the ACP server prompt path never
+    /// invokes interactive editor hooks, so dropping them is both safe and
+    /// required.
+    pub fn fork_session_scope(&self) -> Config {
+        Config {
+            data: self.data.clone(),
+            clients: self.clients.clone(),
+            mcp_servers: self.mcp_servers.clone(),
+            acp_servers: self.acp_servers.clone(),
+            model_cooldowns: self.model_cooldowns.clone(),
+            macro_flag: self.macro_flag,
+            info_flag: self.info_flag,
+            show_sequence_numbers: self.show_sequence_numbers,
+            show_timestamps: self.show_timestamps,
+            agent_variables: self.agent_variables.clone(),
+            mcp_root: self.mcp_root.clone(),
+            model: self.model.clone(),
+            tools: self.tools.clone(),
+            mcp_manager: self.mcp_manager.clone(),
+            acp_manager: self.acp_manager.clone(),
+            working_mode: self.working_mode.clone(),
+            last_message: self.last_message.clone(),
+            session: None,
+            rag: self.rag.clone(),
+            agent: self.agent.clone(),
+            // ACP server prompt path never invokes editor hooks. Drop them so
+            // forked prompt configs can own isolated session state without
+            // trying to clone `FnMut` trait objects.
+            tui_before_editor: None,
+            tui_after_editor: None,
+            sessions_dir_override: self.sessions_dir_override.clone(),
+            temp_dir_override: self.temp_dir_override.clone(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {

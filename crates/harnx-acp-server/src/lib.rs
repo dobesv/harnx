@@ -18,13 +18,7 @@ mod test_regression_issue_68;
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::*;
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
+use std::{collections::HashMap, sync::Arc};
 
 use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, ToolEvent};
 use harnx_runtime::config::GlobalConfig;
@@ -70,7 +64,6 @@ enum AcpForward {
 /// and can't be captured in the sink itself.
 struct AcpChunkSink {
     tx: tokio::sync::mpsc::UnboundedSender<AcpForward>,
-    streamed_text_this_turn: AtomicBool,
 }
 
 impl harnx_core::event::AgentEventSink for AcpChunkSink {
@@ -92,13 +85,10 @@ impl harnx_core::event::AgentEventSink for AcpChunkSink {
                     })
                     .collect();
                 if !text.is_empty() {
-                    self.streamed_text_this_turn.store(true, Ordering::Relaxed);
                     let _ = self.tx.send(AcpForward::Text(text, source));
                 }
             }
-            AgentEvent::Model(ModelEvent::Final { output, .. })
-                if !output.is_empty() && !self.streamed_text_this_turn.load(Ordering::Relaxed) =>
-            {
+            AgentEvent::Model(ModelEvent::Final { output, .. }) if !output.is_empty() => {
                 let _ = self.tx.send(AcpForward::Text(output, source));
             }
             AgentEvent::Tool(ToolEvent::Started {
@@ -172,6 +162,14 @@ struct HarnxSession {
     /// are only sent while a prompt is active, so this case isn't
     /// exercised by any test.
     cancel_notify: Arc<tokio::sync::Notify>,
+    /// Serializes prompts that target THIS session. Prompts to *different*
+    /// sessions still run fully concurrently (each holds its own lock).
+    /// Without this, two concurrent prompts with the same `session_id` would
+    /// each fork their own in-memory `Session`, independently load the same
+    /// on-disk log, and clobber each other's appends (last-writer-wins). The
+    /// lock makes the load → run → persist cycle for one session atomic with
+    /// respect to other prompts on the same session.
+    prompt_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl HarnxAgent {
@@ -224,10 +222,14 @@ impl HarnxAgent {
                 .expect("session must exist after use_session(None)")
                 .id
                 .clone();
+            config
+                .exit_session()
+                .map_err(|e| acp::Error::new(-32603, format!("Failed to persist session: {e}")))?;
         }
         let session = HarnxSession {
             abort_signal: AbortSignalInner::new(),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         self.sessions
             .lock()
@@ -245,39 +247,49 @@ impl HarnxAgent {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let (abort_signal, cancel_notify) = {
+        let (abort_signal, cancel_notify, prompt_lock) = {
             let sessions = self.sessions.lock().await;
             let session = sessions
                 .get(session_key.as_str())
                 .ok_or_else(acp::Error::invalid_params)?;
-            session.abort_signal.reset();
-            (session.abort_signal.clone(), session.cancel_notify.clone())
+            (
+                session.abort_signal.clone(),
+                session.cancel_notify.clone(),
+                session.prompt_lock.clone(),
+            )
         };
 
+        // Hold the per-session lock for the whole prompt so two prompts to the
+        // SAME session_id can't fork independent in-memory sessions and clobber
+        // each other's on-disk transcript. The `sessions` map lock above is
+        // already released, so prompts to different sessions never contend
+        // here. Guard is kept alive until the function returns.
+        let _prompt_guard = prompt_lock.lock_owned().await;
+
+        // Reset the abort signal only AFTER winning the per-session lock. If we
+        // reset before acquiring it, a queued same-session prompt could clear a
+        // cancellation that the still-running prompt holding the lock has not
+        // yet observed, effectively un-cancelling it against user intent.
+        abort_signal.reset();
+
+        let prompt_config: GlobalConfig = Arc::new(parking_lot::RwLock::new({
+            let shared_config = self.config.read();
+            shared_config.fork_session_scope()
+        }));
         {
-            let mut config = self.config.write();
-            let active_session_name = config.session.as_ref().map(|s| s.id().to_string());
-            if active_session_name.as_deref() != Some(session_key.as_str()) {
-                if config.session.is_some() {
-                    config.exit_session().map_err(|e| {
-                        acp::Error::new(-32603, format!("Failed to exit session: {e}"))
-                    })?;
-                }
-                config
-                    .use_agent_by_name(&self.agent_name)
-                    .map_err(|e| acp::Error::new(-32603, format!("Failed to set agent: {e}")))?;
-                config
-                    .use_session(Some(&session_key))
-                    .map_err(|e| acp::Error::new(-32603, format!("Failed to use session: {e}")))?;
-            }
+            let mut config = prompt_config.write();
+            config
+                .use_agent_by_name(&self.agent_name)
+                .map_err(|e| acp::Error::new(-32603, format!("Failed to set agent: {e}")))?;
+            config
+                .use_session(Some(&session_key))
+                .map_err(|e| acp::Error::new(-32603, format!("Failed to use session: {e}")))?;
         }
 
-        // Build a fresh agent for the input.  The agent is also stored on
-        // the config (via `use_agent_by_name` above) which is what carries
-        // session/shared variables; this local copy is used to expand system
-        // prompt variables like {{__os__}} via `set_agent`.
-        let mut agent = self
-            .config
+        // Build a fresh agent for the input. The forked prompt config keeps
+        // per-request session state isolated while still sharing Arc-backed
+        // runtime resources cloned from the base config.
+        let mut agent = prompt_config
             .read()
             .retrieve_agent(&self.agent_name)
             .map_err(|e| acp::Error::new(-32603, format!("Failed to retrieve agent: {e}")))?;
@@ -288,21 +300,17 @@ impl HarnxAgent {
             );
         }
 
-        let mut input = harnx_runtime::config::input::from_str(&self.config, &prompt_text, None);
-        harnx_runtime::config::input::set_agent(&mut input, &self.config, agent.into_config());
+        let mut input = harnx_runtime::config::input::from_str(&prompt_config, &prompt_text, None);
+        harnx_runtime::config::input::set_agent(&mut input, &prompt_config, agent.into_config());
 
-        // Install an AgentEventSink for streaming chunks (MessageChunk events)
-        // and tool calls (ToolEvent::Started). Nested ACP activity from
-        // sub-agent delegations also flows through this sink because
-        // `AcpManager::call_tool` registers a forwarder that re-emits each
-        // nested chunk via `emit_agent_event_with_source` — the global sink
-        // is the single point that converts all events to ACP notifications.
+        // Install a per-prompt AgentEventSink for streaming chunks
+        // (MessageChunk events) and tool calls (ToolEvent::Started).
+        // Nested ACP activity from sub-agent delegations also flows through
+        // this sink because `AcpManager::call_tool` captures and reinstalls
+        // the current task-local sink inside its spawned forwarder task.
         let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<AcpForward>();
-        let sink: Arc<dyn harnx_core::event::AgentEventSink> = Arc::new(AcpChunkSink {
-            tx: chunk_tx,
-            streamed_text_this_turn: AtomicBool::new(false),
-        });
-        harnx_core::sink::install_agent_event_sink(sink);
+        let sink: Arc<dyn harnx_core::event::AgentEventSink> =
+            Arc::new(AcpChunkSink { tx: chunk_tx });
 
         // Spawn local task to drain chunk_rx → session_notification.
         let connection_for_fwd = self.connection.lock().await.clone();
@@ -497,7 +505,7 @@ impl HarnxAgent {
         // parent's transcript would render the assistant's reply twice.
 
         let loop_ctx = harnx_runtime::AgentLoopContext {
-            config: self.config.clone(),
+            config: prompt_config.clone(),
             abort_signal: abort_signal.clone(),
             async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::default())),
             persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::default())),
@@ -542,18 +550,34 @@ impl HarnxAgent {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         };
 
-        let loop_result = tokio::select! {
-            r = harnx_runtime::run_agent_loop(&loop_ctx, input) => r,
-            _ = grace_cancel => {
-                cancel_listener.abort();
-                harnx_core::sink::clear_agent_event_sink();
-                fwd_task.abort();
-                return Ok(PromptResponse::new(StopReason::Cancelled));
+        // Scope the per-prompt event sink to this prompt's task tree so
+        // concurrent prompts to the same agent never clobber each other's
+        // streaming output. The scope wraps the whole select! (including the
+        // grace-cancel arm) so any chunks emitted up to the cancellation
+        // point still route to this prompt's sink. `loop_result` is
+        // `Option<Result<()>>`: `None` means the grace-cancel arm won, a
+        // `Some` carries the agent loop's own result.
+        let loop_result = harnx_core::sink::with_agent_event_sink(sink, async {
+            // Box the agent-loop future before racing it. `run_agent_loop`
+            // produces a very large future; embedding it inline in `select!`
+            // (which itself lives inside the prompt future + LocalSet frames)
+            // can overflow the thread stack before the first poll. Pinning it
+            // on the heap keeps the synchronous stack frame small.
+            let mut run_loop = Box::pin(harnx_runtime::run_agent_loop(&loop_ctx, input));
+            tokio::select! {
+                r = &mut run_loop => Some(r),
+                _ = grace_cancel => None,
             }
+        })
+        .await;
+
+        let Some(loop_result) = loop_result else {
+            cancel_listener.abort();
+            fwd_task.abort();
+            return Ok(PromptResponse::new(StopReason::Cancelled));
         };
 
         cancel_listener.abort();
-        harnx_core::sink::clear_agent_event_sink();
         // Drop loop_ctx so all senders into chunk_rx are dropped and
         // fwd_task can exit cleanly.
         drop(loop_ctx);
