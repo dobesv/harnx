@@ -129,6 +129,13 @@ fn test_split_tool_selectors_empty() {
 
 #[test]
 fn test_init_mcp_manager_with_roots() {
+    // This test asserts cwd is prepended as a root, which depends on HOME
+    // (cwd is skipped when it equals or is an ancestor of $HOME). Other tests
+    // mutate HOME under `env_lock`, so hold the same lock to avoid racing
+    // with them and observing a transient HOME that suppresses the cwd root.
+    #[cfg(unix)]
+    let _env_guard = env_lock();
+
     let mut config = Config::default();
     let server = McpServerConfig {
         name: "test".to_string(),

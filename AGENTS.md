@@ -8,6 +8,7 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 
 - **Language:** Rust (edition 2021, toolchain pinned in `rust-toolchain.toml` — rustup and CI both read this file automatically)
 - **Async runtime:** Tokio (multi-threaded)
+- **Test Runner:** Nextest
 - **HTTP client:** reqwest (rustls-tls)
 - **CLI framework:** clap (derive)
 - **Serialization:** serde + serde_json + serde_yaml
