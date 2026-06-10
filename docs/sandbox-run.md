@@ -93,8 +93,16 @@ exec harnx-sandbox-run \
   --extra-rwx '$GIT_ROOT' \
   --extra-rwx '$NODE_PROJECT_ROOT' \
   --extra-rwx '$GIT_COMMON_DIR' \
+  --env 'AWS_PROFILE=' \
+  --hook claude-command-persistent harnx-aws-creds --profile my-profile \; \
   -- "$tool" "$@"
 ```
+
+AWS access:
+
+Be sure to set the appropriate AWS profile name for `harnx-aws-creds` if your dev tools/servers need AWS access (e.g. for build caching
+or other S3 storage), otherwise remove that line if it is not needed.
+
 Installation:
 
 ```bash
