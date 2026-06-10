@@ -53,7 +53,8 @@ Harnx is a modular command-line LLM agent harness written in **Rust**. It lets u
 ├── example_config/             # Example user configuration
 ├── docs/                       # User-facing documentation
 ├── scripts/                    # Shell completions and shell-integration scripts
-├── Argcfile.sh                 # Developer task runner (argc-based)
+├── Argcfile.sh                 # Developer helper commands (argc-based; install moved to xtask)
+├── xtask/                      # Rust task runner (`cargo xtask install`) for local automation
 ├── .changeset/                 # Changeset files for release notes
 ├── knope.toml                  # Release automation config
 ├── renovate.json               # Dependency update bot config

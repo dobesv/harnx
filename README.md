@@ -56,12 +56,12 @@ track an in-progress branch.
 Clone the repo, then:
 
 ```sh
-# Install all harnx binaries at once via the project's argc task runner:
-argc install
+# Install all harnx binaries at once via cargo xtask:
+cargo xtask install
 
 # ...or pick one or more:
-argc install harnx
-argc install harnx-serve harnx-acp-server
+cargo xtask install harnx
+cargo xtask install harnx-serve harnx-acp-server
 
 # Raw cargo also works:
 cargo install --path crates/harnx
@@ -69,10 +69,10 @@ cargo install --path crates/harnx-serve
 cargo install --path crates/harnx-acp-server
 ```
 
-The `argc install` helper accepts `--debug` (build unoptimized for faster
-compile) and an optional list of bin names to restrict the install. It always
-builds with the committed `Cargo.lock` for a reproducible result and overwrites
-any existing bins.
+The `cargo xtask install` helper accepts `--debug` (build unoptimized for
+faster compile) and an optional list of bin names to restrict the install. It
+always builds with the committed `Cargo.lock` for a reproducible result and
+overwrites any existing bins.
 
 ### Pre-built Binaries
 
