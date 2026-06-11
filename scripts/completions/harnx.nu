@@ -46,7 +46,6 @@ module completions {
     --rebuild-rag                                       # Rebuild the RAG to sync document changes
     --macro: string@"nu-complete harnx macro"          # Execute a macro
     --serve                                             # Serve the LLM API and WebAPP
-    --acp: string@"nu-complete harnx agent"            # Serve as an ACP agent over stdio
     --file(-f): string                                  # Include files, directories, or URLs
     --no-stream(-S)                                     # Turn off stream mode
     --dry-run                                           # Display the message without sending it

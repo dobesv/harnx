@@ -3392,7 +3392,6 @@ dependencies = [
  "glob",
  "globset",
  "harnx-acp",
- "harnx-acp-server",
  "harnx-client",
  "harnx-core",
  "harnx-engine",

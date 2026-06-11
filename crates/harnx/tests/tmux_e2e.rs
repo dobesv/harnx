@@ -8,6 +8,7 @@ use harnx_core::message::MessageRole;
 use harnx_core::session::SessionLogEntry;
 
 use anyhow::{Context, Result};
+use harnx::test_utils::interrupt::harnx_acp_server_bin;
 use insta::assert_snapshot;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,20 @@ const REPRO_249_MCP_TOOL_NAME: &str = "repro249_unique_mcp_tool";
 const REPRO_249_MCP_TOOL_RESPONSE: &str = "repro249 fixed tool response";
 const TEST_AGENT_NAME: &str = "test-agent";
 const TEST_SUB_AGENT_NAME: &str = "test-sub-agent";
+#[cfg(unix)]
+const PACKAGE_DELEGATION_PACKAGE_NAME: &str = "same-package-delegation";
+#[cfg(unix)]
+const PACKAGE_DELEGATION_CALLER_NAME: &str = "package-caller";
+#[cfg(unix)]
+const PACKAGE_DELEGATION_PEER_NAME: &str = "package-peer";
+#[cfg(unix)]
+const PACKAGE_DELEGATION_USER_PROMPT: &str = "delegate to your package peer";
+#[cfg(unix)]
+const PACKAGE_DELEGATION_PEER_RESPONSE: &str =
+    "Package peer response: same-package delegation succeeded.";
+#[cfg(unix)]
+const PACKAGE_DELEGATION_CALLER_RESPONSE: &str =
+    "Package caller final response: Package peer response: same-package delegation succeeded.";
 
 #[test]
 #[cfg(unix)]
@@ -261,6 +276,102 @@ fn repro_249_top_level_delegation_markers() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn same_package_session_prompt_delegation_uses_qualified_spawn() -> Result<()> {
+    if option_env!("CARGO_BIN_NAME") == Some("harnx") {
+        eprintln!(
+            "skipping same_package_session_prompt_delegation_uses_qualified_spawn in binary test target"
+        );
+        return Ok(());
+    }
+    if !TmuxHarness::is_available() {
+        eprintln!("skipping same_package_session_prompt_delegation_uses_qualified_spawn: tmux is unavailable");
+        return Ok(());
+    }
+
+    let repo_root = repo_root()?;
+    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+
+    let temp = TempDir::new().context("failed to create temp dir")?;
+    let mock = MockOpenAiServer::start(package_delegation_script())?;
+    let paths = TestPaths::new(temp.path(), mock.port())?;
+    write_same_package_delegation_fixture_files(&paths)?;
+
+    let path_env = format!(
+        "{}:{}",
+        harnx_bin
+            .parent()
+            .context("harnx binary missing parent directory")?
+            .display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let tmux = match TmuxHarness::new(&repo_root, 120, 35) {
+        Ok(tmux) => tmux,
+        Err(err) => {
+            eprintln!(
+                "skipping same_package_session_prompt_delegation_uses_qualified_spawn: \
+                 tmux is unavailable or unusable ({err:#})"
+            );
+            return Ok(());
+        }
+    };
+    tmux.send_keys(&["C-l"])?;
+
+    tmux.send_text(&format!(
+        "export HARNX_CONFIG_DIR={} HARNX_DATA_DIR={} HARNX_STATE_DIR={}",
+        shell_escape(paths.harnx_config_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_data_dir.to_string_lossy().as_ref()),
+        shell_escape(paths.harnx_state_dir.to_string_lossy().as_ref())
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+
+    tmux.send_text(&format!(
+        "export PATH={} && cd {}; printf '__PKG_DELEGATION_READY__\\n'",
+        shell_escape(&path_env),
+        shell_escape(repo_root.to_string_lossy().as_ref())
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+    tmux.wait_for(Duration::from_secs(5), |screen| {
+        count_occurrences(screen, "__PKG_DELEGATION_READY__") >= 2
+    })?;
+
+    tmux.send_text(&format!(
+        "{} -a {PACKAGE_DELEGATION_PACKAGE_NAME}/{PACKAGE_DELEGATION_CALLER_NAME} --session || echo HARNX_EXIT:$?",
+        shell_escape(harnx_bin.to_string_lossy().as_ref()),
+    ))?;
+    tmux.send_keys(&["Enter"])?;
+
+    tmux.wait_for_contains("Welcome to harnx", Duration::from_secs(15))?;
+
+    tmux.send_text(PACKAGE_DELEGATION_USER_PROMPT)?;
+    tmux.send_keys(&["Enter"])?;
+
+    let screen = tmux.wait_for_stable(
+        Duration::from_secs(30),
+        Duration::from_millis(300),
+        |screen| screen.contains(PACKAGE_DELEGATION_PEER_RESPONSE),
+    )?;
+
+    // #804 regression repro: caller + peer exist only inside package. Before fix,
+    // spawned ACP subagent could lose package prefix and fail once top-level agents
+    // with same bare names were absent. This e2e test covers success path; exact
+    // qualified spawn args are unit-covered in harnx-runtime package_loading tests.
+    assert!(
+        screen.contains(&format!("{}_session_prompt", PACKAGE_DELEGATION_PEER_NAME)),
+        "same-package delegation tool call missing from TUI transcript:\n{screen}"
+    );
+    assert!(
+        screen.contains(PACKAGE_DELEGATION_PEER_RESPONSE),
+        "peer delegated response not visible in TUI transcript:\n{screen}"
+    );
+
+    drop(tmux);
+    drop(mock);
+    Ok(())
+}
+
 // Normalizes screen output for snapshot tests.
 fn normalize_screen(screen: &str) -> String {
     let trimmed = screen
@@ -459,6 +570,43 @@ fn repo_root() -> Result<PathBuf> {
         .context("failed to determine workspace root")
 }
 
+#[cfg(unix)]
+fn package_delegation_script() -> MockOpenAiScript {
+    // Turn order across caller + peer package agents:
+    //   Turn 0 (caller): delegate to same-package peer via bare tool name.
+    //   Turn 1 (peer)  : respond and end delegated session.
+    //   Turn 2 (caller): final summary after delegated session returns.
+    MockOpenAiScript {
+        turns: vec![
+            MockOpenAiTurn {
+                text_chunks: vec!["I'll delegate this to my package peer.".to_string()],
+                tool_calls: vec![MockOpenAiToolCall {
+                    name: format!("{}_session_prompt", PACKAGE_DELEGATION_PEER_NAME),
+                    arguments: json!({
+                        "message": "Explain whether same-package delegation succeeded."
+                    }),
+                    id: Some("call_package_peer_1".to_string()),
+                }],
+                error: None,
+                expect: None,
+            },
+            MockOpenAiTurn {
+                text_chunks: vec![PACKAGE_DELEGATION_PEER_RESPONSE.to_string()],
+                tool_calls: vec![],
+                error: None,
+                expect: None,
+            },
+            MockOpenAiTurn {
+                text_chunks: vec![PACKAGE_DELEGATION_CALLER_RESPONSE.to_string()],
+                tool_calls: vec![],
+                error: None,
+                expect: None,
+            },
+        ],
+        fallback_text: "No more scripted responses.".to_string(),
+        chunk_delay_ms: 0,
+    }
+}
 struct TestPaths {
     harnx_config_dir: PathBuf,
     harnx_data_dir: PathBuf,
@@ -631,7 +779,6 @@ fn write_mock_llm_client(config_dir: &Path, port: u16) -> Result<()> {
 
 fn write_fixture_files(paths: &TestPaths) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
-
     std::fs::write(&paths.config_path, "save: false\n")?;
 
     let clients_dir = paths.harnx_config_dir.join("clients");
@@ -720,6 +867,40 @@ fn write_fixture_files(paths: &TestPaths) -> Result<()> {
             TEST_SUB_AGENT_NAME
         ),
     )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_same_package_delegation_fixture_files(paths: &TestPaths) -> Result<()> {
+    std::fs::create_dir_all(&paths.harnx_config_dir)?;
+    std::fs::write(&paths.config_path, "save: false\n")?;
+    write_mock_llm_client(&paths.harnx_config_dir, paths.port)?;
+
+    let package_agents_dir = paths
+        .harnx_config_dir
+        .join("packages")
+        .join(PACKAGE_DELEGATION_PACKAGE_NAME)
+        .join("agents");
+    std::fs::create_dir_all(&package_agents_dir)?;
+
+    std::fs::write(
+        package_agents_dir.join(format!("{PACKAGE_DELEGATION_CALLER_NAME}.md")),
+        format!(
+            "---\nname: {}\nmodel: /mock-llm:test\nuse_tools: {}_session_prompt\n---\nYou are {}. Delegate to {} in same package.\n",
+            PACKAGE_DELEGATION_CALLER_NAME,
+            PACKAGE_DELEGATION_PEER_NAME,
+            PACKAGE_DELEGATION_CALLER_NAME,
+            PACKAGE_DELEGATION_PEER_NAME,
+        ),
+    )?;
+    std::fs::write(
+        package_agents_dir.join(format!("{PACKAGE_DELEGATION_PEER_NAME}.md")),
+        format!(
+            "---\nname: {}\nmodel: /mock-llm:test\n---\nYou are {}. Answer delegated request.\n",
+            PACKAGE_DELEGATION_PEER_NAME, PACKAGE_DELEGATION_PEER_NAME,
+        ),
+    )?;
+
     Ok(())
 }
 
@@ -1108,16 +1289,21 @@ fn setup_handoff_tmux_session_with_script(
     let paths = TestPaths::new(temp.path(), mock.port())?;
     match (parent_use_tools, write_acp_server) {
         (Some(parent_use_tools), true) => {
-            write_handoff_fixture_files_with_parent_use_tools(&paths, parent_use_tools)?;
+            write_handoff_fixture_files_with_parent_use_tools(
+                &paths,
+                &harnx_bin,
+                parent_use_tools,
+            )?;
         }
         (Some(parent_use_tools), false) => {
             write_handoff_fixture_files_no_acp_server_with_parent_use_tools(
                 &paths,
+                &harnx_bin,
                 parent_use_tools,
             )?;
         }
-        (None, true) => write_handoff_fixture_files(&paths)?,
-        (None, false) => write_handoff_fixture_files_no_acp_server(&paths)?,
+        (None, true) => write_handoff_fixture_files(&paths, &harnx_bin)?,
+        (None, false) => write_handoff_fixture_files_no_acp_server(&paths, &harnx_bin)?,
     }
 
     let path_env = format!(
@@ -1288,42 +1474,45 @@ fn simple_handoff_script() -> MockOpenAiScript {
     }
 }
 
-fn write_handoff_fixture_files(paths: &TestPaths) -> Result<()> {
+fn write_handoff_fixture_files(paths: &TestPaths, harnx_bin: &Path) -> Result<()> {
     write_handoff_fixture_files_with_parent_use_tools(
         paths,
+        harnx_bin,
         &format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME),
     )
 }
 
-fn write_handoff_fixture_files_no_acp_server(paths: &TestPaths) -> Result<()> {
+fn write_handoff_fixture_files_no_acp_server(paths: &TestPaths, harnx_bin: &Path) -> Result<()> {
     write_handoff_fixture_files_no_acp_server_with_parent_use_tools(
         paths,
+        harnx_bin,
         &format!("{}_session_handoff", HANDOFF_SUB_AGENT_NAME),
     )
 }
 
 fn write_handoff_fixture_files_with_parent_use_tools(
     paths: &TestPaths,
+    harnx_bin: &Path,
     parent_use_tools: &str,
 ) -> Result<()> {
-    write_handoff_fixture_files_inner(paths, parent_use_tools, true)
+    write_handoff_fixture_files_inner(paths, harnx_bin, parent_use_tools, true)
 }
 
 fn write_handoff_fixture_files_no_acp_server_with_parent_use_tools(
     paths: &TestPaths,
+    harnx_bin: &Path,
     parent_use_tools: &str,
 ) -> Result<()> {
-    write_handoff_fixture_files_inner(paths, parent_use_tools, false)
+    write_handoff_fixture_files_inner(paths, harnx_bin, parent_use_tools, false)
 }
 
 fn write_handoff_fixture_files_inner(
     paths: &TestPaths,
+    harnx_bin: &Path,
     parent_use_tools: &str,
     write_acp_server: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(&paths.harnx_config_dir)?;
-
-    let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
 
     std::fs::write(&paths.config_path, "save: false\n")?;
 
@@ -1381,8 +1570,10 @@ fn write_handoff_fixture_files_inner(
         std::fs::create_dir_all(&acp_servers_dir)?;
         let acp_server = AcpServerConfig {
             name: HANDOFF_SUB_AGENT_NAME.to_string(),
-            command: harnx_bin.to_string_lossy().into_owned(),
-            args: vec!["--acp".to_string(), HANDOFF_SUB_AGENT_NAME.to_string()],
+            command: harnx_acp_server_bin(harnx_bin)
+                .to_string_lossy()
+                .into_owned(),
+            args: vec![HANDOFF_SUB_AGENT_NAME.to_string()],
             env: Default::default(),
             enabled: true,
             description: None,

@@ -1,6 +1,17 @@
 //! MCP/ACP server management extracted from config/mod.rs for code health.
 use super::*;
+use harnx_core::package_namespace::qualify_agent_name;
 use std::env;
+
+fn normalize_package_acp_server_args(server: &mut AcpServerConfig, pkg_name: &str) {
+    let stem = server.name.as_str();
+    let qualified = qualify_agent_name(pkg_name, stem);
+    for arg in &mut server.args {
+        if arg == stem {
+            *arg = qualified.clone();
+        }
+    }
+}
 
 impl Config {
     /// Load MCP and ACP servers from a single package directory.
@@ -34,6 +45,7 @@ impl Config {
         if pkg_acp_dir.is_dir() {
             for mut server in Self::load_acp_servers_from_dir(&pkg_acp_dir).unwrap_or_default() {
                 server.package = Some(pkg_name.to_string());
+                normalize_package_acp_server_args(&mut server, pkg_name);
                 config.acp_servers.push(server);
             }
         }

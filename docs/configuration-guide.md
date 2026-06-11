@@ -133,8 +133,8 @@ All agents defined in the `agents/` directory are **automatically registered** a
 If you need to customize an agent's ACP settings (e.g., add environment variables or change timeouts), create a file in `acp_servers/` with the same name as the agent (e.g., `acp_servers/coder.yaml`).
 
 ```yaml
-command: harnx
-args: ["--acp", "coder"]
+command: harnx-acp-server
+args: ["coder"]
 env:
   DEBUG: "true"
 idle_timeout_secs: 600

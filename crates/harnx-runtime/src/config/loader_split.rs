@@ -169,7 +169,7 @@ impl Config {
             .iter()
             .map(|server| server.name.clone())
             .collect();
-        let current_exe = std::env::current_exe()?.to_string_lossy().to_string();
+        let command = harnx_acp_server_command();
         for agent_name in list_agents() {
             if !existing_names.contains(&agent_name) {
                 // Extract the package for package agents (e.g. "mypkg/coder" → Some("mypkg")).
@@ -178,8 +178,8 @@ impl Config {
                     .map(str::to_string);
                 acp_servers.push(AcpServerConfig {
                     name: agent_name.clone(),
-                    command: current_exe.clone(),
-                    args: vec!["--acp".to_string(), agent_name],
+                    command: command.clone(),
+                    args: vec![agent_name.clone()],
                     env: Default::default(),
                     enabled: true,
                     description: None,
@@ -279,6 +279,48 @@ impl Config {
     }
 }
 
+fn harnx_acp_server_command() -> String {
+    std::env::current_exe()
+        .map(|current_exe| harnx_acp_server_command_from_current_exe(&current_exe))
+        .unwrap_or_else(|_| fallback_harnx_acp_server_command())
+}
+
+fn harnx_acp_server_command_from_current_exe(current_exe: &Path) -> String {
+    harnx_acp_server_command_from_parent(current_exe.parent(), current_exe.is_absolute())
+}
+
+fn harnx_acp_server_command_from_parent(
+    parent_dir: Option<&Path>,
+    current_exe_is_absolute: bool,
+) -> String {
+    let Some(parent_dir) = parent_dir else {
+        return fallback_harnx_acp_server_command();
+    };
+    if !current_exe_is_absolute {
+        return fallback_harnx_acp_server_command();
+    }
+    let sibling = parent_dir.join(harnx_acp_server_binary_name());
+    if sibling.is_file() {
+        sibling.to_string_lossy().to_string()
+    } else {
+        fallback_harnx_acp_server_command()
+    }
+}
+
+#[cfg(windows)]
+fn harnx_acp_server_binary_name() -> &'static str {
+    "harnx-acp-server.exe"
+}
+
+#[cfg(not(windows))]
+fn harnx_acp_server_binary_name() -> &'static str {
+    "harnx-acp-server"
+}
+
+fn fallback_harnx_acp_server_command() -> String {
+    String::from("harnx-acp-server")
+}
+
 async fn create_config_file(config_path: &Path) -> Result<()> {
     let ans = Confirm::new("No config file, create a new one?")
         .with_default(true)
@@ -336,4 +378,77 @@ async fn create_config_file(config_path: &Path) -> Result<()> {
     ));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::harnx_acp_server_command_from_current_exe;
+    use std::{fs, path::PathBuf};
+
+    #[test]
+    fn harnx_acp_server_command_uses_existing_sibling_binary() {
+        let temp_dir = unique_temp_dir("harnx-acp-server-sibling-present");
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let current_exe = temp_dir.join(current_exe_name());
+        fs::write(&current_exe, b"").unwrap();
+
+        let sibling = temp_dir.join(harnx_acp_server_binary_name());
+        fs::write(&sibling, b"").unwrap();
+
+        assert_eq!(
+            harnx_acp_server_command_from_current_exe(&current_exe),
+            sibling.to_string_lossy().to_string()
+        );
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn harnx_acp_server_command_falls_back_when_sibling_missing() {
+        let temp_dir = unique_temp_dir("harnx-acp-server-sibling-missing");
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let current_exe = temp_dir.join(current_exe_name());
+        fs::write(&current_exe, b"").unwrap();
+
+        assert_eq!(
+            harnx_acp_server_command_from_current_exe(&current_exe),
+            "harnx-acp-server"
+        );
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let unique = format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    #[cfg(windows)]
+    fn current_exe_name() -> &'static str {
+        "harnx-runtime-test.exe"
+    }
+
+    #[cfg(not(windows))]
+    fn current_exe_name() -> &'static str {
+        "harnx-runtime-test"
+    }
+
+    #[cfg(windows)]
+    fn harnx_acp_server_binary_name() -> &'static str {
+        "harnx-acp-server.exe"
+    }
+
+    #[cfg(not(windows))]
+    fn harnx_acp_server_binary_name() -> &'static str {
+        "harnx-acp-server"
+    }
 }

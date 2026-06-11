@@ -34,7 +34,6 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
             [CompletionResult]::new('--rebuild-rag', '--rebuild-rag', [CompletionResultType]::ParameterName, 'Rebuild the RAG to sync document changes')
             [CompletionResult]::new('--macro', '--macro', [CompletionResultType]::ParameterName, 'Execute a macro')
             [CompletionResult]::new('--serve', '--serve', [CompletionResultType]::ParameterName, 'Serve the LLM API and WebAPP')
-            [CompletionResult]::new('--acp', '--acp', [CompletionResultType]::ParameterName, 'Serve as an ACP agent over stdio')
             [CompletionResult]::new('-f', '-f', [CompletionResultType]::ParameterName, 'Include files, directories, or URLs')
             [CompletionResult]::new('--file', '--file', [CompletionResultType]::ParameterName, 'Include files, directories, or URLs')
             [CompletionResult]::new('-S', '-S', [CompletionResultType]::ParameterName, 'Turn off stream mode')
@@ -78,8 +77,6 @@ Register-ArgumentCompleter -Native -CommandName 'harnx' -ScriptBlock {
             $completions = Get-HarnxValues "--list-rags"
         } elseif ($flag -eq "--macro") {
             $completions = Get-HarnxValues "--list-macros"
-        } elseif ($flag -eq "--acp") {
-            $completions = Get-HarnxValues "--list-assistant-agents"
         } elseif ($flag -ceq "-f" -or $flag -eq "--file") {
             $completions = @()
         } elseif ($flag -eq "--mcp-root") {
