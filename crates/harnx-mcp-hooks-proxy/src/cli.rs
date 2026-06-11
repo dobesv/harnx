@@ -5,6 +5,33 @@ pub fn parse_args() -> Result<(HooksConfig, Vec<String>)> {
     parse_args_from(std::env::args().skip(1))
 }
 
+fn collect_hook_tokens<I>(iter: &mut I, flag: &str) -> Result<Vec<String>>
+where
+    I: Iterator<Item = String>,
+{
+    let mut tokens = Vec::new();
+    for token in iter.by_ref() {
+        if token == ";" || token == "\\;" {
+            return Ok(tokens);
+        }
+        tokens.push(token);
+    }
+    bail!("unterminated {flag} (missing ';')")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn build_hook_command(command: &str, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(shell_quote(command));
+    for arg in args {
+        parts.push(shell_quote(arg));
+    }
+    parts.join(" ")
+}
+
 fn parse_args_from<I>(args: I) -> Result<(HooksConfig, Vec<String>)>
 where
     I: IntoIterator<Item = String>,
@@ -31,66 +58,63 @@ where
                     child_cmd_args,
                 ));
             }
-            "--pre-tool-use" => hooks.push(parse_hook_flag("PreToolUse", &mut iter)?),
-            "--post-tool-use" => hooks.push(parse_hook_flag("PostToolUse", &mut iter)?),
+            "--pre-tool-use" => hooks.push(parse_hook_flag("PreToolUse", &arg, &mut iter)?),
+            "--post-tool-use" => hooks.push(parse_hook_flag("PostToolUse", &arg, &mut iter)?),
             "--post-tool-use-failure" => {
-                hooks.push(parse_hook_flag("PostToolUseFailure", &mut iter)?)
+                hooks.push(parse_hook_flag("PostToolUseFailure", &arg, &mut iter)?)
             }
-            other => bail!("unknown argument: {other}"),
+            other => bail!("unexpected argument before `--`: {other}"),
         }
     }
 }
 
-fn parse_hook_flag<I>(event: &str, iter: &mut I) -> Result<HookConfig>
+fn parse_hook_flag<I>(event: &str, flag: &str, iter: &mut I) -> Result<HookConfig>
 where
     I: Iterator<Item = String>,
 {
-    let value = iter
-        .next()
-        .with_context(|| format!("missing value for flag corresponding to {event}"))?;
-    parse_hook_spec(event, &value)
+    let hook_tokens = collect_hook_tokens(iter, flag)?;
+    parse_hook_tokens(event, flag, hook_tokens)
 }
 
-fn parse_hook_spec(event: &str, spec: &str) -> Result<HookConfig> {
-    let tokens: Vec<&str> = spec.split_whitespace().collect();
-    if tokens.is_empty() {
-        bail!("empty hook specification for {event}");
-    }
+fn parse_hook_tokens(event: &str, flag: &str, tokens: Vec<String>) -> Result<HookConfig> {
+    let mut iter = tokens.into_iter();
 
-    let hook_type = tokens[0].to_string();
+    let hook_type = iter
+        .next()
+        .with_context(|| format!("{flag} requires a TYPE before command"))?;
+
     let mut async_hook = None;
     let mut matcher = None;
-    let mut command_tokens = Vec::new();
-    let mut index = 1;
+    let mut command = None;
+    let mut args = Vec::new();
 
-    while index < tokens.len() {
-        match tokens[index] {
-            "--async" => {
+    while let Some(token) = iter.next() {
+        match token.as_str() {
+            "--async" if command.is_none() => {
                 async_hook = Some(true);
-                index += 1;
             }
-            "--matcher" => {
-                let regex = tokens
-                    .get(index + 1)
-                    .ok_or_else(|| anyhow!("missing regex after --matcher in {event}"))?;
-                matcher = Some((*regex).to_string());
-                index += 2;
+            "--matcher" if command.is_none() => {
+                let regex = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("{flag} --matcher requires a REGEX"))?;
+                matcher = Some(regex);
             }
             _ => {
-                command_tokens.extend(tokens[index..].iter().copied());
+                command = Some(token);
+                args.extend(iter);
                 break;
             }
         }
     }
 
-    if command_tokens.is_empty() {
-        bail!("missing hook command for {event}");
-    }
+    let command =
+        command.ok_or_else(|| anyhow!("{flag} requires a command after TYPE and options"))?;
+    let command = build_hook_command(&command, &args);
 
     Ok(HookConfig {
         event: event.to_string(),
         matcher,
-        command: command_tokens.join(" "),
+        command,
         timeout: Some(30),
         status_message: None,
         async_hook,
@@ -100,13 +124,15 @@ fn parse_hook_spec(event: &str, spec: &str) -> Result<HookConfig> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_args_from;
+    use super::*;
 
     #[test]
-    fn parses_basic_hook_and_child_command() {
+    fn parses_single_hook_and_child_command() {
         let (hooks, child) = parse_args_from(vec![
             "--pre-tool-use".to_string(),
-            "claude-command my-hook-script".to_string(),
+            "claude-command".to_string(),
+            "my-hook-script".to_string(),
+            ";".to_string(),
             "--".to_string(),
             "child-bin".to_string(),
             "--flag".to_string(),
@@ -117,7 +143,7 @@ mod tests {
         let hook = &hooks.entries[0];
         assert_eq!(hook.event, "PreToolUse");
         assert_eq!(hook.hook_type, "claude-command");
-        assert_eq!(hook.command, "my-hook-script");
+        assert_eq!(hook.command, "'my-hook-script'");
         assert_eq!(child, vec!["child-bin", "--flag"]);
     }
 
@@ -125,7 +151,12 @@ mod tests {
     fn parses_hook_with_matcher_and_async_flags() {
         let (hooks, child) = parse_args_from(vec![
             "--pre-tool-use".to_string(),
-            "claude-command --async --matcher bash.* my-script".to_string(),
+            "claude-command".to_string(),
+            "--async".to_string(),
+            "--matcher".to_string(),
+            "bash.*".to_string(),
+            "my-script".to_string(),
+            ";".to_string(),
             "--".to_string(),
             "child".to_string(),
         ])
@@ -136,19 +167,62 @@ mod tests {
         assert_eq!(hook.event, "PreToolUse");
         assert_eq!(hook.matcher.as_deref(), Some("bash.*"));
         assert_eq!(hook.async_hook, Some(true));
-        assert_eq!(hook.command, "my-script");
+        assert_eq!(hook.command, "'my-script'");
         assert_eq!(child, vec!["child"]);
+    }
+
+    #[test]
+    fn accepts_escaped_semicolon_terminator() {
+        let (hooks, child) = parse_args_from(vec![
+            "--pre-tool-use".to_string(),
+            "claude-command".to_string(),
+            "my-script".to_string(),
+            "\\;".to_string(),
+            "--".to_string(),
+            "child".to_string(),
+        ])
+        .expect("parse succeeds");
+
+        assert_eq!(hooks.entries.len(), 1);
+        assert_eq!(hooks.entries[0].command, "'my-script'");
+        assert_eq!(child, vec!["child"]);
+    }
+
+    #[test]
+    fn preserves_and_quotes_multiple_args() {
+        let (hooks, _) = parse_args_from(vec![
+            "--pre-tool-use".to_string(),
+            "claude-command".to_string(),
+            "hook script".to_string(),
+            "arg with spaces".to_string(),
+            "it's-fine".to_string(),
+            ";".to_string(),
+            "--".to_string(),
+            "child".to_string(),
+        ])
+        .expect("parse succeeds");
+
+        assert_eq!(
+            hooks.entries[0].command,
+            "'hook script' 'arg with spaces' 'it'\\''s-fine'"
+        );
     }
 
     #[test]
     fn parses_multiple_hooks_of_different_events() {
         let (hooks, child) = parse_args_from(vec![
             "--pre-tool-use".to_string(),
-            "claude-command pre-script".to_string(),
+            "claude-command".to_string(),
+            "pre-script".to_string(),
+            ";".to_string(),
             "--post-tool-use".to_string(),
-            "claude-command post-script".to_string(),
+            "claude-command".to_string(),
+            "post-script".to_string(),
+            ";".to_string(),
             "--post-tool-use-failure".to_string(),
-            "claude-command fail-script".to_string(),
+            "claude-command".to_string(),
+            "fail-script".to_string(),
+            ";".to_string(),
             "--".to_string(),
             "child".to_string(),
         ])
@@ -156,19 +230,54 @@ mod tests {
 
         assert_eq!(hooks.entries.len(), 3);
         assert_eq!(hooks.entries[0].event, "PreToolUse");
-        assert_eq!(hooks.entries[0].command, "pre-script");
+        assert_eq!(hooks.entries[0].command, "'pre-script'");
         assert_eq!(hooks.entries[1].event, "PostToolUse");
-        assert_eq!(hooks.entries[1].command, "post-script");
+        assert_eq!(hooks.entries[1].command, "'post-script'");
         assert_eq!(hooks.entries[2].event, "PostToolUseFailure");
-        assert_eq!(hooks.entries[2].command, "fail-script");
+        assert_eq!(hooks.entries[2].command, "'fail-script'");
         assert_eq!(child, vec!["child"]);
+    }
+
+    #[test]
+    fn error_on_unterminated_hook() {
+        let result = parse_args_from(vec![
+            "--pre-tool-use".to_string(),
+            "claude-command".to_string(),
+            "script".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "unterminated --pre-tool-use (missing ';')"
+        );
+    }
+
+    #[test]
+    fn error_on_missing_command() {
+        let result = parse_args_from(vec![
+            "--pre-tool-use".to_string(),
+            "claude-command".to_string(),
+            "--async".to_string(),
+            "--matcher".to_string(),
+            "bash.*".to_string(),
+            ";".to_string(),
+            "--".to_string(),
+            "child".to_string(),
+        ]);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "--pre-tool-use requires a command after TYPE and options"
+        );
     }
 
     #[test]
     fn error_on_missing_separator() {
         let result = parse_args_from(vec![
             "--pre-tool-use".to_string(),
-            "claude-command script".to_string(),
+            "claude-command".to_string(),
+            "script".to_string(),
+            ";".to_string(),
         ]);
         assert!(result.is_err());
     }
@@ -177,9 +286,59 @@ mod tests {
     fn error_on_empty_child_command() {
         let result = parse_args_from(vec![
             "--pre-tool-use".to_string(),
-            "claude-command script".to_string(),
+            "claude-command".to_string(),
+            "script".to_string(),
+            ";".to_string(),
             "--".to_string(),
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn error_on_unexpected_arg_before_separator() {
+        let result = parse_args_from(vec![
+            "--bogus".to_string(),
+            "--pre-tool-use".to_string(),
+            "claude-command".to_string(),
+            "script".to_string(),
+            ";".to_string(),
+            "--".to_string(),
+            "child".to_string(),
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn error_on_matcher_without_regex() {
+        let result = parse_args_from(vec![
+            "--pre-tool-use".to_string(),
+            "claude-command".to_string(),
+            "--matcher".to_string(),
+            ";".to_string(),
+            "--".to_string(),
+            "child".to_string(),
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn option_like_tokens_after_command_are_literal_args() {
+        let (hooks, child) = parse_args_from(vec![
+            "--pre-tool-use".to_string(),
+            "claude-command".to_string(),
+            "my-cmd".to_string(),
+            "--async".to_string(),
+            ";".to_string(),
+            "--".to_string(),
+            "child".to_string(),
+        ])
+        .expect("parse succeeds");
+
+        assert_eq!(hooks.entries.len(), 1);
+        let hook = &hooks.entries[0];
+        assert_eq!(hook.event, "PreToolUse");
+        assert_eq!(hook.async_hook, None);
+        assert!(hook.command.contains("--async"));
+        assert_eq!(child, vec!["child"]);
     }
 }

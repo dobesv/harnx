@@ -119,13 +119,13 @@ async fn pre_tool_use_block() {
     .expect("write hook script");
     chmod_script(&script_path);
 
-    let hook_arg = format!("claude-command {}", shell_escape_path(&script_path));
     let repo_root = repo_root();
+    let script_path_str = script_path.to_str().expect("utf-8 script path");
     let service = spawn_proxy(
         &proxy_bin,
         &bash_bin,
         &repo_root,
-        &[("--pre-tool-use", hook_arg.as_str())],
+        &[&["--pre-tool-use", "claude-command", script_path_str, ";"]],
     )
     .await
     .expect("spawn proxy with blocking hook and connect MCP client");
@@ -177,12 +177,12 @@ async fn run_mutation_test(test_name: &str, tc: MutationTestCase<'_>) {
     std::fs::write(&script_path, tc.hook_script).expect("write hook script");
     chmod_script(&script_path);
 
-    let hook_arg = format!("claude-command {}", shell_escape_path(&script_path));
+    let script_path_str = script_path.to_str().expect("utf-8 script path");
     let service = spawn_proxy(
         &proxy_bin,
         &bash_bin,
         &repo_root,
-        &[(tc.hook_flag, hook_arg.as_str())],
+        &[&[tc.hook_flag, "claude-command", script_path_str, ";"]],
     )
     .await
     .expect("spawn proxy with mutation hook and connect MCP client");
@@ -286,12 +286,17 @@ async fn post_tool_use_failure() {
     .expect("write failure hook script");
     chmod_script(&script_path);
 
-    let hook_arg = format!("claude-command {}", shell_escape_path(&script_path));
+    let script_path_str = script_path.to_str().expect("utf-8 script path");
     let service = spawn_proxy(
         &proxy_bin,
         &bash_bin,
         &repo_root,
-        &[("--post-tool-use-failure", hook_arg.as_str())],
+        &[&[
+            "--post-tool-use-failure",
+            "claude-command",
+            script_path_str,
+            ";",
+        ]],
     )
     .await
     .expect("spawn proxy with failure hook");
@@ -327,11 +332,13 @@ async fn spawn_proxy(
     proxy_bin: &Path,
     bash_bin: &Path,
     repo_root: &Path,
-    hook_args: &[(&str, &str)],
+    hook_args: &[&[&str]],
 ) -> anyhow::Result<rmcp::service::RunningService<RoleClient, TestClientHandler>> {
     let mut command = tokio::process::Command::new(proxy_bin);
-    for (flag, value) in hook_args {
-        command.arg(flag).arg(value);
+    for hook_group in hook_args {
+        for token in *hook_group {
+            command.arg(token);
+        }
     }
     command.arg("--");
     command.arg(bash_bin);
@@ -410,11 +417,6 @@ fn binary_name(base: &str) -> String {
     } else {
         base.to_string()
     }
-}
-
-fn shell_escape_path(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn chmod_script(path: &Path) {
