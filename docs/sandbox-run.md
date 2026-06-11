@@ -198,7 +198,7 @@ exec harnx-sandbox-run \
 **Key points:**
 - Replace `my-profile` with your AWS profile name (omit `--hook ... harnx-aws-creds ...` entirely if you don't need AWS). Project access now uses harnx-sandbox-run pseudo-vars, so current git root / node project root / git common dir are granted automatically when present; add `--extra-rwx /path` for any extra directories the agent should access.
 - The `--env` and `--fs` scripts inject fake sentinel tokens into the sandbox (e.g. `ghp_<random>` for GitHub, or a synthetic `jira_config.yaml` for Atlassian) so tools like `gh` or `acli` consider themselves authenticated. The real tokens never enter the sandbox — `harnx-proxy-auth` reads them from the host (environment or OS keyring) and injects them into outbound HTTP headers.
-- The Atlassian flow self-sources credentials from your host OS keyring (Linux Secret Service or macOS Keychain) using `--load-exec`. As long as you have run `acli jira auth login` on your host, it works automatically with no manual environment variables required.
+- The Atlassian flow self-sources credentials from your host OS keyring (Linux Secret Service or macOS Keychain) using `--load-exec`. **It works only when `acli` is authenticated with an API token, not OAuth** — see the Atlassian example below. As long as you have logged in with an API token on your host, it works automatically with no manual environment variables required.
 - macOS users: change the `--load-exec` command for `atlassian_token` to use `security find-generic-password -s acli -a "jira:$p" -w`.
 - Remove the Atlassian block if you don't use Jira/Confluence.
 - `if COND then EXPR end` — omitting `else` passes the input through unchanged (jaq default).
@@ -397,6 +397,15 @@ The hooks match the *exact* sentinel values injected by `--env` — `basic("x-ac
 
 ### Example: Atlassian (Jira / Confluence) with `harnx-proxy-auth`
 
+> **API-token auth only — OAuth is not supported.** This flow replays your stored credential as an HTTP Basic auth password, so `acli` must be logged in with an **API token**. It does **not** work if you authenticated with OAuth (`acli jira auth login --web`): OAuth stores a short-lived, rotating bearer token as a compressed binary blob, which the proxy can neither read (it is not valid UTF-8) nor replay as Basic auth — sandboxed `acli` then fails with `unauthorized: use 'acli jira auth login' to authenticate`. If `acli jira auth status` reports `Authentication Type: oauth`, switch to an API token:
+>
+> ```sh
+> acli jira auth logout
+> echo '<your-api-token>' | acli jira auth login --site "<your-site>.atlassian.net" --email "<your-email>" --token
+> ```
+>
+> Create an API token at <https://id.atlassian.com/manage-profile/security/api-tokens>.
+
 Atlassian's REST API uses HTTP Basic auth with your email as the username and an API token as the password.
 
 ```bash
@@ -422,7 +431,7 @@ harnx-sandbox-run \
   -- acli jira workitem search --jql "assignee = currentUser() AND resolution = Unresolved"
 ```
 
-The proxy automatically sources your real credentials from the host OS keyring using `--load-exec`. It injects a synthetic `jira_config.yaml` containing a sentinel token into the sandbox via `--fs`, and the `--hook` filter replaces that sentinel with the real token in outbound requests. No manual environment variables are required as long as you have run `acli jira auth login` on your host.
+The proxy automatically sources your real credentials from the host OS keyring using `--load-exec`. It injects a synthetic `jira_config.yaml` containing a sentinel token into the sandbox via `--fs`, and the `--hook` filter replaces that sentinel with the real token in outbound requests. No manual environment variables are required as long as you have logged in with an **API token** (`acli jira auth login --site … --email … --token`) on your host. OAuth logins (`--web`) are not supported — see the warning above.
 
 ### Combining multiple hooks in one `harnx-proxy-auth` invocation
 

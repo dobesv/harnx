@@ -23,6 +23,8 @@ plan_ref: acli-sandbox-credential-isolation
 
 > **Superseded (2026-06):** The previous workaround (injecting headers via proxy and allowing `~/.config/acli` read access) was incomplete. Research revealed that `acli` performs a keyring lookup *before* making any HTTP requests. If the keyring is inaccessible (e.g., due to sandbox isolation), `acli` fails locally with an "unauthorized" error and never attempts a network connection, preventing the proxy from intervening. Additionally, a major security gap was discovered where sandboxed processes could access the host's DBus session bus to read all OS keyring secrets. This document has been updated to reflect the comprehensive fix.
 
+> **Applies to API-token auth only — not OAuth.** The flow replays the credential as HTTP Basic auth, so it works only when `acli` is authenticated with an **API token** (`acli jira auth login … --token`). An OAuth login (`acli jira auth login --web`) stores a short-lived, rotating bearer token as a gzip-compressed binary blob: the `--load-exec` capture cannot read it (it is not valid UTF-8, so `$atlassian_token` degrades to `null` and the `if $p and $atlassian_token` guards all skip — no synthetic config, no `ACLI_CONFIG_DIR`, no header rewrite), and it could not be replayed as a Basic-auth password even if it could be read. Sandboxed `acli` then fails locally with `unauthorized: use 'acli jira auth login' to authenticate`.
+
 ## Problem
 
 Atlassian CLI (`acli`) stores API tokens in the OS keyring (Secret Service/libsecret on Linux). Historically, providing these credentials to sandboxed agents required either granting the sandbox access to the host DBus session (a severe security risk) or finding a way to bypass the local check.
@@ -140,7 +142,7 @@ By providing a valid `SecretStore` blob (a sentinel token) in a private `jira_co
 
 ### Configuration Checklist
 
--   [x] `acli auth login` run on host to generate `~/.config/acli/jira_config.yaml`.
+-   [x] `acli auth login` run on host **with an API token** (`--token`, not `--web`/OAuth) to generate `~/.config/acli/jira_config.yaml`.
 -   [x] `harnx-proxy-auth` configured with `--load-yaml`, `--load-exec`, `--fs`, and the Atlassian `--hook`.
 -   [x] `~/.config/acli` removed from sandbox `--extra-read` paths.
 -   [x] `XDG_RUNTIME_DIR` confirmed as excluded from sandbox environment (blocking DBus).
