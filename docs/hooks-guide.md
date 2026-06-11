@@ -417,7 +417,9 @@ hooks:
 
 ### Atlassian CLI (`acli`) Example
 
-`acli` (the Atlassian CLI for Jira, Confluence, etc.) stores API tokens in the OS keyring, which is inaccessible inside the sandboxed environment. `harnx-proxy-auth` solves this by automatically sourcing the token from your host OS keyring at startup. Once you have run `acli jira auth login` on the host, no further manual environment variables or `.env` entries are required.
+`acli` (the Atlassian CLI for Jira, Confluence, etc.) stores API tokens in the OS keyring, which is inaccessible inside the sandboxed environment. `harnx-proxy-auth` solves this by automatically sourcing the token from your host OS keyring at startup. Once you have logged in with an API token on the host, no further manual environment variables or `.env` entries are required.
+
+> **API-token auth only — OAuth is not supported.** This flow replays your stored credential as an HTTP Basic auth password, so `acli` must be authenticated with an **API token** (Step 1 below). It does **not** work if you logged in with OAuth (`acli jira auth login --web`): OAuth stores a short-lived, rotating bearer token as a compressed binary blob the proxy can neither read (it is not valid UTF-8, so it degrades to `null` and no synthetic config is injected) nor replay as Basic auth — sandboxed `acli` then fails with `unauthorized: use 'acli jira auth login' to authenticate`. If `acli jira auth status` reports `Authentication Type: oauth`, run `acli jira auth logout` and repeat Step 1 with an API token.
 
 #### Step 1 — Log in with your real token (once, on the host)
 
@@ -440,7 +442,7 @@ The same command applies to other `acli` products: replace `jira` with `confluen
 
 Add the following to your `config.yaml`. The proxy will self-source credentials from your host OS keyring using `--load-exec`. It injects a synthetic `jira_config.yaml` containing a sentinel token into the sandbox via `--fs`, and the `--hook` filter replaces that sentinel with the real token in outbound requests.
 
-No manual environment variables are required as long as you have run `acli jira auth login` on your host.
+No manual environment variables are required as long as you have logged in with an **API token** (Step 1) on your host — OAuth (`--web`) is not supported.
 
 ```yaml
 hooks:
