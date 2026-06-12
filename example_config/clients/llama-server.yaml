@@ -1,0 +1,13 @@
+type: llama-server
+name: local-llama
+model_path: /path/to/your/model.gguf  # REQUIRED: Path to your .gguf model file
+# binary_path: llama-server            # Optional: Path to llama-server binary
+# ctx_size: 2048                       # Optional: Context size (-c)
+# n_gpu_layers: 32                     # Optional: Number of GPU layers (-ngl)
+# threads: 8                           # Optional: Number of threads (-t)
+# socket_path: /tmp/llama.sock         # Optional: Override Unix socket path
+# extra_args: ["--flash-attn"]         # Optional: Raw passthrough arguments
+models:
+  - name: qwen2.5-7b-instruct
+    max_input_tokens: 32768
+    supports_tool_use: true

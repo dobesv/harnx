@@ -75,6 +75,12 @@ register_client!(
     ),
     (vertexai, "vertexai", VertexAIConfig, VertexAIClient),
     (bedrock, "bedrock", BedrockConfig, BedrockClient),
+    (
+        llama_server,
+        "llama-server",
+        LlamaServerConfig,
+        LlamaServerClient
+    ),
 );
 
 impl ClientConfig {
@@ -90,6 +96,7 @@ impl ClientConfig {
             ClientConfig::AzureOpenAIConfig(c) => c.name.as_deref(),
             ClientConfig::VertexAIConfig(c) => c.name.as_deref(),
             ClientConfig::BedrockConfig(c) => c.name.as_deref(),
+            ClientConfig::LlamaServerConfig(c) => c.name.as_deref(),
             ClientConfig::Unknown => None,
         }
     }
@@ -108,6 +115,7 @@ impl ClientConfig {
             ClientConfig::AzureOpenAIConfig(c) => c.name.as_deref().unwrap_or("azure-openai"),
             ClientConfig::VertexAIConfig(c) => c.name.as_deref().unwrap_or("vertexai"),
             ClientConfig::BedrockConfig(c) => c.name.as_deref().unwrap_or("bedrock"),
+            ClientConfig::LlamaServerConfig(c) => c.name.as_deref().unwrap_or("llama-server"),
             ClientConfig::Unknown => "unknown",
         }
     }
@@ -145,6 +153,10 @@ impl ClientConfig {
                 c.package = Some(package);
             }
             ClientConfig::BedrockConfig(c) => {
+                c.name = Some(name);
+                c.package = Some(package);
+            }
+            ClientConfig::LlamaServerConfig(c) => {
                 c.name = Some(name);
                 c.package = Some(package);
             }
