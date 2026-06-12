@@ -2,6 +2,7 @@ use crate::access_token::*;
 use crate::claude::*;
 use crate::openai::*;
 use crate::*;
+use harnx_core::tool::ToolCall;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration, Utc};
@@ -386,7 +387,7 @@ pub fn gemini_build_chat_completions_body(
                                 MessageContentPart::Text { text } => json!({"text": text}),
                                 MessageContentPart::ImageUrl { image_url: ImageUrl { url } } => {
                                     if let Some((mime_type, data)) = url.strip_prefix("data:").and_then(|v| v.split_once(";base64,")) {
-                                        json!({ "inline_data": { "mime_type": mime_type, "data": data } })
+                                        json!({ "inlineData": { "mimeType": mime_type, "data": data } })
                                     } else {
                                         network_image_urls.push(url.clone());
                                         json!({ "url": url })
@@ -425,20 +426,40 @@ pub fn gemini_build_chat_completions_body(
                             }
                             model_parts.push(part_obj);
                         }
-                        let function_parts: Vec<Value> = tool_results.into_iter().map(|tool_result| {
-                            json!({
-                                "functionResponse": {
-                                    "name": tool_result.call.name,
-                                    "response": {
-                                        "name": tool_result.call.name,
-                                        "content": tool_result.output,
-                                    }
-                                }
-                            })
-                        }).collect();
-                        vec![
-                            json!({ "role": "model", "parts": model_parts }),
-                            json!({ "role": "function", "parts": function_parts }),
+                        let mut function_parts: Vec<Value> = Vec::new();
+                for tool_result in &tool_results {
+                    function_parts.push(json!({
+                        "functionResponse": {
+                            "name": tool_result.call.name,
+                            "response": {
+                                "name": tool_result.call.name,
+                                "content": tool_result.output,
+                            }
+                        }
+                    }));
+                }
+                for tool_result in &tool_results {
+                    for part in &tool_result.content {
+                        if let MessageContentPart::ImageUrl {
+                            image_url: ImageUrl { url },
+                        } = part
+                        {
+                            if let Some((mime_type, data)) =
+                                url.strip_prefix("data:").and_then(|v| v.split_once(";base64,"))
+                            {
+                                function_parts.push(
+                                    json!({ "text": format!("[Tool {} returned image]", tool_result.call.name) }),
+                                );
+                                function_parts.push(json!({
+                                    "inlineData": { "mimeType": mime_type, "data": data }
+                                }));
+                            }
+                        }
+                    }
+                }
+                vec![
+                    json!({ "role": "model", "parts": model_parts }),
+                    json!({ "role": "function", "parts": function_parts }),
                         ]
                     }
                 }
@@ -608,8 +629,119 @@ fn strip_model_version(name: &str) -> &str {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gemini_serializer_appends_tool_images_after_function_responses() {
+        let mut first_tool_call = ToolCall::new(
+            "first_tool".to_string(),
+            json!({"arg": 1}),
+            Some("call_1".to_string()),
+            None,
+        );
+        first_tool_call.thought_signature = Some("sig_1".to_string());
+        let mut first_tool_result = harnx_core::tool::ToolResult::new(first_tool_call, json!({"status": "ok"}));
+        first_tool_result.content = vec![MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,aGVsbG8=".to_string(),
+            },
+        }];
+
+        let second_tool_call = ToolCall::new(
+            "second_tool".to_string(),
+            json!({"arg": 2}),
+            Some("call_2".to_string()),
+            None,
+        );
+        let second_tool_result = harnx_core::tool::ToolResult::new(second_tool_call, json!({"status": "ok2"}));
+
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Run tools".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![first_tool_result, second_tool_result],
+                    "Calling tools".to_string(),
+                    None,
+                )),
+            ),
+        ];
+        let body = gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: true,
+            },
+            &Model::new("gemini", "gemini-2.5-pro"),
+        )
+        .unwrap();
+
+        let contents = body["contents"].as_array().unwrap();
+        let function_turn = contents
+            .iter()
+            .find(|content| content["role"] == "function")
+            .expect("tool results must serialize to function turn");
+        let parts = function_turn["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["functionResponse"]["name"], "first_tool");
+        assert_eq!(parts[1]["functionResponse"]["name"], "second_tool");
+        assert_eq!(parts[2]["text"], "[Tool first_tool returned image]");
+        assert_eq!(parts[3]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[3]["inlineData"]["data"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn gemini_serializer_leaves_no_image_tool_turn_unchanged() {
+        let tool_call = ToolCall::new(
+            "plain_tool".to_string(),
+            json!({"arg": 1}),
+            Some("call_plain".to_string()),
+            None,
+        );
+        let tool_result = harnx_core::tool::ToolResult::new(tool_call, json!({"status": "ok"}));
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Run tool".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![tool_result],
+                    "Calling tool".to_string(),
+                    None,
+                )),
+            ),
+        ];
+        let body = gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: true,
+            },
+            &Model::new("gemini", "gemini-2.5-pro"),
+        )
+        .unwrap();
+
+        let contents = body["contents"].as_array().unwrap();
+        let function_turn = contents
+            .iter()
+            .find(|content| content["role"] == "function")
+            .expect("tool results must serialize to function turn");
+        let parts = function_turn["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["functionResponse"]["name"], "plain_tool");
+        assert!(parts[0]["inlineData"].is_null());
+    }
+
     use super::*;
     use harnx_core::abort::create_abort_signal;
     use tokio::sync::mpsc::unbounded_channel;

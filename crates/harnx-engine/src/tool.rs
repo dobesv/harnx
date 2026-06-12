@@ -205,6 +205,10 @@ pub async fn eval_tool_calls(
                 if let Some(mutated_response) = post_outcome.result.mutated_tool_response {
                     result = mutated_response;
                 }
+                let images = crate::media::extract_image_parts(&result);
+                if !images.is_empty() {
+                    crate::media::redact_image_data(&mut result);
+                }
                 (ctx.emit_tool_result_fn)(&call, &result);
                 if !result.is_null() {
                     is_all_null = false;
@@ -212,6 +216,7 @@ pub async fn eval_tool_calls(
                     result = json!("DONE");
                 }
                 let mut result_obj = ToolResult::new(call, result);
+                result_obj.content = images;
                 result_obj.switch_agent = detect_switch_agent(&result_obj.output);
                 output.push(result_obj);
             }
@@ -785,6 +790,67 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].output, json!({"mutated": true}));
+    }
+
+    #[tokio::test]
+    async fn successful_tool_result_populates_image_content_parts() {
+        let image_data = "Zm9v";
+        let emitted_results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emitted_results_clone = Arc::clone(&emitted_results);
+        let ctx = test_context_with_emitters(
+            vec![Arc::new(MockToolProvider::ok(
+                "tool_a",
+                Duration::ZERO,
+                json!({
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "caption"
+                        },
+                        {
+                            "type": "image",
+                            "mimeType": "image/png",
+                            "data": image_data
+                        }
+                    ]
+                }),
+            ))],
+            |_| continue_hook_outcome(),
+            |_, _| {},
+            move |_, value| {
+                emitted_results_clone
+                    .lock()
+                    .expect("lock emitted results")
+                    .push(value.clone());
+            },
+            |_, _| {},
+        );
+        let abort_signal = create_abort_signal();
+
+        let result = eval_tool_calls(&ctx, vec![test_call("tool_a")], &abort_signal)
+            .await
+            .expect("tool call should succeed");
+
+        let emitted_results = emitted_results.lock().expect("lock emitted results");
+        assert_eq!(emitted_results.len(), 1);
+        let emitted_output = emitted_results[0].to_string();
+        assert!(!emitted_output.contains(image_data));
+        assert!(emitted_output.contains("caption"));
+        assert!(emitted_output.contains("<image: image/png, 4 base64 chars>"));
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content.len(), 1);
+        match &result[0].content[0] {
+            harnx_core::message::MessageContentPart::ImageUrl { image_url } => {
+                assert_eq!(image_url.url, format!("data:image/png;base64,{image_data}"));
+            }
+            other => panic!("expected image content part, got {other:?}"),
+        }
+
+        let serialized_output = result[0].output.to_string();
+        assert!(!serialized_output.contains(image_data));
+        assert!(serialized_output.contains("caption"));
+        assert!(serialized_output.contains("<image: image/png, 4 base64 chars>"));
     }
 
     #[tokio::test]

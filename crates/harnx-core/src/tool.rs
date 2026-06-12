@@ -5,6 +5,7 @@
 //! crate that needs to speak the schema.
 
 use crate::abort::AbortSignal;
+use crate::message::MessageContentPart;
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use minijinja::{Environment, Error, UndefinedBehavior};
@@ -16,6 +17,8 @@ use std::collections::HashSet;
 pub struct ToolResult {
     pub call: ToolCall,
     pub output: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<MessageContentPart>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub switch_agent: Option<SwitchAgentData>,
 }
@@ -33,8 +36,21 @@ impl ToolResult {
         Self {
             call,
             output,
+            content: Vec::new(),
             switch_agent: None,
         }
+    }
+
+    /// Returns true if this result has media content (images, etc.).
+    pub fn has_media(&self) -> bool {
+        !self.content.is_empty()
+    }
+
+    /// Returns an iterator over image content parts in this result.
+    pub fn images(&self) -> impl Iterator<Item = &MessageContentPart> {
+        self.content
+            .iter()
+            .filter(|part| matches!(part, MessageContentPart::ImageUrl { .. }))
     }
 }
 

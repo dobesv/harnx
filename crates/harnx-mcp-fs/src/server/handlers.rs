@@ -1,3 +1,5 @@
+use base64::Engine;
+
 // Auto-split from server.rs for cohesion. See server/mod.rs.
 use super::*;
 
@@ -286,6 +288,76 @@ impl FsServer {
         }
     }
 
+    fn image_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Some("image/png");
+        }
+        if bytes.starts_with(b"\xFF\xD8\xFF") {
+            return Some("image/jpeg");
+        }
+        if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            return Some("image/gif");
+        }
+        if Self::is_webp(bytes) {
+            return Some("image/webp");
+        }
+
+        None
+    }
+
+    fn is_webp(bytes: &[u8]) -> bool {
+        bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
+    }
+
+    fn image_mime_from_ext(path: &std::path::Path) -> Option<&'static str> {
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())?;
+
+        match ext.as_str() {
+            "png" => Some("image/png"),
+            "jpg" | "jpeg" => Some("image/jpeg"),
+            "gif" => Some("image/gif"),
+            "webp" => Some("image/webp"),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn detect_image_mime(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str> {
+        Self::image_mime_from_magic(bytes).or_else(|| Self::image_mime_from_ext(path))
+    }
+
+    fn try_read_image_content(
+        path: &std::path::Path,
+        bytes: &[u8],
+        params_path: &str,
+    ) -> Option<Result<CallToolResult, ErrorData>> {
+        const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+        let mime = Self::detect_image_mime(path, bytes)?;
+
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Some(tool_error(format!(
+                "'{}' image too large ({} bytes, max {}).",
+                params_path,
+                bytes.len(),
+                MAX_IMAGE_BYTES
+            )));
+        }
+
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let summary = format!(
+            "Read image '{}' ({}, {} bytes)",
+            params_path,
+            mime,
+            bytes.len()
+        );
+
+        Some(Ok(CallToolResult::success(vec![
+            Content::image(data, mime.to_string()).with_audience(vec![Role::Assistant]),
+            Content::text(summary).with_audience(vec![Role::User]),
+        ])))
+    }
     pub(crate) async fn read_file_impl(
         &self,
         params: ReadFileParams,
@@ -321,6 +393,10 @@ impl FsServer {
 
         let bytes = std::fs::read(&path)
             .map_err(|err| internal_error(format!("failed to read '{}': {err}", params.path)))?;
+
+        if let Some(result) = Self::try_read_image_content(&path, &bytes, &params.path) {
+            return result;
+        }
 
         if is_binary_content(&bytes) {
             return tool_error(format!("'{}' appears to be a binary file.", params.path));

@@ -51,6 +51,38 @@ pub fn render_message_input(
     }
 }
 
+fn strip_image_parts(messages: &mut [Message]) -> usize {
+    let mut stripped_images = 0usize;
+
+    for message in messages.iter_mut() {
+        match &mut message.content {
+            MessageContent::ToolCalls(tool_calls) => {
+                stripped_images += strip_tool_call_image_parts(tool_calls);
+            }
+            MessageContent::Array(parts) => {
+                stripped_images += strip_content_part_images(parts);
+            }
+            _ => {}
+        }
+    }
+
+    stripped_images
+}
+
+fn strip_tool_call_image_parts(tool_calls: &mut MessageContentToolCalls) -> usize {
+    tool_calls
+        .tool_results
+        .iter_mut()
+        .map(|tool_result| strip_content_part_images(&mut tool_result.content))
+        .sum()
+}
+
+fn strip_content_part_images(parts: &mut Vec<MessageContentPart>) -> usize {
+    let before = parts.len();
+    parts.retain(|part| !matches!(part, MessageContentPart::ImageUrl { .. }));
+    before - parts.len()
+}
+
 pub fn patch_messages(messages: &mut Vec<Message>, model: &Model) {
     if messages.is_empty() {
         return;
@@ -84,12 +116,40 @@ pub fn patch_messages(messages: &mut Vec<Message>, model: &Model) {
             message.merge_system(system);
         }
     }
+    if !model.supports_vision() {
+        let stripped_images = strip_image_parts(messages);
+        if stripped_images > 0 {
+            log::warn!(
+                "model '{}' lacks vision support; stripped {} image(s)",
+                model.id(),
+                stripped_images
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harnx_core::message::extract_system_message;
+    use harnx_core::{
+        message::{extract_system_message, ImageUrl},
+        tool::{ToolCall, ToolResult},
+    };
+
+    fn tool_result_with_content(content: Vec<MessageContentPart>) -> ToolResult {
+        ToolResult {
+            call: ToolCall::new(
+                "read_media".to_string(),
+                json!({ "path": "image.png" }),
+                None,
+                None,
+            ),
+            output: json!({ "status": "ok" }),
+            content,
+            switch_agent: None,
+        }
+    }
+    use serde_json::json;
 
     #[test]
     fn extract_system_message_text_returns_vec() {
@@ -199,6 +259,166 @@ mod tests {
                 assert!(
                     matches!(&parts[2], MessageContentPart::Text { text } if text == "Be helpful")
                 );
+            }
+            other => panic!("Expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn patch_messages_strips_tool_result_images_for_non_vision_model() {
+        let mut messages = vec![Message::new(
+            MessageRole::Assistant,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![tool_result_with_content(vec![
+                    MessageContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "file:///image.png".to_string(),
+                        },
+                    },
+                ])],
+                "tool output".to_string(),
+                None,
+            )),
+        )];
+        let model = Model::new("test", "test-model");
+
+        patch_messages(&mut messages, &model);
+
+        match &messages[0].content {
+            MessageContent::ToolCalls(tool_calls) => {
+                assert!(tool_calls.tool_results[0].content.is_empty());
+            }
+            other => panic!("Expected ToolCalls, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn patch_messages_keeps_tool_result_images_for_vision_model() {
+        let mut messages = vec![Message::new(
+            MessageRole::Assistant,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![tool_result_with_content(vec![
+                    MessageContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "file:///image.png".to_string(),
+                        },
+                    },
+                ])],
+                "tool output".to_string(),
+                None,
+            )),
+        )];
+        let mut model = Model::new("test", "test-model");
+        model.data_mut().supports_vision = true;
+
+        patch_messages(&mut messages, &model);
+
+        match &messages[0].content {
+            MessageContent::ToolCalls(tool_calls) => {
+                assert_eq!(tool_calls.tool_results[0].content.len(), 1);
+                assert!(matches!(
+                    tool_calls.tool_results[0].content[0],
+                    MessageContentPart::ImageUrl { .. }
+                ));
+            }
+            other => panic!("Expected ToolCalls, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn patch_messages_strips_only_image_parts_for_non_vision_model() {
+        let mut messages = vec![Message::new(
+            MessageRole::Assistant,
+            MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![tool_result_with_content(vec![
+                    MessageContentPart::Text {
+                        text: "caption".to_string(),
+                    },
+                    MessageContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "file:///image.png".to_string(),
+                        },
+                    },
+                ])],
+                "tool output".to_string(),
+                None,
+            )),
+        )];
+        let model = Model::new("test", "test-model");
+
+        patch_messages(&mut messages, &model);
+
+        match &messages[0].content {
+            MessageContent::ToolCalls(tool_calls) => {
+                assert_eq!(tool_calls.tool_results[0].content.len(), 1);
+                assert!(matches!(
+                    &tool_calls.tool_results[0].content[0],
+                    MessageContentPart::Text { text } if text == "caption"
+                ));
+            }
+            other => panic!("Expected ToolCalls, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn patch_messages_strips_user_images_for_non_vision_model() {
+        let mut messages = vec![Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![
+                MessageContentPart::Text {
+                    text: "describe this".to_string(),
+                },
+                MessageContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "file:///image.png".to_string(),
+                    },
+                },
+            ]),
+        )];
+        let model = Model::new("test", "test-model");
+
+        patch_messages(&mut messages, &model);
+
+        match &messages[0].content {
+            MessageContent::Array(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert!(matches!(
+                    &parts[0],
+                    MessageContentPart::Text { text } if text == "describe this"
+                ));
+            }
+            other => panic!("Expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn patch_messages_keeps_user_images_for_vision_model() {
+        let mut messages = vec![Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![
+                MessageContentPart::Text {
+                    text: "describe this".to_string(),
+                },
+                MessageContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "file:///image.png".to_string(),
+                    },
+                },
+            ]),
+        )];
+        let mut model = Model::new("test", "test-model");
+        model.data_mut().supports_vision = true;
+
+        patch_messages(&mut messages, &model);
+
+        match &messages[0].content {
+            MessageContent::Array(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(
+                    &parts[0],
+                    MessageContentPart::Text { text } if text == "describe this"
+                ));
+                assert!(matches!(&parts[1], MessageContentPart::ImageUrl { .. }));
             }
             other => panic!("Expected Array, got {:?}", other),
         }

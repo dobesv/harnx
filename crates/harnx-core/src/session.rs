@@ -129,6 +129,8 @@ pub struct ToolOutput {
     pub id: Option<String>,
     pub name: String,
     pub output: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<crate::message::MessageContentPart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_agent: Option<SwitchAgentData>,
 }

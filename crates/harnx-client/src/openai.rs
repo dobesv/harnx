@@ -1,6 +1,6 @@
 use crate::*;
 
-use harnx_core::text::strip_think_tag;
+use harnx_core::{message::MessageContentPart, text::strip_think_tag, tool::ToolResult};
 
 use anyhow::{bail, Context, Result};
 use reqwest::RequestBuilder;
@@ -8,6 +8,37 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 const API_BASE: &str = "https://api.openai.com/v1";
+
+
+fn openai_collect_tool_result_images(tool_results: &[ToolResult]) -> Vec<Value> {
+    tool_results
+        .iter()
+        .flat_map(|tool_result| tool_result.content.iter())
+        .filter_map(|part| match part {
+            MessageContentPart::ImageUrl { image_url } => Some(json!({
+                "type": "image_url",
+                "image_url": { "url": image_url.url },
+            })),
+            MessageContentPart::Text { .. } => None,
+        })
+        .collect()
+}
+
+fn openai_tool_message_content(tool_result: &ToolResult) -> String {
+    let output = tool_result.output.to_string();
+    if tool_result
+        .content
+        .iter()
+        .any(|part| matches!(part, MessageContentPart::ImageUrl { .. }))
+    {
+        format!(
+            "{output}\n[Tool {} returned image(s): see next message]",
+            tool_result.call.name
+        )
+    } else {
+        output
+    }
+}
 
 impl OpenAIClient {
     config_get_fn!(api_key, get_api_key);
@@ -309,6 +340,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                     thought: _,
                     sequence,
                 }) => {
+                    let trailing_image_parts = openai_collect_tool_result_images(&tool_results);
                     if !sequence {
                         let tool_calls: Vec<_> = tool_results
                             .iter()
@@ -326,38 +358,53 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                         let mut messages = vec![
                             json!({ "role": MessageRole::Assistant, "tool_calls": tool_calls }),
                         ];
-                        for tool_result in tool_results {
+                        for tool_result in &tool_results {
                             messages.push(json!({
                                 "role": "tool",
-                                "content": tool_result.output.to_string(),
+                                "content": openai_tool_message_content(tool_result),
                                 "tool_call_id": tool_result.call.id,
+                            }));
+                        }
+                        if !trailing_image_parts.is_empty() {
+                            messages.push(json!({
+                                "role": MessageRole::User,
+                                "content": trailing_image_parts,
                             }));
                         }
                         messages
                     } else {
-                        tool_results.into_iter().flat_map(|tool_result| {
-                            vec![
-                                json!({
-                                    "role": MessageRole::Assistant,
-                                    "tool_calls": [
-                                        {
-                                            "id": tool_result.call.id,
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_result.call.name,
-                                                "arguments": tool_result.call.arguments.to_string(),
-                                            },
-                                        }
-                                    ]
-                                }),
-                                json!({
-                                    "role": "tool",
-                                    "content": tool_result.output.to_string(),
-                                    "tool_call_id": tool_result.call.id,
-                                })
-                            ]
-
-                        }).collect()
+                        let mut messages: Vec<_> = tool_results
+                            .into_iter()
+                            .flat_map(|tool_result| {
+                                vec![
+                                    json!({
+                                        "role": MessageRole::Assistant,
+                                        "tool_calls": [
+                                            {
+                                                "id": tool_result.call.id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": tool_result.call.name,
+                                                    "arguments": tool_result.call.arguments.to_string(),
+                                                },
+                                            }
+                                        ]
+                                    }),
+                                    json!({
+                                        "role": "tool",
+                                        "content": openai_tool_message_content(&tool_result),
+                                        "tool_call_id": tool_result.call.id,
+                                    })
+                                ]
+                            })
+                            .collect();
+                        if !trailing_image_parts.is_empty() {
+                            messages.push(json!({
+                                "role": MessageRole::User,
+                                "content": trailing_image_parts,
+                            }));
+                        }
+                        messages
                     }
                 }
                 MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => {
@@ -486,6 +533,45 @@ fn normalize_function_id(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use harnx_core::{
+        message::{ImageUrl, Message, MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole},
+        tool::{ToolCall, ToolResult},
+    };
+
+    fn test_tool_result(id: &str, name: &str, output: Value) -> ToolResult {
+        ToolResult::new(
+            ToolCall::new(name.to_string(), json!({"arg": id}), Some(id.to_string()), None),
+            output,
+        )
+    }
+
+    fn image_part(url: &str) -> MessageContentPart {
+        MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: url.to_string(),
+            },
+        }
+    }
+
+    fn build_tool_calls_body(tool_results: Vec<ToolResult>, sequence: bool) -> Value {
+        let mut tool_calls = MessageContentToolCalls::new(tool_results, String::new(), None);
+        tool_calls.sequence = sequence;
+        let data = ChatCompletionsData {
+            messages: vec![Message {
+                role: MessageRole::Assistant,
+                content: MessageContent::ToolCalls(tool_calls),
+                ..Default::default()
+            }],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+        };
+        let model = harnx_core::model::Model::new("openai", "gpt-4o");
+        openai_build_chat_completions_body(data, &model)
+    }
+
     use harnx_core::abort::create_abort_signal;
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -554,6 +640,146 @@ mod tests {
         model.set_max_tokens(Some(1024), true);
         model.data_mut().patches = Some(patches.into_iter().map(String::from).collect());
         model
+    }
+
+
+    #[test]
+    fn tool_calls_with_images_emit_single_trailing_user_message_in_normal_mode() {
+        let mut first = test_tool_result("call_1", "read_file", json!({"ok": true, "idx": 1}));
+        first.content.push(image_part("data:image/png;base64,AAAA"));
+        let mut second = test_tool_result("call_2", "inspect_file", json!({"ok": true, "idx": 2}));
+        second.content.push(image_part("data:image/jpeg;base64,BBBB"));
+
+        let body = build_tool_calls_body(vec![first.clone(), second.clone()], false);
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], json!("assistant"));
+        assert_eq!(messages[0]["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(messages[0]["tool_calls"][1]["id"], json!("call_2"));
+
+        assert_eq!(messages[1]["role"], json!("tool"));
+        assert_eq!(messages[1]["tool_call_id"], json!("call_1"));
+        assert_eq!(
+            messages[1]["content"],
+            json!(format!(
+                "{}\n[Tool {} returned image(s): see next message]",
+                first.output, first.call.name
+            ))
+        );
+
+        assert_eq!(messages[2]["role"], json!("tool"));
+        assert_eq!(messages[2]["tool_call_id"], json!("call_2"));
+        assert_eq!(
+            messages[2]["content"],
+            json!(format!(
+                "{}\n[Tool {} returned image(s): see next message]",
+                second.output, second.call.name
+            ))
+        );
+
+        assert_eq!(messages[3]["role"], json!("user"));
+        assert_eq!(
+            messages[3]["content"],
+            json!([
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BBBB"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_calls_with_single_image_emit_trailing_user_message_in_sequence_mode() {
+        let mut first = test_tool_result("call_1", "read_file", json!("preview"));
+        first.content.push(image_part("data:image/png;base64,AAAA"));
+        let second = test_tool_result("call_2", "list_dir", json!("no image"));
+
+        let body = build_tool_calls_body(vec![first.clone(), second.clone()], true);
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0]["role"], json!("assistant"));
+        assert_eq!(messages[0]["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(messages[1]["role"], json!("tool"));
+        assert_eq!(messages[1]["tool_call_id"], json!("call_1"));
+        assert_eq!(
+            messages[1]["content"],
+            json!(format!(
+                "{}\n[Tool {} returned image(s): see next message]",
+                first.output, first.call.name
+            ))
+        );
+        assert_eq!(messages[2]["role"], json!("assistant"));
+        assert_eq!(messages[2]["tool_calls"][0]["id"], json!("call_2"));
+        assert_eq!(messages[3]["role"], json!("tool"));
+        assert_eq!(messages[3]["tool_call_id"], json!("call_2"));
+        assert_eq!(messages[3]["content"], json!(second.output.to_string()));
+        assert_eq!(messages[4]["role"], json!("user"));
+        assert_eq!(
+            messages[4]["content"],
+            json!([
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_calls_without_images_match_legacy_output() {
+        let first = test_tool_result("call_1", "read_file", json!("first"));
+        let second = test_tool_result("call_2", "list_dir", json!({"ok": true}));
+
+        let normal_body = build_tool_calls_body(vec![first.clone(), second.clone()], false);
+        assert_eq!(
+            normal_body["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{\"arg\":\"call_1\"}"}
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "list_dir", "arguments": "{\"arg\":\"call_2\"}"}
+                        }
+                    ]
+                },
+                {"role": "tool", "content": "\"first\"", "tool_call_id": "call_1"},
+                {"role": "tool", "content": "{\"ok\":true}", "tool_call_id": "call_2"}
+            ])
+        );
+
+        let sequence_body = build_tool_calls_body(vec![first, second], true);
+        assert_eq!(
+            sequence_body["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{\"arg\":\"call_1\"}"}
+                        }
+                    ]
+                },
+                {"role": "tool", "content": "\"first\"", "tool_call_id": "call_1"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "list_dir", "arguments": "{\"arg\":\"call_2\"}"}
+                        }
+                    ]
+                },
+                {"role": "tool", "content": "{\"ok\":true}", "tool_call_id": "call_2"}
+            ])
+        );
     }
 
     #[test]

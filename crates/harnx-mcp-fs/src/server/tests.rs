@@ -206,6 +206,21 @@ async fn test_fs_server_list_tools() {
             "rollback_file"
         ]
     );
+
+    // Verify read tool advertises image support in its description
+    let read_tool = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "read")
+        .expect("read tool should exist");
+    let desc = read_tool
+        .description
+        .as_ref()
+        .expect("read tool should have description");
+    assert!(
+        desc.to_lowercase().contains("image"),
+        "read tool description should mention image support"
+    );
 }
 
 #[tokio::test]
@@ -610,6 +625,113 @@ async fn test_read_file_binary_detection() {
     assert!(text_content(&result).contains("appears to be a binary file"));
 }
 
+#[tokio::test]
+async fn test_read_file_image_png() {
+    let temp_dir = TestDir::new();
+    let file_path = temp_dir.path().join("test.png");
+    std::fs::write(&file_path, b"\x89PNG\r\n\x1a\n...fake...").unwrap();
+    let server = make_server(temp_dir.path());
+
+    let result = server
+        .read_file_impl(ReadFileParams {
+            path: path_string(&file_path),
+            offset: None,
+            limit: None,
+            tail: None,
+            grep: None,
+            head_lines: None,
+            tail_lines: None,
+            max_output_bytes: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(false));
+    let mut found_image = false;
+    for content in result.content {
+        let v = serde_json::to_value(&content).unwrap();
+        if v["type"] == "image" {
+            found_image = true;
+            assert_eq!(v["mimeType"], "image/png");
+            assert!(!v["data"].as_str().unwrap().is_empty());
+        }
+    }
+    assert!(found_image, "expected to find an Image content block");
+}
+
+#[tokio::test]
+async fn test_read_file_image_oversized() {
+    let temp_dir = TestDir::new();
+    let file_path = temp_dir.path().join("big.jpg");
+    // > 5MB
+    let big_data = vec![0xFF, 0xD8, 0xFF, 0x00];
+    let mut file_data = big_data.clone();
+    file_data.resize(5 * 1024 * 1024 + 10, 0);
+    std::fs::write(&file_path, &file_data).unwrap();
+    let server = make_server(temp_dir.path());
+
+    let result = server
+        .read_file_impl(ReadFileParams {
+            path: path_string(&file_path),
+            offset: None,
+            limit: None,
+            tail: None,
+            grep: None,
+            head_lines: None,
+            tail_lines: None,
+            max_output_bytes: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.is_error, Some(true));
+    assert!(text_content(&result).contains("image too large"));
+}
+
+#[test]
+fn test_detect_image_mime_logic() {
+    let p = Path::new("test.txt");
+    assert_eq!(
+        FsServer::detect_image_mime(p, b"\x89PNG\r\n\x1a\n123"),
+        Some("image/png")
+    );
+    assert_eq!(
+        FsServer::detect_image_mime(p, b"\xFF\xD8\xFF123"),
+        Some("image/jpeg")
+    );
+    assert_eq!(
+        FsServer::detect_image_mime(p, b"GIF87a123"),
+        Some("image/gif")
+    );
+    assert_eq!(
+        FsServer::detect_image_mime(p, b"GIF89a123"),
+        Some("image/gif")
+    );
+    assert_eq!(
+        FsServer::detect_image_mime(p, b"RIFF1234WEBP123"),
+        Some("image/webp")
+    );
+
+    // Extension fallback
+    assert_eq!(
+        FsServer::detect_image_mime(Path::new("test.png"), b"random"),
+        Some("image/png")
+    );
+    assert_eq!(
+        FsServer::detect_image_mime(Path::new("TEST.JPG"), b"random"),
+        Some("image/jpeg")
+    );
+    assert_eq!(
+        FsServer::detect_image_mime(Path::new("file.webp"), b"random"),
+        Some("image/webp")
+    );
+
+    // Neither
+    assert_eq!(
+        FsServer::detect_image_mime(Path::new("test.txt"), b"random"),
+        None
+    );
+}
 #[tokio::test]
 async fn test_edit_file_unique_match() {
     let temp_dir = TestDir::new();
