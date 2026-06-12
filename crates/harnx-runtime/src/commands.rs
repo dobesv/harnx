@@ -26,7 +26,7 @@ pub enum CommandOutcome {
     OpenSessionPicker,
 }
 
-pub static COMMANDS: LazyLock<[Command; 45]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 46]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -53,6 +53,10 @@ pub static COMMANDS: LazyLock<[Command; 45]> = LazyLock::new(|| {
             "Compact session messages using configured compaction agent",
         ),
         Command::new(".info session", "Show session info"),
+        Command::new(
+            ".info model",
+            "Show active model details (id, client, pricing, vision/tool-use, catalog source)",
+        ),
         Command::new(".edit session", "Modify current session"),
         Command::new(
             ".edit message <n>",
@@ -169,6 +173,10 @@ pub async fn run_command_with_output(
                 Some("session") => {
                     let info = config.read().session_info()?;
                     write!(output, "{info}")?;
+                }
+                Some("model") => {
+                    let conf = config.read();
+                    write_model_info_block(output, &conf, conf.current_model())?;
                 }
                 Some("rag") => {
                     let info = config.read().rag_info()?;
@@ -943,6 +951,60 @@ fn split_first_arg(args: Option<&str>) -> Option<(&str, Option<&str>)> {
     })
 }
 
+fn model_source_label(conf: &Config, model: &crate::client::Model) -> &'static str {
+    if crate::client::list_all_models(&conf.clients)
+        .iter()
+        .any(|candidate| {
+            candidate.id() == model.id() && candidate.model_type() == model.model_type()
+        })
+    {
+        "catalog"
+    } else {
+        "fallback/default (not found in catalog — capabilities may be wrong!)"
+    }
+}
+
+fn format_option<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn write_model_info_block(
+    output: &mut (dyn Write + Send),
+    conf: &Config,
+    model: &crate::client::Model,
+) -> Result<()> {
+    writeln!(output, "model: {}", model.id())?;
+    writeln!(output, "client: {}", model.client_name())?;
+    writeln!(output, "real_name: {}", model.real_name())?;
+    writeln!(output, "type: {}", model.model_type())?;
+    writeln!(output, "source: {}", model_source_label(conf, model))?;
+    writeln!(output, "supports_vision: {}", model.supports_vision())?;
+    writeln!(output, "supports_tool_use: {}", model.supports_tool_use())?;
+    writeln!(
+        output,
+        "max_input_tokens: {}",
+        format_option(model.max_input_tokens())
+    )?;
+    writeln!(
+        output,
+        "max_output_tokens: {}",
+        format_option(model.max_output_tokens())
+    )?;
+    writeln!(
+        output,
+        "input_price: {}",
+        format_option(model.input_price())
+    )?;
+    writeln!(
+        output,
+        "output_price: {}",
+        format_option(model.output_price())
+    )?;
+    Ok(())
+}
+
 pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -1018,6 +1080,92 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{self, WorkingMode};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    fn test_config_with_model(model: crate::client::Model) -> GlobalConfig {
+        let mut config = Config {
+            model,
+            working_mode: WorkingMode::Cmd,
+            ..Default::default()
+        };
+        config.session = Some(config::session::new(&config, "test").expect("test session"));
+        Arc::new(RwLock::new(config))
+    }
+
+    fn model_with_data(
+        client_name: &str,
+        name: &str,
+        supports_vision: bool,
+    ) -> crate::client::Model {
+        let mut model = crate::client::Model::new(client_name, name);
+        model.data_mut().supports_vision = supports_vision;
+        model
+    }
+
+    #[tokio::test]
+    async fn test_info_model_reports_catalog_model() {
+        let mut config = Config {
+            clients: vec![crate::client::ClientConfig::OpenAIConfig(Default::default())],
+            model: model_with_data("openai", "gpt-4o", true),
+            working_mode: WorkingMode::Cmd,
+            ..Default::default()
+        };
+        config.session = Some(config::session::new(&config, "test").expect("test session"));
+        let config = Arc::new(RwLock::new(config));
+        let mut output = Vec::new();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut async_manager = AsyncHookManager::default();
+        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
+        let mut pending_async_context = None;
+
+        let outcome = run_command_with_output(
+            &config,
+            abort_signal,
+            ".info model",
+            &mut async_manager,
+            &persistent_manager,
+            &mut pending_async_context,
+            &mut output,
+        )
+        .await
+        .expect("command succeeds");
+
+        assert_eq!(outcome, CommandOutcome::Continue);
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("model: openai:gpt-4o"));
+        assert!(output.contains("supports_vision: true"));
+        assert!(output.contains("source: catalog"));
+    }
+
+    #[tokio::test]
+    async fn test_info_model_reports_fallback_model() {
+        let config =
+            test_config_with_model(model_with_data("test-client", "fallback-model", false));
+        let mut output = Vec::new();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut async_manager = AsyncHookManager::default();
+        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
+        let mut pending_async_context = None;
+
+        run_command_with_output(
+            &config,
+            abort_signal,
+            ".info model",
+            &mut async_manager,
+            &persistent_manager,
+            &mut pending_async_context,
+            &mut output,
+        )
+        .await
+        .expect("command succeeds");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        assert!(output.contains("model: test-client:fallback-model"));
+        assert!(output.contains("supports_vision: false"));
+        assert!(output.contains("source: fallback/default"));
+    }
 
     #[test]
     fn test_process_command_line() {

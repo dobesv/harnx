@@ -580,14 +580,32 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
                                 "input": tool_result.call.arguments,
                             }
                         }));
+                        let mut tr_content = vec![json!({
+                            "json": tool_result.output,
+                        })];
+                        for part in &tool_result.content {
+                            if let MessageContentPart::ImageUrl {
+                                image_url: ImageUrl { url },
+                            } = part
+                            {
+                                if let Some((mime, data)) = url
+                                    .strip_prefix("data:")
+                                    .and_then(|v| v.split_once(";base64,"))
+                                {
+                                    let format = mime.strip_prefix("image/").unwrap_or(mime);
+                                    tr_content.push(json!({
+                                        "image": {
+                                            "format": format,
+                                            "source": { "bytes": data }
+                                        }
+                                    }));
+                                }
+                            }
+                        }
                         user_parts.push(json!({
                             "toolResult": {
                                 "toolUseId": tool_result.call.id,
-                                "content": [
-                                    {
-                                        "json": tool_result.output,
-                                    }
-                                ]
+                                "content": tr_content,
                             }
                         }));
                     }
@@ -1358,6 +1376,81 @@ mod tests {
         assert!(
             tool_calls.is_empty(),
             "no toolUse blocks were sent; tool_calls must stay empty"
+        );
+    }
+
+    #[test]
+    fn bedrock_tool_result_with_image_appends_image_block() {
+        use harnx_core::tool::ToolResult;
+        let model = Model::new("bedrock", "us.anthropic.claude-sonnet-4-6");
+        let tool_call = ToolCall {
+            id: Some("toolu_XYZ".to_string()),
+            name: "fs_read".to_string(),
+            arguments: json!({"path": "foo.png"}),
+            thought_signature: None,
+        };
+        let mut tool_result = ToolResult::new(tool_call, json!("output text"));
+        tool_result.content.push(MessageContentPart::ImageUrl {
+            image_url: crate::ImageUrl {
+                url: "data:image/png;base64,iVBORw0KGgo".to_string(),
+            },
+        });
+
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Do something".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![tool_result],
+                    "".to_string(),
+                    None,
+                )),
+            ),
+        ];
+
+        let body = build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+            },
+            &model,
+        )
+        .unwrap();
+
+        let user_msg = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| {
+                m["role"] == "user"
+                    && m["content"]
+                        .as_array()
+                        .is_some_and(|c| !c.is_empty() && c[0].get("toolResult").is_some())
+            })
+            .expect("must have a user toolResult turn");
+
+        let content = user_msg["content"]
+            .as_array()
+            .expect("user content array")[0]["toolResult"]["content"]
+            .as_array()
+            .expect("toolResult content array");
+
+        assert_eq!(content.len(), 2, "must have 2 blocks (json and image)");
+        assert_eq!(content[0], json!({"json": "output text"}));
+        assert_eq!(
+            content[1],
+            json!({
+                "image": {
+                    "format": "png",
+                    "source": { "bytes": "iVBORw0KGgo" }
+                }
+            })
         );
     }
 }

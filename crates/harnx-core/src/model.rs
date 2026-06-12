@@ -149,6 +149,22 @@ impl Model {
         self.data.no_system_message
     }
 
+    pub fn supports_vision(&self) -> bool {
+        self.data.supports_vision
+    }
+
+    pub fn supports_tool_use(&self) -> bool {
+        self.data.supports_tool_use
+    }
+
+    pub fn input_price(&self) -> Option<f64> {
+        self.data.input_price
+    }
+
+    pub fn output_price(&self) -> Option<f64> {
+        self.data.output_price
+    }
+
     pub fn system_prompt_prefix(&self) -> Option<&[String]> {
         self.data.system_prompt_prefix.as_deref()
     }

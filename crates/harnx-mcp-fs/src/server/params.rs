@@ -107,7 +107,7 @@ impl JsonSchema for ReadFileParams {
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
         object_schema_with_desc(
             vec![
-                ("path", "Absolute path to the file to read. Prefer this tool over shell commands like sed, cat, head, tail for reading files.", path),
+                ("path", "Absolute path to the file to read. Prefer this tool over shell commands like sed, cat, head, tail for reading files. If the path is an image file (PNG/JPEG/GIF/WebP), it is returned as viewable image content.", path),
                 ("offset", "Start reading at this line number (1-indexed). Use to read a specific line range instead of `sed -n 'N,Mp'`.", offset),
                 ("limit", "Maximum number of lines to return from offset. Combine with offset to read a range.", limit),
                 ("tail", "Return only the last N lines of the file.", tail),

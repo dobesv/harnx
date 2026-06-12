@@ -376,6 +376,7 @@ fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Me
         output: serde_json::json!({
             "error": "tool response lost (session was interrupted before results were persisted)"
         }),
+        content: Vec::new(),
         switch_agent: None,
     };
     // Fabricate one lost-response per call, matched by id/position.
@@ -422,6 +423,7 @@ fn assemble_tool_message(
                 Some(out) => ToolResult {
                     call,
                     output: out.output,
+                    content: out.content,
                     switch_agent: out.switch_agent,
                 },
                 None => ToolResult::new(
@@ -546,7 +548,14 @@ pub fn render(session: &Session) -> Result<String> {
         items.push(("path", path.to_string()));
     }
 
-    items.push(("model", session.model().id()));
+    items.push((
+        "model",
+        format!(
+            "{} (vision: {})",
+            session.model().id(),
+            session.model().supports_vision()
+        ),
+    ));
 
     if let Some(temperature) = session.temperature() {
         items.push(("temperature", temperature.to_string()));
@@ -646,6 +655,7 @@ fn append_message_entries(content: &mut String, msg: &Message, session_id: &str)
                     id: r.call.id.clone(),
                     name: r.call.name.clone(),
                     output: r.output.clone(),
+                    content: r.content.clone(),
                     switch_agent: r.switch_agent.clone(),
                 })
                 .collect();
@@ -937,6 +947,7 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
             .or_else(|| positional.next());
         if let Some(replacement) = replacement {
             slot.output = replacement.output;
+            slot.content = replacement.content;
             slot.switch_agent = replacement.switch_agent;
         }
     }
@@ -948,6 +959,7 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
             id: r.call.id.clone(),
             name: r.call.name.clone(),
             output: r.output.clone(),
+            content: r.content.clone(),
             switch_agent: r.switch_agent.clone(),
         })
         .collect();
@@ -1761,6 +1773,273 @@ content: second
             json!({"results": ["a", "b"]}),
             "reloaded tool output should match what we wrote"
         );
+    }
+
+    #[test]
+    fn legacy_tool_result_without_content_loads_with_empty_content() {
+        use serde_json::json;
+
+        let content = r#"---
+type: header
+model: test:model
+agent: default
+save_session: true
+---
+type: user
+text: find test
+---
+type: tool_calls
+text: searching...
+calls:
+  - name: search
+    arguments:
+      query: test
+    id: c1
+---
+type: tool_results
+results:
+  - id: c1
+    name: search
+    output:
+      results:
+        - a
+        - b
+"#;
+
+        let reloaded = super::load_from_log_for_test(content);
+        let tool_msg = reloaded
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("session should contain a Tool message");
+        let MessageContent::ToolCalls(tc) = &tool_msg.content else {
+            panic!("expected ToolCalls content on Tool message");
+        };
+
+        assert_eq!(tc.tool_results[0].output, json!({"results": ["a", "b"]}));
+        assert!(
+            tc.tool_results[0].content.is_empty(),
+            "legacy sessions without content field should load as empty Vec"
+        );
+    }
+
+    #[test]
+    fn session_serialization_omits_empty_tool_result_content() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+
+        let call = ToolCall {
+            name: "search".to_string(),
+            arguments: json!({"query": "test"}),
+            id: Some("c1".to_string()),
+            thought_signature: None,
+        };
+        let result = ToolResult::new(call.clone(), json!({"results": ["a", "b"]}));
+
+        let input = crate::config::input::from_str(&global_config, "find test", Some(agent));
+        super::add_tool_calls(&mut session, &input, "searching...", None, &[call]).unwrap();
+        super::add_tool_results(&mut session, &[result]).unwrap();
+
+        let serialized = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        let tool_results_doc = serialized
+            .split("---")
+            .find(|doc| doc.contains("type: tool_results"))
+            .expect("persisted session should contain tool_results document");
+        assert!(
+            !tool_results_doc.contains("content:"),
+            "empty tool result content should be omitted from persisted tool_results YAML"
+        );
+    }
+
+    #[test]
+    fn tool_result_image_content_survives_add_tool_results_and_build_messages() {
+        use crate::tool::{ToolCall, ToolResult};
+        use harnx_core::message::{ImageUrl, MessageContentPart};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+        let input = crate::config::input::from_str(&global_config, "inspect image", Some(agent));
+
+        let data_uri = "data:image/png;base64,AAAA".to_string();
+        let call = ToolCall {
+            name: "read".to_string(),
+            arguments: json!({"path": "chart.png"}),
+            id: Some("c1".to_string()),
+            thought_signature: None,
+        };
+        let result = ToolResult {
+            call: call.clone(),
+            output: json!({
+                "content": [{
+                    "type": "image",
+                    "mime_type": "image/png",
+                    "data": "<image: image/png, 4 base64 chars>"
+                }]
+            }),
+            content: vec![MessageContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: data_uri.clone(),
+                },
+            }],
+            switch_agent: None,
+        };
+
+        super::add_tool_calls(&mut session, &input, "reading...", None, &[call]).unwrap();
+        super::add_tool_results(&mut session, &[result]).unwrap();
+
+        let messages = super::build_messages(&session, &input).unwrap();
+        let tool_message = messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .expect("tool message should be present");
+        let MessageContent::ToolCalls(tool_calls) = &tool_message.content else {
+            panic!("expected tool-call message, got {tool_message:#?}");
+        };
+        assert_eq!(tool_calls.tool_results.len(), 1);
+        assert_eq!(tool_calls.tool_results[0].content.len(), 1);
+        match &tool_calls.tool_results[0].content[0] {
+            MessageContentPart::ImageUrl { image_url } => assert_eq!(image_url.url, data_uri),
+            other => panic!("expected ImageUrl content part, got {other:#?}"),
+        }
+        assert_eq!(
+            tool_calls.tool_results[0].output,
+            json!({
+                "content": [{
+                    "type": "image",
+                    "mime_type": "image/png",
+                    "data": "<image: image/png, 4 base64 chars>"
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn session_persistence_round_trips_tool_result_image_content_with_redacted_output() {
+        use crate::tool::{ToolCall, ToolResult};
+        use harnx_core::message::{ImageUrl, MessageContentPart};
+        use serde_json::json;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
+
+        let base64_payload = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(8);
+        let data_uri = format!("data:image/png;base64,{base64_payload}");
+        let call = ToolCall {
+            name: "read".to_string(),
+            arguments: json!({"path": "chart.png"}),
+            id: Some("c1".to_string()),
+            thought_signature: None,
+        };
+        let redacted_output = json!({
+            "content": [{
+                "type": "image",
+                "mime_type": "image/png",
+                "data": format!("<image: image/png, {} base64 chars>", base64_payload.len())
+            }]
+        });
+        let result = ToolResult {
+            call: call.clone(),
+            output: redacted_output.clone(),
+            content: vec![MessageContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: data_uri.clone(),
+                },
+            }],
+            switch_agent: None,
+        };
+
+        let input = crate::config::input::from_str(&global_config, "inspect image", Some(agent));
+        super::add_tool_calls(&mut session, &input, "reading...", None, &[call]).unwrap();
+        super::add_tool_results(&mut session, &[result]).unwrap();
+
+        let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(persisted.contains("<image: image/png,"));
+        assert!(
+            persisted.contains(&data_uri),
+            "persisted session should inline tool result data URI in content"
+        );
+
+        let reloaded = super::load_from_log_for_test(&persisted);
+        let MessageContent::ToolCalls(tool_calls) = &reloaded
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .expect("reloaded tool message should be present")
+            .content
+        else {
+            panic!("expected reloaded tool-call message");
+        };
+        assert_eq!(tool_calls.tool_results.len(), 1);
+        assert_eq!(tool_calls.tool_results[0].content.len(), 1);
+        match &tool_calls.tool_results[0].content[0] {
+            MessageContentPart::ImageUrl { image_url } => assert_eq!(image_url.url, data_uri),
+            other => panic!("expected ImageUrl content part, got {other:#?}"),
+        }
+        assert_eq!(tool_calls.tool_results[0].output, redacted_output);
+    }
+
+    #[test]
+    fn load_old_tool_results_without_content_defaults_to_empty_content() {
+        let content = r#"type: header
+model: test
+---
+type: message
+role: user
+content: inspect image
+---
+type: tool_calls
+text: reading...
+calls:
+  - name: read
+    arguments:
+      path: chart.png
+    id: c1
+---
+type: tool_results
+results:
+  - id: c1
+    name: read
+    output:
+      content:
+        - type: image
+          mime_type: image/png
+          data: "<image: image/png, 4 base64 chars>"
+"#;
+
+        let session = super::load_from_log_for_test(content);
+        let MessageContent::ToolCalls(tool_calls) = &session
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .expect("tool message should load")
+            .content
+        else {
+            panic!("expected tool-call message");
+        };
+        assert_eq!(tool_calls.tool_results.len(), 1);
+        assert!(tool_calls.tool_results[0].content.is_empty());
     }
 
     #[test]

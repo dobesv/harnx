@@ -369,10 +369,39 @@ pub fn claude_build_chat_completions_body(
                             "name": tool_result.call.name,
                             "input": tool_result.call.arguments,
                         }));
+                        let tr_content = if tool_result.content.is_empty() {
+                            json!(tool_result.output.to_string())
+                        } else {
+                            let mut blocks = vec![json!({
+                                "type": "text",
+                                "text": tool_result.output.to_string()
+                            })];
+                            for part in &tool_result.content {
+                                if let MessageContentPart::ImageUrl {
+                                    image_url: crate::ImageUrl { url },
+                                } = part
+                                {
+                                    if let Some((mime, data)) = url
+                                        .strip_prefix("data:")
+                                        .and_then(|v| v.split_once(";base64,"))
+                                    {
+                                        blocks.push(json!({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": mime,
+                                                "data": data,
+                                            }
+                                        }));
+                                    }
+                                }
+                            }
+                            json!(blocks)
+                        };
                         user_parts.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_result.call.id,
-                            "content": tool_result.output.to_string(),
+                            "content": tr_content,
                         }));
                     }
                     vec![
@@ -1197,5 +1226,136 @@ system_prompt_prefix:
         unsafe { std::env::remove_var("CLAUDE_API_KEY") };
 
         assert_eq!(result.unwrap(), "test-key-bare");
+    }
+
+    /// When a ToolResult has image content, tool_result content should be an array
+    /// containing a text block and an image block with base64 data.
+    #[test]
+    fn claude_tool_result_with_image_emits_array_with_image_block() {
+        use harnx_core::tool::ToolResult;
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        let tool_call = ToolCall {
+            id: Some("toolu_XYZ".to_string()),
+            name: "fs_read".to_string(),
+            arguments: json!({"path": "foo.png"}),
+            thought_signature: None,
+        };
+        let mut tool_result = ToolResult::new(tool_call, json!("output text"));
+        tool_result.content.push(MessageContentPart::ImageUrl {
+            image_url: crate::ImageUrl {
+                url: "data:image/png;base64,iVBORw0KGgo".to_string(),
+            },
+        });
+
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Do something".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![tool_result],
+                    "".to_string(),
+                    None,
+                )),
+            ),
+        ];
+
+        let body = claude_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+            },
+            &model,
+        )
+        .unwrap();
+
+        let user_msg = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "user" && m["content"].as_array().is_some_and(|c| !c.is_empty() && c[0].get("type").is_some_and(|t| t == "tool_result")))
+            .expect("must have a user tool_result turn");
+
+        let content = user_msg["content"]
+            .as_array()
+            .expect("user content array")[0]["content"]
+            .as_array()
+            .expect("tool_result content should be an array when images present");
+
+        assert_eq!(content.len(), 2, "must have 2 blocks (text and image)");
+        // tool_result.output.to_string() JSON-encodes the Value, so "output text" becomes "\"output text\""
+        assert_eq!(content[0], json!({"type": "text", "text": "\"output text\""}));
+        assert_eq!(
+            content[1],
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgo"
+                }
+            })
+        );
+    }
+
+    /// When a ToolResult has no content, tool_result content should be a string
+    /// (unchanged from prior behavior).
+    #[test]
+    fn claude_tool_result_without_image_emits_string() {
+        use harnx_core::tool::ToolResult;
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        let tool_call = ToolCall {
+            id: Some("toolu_ABC".to_string()),
+            name: "fs_read".to_string(),
+            arguments: json!({"path": "foo.txt"}),
+            thought_signature: None,
+        };
+        let tool_result = ToolResult::new(tool_call, json!({"status": "ok"}));
+
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("Do something".to_string()),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![tool_result],
+                    "".to_string(),
+                    None,
+                )),
+            ),
+        ];
+
+        let body = claude_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+            },
+            &model,
+        )
+        .unwrap();
+
+        let user_msg = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "user" && m["content"].as_array().is_some_and(|c| !c.is_empty() && c[0].get("type").is_some_and(|t| t == "tool_result")))
+            .expect("must have a user tool_result turn");
+
+        let content = &user_msg["content"]
+            .as_array()
+            .expect("user content array")[0]["content"];
+
+        assert!(content.is_string(), "tool_result content should be a string when no images");
+        assert_eq!(content.as_str().unwrap(), "{\"status\":\"ok\"}");
     }
 }
