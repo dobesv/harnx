@@ -16,6 +16,12 @@ pub mod process;
 pub mod process {
     use anyhow::{bail, Result};
 
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub enum ModelSource {
+        LocalPath(std::path::PathBuf),
+        HfRepo(String),
+    }
+
     #[derive(Debug, Clone)]
     pub struct LlamaServerProcessConfig;
 

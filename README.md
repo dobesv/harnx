@@ -179,16 +179,25 @@ AI Agent = Instructions (Prompt) + Tools (Function Callings) + Documents (RAG).
 
 ### Local LLM via llama-server
 
-Harnx can spawn and manage a local `llama-server` (from the [llama.cpp](https://github.com/ggml-org/llama.cpp) project) as a child process. It communicates over a high-performance **Unix domain socket**, serving OpenAI-compatible chat completions. This allows you to run local GGUF models with streaming and tool use support without heavy in-process builds or external TCP services.
+Harnx can spawn and manage local `llama-server` (from the [llama.cpp](https://github.com/ggml-org/llama.cpp) project) child processes. It communicates over high-performance **Unix domain sockets**, serving OpenAI-compatible chat completions. This allows you to run local GGUF models with streaming and tool use support without heavy in-process builds or external TCP services.
 
 - **Installation**: Install `llama-server` via [GitHub Releases](https://github.com/ggml-org/llama.cpp/releases) or `brew install llama.cpp`.
+- **Per-Model Config**: Each model entry in `models[]` specifies its own GGUF source and tuning knobs (`ctx_size`, `n_gpu_layers`, `threads`). One configuration file can serve multiple distinct models.
+- **Model Sources (Precedence)**:
+  1. `model_path`: Path to a local `.gguf` file (passes `-m`).
+  2. `hf_repo`: HuggingFace repo spec (passes `-hf`, e.g. `ggml-org/gemma-3-1b-it-GGUF`).
+  3. **Name as Source**: If both above are missing, the model `name` is used as the HuggingFace repo spec.
+- **HuggingFace Auto-Download**: When using an `hf_repo` (or a name-based HF spec), `llama-server` automatically downloads the GGUF to the standard HuggingFace cache on first use. No manual download is required.
+  - *Note*: Private or gated repos require the `HF_TOKEN` environment variable.
+  - *Note*: Auto-download requires a `llama-server` binary built with OpenSSL (included in official releases and `brew` installations).
+  - *Note*: First-run downloads can be large; initial readiness may take several minutes.
+- **Multi-Process Lifecycle**: Harnx lazily spawns up to one `llama-server` process per distinct runtime configuration. A configuration's identity includes the model source (local path or HF repo) **plus** its tuning parameters (`ctx_size`, `n_gpu_layers`, `threads`, `extra_args`, `socket_path`), so two models that differ only in tuning — even with the same HF repo spec — run as separate processes and are not shared. Only models you actually use will run. Each process holds its own model in RAM/VRAM. All processes are reaped when Harnx exits.
 - **Capability Matrix**: chat ✅, streaming ✅, tool calls ✅ (model-dependent), embeddings ❌, rerank ❌, vision ❌.
 - **Binary Discovery**: Harnx searches for the `llama-server` binary in this order:
   1. Config `binary_path`
   2. `HARNX_LLAMA_SERVER_BIN` environment variable
   3. System `PATH`
-- **Lifecycle**: One `llama-server` instance is lazily spawned per unique subprocess config on first request and reused. Matching configs share one process; different runtime knobs get distinct processes. All instances are killed when Harnx exits.
-- **Socket path**: defaults to `~/.local/share/harnx/llama-server-<pid>-<hash>.sock` (override with the `socket_path` config field).
+- **Socket Path**: Defaults to `~/.local/share/harnx/llama-server-<pid>-<hash>.sock` (override with the per-model `socket_path` field).
 - **Platform**: Unix-only (uses AF_UNIX sockets); not supported on Windows.
 
 See `example_config/clients/llama-server.yaml` for a configuration template.

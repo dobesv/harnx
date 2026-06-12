@@ -35,7 +35,7 @@ use hyperlocal::{UnixConnector, Uri as UnixUri};
 #[cfg(unix)]
 use serde_json::Value;
 #[cfg(unix)]
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
 #[cfg(unix)]
 use log::debug;
@@ -59,19 +59,54 @@ impl crate::LlamaServerClient {
     /// Returns the socket path, spawning the server if necessary.
     ///
     /// Uses the global manager registry to ensure single-flight initialization.
+    /// Sources per-model fields from the selected model's `ModelData`.
     async fn get_socket_path(&self) -> Result<PathBuf> {
         use super::process::{get_or_create_manager, LlamaServerProcessConfig};
 
-        // Translate config fields to process config
+        let model_data = self.model.data();
+
+        // Resolve the model source from the selected model. Treat blank /
+        // whitespace-only values as absent so they don't win the precedence and
+        // forward an empty `-m ""` / `-hf ""` to llama-server.
+        let model_path = model_data
+            .model_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let hf_repo = model_data
+            .hf_repo
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+
+        use super::process::ModelSource;
+        use std::path::PathBuf;
+
+        let model_source = if let Some(p) = model_path {
+            ModelSource::LocalPath(PathBuf::from(p))
+        } else if let Some(repo) = hf_repo {
+            ModelSource::HfRepo(repo.to_string())
+        } else {
+            // No model_path or hf_repo: treat the model's name as a HuggingFace
+            // repo spec so `llama-server -hf <name>` can auto-download it.
+            let repo = self.model.real_name().to_string();
+            debug!(
+                "llama-server model '{}' has no model_path or hf_repo; using its name as a HuggingFace repo (-hf {repo})",
+                self.model.name()
+            );
+            ModelSource::HfRepo(repo)
+        };
+
+        // Translate model fields to process config
         let process_config = LlamaServerProcessConfig {
-            model_path: PathBuf::from(&self.config.model_path),
+            model_source,
             binary_path: self.config.binary_path.as_ref().map(PathBuf::from),
-            socket_path: self.config.socket_path.as_ref().map(PathBuf::from),
-            context_size: self.config.ctx_size,
-            gpu_layers: self.config.n_gpu_layers.map(|n| n as i32),
-            threads: self.config.threads,
-            extra_args: self.config.extra_args.clone().unwrap_or_default(),
-            ready_timeout: Duration::from_secs(5 * 60), // Default 5 min; configurable in future
+            socket_path: model_data.socket_path.as_ref().map(PathBuf::from),
+            context_size: model_data.ctx_size,
+            gpu_layers: model_data.n_gpu_layers.map(|n| n as i32),
+            threads: model_data.threads,
+            extra_args: model_data.extra_args.clone().unwrap_or_default(),
+            ready_timeout: super::process::DEFAULT_READY_TIMEOUT,
         };
 
         // Get or create manager from global registry

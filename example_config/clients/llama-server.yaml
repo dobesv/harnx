@@ -1,13 +1,29 @@
 type: llama-server
 name: local-llama
-model_path: /path/to/your/model.gguf  # REQUIRED: Path to your .gguf model file
-# binary_path: llama-server            # Optional: Path to llama-server binary
-# ctx_size: 2048                       # Optional: Context size (-c)
-# n_gpu_layers: 32                     # Optional: Number of GPU layers (-ngl)
-# threads: 8                           # Optional: Number of threads (-t)
-# socket_path: /tmp/llama.sock         # Optional: Override Unix socket path
-# extra_args: ["--flash-attn"]         # Optional: Raw passthrough arguments
+
+# binary_path: llama-server  # Optional: Shared binary path for all models below
+
 models:
-  - name: qwen2.5-7b-instruct
-    max_input_tokens: 32768
+  # 1. Local GGUF model with tuning knobs
+  - name: local-model
+    model_path: /path/to/your/model.gguf # Local path to .gguf file (-m)
+    ctx_size: 4096                       # Optional: Context size (-c)
+    n_gpu_layers: 32                     # Optional: Number of GPU layers to offload (-ngl)
+    threads: 8                           # Optional: Number of threads (-t)
+    max_input_tokens: 4096
+    supports_tool_use: true
+    # extra_args: ["--flash-attn"]       # Optional: Raw passthrough flags
+    # socket_path: /tmp/custom.sock      # Optional: Override Unix socket path
+
+  # 2. Explicit HuggingFace model (auto-download)
+  # llama-server will download the GGUF from HF on first use.
+  - name: gemma-3-1b
+    hf_repo: ggml-org/gemma-3-1b-it-GGUF  # Explicit HF repo spec (-hf)
+    max_input_tokens: 8192
+    supports_tool_use: true
+
+  # 3. "Name is the HF repo" (minimal config, auto-download)
+  # If model_path and hf_repo are both missing, 'name' is used as the HF repo spec.
+  - name: unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
+    max_input_tokens: 8192
     supports_tool_use: true

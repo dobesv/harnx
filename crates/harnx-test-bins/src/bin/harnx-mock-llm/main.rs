@@ -193,7 +193,7 @@ fn takes_value(flag: &str) -> bool {
     // Only the known llama-server value-flags consume the following argument.
     // Other unknown flags are treated as bare booleans and ignored, so a flag
     // like `--verbose` does not accidentally swallow the next argument.
-    matches!(flag, "-m" | "-c" | "-ngl" | "-t")
+    matches!(flag, "-m" | "-hf" | "-c" | "-ngl" | "-t")
 }
 
 fn print_help() {

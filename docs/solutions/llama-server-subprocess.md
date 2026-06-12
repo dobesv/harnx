@@ -52,7 +52,7 @@ Since `reqwest` does not support Unix sockets natively, we implemented a custom 
 ## Why This Works
 
 - **Lean Binary**: The `harnx` binary stays small because it doesn't link `llama.cpp` directly.
-- **Zero Configuration**: If `llama-server` is in the `PATH`, the user only needs to provide a `model_path`.
+- **Zero Configuration**: If `llama-server` is in the `PATH`, the user only needs to provide a model name or source. GGUF models can be automatically downloaded from HuggingFace.
 - **Robustness**: The subprocess approach isolates the C++ memory management from the Rust runtime.
 - **Full Compatibility**: Supports streaming, tool calls (grammar-constrained), and all other standard chat completion features.
 
@@ -117,10 +117,10 @@ fn get_or_create_manager(config: &LlamaServerProcessConfig) -> Result<Arc<LlamaS
 
 ### 5. Registry Keying: Composite Identity Over ALL Process-Affecting Config
 
-**Problem** (from review): Keying by `model_path` alone silently reuses wrong subprocess or collides sockets.
+**Problem** (from review): Keying by model source alone silently reuses wrong subprocess or collides sockets.
 
 **Solution**: Key by composite identity including:
-- `model_path` (resolved)
+- `model_source` (Local path or HuggingFace repo)
 - `binary_path` (resolved)
 - `socket_path` (resolved)
 - `context_size`, `gpu_layers`, `threads`
@@ -128,7 +128,7 @@ fn get_or_create_manager(config: &LlamaServerProcessConfig) -> Result<Arc<LlamaS
 
 ```rust
 struct ProcessIdentity {
-    canonical: String,  // "model_path=...\nbinary_path=...\n..." 
+    canonical: String,  // "source=hf:unsloth/gemma-3\nbinary_path=...\n..." 
 }
 ```
 

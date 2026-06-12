@@ -305,6 +305,39 @@ pub struct ModelData {
     pub default_chunk_size: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_batch_size: Option<usize>,
+
+    // llama-server local provider properties
+    /// Path to the GGUF model file (passed to llama-server via `-m`).
+    /// Optional; if unset, `hf_repo` or the model name is used as the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<String>,
+
+    /// HuggingFace repo spec for `-hf` auto-download (e.g. `unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL`).
+    /// Optional; used when `model_path` is unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hf_repo: Option<String>,
+
+    /// Context size in tokens (`-c` flag). Defaults to llama-server's default
+    /// (typically 512) if unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctx_size: Option<u32>,
+
+    /// Number of GPU layers to offload (`-ngl` flag). Zero means CPU-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n_gpu_layers: Option<u32>,
+
+    /// Number of threads (`-t` flag). Defaults to llama-server's default if unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads: Option<u32>,
+
+    /// Raw passthrough arguments to llama-server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_args: Option<Vec<String>>,
+
+    /// Override Unix socket path. If unset, runtime uses
+    /// `~/.local/share/harnx/llama-server-<pid>-<hash>.sock`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_path: Option<String>,
 }
 
 impl ModelData {
@@ -314,6 +347,42 @@ impl ModelData {
             model_type: default_model_type(),
             ..Default::default()
         }
+    }
+
+    // llama-server per-model builder methods
+    pub fn with_model_path(mut self, path: String) -> Self {
+        self.model_path = Some(path);
+        self
+    }
+
+    pub fn with_hf_repo(mut self, repo: String) -> Self {
+        self.hf_repo = Some(repo);
+        self
+    }
+
+    pub fn with_ctx_size(mut self, size: u32) -> Self {
+        self.ctx_size = Some(size);
+        self
+    }
+
+    pub fn with_n_gpu_layers(mut self, layers: u32) -> Self {
+        self.n_gpu_layers = Some(layers);
+        self
+    }
+
+    pub fn with_threads(mut self, threads: u32) -> Self {
+        self.threads = Some(threads);
+        self
+    }
+
+    pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
+        self.extra_args = Some(args);
+        self
+    }
+
+    pub fn with_socket_path(mut self, path: String) -> Self {
+        self.socket_path = Some(path);
+        self
     }
 }
 

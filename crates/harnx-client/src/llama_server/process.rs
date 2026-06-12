@@ -37,6 +37,29 @@ use tokio::{
     time::{sleep, Instant},
 };
 
+/// Represents the source of a model for llama-server.
+///
+/// Used to determine whether to pass `-m <path>` (local file) or `-hf <repo>`
+/// (HuggingFace auto-download) to llama-server.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ModelSource {
+    /// Local GGUF file path (passed via `-m`).
+    LocalPath(PathBuf),
+    /// HuggingFace repo spec (passed via `-hf`, e.g. `user/repo:quant`).
+    HfRepo(String),
+}
+
+impl ModelSource {
+    /// Stable string label used for identity/socket-hash keying. Distinct
+    /// prefixes ensure a local path and an HF repo spec never collide.
+    fn label(&self) -> String {
+        match self {
+            ModelSource::LocalPath(p) => format!("local:{}", p.display()),
+            ModelSource::HfRepo(r) => format!("hf:{r}"),
+        }
+    }
+}
+
 #[cfg(unix)]
 type HealthClient = Client<UnixConnector, Empty<Bytes>>;
 
@@ -49,8 +72,19 @@ const SOCKET_HASH_LEN: usize = 12;
 #[cfg(unix)]
 const LLAMA_SERVER_BIN_ENV: &str = "HARNX_LLAMA_SERVER_BIN";
 
+/// Default time to wait for `llama-server` to become ready. Generous because a
+/// first-run HuggingFace (`-hf`) download or a large local GGUF can take a while.
+pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 /// Global registry of process managers, keyed by full process identity.
 /// Ensures one manager per unique llama-server subprocess config.
+///
+/// The registry deliberately holds a strong [`Arc`] so each spawned
+/// `llama-server` lives for the whole harnx process and is reused across
+/// requests (callers obtain the manager per request and drop their `Arc`
+/// immediately, so a `Weak` registry would tear the child down after every
+/// call and force a model reload on the next one). The child is reaped on
+/// process exit via `kill_on_drop(true)` on the spawned `Command`.
 #[cfg(unix)]
 static MANAGERS: OnceLock<std::sync::Mutex<HashMap<ProcessIdentity, Arc<LlamaServerProcessManager>>>> =
     OnceLock::new();
@@ -86,7 +120,7 @@ impl ProcessIdentity {
         let resolved_socket_path = resolve_socket_path_for_config(config)?;
 
         let canonical = [
-            format!("model_path={}", config.model_path.display()),
+            format!("model_source={}", config.model_source.label()),
             format!("binary_path={}", resolved_binary_path.display()),
             format!("socket_path={}", resolved_socket_path.display()),
             format!(
@@ -122,7 +156,7 @@ impl ProcessIdentity {
 #[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct LlamaServerProcessConfig {
-    pub model_path: PathBuf,
+    pub model_source: ModelSource,
     pub binary_path: Option<PathBuf>,
     pub socket_path: Option<PathBuf>,
     pub context_size: Option<u32>,
@@ -134,24 +168,29 @@ pub struct LlamaServerProcessConfig {
 
 #[cfg(unix)]
 impl LlamaServerProcessConfig {
-    pub fn new(model_path: impl Into<PathBuf>) -> Self {
+    pub fn new(model_source: ModelSource) -> Self {
         Self {
-            model_path: model_path.into(),
+            model_source,
             binary_path: None,
             socket_path: None,
             context_size: None,
             gpu_layers: None,
             threads: None,
             extra_args: Vec::new(),
-            ready_timeout: Duration::from_secs(5 * 60),
+            ready_timeout: DEFAULT_READY_TIMEOUT,
         }
+    }
+
+    /// Human-readable label for the model source (for logging).
+    fn model_source_label(&self) -> String {
+        self.model_source.label()
     }
 }
 
 #[cfg(unix)]
 impl Default for LlamaServerProcessConfig {
     fn default() -> Self {
-        Self::new("")
+        Self::new(ModelSource::LocalPath(PathBuf::new()))
     }
 }
 
@@ -169,8 +208,15 @@ impl LlamaServerProcessManager {
         if cfg!(windows) {
             bail!("llama-server provider requires a Unix platform (uses unix domain sockets)");
         }
-        if config.model_path.as_os_str().is_empty() {
-            bail!("llama-server model_path is required");
+        // Validate that the model source is non-empty
+        match &config.model_source {
+            ModelSource::LocalPath(p) if p.as_os_str().is_empty() => {
+                bail!("llama-server model_source LocalPath cannot be empty");
+            }
+            ModelSource::HfRepo(r) if r.trim().is_empty() => {
+                bail!("llama-server model_source HfRepo cannot be empty");
+            }
+            _ => {}
         }
         Ok(Self {
             config,
@@ -192,7 +238,7 @@ impl LlamaServerProcessManager {
             }
             warn!(
                 "llama-server process for {} exited after startup; respawning",
-                self.config.model_path.display()
+                self.config.model_source_label()
             );
             state.take();
         }
@@ -300,9 +346,8 @@ fn resolve_socket_path_for_config(config: &LlamaServerProcessConfig) -> Result<P
         return Ok(path.to_path_buf());
     }
 
-    let model_canonical = format!("model_path={}", config.model_path.display());
     let model_identity = ProcessIdentity {
-        canonical: model_canonical,
+        canonical: format!("model_source={}", config.model_source.label()),
     };
     Ok(default_socket_path(std::process::id(), &model_identity))
 }
@@ -322,11 +367,16 @@ async fn spawn_server(config: LlamaServerProcessConfig) -> Result<RunningServer>
     prepare_socket_path(&socket_path).await?;
 
     let mut command = Command::new(&binary_path);
-    command
-        .arg("-m")
-        .arg(&config.model_path)
-        .arg("--host")
-        .arg(&socket_path);
+    // Emit -m for local path or -hf for HuggingFace repo
+    match &config.model_source {
+        ModelSource::LocalPath(p) => {
+            command.arg("-m").arg(p);
+        }
+        ModelSource::HfRepo(r) => {
+            command.arg("-hf").arg(r);
+        }
+    }
+    command.arg("--host").arg(&socket_path);
 
     if let Some(context_size) = config.context_size {
         command.arg("-c").arg(context_size.to_string());
@@ -576,7 +626,20 @@ mod tests {
 
     fn test_config(model_path: &str) -> LlamaServerProcessConfig {
         LlamaServerProcessConfig {
-            model_path: PathBuf::from(model_path),
+            model_source: ModelSource::LocalPath(PathBuf::from(model_path)),
+            binary_path: Some(PathBuf::from("/bin/echo")),
+            socket_path: None,
+            context_size: Some(512),
+            gpu_layers: Some(0),
+            threads: Some(2),
+            extra_args: vec!["--alias".into(), "test".into()],
+            ready_timeout: Duration::from_secs(1),
+        }
+    }
+
+    fn test_config_hf(hf_repo: &str) -> LlamaServerProcessConfig {
+        LlamaServerProcessConfig {
+            model_source: ModelSource::HfRepo(hf_repo.to_string()),
             binary_path: Some(PathBuf::from("/bin/echo")),
             socket_path: None,
             context_size: Some(512),
@@ -651,6 +714,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn process_identity_differs_local_vs_hf() {
+        let local = ProcessIdentity::from_config(&test_config("/models/model.gguf")).unwrap();
+        let hf = ProcessIdentity::from_config(&test_config_hf("user/model:Q4_K_M")).unwrap();
+        // Different source types produce different identities
+        assert_ne!(local, hf);
+    }
+
     #[tokio::test]
     async fn discover_binary_path_reports_install_hint() {
         let temp = TempDir::new().unwrap();
@@ -719,12 +790,20 @@ mod tests {
         let err = get_or_create_manager(&LlamaServerProcessConfig::default()).unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("llama-server model_path is required")
+            message.contains("llama-server model_source LocalPath cannot be empty")
                 || message.contains("Unable to find `llama-server`")
         );
 
         restore_env("PATH", old_path);
         restore_env(LLAMA_SERVER_BIN_ENV, old_env);
+    }
+
+    #[test]
+    fn manager_rejects_whitespace_only_hf_repo() {
+        let err = LlamaServerProcessManager::new(test_config_hf("   ")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("llama-server model_source HfRepo cannot be empty"));
     }
 
     #[tokio::test]
@@ -740,14 +819,14 @@ mod tests {
             env::temp_dir().join(format!("harnx-llama-test-{}.sock", std::process::id()));
 
         let manager = LlamaServerProcessManager::new(LlamaServerProcessConfig {
-            model_path,
+            model_source: ModelSource::LocalPath(model_path),
             binary_path: Some(binary_path),
             socket_path: Some(socket_path.clone()),
             context_size: Some(512),
             gpu_layers: Some(0),
             threads: Some(2),
             extra_args: Vec::new(),
-            ready_timeout: Duration::from_secs(5 * 60),
+            ready_timeout: DEFAULT_READY_TIMEOUT,
         })?;
 
         let running = manager.ensure_ready().await?;
@@ -792,7 +871,7 @@ use std::{path::PathBuf, time::Duration};
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 pub struct LlamaServerProcessConfig {
-    pub model_path: PathBuf,
+    pub model_source: ModelSource,
     pub binary_path: Option<PathBuf>,
     pub socket_path: Option<PathBuf>,
     pub context_size: Option<u32>,
