@@ -58,6 +58,8 @@ For project access, the shims use [Project-Root Pseudo-Variables](#project-root-
 ### Node, Yarn, npm, npx, pnpm (`node`)
 
 A single dispatcher script can handle the entire Node family by detecting which name it was called with. Common Node caches are already whitelisted by default, and project roots are granted automatically.
+
+> **`npx` note:** the default whitelist grants `~/.npm` read+write but **not execute** (a writable+executable directory lets sandboxed code plant a binary the host might later run). `npx <pkg>@<version>` installs the package under `~/.npm/_npx/<hash>/node_modules/` and then executes its bin from there, so without an exec grant it fails with `sh: 1: <pkg>: Permission denied`. The shim below opts in with `--extra-rwx ~/.npm`. Omit that line if you never use `npx` to run cached package binaries.
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -65,7 +67,9 @@ set -euo pipefail
 # Node-family sandbox shim.
 # Save this file as "node", then symlink or copy it to yarn, npm, npx, and pnpm.
 # It detects which real tool to run from its own basename, so one script covers all five.
-# Common Node caches are already in harnx-sandbox-run's default whitelist, so no extra cache flags are needed.
+# Common Node caches are already in harnx-sandbox-run's default whitelist.
+# Exception: ~/.npm is read+write but NOT exec by default, so `npx <pkg>@<ver>`
+# cannot run its cached bin. We add --extra-rwx ~/.npm below to allow it.
 # Project roots are auto-detected by harnx-sandbox-run's pseudo-vars and silently skipped when absent.
 
 tool="$(basename "$0")"
@@ -88,8 +92,10 @@ PATH="$({
 export PATH
 
 # shellcheck disable=SC2016 -- '$GIT_ROOT' style args are harnx-sandbox-run pseudo-vars; shell must pass them through literally.
-# Common tool and cache paths (like ~/.npm, ~/.cargo, ~/.cache) are pre-whitelisted.
+# Common tool and cache paths (like ~/.npm, ~/.cargo, ~/.cache) are pre-whitelisted
+# for read/write; ~/.npm needs the explicit --extra-rwx below to also allow exec (see npx note above).
 exec harnx-sandbox-run \
+  --extra-rwx ~/.npm \
   --extra-rwx '$GIT_ROOT' \
   --extra-rwx '$NODE_PROJECT_ROOT' \
   --extra-rwx '$GIT_COMMON_DIR' \
@@ -317,6 +323,8 @@ The `--working-dir <path>` flag changes where the sandboxed command starts, but 
 | Exec | `~/.local/bin`, `~/.local/lib`, `~/.bun`, `~/.asdf`, `~/go/bin`, `~/.cargo`, `~/.nvm`, `~/.cargo/bin`, `~/.mono`, `~/.pyenv`, `~/.rye`, `~/.local/share/claude`, `~/.local/share/opencode`, `~/.local/share/pipx` |
 
 Tool-install and self-update operations (such as `cargo install`, `nvm install`, etc.) require explicit write access; grant with `--extra-rwx` or perform them outside the sandbox.
+
+Note that the Read/Write caches above are **not** executable. In particular, `npx <pkg>@<version>` installs and then runs a package binary from `~/.npm/_npx/...`, which fails with `sh: 1: <pkg>: Permission denied` unless you also grant exec. Add `--extra-rwx ~/.npm` (see the [Node shim](#node-yarn-npm-npx-pnpm-node) for an example).
 
 Any other `$HOME` subdirectory (e.g. `~/.gemini`, `~/.config`, `~/.ssh`) is **blocked** unless you add it with `--extra-read`, `--extra-write`, or `--extra-rwx`. This is intentional — it prevents the sandboxed process from reading credentials or config files it doesn't need.
 
