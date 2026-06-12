@@ -9,7 +9,7 @@ impl ServerHandler for FsServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Filesystem MCP server with read, write, edit, insert, re_replace, listing, grep, and glob tools.",
+                "Filesystem MCP server with read (text and local images), write, edit, insert, re_replace, listing, grep, and glob tools.",
             )
     }
 
@@ -20,7 +20,7 @@ impl ServerHandler for FsServer {
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = ToolAnnotations::new().read_only(true);
         let tools = vec![
-                Tool::new("read", "Read a text file with line numbers, pagination, grep filtering, and smart truncation. Prefer this tool over shell commands like sed, cat, head, tail. Use offset+limit to read specific line ranges instead of sed -n.", Map::new())
+                Tool::new("read", "Read a text file with line numbers, pagination, grep filtering, and smart truncation. Prefer this tool over shell commands like sed, cat, head, tail. Use offset+limit to read specific line ranges instead of sed -n. Also reads local image files (PNG, JPEG, GIF, WebP, up to 5MB) and returns them as viewable images for vision-capable models — use this to view/inspect an image file by its path.", Map::new())
                     .with_input_schema::<ReadFileParams>()
                     .annotate(read_only.clone())
                     .with_meta(make_tool_meta("📖 {{ args.path }}{% if args.offset %} +{{ args.offset }}{% endif %}{% if args.limit is not none %} [:{{ args.limit }}]{% endif %}{% if args.tail is not none %} [tail:{{ args.tail }}]{% endif %}{% if args.grep %} /{{ args.grep }}/{% endif %}{% if args.head_lines is not none %} [head:{{ args.head_lines }}]{% endif %}{% if args.tail_lines is not none %} [tail_lines:{{ args.tail_lines }}]{% endif %}{% if args.max_output_bytes is not none %} [:{{ args.max_output_bytes }}b]{% endif %}")),
