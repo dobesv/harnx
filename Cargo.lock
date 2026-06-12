@@ -4735,9 +4735,9 @@ dependencies = [
 
 [[package]]
 name = "jaq-core"
-version = "3.0.0"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dca0f164c8e9c55fc5aefe60b371df735c719b09930dac185878f2f8c7ab6b68"
+checksum = "7561783b20275a6c9cb576e39208b0c635f34ef14357f1f05a2927a774f3adec"
 dependencies = [
  "dyn-clone",
  "once_cell",
@@ -4787,9 +4787,9 @@ dependencies = [
 
 [[package]]
 name = "jaq-std"
-version = "3.0.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a11bb307027b20b3dc7b212ad687e7e410cbc43933eec5d498672ab2bc60666"
+checksum = "8bdc5a74b0feeb5e6a1dc2dd08c34280a61e37668d10a6a3b27ad69d0fb9ce2e"
 dependencies = [
  "aho-corasick",
  "base64",
