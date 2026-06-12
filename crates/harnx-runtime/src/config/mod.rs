@@ -30,10 +30,10 @@ pub use self::agent::{
     AgentVariables,
 };
 pub use self::input::Input;
+pub use self::patches_split::acp_server_display_name;
 pub use self::patches_split::mcp_server_display_name;
 use self::patches_split::{
-    acp_server_display_name, apply_client_patch, apply_mcp_server_patch, load_package_mcp_patch,
-    package_dir_name,
+    apply_client_patch, apply_mcp_server_patch, load_package_mcp_patch, package_dir_name,
 };
 use self::session::Session;
 pub use self::session_meta::{

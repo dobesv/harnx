@@ -14,7 +14,7 @@ what you need:
 
 | Binary | What it does | Docs |
 |---|---|---|
-| `harnx` | Full CLI — TUI + Cmd + HTTP (`--serve`) + ACP (`--acp=<agent>`) | [Command-Line Guide](docs/command-line-guide.md) |
+| `harnx` | Full CLI — TUI + Cmd + HTTP (`--serve`); ACP via `harnx-acp-server <agent>` | [Command-Line Guide](docs/command-line-guide.md) |
 | `harnx-serve` | HTTP-only server, no TUI deps | [README](crates/harnx-serve/README.md) |
 | `harnx-acp-server` | ACP-only headless agent over stdio, no TUI deps | [README](crates/harnx-acp-server/README.md) |
 | `harnx-pkg` | Package manager for harnx agent configurations | [Package System](docs/packages.md) |

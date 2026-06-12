@@ -108,10 +108,7 @@ pub fn mcp_server_display_name(server: &McpServerConfig, agent_package: Option<&
 }
 
 /// Compute display name for ACP server given active agent package.
-pub(super) fn acp_server_display_name(
-    server: &AcpServerConfig,
-    agent_package: Option<&str>,
-) -> String {
+pub fn acp_server_display_name(server: &AcpServerConfig, agent_package: Option<&str>) -> String {
     handoff_display_name(
         &server_target_qualified(&server.name, server.package.as_deref()),
         agent_package,

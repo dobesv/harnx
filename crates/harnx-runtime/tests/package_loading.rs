@@ -659,3 +659,160 @@ fn package_loading_test_mcp_server_display_names_for_agent() {
         "mypkg__fs"
     );
 }
+
+#[test]
+fn package_loading_test_auto_registered_acp_servers_use_harnx_acp_server_command_and_qualified_args(
+) {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    std::fs::create_dir_all(tmp.path().join("clients")).unwrap();
+    std::fs::write(tmp.path().join("clients/openai.yaml"), "type: openai\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("agents")).unwrap();
+    std::fs::write(
+        tmp.path().join("agents").join("foo.md"),
+        "---\nmodel: openai:gpt-4o\n---\nTop-level agent.",
+    )
+    .unwrap();
+
+    install_test_package(
+        tmp.path(),
+        "pantheon",
+        &[(
+            "agents/aristarchus.md",
+            "---\nmodel: openai:gpt-4o\n---\nPackage agent.",
+        )],
+    );
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+
+    let package_server = config
+        .acp_servers
+        .iter()
+        .find(|server| server.name == "pantheon/aristarchus")
+        .expect("package agent acp server should be auto-registered");
+    assert_eq!(
+        package_server.args,
+        vec!["pantheon/aristarchus".to_string()]
+    );
+    assert!(
+        package_server.command.ends_with("harnx-acp-server")
+            || package_server.command.ends_with("harnx-acp-server.exe"),
+        "expected harnx-acp-server command, got: {}",
+        package_server.command
+    );
+
+    let top_level_server = config
+        .acp_servers
+        .iter()
+        .find(|server| server.name == "foo")
+        .expect("top-level agent acp server should be auto-registered");
+    assert_eq!(top_level_server.args, vec!["foo".to_string()]);
+    assert!(
+        top_level_server.command.ends_with("harnx-acp-server")
+            || top_level_server.command.ends_with("harnx-acp-server.exe"),
+        "expected harnx-acp-server command, got: {}",
+        top_level_server.command
+    );
+}
+
+#[test]
+fn package_loading_test_reinit_acp_display_rewrite_keeps_spawn_target_qualified() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    std::fs::create_dir_all(tmp.path().join("clients")).unwrap();
+    std::fs::write(tmp.path().join("clients/openai.yaml"), "type: openai\n").unwrap();
+    install_test_package(
+        tmp.path(),
+        "pantheon",
+        &[(
+            "agents/aristarchus.md",
+            "---\nmodel: openai:gpt-4o\n---\nPackage agent.",
+        )],
+    );
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+
+    let original_server = config
+        .acp_servers
+        .iter()
+        .find(|server| server.name == "pantheon/aristarchus")
+        .expect("package agent acp server should be auto-registered");
+    assert_eq!(
+        original_server.args,
+        vec!["pantheon/aristarchus".to_string()]
+    );
+    // #804: same-package ACP display rewrite clones server and only rewrites display
+    // name, so bare display name + qualified source args proves spawn target stays qualified.
+    assert_eq!(
+        harnx_runtime::acp_server_display_name_for_test(original_server, Some("pantheon")),
+        "aristarchus"
+    );
+}
+
+#[test]
+fn package_loading_test_package_explicit_yaml_acp_bare_arg_is_qualified_but_top_level_stays_bare() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    std::fs::create_dir_all(tmp.path().join("clients")).unwrap();
+    std::fs::write(tmp.path().join("clients/openai.yaml"), "type: openai\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("acp_servers")).unwrap();
+    std::fs::write(
+        tmp.path().join("acp_servers").join("top.yaml"),
+        "command: custom-top\nargs:\n  - top\n",
+    )
+    .unwrap();
+    install_test_package(
+        tmp.path(),
+        "momus",
+        &[(
+            "acp_servers/helper.yaml",
+            "command: custom-helper\nargs:\n  - helper\n  - --flag\n",
+        )],
+    );
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+
+    let package_server = config
+        .acp_servers
+        .iter()
+        .find(|server| server.package.as_deref() == Some("momus") && server.name == "helper")
+        .expect("package acp server should load");
+    assert_eq!(
+        package_server.args,
+        vec!["momus/helper".to_string(), "--flag".to_string()]
+    );
+
+    let top_level_server = config
+        .acp_servers
+        .iter()
+        .find(|server| server.package.is_none() && server.name == "top")
+        .expect("top-level acp server should load");
+    assert_eq!(top_level_server.args, vec!["top".to_string()]);
+}

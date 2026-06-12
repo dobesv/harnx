@@ -29,7 +29,6 @@ _harnx() {
 '--rebuild-rag[Rebuild the RAG to sync document changes]' \
 '--macro[Execute a macro]:MACRO:->macros' \
 '--serve[Serve the LLM API and WebAPP]:ADDRESS: ' \
-'--acp[Serve as an ACP agent over stdio]:AGENT:->agents' \
 '*-f[Include files, directories, or URLs]:FILE:_files' \
 '*--file[Include files, directories, or URLs]:FILE:_files' \
 '-S[Turn off stream mode]' \

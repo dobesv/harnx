@@ -39,14 +39,8 @@ use std::{env, path::PathBuf, sync::Arc, time::Duration};
 async fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
-    let text = if cli.should_read_stdin() {
-        cli.text()?
-    } else {
-        None
-    };
-    let working_mode = if let Some(ref agent_name) = cli.acp {
-        WorkingMode::Acp(agent_name.clone())
-    } else if cli.serve.is_some() {
+    let text = cli.text()?;
+    let working_mode = if cli.serve.is_some() {
         WorkingMode::Serve
     } else if text.is_none() && cli.file.is_empty() {
         WorkingMode::Tui
@@ -61,7 +55,7 @@ async fn main() -> Result<()> {
         || cli.list_rags
         || cli.list_macros
         || cli.list_sessions;
-    setup_logger(working_mode.is_serve() || working_mode.is_acp())?;
+    setup_logger(working_mode.is_serve())?;
     let config = Arc::new(RwLock::new(
         Config::init(working_mode, info_flag, cli.mcp_root.clone()).await?,
     ));
@@ -202,10 +196,6 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         let info = config.read().info()?;
         println!("{info}");
         return Ok(());
-    }
-    let working_mode = config.read().working_mode.clone();
-    if let WorkingMode::Acp(agent_name) = working_mode {
-        return harnx_acp_server::run(config, agent_name).await;
     }
     if let Some(addr) = cli.serve {
         return serve::run(config, addr).await;

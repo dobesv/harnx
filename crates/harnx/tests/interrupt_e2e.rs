@@ -12,11 +12,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use harnx::test_utils::interrupt::{
-    script_call_sub_agent, script_call_trivial_tool, script_call_wait_tool, script_stall_streaming,
-    script_streaming_with_sentinel, send_sigint, spawn_acp_client, spawn_oneshot,
-    spawn_oneshot_in_tmux, spawn_tui, wait_for_cmd_exit, wait_for_exit, wait_for_prompt_return,
-    write_acp_agent, write_minimal_config, write_with_blocking_hook, write_with_sub_agent,
-    write_with_wait_tool,
+    harnx_acp_server_bin, script_call_sub_agent, script_call_trivial_tool, script_call_wait_tool,
+    script_stall_streaming, script_streaming_with_sentinel, send_sigint, spawn_acp_client,
+    spawn_oneshot, spawn_oneshot_in_tmux, spawn_tui, wait_for_cmd_exit, wait_for_exit,
+    wait_for_prompt_return, write_acp_agent, write_minimal_config, write_with_blocking_hook,
+    write_with_sub_agent, write_with_wait_tool,
 };
 use harnx::test_utils::mock_openai_server::MockOpenAiServer;
 use harnx::test_utils::tmux_harness::TmuxHarness;
@@ -500,14 +500,14 @@ fn interrupt_acp_sigint_cancels_and_exits() -> Result<()> {
     let mock = MockOpenAiServer::start(script_stall_streaming())?;
     let tmp = tempfile::tempdir()?;
     let paths = write_minimal_config(tmp.path(), &format!("http://127.0.0.1:{}/v1", mock.port()))?;
-    write_acp_agent(&paths, "default")?;
     let harnx_bin = PathBuf::from(env!("CARGO_BIN_EXE_harnx"));
+    write_acp_agent(&paths, "default")?;
+    let acp_server_bin = harnx_acp_server_bin(&harnx_bin);
 
-    // Spawn `harnx --acp default` with raw stdio. We don't need the
-    // RPC responses parsed — just need the child to be busy enough
+    // Spawn `harnx-acp-server default` with raw stdio. We don't need
+    // RPC responses parsed — just need child to be busy enough
     // that SIGINT is meaningful, and to confirm it then exits.
-    let mut child = Command::new(&harnx_bin)
-        .arg("--acp")
+    let mut child = Command::new(&acp_server_bin)
         .arg("default")
         .env("HARNX_CONFIG_DIR", &paths.harnx_config_dir)
         .stdin(Stdio::piped())

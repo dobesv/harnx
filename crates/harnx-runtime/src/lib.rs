@@ -23,5 +23,7 @@ pub use agent_loop::{
     run_agent_loop, AgentCallFn, AgentLoopContext, OnTextResponseFn, OnToolRoundFn,
 };
 
+/// Re-export for integration tests — verifies scoped-ACP display naming logic.
+pub use config::acp_server_display_name as acp_server_display_name_for_test;
 /// Re-export for integration tests — verifies the scoped-MCP naming logic.
 pub use config::mcp_server_display_name as mcp_server_display_name_for_test;

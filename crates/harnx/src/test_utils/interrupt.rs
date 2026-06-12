@@ -11,6 +11,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Locate the `harnx-acp-server` binary given the already-resolved `harnx`
+/// binary path.
+///
+/// The `harnx-acp-server` binary lives in its own crate, so
+/// `CARGO_BIN_EXE_harnx-acp-server` isn't visible from `harnx`'s test
+/// context. Because Cargo builds every workspace member into the same target
+/// dir, the binary sits next to the `harnx` binary. Callers are responsible
+/// for ensuring it has been built (e.g. via `cargo build --workspace` or
+/// `cargo nextest run --workspace`, which is what CI uses).
+pub fn harnx_acp_server_bin(harnx_bin: &Path) -> PathBuf {
+    let ext = std::env::consts::EXE_SUFFIX;
+    harnx_bin.with_file_name(format!("harnx-acp-server{ext}"))
+}
+
 /// Spinner frames used by the TUI when an LLM/tool/hook call is in flight.
 /// Mirrors `SPINNER_FRAMES` in `src/tui/types.rs`. Used to detect whether
 /// the TUI is currently busy.
@@ -366,10 +380,10 @@ pub fn script_call_sub_agent(agent_name: &str) -> MockOpenAiScript {
 /// Sets up two config dirs (child and parent) for a sub-agent delegation test.
 ///
 /// - Child dir: `dir/child` — minimal config pointing at `child_mock_url`,
-///   plus an agent file at `agents/child.md` (required by `harnx --acp child`).
+///   plus an agent file at `agents/child.md` (required by `harnx-acp-server child`).
 /// - Parent dir: `dir/parent` — minimal config pointing at `parent_mock_url`,
 ///   plus an `acp_servers/child.yaml` that spawns another harnx with
-///   `--acp child` and `HARNX_CONFIG_DIR` pointing at the child config dir.
+///   `harnx-acp-server child` and `HARNX_CONFIG_DIR` pointing at the child config dir.
 ///
 /// Returns the PARENT's `ConfigPaths` so `spawn_tui` launches the parent.
 pub fn write_with_sub_agent(
@@ -380,7 +394,7 @@ pub fn write_with_sub_agent(
 ) -> Result<ConfigPaths> {
     // Child config (lives in <dir>/child/harnx-config).
     let child_paths = write_minimal_config(&dir.join("child"), child_mock_url)?;
-    // The child needs an agent file matching the agent name passed to --acp.
+    // The child needs an agent file matching agent name passed to harnx-acp-server.
     std::fs::create_dir_all(child_paths.harnx_config_dir.join("agents"))?;
     std::fs::write(
         child_paths.harnx_config_dir.join("agents/child.md"),
@@ -390,7 +404,7 @@ pub fn write_with_sub_agent(
     // Parent config (lives in <dir>/parent/harnx-config).
     let parent_paths = write_minimal_config(&dir.join("parent"), parent_mock_url)?;
 
-    // ACP server entry on the parent — points at another harnx --acp child
+    // ACP server entry on parent — points at sibling harnx-acp-server child
     // with the child's HARNX_CONFIG_DIR.
     let acp_servers_dir = parent_paths.harnx_config_dir.join("acp_servers");
     std::fs::create_dir_all(&acp_servers_dir)?;
@@ -409,8 +423,10 @@ pub fn write_with_sub_agent(
     );
     let acp_server = AcpServerConfig {
         name: "child".to_string(),
-        command: harnx_bin.to_string_lossy().into_owned(),
-        args: vec!["--acp".to_string(), "child".to_string()],
+        command: harnx_acp_server_bin(harnx_bin)
+            .to_string_lossy()
+            .into_owned(),
+        args: vec!["child".to_string()],
         env,
         enabled: true,
         description: None,
@@ -487,7 +503,7 @@ pub fn send_sigint(child: &std::process::Child) -> Result<()> {
 
 /// Writes an agent markdown file under `<harnx_config_dir>/agents/<name>.md`
 /// pointing at the `mock-llm:test` model with `use_tools: '*'`. Required
-/// before launching `harnx --acp <name>`.
+/// before launching `harnx-acp-server <name>`.
 pub fn write_acp_agent(paths: &ConfigPaths, name: &str) -> Result<()> {
     let agents = paths.harnx_config_dir.join("agents");
     std::fs::create_dir_all(&agents).context("failed to create agents dir")?;
@@ -499,7 +515,7 @@ pub fn write_acp_agent(paths: &ConfigPaths, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Builds a connected `AcpClient` against a `harnx --acp <agent>` child
+/// Builds connected `AcpClient` against `harnx-acp-server <agent>` child
 /// using the given config dir.
 pub async fn spawn_acp_client(
     paths: &ConfigPaths,
@@ -521,8 +537,10 @@ pub async fn spawn_acp_client(
     );
     let config = AcpServerConfig {
         name: format!("test-{agent}"),
-        command: harnx_bin.to_string_lossy().into_owned(),
-        args: vec!["--acp".to_string(), agent.to_string()],
+        command: harnx_acp_server_bin(harnx_bin)
+            .to_string_lossy()
+            .into_owned(),
+        args: vec![agent.to_string()],
         env,
         enabled: true,
         description: None,

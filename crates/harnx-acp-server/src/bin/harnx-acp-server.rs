@@ -2,8 +2,8 @@
 //! that don't need the TUI or HTTP server. Speaks the ACP protocol over
 //! stdin/stdout to a host coordinator (Zed, Superpowers, etc.).
 //!
-//! All advanced features (session management, macros, model picker, etc.)
-//! remain available through the primary `harnx --acp=<name>` path.
+//! Run as `harnx-acp-server <agent>` to serve an agent with full
+//! session management, macros, model picker, and other runtime features.
 
 use anyhow::{Context, Result};
 use clap::Parser;
