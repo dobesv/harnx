@@ -121,15 +121,15 @@ pub async fn openai_chat_completions(
 /// Mutable accumulator state for the OpenAI streaming parser. Extracted
 /// so per-event handling is testable in isolation.
 #[derive(Default)]
-struct OpenAiStreamState {
-    call_id: String,
-    function_name: String,
-    function_arguments: String,
-    function_id: String,
-    reasoning_state: i32,
+pub(crate) struct OpenAiStreamState {
+    pub call_id: String,
+    pub function_name: String,
+    pub function_arguments: String,
+    pub function_id: String,
+    pub reasoning_state: i32,
 }
 
-fn openai_emit_pending_tool_call(
+pub(crate) fn openai_emit_pending_tool_call(
     state: &mut OpenAiStreamState,
     handler: &mut SseHandler,
 ) -> Result<()> {
@@ -160,7 +160,7 @@ fn openai_emit_pending_tool_call(
 /// Transition the reasoning-block bracket state. Emits `<think>\n` when
 /// opening and `\n</think>\n\n` when closing; no-op when already in the
 /// target state.
-fn openai_transition_reasoning(
+pub(crate) fn openai_transition_reasoning(
     state: &mut OpenAiStreamState,
     handler: &mut SseHandler,
     open: bool,
@@ -175,7 +175,7 @@ fn openai_transition_reasoning(
     Ok(())
 }
 
-fn openai_handle_text_delta(
+pub(crate) fn openai_handle_text_delta(
     state: &mut OpenAiStreamState,
     handler: &mut SseHandler,
     data: &Value,
@@ -195,7 +195,7 @@ fn openai_handle_text_delta(
     Ok(())
 }
 
-fn openai_accumulate_tool_call_delta(
+pub(crate) fn openai_accumulate_tool_call_delta(
     state: &mut OpenAiStreamState,
     function: &serde_json::Map<String, Value>,
     id: Option<&str>,
@@ -215,7 +215,7 @@ fn openai_accumulate_tool_call_delta(
     }
 }
 
-fn openai_handle_tool_call_delta(
+pub(crate) fn openai_handle_tool_call_delta(
     state: &mut OpenAiStreamState,
     handler: &mut SseHandler,
     data: &Value,
@@ -240,7 +240,7 @@ fn openai_handle_tool_call_delta(
     Ok(())
 }
 
-fn openai_handle_final_usage(handler: &mut SseHandler, data: &Value) {
+pub(crate) fn openai_handle_final_usage(handler: &mut SseHandler, data: &Value) {
     // Only capture usage from the final usage-only chunk (where choices is empty/absent).
     // Some providers send partial usage in intermediate chunks which would give wrong values.
     let Some(usage) = data.get("usage") else {
@@ -257,7 +257,7 @@ fn openai_handle_final_usage(handler: &mut SseHandler, data: &Value) {
     );
 }
 
-fn openai_handle_stream_event(
+pub(crate) fn openai_handle_stream_event(
     state: &mut OpenAiStreamState,
     handler: &mut SseHandler,
     data: &Value,

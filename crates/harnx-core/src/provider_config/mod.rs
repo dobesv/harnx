@@ -9,6 +9,7 @@ pub mod bedrock;
 pub mod claude;
 pub mod cohere;
 pub mod gemini;
+pub mod llama_server;
 pub mod openai;
 pub mod openai_compatible;
 pub mod vertexai;

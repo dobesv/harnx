@@ -32,8 +32,8 @@
 //!
 //! Each turn is consumed sequentially as requests arrive.
 
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -41,6 +41,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 
 /// Script describing mock responses for each turn.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -62,30 +65,30 @@ fn default_fallback_text() -> String {
     "No more scripted responses.".to_string()
 }
 
-/// A single turn in the mock conversation.
+/// A single turn in mock conversation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MockTurn {
     /// Text chunks to stream back.
     #[serde(default)]
     pub text_chunks: Vec<String>,
 
-    /// Tool calls to include in the response.
+    /// Tool calls to include in response.
     #[serde(default)]
     pub tool_calls: Vec<MockToolCallDef>,
 }
 
-/// A tool call definition in the script.
+/// A tool call definition in script.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MockToolCallDef {
     pub name: String,
     pub arguments: Value,
 
-    /// Optional: ID for the tool call (auto-generated if not provided).
+    /// Optional: ID for tool call (auto-generated if not provided).
     #[serde(default)]
     pub id: Option<String>,
 }
 
-/// Global state for the mock server.
+/// Global state for mock server.
 struct ServerState {
     script: MockScript,
     turn_index: AtomicUsize,
@@ -117,69 +120,112 @@ impl ServerState {
     }
 }
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let mut port: u16 = 3829;
-    let mut script_path: Option<PathBuf> = None;
+#[derive(Debug, Clone, Default)]
+struct ServerArgs {
+    port: u16,
+    host: Option<String>,
+    script_path: Option<PathBuf>,
+}
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--port" | "-p" => {
-                if let Some(value) = args.next() {
-                    if let Ok(p) = value.parse::<u16>() {
-                        port = p;
-                    }
-                }
-            }
-            "--script" | "-s" => {
-                if let Some(value) = args.next() {
-                    script_path = Some(PathBuf::from(value));
-                }
-            }
-            "--help" | "-h" => {
-                println!("harnx-mock-llm - Standalone mock LLM server for TUI repro workflows");
-                println!();
-                println!("Usage: harnx-mock-llm [OPTIONS]");
-                println!();
-                println!("Options:");
-                println!("  --port, -p <PORT>      Port to listen on (default: 3829)");
-                println!("  --script, -s <FILE>    YAML script file defining responses");
-                println!("  --help, -h             Show this help message");
-                println!();
-                println!("The server provides an OpenAI-compatible API at http://localhost:<PORT>");
-                println!();
-                println!("Script format (YAML):");
-                println!("  turns:");
-                println!("    - text_chunks: [\"Hello\", \" world\"]");
-                println!("      tool_calls:");
-                println!("        - name: Bash");
-                println!("          arguments: {{command: \"echo test\"}}");
+fn main() {
+    let args = parse_args();
+    let script = load_script(args.script_path.as_deref());
+    let state = Arc::new(ServerState::new(script));
+
+    if let Some(host) = args.host.as_deref() {
+        if host.ends_with(".sock") {
+            #[cfg(unix)]
+            {
+                run_unix_server(host, state);
                 return;
             }
-            _ => {
-                eprintln!("Unknown argument: {}", arg);
-                eprintln!("Use --help for usage information");
+            #[cfg(not(unix))]
+            {
+                eprintln!("Unix socket mode is only supported on Unix platforms");
                 std::process::exit(1);
             }
         }
     }
 
-    let script = if let Some(path) = script_path {
-        match std::fs::read_to_string(&path) {
+    run_tcp_server(args.port, state);
+}
+
+fn parse_args() -> ServerArgs {
+    let mut args = std::env::args().skip(1);
+    let mut parsed = ServerArgs {
+        port: 3829,
+        ..Default::default()
+    };
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--port" | "-p" => {
+                if let Some(value) = args.next() {
+                    if let Ok(port) = value.parse::<u16>() {
+                        parsed.port = port;
+                    }
+                }
+            }
+            "--host" => {
+                parsed.host = args.next();
+            }
+            "--script" | "-s" => {
+                if let Some(value) = args.next() {
+                    parsed.script_path = Some(PathBuf::from(value));
+                }
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            _ => {
+                if takes_value(&arg) {
+                    let _ = args.next();
+                }
+            }
+        }
+    }
+
+    parsed
+}
+
+fn takes_value(flag: &str) -> bool {
+    // Only the known llama-server value-flags consume the following argument.
+    // Other unknown flags are treated as bare booleans and ignored, so a flag
+    // like `--verbose` does not accidentally swallow the next argument.
+    matches!(flag, "-m" | "-c" | "-ngl" | "-t")
+}
+
+fn print_help() {
+    println!("harnx-mock-llm - Standalone mock LLM server for TUI repro workflows");
+    println!();
+    println!("Usage: harnx-mock-llm [OPTIONS]");
+    println!();
+    println!("Options:");
+    println!("  --port, -p <PORT>      Port to listen on (default: 3829)");
+    println!("  --host <HOST|PATH>     Host/socket to listen on (.sock => Unix socket mode)");
+    println!("  --script, -s <FILE>    YAML script file defining responses");
+    println!("  --help, -h             Show this help message");
+    println!();
+    println!("Unknown flags are ignored so this can mimic llama-server CLI.");
+}
+
+fn load_script(script_path: Option<&Path>) -> MockScript {
+    if let Some(path) = script_path {
+        match std::fs::read_to_string(path) {
             Ok(content) => match serde_yaml::from_str::<MockScript>(&content) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Failed to parse script file: {}", e);
+                Ok(script) => script,
+                Err(err) => {
+                    eprintln!("Failed to parse script file: {err}");
                     std::process::exit(1);
                 }
             },
-            Err(e) => {
-                eprintln!("Failed to read script file: {}", e);
+            Err(err) => {
+                eprintln!("Failed to read script file: {err}");
                 std::process::exit(1);
             }
         }
     } else {
-        // Default script with a simple response
         MockScript {
             turns: vec![
                 MockTurn {
@@ -194,42 +240,85 @@ fn main() {
             fallback_text: "No more scripted responses.".to_string(),
             chunk_delay_ms: 50,
         }
-    };
+    }
+}
 
-    let state = Arc::new(ServerState::new(script));
-
-    // Run a simple HTTP server using std::net
-    let addr = format!("127.0.0.1:{}", port);
+fn run_tcp_server(port: u16, state: Arc<ServerState>) {
+    let addr = format!("127.0.0.1:{port}");
     let listener = match std::net::TcpListener::bind(&addr) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("Failed to bind to {}: {}", addr, e);
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("Failed to bind to {addr}: {err}");
             std::process::exit(1);
         }
     };
 
-    // Signal ready
-    println!("READY listening on {}", addr);
+    println!("READY listening on {addr}");
     io::stdout().flush().ok();
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let state = Arc::clone(&state);
-                thread::spawn(move || {
-                    handle_connection(stream, state);
-                });
+                thread::spawn(move || handle_connection(stream, state));
             }
-            Err(e) => {
-                eprintln!("Connection failed: {}", e);
-            }
+            Err(err) => eprintln!("Connection failed: {err}"),
         }
     }
 }
 
-fn handle_connection(mut stream: std::net::TcpStream, state: Arc<ServerState>) {
-    use std::io::Read;
+#[cfg(unix)]
+fn run_unix_server(socket_path: &str, state: Arc<ServerState>) {
+    let socket_path = PathBuf::from(socket_path);
+    if let Some(parent) = socket_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "Failed to create socket parent dir {}: {err}",
+                parent.display()
+            );
+            std::process::exit(1);
+        }
+    }
 
+    if socket_path.exists() {
+        match std::fs::remove_file(&socket_path) {
+            Ok(()) => {}
+            Err(err) => {
+                eprintln!(
+                    "Failed to remove stale socket {}: {err}",
+                    socket_path.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("Failed to bind to {}: {err}", socket_path.display());
+            std::process::exit(1);
+        }
+    };
+
+    println!("READY listening on {}", socket_path.display());
+    io::stdout().flush().ok();
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let state = Arc::clone(&state);
+                thread::spawn(move || handle_connection(stream, state));
+            }
+            Err(err) => eprintln!("Connection failed: {err}"),
+        }
+    }
+}
+
+fn handle_connection<S>(mut stream: S, state: Arc<ServerState>)
+where
+    S: Read + Write,
+{
     let mut buffer = [0; 65536];
     let bytes_read = match stream.read(&mut buffer) {
         Ok(n) if n > 0 => n,
@@ -237,11 +326,9 @@ fn handle_connection(mut stream: std::net::TcpStream, state: Arc<ServerState>) {
     };
 
     let request_str = String::from_utf8_lossy(&buffer[..bytes_read]);
-
-    // Parse HTTP request
     let mut lines = request_str.lines();
     let request_line = match lines.next() {
-        Some(l) => l,
+        Some(line) => line,
         None => return,
     };
 
@@ -252,139 +339,116 @@ fn handle_connection(mut stream: std::net::TcpStream, state: Arc<ServerState>) {
 
     let method = parts[0];
     let path = parts[1];
-
-    // Find body (after double newline)
     let body_start = request_str.find("\r\n\r\n").map(|i| i + 4);
     let body = body_start.map(|start| &request_str[start..]).unwrap_or("");
 
-    // Route the request
     match (method, path) {
-        ("GET", "/v1/models") => {
-            let response = handle_list_models();
-            let response_str = response.to_string();
-            let http_response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                response_str.len(),
-                response_str
-            );
-            let _ = stream.write_all(http_response.as_bytes());
-            let _ = stream.flush();
-        }
-        ("POST", "/v1/chat/completions") => {
-            let body_json: Value = match serde_json::from_str(body) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("Failed to parse request body: {}", e);
-                    json!({"error": "Invalid JSON"})
-                }
-            };
-            state.log_request(body_json.clone());
-            handle_chat_completions(body_json, &state, &mut stream);
-        }
-        _ => {
-            let response = json!({"error": "Not found"});
-            let response_str = response.to_string();
-            let http_response = format!(
-                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                response_str.len(),
-                response_str
-            );
-            let _ = stream.write_all(http_response.as_bytes());
-            let _ = stream.flush();
-        }
+        ("GET", "/health") => handle_health(&mut stream),
+        ("POST", "/v1/chat/completions") => handle_chat_completions(&mut stream, body, state),
+        _ => write_not_found(&mut stream),
     }
 }
 
-fn handle_list_models() -> Value {
-    json!({
-        "object": "list",
-        "data": [
-            {
-                "id": "mock-llm",
-                "object": "model",
-                "created": 0,
-                "owned_by": "mock"
-            }
-        ]
-    })
+fn handle_health(stream: &mut impl Write) {
+    let body = b"{\"status\":\"ok\"}";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
 }
 
-fn handle_chat_completions(request: Value, state: &ServerState, stream: &mut std::net::TcpStream) {
-    let is_stream = request
+fn handle_chat_completions(stream: &mut impl Write, body: &str, state: Arc<ServerState>) {
+    let request_json: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+    state.log_request(request_json.clone());
+
+    let is_streaming = request_json
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let turn = state.current_turn();
-    state.advance_turn();
-
-    let turn = match turn {
-        Some(t) => t,
-        None => MockTurn {
-            text_chunks: vec![state.script.fallback_text.clone()],
-            tool_calls: vec![],
-        },
+    let (response_text, tool_calls) = if let Some(turn) = state.current_turn() {
+        let text = turn.text_chunks.join("");
+        let tool_calls = turn
+            .tool_calls
+            .iter()
+            .enumerate()
+            .map(|(i, tc)| {
+                json!({
+                    "id": tc.id.clone().unwrap_or_else(|| format!("call_{}", i + 1)),
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": tc.arguments.to_string()
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        state.advance_turn();
+        (text, tool_calls)
+    } else {
+        (state.script.fallback_text.clone(), vec![])
     };
 
-    // Build tool calls array
-    let tool_calls: Vec<Value> = turn
-        .tool_calls
-        .iter()
-        .enumerate()
-        .map(|(i, tc)| {
-            json!({
-                "id": tc.id.clone().unwrap_or_else(|| format!("call_{}", i)),
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    "arguments": tc.arguments.to_string()
-                }
-            })
-        })
-        .collect();
-
-    if is_stream {
+    if is_streaming {
         write_streaming_response(
             stream,
-            &turn.text_chunks,
+            &response_text,
+            tool_calls,
             state.script.chunk_delay_ms,
-            &tool_calls,
         );
     } else {
-        let full_text = turn.text_chunks.join("");
-        let response = build_non_streaming_response(&full_text, tool_calls);
-        let response_str = response.to_string();
-        let http_response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            response_str.len(),
-            response_str
+        let response = build_non_streaming_response(&response_text, tool_calls);
+        let body = response.to_string();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
         );
-        let _ = stream.write_all(http_response.as_bytes());
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
         let _ = stream.flush();
     }
 }
 
+fn write_not_found(stream: &mut impl Write) {
+    let body = "Not Found";
+    let response = format!(
+        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
 fn write_streaming_response(
-    stream: &mut std::net::TcpStream,
-    text_chunks: &[String],
+    stream: &mut impl Write,
+    text: &str,
+    tool_calls: Vec<Value>,
     chunk_delay_ms: u64,
-    tool_calls: &[Value],
 ) {
-    // Write HTTP headers for SSE (no Content-Length so we can flush per-event).
-    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.flush();
 
-    let delay = Duration::from_millis(chunk_delay_ms);
+    let chunks: Vec<String> = if text.is_empty() {
+        vec![]
+    } else {
+        text.split_whitespace()
+            .enumerate()
+            .map(|(i, word)| {
+                if i == 0 {
+                    word.to_string()
+                } else {
+                    format!(" {word}")
+                }
+            })
+            .collect()
+    };
 
-    // Emit one SSE event per text chunk, preserving ordering.
-    for (i, chunk) in text_chunks.iter().enumerate() {
-        if chunk.is_empty() {
-            continue;
-        }
-        if i > 0 && chunk_delay_ms > 0 {
-            thread::sleep(delay);
-        }
+    for chunk in chunks {
         let event = format!(
             "data: {}\n\n",
             json!({
@@ -394,20 +458,19 @@ fn write_streaming_response(
                 "model": "mock-llm",
                 "choices": [{
                     "index": 0,
-                    "delta": {"role": "assistant", "content": chunk},
-                    "finish_reason": serde_json::Value::Null
+                    "delta": {"content": chunk},
+                    "finish_reason": Value::Null
                 }]
             })
         );
         let _ = stream.write_all(event.as_bytes());
         let _ = stream.flush();
+        if chunk_delay_ms > 0 {
+            thread::sleep(Duration::from_millis(chunk_delay_ms));
+        }
     }
 
-    // Emit tool_calls or stop event.
     if !tool_calls.is_empty() {
-        if chunk_delay_ms > 0 && !text_chunks.is_empty() {
-            thread::sleep(delay);
-        }
         let event = format!(
             "data: {}\n\n",
             json!({

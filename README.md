@@ -94,7 +94,7 @@ publishes a separate archive per binary per target (e.g.
 ### Multi-Providers
 
 Integrate seamlessly with over 20 leading LLM providers through a unified interface. Supported 
-providers include OpenAI, Claude, Gemini (Google AI Studio), Ollama, Groq, Azure-OpenAI, 
+providers include OpenAI, Claude, Gemini (Google AI Studio), Ollama, llama-server, Groq, Azure-OpenAI, 
 VertexAI, Bedrock, Github Models, Mistral, Deepseek, AI21, XAI Grok, Cohere, Perplexity, 
 Cloudflare, OpenRouter, Ernie, Qianwen, Moonshot, ZhipuAI, MiniMax, Deepinfra, VoyageAI, 
 any OpenAI-Compatible API provider.
@@ -176,6 +176,22 @@ AI Agent = Instructions (Prompt) + Tools (Function Callings) + Documents (RAG).
 
 <img width="1100" height="520" alt="Image" src="https://github.com/user-attachments/assets/81690302-fb9c-468b-b212-f06042d584ac" />
 
+
+### Local LLM via llama-server
+
+Harnx can spawn and manage a local `llama-server` (from the [llama.cpp](https://github.com/ggml-org/llama.cpp) project) as a child process. It communicates over a high-performance **Unix domain socket**, serving OpenAI-compatible chat completions. This allows you to run local GGUF models with streaming and tool use support without heavy in-process builds or external TCP services.
+
+- **Installation**: Install `llama-server` via [GitHub Releases](https://github.com/ggml-org/llama.cpp/releases) or `brew install llama.cpp`.
+- **Capability Matrix**: chat ✅, streaming ✅, tool calls ✅ (model-dependent), embeddings ❌, rerank ❌, vision ❌.
+- **Binary Discovery**: Harnx searches for the `llama-server` binary in this order:
+  1. Config `binary_path`
+  2. `HARNX_LLAMA_SERVER_BIN` environment variable
+  3. System `PATH`
+- **Lifecycle**: One `llama-server` instance is lazily spawned per unique subprocess config on first request and reused. Matching configs share one process; different runtime knobs get distinct processes. All instances are killed when Harnx exits.
+- **Socket path**: defaults to `~/.local/share/harnx/llama-server-<pid>-<hash>.sock` (override with the `socket_path` config field).
+- **Platform**: Unix-only (uses AF_UNIX sockets); not supported on Windows.
+
+See `example_config/clients/llama-server.yaml` for a configuration template.
 ### Local Server Capabilities
 
 Harnx includes a lightweight built-in HTTP server for easy deployment.
