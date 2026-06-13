@@ -67,6 +67,47 @@ fn test_config_with_mock_client_and_agent(
     config
 }
 
+fn make_compacted_message(
+    role: harnx_core::message::MessageRole,
+    content: harnx_core::message::MessageContent,
+    log_seq: usize,
+) -> harnx_core::message::Message {
+    harnx_core::message::Message {
+        role,
+        content,
+        log_seq: Some(log_seq),
+        log_timestamp: None,
+    }
+}
+
+fn seed_compressed_session(config: &GlobalConfig) {
+    let mut guard = config.write();
+    let mut session = harnx_runtime::config::session::new(&guard, "compacted").unwrap();
+    session.compressed_messages = vec![
+        make_compacted_message(
+            harnx_core::message::MessageRole::System,
+            harnx_core::message::MessageContent::Text("Old system note".to_string()),
+            0,
+        ),
+        make_compacted_message(
+            harnx_core::message::MessageRole::User,
+            harnx_core::message::MessageContent::Text("Old question".to_string()),
+            1,
+        ),
+        make_compacted_message(
+            harnx_core::message::MessageRole::Assistant,
+            harnx_core::message::MessageContent::Text("Old answer".to_string()),
+            2,
+        ),
+    ];
+    session.messages = vec![make_compacted_message(
+        harnx_core::message::MessageRole::User,
+        harnx_core::message::MessageContent::Text("Current question".to_string()),
+        3,
+    )];
+    guard.session = Some(session);
+}
+
 fn normalize_screen(contents: &str) -> String {
     let trimmed = contents
         .lines()
@@ -7741,14 +7782,41 @@ async fn render_agent_event_compacting_started_produces_transcript_entry() {
 }
 
 #[tokio::test]
-async fn render_agent_event_compacting_completed_produces_transcript_entry() {
-    let config = test_config();
+async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
+    let config = test_config_with_mock_client_and_agent("test-agent", None);
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
         .await
         .unwrap();
 
-    // First emit CompactingStarted
+    tui.app.transcript = vec![
+        TranscriptItem::UserText {
+            text: "Old question".to_string(),
+            seq: Some(1),
+            timestamp: None,
+        },
+        TranscriptItem::AssistantText {
+            text: "Old answer".to_string(),
+            seq: Some(2),
+            timestamp: None,
+            rendered_cache: None,
+        },
+        TranscriptItem::UserText {
+            text: "Current question".to_string(),
+            seq: Some(3),
+            timestamp: None,
+        },
+    ];
+    tui.app.streaming_assistant_idx = Some(1);
+    tui.app.last_usage_transcript_idx = Some(2);
+    tui.app.last_usage_source = Some(AgentSource {
+        agent: "primary".to_string(),
+        session_id: None,
+        model: None,
+    });
+    tui.app.transcript_focus = Some(99);
+    tui.app.transcript_selection_anchor = Some(88);
+
     tui.handle_tui_event(TuiEvent::Agent(
         AgentEvent::Session(SessionEvent::CompactingStarted),
         None,
@@ -7756,7 +7824,8 @@ async fn render_agent_event_compacting_completed_produces_transcript_entry() {
     .await
     .unwrap();
 
-    // Then emit CompactingCompleted
+    seed_compressed_session(&config);
+
     tui.handle_tui_event(TuiEvent::Agent(
         AgentEvent::Session(SessionEvent::CompactingCompleted),
         None,
@@ -7764,25 +7833,86 @@ async fn render_agent_event_compacting_completed_produces_transcript_entry() {
     .await
     .unwrap();
 
-    // Should have both transcript items
-    let items: Vec<_> = tui
+    assert_eq!(
+        tui.app
+            .transcript
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::CompactionMarker { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        tui.app
+            .transcript
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::SystemText(text) if text == "Compacting session…"))
+            .count(),
+        0
+    );
+    assert_eq!(
+        tui.app
+            .transcript
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Old question"))
+            .count(),
+        0
+    );
+    assert_eq!(
+        tui.app
+            .transcript
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::AssistantText { text, .. } if text == "Old answer"))
+            .count(),
+        0
+    );
+    assert_eq!(
+        tui.app
+            .transcript
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::UserText { text, .. } if text == "Current question"))
+            .count(),
+        1
+    );
+    // seed_compressed_session assigns log_seq 0,1,2 to the compressed
+    // messages, so the marker must span that full range.
+    assert!(matches!(
+        tui.app.transcript.first(),
+        Some(TranscriptItem::CompactionMarker { text, detail_text, from_seq, to_seq })
+            if text == "─── session compacted ───"
+                && detail_text.contains("Old question")
+                && detail_text.contains("Old answer")
+                && *from_seq == Some(0)
+                && *to_seq == Some(2)
+    ));
+    assert!(tui.app.transcript[0].is_navigable());
+    assert_eq!(tui.app.streaming_assistant_idx, None);
+    assert_eq!(tui.app.last_usage_transcript_idx, None);
+    assert_eq!(tui.app.last_usage_source, None);
+    assert_eq!(tui.app.transcript_focus, None);
+    assert_eq!(tui.app.transcript_selection_anchor, None);
+}
+
+#[tokio::test]
+async fn session_history_compaction_detail_includes_system_messages() {
+    let config = test_config_with_mock_client_and_agent("test-agent", None);
+    seed_compressed_session(&config);
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    let marker = tui
         .app
         .transcript
         .iter()
-        .filter_map(|item| match item {
-            TranscriptItem::SystemText(text) => Some(text.clone()),
+        .find_map(|item| match item {
+            TranscriptItem::CompactionMarker { detail_text, .. } => Some(detail_text),
             _ => None,
         })
-        .collect();
+        .expect("expected compaction marker");
 
-    assert!(
-        items.contains(&"Compacting session…".to_string()),
-        "Expected 'Compacting session…' in transcript"
-    );
-    assert!(
-        items.contains(&"Session compacted.".to_string()),
-        "Expected 'Session compacted.' in transcript"
-    );
+    assert!(marker.contains("── system ──"));
+    assert!(marker.contains("Old system note"));
 }
 
 #[tokio::test]
@@ -7831,4 +7961,96 @@ async fn render_agent_event_compacting_failed_produces_error_transcript_entry() 
             .any(|s| s.contains("Compaction failed: test error")),
         "Expected 'Compaction failed: test error' in transcript"
     );
+}
+
+#[tokio::test]
+async fn session_history_compaction_is_single_navigable_item() {
+    let config = test_config();
+    seed_compressed_session(&config);
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    let compaction_items: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::CompactionMarker { .. }))
+        .collect();
+    assert_eq!(compaction_items.len(), 1);
+    assert!(compaction_items[0].is_navigable());
+    assert!(!tui.app.transcript.iter().any(|item| {
+        matches!(item, TranscriptItem::UserText { text, .. } if text == "Old question")
+            || matches!(item, TranscriptItem::AssistantText { text, .. } if text == "Old answer")
+    }));
+}
+
+#[tokio::test]
+async fn transcript_navigation_can_focus_compaction_marker() {
+    let config = test_config();
+    seed_compressed_session(&config);
+    let mut harness = TuiTestHarness::with_config(config).await;
+
+    // Locate indices dynamically so the test does not depend on the exact
+    // bootstrap transcript ordering.
+    let marker_idx = harness
+        .tui()
+        .app
+        .transcript
+        .iter()
+        .position(|item| matches!(item, TranscriptItem::CompactionMarker { .. }))
+        .expect("compaction marker present");
+    // The navigable item immediately after the marker (e.g. "Current question").
+    let after_marker_idx = (marker_idx + 1..harness.tui().app.transcript.len())
+        .find(|&i| harness.tui().app.transcript[i].is_navigable())
+        .expect("navigable item after marker");
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(after_marker_idx));
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(marker_idx));
+    assert!(matches!(
+        harness.tui().app.transcript.get(marker_idx),
+        Some(TranscriptItem::CompactionMarker { .. })
+    ));
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(harness.tui().app.transcript_focus, Some(after_marker_idx));
+}
+
+#[tokio::test]
+async fn enter_on_compaction_marker_opens_full_detail_view() {
+    let config = test_config();
+    seed_compressed_session(&config);
+    let mut harness = TuiTestHarness::with_config(config).await;
+    harness.tui().app.transcript_focus = Some(1);
+
+    harness
+        .tui()
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(harness.tui().app.detail_view_open);
+    let detail = harness.tui().app.detail_view_text.clone();
+    assert!(detail.as_deref().is_some_and(|text| {
+        text.contains("── user ──")
+            && text.contains("Old question")
+            && text.contains("── assistant ──")
+            && text.contains("Old answer")
+    }));
 }

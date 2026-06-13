@@ -111,6 +111,7 @@ pub(super) struct App {
     /// detail_view_open is set.  None when no session is active or the item
     /// has no sequence number.
     pub(super) detail_view_raw_yaml: Option<String>,
+    pub(super) detail_view_text: Option<String>,
     /// True when the user is browsing history in fullscreen mode.
     /// Distinct from detail_view_open which shows raw YAML.
     pub(super) transcript_browsing: bool,
@@ -238,6 +239,12 @@ pub enum TranscriptItem {
         rendered_cache: RenderedCache,
     },
     StatusLine(String),
+    CompactionMarker {
+        text: String,
+        from_seq: Option<usize>,
+        to_seq: Option<usize>,
+        detail_text: String,
+    },
     Plan(Vec<PlanEntry>),
     UsageLine(String),
     ToolCall {
@@ -276,6 +283,7 @@ impl TranscriptItem {
             TranscriptItem::UserText { .. }
                 | TranscriptItem::AssistantText { .. }
                 | TranscriptItem::ToolCall { .. }
+                | TranscriptItem::CompactionMarker { .. }
         )
     }
 }

@@ -129,6 +129,7 @@ impl Tui {
             },
             detail_view_open: false,
             detail_view_raw_yaml: None,
+            detail_view_text: None,
             transcript_browsing: false,
             browsing_view_scroll: {
                 let mut s = ratatui_widget_scrolling::ScrollState::new();
@@ -497,6 +498,110 @@ pub(crate) fn messages_to_transcript_items(
     items
 }
 
+fn flatten_transcript_item_to_compaction_lines(item: &TranscriptItem, lines: &mut Vec<String>) {
+    match item {
+        TranscriptItem::UserText { text, .. }
+        | TranscriptItem::AssistantText { text, .. }
+        | TranscriptItem::SystemText(text)
+        | TranscriptItem::ErrorText(text)
+        | TranscriptItem::ThoughtText(text)
+        | TranscriptItem::StatusLine(text)
+        | TranscriptItem::UsageLine(text)
+        | TranscriptItem::AttachmentHeader(text)
+        | TranscriptItem::AttachmentItem(text)
+        | TranscriptItem::AttachmentPreviewLine(text)
+        | TranscriptItem::MutationNotice(text) => lines.extend(text.lines().map(str::to_string)),
+        TranscriptItem::ToolCall {
+            tool_name, body, ..
+        } => {
+            lines.push(format!("name: {tool_name}"));
+            match body {
+                Some(crate::types::ToolCallBody::Yaml(body))
+                | Some(crate::types::ToolCallBody::Markdown(body)) => {
+                    lines.extend(body.lines().map(str::to_string));
+                }
+                None => {}
+            }
+        }
+        TranscriptItem::ToolResultMarkdown { text, .. } => {
+            lines.extend(text.lines().map(str::to_string));
+        }
+        TranscriptItem::Plan(entries) => {
+            for entry in entries {
+                lines.push(format!("- [{}] {}", entry.status, entry.content));
+            }
+        }
+        TranscriptItem::SourceHeading(source) => {
+            lines.push(crate::render_helpers::source_heading(source));
+        }
+        TranscriptItem::CompactionMarker { text, .. } => lines.push(text.clone()),
+    }
+}
+
+fn compaction_section_label(item: &TranscriptItem) -> Option<String> {
+    match item {
+        TranscriptItem::UserText { .. } => Some("── user ──".to_string()),
+        TranscriptItem::AssistantText { .. } => Some("── assistant ──".to_string()),
+        TranscriptItem::ToolCall { tool_name, .. } => Some(format!("── tool call: {tool_name} ──")),
+        TranscriptItem::ToolResultMarkdown { .. } => Some("── tool result ──".to_string()),
+        TranscriptItem::ThoughtText(_) => Some("── thinking ──".to_string()),
+        _ => None,
+    }
+}
+
+fn append_message_compaction_detail_sections(
+    detail_sections: &mut Vec<String>,
+    message: &Message,
+    decl_map: &HashMap<String, ToolDeclaration>,
+) {
+    use harnx_core::message::MessageRole;
+
+    if message.role == MessageRole::System {
+        let text = message.content.to_text();
+        if !text.is_empty() {
+            detail_sections.push(format!(
+                "── system ──
+{text}"
+            ));
+        }
+        return;
+    }
+
+    for item in messages_to_transcript_items(std::slice::from_ref(message), decl_map) {
+        if let Some(label) = compaction_section_label(&item) {
+            let mut section_lines = vec![label];
+            flatten_transcript_item_to_compaction_lines(&item, &mut section_lines);
+            detail_sections.push(section_lines.join(
+                "
+",
+            ));
+        }
+    }
+}
+
+fn build_compaction_marker(
+    messages: &[Message],
+    decl_map: &HashMap<String, ToolDeclaration>,
+) -> TranscriptItem {
+    let from_seq = messages.iter().filter_map(|msg| msg.log_seq).min();
+    let to_seq = messages.iter().filter_map(|msg| msg.log_seq).max();
+    let mut detail_sections = Vec::new();
+    for message in messages {
+        append_message_compaction_detail_sections(&mut detail_sections, message, decl_map);
+    }
+    let detail_text = detail_sections.join(
+        "
+
+",
+    );
+    TranscriptItem::CompactionMarker {
+        text: "─── session compacted ───".to_string(),
+        from_seq,
+        to_seq,
+        detail_text,
+    }
+}
+
 pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<TranscriptItem> {
     let cfg = config.read();
     let session = match cfg.session.as_ref() {
@@ -514,12 +619,9 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
         .collect();
     let mut items = Vec::new();
     if !session.compressed_messages.is_empty() {
-        items.extend(messages_to_transcript_items(
+        items.push(build_compaction_marker(
             &session.compressed_messages,
             &decl_map,
-        ));
-        items.push(TranscriptItem::SystemText(
-            "─── session compacted ───".to_string(),
         ));
     }
     items.extend(messages_to_transcript_items(&session.messages, &decl_map));
