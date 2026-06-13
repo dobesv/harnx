@@ -79,19 +79,46 @@ impl Config {
         self.use_agent_obj(agent)
     }
 
+    /// Reinitialize the MCP/ACP managers so they are scoped to the package of
+    /// the agent named `agent_name` (or to the global, no-package view for a
+    /// top-level agent).
+    ///
+    /// This MUST run before the agent's tool declarations are read/snapshotted
+    /// (e.g. `agent::init` calls `mcp_manager.get_all_tools()`), otherwise the
+    /// agent inherits whatever scope the managers were last left in — typically
+    /// the global (`None`) scope from `Config::init`, which prefixes every
+    /// package server (`<pkg>__*`) and breaks same-package delegation and tool
+    /// naming (#826).
+    ///
+    /// Both agent-activation paths funnel their scoping decision through here so
+    /// the logic cannot drift between them again:
+    /// - the synchronous `use_agent_obj` path, and
+    /// - the asynchronous `use_agent` path.
+    pub(super) fn scope_managers_for_agent(&mut self, agent_name: &str) {
+        let agent_package =
+            harnx_core::package_namespace::pkg_from_qualified(agent_name).map(str::to_string);
+        self.reinit_managers_for_agent(agent_package.as_deref());
+    }
+
+    /// Install an already-built, already-scoped agent as the active agent.
+    ///
+    /// Assumes the managers have already been scoped for this agent via
+    /// [`scope_managers_for_agent`]. Use [`use_agent_obj`] when you have a
+    /// freshly built agent and still need the managers scoped.
+    pub(super) fn set_active_agent(&mut self, agent: Agent) {
+        self.agent = Some(agent);
+    }
+
     pub fn use_agent_obj(&mut self, agent: Agent) -> Result<()> {
         if self.agent.is_some() {
             self.exit_agent()?;
         }
 
-        // Reinitialize MCP/ACP managers scoped to the incoming agent's package
-        // (or None for top-level agents). This gives the agent a clean view:
-        // same-package MCP servers appear under their bare names, others prefixed.
-        let agent_package =
-            harnx_core::package_namespace::pkg_from_qualified(agent.name()).map(str::to_string);
-        self.reinit_managers_for_agent(agent_package.as_deref());
-
-        self.agent = Some(agent);
+        // Scope MCP/ACP managers to the incoming agent's package (or None for
+        // top-level agents) so same-package MCP servers appear under their bare
+        // names and others stay prefixed.
+        self.scope_managers_for_agent(agent.name());
+        self.set_active_agent(agent);
         Ok(())
     }
 
@@ -205,26 +232,20 @@ impl Config {
         }
         // Scope the MCP/ACP managers to the incoming agent's package BEFORE
         // `agent::init` snapshots the MCP tool declarations (it reads
-        // `mcp_manager.get_all_tools()` during init). Without this, a package
-        // agent activated through this async path inherits the global (`None`)
-        // manager scope left by `Config::init`, so every package server is
-        // prefixed: same-package MCP tools leak in under both `<pkg>__*` and
-        // sibling-package namespaces, and the agent's own ACP delegation tools
-        // are emitted as `<pkg>__<agent>_session_prompt` instead of the bare
-        // `<agent>_session_prompt` its `use_tools` allow-list references — so
-        // they are filtered out and the agent cannot delegate (#826).
+        // `mcp_manager.get_all_tools()` during init). Without this the agent
+        // would inherit the global (`None`) scope left by `Config::init` and
+        // its same-package tools would be wrongly prefixed (#826).
         //
-        // This mirrors the synchronous `use_agent_obj` path, which already
-        // scopes managers before the agent's tools are read.
-        let agent_package =
-            harnx_core::package_namespace::pkg_from_qualified(agent_name).map(str::to_string);
-        config
-            .write()
-            .reinit_managers_for_agent(agent_package.as_deref());
+        // Scoping + install go through the same `scope_managers_for_agent` /
+        // `set_active_agent` helpers as the synchronous `use_agent_obj` path, so
+        // the two activation paths cannot drift apart. We scope here (rather than
+        // letting `use_agent_obj` do it after the build) because the async build
+        // snapshots the agent's tools and must see the scoped managers.
+        config.write().scope_managers_for_agent(agent_name);
         let agent = self::agent::init(config, agent_name, abort_signal).await?;
         let session = session_name.map(|v| v.to_string());
         config.write().rag = agent.rag();
-        config.write().agent = Some(agent);
+        config.write().set_active_agent(agent);
         // Populate shared_variables from resolved file-backed defaults and
         // any --agent-variable overrides before any code path that renders
         // the template. session::new() -> set_agent() runs the template
