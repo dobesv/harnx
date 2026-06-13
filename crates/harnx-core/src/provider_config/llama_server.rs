@@ -13,7 +13,8 @@ use crate::model::{ModelData, RequestPatches};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LlamaServerConfig {
-    pub name: Option<String>,
+    #[serde(skip)]
+    pub name: String,
 
     /// Models served by this provider. Each model specifies its own
     /// GGUF path and tuning knobs; selecting a model spawns its subprocess.

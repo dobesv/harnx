@@ -28,8 +28,16 @@ mod tests {
         )
         .expect("parse test client config");
 
-        let mut config = Config::default();
-        config.clients = clients;
+        // Set the client name to match what the file loader would do for openai.yaml
+        let mut clients = clients;
+        if let Some(c) = clients.first_mut() {
+            c.set_name("openai".to_string());
+        }
+
+        let mut config = Config {
+            clients,
+            ..Default::default()
+        };
         config.model = harnx_runtime::client::retrieve_model(
             &config.clients,
             "openai:gpt-4o",

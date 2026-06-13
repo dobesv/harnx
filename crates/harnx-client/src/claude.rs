@@ -1213,8 +1213,9 @@ system_prompt_prefix:
     /// CLAUDE_API_KEY, not the invalid PANTHEON/CLAUDE_API_KEY.
     #[test]
     fn package_client_uses_bare_name_for_env_var() {
-        let config: ClaudeConfig =
-            serde_yaml::from_str("name: \"pantheon/claude\"").expect("parse config");
+        let mut config: ClaudeConfig =
+            serde_yaml::from_str("type: claude").expect("parse config");
+        config.name = "pantheon/claude".to_string();
         let client = ClaudeClient {
             config,
             model: Model::new("pantheon/claude", "claude-3-5-sonnet"),

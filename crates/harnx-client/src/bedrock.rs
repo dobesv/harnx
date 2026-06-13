@@ -946,7 +946,7 @@ mod tests {
         session_token: Option<&str>,
     ) -> BedrockConfig {
         BedrockConfig {
-            name: None,
+            name: String::new(),
             access_key_id: access_key_id.map(Into::into),
             secret_access_key: secret_access_key.map(Into::into),
             region: region.map(Into::into),

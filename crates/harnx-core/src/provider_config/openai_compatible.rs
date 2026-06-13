@@ -8,7 +8,8 @@ use crate::model::{ModelData, RequestPatches};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAICompatibleConfig {
-    pub name: Option<String>,
+    #[serde(skip)]
+    pub name: String,
     pub api_base: Option<String>,
     pub api_key: Option<String>,
     #[serde(default)]

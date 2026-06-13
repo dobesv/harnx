@@ -1106,8 +1106,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_info_model_reports_catalog_model() {
+        let mut openai_client = crate::client::ClientConfig::OpenAIConfig(Default::default());
+        openai_client.set_name("openai".to_string());
         let mut config = Config {
-            clients: vec![crate::client::ClientConfig::OpenAIConfig(Default::default())],
+            clients: vec![openai_client],
             model: model_with_data("openai", "gpt-4o", true),
             working_mode: WorkingMode::Cmd,
             ..Default::default()
