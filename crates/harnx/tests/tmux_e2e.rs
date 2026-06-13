@@ -358,8 +358,15 @@ fn same_package_session_prompt_delegation_uses_qualified_spawn() -> Result<()> {
     // spawned ACP subagent could lose package prefix and fail once top-level agents
     // with same bare names were absent. This e2e test covers success path; exact
     // qualified spawn args are unit-covered in harnx-runtime package_loading tests.
+    //
+    // #826: once the same-package ACP delegation tool resolves under its bare
+    // name, the TUI renders the tool's `call_template` ("@ <peer> …") as the
+    // tool-call header instead of the raw `<peer>_session_prompt` name, so we
+    // assert on the rendered delegation header. (Before #826 was fixed the bare
+    // tool failed to resolve to a registered ACP server, so the raw name leaked
+    // through as a fallback header — that incidental display is no longer used.)
     assert!(
-        screen.contains(&format!("{}_session_prompt", PACKAGE_DELEGATION_PEER_NAME)),
+        screen.contains(&format!("@ {PACKAGE_DELEGATION_PEER_NAME}")),
         "same-package delegation tool call missing from TUI transcript:\n{screen}"
     );
     assert!(
