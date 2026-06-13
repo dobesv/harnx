@@ -136,6 +136,17 @@ impl Tui {
                 );
                 RenderedEntry::from_lines(lines, width)
             }
+            TranscriptItem::CompactionMarker { text, .. } => {
+                let lines = Self::render_text_entry(
+                    "",
+                    text,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                    false,
+                );
+                RenderedEntry::from_lines(lines, width)
+            }
             TranscriptItem::SystemText(text) => {
                 let lines = Self::render_text_entry(
                     "",
@@ -1054,6 +1065,24 @@ impl Tui {
                 lines.push(Line::from(Span::styled("── source ──", label_style)));
                 push_field!("source", &crate::render_helpers::source_heading(source));
             }
+            TranscriptItem::CompactionMarker {
+                text,
+                from_seq,
+                to_seq,
+                detail_text,
+            } => {
+                lines.push(Line::from(Span::styled(
+                    "── compacted session ──",
+                    label_style,
+                )));
+                push_field!("text", text);
+                let seq_range = match (from_seq, to_seq) {
+                    (Some(from), Some(to)) => format!("{from}–{to}"),
+                    _ => "n/a".to_string(),
+                };
+                push_field!("seq_range", seq_range);
+                push_field!("detail", detail_text);
+            }
             TranscriptItem::SystemText(text) => {
                 lines.push(Line::from(Span::styled("── system ──", label_style)));
                 push_field!("text", text);
@@ -1132,7 +1161,13 @@ impl Tui {
         // Fallback: render_entry_detail() for items that have no seq number or
         // when no session is active.
         let (entries_as_vec, title): (Vec<Vec<Line<'static>>>, String) =
-            if let Some(yaml) = &self.app.detail_view_raw_yaml {
+            if let Some(text) = &self.app.detail_view_text {
+                let entries = vec![text
+                    .lines()
+                    .map(|line| Line::from(Span::raw(line.to_string())))
+                    .collect()];
+                (entries, "Compacted session".to_string())
+            } else if let Some(yaml) = &self.app.detail_view_raw_yaml {
                 // Split on the same separator edit_message_range joins with.
                 let docs: Vec<&str> = yaml.split("\n---\n").collect();
                 let doc_count = docs.len();

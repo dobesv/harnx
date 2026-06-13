@@ -1,3 +1,4 @@
+use crate::lifecycle::session_history_transcript_items;
 use crate::render_helpers::{render_status_line, render_usage_line};
 use crate::strip_ansi;
 use crate::types::Tui;
@@ -159,6 +160,34 @@ fn tool_completed_to_transcript_items(
 }
 
 impl Tui {
+    fn open_detail_view_for_focused_item(&mut self) {
+        self.app.detail_view_scroll = {
+            let mut s = ratatui_widget_scrolling::ScrollState::new();
+            s.follow = false;
+            s
+        };
+        let focused_item = self
+            .app
+            .transcript_focus
+            .and_then(|focus| self.app.transcript.get(focus));
+        match focused_item {
+            Some(TranscriptItem::CompactionMarker { detail_text, .. }) => {
+                // The detail view always renders detail_text for a compaction
+                // marker (see render_detail_view), so a raw-YAML lookup here
+                // would be computed but never displayed. Skip it.
+                self.app.detail_view_text = Some(detail_text.clone());
+                self.app.detail_view_raw_yaml = None;
+            }
+            _ => {
+                self.app.detail_view_text = None;
+                self.app.detail_view_raw_yaml = self
+                    .selected_seq_range()
+                    .and_then(|(from, to)| self.config.read().get_message_range_yaml(from, to));
+            }
+        }
+        self.app.detail_view_open = true;
+    }
+
     async fn handle_detail_view_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, KeyModifiers::NONE) => {
@@ -197,16 +226,7 @@ impl Tui {
                         self.app.transcript_focus = Some(focus_idx);
                         self.app.transcript_selection_anchor = None;
                         self.app.transcript_browsing = prior_browsing;
-                        self.app.detail_view_scroll = {
-                            let mut s = ratatui_widget_scrolling::ScrollState::new();
-                            s.follow = false;
-                            s
-                        };
-                        self.app.detail_view_raw_yaml =
-                            self.selected_seq_range().and_then(|(from, to)| {
-                                self.config.read().get_message_range_yaml(from, to)
-                            });
-                        self.app.detail_view_open = true;
+                        self.open_detail_view_for_focused_item();
                     }
                 }
             }
@@ -245,15 +265,7 @@ impl Tui {
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 // Open detail view for current focused item
-                self.app.detail_view_scroll = {
-                    let mut s = ratatui_widget_scrolling::ScrollState::new();
-                    s.follow = false;
-                    s
-                };
-                self.app.detail_view_raw_yaml = self
-                    .selected_seq_range()
-                    .and_then(|(from, to)| self.config.read().get_message_range_yaml(from, to));
-                self.app.detail_view_open = true;
+                self.open_detail_view_for_focused_item();
             }
             (KeyCode::Char('e'), KeyModifiers::NONE) => {
                 self.handle_transcript_edit().await?;
@@ -400,16 +412,7 @@ impl Tui {
                 self.handle_transcript_rewind();
             }
             (KeyCode::Enter, KeyModifiers::NONE) if self.app.transcript_focus.is_some() => {
-                self.app.detail_view_scroll = {
-                    let mut s = ratatui_widget_scrolling::ScrollState::new();
-                    s.follow = false;
-                    s
-                };
-                // Pre-load raw session YAML (same content .edit message would open).
-                self.app.detail_view_raw_yaml = self
-                    .selected_seq_range()
-                    .and_then(|(from, to)| self.config.read().get_message_range_yaml(from, to));
-                self.app.detail_view_open = true;
+                self.open_detail_view_for_focused_item();
             }
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 if self.try_handle_attach_command().await {
@@ -1211,7 +1214,27 @@ impl Tui {
                 )]
             }
             AgentEvent::Session(SessionEvent::CompactingCompleted) => {
-                vec![TranscriptItem::SystemText("Session compacted.".to_string())]
+                self.app.transcript = session_history_transcript_items(&self.config);
+                self.app.streaming_assistant_idx = None;
+                // A compaction can land mid-turn after some assistant text has
+                // already streamed. The rebuild drops that streamed row, so the
+                // per-turn flag must also reset — otherwise the next
+                // ModelEvent::Final sees streamed_text_this_turn == true and
+                // skips rendering the final assistant row.
+                self.app.streamed_text_this_turn = false;
+                // The rebuild drops all SourceHeading entries, so the next
+                // output must re-emit its heading even if it shares the prior
+                // source. Without this, the first post-compaction message would
+                // render without an agent label.
+                self.app.last_ui_output_source = None;
+                self.clear_usage_tracking();
+                // The transcript is entirely rebuilt, so any prior focus/anchor
+                // indices reference now-different items even when still in
+                // bounds. Clear selection/detail state unconditionally.
+                self.app.transcript_focus = None;
+                self.app.transcript_selection_anchor = None;
+                self.pin_transcript_to_bottom();
+                vec![]
             }
             AgentEvent::Session(SessionEvent::CompactingFailed(err)) => {
                 vec![TranscriptItem::ErrorText(format!(
@@ -2341,6 +2364,7 @@ impl Tui {
                     self.run_command(&cmd).await?;
                     self.app.detail_view_open = false;
                     self.app.detail_view_raw_yaml = None;
+                    self.app.detail_view_text = None;
                     self.app.transcript_browsing = false;
                     self.app.transcript_focus = None;
                     self.app.transcript_selection_anchor = None;
@@ -2365,6 +2389,7 @@ impl Tui {
                     }
                     self.app.detail_view_open = false;
                     self.app.detail_view_raw_yaml = None;
+                    self.app.detail_view_text = None;
                     self.app.transcript_browsing = false;
                     self.app.transcript_focus = None;
                     self.app.transcript_selection_anchor = None;
@@ -2410,6 +2435,7 @@ impl Tui {
         match item {
             TranscriptItem::UserText { text, .. } => Some(text.clone()),
             TranscriptItem::AssistantText { text, .. } => Some(text.clone()),
+            TranscriptItem::CompactionMarker { detail_text, .. } => Some(detail_text.clone()),
             TranscriptItem::ToolCall {
                 tool_name,
                 body: Some(crate::types::ToolCallBody::Yaml(body)),
