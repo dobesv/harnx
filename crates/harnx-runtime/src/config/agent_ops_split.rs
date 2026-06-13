@@ -203,6 +203,24 @@ impl Config {
         if config.read().agent.is_some() {
             config.write().exit_agent()?;
         }
+        // Scope the MCP/ACP managers to the incoming agent's package BEFORE
+        // `agent::init` snapshots the MCP tool declarations (it reads
+        // `mcp_manager.get_all_tools()` during init). Without this, a package
+        // agent activated through this async path inherits the global (`None`)
+        // manager scope left by `Config::init`, so every package server is
+        // prefixed: same-package MCP tools leak in under both `<pkg>__*` and
+        // sibling-package namespaces, and the agent's own ACP delegation tools
+        // are emitted as `<pkg>__<agent>_session_prompt` instead of the bare
+        // `<agent>_session_prompt` its `use_tools` allow-list references — so
+        // they are filtered out and the agent cannot delegate (#826).
+        //
+        // This mirrors the synchronous `use_agent_obj` path, which already
+        // scopes managers before the agent's tools are read.
+        let agent_package =
+            harnx_core::package_namespace::pkg_from_qualified(agent_name).map(str::to_string);
+        config
+            .write()
+            .reinit_managers_for_agent(agent_package.as_deref());
         let agent = self::agent::init(config, agent_name, abort_signal).await?;
         let session = session_name.map(|v| v.to_string());
         config.write().rag = agent.rag();
