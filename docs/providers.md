@@ -13,7 +13,7 @@ All clients support these common fields:
 | `system_prompt_prefix` | List of strings prepended to all system prompts for this client (each item is a separate paragraph). | N/A |
 | `models` | List of manual model definitions. | N/A |
 
-> **Note on Environment Variables:** The `{NAME}` prefix in environment variables is derived from the client's **filename stem** (uppercased). For example, a client defined in `clients/my-openai.yaml` will use `MY_OPENAI_API_KEY`. If the filename is just the provider type (e.g., `openai.yaml`), it defaults to `OPENAI_API_KEY`. Any `name` field in the file is ignored.
+> **Note on Environment Variables:** The `{NAME}` prefix in environment variables is the client's **filename stem, uppercased as-is** — env var names are built as `${NAME}_${FIELD}` with no character substitution. For example, a client defined in `clients/my_openai.yaml` uses `MY_OPENAI_API_KEY`. If the filename is just the provider type (e.g., `openai.yaml`), it defaults to `OPENAI_API_KEY`. Hyphens are **not** converted to underscores, so a stem with a hyphen produces a hyphen in the prefix (e.g., `clients/my-openai.yaml` → `MY-OPENAI_API_KEY`); prefer underscores in filenames if you intend to use env var overrides. Any `name` field in the file is ignored.
 
 ---
 

@@ -1082,6 +1082,7 @@ fn dynamic_provider_model_init_sets_client_name_from_provider() {
         }
     }
 
+    #[cfg(unix)]
     let _lock = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());

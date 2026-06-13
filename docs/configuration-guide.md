@@ -77,6 +77,7 @@ api_base: https://...     # Optional custom endpoint
 patches:                  # Patch API requests using jq expressions
   chat_completions:
     - '.body.cache_control = {"type":"ephemeral"}'
+```
 
 ### Per-Model Patches
 

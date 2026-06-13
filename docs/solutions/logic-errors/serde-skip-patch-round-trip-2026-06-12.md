@@ -29,7 +29,7 @@ When a Rust struct field is marked `#[serde(skip)]` and that struct is round-tri
 - Qualified names derived from the field become invalid (e.g. `pkg/` instead of `pkg/openai`)
 - Test fixtures that parse YAML directly via `serde_yaml::from_str` without going through the loader produce configs with empty identity fields
 
-```
+```yaml
 # Example: package patch filter stops matching after name becomes #[serde(skip)]
 patches:
   clients:

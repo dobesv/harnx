@@ -1,5 +1,5 @@
 ---
-harnx: minor
+harnx: major
 ---
 Client names are now derived from the YAML filename stem instead of a `name:` field in the file contents.
 

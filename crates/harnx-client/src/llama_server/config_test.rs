@@ -101,9 +101,12 @@ models:
   - name: hf-model
     hf_repo: unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
 "#;
-    let deserialized: ClientConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut deserialized: ClientConfig = serde_yaml::from_str(yaml).unwrap();
+    // Set the name as the loader would (from the filename stem).
+    deserialized.set_name("test-hf".to_string());
     match deserialized {
         ClientConfig::LlamaServerConfig(c) => {
+            assert_eq!(c.name, "test-hf");
             assert_eq!(c.models.len(), 1);
             let m = &c.models[0];
             assert_eq!(m.name, "hf-model");

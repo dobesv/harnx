@@ -155,11 +155,19 @@ impl Config {
         }
         let mut clients = Vec::new();
         for path in Self::sorted_yaml_files(dir)? {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
+            // Derive the client name from the filename stem. Skip paths with a
+            // missing or empty stem (e.g. non-UTF-8 names) — an empty name would
+            // violate ClientConfig::set_name's debug_assert.
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(stem) if !stem.is_empty() => stem.to_string(),
+                _ => {
+                    log::warn!(
+                        "Skipping client config with invalid filename stem: '{}'",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
             let content = read_to_string(&path)
                 .with_context(|| format!("Failed to read client config '{}'", path.display()))?;
             let mut client: ClientConfig = serde_yaml::from_str(&content)
