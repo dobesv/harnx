@@ -1347,3 +1347,73 @@ async fn use_agent_scopes_managers_to_package_for_delegation_tools() {
         "after use_agent, same-package ACP tools must NOT be `pantheon__`-prefixed; got {names:?}"
     );
 }
+
+/// #826 follow-up: when the async `use_agent` path scopes the managers to the
+/// incoming package but `agent::init` then fails (e.g. the agent references a
+/// model no client provides), the managers must be restored to the global
+/// (`None`) scope rather than left scoped to an agent that was never installed.
+#[tokio::test]
+async fn use_agent_restores_global_scope_when_init_fails() {
+    use crate::client::TestStateGuard;
+    use harnx_core::abort::create_abort_signal;
+
+    let _guard = TestStateGuard::new(None).await;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let pkg_agents = temp.path().join("packages/pantheon/agents");
+    std::fs::create_dir_all(&pkg_agents).unwrap();
+    // This agent pins a model that no configured client provides, so
+    // `agent::init` -> `retrieve_model` fails.
+    std::fs::write(
+        pkg_agents.join("atlas.md"),
+        "---\nmodel: nonexistent-provider:no-such-model\n---\nYou are Atlas.\n",
+    )
+    .unwrap();
+
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    let provider_prev = std::env::var_os("HARNX_PROVIDER");
+    // SAFETY: test-only; the shared test lock is held for the duration.
+    unsafe { std::env::set_var("HARNX_PROVIDER", "claude:some-model") };
+
+    let config = Config::init(WorkingMode::Cmd, false, vec![])
+        .await
+        .expect("config init");
+    let config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+
+    let result = Config::use_agent(&config, "pantheon/atlas", None, create_abort_signal()).await;
+
+    // SAFETY: test-only; restore provider env before asserting.
+    unsafe {
+        match &provider_prev {
+            Some(v) => std::env::set_var("HARNX_PROVIDER", v),
+            None => std::env::remove_var("HARNX_PROVIDER"),
+        }
+    }
+
+    assert!(
+        result.is_err(),
+        "use_agent should fail when the agent's model cannot be resolved"
+    );
+
+    let cfg = config.read();
+    assert!(
+        cfg.agent.is_none(),
+        "no agent should be installed after a failed activation"
+    );
+    // Managers must be back in the global scope: the package ACP server is
+    // exposed under its prefixed name, not the bare same-package name.
+    let manager = cfg.acp_manager.as_ref().expect("acp_manager");
+    let names: Vec<String> = manager
+        .get_all_tools_blocking()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(
+        names.contains(&"pantheon__atlas_session_prompt".to_string()),
+        "after failed activation, managers must be back in global scope (prefixed); got {names:?}"
+    );
+    assert!(
+        !names.contains(&"atlas_session_prompt".to_string()),
+        "after failed activation, managers must NOT remain scoped to pantheon; got {names:?}"
+    );
+}

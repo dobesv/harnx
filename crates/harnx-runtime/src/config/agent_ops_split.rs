@@ -242,7 +242,17 @@ impl Config {
         // letting `use_agent_obj` do it after the build) because the async build
         // snapshots the agent's tools and must see the scoped managers.
         config.write().scope_managers_for_agent(agent_name);
-        let agent = self::agent::init(config, agent_name, abort_signal).await?;
+        let agent = match self::agent::init(config, agent_name, abort_signal).await {
+            Ok(agent) => agent,
+            Err(err) => {
+                // `agent::init` failed after we already re-scoped the managers,
+                // but no agent was installed. Restore the global ("no active
+                // agent") scope so config state stays consistent for whatever
+                // runs next, mirroring `exit_agent`'s post-condition.
+                config.write().reinit_managers_for_agent(None);
+                return Err(err);
+            }
+        };
         let session = session_name.map(|v| v.to_string());
         config.write().rag = agent.rag();
         config.write().set_active_agent(agent);
