@@ -73,6 +73,11 @@ cargo nextest run --workspace --stress-count=5                # Run all tests, r
 cs delta $(git merge-base HEAD origin/main)                   # Run CodeScene code quality analysis on current branch changes                                          
 ```
 
+**Use `cargo nextest`, never `cargo test`.** Tests rely on nextest's per-test
+process isolation; `cargo test` shares one process and produces spurious
+failures. The tmux/interrupt e2e tests guard against this and will panic with a
+redirect message if run under `cargo test` (via `harnx_core::require_nextest()`).
+
 **Do not skip any of these steps or you WILL miss problems**
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
 

@@ -37,6 +37,10 @@ impl TmuxHarness {
     /// variables needed by their test subject inside the pane (e.g., via `send_text`
     /// with `env VAR=val ...`).
     pub fn new(cwd: impl AsRef<Path>, cols: u16, rows: u16) -> Result<Self> {
+        // tmux-driven tests mutate global session/socket state and must run with
+        // per-test process isolation. Refuse to run under `cargo test`.
+        harnx_core::require_nextest();
+
         let session_name = unique_name("harnx-test");
         let socket_path = std::env::temp_dir().join(format!("{}.sock", unique_name("tmux")));
 
