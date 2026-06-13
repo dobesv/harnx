@@ -16,18 +16,9 @@ use unicode_width::UnicodeWidthStr;
 /// Comes from <https://github.com/sharkdp/bat/raw/5e77ca37e89c873e4490b42ff556370dc5c6ba4f/assets/syntaxes.bin>
 const SYNTAXES: &[u8] = include_bytes!("../../harnx-render/assets/syntaxes.bin");
 
-/// Monokai Extended dark theme (bincode-encoded)
-const THEME_BYTES: &[u8] = include_bytes!("../../harnx-render/assets/monokai-extended.theme.bin");
-
 static SYNTAX_SET: LazyLock<Option<SyntaxSet>> = LazyLock::new(|| {
     bincode::serde::decode_from_slice(SYNTAXES, bincode::config::legacy())
         .map(|(set, _): (SyntaxSet, usize)| set)
-        .ok()
-});
-
-static THEME: LazyLock<Option<Theme>> = LazyLock::new(|| {
-    bincode::serde::decode_from_slice(THEME_BYTES, bincode::config::legacy())
-        .map(|(theme, _): (Theme, usize)| theme)
         .ok()
 });
 
@@ -160,7 +151,12 @@ struct TableState {
     in_header: bool,
 }
 
-pub fn render_markdown(text: &str, base_style: Style, width: u16) -> RenderedEntry {
+pub fn render_markdown(
+    text: &str,
+    base_style: Style,
+    width: u16,
+    theme: Option<&Theme>,
+) -> RenderedEntry {
     let mut blocks = Vec::new();
     let mut current_lines: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
@@ -349,6 +345,7 @@ pub fn render_markdown(text: &str, base_style: Style, width: u16) -> RenderedEnt
                         base_style,
                         pending_blockquote_depth,
                         &mut pending_list_prefix,
+                        theme,
                     );
                 } else {
                     let span_style = resolve_span_style(base_style, &inline_stack, heading_style);
@@ -577,6 +574,7 @@ fn ensure_line_prefix(
 /// Append text content inside a code block, applying syntect syntax highlighting.
 /// For each line in the content, find the appropriate syntax (by language or first-line heuristics),
 /// run it through syntect's HighlightLines, and convert the styled ranges to ratatui Spans.
+#[allow(clippy::too_many_arguments)]
 fn append_code_block_text(
     current_lines: &mut Vec<Line<'static>>,
     current_spans: &mut Vec<Span<'static>>,
@@ -585,6 +583,7 @@ fn append_code_block_text(
     base_style: Style,
     blockquote_depth: usize,
     pending_list_prefix: &mut Option<(String, Style)>,
+    theme: Option<&Theme>,
 ) {
     // Get syntax set and theme from statics
     let Some(syntax_set) = SYNTAX_SET.as_ref() else {
@@ -605,7 +604,7 @@ fn append_code_block_text(
         return;
     };
 
-    let Some(theme) = THEME.as_ref() else {
+    let Some(theme) = theme else {
         // Fallback to plain dim text if theme failed to load
         let fallback_style = base_style.patch(
             Style::default()
@@ -1006,15 +1005,18 @@ fn shrink_table_widths(col_widths: &mut [u16], available_width: u16, natural_wid
 
 #[cfg(test)]
 mod tests {
-    use super::{render_markdown, shrink_table_widths, wrap_spans, MarkdownBlockData};
+    use super::{
+        render_markdown, shrink_table_widths, wrap_spans, MarkdownBlockData, RenderedEntry,
+    };
     use ratatui::{
         style::{Color, Modifier, Style},
         text::Span,
     };
+    use syntect::highlighting::Theme;
 
     #[test]
     fn paragraph_renders_to_paragraph_block() {
-        let rendered = render_markdown("plain text", Style::default(), 40);
+        let rendered = render_markdown("plain text", Style::default(), 40, None);
         assert_eq!(rendered.blocks.len(), 1);
         match &rendered.blocks[0] {
             MarkdownBlockData::Paragraph { lines, height } => {
@@ -1034,7 +1036,7 @@ mod tests {
 
     #[test]
     fn inline_styles_are_preserved() {
-        let rendered = render_markdown("**bold** *italic* `code`", Style::default(), 80);
+        let rendered = render_markdown("**bold** *italic* `code`", Style::default(), 80, None);
         let MarkdownBlockData::Paragraph { lines, .. } = &rendered.blocks[0] else {
             panic!("expected paragraph block");
         };
@@ -1061,7 +1063,7 @@ mod tests {
 
     #[test]
     fn code_fence_renders_as_paragraph_without_fence_markers() {
-        let rendered = render_markdown("```rust\nfn main() {}\n```", Style::default(), 80);
+        let rendered = render_markdown("```rust\nfn main() {}\n```", Style::default(), 80, None);
         assert_eq!(rendered.blocks.len(), 1);
         let MarkdownBlockData::Paragraph { lines, .. } = &rendered.blocks[0] else {
             panic!("expected paragraph block");
@@ -1085,6 +1087,7 @@ mod tests {
             "| alpha | beta | gamma |\n| --- | --- | --- |\n| one | three | seven |\n| two | four | six |",
             Style::default(),
             80,
+            None,
         );
         assert_eq!(rendered.blocks.len(), 1);
         match &rendered.blocks[0] {
@@ -1168,6 +1171,55 @@ mod tests {
     }
 
     #[test]
+    fn code_block_theme_parameter_controls_highlighting() {
+        let dark = load_builtin_theme("monokai-extended");
+        let light = load_builtin_theme("monokai-extended-light");
+        let input = "```rust\nlet s = \"hi\";\n```";
+
+        let dark_rendered = render_markdown(input, Style::default(), 80, Some(&dark));
+        let light_rendered = render_markdown(input, Style::default(), 80, Some(&light));
+        let fallback_rendered = render_markdown(input, Style::default(), 80, None);
+
+        let dark_string = find_span(&dark_rendered, "hi");
+        let light_string = find_span(&light_rendered, "hi");
+        let fallback_string = find_span(&fallback_rendered, "hi");
+
+        assert_ne!(dark_string.style.fg, light_string.style.fg);
+        assert_ne!(dark_string.style, light_string.style);
+        assert_eq!(fallback_string.style.fg, Some(Color::DarkGray));
+        assert!(fallback_string.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    fn load_builtin_theme(name: &str) -> Theme {
+        let bytes: &[u8] = match name {
+            "monokai-extended" => {
+                include_bytes!("../../harnx-render/assets/monokai-extended.theme.bin")
+            }
+            "monokai-extended-light" => {
+                include_bytes!("../../harnx-render/assets/monokai-extended-light.theme.bin")
+            }
+            other => panic!("unknown builtin theme {other}"),
+        };
+
+        bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
+            .map(|(theme, _): (Theme, usize)| theme)
+            .expect("decode builtin theme")
+    }
+
+    fn find_span<'a>(rendered: &'a RenderedEntry, needle: &str) -> &'a Span<'static> {
+        rendered
+            .blocks
+            .iter()
+            .flat_map(|block| match block {
+                MarkdownBlockData::Paragraph { lines, .. } => lines.iter(),
+                MarkdownBlockData::Table { .. } => panic!("expected paragraph block"),
+            })
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref().contains(needle))
+            .unwrap_or_else(|| panic!("missing span containing {needle:?}"))
+    }
+
+    #[test]
     fn wrap_spans_empty() {
         let lines = wrap_spans(Vec::new(), 10);
         assert_eq!(lines.len(), 1);
@@ -1194,6 +1246,7 @@ mod tests {
             "| col |\n| --- |\n| this is a very long cell value! |",
             Style::default(),
             13,
+            None,
         );
         assert_eq!(rendered.blocks.len(), 1);
         match &rendered.blocks[0] {
@@ -1207,7 +1260,7 @@ mod tests {
 
     #[test]
     fn gfm_table_short_content_no_wrap() {
-        let rendered = render_markdown("| ab |\n| --- |\n| cd |", Style::default(), 80);
+        let rendered = render_markdown("| ab |\n| --- |\n| cd |", Style::default(), 80, None);
         assert_eq!(rendered.blocks.len(), 1);
         match &rendered.blocks[0] {
             MarkdownBlockData::Table {
@@ -1226,7 +1279,7 @@ mod tests {
 
     #[test]
     fn total_height_sums_block_heights() {
-        let rendered = render_markdown("first\n\nsecond", Style::default(), 80);
+        let rendered = render_markdown("first\n\nsecond", Style::default(), 80, None);
         let expected: u16 = rendered
             .blocks
             .iter()
@@ -1402,6 +1455,7 @@ mod tests {
             "| col1 | col2 |\n| --- | --- |\n| abc | def |\n| ghi | jkl |",
             Style::default(),
             80,
+            None,
         );
         assert_eq!(rendered.blocks.len(), 1);
         match &rendered.blocks[0] {

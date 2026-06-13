@@ -87,6 +87,7 @@ impl Tui {
 
         // Build the initial transcript: welcome + banner (if agent)
         let initial_transcript = Self::build_initial_transcript(config);
+        let code_theme = config.read().render_options()?.theme;
 
         let mut app = App {
             transcript: initial_transcript,
@@ -147,6 +148,7 @@ impl Tui {
 
         Ok(Self {
             config: config.clone(),
+            code_theme,
             abort_signal: create_abort_signal(),
             async_manager: Arc::new(Mutex::new(async_manager)),
             persistent_manager,

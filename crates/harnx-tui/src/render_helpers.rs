@@ -16,9 +16,13 @@ use ratatui::style::Style;
 ///
 /// Only used in tests.
 #[cfg(test)]
-pub(crate) fn markdown_line_spans(text: &str, base_style: Style) -> Line<'static> {
+pub(crate) fn markdown_line_spans(
+    text: &str,
+    base_style: Style,
+    theme: Option<&syntect::highlighting::Theme>,
+) -> Line<'static> {
     let plain_fallback = || Line::from(Span::styled(text.to_string(), base_style));
-    let entry = crate::markdown_render::render_markdown(text, base_style, 120);
+    let entry = crate::markdown_render::render_markdown(text, base_style, 120, theme);
     match entry.blocks.into_iter().next() {
         Some(crate::markdown_render::MarkdownBlockData::Paragraph { lines, .. }) => {
             lines.into_iter().next().unwrap_or_else(plain_fallback)
@@ -86,7 +90,7 @@ mod markdown_tests {
 
     #[test]
     fn plain_text_passes_through() {
-        let line = markdown_line_spans("hello world", Style::default());
+        let line = markdown_line_spans("hello world", Style::default(), None);
         assert_eq!(span_text(&line), "hello world");
         for span in &line.spans {
             assert!(!span.style.add_modifier.contains(Modifier::BOLD));
@@ -96,7 +100,7 @@ mod markdown_tests {
 
     #[test]
     fn bold_marker_produces_bold_span() {
-        let line = markdown_line_spans("hi **there** you", Style::default());
+        let line = markdown_line_spans("hi **there** you", Style::default(), None);
         assert_eq!(span_text(&line), "hi there you");
         let bold = line
             .spans
@@ -114,7 +118,7 @@ mod markdown_tests {
     fn italic_marker_produces_italic_span() {
         // Both `*text*` and `_text_` should produce an ITALIC-modifier span.
         for input in ["hi *there* you", "hi _there_ you"] {
-            let line = markdown_line_spans(input, Style::default());
+            let line = markdown_line_spans(input, Style::default(), None);
             assert_eq!(span_text(&line), "hi there you", "input: {input}");
             let it = line
                 .spans
@@ -131,7 +135,7 @@ mod markdown_tests {
 
     #[test]
     fn code_marker_produces_styled_span() {
-        let line = markdown_line_spans("run `ls -la`", Style::default());
+        let line = markdown_line_spans("run `ls -la`", Style::default(), None);
         assert_eq!(span_text(&line), "run ls -la");
         let code = line
             .spans
@@ -150,7 +154,7 @@ mod markdown_tests {
 
     #[test]
     fn unmatched_marker_renders_literally() {
-        let line = markdown_line_spans("a * b _ c ` d", Style::default());
+        let line = markdown_line_spans("a * b _ c ` d", Style::default(), None);
         assert_eq!(span_text(&line), "a * b _ c ` d");
         for s in &line.spans {
             assert!(!s.style.add_modifier.contains(Modifier::BOLD));
@@ -163,7 +167,7 @@ mod markdown_tests {
         // Test inline code span rendering (used by older single-line templates
         // and any template that produces inline backtick markup).
         // "**$** `ls -la /tmp`" exercises both bold and inline code styling.
-        let line = markdown_line_spans("**$** `ls -la /tmp`", Style::default());
+        let line = markdown_line_spans("**$** `ls -la /tmp`", Style::default(), None);
         assert_eq!(span_text(&line), "$ ls -la /tmp");
         let bold = line
             .spans
@@ -184,7 +188,7 @@ mod markdown_tests {
         // Each newline in the source should become a separate line
         use crate::markdown_render::{render_markdown, MarkdownBlockData};
 
-        let entry = render_markdown("line-01\nline-02\nline-03", Style::default(), 120);
+        let entry = render_markdown("line-01\nline-02\nline-03", Style::default(), 120, None);
         let texts: Vec<String> = entry
             .blocks
             .iter()
@@ -223,7 +227,7 @@ mod markdown_tests {
         // `\n\n` is a paragraph break — should produce separate blocks
         use crate::markdown_render::render_markdown;
 
-        let entry = render_markdown("para1\n\npara2", Style::default(), 120);
+        let entry = render_markdown("para1\n\npara2", Style::default(), 120, None);
         // Check that there are two blocks (two paragraphs)
         assert!(
             entry.blocks.len() >= 2,
@@ -237,7 +241,7 @@ mod markdown_tests {
         // Emphasis still works across lines.
         use crate::markdown_render::{render_markdown, MarkdownBlockData};
 
-        let entry = render_markdown("first line\n**bold line**", Style::default(), 120);
+        let entry = render_markdown("first line\n**bold line**", Style::default(), 120, None);
         let bold = entry
             .blocks
             .iter()
@@ -281,7 +285,7 @@ mod markdown_tests {
         let base = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
-        let line = markdown_line_spans("hi **bold** world", base);
+        let line = markdown_line_spans("hi **bold** world", base, None);
 
         // Find the unstyled "hi " span and check it inherits the base.
         let unstyled = line
@@ -309,7 +313,7 @@ mod markdown_tests {
         use crate::markdown_render::{render_markdown, MarkdownBlockData};
 
         let input = "```rust\nfn main() {}\n```";
-        let entry = render_markdown(input, Style::default(), 120);
+        let entry = render_markdown(input, Style::default(), 120, None);
         let texts: Vec<String> = entry
             .blocks
             .iter()

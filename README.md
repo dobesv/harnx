@@ -244,7 +244,7 @@ A web platform to compare different LLMs side-by-side.
 
 Harnx supports custom dark and light themes, which highlight response text and code blocks.
 
-![harnx-themes](https://github.com/dobesv/harnx/assets/4012553/29fa8b79-031e-405d-9caa-70d24fa0acf8)
+![harnx-themes](demos/out/themes.gif)
 
 ## Documentation
 

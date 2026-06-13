@@ -5206,7 +5206,7 @@ fn render_entry_lines(
     use_utc: bool,
 ) -> Vec<ratatui::text::Line<'static>> {
     let mut entry = entry.clone();
-    Tui::render_entry(&mut entry, show_seq, show_ts, use_utc, 80, false)
+    Tui::render_entry(&mut entry, show_seq, show_ts, use_utc, 80, false, None)
         .blocks
         .into_iter()
         .flat_map(|b| match b {

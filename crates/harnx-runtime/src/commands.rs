@@ -1,5 +1,7 @@
 use std::io::Write;
 
+use syntect::highlighting::{Color, Theme};
+
 use crate::config::{macro_execute, AgentVariables, Config, GlobalConfig, Input, LastMessage};
 use crate::utils::{dimmed_text, set_text, AbortSignal};
 use harnx_hooks::{
@@ -26,7 +28,7 @@ pub enum CommandOutcome {
     OpenSessionPicker,
 }
 
-pub static COMMANDS: LazyLock<[Command; 46]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 47]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
@@ -57,6 +59,7 @@ pub static COMMANDS: LazyLock<[Command; 46]> = LazyLock::new(|| {
             ".info model",
             "Show active model details (id, client, pricing, vision/tool-use, catalog source)",
         ),
+        Command::new(".info theme", "Show active syntax-highlight theme"),
         Command::new(".edit session", "Modify current session"),
         Command::new(
             ".edit message <n>",
@@ -216,6 +219,46 @@ pub async fn run_command_with_output(
                             active_count,
                             declarations.len()
                         )?;
+                    }
+                }
+                Some("theme") => {
+                    let config = config.read();
+                    let mode = if config.light_theme() { "light" } else { "dark" };
+                    writeln!(output, "mode: {mode}")?;
+
+                    let render_options = config.render_options()?;
+                    if let Some(theme) = render_options.theme.as_ref() {
+                        let theme_path = Config::local_path(&format!("{mode}.tmTheme"));
+                        let fallback_name = if theme_path.exists() {
+                            "(custom theme)"
+                        } else if config.light_theme() {
+                            "(builtin monokai-extended-light)"
+                        } else {
+                            "(builtin monokai-extended)"
+                        };
+                        let theme_name = theme.name.as_deref().unwrap_or(fallback_name);
+
+                        writeln!(output, "theme: {theme_name}")?;
+                        if theme_path.exists() {
+                            writeln!(output, "source: {}", theme_path.display())?;
+                        } else {
+                            writeln!(output, "source: builtin")?;
+                        }
+                        writeln!(
+                            output,
+                            "foreground: {}",
+                            color_to_hex(theme.settings.foreground.as_ref())
+                        )?;
+                        writeln!(
+                            output,
+                            "background: {}",
+                            color_to_hex(theme.settings.background.as_ref())
+                        )?;
+                        writeln!(output, "string: {}", scope_color(theme, "string"))?;
+                        writeln!(output, "keyword: {}", scope_color(theme, "keyword"))?;
+                        writeln!(output, "comment: {}", scope_color(theme, "comment"))?;
+                    } else {
+                        writeln!(output, "highlighting: disabled")?;
                     }
                 }
                 Some(_) => unknown_command()?,
@@ -1005,6 +1048,30 @@ fn write_model_info_block(
     Ok(())
 }
 
+fn color_to_hex(color: Option<&Color>) -> String {
+    match color {
+        Some(Color { r, g, b, .. }) => format!("#{r:02X}{g:02X}{b:02X}"),
+        None => "none".to_string(),
+    }
+}
+
+fn scope_color(theme: &Theme, scope_name: &str) -> String {
+    theme
+        .scopes
+        .iter()
+        .find(|item| {
+            item.scope.selectors.iter().any(|selector| {
+                selector
+                    .path
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.to_string() == scope_name)
+            })
+        })
+        .and_then(|item| item.style.foreground.as_ref())
+        .map_or_else(|| "default".to_string(), |color| color_to_hex(Some(color)))
+}
+
 pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -1081,8 +1148,36 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
 mod tests {
     use super::*;
     use crate::config::{self, WorkingMode};
+    use harnx_core::config_data::ConfigData;
     use parking_lot::RwLock;
+    use std::path::Path;
     use std::sync::Arc;
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str, value: &std::path::Path) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn write_text(path: &Path, text: &str) {
+        std::fs::write(path, text).expect("write test file");
+    }
 
     fn test_config_with_model(model: crate::client::Model) -> GlobalConfig {
         let mut config = Config {
@@ -1167,6 +1262,210 @@ mod tests {
         assert!(output.contains("model: test-client:fallback-model"));
         assert!(output.contains("supports_vision: false"));
         assert!(output.contains("source: fallback/default"));
+    }
+
+    fn test_config_with_theme(theme: &str, highlight: bool) -> GlobalConfig {
+        let mut config = Config {
+            data: ConfigData {
+                theme: Some(theme.to_string()),
+                highlight,
+                ..Default::default()
+            },
+            working_mode: WorkingMode::Cmd,
+            ..Default::default()
+        };
+        config.session = Some(config::session::new(&config, "test").expect("test session"));
+        Arc::new(RwLock::new(config))
+    }
+
+    async fn run_info_theme(config: &GlobalConfig) -> String {
+        let mut output = Vec::new();
+        let abort_signal = crate::utils::create_abort_signal();
+        let mut async_manager = AsyncHookManager::default();
+        let persistent_manager = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
+        let mut pending_async_context = None;
+
+        let outcome = run_command_with_output(
+            config,
+            abort_signal,
+            ".info theme",
+            &mut async_manager,
+            &persistent_manager,
+            &mut pending_async_context,
+            &mut output,
+        )
+        .await
+        .expect("command succeeds");
+
+        assert_eq!(outcome, CommandOutcome::Continue);
+        String::from_utf8(output).expect("utf8 output")
+    }
+
+    #[tokio::test]
+    async fn info_theme_reports_builtin_dark_and_light_modes() {
+        let dark_config = test_config_with_theme("dark", true);
+        let dark_output = run_info_theme(&dark_config).await;
+        assert!(dark_output.contains("mode: dark"));
+        assert!(dark_output.contains("theme: Monokai Extended"));
+        assert!(dark_output.contains("source: builtin"));
+        assert!(dark_output.contains("background: #"));
+
+        let light_config = test_config_with_theme("light", true);
+        let light_output = run_info_theme(&light_config).await;
+        assert!(light_output.contains("mode: light"));
+        assert!(light_output.contains("theme: Monokai Extended Light"));
+        assert!(light_output.contains("source: builtin"));
+        assert!(light_output.contains("background: #"));
+    }
+
+    #[tokio::test]
+    async fn info_theme_reports_disabled_highlighting() {
+        let config = test_config_with_theme("dark", false);
+        let output = run_info_theme(&config).await;
+
+        assert!(output.contains("mode: dark"));
+        assert!(output.contains("highlighting: disabled"));
+        assert!(!output.contains("theme:"));
+        assert!(!output.contains("source:"));
+    }
+
+    #[tokio::test]
+    async fn info_theme_reports_custom_theme_path_and_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+        write_text(
+            &temp.path().join("dark.tmTheme"),
+            r##"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>name</key>
+  <string>Dracula</string>
+  <key>settings</key>
+  <array>
+    <dict>
+      <key>settings</key>
+      <dict>
+        <key>foreground</key>
+        <string>#F8F8F2</string>
+        <key>background</key>
+        <string>#282A36</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>scope</key>
+      <string>string</string>
+      <key>settings</key>
+      <dict>
+        <key>foreground</key>
+        <string>#F1FA8C</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>scope</key>
+      <string>keyword</string>
+      <key>settings</key>
+      <dict>
+        <key>foreground</key>
+        <string>#FF79C6</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>scope</key>
+      <string>comment</string>
+      <key>settings</key>
+      <dict>
+        <key>foreground</key>
+        <string>#6272A4</string>
+      </dict>
+    </dict>
+  </array>
+</dict>
+</plist>
+"##,
+        );
+
+        let config = test_config_with_theme("dark", true);
+        let output = run_info_theme(&config).await;
+
+        assert!(output.contains("mode: dark"));
+        assert!(output.contains("theme: Dracula"));
+        assert!(output.contains(&format!(
+            "source: {}",
+            temp.path().join("dark.tmTheme").display()
+        )));
+    }
+
+    /// Tests that a custom .tmTheme without a `<name>` key falls back to "(custom theme)".
+    /// syntect's ThemeSet::get_theme parses themes without a name key, resulting in
+    /// `theme.name == None`, which triggers the fallback in the `.info theme` output.
+    #[tokio::test]
+    async fn info_theme_reports_custom_theme_without_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+        // Minimal valid .tmTheme plist WITHOUT a <key>name</key> entry.
+        // Contains only the required settings array with global foreground/background.
+        write_text(
+            &temp.path().join("dark.tmTheme"),
+            r##"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>settings</key>
+  <array>
+    <dict>
+      <key>settings</key>
+      <dict>
+        <key>foreground</key>
+        <string>#F8F8F2</string>
+        <key>background</key>
+        <string>#282A36</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>scope</key>
+      <string>string</string>
+      <key>settings</key>
+      <dict>
+        <key>foreground</key>
+        <string>#F1FA8C</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>scope</key>
+      <string>keyword</string>
+      <key>settings</key>
+      <dict>
+        <key>foreground</key>
+        <string>#FF79C6</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>scope</key>
+      <string>comment</string>
+      <key>settings</key>
+      <dict>
+        <key>foreground</key>
+        <string>#6272A4</string>
+      </dict>
+    </dict>
+  </array>
+</dict>
+</plist>
+"##,
+        );
+
+        let config = test_config_with_theme("dark", true);
+        let output = run_info_theme(&config).await;
+
+        assert!(output.contains("mode: dark"));
+        assert!(output.contains("theme: (custom theme)"));
+        assert!(output.contains(&format!(
+            "source: {}",
+            temp.path().join("dark.tmTheme").display()
+        )));
+        // Should NOT report builtin
+        assert!(!output.contains("source: builtin"));
     }
 
     #[test]

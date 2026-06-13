@@ -84,7 +84,7 @@ palette filter for size + colour quality. Everything is torn down on exit.
 | `harnx-tool-confirm`    | TUI           | `demos/tool-confirm.tape`        |
 | `harnx-llm-playground`  | Web           | `demos/web/playground.mjs`       |
 | `harnx-llm-arena`       | Web           | `demos/web/arena.mjs`            |
-| `harnx-themes`          | TUI (no demo yet) | swap in custom `.tmTheme` files; see `docs/custom-theme.md` |
+| `harnx-themes`          | TUI           | `demos/themes.tape`              |
 
 Once a recording looks right, upload the GIF (GitHub releases, an `assets/`
 branch, or `user-attachments` drag-and-drop) and update the matching

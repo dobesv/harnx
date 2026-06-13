@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use syntect::highlighting::Theme;
 
 /// Options for `render_list_modal` — bundles the three metadata strings so the
 /// function stays within clippy's `too_many_arguments` limit.
@@ -52,7 +53,12 @@ impl Tui {
     /// by the body lines. Body rendering depends on its origin —
     /// `Markdown` (from a `call_template`) is rendered inline; `Yaml`
     /// (raw args, no template) is displayed verbatim, each line indented.
-    fn render_tool_call(tool_name: &str, body: Option<&ToolCallBody>, width: u16) -> RenderedEntry {
+    fn render_tool_call(
+        tool_name: &str,
+        body: Option<&ToolCallBody>,
+        width: u16,
+        theme: Option<&Theme>,
+    ) -> RenderedEntry {
         let dim_gray = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
@@ -61,7 +67,7 @@ impl Tui {
             Some(ToolCallBody::Markdown(md)) => {
                 // Markdown body is the tool description itself — header suppressed
                 // intentionally (the markdown content replaces the "→ tool_name" line).
-                crate::markdown_render::render_markdown(md, dim_gray, width)
+                crate::markdown_render::render_markdown(md, dim_gray, width, theme)
             }
             Some(ToolCallBody::Yaml(yaml)) => {
                 let mut lines = vec![];
@@ -123,6 +129,7 @@ impl Tui {
         use_utc: bool,
         width: u16,
         skip_cache: bool,
+        theme: Option<&Theme>,
     ) -> RenderedEntry {
         match entry {
             TranscriptItem::SourceHeading(source) => {
@@ -209,7 +216,7 @@ impl Tui {
                 // asterisks for the moment, then upgrades to bold once the
                 // closing `**` arrives in a later chunk.
                 let mut entry =
-                    crate::markdown_render::render_markdown(text, Style::default(), width);
+                    crate::markdown_render::render_markdown(text, Style::default(), width, theme);
                 if let Some(suffix) =
                     Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
@@ -281,7 +288,7 @@ impl Tui {
                     }
                 }
                 let body_base = Style::default().add_modifier(Modifier::DIM);
-                let entry = crate::markdown_render::render_markdown(text, body_base, width);
+                let entry = crate::markdown_render::render_markdown(text, body_base, width, theme);
                 if !skip_cache {
                     *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
                 }
@@ -342,7 +349,7 @@ impl Tui {
                         return cached.clone();
                     }
                 }
-                let mut entry = Self::render_tool_call(tool_name, body.as_ref(), width);
+                let mut entry = Self::render_tool_call(tool_name, body.as_ref(), width, theme);
                 if let Some(suffix) =
                     Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
@@ -1319,6 +1326,7 @@ impl Tui {
                     use_utc,
                     width,
                     Some(i) == streaming_idx,
+                    self.code_theme.as_ref(),
                 );
                 if let Some(range) = selected_range {
                     if range.contains(&i) {

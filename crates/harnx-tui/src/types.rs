@@ -10,6 +10,7 @@ use ratatui_textarea::TextArea;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use syntect::highlighting::Theme;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
@@ -20,6 +21,7 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 
 pub struct Tui {
     pub(super) config: GlobalConfig,
+    pub(super) code_theme: Option<Theme>,
     /// Set to `true` by the after-editor hook so the main loop can call
     /// `terminal.clear()` before the next draw, forcing a full repaint after
     /// the external editor exits and the TUI re-enters the alternate screen.
