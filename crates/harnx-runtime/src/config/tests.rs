@@ -1099,27 +1099,52 @@ fn dynamic_provider_model_init_sets_client_name_from_provider() {
 // ── Regression tests for #826: package agent delegation/MCP tools must be
 //    scoped to the active agent's package ───────────────────────────────────
 
-/// Build an ACP server config that came from package `pkg` (bare stem `name`),
-/// mirroring what `load_package_servers` produces on disk.
-fn make_package_acp_server(name: &str, pkg: &str) -> AcpServerConfig {
-    AcpServerConfig {
-        name: name.to_string(),
-        command: "echo".to_string(),
-        args: vec![],
-        env: HashMap::new(),
-        enabled: true,
-        description: None,
-        idle_timeout_secs: 300,
-        operation_timeout_secs: 3600,
-        package: Some(pkg.to_string()),
-    }
+/// A package-loaded server identity: the bare yaml stem plus the package it
+/// belongs to. Mirrors what `load_package_servers` records on disk.
+struct PackageServer<'a> {
+    stem: &'a str,
+    package: &'a str,
 }
 
-/// Build an MCP server config that came from package `pkg`.
-fn make_package_mcp_server(name: &str, pkg: &str) -> McpServerConfig {
-    let mut server = make_test_mcp_server(name);
-    server.package = Some(pkg.to_string());
-    server
+impl<'a> PackageServer<'a> {
+    fn new(stem: &'a str, package: &'a str) -> Self {
+        Self { stem, package }
+    }
+
+    /// Build an ACP server config for this package server.
+    fn into_acp(self) -> AcpServerConfig {
+        AcpServerConfig {
+            name: self.stem.to_string(),
+            command: "echo".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            enabled: true,
+            description: None,
+            idle_timeout_secs: 300,
+            operation_timeout_secs: 3600,
+            package: Some(self.package.to_string()),
+        }
+    }
+
+    /// Build an MCP server config for this package server.
+    ///
+    /// Built inline (rather than via the `#[cfg(unix)]` `make_test_mcp_server`
+    /// helper) so these regression tests compile on all platforms.
+    fn into_mcp(self) -> McpServerConfig {
+        McpServerConfig {
+            name: self.stem.to_string(),
+            command: "echo".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            roots: vec![],
+            enabled: true,
+            description: None,
+            rename_tools: HashMap::new(),
+            tool_templates: HashMap::new(),
+            hooks: None,
+            package: Some(self.package.to_string()),
+        }
+    }
 }
 
 /// #826 regression: when the active agent belongs to package `pantheon`, its
@@ -1132,7 +1157,7 @@ fn make_package_mcp_server(name: &str, pkg: &str) -> McpServerConfig {
 #[test]
 fn package_agent_acp_delegation_tool_uses_bare_name_when_scoped() {
     let mut config = Config {
-        acp_servers: vec![make_package_acp_server("atlas", "pantheon")],
+        acp_servers: vec![PackageServer::new("atlas", "pantheon").into_acp()],
         ..Config::default()
     };
 
@@ -1170,7 +1195,7 @@ fn package_agent_acp_delegation_tool_uses_bare_name_when_scoped() {
 #[test]
 fn unscoped_managers_emit_prefixed_acp_tool_name() {
     let mut config = Config {
-        acp_servers: vec![make_package_acp_server("atlas", "pantheon")],
+        acp_servers: vec![PackageServer::new("atlas", "pantheon").into_acp()],
         ..Config::default()
     };
 
@@ -1204,8 +1229,8 @@ fn unscoped_managers_emit_prefixed_acp_tool_name() {
 fn package_agent_mcp_tools_scoped_to_active_package() {
     let mut config = Config {
         mcp_servers: vec![
-            make_package_mcp_server("fs", "pantheon"),
-            make_package_mcp_server("db", "coding"),
+            PackageServer::new("fs", "pantheon").into_mcp(),
+            PackageServer::new("db", "coding").into_mcp(),
         ],
         mcp_root: vec![],
         ..Config::default()
