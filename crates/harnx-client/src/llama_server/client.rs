@@ -294,7 +294,7 @@ impl crate::Client for crate::LlamaServerClient {
     }
 
     fn name(&self) -> &str {
-        self.config.name.as_deref().unwrap_or("llama-server")
+        &self.config.name
     }
 
     fn model(&self) -> &Model {

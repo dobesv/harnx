@@ -136,15 +136,15 @@ impl Config {
         // Qualify client names with package prefix after patching.
         // Must be after patching because apply_client_patch round-trips through
         // serde_json and resets #[serde(skip)] fields like `package`.
-        // Always call set_name_and_package (not just for bare names) so the
-        // `package` field is restored even for explicitly-named clients whose
+        // Always restore `package` even for explicitly-named clients whose
         // name already contains '/'.
         for client in &mut clients {
             let resolved_name = harnx_core::package_namespace::resolve_package_relative_name(
                 client.effective_name(),
                 Some(pkg_name),
             );
-            client.set_name_and_package(resolved_name, pkg_name.to_string());
+            client.set_name(resolved_name);
+            client.set_package(Some(pkg_name.to_string()));
         }
         clients
     }
@@ -155,10 +155,24 @@ impl Config {
         }
         let mut clients = Vec::new();
         for path in Self::sorted_yaml_files(dir)? {
+            // Derive the client name from the filename stem. Skip paths with a
+            // missing or empty stem (e.g. non-UTF-8 names) — an empty name would
+            // violate ClientConfig::set_name's debug_assert.
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(stem) if !stem.is_empty() => stem.to_string(),
+                _ => {
+                    log::warn!(
+                        "Skipping client config with invalid filename stem: '{}'",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
             let content = read_to_string(&path)
                 .with_context(|| format!("Failed to read client config '{}'", path.display()))?;
-            let client: ClientConfig = serde_yaml::from_str(&content)
+            let mut client: ClientConfig = serde_yaml::from_str(&content)
                 .with_context(|| format!("Failed to parse client config '{}'", path.display()))?;
+            client.set_name(stem);
             clients.push(client);
         }
         Ok(clients)
@@ -217,7 +231,7 @@ impl Config {
             .into_iter()
             .any(|(name, _)| provider == name);
         let client = if is_openai_compatible {
-            json!({ "type": "openai-compatible", "name": provider })
+            json!({ "type": "openai-compatible" })
         } else {
             json!({ "type": provider })
         };
@@ -233,8 +247,10 @@ impl Config {
             ..Self::default()
         };
 
-        config.clients =
-            vec![serde_json::from_value(client).context("Failed to parse client config")?];
+        let mut client: ClientConfig =
+            serde_json::from_value(client).context("Failed to parse client config")?;
+        client.set_name(provider.to_string());
+        config.clients = vec![client];
 
         let config_dir = Self::config_dir();
         config.mcp_servers =

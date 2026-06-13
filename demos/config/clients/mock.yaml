@@ -1,5 +1,4 @@
 type: openai-compatible
-name: mock
 api_key: sk-mock
 api_base: http://127.0.0.1:3829/v1
 models:

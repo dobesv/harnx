@@ -2,6 +2,5 @@
 # Env var: GROQ_API_KEY
 
 type: openai-compatible
-name: groq
 api_base: https://api.groq.com/openai/v1
 # api_key: "..."   # or set GROQ_API_KEY

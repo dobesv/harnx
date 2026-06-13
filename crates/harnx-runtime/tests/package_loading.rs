@@ -44,6 +44,67 @@ fn install_test_package(config_dir: &Path, pkg_name: &str, files: &[(&str, &str)
 }
 
 #[test]
+fn package_loading_test_package_client_patch_preserves_qualified_name() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    install_test_package(
+        tmp.path(),
+        "mypkg",
+        &[
+            (
+                "clients/openai.yaml",
+                "type: openai
+api_key: sk-original
+",
+            ),
+            (
+                "agents/worker.md",
+                "---
+model: openai:gpt-4o
+---
+You work.",
+            ),
+        ],
+    );
+
+    // The package patch file is a SIBLING of the package directory:
+    // packages/<pkg>.patch.yaml (see harnx_core::config_paths::package_patch_file).
+    std::fs::write(
+        tmp.path().join("packages").join("mypkg.patch.yaml"),
+        "clients:
+  - 'if .name == \"openai\" then .api_key = \"patched-key\" else . end'
+",
+    )
+    .unwrap();
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+
+    let client = config
+        .clients
+        .iter()
+        .find(|client| client.effective_name() == "mypkg/openai")
+        .expect("expected qualified package client named mypkg/openai");
+
+    assert_eq!(client.effective_name(), "mypkg/openai");
+    match client {
+        harnx_client::ClientConfig::OpenAIConfig(c) => {
+            assert_eq!(c.api_key.as_deref(), Some("patched-key"));
+            assert_eq!(c.package.as_deref(), Some("mypkg"));
+        }
+        _ => panic!("expected OpenAIConfig variant, got: {client:?}"),
+    }
+}
+
+#[test]
 fn package_loading_test_package_client_loaded_with_qualified_name() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -815,4 +876,55 @@ fn package_loading_test_package_explicit_yaml_acp_bare_arg_is_qualified_but_top_
         .find(|server| server.package.is_none() && server.name == "top")
         .expect("top-level acp server should load");
     assert_eq!(top_level_server.args, vec!["top".to_string()]);
+}
+
+/// Test that in-file `name:` is ignored and client name comes from filename.
+/// This directly verifies issue #823: client name should come from YAML filename stem,
+/// NOT from a `name:` field in file contents.
+#[test]
+fn package_loading_test_client_name_ignored_from_file_contents() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+
+    // Create clients directory at root level
+    std::fs::create_dir_all(tmp.path().join("clients")).unwrap();
+
+    // Write a client file named "foo.yaml" but with `name: bar` inside
+    // The effective_name should be "foo" (from filename), NOT "bar" (from file contents)
+    std::fs::write(
+        tmp.path().join("clients/foo.yaml"),
+        "type: claude\nname: bar\n",
+    )
+    .unwrap();
+
+    let config = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Config::init(
+            harnx_runtime::config::WorkingMode::Cmd,
+            false,
+            vec![],
+        ))
+        .expect("config should load");
+
+    // Find the client and verify its effective_name is "foo" (filename stem), not "bar"
+    let client = config
+        .clients
+        .iter()
+        .find(|c| c.effective_name() == "foo")
+        .expect("expected client named 'foo' from filename, not 'bar' from file contents");
+
+    // Also verify no client named "bar" exists (proving name: field was ignored)
+    assert!(
+        !config.clients.iter().any(|c| c.effective_name() == "bar"),
+        "client 'bar' should not exist - in-file name: field must be ignored"
+    );
+
+    // Verify the client is a ClaudeConfig variant (correct deserialization)
+    match client {
+        harnx_client::ClientConfig::ClaudeConfig(c) => {
+            assert_eq!(c.name, "foo");
+        }
+        _ => panic!("expected ClaudeConfig variant, got: {:?}", client),
+    }
 }

@@ -7,7 +7,8 @@ use crate::model::{ModelData, RequestPatches};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BedrockConfig {
-    pub name: Option<String>,
+    #[serde(skip)]
+    pub name: String,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub region: Option<String>,

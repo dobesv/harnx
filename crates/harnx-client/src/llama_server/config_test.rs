@@ -16,7 +16,7 @@ fn test_client_config_roundtrip_llama_server() {
         .with_socket_path("/tmp/llama.sock".to_string());
 
     let config = LlamaServerConfig {
-        name: Some("test-llama-server".to_string()),
+        name: "test-llama-server".to_string(),
         models: vec![model],
         binary_path: Some("/usr/local/bin/llama-server".to_string()),
         ..Default::default()
@@ -37,7 +37,6 @@ fn test_client_config_roundtrip_llama_server() {
     // Test deserialization from YAML
     let yaml = r#"
 type: llama-server
-name: test-llama-server
 binary_path: /usr/local/bin/llama-server
 models:
   - name: test-model
@@ -49,10 +48,12 @@ models:
       - --verbose
     socket_path: /tmp/llama.sock
 "#;
-    let deserialized: ClientConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut deserialized: ClientConfig = serde_yaml::from_str(yaml).unwrap();
+    // Set the name as the loader would
+    deserialized.set_name("test-llama-server".to_string());
     match deserialized {
         ClientConfig::LlamaServerConfig(c) => {
-            assert_eq!(c.name, Some("test-llama-server".to_string()));
+            assert_eq!(c.name, "test-llama-server");
             assert_eq!(c.models.len(), 1);
             let m = &c.models[0];
             assert_eq!(m.name, "test-model");
@@ -77,7 +78,7 @@ fn test_client_config_hf_repo() {
         .with_hf_repo("unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL".to_string());
 
     let config = LlamaServerConfig {
-        name: Some("test-hf".to_string()),
+        name: "test-hf".to_string(),
         models: vec![model],
         ..Default::default()
     };
@@ -96,14 +97,16 @@ fn test_client_config_hf_repo() {
     // Test deserialization from YAML
     let yaml = r#"
 type: llama-server
-name: test-hf
 models:
   - name: hf-model
     hf_repo: unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
 "#;
-    let deserialized: ClientConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut deserialized: ClientConfig = serde_yaml::from_str(yaml).unwrap();
+    // Set the name as the loader would (from the filename stem).
+    deserialized.set_name("test-hf".to_string());
     match deserialized {
         ClientConfig::LlamaServerConfig(c) => {
+            assert_eq!(c.name, "test-hf");
             assert_eq!(c.models.len(), 1);
             let m = &c.models[0];
             assert_eq!(m.name, "hf-model");
@@ -122,7 +125,6 @@ fn test_client_config_unknown_type() {
 
     let yaml = r#"
 type: unknown-provider
-name: test
 "#;
     let deserialized: ClientConfig = serde_yaml::from_str(yaml).unwrap();
     assert!(matches!(deserialized, ClientConfig::Unknown));

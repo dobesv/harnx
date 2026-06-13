@@ -1,5 +1,4 @@
 type: openai-compatible
-name: bedrock
 # AWS Bedrock OpenAI-compatible endpoint.
 # Change the region in api_base if you use a different one.
 api_base: https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1

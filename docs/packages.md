@@ -110,6 +110,16 @@ Package agents and servers are automatically namespaced to avoid collisions with
 
 The `/` in agent names is replaced with `__` in tool names.
 
+### Naming Convention
+
+The names of agents, servers, and clients are derived from their **filename stems** (extension stripped):
+
+- **Agents**: `agents/coder.md` becomes `coder`.
+- **MCP Servers**: `mcp_servers/fs.yaml` becomes `fs`.
+- **Clients**: `clients/openai.yaml` becomes `openai`.
+
+For package-provided entities, the name is prefixed with the package name: `<package>/<stem>`. For example, `my-pkg/openai`. Any `name:` field inside the configuration file is ignored.
+
 ### Within-package `use_tools` references
 
 When an agent inside a package references tools from the same package, write them exactly as you would for a top-level agent — using the bare server name:
@@ -155,7 +165,7 @@ mcp_servers:
 ```
 
 - **Matching**: Use `if .name == "..." then ... end` for exact matching, or `if (.name | test("...")) then ... end` for pattern matching. The `else .` (pass through unchanged) is implicit when omitted.
-- **Context**: Agent patches match against the bare agent name (stem), not the qualified `pkg/name` form.
+- **Context**: Patches match against the **bare name** (filename stem), not the qualified `pkg/name` form. This applies to agents, clients, and MCP servers.
 - **Chaining**: Filters are applied in sequence. If a filter fails, it is skipped with a warning.
 
 ## manifest.yaml schema

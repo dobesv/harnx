@@ -2,7 +2,6 @@
 # Vertex AI uses Google Application Default Credentials (ADC).
 
 type: vertexai
-name: vertexai
 
 # Required: Google Cloud Project ID
 project_id: "your-project-id"

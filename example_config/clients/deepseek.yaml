@@ -2,6 +2,5 @@
 # Env var: DEEPSEEK_API_KEY
 
 type: openai-compatible
-name: deepseek
 api_base: https://api.deepseek.com
 # api_key: "..."   # or set DEEPSEEK_API_KEY

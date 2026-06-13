@@ -84,82 +84,54 @@ register_client!(
 );
 
 impl ClientConfig {
-    /// Returns the client's configured name (the `name` field of the inner config),
-    /// or `None` for `Unknown` variants.
-    pub fn inner_name(&self) -> Option<&str> {
-        match self {
-            ClientConfig::OpenAIConfig(c) => c.name.as_deref(),
-            ClientConfig::OpenAICompatibleConfig(c) => c.name.as_deref(),
-            ClientConfig::GeminiConfig(c) => c.name.as_deref(),
-            ClientConfig::ClaudeConfig(c) => c.name.as_deref(),
-            ClientConfig::CohereConfig(c) => c.name.as_deref(),
-            ClientConfig::AzureOpenAIConfig(c) => c.name.as_deref(),
-            ClientConfig::VertexAIConfig(c) => c.name.as_deref(),
-            ClientConfig::BedrockConfig(c) => c.name.as_deref(),
-            ClientConfig::LlamaServerConfig(c) => c.name.as_deref(),
-            ClientConfig::Unknown => None,
-        }
-    }
-
     /// Returns the effective name used to identify this client.
-    /// This is the explicit `name` field if set, or the provider's default name.
+    /// This is the configured `name` field (filename-derived), or "unknown" for Unknown.
     pub fn effective_name(&self) -> &str {
         match self {
-            ClientConfig::OpenAIConfig(c) => c.name.as_deref().unwrap_or("openai"),
-            ClientConfig::OpenAICompatibleConfig(c) => {
-                c.name.as_deref().unwrap_or("openai-compatible")
-            }
-            ClientConfig::GeminiConfig(c) => c.name.as_deref().unwrap_or("gemini"),
-            ClientConfig::ClaudeConfig(c) => c.name.as_deref().unwrap_or("claude"),
-            ClientConfig::CohereConfig(c) => c.name.as_deref().unwrap_or("cohere"),
-            ClientConfig::AzureOpenAIConfig(c) => c.name.as_deref().unwrap_or("azure-openai"),
-            ClientConfig::VertexAIConfig(c) => c.name.as_deref().unwrap_or("vertexai"),
-            ClientConfig::BedrockConfig(c) => c.name.as_deref().unwrap_or("bedrock"),
-            ClientConfig::LlamaServerConfig(c) => c.name.as_deref().unwrap_or("llama-server"),
+            ClientConfig::OpenAIConfig(c) => &c.name,
+            ClientConfig::OpenAICompatibleConfig(c) => &c.name,
+            ClientConfig::GeminiConfig(c) => &c.name,
+            ClientConfig::ClaudeConfig(c) => &c.name,
+            ClientConfig::CohereConfig(c) => &c.name,
+            ClientConfig::AzureOpenAIConfig(c) => &c.name,
+            ClientConfig::VertexAIConfig(c) => &c.name,
+            ClientConfig::BedrockConfig(c) => &c.name,
+            ClientConfig::LlamaServerConfig(c) => &c.name,
             ClientConfig::Unknown => "unknown",
         }
     }
 
-    /// Sets the `name` and `package` fields on the inner config struct.
-    /// Used at load time to qualify package clients.
-    pub fn set_name_and_package(&mut self, name: String, package: String) {
+    /// Sets the `name` field on the inner config struct.
+    /// Used at load time to set the filename-derived name.
+    pub fn set_name(&mut self, name: String) {
+        debug_assert!(!name.is_empty());
         match self {
-            ClientConfig::OpenAIConfig(c) => {
-                c.name = Some(name);
-                c.package = Some(package);
-            }
-            ClientConfig::OpenAICompatibleConfig(c) => {
-                c.name = Some(name);
-                c.package = Some(package);
-            }
-            ClientConfig::GeminiConfig(c) => {
-                c.name = Some(name);
-                c.package = Some(package);
-            }
-            ClientConfig::ClaudeConfig(c) => {
-                c.name = Some(name);
-                c.package = Some(package);
-            }
-            ClientConfig::CohereConfig(c) => {
-                c.name = Some(name);
-                c.package = Some(package);
-            }
-            ClientConfig::AzureOpenAIConfig(c) => {
-                c.name = Some(name);
-                c.package = Some(package);
-            }
-            ClientConfig::VertexAIConfig(c) => {
-                c.name = Some(name);
-                c.package = Some(package);
-            }
-            ClientConfig::BedrockConfig(c) => {
-                c.name = Some(name);
-                c.package = Some(package);
-            }
-            ClientConfig::LlamaServerConfig(c) => {
-                c.name = Some(name);
-                c.package = Some(package);
-            }
+            ClientConfig::OpenAIConfig(c) => c.name = name,
+            ClientConfig::OpenAICompatibleConfig(c) => c.name = name,
+            ClientConfig::GeminiConfig(c) => c.name = name,
+            ClientConfig::ClaudeConfig(c) => c.name = name,
+            ClientConfig::CohereConfig(c) => c.name = name,
+            ClientConfig::AzureOpenAIConfig(c) => c.name = name,
+            ClientConfig::VertexAIConfig(c) => c.name = name,
+            ClientConfig::BedrockConfig(c) => c.name = name,
+            ClientConfig::LlamaServerConfig(c) => c.name = name,
+            ClientConfig::Unknown => {}
+        }
+    }
+
+    /// Sets the `package` field on the inner config struct.
+    /// Used at load time to set the package identifier.
+    pub fn set_package(&mut self, package: Option<String>) {
+        match self {
+            ClientConfig::OpenAIConfig(c) => c.package = package,
+            ClientConfig::OpenAICompatibleConfig(c) => c.package = package,
+            ClientConfig::GeminiConfig(c) => c.package = package,
+            ClientConfig::ClaudeConfig(c) => c.package = package,
+            ClientConfig::CohereConfig(c) => c.package = package,
+            ClientConfig::AzureOpenAIConfig(c) => c.package = package,
+            ClientConfig::VertexAIConfig(c) => c.package = package,
+            ClientConfig::BedrockConfig(c) => c.package = package,
+            ClientConfig::LlamaServerConfig(c) => c.package = package,
             ClientConfig::Unknown => {}
         }
     }

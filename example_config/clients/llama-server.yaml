@@ -1,5 +1,4 @@
 type: llama-server
-name: local-llama
 
 # binary_path: llama-server  # Optional: Shared binary path for all models below
 

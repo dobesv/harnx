@@ -153,7 +153,7 @@ async fn llama_server_mock_multi_model_distinct_processes() -> Result<()> {
 
     // Single provider config with two models, each with its own GGUF/socket
     let provider = LlamaServerConfig {
-        name: Some("multi-llama".to_string()),
+        name: "multi-llama".to_string(),
         models: vec![
             ModelData::new("model-a")
                 .with_model_path(model_path_a.display().to_string())
@@ -290,7 +290,7 @@ async fn llama_server_mock_hf_repo_only() -> Result<()> {
         ]);
 
     let provider = LlamaServerConfig {
-        name: Some("test-hf-provider".to_string()),
+        name: "test-hf-provider".to_string(),
         models: vec![model_data],
         binary_path: Some(binary_path.display().to_string()),
         ..Default::default()
@@ -349,7 +349,7 @@ async fn llama_server_mock_name_as_hf_repo() -> Result<()> {
         ]);
 
     let provider = LlamaServerConfig {
-        name: Some("test-name-hf".to_string()),
+        name: "test-name-hf".to_string(),
         models: vec![model_data],
         binary_path: Some(binary_path.display().to_string()),
         ..Default::default()
@@ -413,7 +413,7 @@ fn build_client(config: &LlamaServerProcessConfig, model_name: &str) -> Option<B
         .with_extra_args(config.extra_args.clone());
 
     let provider = LlamaServerConfig {
-        name: Some("llama-server".to_string()),
+        name: "llama-server".to_string(),
         models: vec![model_data],
         binary_path: config.binary_path.as_ref().map(|p| p.display().to_string()),
         ..Default::default()

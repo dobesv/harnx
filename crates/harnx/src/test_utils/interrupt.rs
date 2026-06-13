@@ -472,6 +472,7 @@ pub fn spawn_oneshot(
     harnx_bin: &Path,
     prompt: &str,
 ) -> Result<std::process::Child> {
+    harnx_core::require_nextest();
     use std::process::{Command, Stdio};
     // --agent default is required since chat activity needs an active agent.
     // The "default" agent is written by write_minimal_config.
@@ -522,6 +523,7 @@ pub async fn spawn_acp_client(
     harnx_bin: &Path,
     agent: &str,
 ) -> Result<harnx_acp::AcpClient> {
+    harnx_core::require_nextest();
     let mut env = HashMap::new();
     env.insert(
         "HARNX_CONFIG_DIR".to_string(),

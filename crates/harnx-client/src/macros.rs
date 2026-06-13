@@ -53,7 +53,7 @@ macro_rules! register_client {
                         if let Some(v) = $crate::ALL_PROVIDER_MODELS.iter().find(|v| {
                             v.provider == $name ||
                                 ($name == OpenAICompatibleClient::NAME
-                                    && local_config.name.as_ref().map(|name| name.starts_with(&v.provider)).unwrap_or_default())
+                                    && local_config.name.starts_with(&v.provider))
                         }) {
                             Model::from_config(client_name, &v.models)
                         } else {
@@ -74,7 +74,7 @@ macro_rules! register_client {
                 }
 
                 pub fn name(local_config: &$config) -> &str {
-                    local_config.name.as_deref().unwrap_or(Self::NAME)
+                    &local_config.name
                 }
             }
 

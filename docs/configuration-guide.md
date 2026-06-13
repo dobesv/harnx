@@ -66,18 +66,18 @@ Each LLM provider is configured in its own YAML file within the `clients/` direc
 
 For a complete list of supported providers and their specific configuration options, see the [**LLM Providers Reference**](providers.md).
 
-**Note:** The filename is for organization only. The client's ID used in `model` settings (e.g., `myclient:gpt-4`) is determined by the `name` field inside the configuration file.
+**Note:** The **filename** (without `.yaml`) is used as the client's ID in `model` settings (e.g., `openai:gpt-4`). Any `name` field inside the file is ignored.
 
 ### General Client Options
 
 ```yaml
 type: openai              # Provider type (openai, claude, gemini, etc.)
-name: my-openai           # Client ID for model strings (e.g., my-openai:gpt-4)
 api_key: sk-...           # Optional if <NAME>_API_KEY env var is set
 api_base: https://...     # Optional custom endpoint
 patches:                  # Patch API requests using jq expressions
   chat_completions:
     - '.body.cache_control = {"type":"ephemeral"}'
+```
 
 ### Per-Model Patches
 

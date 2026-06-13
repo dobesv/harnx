@@ -199,7 +199,7 @@ fn edit_message_range_supports_reordering_plain_messages() {
             .clients
             .push(harnx_client::ClientConfig::OpenAICompatibleConfig(
                 harnx_core::provider_config::openai_compatible::OpenAICompatibleConfig {
-                    name: Some("test".to_string()),
+                    name: "test".to_string(),
                     api_base: None,
                     api_key: None,
                     models: vec![],

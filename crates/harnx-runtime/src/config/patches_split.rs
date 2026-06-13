@@ -69,12 +69,48 @@ pub(super) fn apply_client_patch(client: &mut ClientConfig, patches: &[String]) 
     if patches.is_empty() {
         return Ok(());
     }
-    let input = serde_json::to_value(&*client)
+
+    let saved_name = match client {
+        ClientConfig::Unknown => None,
+        _ => Some(client.effective_name().to_string()),
+    };
+    let saved_package = match client {
+        ClientConfig::OpenAIConfig(c) => c.package.clone(),
+        ClientConfig::OpenAICompatibleConfig(c) => c.package.clone(),
+        ClientConfig::GeminiConfig(c) => c.package.clone(),
+        ClientConfig::ClaudeConfig(c) => c.package.clone(),
+        ClientConfig::CohereConfig(c) => c.package.clone(),
+        ClientConfig::AzureOpenAIConfig(c) => c.package.clone(),
+        ClientConfig::VertexAIConfig(c) => c.package.clone(),
+        ClientConfig::BedrockConfig(c) => c.package.clone(),
+        ClientConfig::LlamaServerConfig(c) => c.package.clone(),
+        ClientConfig::Unknown => None,
+    };
+
+    let mut input = serde_json::to_value(&*client)
         .with_context(|| "Failed to serialize ClientConfig for jaq patch")?;
+    if let (Some(name), serde_json::Value::Object(obj)) = (&saved_name, &mut input) {
+        obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
+    }
+
     let output = harnx_core::jaq::eval_filters_strict(patches, input)
         .with_context(|| "jq patch expression failed for client config")?;
+
+    let patched_name = output
+        .as_object()
+        .and_then(|obj| obj.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+
     *client = serde_json::from_value(output)
         .with_context(|| "Failed to deserialize ClientConfig after jaq patch")?;
+
+    if let Some(name) = patched_name.or(saved_name) {
+        client.set_name(name);
+    }
+    client.set_package(saved_package);
+
     Ok(())
 }
 

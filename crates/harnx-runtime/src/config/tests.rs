@@ -943,8 +943,17 @@ use super::apply_client_patch;
 use harnx_client::ClientConfig;
 
 fn make_openai_client() -> ClientConfig {
-    serde_yaml::from_str("type: openai\napi_key: sk-original\n")
-        .expect("should parse openai client config")
+    let mut client: ClientConfig = serde_yaml::from_str("type: openai\napi_key: sk-original\n")
+        .expect("should parse openai client config");
+    client.set_name("openai".to_string());
+    client
+}
+
+fn make_claude_client() -> ClientConfig {
+    let mut client: ClientConfig = serde_yaml::from_str("type: claude\napi_key: sk-original\n")
+        .expect("should parse claude client config");
+    client.set_name("claude".to_string());
+    client
 }
 
 #[test]
@@ -976,6 +985,26 @@ fn apply_client_patch_sets_field_via_jq_expression() {
         assert_eq!(c.api_key.as_deref(), Some("sk-patched"));
     } else {
         panic!("expected OpenAI client, got: {client:?}");
+    }
+}
+
+#[test]
+fn apply_client_patch_name_filter_matches_and_preserves_name() {
+    let mut client = make_claude_client();
+    client.set_package(Some("pkg".to_string()));
+
+    let result = apply_client_patch(
+        &mut client,
+        &[r#"if .name == "claude" then .api_key = "patched-key" else . end"#.to_string()],
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(client.effective_name(), "claude");
+    if let ClientConfig::ClaudeConfig(c) = &client {
+        assert_eq!(c.api_key.as_deref(), Some("patched-key"));
+        assert_eq!(c.package.as_deref(), Some("pkg"));
+    } else {
+        panic!("expected Claude client, got: {client:?}");
     }
 }
 
@@ -1039,4 +1068,30 @@ fn handoff_tool_declarations_are_package_aware_and_valid() {
         handoff_targets.get("__global").map(String::as_str),
         Some("global")
     );
+}
+
+#[test]
+fn dynamic_provider_model_init_sets_client_name_from_provider() {
+    struct ProviderGuard(Option<std::ffi::OsString>);
+    impl Drop for ProviderGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => unsafe { std::env::set_var("HARNX_PROVIDER", value) },
+                None => unsafe { std::env::remove_var("HARNX_PROVIDER") },
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    let _lock = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", tmp.path());
+    let _provider_guard = ProviderGuard(std::env::var_os("HARNX_PROVIDER"));
+    unsafe { std::env::set_var("HARNX_PROVIDER", "claude:some-model") };
+
+    let config = tokio_test::block_on(Config::init(WorkingMode::Cmd, false, vec![]))
+        .expect("dynamic config should load");
+
+    assert_eq!(config.clients.len(), 1);
+    assert_eq!(config.clients[0].effective_name(), "claude");
 }
