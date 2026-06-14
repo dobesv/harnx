@@ -920,6 +920,14 @@ pub fn add_tool_calls(
 /// Matches each result to its call by id (or by position when the id
 /// is absent).
 pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResult]) -> Result<()> {
+    // Resolve the attachments dir up front so we don't need to borrow `session`
+    // again while the `pending` mutable borrow below is live.
+    let attachments_dir = session
+        .path
+        .as_deref()
+        .map(|p| crate::config::attachments::attachments_dir_for(std::path::Path::new(p)));
+    let mut cid_urls = std::collections::HashMap::new();
+
     let Some(last) = session.messages.last_mut() else {
         anyhow::bail!("add_tool_results called on empty session");
     };
@@ -952,6 +960,21 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
         }
     }
 
+    // Externalize inline image data URIs in tool-result content to cid refs
+    // before persisting, freeing the in-memory base64. Files are written now;
+    // the cid -> filename map is logged as a DataUrls entry after the
+    // ToolResults entry (below) so the ToolCalls/ToolResults pairing on replay
+    // is not split.
+    if let Some(dir) = attachments_dir.as_ref() {
+        for slot in pending.tool_results.iter_mut() {
+            if let Err(err) =
+                crate::config::attachments::externalize_parts(dir, &mut slot.content, &mut cid_urls)
+            {
+                log::warn!("tool-result attachment externalization failed: {err}");
+            }
+        }
+    }
+
     let log_results: Vec<harnx_core::session::ToolOutput> = pending
         .tool_results
         .iter()
@@ -973,6 +996,17 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
     );
     if !appended {
         session.dirty = true;
+    }
+    if !cid_urls.is_empty() {
+        if !append_event(
+            session,
+            &SessionLogEntry::DataUrls {
+                urls: cid_urls.clone(),
+            },
+        ) {
+            session.dirty = true;
+        }
+        session.data_urls.extend(cid_urls);
     }
     session.update_tokens();
     Ok(())
@@ -1118,7 +1152,52 @@ pub fn echo_messages(session: &Session, input: &Input) -> String {
     serde_yaml::to_string(&messages).unwrap_or_else(|_| "Unable to echo message".into())
 }
 
+/// Build the outgoing message list and expand any `cid:` attachment references
+/// back into inline `data:` URIs for transmission. Expansion is transient —
+/// it affects only the returned messages, never the stored session.
 pub fn build_messages(session: &Session, input: &Input) -> Result<Vec<Message>> {
+    let mut messages = build_messages_inner(session, input)?;
+    expand_message_attachments(session, &mut messages);
+    Ok(messages)
+}
+
+/// Replace `cid:` image references in outgoing messages with inline `data:`
+/// URIs (base64 backend). Walks both plain content arrays and tool-result
+/// content. No-op when the session has no attachments dir / no cid refs.
+fn expand_message_attachments(session: &Session, messages: &mut [Message]) {
+    // A `cid:` ref only ever enters a message via the externalize-on-save path,
+    // which requires a session path — so no path means no refs to expand.
+    let Some(path) = session.path.as_ref() else {
+        return;
+    };
+    let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(path));
+    let encoder = crate::config::attachments::Base64Encoder;
+    for message in messages.iter_mut() {
+        match &mut message.content {
+            MessageContent::Array(parts) => {
+                if let Err(err) =
+                    crate::config::attachments::expand_parts(&encoder, &dir, parts)
+                {
+                    log::warn!("attachment expansion failed: {err}");
+                }
+            }
+            MessageContent::ToolCalls(tool_calls) => {
+                for result in tool_calls.tool_results.iter_mut() {
+                    if let Err(err) = crate::config::attachments::expand_parts(
+                        &encoder,
+                        &dir,
+                        &mut result.content,
+                    ) {
+                        log::warn!("attachment expansion failed: {err}");
+                    }
+                }
+            }
+            MessageContent::Text(_) => {}
+        }
+    }
+}
+
+fn build_messages_inner(session: &Session, input: &Input) -> Result<Vec<Message>> {
     let mut messages = session.messages.clone();
     if input.continue_output().is_some() {
         return Ok(messages);
@@ -2020,10 +2099,15 @@ results:
 
         let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
         assert!(persisted.contains("<image: image/png,"));
+        assert!(persisted.contains("cid:"), "tool-result image is referenced by cid");
         assert!(
-            persisted.contains(&data_uri),
-            "persisted session should inline tool result data URI in content"
+            !persisted.contains(&base64_payload),
+            "tool-result base64 must not be inlined in the transcript"
         );
+        let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(
+            session.path.as_ref().unwrap(),
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().flatten().count(), 1);
 
         let reloaded = super::load_from_log_for_test(&persisted);
         let MessageContent::ToolCalls(tool_calls) = &reloaded
@@ -2038,7 +2122,9 @@ results:
         assert_eq!(tool_calls.tool_results.len(), 1);
         assert_eq!(tool_calls.tool_results[0].content.len(), 1);
         match &tool_calls.tool_results[0].content[0] {
-            MessageContentPart::ImageUrl { image_url } => assert_eq!(image_url.url, data_uri),
+            MessageContentPart::ImageUrl { image_url } => {
+                assert!(image_url.url.starts_with("cid:"), "reloaded content keeps cid ref");
+            }
             other => panic!("expected ImageUrl content part, got {other:#?}"),
         }
         assert_eq!(tool_calls.tool_results[0].output, redacted_output);
