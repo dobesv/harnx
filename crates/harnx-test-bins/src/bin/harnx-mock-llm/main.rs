@@ -433,20 +433,7 @@ fn write_streaming_response(
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.flush();
 
-    let chunks: Vec<String> = if text.is_empty() {
-        vec![]
-    } else {
-        text.split_whitespace()
-            .enumerate()
-            .map(|(i, word)| {
-                if i == 0 {
-                    word.to_string()
-                } else {
-                    format!(" {word}")
-                }
-            })
-            .collect()
-    };
+    let chunks = chunk_text_for_stream(text);
 
     for chunk in chunks {
         let event = format!(
@@ -544,4 +531,105 @@ fn build_non_streaming_response(text: &str, tool_calls: Vec<Value>) -> Value {
             "total_tokens": 0
         }
     })
+}
+
+/// Chunks text for SSE streaming, preserving all whitespace including newlines.
+///
+/// Each chunk ends at a word boundary, including trailing whitespace.
+/// The concatenation of all chunks exactly equals the input text.
+fn chunk_text_for_stream(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+
+    for ch in text.chars() {
+        current_chunk.push(ch);
+        // End chunk after each word (non-whitespace followed by whitespace)
+        // This produces multiple small chunks that preserve all characters.
+        if ch.is_whitespace() && !current_chunk.trim().is_empty() {
+            chunks.push(std::mem::take(&mut current_chunk));
+        }
+    }
+
+    // Push any remaining content
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chunk_text_preserves_newlines() {
+        let input = "line1\n  line2\n\n```rust\nfn x(){}\n```\n";
+        let chunks = chunk_text_for_stream(input);
+        let reconstructed = chunks.join("");
+        assert_eq!(
+            input, reconstructed,
+            "Chunks must preserve exact text including newlines"
+        );
+    }
+
+    #[test]
+    fn test_chunk_empty_input() {
+        let chunks = chunk_text_for_stream("");
+        assert!(chunks.is_empty(), "Empty input should yield empty chunks");
+    }
+
+    #[test]
+    fn test_chunk_single_word() {
+        let input = "hello";
+        let chunks = chunk_text_for_stream(input);
+        assert_eq!(chunks, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_chunk_word_with_space() {
+        let input = "hello ";
+        let chunks = chunk_text_for_stream(input);
+        assert_eq!(chunks, vec!["hello "]);
+    }
+
+    #[test]
+    fn test_chunk_multiple_words() {
+        let input = "hello world";
+        let chunks = chunk_text_for_stream(input);
+        assert_eq!(chunks, vec!["hello ", "world"]);
+        assert_eq!(chunks.join(""), input);
+    }
+
+    #[test]
+    fn test_chunk_preserves_indentation() {
+        let input = "  indented\n    more indented";
+        let chunks = chunk_text_for_stream(input);
+        assert_eq!(chunks.join(""), input);
+    }
+
+    #[test]
+    fn test_chunk_preserves_blank_lines() {
+        let input = "line1\n\nline3";
+        let chunks = chunk_text_for_stream(input);
+        assert_eq!(chunks.join(""), input);
+    }
+
+    #[test]
+    fn test_chunk_preserves_trailing_newline() {
+        let input = "line\n";
+        let chunks = chunk_text_for_stream(input);
+        assert_eq!(chunks.join(""), input);
+    }
+
+    #[test]
+    fn test_chunk_code_fence() {
+        let input = "```rust\ncode\n```\n";
+        let chunks = chunk_text_for_stream(input);
+        assert_eq!(chunks.join(""), input);
+    }
 }

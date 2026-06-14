@@ -1068,6 +1068,36 @@ impl Tui {
                         self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
                     }
                     self.pin_transcript_to_bottom();
+                } else if !output.is_empty() {
+                    let tail_start = self
+                        .app
+                        .transcript
+                        .iter()
+                        .rposition(|item| !matches!(item, TranscriptItem::AssistantText { .. }))
+                        .map_or(0, |idx| idx + 1);
+
+                    if tail_start < self.app.transcript.len() {
+                        let mut tail = self.app.transcript.split_off(tail_start);
+                        if let Some(TranscriptItem::AssistantText {
+                            text,
+                            rendered_cache,
+                            ..
+                        }) = tail.first_mut()
+                        {
+                            *text = output;
+                            *rendered_cache = None;
+                        }
+                        tail.truncate(1);
+                        self.app.transcript.extend(tail);
+                    } else {
+                        self.app.transcript.push(TranscriptItem::AssistantText {
+                            text: output,
+                            seq: None,
+                            timestamp: Some(chrono::Utc::now()),
+                            rendered_cache: None,
+                        });
+                    }
+                    self.pin_transcript_to_bottom();
                 }
                 self.app.streaming_assistant_idx = None;
                 self.app.streamed_text_this_turn = false;
