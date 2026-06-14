@@ -188,6 +188,21 @@ pub fn expand_parts(
     Ok(())
 }
 
+/// Remove a session's attachments directory if it exists. Safe to call when
+/// the directory was never created.
+pub fn remove_attachments_dir(session_yaml_path: &Path) -> Result<()> {
+    let dir = attachments_dir_for(session_yaml_path);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        // No directory means there was nothing to clean up — a success, and
+        // race-free (no exists()-then-remove gap).
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to remove attachments dir {}", dir.display()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +261,21 @@ mod tests {
         assert_eq!(cid, cid2);
         let count = std::fs::read_dir(&dir).unwrap().flatten().count();
         assert_eq!(count, 1, "duplicate blob does not create a second file");
+    }
+
+    #[test]
+    fn remove_attachments_dir_is_idempotent() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let yaml = tmp.path().join("abc.yaml");
+        let dir = attachments_dir_for(&yaml);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.png"), b"x").unwrap();
+
+        remove_attachments_dir(&yaml).unwrap();
+        assert!(!dir.exists());
+        // Second call is a no-op, not an error.
+        remove_attachments_dir(&yaml).unwrap();
     }
 
     #[test]

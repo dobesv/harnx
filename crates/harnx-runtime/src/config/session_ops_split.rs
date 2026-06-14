@@ -333,6 +333,13 @@ impl Config {
             // is preserved across agent changes, not the conversation history.
             let session_path = self.session_file(&name);
             if session_path.exists() {
+                if let Err(err) = crate::config::attachments::remove_attachments_dir(&session_path)
+                {
+                    log::warn!(
+                        "failed to remove attachments for '{}' during reset: {err}",
+                        session_path.display()
+                    );
+                }
                 remove_file(&session_path).with_context(|| {
                     format!("Failed to remove session file '{}'", session_path.display())
                 })?;
