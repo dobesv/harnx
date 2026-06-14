@@ -5,10 +5,12 @@
 //! rest. The wire encoding is pluggable (`AttachmentEncoder`); only the
 //! base64 backend ships today, with provider upload-API backends to follow.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use harnx_core::crypto::{base64_decode, base64_encode, sha256};
+use harnx_core::message::MessageContentPart;
 
 /// Prefix marking a content reference in `ImageUrl.url`.
 pub const CID_PREFIX: &str = "cid:";
@@ -47,6 +49,13 @@ pub fn attachments_dir_for(session_yaml_path: &Path) -> PathBuf {
     parent.join(format!("{stem}.attachments"))
 }
 
+/// The content-addressed filename (`<sha256>.<ext>`) for an inline `data:`
+/// URI. Single source of truth shared by the writer and the `cid -> filename`
+/// map, so the recorded filename can never drift from the file on disk.
+fn attachment_filename(data_url: &str) -> String {
+    format!("{}.{}", sha256(data_url), extension_for_data_url(data_url))
+}
+
 /// Split a `data:<mime>;base64,<payload>` URI into (mime, payload).
 fn split_data_url(data_url: &str) -> Option<(&str, &str)> {
     let rest = data_url.strip_prefix("data:")?;
@@ -69,19 +78,17 @@ pub fn write_attachment(dir: &Path, data_url: &str) -> Result<String> {
         return Ok(data_url.to_string());
     }
     let cid = cid_for_data_url(data_url);
-    let hash = cid.strip_prefix(CID_PREFIX).unwrap_or(&cid);
-    let ext = extension_for_data_url(data_url);
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create attachments dir {}", dir.display()))?;
-    let file_path = dir.join(format!("{hash}.{ext}"));
+    let file_path = dir.join(attachment_filename(data_url));
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&file_path)
     {
         Ok(mut file) => {
-            let (_mime, payload) = split_data_url(data_url)
-                .ok_or_else(|| anyhow::anyhow!("malformed data URI"))?;
+            let (_mime, payload) =
+                split_data_url(data_url).ok_or_else(|| anyhow::anyhow!("malformed data URI"))?;
             let bytes = base64_decode(payload).context("failed to decode attachment base64")?;
             file.write_all(&bytes)
                 .with_context(|| format!("Failed to write attachment {}", file_path.display()))?;
@@ -143,6 +150,44 @@ impl AttachmentEncoder for Base64Encoder {
     }
 }
 
+/// Rewrite every inline-`data:` image part in `parts` to a `cid:` reference,
+/// writing the bytes to `dir` and recording `cid -> filename` in `map`.
+/// Parts already holding a `cid:`/external URL are left unchanged.
+pub fn externalize_parts(
+    dir: &Path,
+    parts: &mut [MessageContentPart],
+    map: &mut HashMap<String, String>,
+) -> Result<()> {
+    for part in parts.iter_mut() {
+        if let MessageContentPart::ImageUrl { image_url } = part {
+            if image_url.url.starts_with("data:") {
+                let filename = attachment_filename(&image_url.url);
+                let cid = write_attachment(dir, &image_url.url)?;
+                map.insert(cid.clone(), filename);
+                image_url.url = cid;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replace every `cid:` image reference in `parts` with its inline `data:`
+/// URI for transmission. Used on the send path only.
+pub fn expand_parts(
+    encoder: &dyn AttachmentEncoder,
+    dir: &Path,
+    parts: &mut [MessageContentPart],
+) -> Result<()> {
+    for part in parts.iter_mut() {
+        if let MessageContentPart::ImageUrl { image_url } = part {
+            if image_url.url.starts_with(CID_PREFIX) {
+                image_url.url = encoder.expand(dir, &image_url.url)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,7 +204,10 @@ mod tests {
     fn extension_is_derived_from_mime() {
         assert_eq!(extension_for_data_url("data:image/png;base64,AA"), "png");
         assert_eq!(extension_for_data_url("data:image/jpeg;base64,AA"), "jpg");
-        assert_eq!(extension_for_data_url("data:application/x;base64,AA"), "bin");
+        assert_eq!(
+            extension_for_data_url("data:application/x;base64,AA"),
+            "bin"
+        );
     }
 
     #[test]
@@ -188,12 +236,64 @@ mod tests {
 
         let encoder = Base64Encoder;
         let restored = encoder.expand(&dir, &cid).unwrap();
-        assert_eq!(restored, data_url, "expand reproduces the original data URI");
+        assert_eq!(
+            restored, data_url,
+            "expand reproduces the original data URI"
+        );
 
         // Writing the same blob again is idempotent (no duplicate file).
         let cid2 = write_attachment(&dir, &data_url).unwrap();
         assert_eq!(cid, cid2);
         let count = std::fs::read_dir(&dir).unwrap().flatten().count();
         assert_eq!(count, 1, "duplicate blob does not create a second file");
+    }
+
+    #[test]
+    fn externalize_then_expand_parts_round_trips() {
+        use harnx_core::message::{ImageUrl, MessageContentPart};
+        use std::collections::HashMap;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("s.attachments");
+        let data_url = "data:image/png;base64,QUJD".to_string();
+        let mut parts = vec![
+            MessageContentPart::Text { text: "hi".into() },
+            MessageContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: data_url.clone(),
+                },
+            },
+        ];
+
+        let mut map = HashMap::new();
+        externalize_parts(&dir, &mut parts, &mut map).unwrap();
+
+        // The image part now holds a cid: reference, not the base64.
+        match &parts[1] {
+            MessageContentPart::ImageUrl { image_url } => {
+                assert!(image_url.url.starts_with(CID_PREFIX));
+                assert!(!image_url.url.contains("QUJD"));
+            }
+            other => panic!("expected ImageUrl, got {other:#?}"),
+        }
+        assert_eq!(map.len(), 1, "cid -> filename recorded");
+        assert!(
+            map.values().next().unwrap().ends_with(".png"),
+            "recorded filename carries the image extension"
+        );
+
+        // Expansion restores the data URI in-place.
+        let encoder = Base64Encoder;
+        expand_parts(&encoder, &dir, &mut parts).unwrap();
+        match &parts[1] {
+            MessageContentPart::ImageUrl { image_url } => assert_eq!(image_url.url, data_url),
+            other => panic!("expected ImageUrl, got {other:#?}"),
+        }
+        // Non-image parts are left untouched throughout.
+        match &parts[0] {
+            MessageContentPart::Text { text } => assert_eq!(text, "hi"),
+            other => panic!("expected Text, got {other:#?}"),
+        }
     }
 }
