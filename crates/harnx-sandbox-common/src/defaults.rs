@@ -23,6 +23,7 @@ pub const SYSTEM_EXEC_PATHS: &[&str] = &[
     "/usr/bin",
     "/bin",
     "/usr/local/bin",
+    "/usr/local/lib",
     "/usr/sbin",
     "/sbin",
     "/usr/lib",
@@ -64,9 +65,13 @@ pub const SYSTEM_EXEC_PATHS: &[&str] = &[
 pub const SYSTEM_EXEC_PATHS: &[&str] = &["/usr/bin", "/bin", "/tmp", "/etc"];
 
 #[cfg(target_os = "linux")]
-pub const SYSTEM_READ_PATHS: &[&str] = &["/usr/include", "/usr/include/x86_64-linux-gnu"];
+pub const SYSTEM_READ_PATHS: &[&str] = &[
+    "/usr/local",
+    "/usr/include",
+    "/usr/include/x86_64-linux-gnu",
+];
 #[cfg(target_os = "macos")]
-pub const SYSTEM_READ_PATHS: &[&str] = &[];
+pub const SYSTEM_READ_PATHS: &[&str] = &["/usr/local"];
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub const SYSTEM_READ_PATHS: &[&str] = &["/usr/include"];
 
@@ -207,6 +212,51 @@ pub fn push_env_relative_defaults(args: &mut Vec<OsString>) {
         args.push(gocache.clone().into_os_string());
         args.push(OsString::from("--write"));
         args.push(gocache.into_os_string());
+    }
+    push_homebrew_defaults(args);
+}
+
+/// Compile-time default Homebrew install prefix for the current platform, used
+/// only when `HOMEBREW_PREFIX` is unset. Returns `None` on platforms without a
+/// conventional Homebrew location so nothing is granted there.
+///
+/// Selection is purely compile-time via `#[cfg(target_os)]` — no runtime OS
+/// detection (`uname`, `/etc/os-release`) is performed.
+#[cfg(unix)]
+fn default_homebrew_prefix() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        Some("/opt/homebrew")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some("/home/linuxbrew/.linuxbrew")
+    }
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+    {
+        None
+    }
+}
+
+/// Grant the Homebrew install prefix read+execute access so sandboxed commands
+/// can run Homebrew-managed binaries and load their dylibs without manual
+/// overrides. The location varies per install, so it is resolved dynamically
+/// here rather than living in the static `SYSTEM_EXEC_PATHS` list.
+///
+/// Resolution order: honour `HOMEBREW_PREFIX` when set; otherwise fall back to
+/// the compile-time platform default. Emits `--exec` only (read + execute) —
+/// `--write` is never granted by default, matching the least-privilege
+/// precedent for exec paths (a writable+executable prefix would let sandboxed
+/// code plant binaries the host later runs).
+#[cfg(unix)]
+fn push_homebrew_defaults(args: &mut Vec<OsString>) {
+    let prefix = match std::env::var_os("HOMEBREW_PREFIX") {
+        Some(prefix) => Some(PathBuf::from(prefix)),
+        None => default_homebrew_prefix().map(PathBuf::from),
+    };
+    if let Some(prefix) = prefix {
+        args.push(OsString::from("--exec"));
+        args.push(prefix.into_os_string());
     }
 }
 
