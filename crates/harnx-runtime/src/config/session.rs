@@ -991,6 +991,33 @@ fn is_tool_continuation(input: &Input, messages: &[Message]) -> bool {
     input.tool_calls.is_some() && messages.last().is_some_and(|m| m.role == MessageRole::Tool)
 }
 
+/// Rewrite inline image data URIs in `content` to `cid:` references in place,
+/// writing the bytes to the session's attachments dir. Returns the
+/// `cid -> filename` map of newly externalized blobs (empty when there are
+/// none, or when the session has no saved path yet — in which case the blob
+/// stays inline and is externalized on a later save).
+fn externalize_content(
+    session: &Session,
+    content: &mut MessageContent,
+) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(path) = session.path.as_ref() else {
+        return map;
+    };
+    let MessageContent::Array(parts) = content else {
+        return map;
+    };
+    let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(path));
+    if let Err(err) = crate::config::attachments::externalize_parts(&dir, parts, &mut map) {
+        // On partial failure, keep the map entries for blobs that were already
+        // written and rewritten in `content`: their files are on disk and their
+        // `cid:` refs are now in `content`, so the caller must still record them
+        // in a DataUrls entry. Any remaining parts stay inline.
+        log::warn!("attachment externalization failed: {err}");
+    }
+    map
+}
+
 /// Shared round-opening setup used by both `add_assistant_text` and
 /// `add_tool_calls`: first-turn agent-message injection, user-message
 /// push (skipped on continuation rounds), data-URL persistence, and
@@ -1014,8 +1041,16 @@ fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<boo
             session.messages.push(msg.with_log_seq(seq));
         }
     } else if !is_continuation {
+        // `seq` is the message's log-document index. `externalize_content` only
+        // writes attachment files + rewrites `content` in memory (it takes
+        // `&Session`, so it cannot append), so nothing must be appended between
+        // here and the Message append below or `seq` would be off by one. The
+        // cid DataUrls entry is a seq-less metadata record appended *after* the
+        // message.
         let seq = session.next_seq();
-        let user_msg = Message::new(MessageRole::User, input.message_content()).with_log_seq(seq);
+        let mut content = input.message_content();
+        let cid_urls = externalize_content(session, &mut content);
+        let user_msg = Message::new(MessageRole::User, content).with_log_seq(seq);
         all_appended &= append_event(
             session,
             &SessionLogEntry::Message {
@@ -1026,6 +1061,15 @@ fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<boo
         );
         session.messages.push(user_msg);
         emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
+        if !cid_urls.is_empty() {
+            all_appended &= append_event(
+                session,
+                &SessionLogEntry::DataUrls {
+                    urls: cid_urls.clone(),
+                },
+            );
+            session.data_urls.extend(cid_urls);
+        }
     }
     let new_data_urls = input.data_urls();
     if !new_data_urls.is_empty() {
@@ -2606,5 +2650,49 @@ content: second
              the user re-asked and loops on 'Let me look at the current state…'. \
              messages: {messages:#?}"
         );
+    }
+
+    #[test]
+    fn externalize_content_rewrites_image_to_cid_and_writes_file() {
+        use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+        super::ensure_log_file(&mut session);
+        assert!(session.path.is_some(), "ensure_log_file should set a path");
+
+        let base64_payload = "QUJDREVG".repeat(64);
+        let data_uri = format!("data:image/png;base64,{base64_payload}");
+        let mut content = MessageContent::Array(vec![
+            MessageContentPart::Text { text: "look".into() },
+            MessageContentPart::ImageUrl {
+                image_url: ImageUrl { url: data_uri },
+            },
+        ]);
+
+        let map = super::externalize_content(&session, &mut content);
+        assert_eq!(map.len(), 1, "one cid recorded");
+        assert!(
+            map.keys().next().unwrap().starts_with("cid:"),
+            "map is keyed by the cid reference"
+        );
+
+        match &content {
+            MessageContent::Array(parts) => match &parts[1] {
+                MessageContentPart::ImageUrl { image_url } => {
+                    assert!(image_url.url.starts_with("cid:"));
+                    assert!(!image_url.url.contains(&base64_payload));
+                }
+                other => panic!("expected ImageUrl, got {other:#?}"),
+            },
+            other => panic!("expected Array, got {other:#?}"),
+        }
+
+        let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(
+            session.path.as_ref().unwrap(),
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().flatten().count(), 1);
     }
 }
