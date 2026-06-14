@@ -698,6 +698,22 @@ pub fn save(
 
     session.path = Some(session_path.display().to_string());
 
+    // Externalize any still-inline image data URIs across all messages (e.g.
+    // first-turn images persisted before incremental externalization, or
+    // legacy sessions loaded with inline base64) so the rewritten transcript
+    // never carries inline base64. Idempotent: existing cid refs are skipped.
+    {
+        let dir = crate::config::attachments::attachments_dir_for(session_path);
+        let mut map = std::collections::HashMap::new();
+        for msg in session.compressed_messages.iter_mut() {
+            externalize_message(&dir, &mut msg.content, &mut map);
+        }
+        for msg in session.messages.iter_mut() {
+            externalize_message(&dir, &mut msg.content, &mut map);
+        }
+        session.data_urls.extend(map);
+    }
+
     // Write in the new log format.
     let mut content = serde_yaml::to_string(&session.build_header_entry())
         .with_context(|| format!("Failed to serialize session header for '{}'", session.id))?;
@@ -1025,6 +1041,40 @@ fn is_tool_continuation(input: &Input, messages: &[Message]) -> bool {
     input.tool_calls.is_some() && messages.last().is_some_and(|m| m.role == MessageRole::Tool)
 }
 
+/// Externalize inline image data URIs in a single message's content — both
+/// plain content arrays and tool-result content — into `cid:` references,
+/// writing files to `dir` and recording `cid -> filename` in `map`. On partial
+/// failure, keeps whatever was already externalized (those files are on disk
+/// and their refs are already in `content`).
+fn externalize_message(
+    dir: &std::path::Path,
+    content: &mut MessageContent,
+    map: &mut std::collections::HashMap<String, String>,
+) {
+    let result = match content {
+        MessageContent::Array(parts) => {
+            crate::config::attachments::externalize_parts(dir, parts, map)
+        }
+        MessageContent::ToolCalls(tool_calls) => {
+            let mut res = Ok(());
+            for tool_result in tool_calls.tool_results.iter_mut() {
+                if let Err(err) = crate::config::attachments::externalize_parts(
+                    dir,
+                    &mut tool_result.content,
+                    map,
+                ) {
+                    res = Err(err);
+                }
+            }
+            res
+        }
+        MessageContent::Text(_) => Ok(()),
+    };
+    if let Err(err) = result {
+        log::warn!("attachment externalization failed: {err}");
+    }
+}
+
 /// Rewrite inline image data URIs in `content` to `cid:` references in place,
 /// writing the bytes to the session's attachments dir. Returns the
 /// `cid -> filename` map of newly externalized blobs (empty when there are
@@ -1035,20 +1085,11 @@ fn externalize_content(
     content: &mut MessageContent,
 ) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
-    let Some(path) = session.path.as_ref() else {
-        return map;
-    };
-    let MessageContent::Array(parts) = content else {
+    let Some(path) = session.path.as_deref() else {
         return map;
     };
     let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(path));
-    if let Err(err) = crate::config::attachments::externalize_parts(&dir, parts, &mut map) {
-        // On partial failure, keep the map entries for blobs that were already
-        // written and rewritten in `content`: their files are on disk and their
-        // `cid:` refs are now in `content`, so the caller must still record them
-        // in a DataUrls entry. Any remaining parts stay inline.
-        log::warn!("attachment externalization failed: {err}");
-    }
+    externalize_message(&dir, content, &mut map);
     map
 }
 
@@ -1062,8 +1103,12 @@ fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<boo
     let is_continuation = is_tool_continuation(input, &session.messages);
     if session.messages.is_empty() {
         let agent_messages = input.agent().build_messages(input)?;
-        for msg in agent_messages {
+        let mut cid_urls = std::collections::HashMap::new();
+        for mut msg in agent_messages {
+            // `externalize_content` only writes files + rewrites `content` in
+            // memory (takes `&Session`, cannot append), so `seq` stays correct.
             let seq = session.next_seq();
+            cid_urls.extend(externalize_content(session, &mut msg.content));
             all_appended &= append_event(
                 session,
                 &SessionLogEntry::Message {
@@ -1073,6 +1118,17 @@ fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<boo
                 },
             );
             session.messages.push(msg.with_log_seq(seq));
+        }
+        // Seq-less metadata record for the cids written above; appended after
+        // the messages so message log_seqs are unaffected.
+        if !cid_urls.is_empty() {
+            all_appended &= append_event(
+                session,
+                &SessionLogEntry::DataUrls {
+                    urls: cid_urls.clone(),
+                },
+            );
+            session.data_urls.extend(cid_urls);
         }
     } else if !is_continuation {
         // `seq` is the message's log-document index. `externalize_content` only
@@ -1175,9 +1231,7 @@ fn expand_message_attachments(session: &Session, messages: &mut [Message]) {
     for message in messages.iter_mut() {
         match &mut message.content {
             MessageContent::Array(parts) => {
-                if let Err(err) =
-                    crate::config::attachments::expand_parts(&encoder, &dir, parts)
-                {
+                if let Err(err) = crate::config::attachments::expand_parts(&encoder, &dir, parts) {
                     log::warn!("attachment expansion failed: {err}");
                 }
             }
@@ -2099,7 +2153,10 @@ results:
 
         let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
         assert!(persisted.contains("<image: image/png,"));
-        assert!(persisted.contains("cid:"), "tool-result image is referenced by cid");
+        assert!(
+            persisted.contains("cid:"),
+            "tool-result image is referenced by cid"
+        );
         assert!(
             !persisted.contains(&base64_payload),
             "tool-result base64 must not be inlined in the transcript"
@@ -2123,7 +2180,10 @@ results:
         assert_eq!(tool_calls.tool_results[0].content.len(), 1);
         match &tool_calls.tool_results[0].content[0] {
             MessageContentPart::ImageUrl { image_url } => {
-                assert!(image_url.url.starts_with("cid:"), "reloaded content keeps cid ref");
+                assert!(
+                    image_url.url.starts_with("cid:"),
+                    "reloaded content keeps cid ref"
+                );
             }
             other => panic!("expected ImageUrl content part, got {other:#?}"),
         }
@@ -2739,6 +2799,40 @@ content: second
     }
 
     #[test]
+    fn save_externalizes_inline_image_content() {
+        use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let base64_payload = "QUJDREVG".repeat(64);
+        let data_uri = format!("data:image/png;base64,{base64_payload}");
+        session.messages.push(Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                image_url: ImageUrl { url: data_uri },
+            }]),
+        ));
+
+        let path = tmp.path().join("s1.yaml");
+        super::save(&mut session, "s1", &path, false).unwrap();
+
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            persisted.contains("cid:"),
+            "saved transcript references a cid"
+        );
+        assert!(
+            !persisted.contains(&base64_payload),
+            "no inline base64 in saved transcript"
+        );
+        let dir = crate::config::attachments::attachments_dir_for(&path);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().flatten().count(), 1);
+    }
+
+    #[test]
     fn externalize_content_rewrites_image_to_cid_and_writes_file() {
         use harnx_core::message::{ImageUrl, MessageContent, MessageContentPart};
         use tempfile::TempDir;
@@ -2752,7 +2846,9 @@ content: second
         let base64_payload = "QUJDREVG".repeat(64);
         let data_uri = format!("data:image/png;base64,{base64_payload}");
         let mut content = MessageContent::Array(vec![
-            MessageContentPart::Text { text: "look".into() },
+            MessageContentPart::Text {
+                text: "look".into(),
+            },
             MessageContentPart::ImageUrl {
                 image_url: ImageUrl { url: data_uri },
             },

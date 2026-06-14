@@ -181,7 +181,19 @@ pub fn expand_parts(
     for part in parts.iter_mut() {
         if let MessageContentPart::ImageUrl { image_url } = part {
             if image_url.url.starts_with(CID_PREFIX) {
-                image_url.url = encoder.expand(dir, &image_url.url)?;
+                match encoder.expand(dir, &image_url.url) {
+                    Ok(url) => image_url.url = url,
+                    Err(err) => {
+                        // Never send a raw `cid:` ref to the model (it would be
+                        // rejected) and never fail the whole turn over one lost
+                        // blob: drop the unresolvable image to a text
+                        // placeholder and keep going with the rest.
+                        log::warn!("dropping unresolvable attachment {}: {err}", image_url.url);
+                        *part = MessageContentPart::Text {
+                            text: format!("[unavailable image attachment: {}]", image_url.url),
+                        };
+                    }
+                }
             }
         }
     }
@@ -276,6 +288,25 @@ mod tests {
         assert!(!dir.exists());
         // Second call is a no-op, not an error.
         remove_attachments_dir(&yaml).unwrap();
+    }
+
+    #[test]
+    fn expand_parts_drops_unresolvable_cid() {
+        use harnx_core::message::{ImageUrl, MessageContentPart};
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("missing.attachments"); // never created
+        let mut parts = vec![MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "cid:deadbeef".into(),
+            },
+        }];
+        let encoder = Base64Encoder;
+        expand_parts(&encoder, &dir, &mut parts).unwrap();
+        match &parts[0] {
+            MessageContentPart::Text { text } => assert!(text.contains("unavailable")),
+            other => panic!("expected Text placeholder, got {other:#?}"),
+        }
     }
 
     #[test]
