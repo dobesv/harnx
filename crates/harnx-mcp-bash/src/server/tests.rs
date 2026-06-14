@@ -592,6 +592,62 @@ mod sandbox_args {
 
     #[cfg(unix)]
     #[test]
+    fn test_sandbox_args_honours_homebrew_prefix_env_var() {
+        let _env_guard = env_lock();
+        let _homebrew = EnvVar::set("HOMEBREW_PREFIX", "/custom/homebrew");
+
+        let pairs = sandbox_arg_pairs(
+            Path::new("/test/root"),
+            Path::new("/test/root/workdir"),
+            None,
+            None,
+        );
+
+        // The Homebrew prefix is granted read+execute (exec implies read).
+        assert_arg_pair_present(&pairs, "--exec", "/custom/homebrew");
+        // Never writable: a writable+executable prefix would let sandboxed code
+        // plant binaries the host later runs (security precedent).
+        assert_arg_pair_absent(&pairs, "--write", "/custom/homebrew");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_sandbox_args_homebrew_prefix_macos_fallback() {
+        let _env_guard = env_lock();
+        let _homebrew = EnvVar::unset("HOMEBREW_PREFIX");
+
+        let pairs = sandbox_arg_pairs(
+            Path::new("/test/root"),
+            Path::new("/test/root/workdir"),
+            None,
+            None,
+        );
+
+        // With HOMEBREW_PREFIX unset, the macOS compile-time default applies.
+        assert_arg_pair_present(&pairs, "--exec", "/opt/homebrew");
+        assert_arg_pair_absent(&pairs, "--write", "/opt/homebrew");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_sandbox_args_homebrew_prefix_linux_fallback() {
+        let _env_guard = env_lock();
+        let _homebrew = EnvVar::unset("HOMEBREW_PREFIX");
+
+        let pairs = sandbox_arg_pairs(
+            Path::new("/test/root"),
+            Path::new("/test/root/workdir"),
+            None,
+            None,
+        );
+
+        // With HOMEBREW_PREFIX unset, the Linux compile-time default applies.
+        assert_arg_pair_present(&pairs, "--exec", "/home/linuxbrew/.linuxbrew");
+        assert_arg_pair_absent(&pairs, "--write", "/home/linuxbrew/.linuxbrew");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_sandbox_args_empty_outputs() {
         let pairs = sandbox_arg_pairs(
             Path::new("/test/root"),
