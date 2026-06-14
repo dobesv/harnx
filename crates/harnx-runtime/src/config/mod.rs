@@ -1,5 +1,6 @@
 pub mod agent;
 mod agent_ops_split;
+mod attachments;
 mod completion_split;
 mod env_split;
 pub mod input;
