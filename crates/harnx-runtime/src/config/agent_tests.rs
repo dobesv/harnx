@@ -261,44 +261,44 @@ fn test_agent_compaction_agent_roundtrip() {
     assert_eq!(reparsed.model_id(), Some("openai:gpt-4o"));
 }
 
+/// The system prompt must NOT enumerate the agent's tools. The model receives
+/// tool definitions via the API `tools` field (filtered by `use_tools` in
+/// `Config::tool_declarations_for_use_tools`); rendering an unfiltered text
+/// list here duplicated those definitions and leaked tools from other packages
+/// into the prompt.
 #[test]
-fn test_tools_text_with_tools() {
+fn test_system_text_excludes_tool_summary() {
     let agent = make_agent_with_tools(
-        "prompt",
+        "You are a helpful assistant.",
         vec![
             make_tool_declaration("tool_a", "Description A"),
             make_tool_declaration("tool_b", "Description B"),
         ],
     );
 
-    let text = agent.tools_text();
+    let text = agent.system_text().unwrap();
 
-    assert_eq!(
-        text,
-        Some("1. tool_a: Description A\n2. tool_b: Description B".to_string())
-    );
+    assert_eq!(text, "You are a helpful assistant.");
+    assert!(!text.contains("tool_a"));
+    assert!(!text.contains("Description A"));
 }
 
 #[test]
-fn test_tools_text_without_tools() {
-    let agent = make_agent_with_tools("prompt", vec![]);
-
-    assert_eq!(agent.tools_text(), None);
-}
-
-#[test]
-fn test_tools_text_multiline_description() {
+fn test_build_messages_excludes_tool_summary() {
+    let config = GlobalConfig::default();
     let agent = make_agent_with_tools(
-        "prompt",
-        vec![make_tool_declaration(
-            "tool_x",
-            "First line\nSecond line\nThird line",
-        )],
+        "System prompt.",
+        vec![make_tool_declaration("tool_a", "Description A")],
     );
+    let input = crate::config::input::from_str(&config, "Real input", Some(agent));
 
-    let text = agent.tools_text();
+    let messages = input.agent().build_messages(&input).unwrap();
 
-    assert_eq!(text, Some("1. tool_x: First line".to_string()));
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, MessageRole::System);
+    assert_eq!(messages[0].content.to_text(), "System prompt.");
+    assert!(!messages[0].content.to_text().contains("tool_a"));
+    assert_eq!(messages[1].content.to_text(), "Real input");
 }
 
 #[test]
