@@ -554,6 +554,7 @@ fn append_recovery_note(summary: String, covered: (Option<usize>, Option<usize>,
     };
     format!(
         "{summary}\n\n[Earlier conversation: {count} message(s){range} were summarized above. \
-The full pre-compaction transcript remains in this session's log on disk.]"
+The full pre-compaction transcript remains in this session's log; use the \
+`harnx_agent_session_history_read` tool to search it by entry index, type, tool name, or text.]"
     )
 }
