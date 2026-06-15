@@ -129,6 +129,30 @@ pub fn query_entries(entries: &[(usize, SessionLogEntry)], query: &HistoryQuery)
     Ok(Value::Array(rows))
 }
 
+/// Like `query_entries`, then apply the optional `jaq` expression over the
+/// matched-rows array. A broken jaq expression is surfaced as an error (rather
+/// than silently returning unfiltered rows) so the calling agent can fix or
+/// drop it instead of acting on results it wrongly believes were filtered.
+pub fn query_entries_with_jaq(
+    entries: &[(usize, SessionLogEntry)],
+    query: &HistoryQuery,
+) -> Result<Value> {
+    let rows = query_entries(entries, query)?;
+    let Some(expr) = &query.jaq else {
+        return Ok(rows);
+    };
+    // `eval_filter` returns `None` only on a parse/compile/runtime error; a
+    // legitimate empty result comes back as `Some([])`.
+    harnx_core::jaq::eval_filter(expr, rows)
+        .ok_or_else(|| anyhow::anyhow!("invalid jaq expression: {expr}"))
+}
+
+/// Parse a session log document string and run the full query against it.
+pub fn query_log_content(content: &str, session_name: &str, query: &HistoryQuery) -> Result<Value> {
+    let entries = crate::config::session::collect_raw_log_entries(content, session_name)?;
+    query_entries_with_jaq(&entries, query)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +235,31 @@ mod tests {
         let q = HistoryQuery { text_regex: Some("build".into()), limit: Some(1), ..Default::default() };
         let rows = query_entries(&sample_entries(), &q).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn query_applies_jaq_expression() {
+        let q = HistoryQuery { jaq: Some("map(select(.type == \"tool_results\"))".into()), ..Default::default() };
+        let rows = query_entries_with_jaq(&sample_entries(), &q).unwrap();
+        let arr = rows.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "tool_results");
+    }
+
+    #[test]
+    fn query_invalid_jaq_is_surfaced_as_error() {
+        let q = HistoryQuery { jaq: Some("this is (not valid jaq".into()), ..Default::default() };
+        let err = query_entries_with_jaq(&sample_entries(), &q).unwrap_err();
+        assert!(err.to_string().contains("jaq"));
+    }
+
+    #[test]
+    fn query_from_log_content_parses_and_filters() {
+        let log = "type: header\nmodel: openai:gpt-4o\n---\ntype: message\nrole: user\ncontent: hello world\n";
+        let q = HistoryQuery { entry_type: Some("message".into()), ..Default::default() };
+        let rows = query_log_content(log, "test", &q).unwrap();
+        let arr = rows.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert!(arr[0]["text"].as_str().unwrap().contains("hello world"));
     }
 }
