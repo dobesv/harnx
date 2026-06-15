@@ -6,21 +6,13 @@ impl BashServer {
     pub(crate) fn build_sandbox_args(
         &self,
         working_dir: &Path,
-        inputs: Option<&[PathBuf]>,
-        outputs: Option<&[PathBuf]>,
         roots: &[PathBuf],
     ) -> Vec<OsString> {
-        let inputs_explicit_empty = matches!(inputs, Some([]));
         let mut acc = SandboxAcc::new(build_default_sandbox_args(&self.inner.sandbox_config));
 
-        acc.apply_outputs(outputs, roots, inputs_explicit_empty);
-
-        if let Some(paths) = inputs.filter(|paths| !paths.is_empty()) {
-            acc.add_reads(paths);
-        }
-
-        if !inputs_explicit_empty {
-            acc.ensure_working_dir_readable(working_dir);
+        acc.ensure_working_dir_readable(working_dir);
+        for root in roots {
+            push_root_write_exec(root, &mut acc.args, &mut acc.writable);
         }
 
         let mut args = acc.into_args();
@@ -63,12 +55,10 @@ impl BashServer {
             working_dir,
             exec_dir,
             command,
-            inputs,
-            outputs,
             roots,
             extra_env,
         } = spec;
-        let mut sb_args = self.build_sandbox_args(working_dir, inputs, outputs, roots);
+        let mut sb_args = self.build_sandbox_args(working_dir, roots);
         sb_args.push(OsString::from("--working-dir"));
         sb_args.push(working_dir.as_os_str().to_owned());
         if let Some(extra_env) = extra_env {
@@ -165,16 +155,12 @@ impl BashServer {
             #[cfg(unix)]
             {
                 let roots_guard = self.inner.roots.read().await;
-                let inputs = parse_input_path_list(ctx.inputs, &roots_guard, ctx.working_dir)?;
-                let outputs = parse_output_path_list(ctx.outputs, &roots_guard, ctx.working_dir)?;
                 let command = self
                     .build_sandbox_command(
                         SandboxCommandSpec {
                             working_dir: ctx.working_dir,
                             exec_dir: ctx.exec_dir,
                             command: ctx.command,
-                            inputs: inputs.as_deref(),
-                            outputs: outputs.as_deref(),
                             roots: &roots_guard,
                             extra_env: ctx.env,
                         },

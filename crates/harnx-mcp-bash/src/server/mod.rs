@@ -1,6 +1,6 @@
 use harnx_mcp::safety::{
     file_uri_to_path, format_size, sanitize_output_text, truncate_output, validate_path,
-    validate_write_path, TruncateOpts,
+    TruncateOpts,
 };
 
 use fancy_regex::Regex;
@@ -77,9 +77,6 @@ pub(crate) struct SpawnedProcess {
     stderr_log_path: PathBuf,
     before_snap_ids: Vec<(PathBuf, gix::ObjectId)>,
     snapshot_decision: SnapshotDecision,
-    /// Resolved output paths from params.outputs; drives history snapshot in wait_impl.
-    /// None = use snapshot_decision (classifier); Some([]) = ReadOnly; Some(paths) = Targeted.
-    output_paths: Option<Vec<PathBuf>>,
 }
 
 struct BashServerInner {

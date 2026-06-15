@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn bash_spawn_injects_proxy_env_vars() {
-        let input = Some(json!({"command": "sleep 1", "inputs": ["/tmp/in"]}));
+        let input = Some(json!({"command": "sleep 1", "working_dir": "/tmp"}));
 
         let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &Map::new());
 
@@ -169,7 +169,7 @@ mod tests {
             actual,
             json!({
                 "command": "sleep 1",
-                "inputs": ["/tmp/in"],
+                "working_dir": "/tmp",
                 "env": expected_proxy_env(),
             })
         );

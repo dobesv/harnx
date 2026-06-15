@@ -16,6 +16,8 @@ tags:
 plan_ref: bash-sandboxing-birdcage
 ---
 
+
+> **Superseded (#850):** The per-call `inputs`/`outputs` params described below were removed from the bash MCP tools. Project roots now always get read+write+exec and snapshots are always classifier-based. This doc is retained for historical context.
 ## Problem
 
 Birdcage, a Rust sandboxing crate, requires a single-threaded execution context to activate its sandbox. Tokio's multi-threaded runtime (the default with `#[tokio::main]`) spawns the server across multiple threads, making direct in-process sandbox activation impossible.

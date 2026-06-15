@@ -163,7 +163,7 @@ Harnx ships with several built-in MCP servers ready to enable in your config. Se
     *   Path validation against allowed roots; smart output truncation; binary detection.
     *   [Local history snapshots](docs/local-history-guide.md) before and after every mutation.
 *   **`harnx-mcp-bash`** — Bash command execution (`exec`, `spawn`, `wait`, `terminate`, `read_exec_log`)
-    *   **Filesystem sandboxing via [birdcage](https://crates.io/crates/birdcage)** (Linux/macOS) — write access limited to roots by default; per-call `inputs`/`outputs` overrides.
+    *   **Filesystem sandboxing via [birdcage](https://crates.io/crates/birdcage)** (Linux/macOS) — commands run with read+write+exec access to the project roots plus default system/cache allow-lists.
     *   Process group management (kill-on-drop) and background `spawn` + `wait` pattern.
     *   Path validation and history snapshots around mutating commands.
 *   **`harnx-mcp-time`** — Time and timezone utilities (`get_current_time`, `convert_time`, `wait`).

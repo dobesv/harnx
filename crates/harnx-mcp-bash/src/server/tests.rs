@@ -342,19 +342,9 @@ fn sandbox_server(root: impl Into<PathBuf>) -> BashServer {
 }
 
 #[cfg(unix)]
-fn sandbox_arg_pairs(
-    root: &Path,
-    working_dir: &Path,
-    inputs: Option<Vec<PathBuf>>,
-    outputs: Option<Vec<PathBuf>>,
-) -> Vec<(String, String)> {
+fn sandbox_arg_pairs(root: &Path, working_dir: &Path) -> Vec<(String, String)> {
     let server = sandbox_server(root.to_path_buf());
-    let args = server.build_sandbox_args(
-        working_dir,
-        inputs.as_deref(),
-        outputs.as_deref(),
-        &[root.to_path_buf()],
-    );
+    let args = server.build_sandbox_args(working_dir, &[root.to_path_buf()]);
     collect_arg_pairs(&args)
 }
 
@@ -384,8 +374,6 @@ fn exec_params(command: impl Into<String>, working_dir: &Path) -> ExecCommandPar
         head_lines: None,
         tail_lines: None,
         max_output_bytes: None,
-        inputs: None,
-        outputs: None,
         env: None,
     }
 }
@@ -394,8 +382,6 @@ fn spawn_params(command: impl Into<String>, working_dir: &Path) -> SpawnCommandP
     SpawnCommandParams {
         command: command.into(),
         working_dir: Some(working_dir.to_string_lossy().to_string()),
-        inputs: None,
-        outputs: None,
         env: None,
     }
 }
@@ -429,6 +415,14 @@ fn assert_text_contains_all(text: &str, needles: &[&str]) {
     for needle in needles {
         assert!(text.contains(needle), "missing {needle:?} in text: {text}");
     }
+}
+
+#[test]
+fn test_exec_params_ignores_legacy_inputs_outputs() {
+    let json = r#"{"command":"echo hi","inputs":["/tmp/in"],"outputs":["/tmp/out"]}"#;
+    let parsed: ExecCommandParams =
+        serde_json::from_str(json).expect("legacy payload must deserialize");
+    assert_eq!(parsed.command, "echo hi");
 }
 
 fn assert_execution_metadata_fields(text: &str) {
@@ -469,31 +463,6 @@ fn extract_field(text: &str, field: &str) -> String {
         .to_string()
 }
 
-async fn git(args: &[&str], cwd: &Path) {
-    let status = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .status()
-        .await
-        .unwrap();
-    assert!(
-        status.success(),
-        "git command failed: git {}",
-        args.join(" ")
-    );
-}
-
-async fn init_git_repo(root: &Path) {
-    tokio::fs::write(root.join("tracked.txt"), "baseline\n")
-        .await
-        .unwrap();
-    git(&["init"], root).await;
-    git(&["config", "user.name", "Test User"], root).await;
-    git(&["config", "user.email", "test@example.com"], root).await;
-    git(&["add", "tracked.txt"], root).await;
-    git(&["commit", "-m", "initial"], root).await;
-}
-
 mod sandbox_args {
     use super::*;
 
@@ -504,7 +473,7 @@ mod sandbox_args {
         // so serialize against tests that mutate HOME via the shared env lock.
         let _env_guard = env_lock();
         let root = Path::new("/test/root");
-        let pairs = sandbox_arg_pairs(root, Path::new("/test/root/workdir"), None, None);
+        let pairs = sandbox_arg_pairs(root, Path::new("/test/root/workdir"));
 
         assert_arg_pair_present(&pairs, "--write", "/test/root");
         assert_arg_pair_present(&pairs, "--exec", "/usr/bin");
@@ -545,12 +514,7 @@ mod sandbox_args {
         let _gopath = EnvVar::set("GOPATH", "/srv/go-workspace");
         let _gobin = EnvVar::set("GOBIN", "/srv/go-workspace/installed");
 
-        let pairs = sandbox_arg_pairs(
-            Path::new("/test/root"),
-            Path::new("/test/root/workdir"),
-            None,
-            None,
-        );
+        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
 
         // Custom CARGO_HOME root is readable so config.toml/credentials work.
         assert_arg_pair_present(&pairs, "--read", "/opt/cargo-custom");
@@ -575,12 +539,7 @@ mod sandbox_args {
         let _gomodcache = EnvVar::set("GOMODCACHE", "/srv/go-mod-cache");
         let _gocache = EnvVar::set("GOCACHE", "/srv/go-build-cache");
 
-        let pairs = sandbox_arg_pairs(
-            Path::new("/test/root"),
-            Path::new("/test/root/workdir"),
-            None,
-            None,
-        );
+        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
 
         assert_arg_pair_present(&pairs, "--read", "/srv/go-mod-cache");
         assert_arg_pair_present(&pairs, "--write", "/srv/go-mod-cache");
@@ -596,12 +555,7 @@ mod sandbox_args {
         let _env_guard = env_lock();
         let _homebrew = EnvVar::set("HOMEBREW_PREFIX", "/custom/homebrew");
 
-        let pairs = sandbox_arg_pairs(
-            Path::new("/test/root"),
-            Path::new("/test/root/workdir"),
-            None,
-            None,
-        );
+        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
 
         // The Homebrew prefix is granted read+execute (exec implies read).
         assert_arg_pair_present(&pairs, "--exec", "/custom/homebrew");
@@ -616,12 +570,7 @@ mod sandbox_args {
         let _env_guard = env_lock();
         let _homebrew = EnvVar::unset("HOMEBREW_PREFIX");
 
-        let pairs = sandbox_arg_pairs(
-            Path::new("/test/root"),
-            Path::new("/test/root/workdir"),
-            None,
-            None,
-        );
+        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
 
         // With HOMEBREW_PREFIX unset, the macOS compile-time default applies.
         assert_arg_pair_present(&pairs, "--exec", "/opt/homebrew");
@@ -634,12 +583,7 @@ mod sandbox_args {
         let _env_guard = env_lock();
         let _homebrew = EnvVar::unset("HOMEBREW_PREFIX");
 
-        let pairs = sandbox_arg_pairs(
-            Path::new("/test/root"),
-            Path::new("/test/root/workdir"),
-            None,
-            None,
-        );
+        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
 
         // With HOMEBREW_PREFIX unset, the Linux compile-time default applies.
         assert_arg_pair_present(&pairs, "--exec", "/home/linuxbrew/.linuxbrew");
@@ -648,50 +592,41 @@ mod sandbox_args {
 
     #[cfg(unix)]
     #[test]
-    fn test_sandbox_args_empty_outputs() {
-        let pairs = sandbox_arg_pairs(
-            Path::new("/test/root"),
-            Path::new("/test/root/workdir"),
-            None,
-            Some(vec![]),
-        );
+    fn test_sandbox_args_root_write_exec_workdir_inside_root() {
+        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/test/root/workdir"));
 
-        assert_arg_pair_present(&pairs, "--read", "/test/root");
-        assert_arg_pair_absent(&pairs, "--write", "/test/root");
+        assert_arg_pair_present(&pairs, "--write", "/test/root");
+        assert_arg_pair_present(&pairs, "--exec", "/test/root");
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_sandbox_args_custom_outputs() {
-        let pairs = sandbox_arg_pairs(
-            Path::new("/test/root"),
-            Path::new("/custom/out/workdir"),
-            None,
-            Some(vec![PathBuf::from("/custom/out")]),
-        );
+    fn test_sandbox_args_root_write_exec_workdir_outside_root() {
+        let pairs = sandbox_arg_pairs(Path::new("/test/root"), Path::new("/custom/out/workdir"));
 
-        assert_arg_pair_present(&pairs, "--write", "/custom/out");
-        assert_arg_pair_absent(&pairs, "--write", "/test/root");
-        assert_arg_pair_absent(&pairs, "--read", "/test/root");
+        assert_arg_pair_present(&pairs, "--write", "/test/root");
+        assert_arg_pair_present(&pairs, "--exec", "/test/root");
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_sandbox_args_empty_inputs_empty_outputs() {
+    fn test_sandbox_args_root_write_exec_tmp_workdir() {
         let working_dir = Path::new("/tmp/test_wd_xxx");
-        let pairs = sandbox_arg_pairs(
-            Path::new("/test/root"),
-            working_dir,
-            Some(vec![]),
-            Some(vec![]),
-        );
+        let pairs = sandbox_arg_pairs(Path::new("/test/root"), working_dir);
 
-        assert_arg_pair_absent(&pairs, "--write", "/test/root");
-        assert_arg_pair_absent(&pairs, "--read", "/test/root");
-        assert_arg_pair_absent(&pairs, "--read", "/tmp/test_wd_xxx");
+        assert_arg_pair_present(&pairs, "--write", "/test/root");
+        assert_arg_pair_present(&pairs, "--exec", "/test/root");
     }
 
     #[cfg(unix)]
+    #[test]
+    fn test_roots_always_writable_and_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let pairs = sandbox_arg_pairs(root.path(), root.path());
+
+        assert_arg_pair_present(&pairs, "--write", root.path().to_string_lossy());
+        assert_arg_pair_present(&pairs, "--exec", root.path().to_string_lossy());
+    }
     #[test]
     fn test_sandbox_args_extra_writable() {
         let mut config = enabled_sandbox_config();
@@ -701,8 +636,6 @@ mod sandbox_args {
         let server = BashServer::new_with_sandbox(vec![PathBuf::from("/test/root")], config);
         let args = server.build_sandbox_args(
             Path::new("/custom/writable/workdir"),
-            None,
-            None,
             &[PathBuf::from("/test/root")],
         );
         let pairs = collect_arg_pairs(&args);
@@ -718,8 +651,6 @@ mod sandbox_args {
         let server = BashServer::new_with_sandbox(vec![PathBuf::from("/test/root")], config);
         let args = server.build_sandbox_args(
             Path::new("/custom/rwx/workdir"),
-            None,
-            None,
             &[PathBuf::from("/test/root")],
         );
         let pairs = collect_arg_pairs(&args);
@@ -734,7 +665,7 @@ mod sandbox_args {
     fn test_sandbox_args_roots_get_exec() {
         let root = PathBuf::from("/test/root");
         let server = BashServer::new_with_sandbox(vec![root.clone()], enabled_sandbox_config());
-        let args = server.build_sandbox_args(Path::new("/test/root/workdir"), None, None, &[root]);
+        let args = server.build_sandbox_args(Path::new("/test/root/workdir"), &[root]);
         let pairs = collect_arg_pairs(&args);
 
         assert!(pairs.contains(&("--write".into(), "/test/root".into())));
@@ -750,8 +681,6 @@ mod sandbox_args {
         );
         let args = server.build_sandbox_args(
             Path::new("/test/root/workdir"),
-            None,
-            None,
             &[PathBuf::from("/test/root")],
         );
         let pairs = collect_arg_pairs(&args);
@@ -771,8 +700,6 @@ mod sandbox_args {
         );
         let args = server.build_sandbox_args(
             Path::new("/test/root/workdir"),
-            None,
-            None,
             &[PathBuf::from("/test/root")],
         );
         let pairs = collect_arg_pairs(&args);
@@ -975,78 +902,8 @@ fn env_bash_dotfile_loaded() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn test_inputs_validation_rejects_paths_outside_roots() {
-    let root = TestDir::new();
-    let server =
-        BashServer::new_with_sandbox(vec![root.path().to_path_buf()], enabled_sandbox_config());
-
-    let result = server
-        .exec_command_impl(ExecCommandParams {
-            inputs: Some(vec!["/etc".into()]),
-            ..exec_params("cat /etc/passwd", root.path())
-        })
-        .await;
-
-    let err = result.unwrap_err();
-    assert_eq!(err.code.0, -32602);
-    assert!(
-        err.message.contains("outside allowed roots")
-            || err.message.contains("not under allowed roots")
-    );
-}
-
 #[cfg(unix)]
-#[tokio::test]
-async fn test_outputs_validation_rejects_paths_outside_roots() {
-    let root = TestDir::new();
-    let server =
-        BashServer::new_with_sandbox(vec![root.path().to_path_buf()], enabled_sandbox_config());
-
-    let result = server
-        .exec_command_impl(ExecCommandParams {
-            outputs: Some(vec!["/etc".into()]),
-            ..exec_params("echo hi", root.path())
-        })
-        .await;
-
-    let err = result.unwrap_err();
-    assert_eq!(err.code.0, -32602);
-    assert!(
-        err.message.contains("outside allowed roots")
-            || err.message.contains("not under allowed roots")
-    );
-}
-
 #[cfg(unix)]
-#[tokio::test]
-async fn test_inputs_relative_paths_resolved_against_working_dir() {
-    // Verifies that a relative `inputs` path is resolved against the
-    // tool's `working_dir` at validation time (not the server's CWD).
-    // We don't run bash here — that's a separate concern covered by the
-    // Linux-only sandbox-runtime tests below; we just check that
-    // validation accepts the relative path.
-    let root = TestDir::new();
-    std::fs::create_dir(root.path().join("subdir")).unwrap();
-    let roots = vec![root.path().to_path_buf()];
-
-    let validated = parse_input_path_list(&Some(vec!["subdir".to_string()]), &roots, root.path())
-        .expect("relative input path under working_dir must validate");
-
-    let paths = validated.expect("Some(_) when input list provided");
-    assert_eq!(paths.len(), 1);
-    assert!(
-        paths[0].ends_with("subdir"),
-        "validated path should canonicalize to .../subdir, got {}",
-        paths[0].display()
-    );
-    assert!(
-        paths[0].starts_with(root.path().canonicalize().unwrap()),
-        "validated path should be under root, got {}",
-        paths[0].display()
-    );
-}
-
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sandbox_exec_write_allowed() {
@@ -1064,8 +921,6 @@ async fn test_sandbox_exec_write_allowed() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -1101,8 +956,6 @@ async fn test_sandbox_exec_write_denied_outside_root() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: Some(vec![]),
             env: None,
         })
         .await
@@ -1128,72 +981,6 @@ async fn test_sandbox_exec_write_denied_outside_root() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn test_sandbox_exec_custom_outputs() {
-    if !sandbox_runtime_works() {
-        return;
-    }
-    let root = TestDir::new();
-    let other = TestDir::new();
-    let server = sandboxed_server(vec![root.path().to_path_buf(), other.path().to_path_buf()]);
-    let outputs = vec![other.path().to_string_lossy().to_string()];
-
-    let fail_result = server
-        .exec_command_impl(ExecCommandParams {
-            command: "echo hi > in_root.txt".to_string(),
-            working_dir: Some(root.path().to_string_lossy().to_string()),
-            timeout_secs: Some(15),
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-            inputs: None,
-            outputs: Some(outputs.clone()),
-            env: None,
-        })
-        .await
-        .unwrap();
-    let fail_text = text_content(&fail_result);
-    eprintln!(
-        "sandbox custom outputs fail output:
-{fail_text}"
-    );
-    let fail_exit_code = extract_field(&fail_text, "exit_code")
-        .parse::<i32>()
-        .unwrap();
-    assert_ne!(
-        fail_exit_code, 0,
-        "expected root write failure, got:
-{fail_text}"
-    );
-    assert!(!root.path().join("in_root.txt").exists());
-
-    let success_result = server
-        .exec_command_impl(ExecCommandParams {
-            command: format!("echo bye > {}", other.path().join("in_other.txt").display()),
-            working_dir: Some(root.path().to_string_lossy().to_string()),
-            timeout_secs: Some(15),
-            head_lines: None,
-            tail_lines: None,
-            max_output_bytes: None,
-            inputs: None,
-            outputs: Some(outputs),
-            env: None,
-        })
-        .await
-        .unwrap();
-    let success_text = text_content(&success_result);
-    eprintln!(
-        "sandbox custom outputs success output:
-{success_text}"
-    );
-    assert_eq!(extract_field(&success_text, "exit_code"), "0");
-    assert_eq!(
-        std::fs::read_to_string(other.path().join("in_other.txt")).unwrap(),
-        "bye
-"
-    );
-}
-
-#[tokio::test]
 async fn test_working_dir_rejected_outside_roots() {
     let allowed = TestDir::new();
     let outside = TestDir::new();
@@ -1207,8 +994,6 @@ async fn test_working_dir_rejected_outside_roots() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await;
@@ -1233,8 +1018,6 @@ async fn test_exec_rejects_empty_command() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await;
@@ -1258,8 +1041,6 @@ async fn test_exec_rejects_invalid_env_keys() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: Some(bad_env),
         })
         .await;
@@ -1276,8 +1057,6 @@ async fn test_exec_rejects_invalid_env_keys() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: Some(bad_env2),
         })
         .await;
@@ -1294,8 +1073,6 @@ async fn test_exec_rejects_invalid_env_keys() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: Some(bad_env3),
         })
         .await;
@@ -1333,8 +1110,6 @@ async fn test_exec_basic_command() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -1385,8 +1160,6 @@ async fn test_exec_per_call_env_vars() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: Some(extra_env),
         })
         .await
@@ -1411,8 +1184,6 @@ async fn test_spawn_per_call_env_vars() {
         .spawn_impl(SpawnCommandParams {
             command: "echo $MY_SPAWN_VAR".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: Some(extra_env),
         })
         .await
@@ -1463,8 +1234,6 @@ async fn test_sandbox_exec_per_call_env_vars() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: Some(extra_env),
         })
         .await
@@ -1496,8 +1265,6 @@ async fn test_sandbox_spawn_per_call_env_vars() {
         .spawn_impl(SpawnCommandParams {
             command: "echo $MY_SANDBOX_SPAWN_VAR".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: Some(extra_env),
         })
         .await
@@ -1544,8 +1311,6 @@ async fn env_secret_not_leaked_to_child() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -1574,8 +1339,6 @@ async fn test_exec_timeout() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -1605,8 +1368,6 @@ async fn test_exec_truncation_mentions_log_paths_and_read_exec_log_works() {
             head_lines: Some(1),
             tail_lines: Some(1),
             max_output_bytes: Some(16),
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -1694,8 +1455,6 @@ async fn test_cleanup_log_dir_removes_temp_logs() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -1719,8 +1478,6 @@ async fn test_spawn_and_wait() {
         .spawn_impl(SpawnCommandParams {
             command: "echo background && sleep 1".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -1763,8 +1520,6 @@ async fn test_spawn_wait_timeout() {
         .spawn_impl(SpawnCommandParams {
             command: "sleep 5".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -1869,8 +1624,6 @@ async fn test_spawn_with_output() {
         .spawn_impl(SpawnCommandParams {
             command: "for i in 1 2 3; do echo line$i; done".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -1899,112 +1652,6 @@ async fn test_spawn_with_output() {
 }
 
 #[tokio::test]
-async fn test_exec_with_outputs_uses_targeted_snapshot() {
-    let temp_dir = TestDir::new();
-    init_git_repo(temp_dir.path()).await;
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
-
-    let result = server
-        .exec_command_impl(ExecCommandParams {
-            command: "printf 'one\n' > specific_file.txt && printf 'two\n' > other_file.txt"
-                .to_string(),
-            working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            timeout_secs: Some(5),
-            head_lines: None,
-            tail_lines: Some(20),
-            max_output_bytes: None,
-            inputs: None,
-            outputs: Some(vec!["specific_file.txt".to_string()]),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    let text = text_content(&result);
-    assert!(text.contains("exit_code: 0"));
-    assert!(text.contains("status: exited"));
-    assert!(text.contains("diff --git"));
-    assert!(text.contains("specific_file.txt"));
-    assert!(!text.contains("diff --git a/other_file.txt b/other_file.txt"));
-}
-
-#[tokio::test]
-async fn test_exec_with_empty_outputs_skips_snapshot() {
-    let temp_dir = TestDir::new();
-    init_git_repo(temp_dir.path()).await;
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
-
-    let result = server
-        .exec_command_impl(ExecCommandParams {
-            command: "printf 'one\n' > specific_file.txt && printf 'two\n' > other_file.txt"
-                .to_string(),
-            working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            timeout_secs: Some(5),
-            head_lines: None,
-            tail_lines: Some(20),
-            max_output_bytes: None,
-            inputs: None,
-            outputs: Some(vec![]),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    let text = text_content(&result);
-    assert!(text.contains("exit_code: 0"));
-    assert!(text.contains("status: exited"));
-    assert!(!text.contains("diff --git"));
-}
-
-#[tokio::test]
-async fn test_spawn_wait_with_outputs_uses_targeted_snapshot() {
-    let temp_dir = TestDir::new();
-    init_git_repo(temp_dir.path()).await;
-    let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
-
-    let result = server
-        .spawn_impl(SpawnCommandParams {
-            command: "printf 'one\n' > out.txt && printf 'two\n' > other.txt".to_string(),
-            working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: Some(vec!["out.txt".to_string()]),
-            env: None,
-        })
-        .await
-        .unwrap();
-
-    let text = text_content(&result);
-    let execution_id = extract_field(&text, "execution_id");
-
-    let result = server
-        .wait_impl(WaitParams {
-            execution_id,
-            timeout_secs: Some(5),
-            head_lines: None,
-            tail_lines: Some(20),
-            max_output_bytes: None,
-            grep: None,
-        })
-        .await
-        .unwrap();
-
-    let text = text_content(&result);
-    let diff_text = result
-        .content
-        .iter()
-        .skip(2)
-        .filter_map(|content| match &content.raw {
-            rmcp::model::RawContent::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(text.contains("exit_code: 0"));
-    assert!(diff_text.contains("out.txt"));
-    assert!(!diff_text.contains("other.txt"));
-}
-
-#[tokio::test]
 async fn test_exec_env_special_chars_and_override() {
     let temp_dir = TestDir::new();
     let server = BashServer::new(vec![temp_dir.path().to_path_buf()]);
@@ -2024,8 +1671,6 @@ async fn test_exec_env_special_chars_and_override() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: Some(extra_env),
         })
         .await
@@ -2070,8 +1715,6 @@ async fn test_sandbox_exec_env_special_chars_and_override() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: Some(extra_env),
         })
         .await
@@ -2164,8 +1807,6 @@ mod home_filtering {
             BashServer::new_with_sandbox(vec![home_root.clone()], enabled_sandbox_config());
         let args = server.build_sandbox_args(
             std::path::Path::new("/tmp/harnx-test-sandbox-home/work"),
-            None,
-            None,
             &[home_root],
         );
         let pairs = collect_arg_pairs(&args);
@@ -2193,8 +1834,6 @@ mod home_filtering {
             BashServer::new_with_sandbox(vec![subdir_root.clone()], enabled_sandbox_config());
         let args = server.build_sandbox_args(
             std::path::Path::new("/tmp/harnx-test-sandbox-home2/projects"),
-            None,
-            None,
             &[subdir_root],
         );
         let pairs = collect_arg_pairs(&args);
@@ -2240,8 +1879,6 @@ async fn test_exec_python_shebang() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -2272,8 +1909,6 @@ async fn test_exec_node_shebang() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -2300,8 +1935,6 @@ async fn test_spawn_python_shebang() {
         .spawn_impl(SpawnCommandParams {
             command: "#!/usr/bin/env python3\nprint(\"hello from spawn python\")".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -2421,8 +2054,6 @@ async fn test_sandbox_exec_python_shebang() {
             head_lines: None,
             tail_lines: None,
             max_output_bytes: None,
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -2453,8 +2084,6 @@ async fn test_wait_grep_filters_per_stream() {
             command: "printf 'keep-out\\ndrop-out\\n'; printf 'keep-err\\ndrop-err\\n' >&2"
                 .to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -2501,8 +2130,6 @@ async fn test_wait_truncation_triggers_and_mentions_log_path() {
         .spawn_impl(SpawnCommandParams {
             command: "for i in $(seq 1 200); do echo \"stdout-line-$i\"; done".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -2545,8 +2172,6 @@ async fn test_wait_max_output_bytes_truncates() {
         .spawn_impl(SpawnCommandParams {
             command: "for i in $(seq 1 200); do echo \"line-$i\"; done".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -2584,8 +2209,6 @@ async fn test_wait_stream_markers() {
         .spawn_impl(SpawnCommandParams {
             command: "echo only-stdout".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await
@@ -2637,15 +2260,11 @@ async fn test_concurrent_execution_log_isolation() {
         server.spawn_impl(SpawnCommandParams {
             command: "echo alpha-out; echo alpha-err >&2; sleep 0.3".to_string(),
             working_dir: Some(wd.clone()),
-            inputs: None,
-            outputs: None,
             env: None,
         }),
         server.spawn_impl(SpawnCommandParams {
             command: "echo bravo-out; echo bravo-err >&2; sleep 0.3".to_string(),
             working_dir: Some(wd.clone()),
-            inputs: None,
-            outputs: None,
             env: None,
         }),
     );
@@ -2715,8 +2334,6 @@ async fn test_spawn_wait_read_exec_log_returns_full_output() {
         .spawn_impl(SpawnCommandParams {
             command: "printf 'out1\\nout2\\nout3\\n'; printf 'err1\\nerr2\\n' >&2".to_string(),
             working_dir: Some(temp_dir.path().to_string_lossy().to_string()),
-            inputs: None,
-            outputs: None,
             env: None,
         })
         .await

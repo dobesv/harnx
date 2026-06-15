@@ -14,7 +14,6 @@ impl BashServer {
             .prepare_exec(
                 &params.command,
                 params.working_dir.as_deref(),
-                params.outputs.as_ref(),
                 params.env.as_ref(),
                 "before spawn",
             )
@@ -24,10 +23,6 @@ impl BashServer {
             snapshot_decision,
             before_snap_ids,
         } = prepared;
-        let output_paths = self
-            .resolve_output_paths(&working_dir, params.outputs.as_ref())
-            .await?;
-
         self.ensure_log_dir().await?;
 
         let exec_dir = self.next_exec_dir()?.keep();
@@ -54,10 +49,6 @@ impl BashServer {
                     command: &params.command,
                     working_dir: &working_dir,
                     exec_dir: &exec_dir,
-                    #[cfg(unix)]
-                    inputs: &params.inputs,
-                    #[cfg(unix)]
-                    outputs: &params.outputs,
                     env: params.env.as_ref(),
                 },
                 Stdio::from(stdout_file),
@@ -81,7 +72,6 @@ impl BashServer {
             stderr_log_path: stderr_log_path.clone(),
             before_snap_ids,
             snapshot_decision: snapshot_decision.clone(),
-            output_paths,
         };
 
         self.store_spawned_process(execution_id.clone(), entry)
@@ -116,7 +106,6 @@ impl BashServer {
             stderr_log_path,
             before_snap_ids,
             snapshot_decision,
-            output_paths,
         ) = {
             let mut map = self.inner.spawned.lock().await;
             let entry = map.remove(&params.execution_id).ok_or_else(|| {
@@ -136,14 +125,7 @@ impl BashServer {
                 entry.stderr_log_path,
                 entry.before_snap_ids,
                 entry.snapshot_decision,
-                entry.output_paths,
             )
-        };
-
-        let snapshot_decision = match &output_paths {
-            None => snapshot_decision,
-            Some(paths) if paths.is_empty() => SnapshotDecision::ReadOnly,
-            Some(paths) => SnapshotDecision::Targeted(paths.clone()),
         };
 
         let timeout = Duration::from_secs(timeout_secs);
@@ -209,7 +191,6 @@ impl BashServer {
                         stderr_log_path: stderr_log_path.clone(),
                         before_snap_ids,
                         snapshot_decision,
-                        output_paths,
                     },
                 );
 
