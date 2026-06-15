@@ -3,6 +3,9 @@
 //! attachments out of the request) and sends it to a summarizer; the most
 //! recent turns are kept verbatim. See `session_ops_split::compact_session`.
 
+use harnx_core::message::{
+    Message, MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole,
+};
 use harnx_core::session::ToolOutput;
 
 /// Number of recent user-turns kept verbatim (not summarized) by default.
@@ -63,6 +66,76 @@ pub fn render_tool_output(out: &ToolOutput, max_chars: usize) -> String {
     // Tier 3: redacted output JSON, truncated.
     let full = serde_json::to_string(&out.output).unwrap_or_default();
     truncate_middle(&full, max_chars)
+}
+
+/// Render image/text content parts to plain text, replacing images with a
+/// `[image: <ref>]` placeholder so no base64 enters the transcript.
+fn render_parts(parts: &[MessageContentPart]) -> String {
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            MessageContentPart::Text { text } => out.push(text.clone()),
+            MessageContentPart::ImageUrl { image_url } => {
+                out.push(format!("[image: {}]", image_url.url))
+            }
+        }
+    }
+    out.join("\n")
+}
+
+/// Render a tool-call turn: the assistant's preceding text, each tool call
+/// header, and each tool result via the three-tier renderer.
+fn render_tool_calls(calls: &MessageContentToolCalls, max_tool_chars: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if !calls.text.is_empty() {
+        lines.push(format!("── assistant ──\n{}", calls.text));
+    }
+    for result in &calls.tool_results {
+        let args = serde_json::to_string(&result.call.arguments).unwrap_or_default();
+        lines.push(format!("── tool call: {} ──\n{}", result.call.name, args));
+        let out = ToolOutput {
+            id: result.call.id.clone(),
+            name: result.call.name.clone(),
+            output: result.output.clone(),
+            content: result.content.clone(),
+            switch_agent: result.switch_agent.clone(),
+        };
+        lines.push(format!(
+            "── tool result ──\n{}",
+            render_tool_output(&out, max_tool_chars)
+        ));
+    }
+    lines.join("\n\n")
+}
+
+/// Render a slice of messages into a single flattened, labeled transcript for
+/// summarization. Images are placeholdered; tool results use the three-tier
+/// `render_tool_output`. `max_tool_chars` caps each tool result.
+pub fn render_transcript(messages: &[Message], max_tool_chars: usize) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    for message in messages {
+        match (&message.role, &message.content) {
+            (MessageRole::System, content) => {
+                sections.push(format!("── system ──\n{}", content.to_text()));
+            }
+            (MessageRole::User, MessageContent::Array(parts)) => {
+                sections.push(format!("── user ──\n{}", render_parts(parts)));
+            }
+            (MessageRole::User, content) => {
+                sections.push(format!("── user ──\n{}", content.to_text()));
+            }
+            (MessageRole::Assistant, content) => {
+                sections.push(format!("── assistant ──\n{}", content.to_text()));
+            }
+            (MessageRole::Tool, MessageContent::ToolCalls(calls)) => {
+                sections.push(render_tool_calls(calls, max_tool_chars));
+            }
+            (MessageRole::Tool, content) => {
+                sections.push(format!("── tool result ──\n{}", content.to_text()));
+            }
+        }
+    }
+    sections.join("\n\n")
 }
 
 #[cfg(test)]
@@ -135,5 +208,67 @@ mod tests {
         let rendered = render_tool_output(&out, 200);
         assert!(rendered.chars().count() <= 200);
         assert!(rendered.contains("[truncated]"));
+    }
+
+    #[test]
+    fn render_transcript_labels_roles_and_placeholders_images() {
+        use harnx_core::message::{
+            ImageUrl, Message, MessageContent, MessageContentPart, MessageContentToolCalls,
+            MessageRole,
+        };
+        use harnx_core::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+
+        let messages = vec![
+            Message::new(
+                MessageRole::System,
+                MessageContent::Text("you are X".into()),
+            ),
+            Message::new(
+                MessageRole::User,
+                MessageContent::Array(vec![
+                    MessageContentPart::Text {
+                        text: "look at this".into(),
+                    },
+                    MessageContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "cid:abc123".into(),
+                        },
+                    },
+                ]),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls {
+                    text: "let me check".into(),
+                    thought: None,
+                    sequence: false,
+                    tool_results: vec![ToolResult {
+                        call: ToolCall {
+                            name: "bash".into(),
+                            arguments: json!({"cmd": "ls"}),
+                            id: Some("c1".into()),
+                            thought_signature: None,
+                        },
+                        output: json!({"_meta": {"harnx.dev/compaction": "3 files"}}),
+                        content: vec![],
+                        switch_agent: None,
+                    }],
+                }),
+            ),
+        ];
+
+        let t = render_transcript(&messages, 2000);
+        assert!(t.contains("── system ──"));
+        assert!(t.contains("you are X"));
+        assert!(t.contains("── user ──"));
+        assert!(t.contains("look at this"));
+        assert!(
+            t.contains("[image:"),
+            "image rendered as placeholder, not base64"
+        );
+        assert!(t.contains("── tool call: bash ──"));
+        assert!(t.contains("── tool result ──"));
+        assert!(t.contains("3 files"));
     }
 }
