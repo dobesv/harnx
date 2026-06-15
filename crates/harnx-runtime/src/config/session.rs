@@ -317,17 +317,25 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
             SessionLogEntry::DataUrls { urls } => {
                 session.data_urls.extend(urls);
             }
-            SessionLogEntry::Compress { prompt } => {
+            SessionLogEntry::Compress { prompt, keep_from } => {
                 if let Some(pending) = pending.take() {
                     session
                         .messages
                         .push(repair_orphan_tool_calls(pending, name)?);
                 }
+                // None = move all (legacy / full `compress`). Some(k) keeps the
+                // recent suffix `messages[k..]` verbatim, archiving only the
+                // prefix — mirrors `compress_keeping_recent`'s in-memory result.
+                let keep_from = keep_from
+                    .unwrap_or(session.messages.len())
+                    .min(session.messages.len());
+                let suffix = session.messages.split_off(keep_from);
                 session.compressed_messages.append(&mut session.messages);
                 session.messages.push(Message::new(
                     MessageRole::System,
                     MessageContent::Text(prompt),
                 ));
+                session.messages.extend(suffix);
             }
             SessionLogEntry::Clear => {
                 pending = None;
@@ -718,6 +726,7 @@ pub fn save(
             if system_msg.role == MessageRole::System {
                 let compress_entry = SessionLogEntry::Compress {
                     prompt: system_msg.content.to_text(),
+                    keep_from: None,
                 };
                 content.push_str("---\n");
                 content.push_str(&serde_yaml::to_string(&compress_entry).with_context(|| {
@@ -802,7 +811,13 @@ pub fn compress(session: &mut Session, mut prompt: String) {
         MessageContent::Text(prompt.clone()),
     ));
     session.update_tokens();
-    if !append_event(session, &SessionLogEntry::Compress { prompt }) {
+    if !append_event(
+        session,
+        &SessionLogEntry::Compress {
+            prompt,
+            keep_from: None,
+        },
+    ) {
         session.dirty = true;
     }
 }
@@ -833,7 +848,13 @@ pub fn compress_keeping_recent(session: &mut Session, mut prompt: String, keep_f
     ));
     session.messages.extend(suffix);
     session.update_tokens();
-    if !append_event(session, &SessionLogEntry::Compress { prompt }) {
+    if !append_event(
+        session,
+        &SessionLogEntry::Compress {
+            prompt,
+            keep_from: Some(keep_from),
+        },
+    ) {
         session.dirty = true;
     }
 }
@@ -1438,6 +1459,164 @@ content: second
         assert_eq!(session.messages[0].content.to_text(), "second");
         assert_eq!(session.log_entry_count, 5);
         assert_eq!(session.next_seq(), 5);
+    }
+
+    #[test]
+    fn compress_with_keep_from_preserves_recent_suffix_on_reload() {
+        // Header + prefix (system, user, assistant) + suffix (user, assistant),
+        // then a compress entry with keep_from=3. Replay must archive the
+        // prefix [0..3] into compressed_messages, insert the summary system
+        // message, and keep the suffix [3..] verbatim.
+        let content = r#"---
+type: header
+model: openai:gpt-4o
+---
+type: message
+role: system
+content: old system prompt
+---
+type: message
+role: user
+content: prefix question
+---
+type: message
+role: assistant
+content: prefix answer
+---
+type: message
+role: user
+content: recent question
+---
+type: message
+role: assistant
+content: recent answer
+---
+type: compress
+prompt: summary of earlier conversation
+keep_from: 3
+"#;
+
+        let session = super::load_from_log_for_test(content);
+
+        // The kept suffix must survive: summary system message + 2 recent msgs.
+        assert_eq!(
+            session.messages.len(),
+            3,
+            "summary system message plus the kept suffix should survive"
+        );
+        assert_eq!(session.messages[0].role, MessageRole::System);
+        assert_eq!(
+            session.messages[0].content.to_text(),
+            "summary of earlier conversation"
+        );
+        assert_eq!(session.messages[1].role, MessageRole::User);
+        assert_eq!(session.messages[1].content.to_text(), "recent question");
+        assert_eq!(session.messages[2].role, MessageRole::Assistant);
+        assert_eq!(session.messages[2].content.to_text(), "recent answer");
+
+        // The prefix [0..3] must have been archived.
+        assert_eq!(session.compressed_messages.len(), 3);
+        assert_eq!(
+            session.compressed_messages[0].content.to_text(),
+            "old system prompt"
+        );
+        assert_eq!(
+            session.compressed_messages[1].content.to_text(),
+            "prefix question"
+        );
+        assert_eq!(
+            session.compressed_messages[2].content.to_text(),
+            "prefix answer"
+        );
+    }
+
+    #[test]
+    fn compress_without_keep_from_moves_all_messages_on_reload() {
+        // Legacy logs (and the full `compress`) omit keep_from: every preceding
+        // message is archived and only the summary survives.
+        let content = r#"---
+type: header
+model: openai:gpt-4o
+---
+type: message
+role: user
+content: first
+---
+type: message
+role: assistant
+content: second
+---
+type: compress
+prompt: summary
+"#;
+
+        let session = super::load_from_log_for_test(content);
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, MessageRole::System);
+        assert_eq!(session.messages[0].content.to_text(), "summary");
+        assert_eq!(session.compressed_messages.len(), 2);
+    }
+
+    #[test]
+    fn compress_keeping_recent_reload_matches_in_memory() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        session.messages = vec![
+            Message::new(
+                MessageRole::System,
+                MessageContent::Text("base prompt".to_string()),
+            ),
+            Message::new(MessageRole::User, MessageContent::Text("q1".to_string())),
+            Message::new(
+                MessageRole::Assistant,
+                MessageContent::Text("a1".to_string()),
+            ),
+            Message::new(MessageRole::User, MessageContent::Text("q2".to_string())),
+            Message::new(
+                MessageRole::Assistant,
+                MessageContent::Text("a2".to_string()),
+            ),
+        ];
+
+        // Persist the message entries to a real log file so the compress entry
+        // is appended incrementally on top of them.
+        super::save(&mut session, "test", &tmp.path().join("test.yaml"), false).unwrap();
+
+        // Compact the prefix, keeping the last two messages verbatim.
+        super::compress_keeping_recent(&mut session, "rolling summary".to_string(), 3);
+
+        let in_memory: Vec<(MessageRole, String)> = session
+            .messages
+            .iter()
+            .map(|m| (m.role, m.content.to_text()))
+            .collect();
+
+        let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        let reloaded = super::load_from_log_for_test(&persisted);
+        let reloaded_view: Vec<(MessageRole, String)> = reloaded
+            .messages
+            .iter()
+            .map(|m| (m.role, m.content.to_text()))
+            .collect();
+
+        assert_eq!(
+            reloaded_view, in_memory,
+            "reloaded messages must equal the in-memory result of compress_keeping_recent"
+        );
+        // Sanity: the recent suffix survived rather than being dropped.
+        assert!(reloaded
+            .messages
+            .iter()
+            .any(|m| m.content.to_text() == "q2"));
+        assert!(reloaded
+            .messages
+            .iter()
+            .any(|m| m.content.to_text() == "a2"));
     }
 
     #[test]

@@ -177,7 +177,10 @@ pub fn split_index(
         idx += 1;
     }
     // Never compact zero messages when there is something to compact: if the
-    // budget would keep everything, fall back to keeping only the last turn.
+    // budget would keep everything, fall back to splitting at the last user
+    // turn so at least the prefix before it is compacted. When the only user
+    // message is at index 0 there is no earlier turn to keep, so we compact
+    // everything (idx = len).
     if idx == 0 {
         idx = messages
             .iter()
