@@ -6,6 +6,7 @@
 use harnx_core::message::{
     Message, MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole,
 };
+use harnx_core::model::Model;
 use harnx_core::session::ToolOutput;
 
 /// Number of recent user-turns kept verbatim (not summarized) by default.
@@ -138,6 +139,55 @@ pub fn render_transcript(messages: &[Message], max_tool_chars: usize) -> String 
     sections.join("\n\n")
 }
 
+/// Index in `messages` where the verbatim recent suffix begins; messages before
+/// it are compacted. Keeps at most `keep_turns` recent user-turns and
+/// `keep_tokens` estimated tokens, snapping the boundary forward to a `User`
+/// message. When `len >= 2` and the slice contains a user message — which the
+/// compaction caller guarantees by checking `has_user_messages` first — at
+/// least the first message is compacted. (A multi-message slice with no user
+/// message at all returns `len`, i.e. compacts nothing.)
+pub fn split_index(
+    messages: &[Message],
+    model: &Model,
+    keep_turns: usize,
+    keep_tokens: usize,
+) -> usize {
+    let len = messages.len();
+    if len <= 1 {
+        return len;
+    }
+    let mut idx = len;
+    let mut turns = 0usize;
+    let mut tokens = 0usize;
+    for i in (0..len).rev() {
+        let t = model.messages_tokens(std::slice::from_ref(&messages[i]));
+        let is_user = messages[i].role == MessageRole::User;
+        // Stop before including message i if adding it would exceed either cap.
+        if (is_user && turns >= keep_turns) || tokens + t > keep_tokens {
+            break;
+        }
+        tokens += t;
+        if is_user {
+            turns += 1;
+        }
+        idx = i;
+    }
+    // Snap forward to a User boundary so a kept reply always has its prompt.
+    while idx < len && messages[idx].role != MessageRole::User {
+        idx += 1;
+    }
+    // Never compact zero messages when there is something to compact: if the
+    // budget would keep everything, fall back to keeping only the last turn.
+    if idx == 0 {
+        idx = messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::User)
+            .filter(|&p| p >= 1)
+            .unwrap_or(len);
+    }
+    idx.min(len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +258,45 @@ mod tests {
         let rendered = render_tool_output(&out, 200);
         assert!(rendered.chars().count() <= 200);
         assert!(rendered.contains("[truncated]"));
+    }
+
+    fn msg(role: harnx_core::message::MessageRole, text: &str) -> harnx_core::message::Message {
+        use harnx_core::message::{Message, MessageContent};
+        Message::new(role, MessageContent::Text(text.into()))
+    }
+
+    #[test]
+    fn split_index_keeps_recent_user_turns() {
+        use harnx_core::message::MessageRole::*;
+        use harnx_core::model::Model;
+        let model = Model::default();
+        let messages = vec![
+            msg(System, "sys"), msg(User, "u1"), msg(Assistant, "a1"),
+            msg(User, "u2"), msg(Assistant, "a2"),
+            msg(User, "u3"), msg(Assistant, "a3"),
+        ];
+        let idx = split_index(&messages, &model, 1, 100_000);
+        assert_eq!(idx, 5);
+        assert_eq!(messages[idx].role, User);
+    }
+
+    #[test]
+    fn split_index_compacts_at_least_one_message() {
+        use harnx_core::message::MessageRole::*;
+        use harnx_core::model::Model;
+        let model = Model::default();
+        let messages = vec![msg(User, "u1"), msg(Assistant, "a1")];
+        let idx = split_index(&messages, &model, 100, 100_000);
+        assert!(idx >= 1 && idx <= messages.len());
+    }
+
+    #[test]
+    fn split_index_single_message_keeps_all() {
+        use harnx_core::message::MessageRole::*;
+        use harnx_core::model::Model;
+        let model = Model::default();
+        let messages = vec![msg(User, "only")];
+        assert_eq!(split_index(&messages, &model, 3, 8000), messages.len());
     }
 
     #[test]
