@@ -95,7 +95,10 @@ struct PendingToolCalls {
     timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-pub(crate) fn collect_raw_log_entries(content: &str, name: &str) -> Result<Vec<(usize, SessionLogEntry)>> {
+pub(crate) fn collect_raw_log_entries(
+    content: &str,
+    name: &str,
+) -> Result<Vec<(usize, SessionLogEntry)>> {
     serde_yaml::Deserializer::from_str(content)
         .enumerate()
         .map(|(seq, document)| {
