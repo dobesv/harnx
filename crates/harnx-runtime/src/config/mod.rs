@@ -1189,6 +1189,12 @@ impl Config {
                 declarations.extend(handoff_declarations);
                 handoff_targets.extend(targets);
             }
+            if selectors.iter().any(|v| {
+                let v = v.trim();
+                v == crate::session_history::TOOL_NAME || v == "*"
+            }) {
+                declarations.push(crate::session_history::tool_declaration());
+            }
         }
 
         let mut seen = HashSet::new();

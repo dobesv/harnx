@@ -1087,6 +1087,34 @@ fn handoff_tool_declarations_are_package_aware_and_valid() {
 }
 
 #[test]
+fn session_history_tool_declaration_is_gated_by_use_tools() {
+    let config = Config::default();
+    let history_name = crate::session_history::TOOL_NAME;
+
+    let selected = config
+        .tool_declarations_for_use_tools(Some(history_name), None)
+        .0;
+    assert!(
+        selected.iter().any(|d| d.name == history_name),
+        "explicitly selecting the tool should include its declaration"
+    );
+
+    let unrelated = config
+        .tool_declarations_for_use_tools(Some("some_unrelated_tool"), None)
+        .0;
+    assert!(
+        !unrelated.iter().any(|d| d.name == history_name),
+        "an unrelated selector must not include the session-history declaration"
+    );
+
+    let wildcard = config.tool_declarations_for_use_tools(Some("*"), None).0;
+    assert!(
+        wildcard.iter().any(|d| d.name == history_name),
+        "a wildcard selector should include the session-history declaration"
+    );
+}
+
+#[test]
 fn dynamic_provider_model_init_sets_client_name_from_provider() {
     struct ProviderGuard(Option<std::ffi::OsString>);
     impl Drop for ProviderGuard {
@@ -1361,5 +1389,91 @@ async fn use_agent_scopes_managers_to_package_for_delegation_tools() {
     assert!(
         !names.iter().any(|n| n.starts_with("pantheon__")),
         "after use_agent, same-package ACP tools must NOT be `pantheon__`-prefixed; got {names:?}"
+    );
+}
+
+// ── SessionHistoryProvider::call_tool end-to-end ─────────────────────────
+
+/// Exercises the full `call_tool` path of `SessionHistoryProvider`: build a
+/// real on-disk log, wire it up as the active session's `path`, then call
+/// through the provider and verify the envelope shape.
+#[tokio::test]
+async fn session_history_provider_call_tool_returns_message_entries() {
+    use crate::session_history::SessionHistoryProvider;
+    use harnx_core::abort::create_abort_signal;
+    use harnx_core::tool::ToolProvider as _;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Build a minimal config with a session that has a real on-disk log.
+    let mut config = Config {
+        data: ConfigData {
+            stream: false,
+            save_session: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut session = self::session::new(&config, "call-tool-test").unwrap();
+    session.set_sessions_dir(tmp.path().to_path_buf());
+
+    // Append a message entry so the log file is initialized and contains data.
+    let wrote = self::session::append_event(
+        &mut session,
+        &harnx_core::session::SessionLogEntry::Message {
+            role: crate::client::MessageRole::User,
+            content: crate::client::MessageContent::Text("what is 2+2?".to_string()),
+            timestamp: None,
+        },
+    );
+    assert!(wrote, "append_event must write the log file");
+
+    config.session = Some(session);
+    let global_config: GlobalConfig = Arc::new(RwLock::new(config));
+
+    let provider = SessionHistoryProvider::new(global_config.clone());
+    let abort = create_abort_signal();
+
+    // has_tool assertions
+    assert!(
+        provider.has_tool(crate::session_history::TOOL_NAME),
+        "provider must report the session-history tool as owned"
+    );
+    assert!(
+        !provider.has_tool("other_tool"),
+        "provider must not claim unrelated tools"
+    );
+
+    // call_tool with a type filter so only message entries come back.
+    let result = provider
+        .call_tool(
+            crate::session_history::TOOL_NAME,
+            serde_json::json!({"type": "message"}),
+            &abort,
+        )
+        .await
+        .map_err(|e| match e {
+            harnx_core::tool::ToolError::Recoverable(e) => e,
+            harnx_core::tool::ToolError::Fatal(e) => e,
+        })
+        .unwrap();
+
+    // Verify the content envelope: [{type:"text", text:"[...]"}]
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("content[0].text must be a string");
+    assert_eq!(
+        result["content"][0]["type"], "text",
+        "content type must be 'text'"
+    );
+
+    // The text must deserialize as a JSON array containing at least one object
+    // with type == "message".
+    let rows: serde_json::Value =
+        serde_json::from_str(text).expect("content text must be valid JSON");
+    let arr = rows.as_array().expect("rows must be a JSON array");
+    assert!(
+        arr.iter().any(|r| r["type"] == "message"),
+        "at least one entry with type 'message' must be present; got: {arr:?}"
     );
 }
