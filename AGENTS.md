@@ -80,6 +80,7 @@ redirect message if run under `cargo test` (via `harnx_core::require_nextest()`)
 
 **Do not skip any of these steps or you WILL miss problems**
 **Do not ignore clippy warnings.** CI sets `RUSTFLAGS=--deny warnings` and runs `cargo clippy -- -D warnings`, so any warning will fail the build.
+**CodeScene Health scores MUST NOT decrease as part of the change, only increase**
 
 ## Commit Conventions
 
