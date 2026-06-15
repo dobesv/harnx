@@ -240,10 +240,17 @@ impl AgentConfig {
 {starters}"#
             )
         };
+        // Most agents don't set a version; omit the " v…" suffix entirely so the
+        // header reads "# name" rather than a dangling "# name v".
+        let version = if self.version.is_empty() {
+            String::new()
+        } else {
+            format!(" v{}", self.version)
+        };
         format!(
-            r#"# {} v{}
+            r#"# {}{}
 {}{}"#,
-            self.name, self.version, self.description, starters
+            self.name, version, self.description, starters
         )
     }
 
@@ -644,6 +651,32 @@ mod tests {
         let agent = AgentConfig::from_markdown("my-agent", "Your name is {{agent.name}}.").unwrap();
         let result = agent.interpolated_instructions().unwrap();
         assert_eq!(result, "Your name is my-agent.");
+    }
+
+    #[test]
+    fn banner_omits_version_suffix_when_unset() {
+        let agent =
+            AgentConfig::from_markdown("demo-agent", "---\ndescription: A demo.\n---\nPrompt")
+                .unwrap();
+        let banner = agent.banner();
+        assert!(
+            banner.starts_with("# demo-agent\n"),
+            "expected no dangling version, got: {banner:?}"
+        );
+    }
+
+    #[test]
+    fn banner_includes_version_suffix_when_set() {
+        let agent = AgentConfig::from_markdown(
+            "demo-agent",
+            "---\ndescription: A demo.\nversion: 1.2.3\n---\nPrompt",
+        )
+        .unwrap();
+        assert!(
+            agent.banner().starts_with("# demo-agent v1.2.3\n"),
+            "got: {:?}",
+            agent.banner()
+        );
     }
 
     #[test]
