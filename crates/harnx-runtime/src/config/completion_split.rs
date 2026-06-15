@@ -20,7 +20,9 @@ impl Config {
                 ".rag" => map_completion_values(Self::list_rags()),
                 ".agent" => map_completion_values(precomputed_agents),
                 ".macro" => map_completion_values(Self::list_macros()),
-                ".info" => map_completion_values(vec!["session", "model", "agent", "rag", "tools"]),
+                ".info" => map_completion_values(vec![
+                    "session", "model", "agent", "rag", "tools", "theme",
+                ]),
                 ".mcp" => map_completion_values(vec![
                     "list",
                     "connect",

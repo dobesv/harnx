@@ -2,7 +2,9 @@ use crate::agent_event_sink::install_tui_agent_event_sink;
 use crate::event_source::{CrosstermEventSource, EventSource};
 use crate::terminal::{cleanup_terminal_state, PanicTerminalHookGuard};
 use crate::types::Tui;
-use crate::types::{App, ModalState, PendingMessage, TranscriptItem, SPINNER_FRAMES, TICK_RATE};
+use crate::types::{
+    App, ModalState, PendingMessage, TranscriptItem, TuiEvent, SPINNER_FRAMES, TICK_RATE,
+};
 use anyhow::Result;
 #[cfg(test)]
 use crossterm::event::KeyEvent;
@@ -87,6 +89,7 @@ impl Tui {
 
         // Build the initial transcript: welcome + banner (if agent)
         let initial_transcript = Self::build_initial_transcript(config);
+        let code_theme = config.read().render_options()?.theme;
 
         let mut app = App {
             transcript: initial_transcript,
@@ -122,6 +125,7 @@ impl Tui {
             transcript_focus: None,
             transcript_selection_anchor: None,
             modal: None,
+            pending_confirm_reply: None,
             detail_view_scroll: {
                 let mut s = ratatui_widget_scrolling::ScrollState::new();
                 s.follow = false;
@@ -147,6 +151,7 @@ impl Tui {
 
         Ok(Self {
             config: config.clone(),
+            code_theme,
             abort_signal: create_abort_signal(),
             async_manager: Arc::new(Mutex::new(async_manager)),
             persistent_manager,
@@ -277,6 +282,7 @@ impl Tui {
         E: EventSource,
     {
         self.install_external_editor_bridge();
+        self.install_tool_confirm_bridge();
         let mut last_tick = Instant::now();
         loop {
             // After an external editor exits, the terminal buffer is stale.
@@ -357,6 +363,32 @@ impl Tui {
                 needs_full_redraw.store(true, std::sync::atomic::Ordering::Release);
             })),
         );
+    }
+
+    /// Route `PreToolUse` "ask" confirmations through the TUI instead of the
+    /// default `inquire` terminal prompt (which fights ratatui's alternate
+    /// screen). The callback runs on the blocked tool-eval thread: it sends a
+    /// `ConfirmToolUse` event to the main loop and blocks on a reply channel
+    /// until the user answers the modal. If the channel drops (e.g. the TUI is
+    /// quitting), it denies.
+    fn install_tool_confirm_bridge(&self) {
+        let event_tx = self.event_tx.clone();
+        let confirm: std::sync::Arc<harnx_runtime::tool::ConfirmToolUseFn> = std::sync::Arc::new(
+            move |tool_name: &str, input: &serde_json::Value, reason: Option<&str>| {
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
+                let event = TuiEvent::ConfirmToolUse {
+                    tool_name: tool_name.to_string(),
+                    input_preview: confirm_input_preview(input),
+                    reason: reason.map(str::to_string),
+                    reply: reply_tx,
+                };
+                if event_tx.send(event).is_err() {
+                    return false;
+                }
+                reply_rx.recv().unwrap_or(false)
+            },
+        );
+        self.config.write().set_tui_confirm_tool_use(Some(confirm));
     }
 
     /// Check if an async hook has signalled a resume and automatically start the follow-up prompt.
@@ -626,6 +658,22 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
     }
     items.extend(messages_to_transcript_items(&session.messages, &decl_map));
     items
+}
+
+/// Compact one-line preview of a tool call's arguments for the confirmation
+/// modal. Renders as inline JSON and truncates to keep the modal tidy.
+fn confirm_input_preview(input: &serde_json::Value) -> String {
+    if input.is_null() {
+        return String::new();
+    }
+    let rendered = serde_json::to_string(input).unwrap_or_default();
+    const MAX: usize = 160;
+    if rendered.chars().count() > MAX {
+        let head: String = rendered.chars().take(MAX).collect();
+        format!("{head}…")
+    } else {
+        rendered
+    }
 }
 
 #[cfg(test)]

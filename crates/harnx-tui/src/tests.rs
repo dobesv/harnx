@@ -480,7 +480,7 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
 }
 
 #[tokio::test]
-async fn final_does_not_duplicate_streamed_multiline_assistant_text() {
+async fn final_coalesces_streamed_multiline_assistant_text() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
@@ -520,8 +520,126 @@ async fn final_does_not_duplicate_streamed_multiline_assistant_text() {
             _ => None,
         })
         .collect();
-    assert_eq!(assistant_entries, vec!["Hello\n", "world\n", "Again"]);
+    assert_eq!(assistant_entries, vec!["Hello\nworld\nAgain"]);
     assert!(!tui.app.streamed_text_this_turn);
+}
+
+#[tokio::test]
+async fn final_coalesces_streamed_fenced_code_block_into_one_entry() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.app.llm_busy = true;
+
+    let chunks = [
+        "```rust\n",
+        "fn main() {\n",
+        "    println!(\"hi\");\n",
+        "}\n",
+        "```\n",
+    ];
+    for chunk in chunks {
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text(chunk.to_string())],
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    }
+
+    let full_block = "```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n";
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Final {
+            output: full_block.to_string(),
+            usage: Default::default(),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let assistant_entries: Vec<_> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptItem::AssistantText { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_entries, vec![full_block]);
+}
+
+#[tokio::test]
+async fn final_only_coalesces_trailing_streamed_run_after_interruption() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.app.llm_busy = true;
+
+    for chunk in ["```rust\n", "fn first() {}\n"] {
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text(chunk.to_string())],
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    }
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Notice(NoticeEvent::Info("tool output".to_string())),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    for chunk in ["fn second() {}\n", "```\n"] {
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text(chunk.to_string())],
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    }
+
+    let full_block = "```rust\nfn first() {}\nfn second() {}\n```\n";
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::Final {
+            output: full_block.to_string(),
+            usage: Default::default(),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let transcript = &tui.app.transcript;
+    let assistant_entries: Vec<_> = transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            TranscriptItem::AssistantText { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistant_entries,
+        vec!["```rust\n", "fn first() {}\n", full_block]
+    );
+    assert!(transcript
+        .iter()
+        .any(|entry| matches!(entry, TranscriptItem::SystemText(text) if text == "tool output")));
 }
 
 #[tokio::test]
@@ -5206,7 +5324,7 @@ fn render_entry_lines(
     use_utc: bool,
 ) -> Vec<ratatui::text::Line<'static>> {
     let mut entry = entry.clone();
-    Tui::render_entry(&mut entry, show_seq, show_ts, use_utc, 80, false)
+    Tui::render_entry(&mut entry, show_seq, show_ts, use_utc, 80, false, None)
         .blocks
         .into_iter()
         .flat_map(|b| match b {

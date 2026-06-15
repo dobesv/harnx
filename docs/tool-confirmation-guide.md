@@ -142,7 +142,7 @@ Hooks can return these values in `hookSpecificOutput`:
 
 To see tool confirmation in action, render the demo recording:
 
-<img width="1100" height="600" alt="Image" src="https://github.com/user-attachments/assets/f7d6528f-5622-4848-893a-201c6dab538f" />
+<img width="1100" height="600" alt="Image" src="https://github.com/user-attachments/assets/5dff2e3d-f798-485f-a0df-8f17455ddc72" />
 
 ```sh
 ./demos/render.sh tool-confirm

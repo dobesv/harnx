@@ -234,6 +234,12 @@ pub struct Config {
     pub agent: Option<Agent>,
     pub tui_before_editor: Option<Box<dyn FnMut() + Send + Sync>>,
     pub tui_after_editor: Option<Box<dyn FnMut() + Send + Sync>>,
+    /// Runtime-only override for tool-use confirmation prompts. When set (the
+    /// TUI installs one), a `PreToolUse` hook returning `ask` is resolved
+    /// through this callback instead of the default `inquire` terminal prompt,
+    /// so confirmation renders as a native ratatui modal rather than fighting
+    /// the alternate-screen TUI. `None` keeps the CLI/inquire behavior.
+    pub tui_confirm_tool_use: Option<Arc<crate::tool::ConfirmToolUseFn>>,
 
     /// Override the sessions directory — used in tests to redirect session
     /// log writes to a temp directory without touching real user data.
@@ -306,6 +312,7 @@ impl Clone for Config {
             agent: self.agent.clone(),
             tui_before_editor: None,
             tui_after_editor: None,
+            tui_confirm_tool_use: None,
             sessions_dir_override: self.sessions_dir_override.clone(),
             temp_dir_override: self.temp_dir_override.clone(),
         }
@@ -354,6 +361,7 @@ impl Config {
             // trying to clone `FnMut` trait objects.
             tui_before_editor: None,
             tui_after_editor: None,
+            tui_confirm_tool_use: None,
             sessions_dir_override: self.sessions_dir_override.clone(),
             temp_dir_override: self.temp_dir_override.clone(),
         }
@@ -389,6 +397,7 @@ impl Default for Config {
             agent: None,
             tui_before_editor: None,
             tui_after_editor: None,
+            tui_confirm_tool_use: None,
             sessions_dir_override: None,
             temp_dir_override: None,
         }

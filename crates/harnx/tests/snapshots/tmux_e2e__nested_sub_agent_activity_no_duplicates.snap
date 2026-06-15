@@ -3,7 +3,7 @@ source: crates/harnx/tests/tmux_e2e.rs
 expression: normalized
 ---
 Welcome to harnx [VERSION]  *  Type .help for commands, Tab to complete.
-nested-parent v
+nested-parent
 🤖 nested-parent ▸ mock-llm:test ▸ [SID]
 > do nested delegation
 

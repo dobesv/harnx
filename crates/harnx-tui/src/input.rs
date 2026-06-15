@@ -787,8 +787,33 @@ impl Tui {
                 self.pin_transcript_to_bottom();
                 self.refresh_input_chrome();
             }
+            TuiEvent::ConfirmToolUse {
+                tool_name,
+                input_preview,
+                reason,
+                reply,
+            } => {
+                // A blocked tool-eval thread is waiting on `reply`. Show the
+                // native modal and remember the channel; answering the modal
+                // (handle_modal_key) sends the decision back.
+                self.app.pending_confirm_reply = Some(reply);
+                self.app.modal = Some(crate::types::ModalState::ConfirmToolUse {
+                    tool_name,
+                    input_preview,
+                    reason,
+                });
+            }
         }
         Ok(())
+    }
+
+    /// Resolve an in-flight tool-use confirmation: send the decision to the
+    /// blocked tool-eval thread and dismiss the modal.
+    fn resolve_tool_confirm(&mut self, allow: bool) {
+        if let Some(reply) = self.app.pending_confirm_reply.take() {
+            let _ = reply.send(allow);
+        }
+        self.app.modal = None;
     }
 
     #[cfg(test)]
@@ -1066,6 +1091,36 @@ impl Tui {
                             rendered_cache: None,
                         });
                         self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
+                    }
+                    self.pin_transcript_to_bottom();
+                } else if !output.is_empty() {
+                    let tail_start = self
+                        .app
+                        .transcript
+                        .iter()
+                        .rposition(|item| !matches!(item, TranscriptItem::AssistantText { .. }))
+                        .map_or(0, |idx| idx + 1);
+
+                    if tail_start < self.app.transcript.len() {
+                        let mut tail = self.app.transcript.split_off(tail_start);
+                        if let Some(TranscriptItem::AssistantText {
+                            text,
+                            rendered_cache,
+                            ..
+                        }) = tail.first_mut()
+                        {
+                            *text = output;
+                            *rendered_cache = None;
+                        }
+                        tail.truncate(1);
+                        self.app.transcript.extend(tail);
+                    } else {
+                        self.app.transcript.push(TranscriptItem::AssistantText {
+                            text: output,
+                            seq: None,
+                            timestamp: Some(chrono::Utc::now()),
+                            rendered_cache: None,
+                        });
                     }
                     self.pin_transcript_to_bottom();
                 }
@@ -2045,6 +2100,23 @@ impl Tui {
             Some(crate::types::ModalState::AgentPicker { .. })
             | Some(crate::types::ModalState::SessionPicker { .. }) => {
                 self.handle_picker_key(key).await?;
+            }
+            Some(crate::types::ModalState::ConfirmToolUse { .. }) => {
+                match (key.code, key.modifiers) {
+                    // Default is deny ([y/N]): only an explicit 'y' allows the call.
+                    (KeyCode::Char('y') | KeyCode::Char('Y'), KeyModifiers::NONE) => {
+                        self.resolve_tool_confirm(true);
+                    }
+                    // Deny on n/N/Esc/Enter, and on Ctrl+C so the blocked tool-eval
+                    // thread is never left waiting.
+                    (KeyCode::Char('n') | KeyCode::Char('N'), KeyModifiers::NONE)
+                    | (KeyCode::Esc, KeyModifiers::NONE)
+                    | (KeyCode::Enter, KeyModifiers::NONE)
+                    | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        self.resolve_tool_confirm(false);
+                    }
+                    _ => {}
+                }
             }
             Some(_) => match (key.code, key.modifiers) {
                 (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {

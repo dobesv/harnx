@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use syntect::highlighting::Theme;
 
 /// Options for `render_list_modal` — bundles the three metadata strings so the
 /// function stays within clippy's `too_many_arguments` limit.
@@ -52,7 +53,12 @@ impl Tui {
     /// by the body lines. Body rendering depends on its origin —
     /// `Markdown` (from a `call_template`) is rendered inline; `Yaml`
     /// (raw args, no template) is displayed verbatim, each line indented.
-    fn render_tool_call(tool_name: &str, body: Option<&ToolCallBody>, width: u16) -> RenderedEntry {
+    fn render_tool_call(
+        tool_name: &str,
+        body: Option<&ToolCallBody>,
+        width: u16,
+        theme: Option<&Theme>,
+    ) -> RenderedEntry {
         let dim_gray = Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM);
@@ -61,7 +67,7 @@ impl Tui {
             Some(ToolCallBody::Markdown(md)) => {
                 // Markdown body is the tool description itself — header suppressed
                 // intentionally (the markdown content replaces the "→ tool_name" line).
-                crate::markdown_render::render_markdown(md, dim_gray, width)
+                crate::markdown_render::render_markdown(md, dim_gray, width, theme)
             }
             Some(ToolCallBody::Yaml(yaml)) => {
                 let mut lines = vec![];
@@ -123,6 +129,7 @@ impl Tui {
         use_utc: bool,
         width: u16,
         skip_cache: bool,
+        theme: Option<&Theme>,
     ) -> RenderedEntry {
         match entry {
             TranscriptItem::SourceHeading(source) => {
@@ -209,7 +216,7 @@ impl Tui {
                 // asterisks for the moment, then upgrades to bold once the
                 // closing `**` arrives in a later chunk.
                 let mut entry =
-                    crate::markdown_render::render_markdown(text, Style::default(), width);
+                    crate::markdown_render::render_markdown(text, Style::default(), width, theme);
                 if let Some(suffix) =
                     Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
@@ -281,7 +288,7 @@ impl Tui {
                     }
                 }
                 let body_base = Style::default().add_modifier(Modifier::DIM);
-                let entry = crate::markdown_render::render_markdown(text, body_base, width);
+                let entry = crate::markdown_render::render_markdown(text, body_base, width, theme);
                 if !skip_cache {
                     *rendered_cache = Some((width, show_seq, show_ts, use_utc, entry.clone()));
                 }
@@ -342,7 +349,7 @@ impl Tui {
                         return cached.clone();
                     }
                 }
-                let mut entry = Self::render_tool_call(tool_name, body.as_ref(), width);
+                let mut entry = Self::render_tool_call(tool_name, body.as_ref(), width, theme);
                 if let Some(suffix) =
                     Self::render_meta_suffix(*seq, *timestamp, show_seq, show_ts, use_utc)
                 {
@@ -810,6 +817,19 @@ impl Tui {
                 let prompt_text = format!("Rewind to entry {}? [y/N]", seq);
                 self.render_simple_modal(frame, screen_size, &prompt_text);
             }
+            ModalState::ConfirmToolUse {
+                tool_name,
+                input_preview,
+                reason,
+            } => {
+                self.render_tool_confirm_modal(
+                    frame,
+                    screen_size,
+                    tool_name,
+                    input_preview,
+                    reason.as_deref(),
+                );
+            }
             ModalState::AgentPicker {
                 agents,
                 selected,
@@ -891,6 +911,71 @@ impl Tui {
                 .border_style(Style::default().fg(Color::Reset)),
         );
 
+        frame.render_widget(modal, modal_area);
+    }
+
+    /// Multi-line confirmation modal for a `PreToolUse` "ask" gate. Shows the
+    /// tool name, optional reason, optional argument preview, and a [y/N] prompt.
+    fn render_tool_confirm_modal(
+        &self,
+        frame: &mut Frame<'_>,
+        screen_size: ratatui::layout::Rect,
+        tool_name: &str,
+        input_preview: &str,
+        reason: Option<&str>,
+    ) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("Allow tool '{tool_name}'?"),
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if let Some(r) = reason.filter(|r| !r.is_empty()) {
+            lines.push(Line::from(vec![
+                Span::styled("Reason: ", dim),
+                Span::styled(r.to_string(), Style::default().fg(Color::Reset)),
+            ]));
+        }
+        if !input_preview.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("Input: ", dim),
+                Span::styled(input_preview.to_string(), dim),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "[y] allow   [n] deny   (Enter/Esc denies)",
+            dim,
+        )));
+
+        let content_width = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.chars().count())
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0) as u16;
+        let modal_width = (content_width + 4)
+            .max(24)
+            .min(screen_size.width.saturating_sub(4));
+        let modal_height = (lines.len() as u16 + 2).min(screen_size.height.saturating_sub(2));
+
+        let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
+        let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
+        let modal_area = ratatui::layout::Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+        frame.render_widget(ratatui::widgets::Clear, modal_area);
+        let modal = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Tool confirmation")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
         frame.render_widget(modal, modal_area);
     }
 
@@ -1319,6 +1404,7 @@ impl Tui {
                     use_utc,
                     width,
                     Some(i) == streaming_idx,
+                    self.code_theme.as_ref(),
                 );
                 if let Some(range) = selected_range {
                     if range.contains(&i) {
