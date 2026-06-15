@@ -3,13 +3,28 @@
 
 use super::test_support::EnvGuard;
 use super::*;
-use harnx_core::message::{MessageContent, MessageRole};
+use crate::client::TestStateGuard;
+use crate::test_utils::{MockClient, MockTurnBuilder};
+use harnx_core::message::{Message, MessageContent, MessageRole};
+use std::io::Write as _;
 
-// ── compact_session tests ────────────────────────────────────────────────
+// ── shared test helpers ──────────────────────────────────────────────────
 
-/// Helper: create a GlobalConfig with a session that already has one user
-/// message in it, suitable for compaction tests.
-fn make_config_with_session() -> GlobalConfig {
+/// Write `<dir>/<name>.md` (creating `dir`), for staging agent files a test
+/// resolves via `HARNX_CONFIG_DIR`.
+fn write_agent(dir: &std::path::Path, name: &str, content: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::File::create(dir.join(format!("{name}.md")))
+        .unwrap()
+        .write_all(content.as_bytes())
+        .unwrap();
+}
+
+/// A stream-off `Config` whose current (non-session) agent is built from
+/// `md`, with the gemini test model set.
+fn config_with_agent(name: &str, md: &str) -> Config {
+    let mut agent = Agent::new(AgentConfig::from_markdown(name, md).unwrap());
+    agent.set_model(crate::client::Model::new("gemini", "gemini-3.1-flash-lite"));
     let mut config = Config {
         data: ConfigData {
             stream: false,
@@ -17,30 +32,73 @@ fn make_config_with_session() -> GlobalConfig {
         },
         ..Default::default()
     };
+    config.agent = Some(agent);
+    config
+}
+
+/// Attach a fresh session carrying `turns` and wrap the config for sharing.
+fn with_session(mut config: Config, turns: Vec<(MessageRole, String)>) -> GlobalConfig {
     let mut session = self::session::new(&config, "test-session").unwrap();
-    session.push_message_for_test(
-        MessageRole::User,
-        "Tell me about the Rust ownership model.".to_string(),
-    );
+    for (role, text) in turns {
+        session.push_message_for_test(role, text);
+    }
     config.session = Some(session);
     Arc::new(RwLock::new(config))
 }
+
+/// Install a mock summarizer client (returns one canned turn) under the global
+/// test lock. Hold the returned guard for the duration of the test.
+async fn install_summarizer_mock() -> (Arc<MockClient>, TestStateGuard<'static>) {
+    let mock = Arc::new(
+        MockClient::builder()
+            .add_turn(MockTurnBuilder::new().add_text_chunk("Compacted.").build())
+            .build(),
+    );
+    let guard = TestStateGuard::new(Some(mock.clone())).await;
+    (mock, guard)
+}
+
+/// True if any system message contains `needle`.
+fn system_prompt_contains(messages: &[Message], needle: &str) -> bool {
+    messages.iter().any(|m| {
+        m.role == MessageRole::System
+            && matches!(&m.content, MessageContent::Text(t) if t.contains(needle))
+    })
+}
+
+/// The single rendered-transcript user message sent to the summarizer.
+fn rendered_transcript(messages: &[Message]) -> &str {
+    messages
+        .iter()
+        .find(|m| m.role == MessageRole::User)
+        .and_then(|m| match &m.content {
+            MessageContent::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .expect("rendered transcript user message present")
+}
+
+// ── compact_session tests ────────────────────────────────────────────────
 
 /// compact_session (no compaction_agent) must send the session history to
 /// the LLM — i.e. the user message from the conversation must appear in
 /// the ChatCompletionsData that the mock receives.
 #[tokio::test]
 async fn test_compact_session_default_includes_session_history() {
-    use crate::client::TestStateGuard;
-    use crate::test_utils::{MockClient, MockTurnBuilder};
-
-    let mock = Arc::new(
-        MockClient::builder()
-            .add_turn(MockTurnBuilder::new().add_text_chunk("Summary.").build())
-            .build(),
+    let (mock, _guard) = install_summarizer_mock().await;
+    let config = with_session(
+        Config {
+            data: ConfigData {
+                stream: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        vec![(
+            MessageRole::User,
+            "Tell me about the Rust ownership model.".to_string(),
+        )],
     );
-    let _guard = TestStateGuard::new(Some(mock.clone())).await;
-    let config = make_config_with_session();
 
     Config::compact_session(&config).await.unwrap();
 
@@ -51,13 +109,9 @@ async fn test_compact_session_default_includes_session_history() {
         "expected exactly one LLM call"
     );
     let messages = &history.conversation_history[0].messages;
-    let has_history = messages.iter().any(|m| {
-        if let MessageContent::Text(t) = &m.content {
-            t.contains("Rust ownership model")
-        } else {
-            false
-        }
-    });
+    let has_history = messages.iter().any(
+        |m| matches!(&m.content, MessageContent::Text(t) if t.contains("Rust ownership model")),
+    );
     assert!(
         has_history,
         "session history must be forwarded to the compaction LLM; messages: {messages:?}"
@@ -70,55 +124,24 @@ async fn test_compact_session_default_includes_session_history() {
 /// system prompt plus the transcript as the user message.
 #[tokio::test]
 async fn test_compact_session_with_compaction_agent_sends_rendered_transcript() {
-    use crate::client::TestStateGuard;
-    use crate::test_utils::{MockClient, MockTurnBuilder};
-    use std::io::Write as _;
-
-    // Write a minimal compaction agent file to a temp dir and point the
-    // config's agents directory at it via HARNX_CONFIG_DIR.
     let temp = tempfile::TempDir::new().unwrap();
-    let agents_dir = temp.path().join("agents");
-    std::fs::create_dir_all(&agents_dir).unwrap();
-
-    let agent_content = "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are a specialized compaction agent. Produce a concise summary.\n";
-    let mut f = std::fs::File::create(agents_dir.join("my-compactor.md")).unwrap();
-    f.write_all(agent_content.as_bytes()).unwrap();
-
-    // Build a config where the current (non-session) agent has
-    // compaction_agent = "my-compactor".
-    let mut main_agent = Agent::new(AgentConfig::from_markdown(
-            "main",
-            "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_agent: my-compactor\n---\nYou are the main agent.",
-        ).unwrap());
-    main_agent.set_model(crate::client::Model::new("gemini", "gemini-3.1-flash-lite"));
-
-    let mut config = Config {
-        data: ConfigData {
-            stream: false,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    // Point Config::agent_file() at the temp dir via HARNX_CONFIG_DIR.
-    // Use an RAII guard so the env var is restored even on panic.  The
-    // guard is created *after* `TestStateGuard` acquires the global test
-    // lock so concurrent tests cannot race on the env var.
-    config.agent = Some(main_agent);
-
-    let mut session = self::session::new(&config, "test-session").unwrap();
-    session.push_message_for_test(
-        MessageRole::User,
-        "Tell me about the Rust ownership model.".to_string(),
+    write_agent(
+        &temp.path().join("agents"),
+        "my-compactor",
+        "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are a specialized compaction agent. Produce a concise summary.\n",
     );
-    config.session = Some(session);
-    let config = Arc::new(RwLock::new(config));
-
-    let mock = Arc::new(
-        MockClient::builder()
-            .add_turn(MockTurnBuilder::new().add_text_chunk("Compacted.").build())
-            .build(),
+    let config = config_with_agent(
+        "main",
+        "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_agent: my-compactor\n---\nYou are the main agent.",
     );
-    let _guard = TestStateGuard::new(Some(mock.clone())).await;
+    let config = with_session(
+        config,
+        vec![(
+            MessageRole::User,
+            "Tell me about the Rust ownership model.".to_string(),
+        )],
+    );
+    let (mock, _guard) = install_summarizer_mock().await;
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
     Config::compact_session(&config).await.unwrap();
@@ -151,24 +174,12 @@ async fn test_compact_session_with_compaction_agent_sends_rendered_transcript() 
         transcript.contains("Rust ownership model"),
         "the rendered transcript must include the conversation content; transcript: {transcript:?}"
     );
-    // The transcript is the flattened, role-labeled rendering (not raw live
-    // session messages), so it carries the render_transcript role markers.
     assert!(
         transcript.contains("── user ──"),
         "the user message is a rendered transcript with role labels; transcript: {transcript:?}"
     );
-
-    // The compaction agent's system prompt must also be present.
-    let has_system = messages.iter().any(|m| {
-        m.role == MessageRole::System
-            && if let MessageContent::Text(t) = &m.content {
-                t.contains("specialized compaction agent")
-            } else {
-                false
-            }
-    });
     assert!(
-        has_system,
+        system_prompt_contains(messages, "specialized compaction agent"),
         "compaction agent's system prompt must be in the messages; messages: {messages:?}"
     );
 }
@@ -177,70 +188,43 @@ async fn test_compact_session_with_compaction_agent_sends_rendered_transcript() 
 /// resolve to the same-package compactor, not a top-level agent of the same name.
 #[tokio::test]
 async fn test_compact_session_package_bare_compaction_agent_resolves_within_package() {
-    use crate::client::TestStateGuard;
-    use crate::test_utils::{MockClient, MockTurnBuilder};
-    use std::io::Write as _;
-
     let temp = tempfile::TempDir::new().unwrap();
-    let package_agents_dir = temp.path().join("packages/mypkg/agents");
-    std::fs::create_dir_all(&package_agents_dir).unwrap();
-    let top_level_agents_dir = temp.path().join("agents");
-    std::fs::create_dir_all(&top_level_agents_dir).unwrap();
-
+    let pkg_agents = temp.path().join("packages/mypkg/agents");
+    // Use /gemini (leading slash) to escape to top-level so the model reference
+    // is not rewritten to mypkg/gemini by apply_package_agent_transforms.
+    write_agent(
+        &pkg_agents,
+        "compactor",
+        "---\nmodel: /gemini:gemini-3.1-flash-lite\n---\nYou are the PACKAGE compactor. Produce a concise summary.\n",
+    );
     std::fs::write(
-            temp.path().join("packages/mypkg/manifest.yaml"),
-            "name: mypkg\nsource:\n  type: git\n  url: file:///fake\n  tag: v1.0.0\n  commit: abc123\ninstalled_at: \"2025-01-01T00:00:00Z\"\n",
-        )
-        .unwrap();
-
-    // Use /gemini (leading slash) to escape to top-level so the model
-    // reference is not rewritten to mypkg/gemini by apply_package_agent_transforms.
-    let package_compactor = "---\nmodel: /gemini:gemini-3.1-flash-lite\n---\nYou are the PACKAGE compactor. Produce a concise summary.\n";
-    let mut package_file = std::fs::File::create(package_agents_dir.join("compactor.md")).unwrap();
-    package_file
-        .write_all(package_compactor.as_bytes())
-        .unwrap();
-
-    let top_level_compactor = "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are the TOP-LEVEL compactor. Produce a concise summary.\n";
-    let mut top_level_file =
-        std::fs::File::create(top_level_agents_dir.join("compactor.md")).unwrap();
-    top_level_file
-        .write_all(top_level_compactor.as_bytes())
-        .unwrap();
-
-    let mut main_agent = Agent::new(
-        AgentConfig::from_markdown(
-            "mypkg/main",
-            "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are the main package agent.",
-        )
-        .unwrap(),
+        temp.path().join("packages/mypkg/manifest.yaml"),
+        "name: mypkg\nsource:\n  type: git\n  url: file:///fake\n  tag: v1.0.0\n  commit: abc123\ninstalled_at: \"2025-01-01T00:00:00Z\"\n",
+    )
+    .unwrap();
+    write_agent(
+        &temp.path().join("agents"),
+        "compactor",
+        "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are the TOP-LEVEL compactor. Produce a concise summary.\n",
     );
-    main_agent.set_compaction_agent(Some("compactor".to_string()));
-    main_agent.set_model(crate::client::Model::new("gemini", "gemini-3.1-flash-lite"));
 
-    let mut config = Config {
-        data: ConfigData {
-            stream: false,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    config.agent = Some(main_agent);
-
-    let mut session = self::session::new(&config, "test-session").unwrap();
-    session.push_message_for_test(
-        MessageRole::User,
-        "Tell me about package-local compaction.".to_string(),
+    let mut config = config_with_agent(
+        "mypkg/main",
+        "---\nmodel: gemini:gemini-3.1-flash-lite\n---\nYou are the main package agent.",
     );
-    config.session = Some(session);
-    let config = Arc::new(RwLock::new(config));
-
-    let mock = Arc::new(
-        MockClient::builder()
-            .add_turn(MockTurnBuilder::new().add_text_chunk("Compacted.").build())
-            .build(),
+    config
+        .agent
+        .as_mut()
+        .unwrap()
+        .set_compaction_agent(Some("compactor".to_string()));
+    let config = with_session(
+        config,
+        vec![(
+            MessageRole::User,
+            "Tell me about package-local compaction.".to_string(),
+        )],
     );
-    let _guard = TestStateGuard::new(Some(mock.clone())).await;
+    let (mock, _guard) = install_summarizer_mock().await;
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
     Config::compact_session(&config).await.unwrap();
@@ -252,30 +236,12 @@ async fn test_compact_session_package_bare_compaction_agent_resolves_within_pack
         "expected exactly one LLM call"
     );
     let messages = &history.conversation_history[0].messages;
-
-    let has_package_system = messages.iter().any(|m| {
-        m.role == MessageRole::System
-            && if let MessageContent::Text(t) = &m.content {
-                t.contains("PACKAGE compactor")
-            } else {
-                false
-            }
-    });
     assert!(
-        has_package_system,
+        system_prompt_contains(messages, "PACKAGE compactor"),
         "package compactor system prompt must be used; messages: {messages:?}"
     );
-
-    let has_top_level_system = messages.iter().any(|m| {
-        m.role == MessageRole::System
-            && if let MessageContent::Text(t) = &m.content {
-                t.contains("TOP-LEVEL compactor")
-            } else {
-                false
-            }
-    });
     assert!(
-        !has_top_level_system,
+        !system_prompt_contains(messages, "TOP-LEVEL compactor"),
         "top-level compactor system prompt must not be used; messages: {messages:?}"
     );
 }
@@ -288,49 +254,24 @@ async fn test_compact_session_package_bare_compaction_agent_resolves_within_pack
 /// would keep turns 2–4 and render only turn 1).
 #[tokio::test]
 async fn test_compact_session_honors_compaction_keep_recent_turns() {
-    use crate::client::TestStateGuard;
-    use crate::test_utils::{MockClient, MockTurnBuilder};
-    use std::io::Write as _;
-
     let temp = tempfile::TempDir::new().unwrap();
-    let agents_dir = temp.path().join("agents");
-    std::fs::create_dir_all(&agents_dir).unwrap();
-    let mut f = std::fs::File::create(agents_dir.join("my-compactor.md")).unwrap();
-    f.write_all(b"---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_keep_recent_turns: 1\n---\nProduce a concise summary.\n").unwrap();
-
-    let mut main_agent = Agent::new(
-        AgentConfig::from_markdown(
-            "main",
-            "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_agent: my-compactor\n---\nMain agent.",
-        )
-        .unwrap(),
+    write_agent(
+        &temp.path().join("agents"),
+        "my-compactor",
+        "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_keep_recent_turns: 1\n---\nProduce a concise summary.\n",
     );
-    main_agent.set_model(crate::client::Model::new("gemini", "gemini-3.1-flash-lite"));
-
-    let mut config = Config {
-        data: ConfigData {
-            stream: false,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    config.agent = Some(main_agent);
-
+    let config = config_with_agent(
+        "main",
+        "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_agent: my-compactor\n---\nMain agent.",
+    );
     // Short messages so the turn-count limit (not the token budget) governs split.
-    let mut session = self::session::new(&config, "test-session").unwrap();
+    let mut turns = Vec::new();
     for i in 1..=4 {
-        session.push_message_for_test(MessageRole::User, format!("user turn {i}"));
-        session.push_message_for_test(MessageRole::Assistant, format!("assistant reply {i}"));
+        turns.push((MessageRole::User, format!("user turn {i}")));
+        turns.push((MessageRole::Assistant, format!("assistant reply {i}")));
     }
-    config.session = Some(session);
-    let config = Arc::new(RwLock::new(config));
-
-    let mock = Arc::new(
-        MockClient::builder()
-            .add_turn(MockTurnBuilder::new().add_text_chunk("Compacted.").build())
-            .build(),
-    );
-    let _guard = TestStateGuard::new(Some(mock.clone())).await;
+    let config = with_session(config, turns);
+    let (mock, _guard) = install_summarizer_mock().await;
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
     Config::compact_session(&config).await.unwrap();
@@ -342,15 +283,7 @@ async fn test_compact_session_honors_compaction_keep_recent_turns() {
         1,
         "expected one LLM call"
     );
-    let transcript = history.conversation_history[0]
-        .messages
-        .iter()
-        .find(|m| m.role == MessageRole::User)
-        .and_then(|m| match &m.content {
-            MessageContent::Text(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .expect("rendered transcript user message present");
+    let transcript = rendered_transcript(&history.conversation_history[0].messages);
 
     // Exactly three user turns compacted (default keep of 3 would compact one),
     // and turn 4 stays out of the transcript because it is kept verbatim.
