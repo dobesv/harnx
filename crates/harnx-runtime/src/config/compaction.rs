@@ -3,6 +3,7 @@
 //! attachments out of the request) and sends it to a summarizer; the most
 //! recent turns are kept verbatim. See `session_ops_split::compact_session`.
 
+use harnx_core::agent_config::AgentConfig;
 use harnx_core::message::{
     Message, MessageContent, MessageContentPart, MessageContentToolCalls, MessageRole,
 };
@@ -10,11 +11,42 @@ use harnx_core::model::Model;
 use harnx_core::session::ToolOutput;
 
 /// Number of recent user-turns kept verbatim (not summarized) by default.
-pub const KEEP_RECENT_TURNS: usize = 3;
+pub const DEFAULT_KEEP_RECENT_TURNS: usize = 3;
 /// Token budget for the verbatim recent suffix (estimated tokens).
-pub const KEEP_RECENT_TOKENS: usize = 8000;
+pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 8000;
 /// Per-tool-result character cap when rendering tool output into the transcript.
-pub const TOOL_OUTPUT_MAX_CHARS: usize = 2000;
+pub const DEFAULT_TOOL_OUTPUT_MAX_CHARS: usize = 2000;
+
+/// Resolved compaction tuning values for a single compaction run.
+///
+/// A `keep_recent_turns` of `0` is the degenerate "keep no recent turns
+/// verbatim" case and is safe: `recent_suffix_floor`/`split_index` compare
+/// turn counts with `>=` only, so there is no underflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionParams {
+    pub keep_recent_turns: usize,
+    pub keep_recent_tokens: usize,
+    pub tool_output_max_chars: usize,
+}
+
+/// Resolve the compaction tuning values from the compaction agent's config,
+/// falling back to the built-in defaults for any field the agent does not set.
+/// The compaction agent is the configured `compaction_agent`, or the synthetic
+/// default summarizer when none is configured — in which case all three are
+/// unset and the defaults apply.
+pub fn compaction_params(agent: &AgentConfig) -> CompactionParams {
+    CompactionParams {
+        keep_recent_turns: agent
+            .compaction_keep_recent_turns()
+            .unwrap_or(DEFAULT_KEEP_RECENT_TURNS),
+        keep_recent_tokens: agent
+            .compaction_keep_recent_tokens()
+            .unwrap_or(DEFAULT_KEEP_RECENT_TOKENS),
+        tool_output_max_chars: agent
+            .compaction_tool_output_max_chars()
+            .unwrap_or(DEFAULT_TOOL_OUTPUT_MAX_CHARS),
+    }
+}
 
 /// Default summarizer system prompt, used when no `compaction_agent` is set.
 pub const DEFAULT_COMPACT_SYSTEM_PROMPT: &str = "\
@@ -208,6 +240,30 @@ pub fn split_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_params_uses_agent_overrides_then_defaults() {
+        use harnx_core::agent_config::AgentConfig;
+
+        // No overrides → defaults.
+        let default_agent = AgentConfig::from_prompt("summarize");
+        let p = compaction_params(&default_agent);
+        assert_eq!(p.keep_recent_turns, DEFAULT_KEEP_RECENT_TURNS);
+        assert_eq!(p.keep_recent_tokens, DEFAULT_KEEP_RECENT_TOKENS);
+        assert_eq!(p.tool_output_max_chars, DEFAULT_TOOL_OUTPUT_MAX_CHARS);
+
+        // Agent override wins (per field); unset field still falls back.
+        let md = "---\n\
+compaction_keep_recent_turns: 1\n\
+compaction_tool_output_max_chars: 50\n\
+---\n\
+summarize\n";
+        let agent = AgentConfig::from_markdown("c", md).unwrap();
+        let p = compaction_params(&agent);
+        assert_eq!(p.keep_recent_turns, 1);
+        assert_eq!(p.tool_output_max_chars, 50);
+        assert_eq!(p.keep_recent_tokens, DEFAULT_KEEP_RECENT_TOKENS);
+    }
 
     #[test]
     fn truncate_middle_keeps_short_text() {

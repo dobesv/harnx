@@ -1289,6 +1289,10 @@ where
 }
 
 #[cfg(test)]
+mod compaction_tests;
+#[cfg(test)]
 mod session_edit_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
