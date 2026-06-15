@@ -2946,7 +2946,10 @@ content: second
             Message::new(MessageRole::User, MessageContent::Text("old u".into())),
             Message::new(MessageRole::Assistant, MessageContent::Text("old a".into())),
             Message::new(MessageRole::User, MessageContent::Text("recent u".into())),
-            Message::new(MessageRole::Assistant, MessageContent::Text("recent a".into())),
+            Message::new(
+                MessageRole::Assistant,
+                MessageContent::Text("recent a".into()),
+            ),
         ];
         super::compress_keeping_recent(&mut session, "SUMMARY".to_string(), 3);
 

@@ -271,9 +271,13 @@ mod tests {
         use harnx_core::model::Model;
         let model = Model::default();
         let messages = vec![
-            msg(System, "sys"), msg(User, "u1"), msg(Assistant, "a1"),
-            msg(User, "u2"), msg(Assistant, "a2"),
-            msg(User, "u3"), msg(Assistant, "a3"),
+            msg(System, "sys"),
+            msg(User, "u1"),
+            msg(Assistant, "a1"),
+            msg(User, "u2"),
+            msg(Assistant, "a2"),
+            msg(User, "u3"),
+            msg(Assistant, "a3"),
         ];
         let idx = split_index(&messages, &model, 1, 100_000);
         assert_eq!(idx, 5);
