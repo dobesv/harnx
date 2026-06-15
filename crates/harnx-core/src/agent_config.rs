@@ -137,6 +137,12 @@ pub struct AgentConfig {
     hooks: Option<HooksConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_keep_recent_turns: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_keep_recent_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_tool_output_max_chars: Option<usize>,
     #[serde(default)]
     pub role: AgentRole,
     #[serde(default)]
@@ -185,6 +191,9 @@ impl AgentConfig {
             instructions: frontmatter.instructions,
             hooks: frontmatter.hooks,
             compaction_agent: frontmatter.compaction_agent,
+            compaction_keep_recent_turns: frontmatter.compaction_keep_recent_turns,
+            compaction_keep_recent_tokens: frontmatter.compaction_keep_recent_tokens,
+            compaction_tool_output_max_chars: frontmatter.compaction_tool_output_max_chars,
             role: frontmatter.role,
             prompt,
             ..Default::default()
@@ -308,6 +317,18 @@ impl AgentConfig {
 
     pub fn compaction_agent(&self) -> Option<&str> {
         self.compaction_agent.as_deref()
+    }
+
+    pub fn compaction_keep_recent_turns(&self) -> Option<usize> {
+        self.compaction_keep_recent_turns
+    }
+
+    pub fn compaction_keep_recent_tokens(&self) -> Option<usize> {
+        self.compaction_keep_recent_tokens
+    }
+
+    pub fn compaction_tool_output_max_chars(&self) -> Option<usize> {
+        self.compaction_tool_output_max_chars
     }
 
     pub fn has_args(&self) -> bool {
@@ -543,6 +564,12 @@ struct AgentFrontMatter {
     hooks: Option<HooksConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_keep_recent_turns: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_keep_recent_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_tool_output_max_chars: Option<usize>,
     #[serde(default)]
     role: AgentRole,
 }
@@ -564,6 +591,9 @@ impl AgentFrontMatter {
             instructions: config.instructions.clone(),
             hooks: config.hooks.clone(),
             compaction_agent: config.compaction_agent.clone(),
+            compaction_keep_recent_turns: config.compaction_keep_recent_turns,
+            compaction_keep_recent_tokens: config.compaction_keep_recent_tokens,
+            compaction_tool_output_max_chars: config.compaction_tool_output_max_chars,
             role: config.role,
         }
     }
@@ -583,6 +613,9 @@ impl AgentFrontMatter {
             && self.instructions.is_none()
             && self.hooks.is_none()
             && self.compaction_agent.is_none()
+            && self.compaction_keep_recent_turns.is_none()
+            && self.compaction_keep_recent_tokens.is_none()
+            && self.compaction_tool_output_max_chars.is_none()
             && self.role == AgentRole::Assistant
     }
 }
@@ -601,6 +634,27 @@ fn serialize_frontmatter(frontmatter: &AgentFrontMatter) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_knobs_parse_from_frontmatter() {
+        let md = "---\n\
+model: openai:gpt-4o\n\
+compaction_keep_recent_turns: 5\n\
+compaction_keep_recent_tokens: 12000\n\
+compaction_tool_output_max_chars: 500\n\
+---\n\
+You are a compaction agent.\n";
+        let agent = AgentConfig::from_markdown("compactor", md).unwrap();
+        assert_eq!(agent.compaction_keep_recent_turns(), Some(5));
+        assert_eq!(agent.compaction_keep_recent_tokens(), Some(12000));
+        assert_eq!(agent.compaction_tool_output_max_chars(), Some(500));
+
+        // Absent → None.
+        let bare = AgentConfig::from_markdown("plain", "---\nmodel: openai:gpt-4o\n---\nhi\n").unwrap();
+        assert_eq!(bare.compaction_keep_recent_turns(), None);
+        assert_eq!(bare.compaction_keep_recent_tokens(), None);
+        assert_eq!(bare.compaction_tool_output_max_chars(), None);
+    }
 
     #[test]
     fn test_frontmatter_only_at_start_of_file() {
