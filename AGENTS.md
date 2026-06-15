@@ -70,7 +70,7 @@ cargo build --workspace                                       # Compile the proj
 cargo fmt --all                                               # Auto-format code (rustup uses rust-toolchain.toml version — matches CI)
 cargo clippy --workspace --all-targets -- -D warnings         # Lint — treat warnings as errors
 cargo nextest run --workspace --stress-count=5                # Run all tests, repeat several times to catch flaky tests
-cs delta $(git merge-base HEAD origin/main)                   # Run CodeScene code quality analysis on current branch changes                                          
+cs delta origin/HEAD                                          # Run CodeScene code quality analysis on current branch changes                                          
 ```
 
 **Use `cargo nextest`, never `cargo test`.** Tests rely on nextest's per-test
