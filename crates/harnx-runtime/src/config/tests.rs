@@ -606,20 +606,14 @@ async fn test_compact_session_package_bare_compaction_agent_resolves_within_pack
     );
 }
 
-/// RAII guards and handles for the keep-recent-turns compaction fixture. The
-/// `_temp`/`_guard`/`_env` fields are held only to keep the temp dir, mock
-/// client, and env override alive for the duration of the test.
-struct KeepRecentTurnsFixture {
-    config: Arc<RwLock<Config>>,
-    mock: Arc<crate::test_utils::MockClient>,
-    _temp: tempfile::TempDir,
-    _guard: crate::client::TestStateGuard<'static>,
-    _env: EnvGuard,
-}
-
-/// Build a session of four user turns whose `compaction_agent` overrides
-/// `compaction_keep_recent_turns` to 1, with a mock summarizer client installed.
-async fn setup_keep_recent_turns_fixture() -> KeepRecentTurnsFixture {
+/// compact_session must honor a non-default `compaction_keep_recent_turns`
+/// from the compaction agent's frontmatter: a smaller value keeps fewer recent
+/// turns verbatim and therefore compacts MORE of the conversation. With
+/// `compaction_keep_recent_turns: 1` and four user turns, only turn 4 is kept
+/// verbatim, so the rendered transcript carries turns 1–3 (the default of 3
+/// would keep turns 2–4 and render only turn 1).
+#[tokio::test]
+async fn test_compact_session_honors_compaction_keep_recent_turns() {
     use crate::client::TestStateGuard;
     use crate::test_utils::{MockClient, MockTurnBuilder};
     use std::io::Write as _;
@@ -627,16 +621,16 @@ async fn setup_keep_recent_turns_fixture() -> KeepRecentTurnsFixture {
     let temp = tempfile::TempDir::new().unwrap();
     let agents_dir = temp.path().join("agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
-
-    // Compaction agent overrides keep_recent_turns to 1 (vs the default 3).
-    let agent_content = "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_keep_recent_turns: 1\n---\nYou are a specialized compaction agent. Produce a concise summary.\n";
     let mut f = std::fs::File::create(agents_dir.join("my-compactor.md")).unwrap();
-    f.write_all(agent_content.as_bytes()).unwrap();
+    f.write_all(b"---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_keep_recent_turns: 1\n---\nProduce a concise summary.\n").unwrap();
 
-    let mut main_agent = Agent::new(AgentConfig::from_markdown(
+    let mut main_agent = Agent::new(
+        AgentConfig::from_markdown(
             "main",
-            "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_agent: my-compactor\n---\nYou are the main agent.",
-        ).unwrap());
+            "---\nmodel: gemini:gemini-3.1-flash-lite\ncompaction_agent: my-compactor\n---\nMain agent.",
+        )
+        .unwrap(),
+    );
     main_agent.set_model(crate::client::Model::new("gemini", "gemini-3.1-flash-lite"));
 
     let mut config = Config {
@@ -648,8 +642,7 @@ async fn setup_keep_recent_turns_fixture() -> KeepRecentTurnsFixture {
     };
     config.agent = Some(main_agent);
 
-    // Four user turns, each followed by an assistant reply. Messages are short
-    // so the token budget never binds and the turn-count limit governs split.
+    // Short messages so the turn-count limit (not the token budget) governs split.
     let mut session = self::session::new(&config, "test-session").unwrap();
     for i in 1..=4 {
         session.push_message_for_test(MessageRole::User, format!("user turn {i}"));
@@ -666,28 +659,17 @@ async fn setup_keep_recent_turns_fixture() -> KeepRecentTurnsFixture {
     let _guard = TestStateGuard::new(Some(mock.clone())).await;
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
-    KeepRecentTurnsFixture {
-        config,
-        mock,
-        _temp: temp,
-        _guard,
-        _env,
-    }
-}
+    Config::compact_session(&config).await.unwrap();
 
-/// With keep_recent_turns=1, the last turn (turn 4) is kept verbatim and the
-/// first three turns are compacted, so the single rendered transcript user
-/// message carries turns 1–3 and NOT turn 4. The default of 3 would keep turns
-/// 2–4 and render only turn 1.
-fn assert_first_three_turns_compacted(mock: &crate::test_utils::MockClient) {
+    // The single summarizer call receives a transcript covering turns 1–3.
     let history = mock.conversation_history();
     assert_eq!(
         history.conversation_history.len(),
         1,
         "expected one LLM call"
     );
-    let messages = &history.conversation_history[0].messages;
-    let transcript = messages
+    let transcript = history.conversation_history[0]
+        .messages
         .iter()
         .find(|m| m.role == MessageRole::User)
         .and_then(|m| match &m.content {
@@ -696,50 +678,24 @@ fn assert_first_three_turns_compacted(mock: &crate::test_utils::MockClient) {
         })
         .expect("rendered transcript user message present");
 
-    let user_sections = transcript.matches("── user ──").count();
+    // Exactly three user turns compacted (default keep of 3 would compact one),
+    // and turn 4 stays out of the transcript because it is kept verbatim.
+    let compacted_turns = transcript.matches("── user ──").count();
     assert_eq!(
-        user_sections, 3,
-        "keep_recent_turns=1 must compact the first 3 of 4 user turns \
-         (default 3 would compact only 1); transcript: {transcript:?}"
-    );
-    assert!(
-        transcript.contains("user turn 1")
-            && transcript.contains("user turn 2")
-            && transcript.contains("user turn 3"),
-        "transcript must contain the first three user turns; transcript: {transcript:?}"
+        compacted_turns, 3,
+        "keep_recent_turns=1 must compact 3 of 4 turns; transcript: {transcript:?}"
     );
     assert!(
         !transcript.contains("user turn 4"),
-        "the last user turn must be kept verbatim, not compacted; transcript: {transcript:?}"
+        "the last turn must be kept verbatim, not compacted; transcript: {transcript:?}"
     );
-}
 
-/// The kept-verbatim suffix lands back in the live session as
-/// [summary_system, U4, A4]: one summary message plus the 2 kept messages.
-fn assert_kept_suffix_is_summary_plus_last_turn(config: &Arc<RwLock<Config>>) {
-    let guard = config.read();
-    let session = guard.session.as_ref().unwrap();
+    // The kept-verbatim suffix lands back as [summary_system, U4, A4].
+    let kept = config.read().session.as_ref().unwrap().messages.len();
     assert_eq!(
-        session.messages.len(),
-        3,
-        "keep_recent_turns=1 keeps 1 user turn (2 messages) plus the summary; \
-         messages: {:?}",
-        session.messages
+        kept, 3,
+        "expected the summary plus the one kept turn (2 messages)"
     );
-}
-
-/// compact_session must honor a non-default `compaction_keep_recent_turns`
-/// from the compaction agent's frontmatter: a smaller value keeps fewer recent
-/// turns verbatim and therefore compacts (renders into the transcript) MORE of
-/// the conversation than the default of 3 would.
-#[tokio::test]
-async fn test_compact_session_honors_compaction_keep_recent_turns() {
-    let fixture = setup_keep_recent_turns_fixture().await;
-
-    Config::compact_session(&fixture.config).await.unwrap();
-
-    assert_first_three_turns_compacted(&fixture.mock);
-    assert_kept_suffix_is_summary_plus_last_turn(&fixture.config);
 }
 
 /// Regression test for the ACP-server failure where `use_agent_by_name`
