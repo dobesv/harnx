@@ -3,9 +3,13 @@
 //! dropped by compaction stays recoverable. Pure query core here; the
 //! `ToolProvider` wiring resolves the active session path and reads the file.
 
+use crate::config::GlobalConfig;
 use anyhow::Result;
+use async_trait::async_trait;
 use fancy_regex::Regex;
+use harnx_core::abort::AbortSignal;
 use harnx_core::session::SessionLogEntry;
+use harnx_core::tool::{JsonSchema, ToolDeclaration, ToolError, ToolProvider};
 use serde_json::{json, Value};
 
 /// The tool name exposed to agents.
@@ -46,8 +50,10 @@ fn entry_searchable_text(entry: &SessionLogEntry) -> String {
     match entry {
         SessionLogEntry::Message { content, .. } => content.to_text(),
         SessionLogEntry::ToolCalls { text, calls, .. } => {
-            let calls_text: Vec<String> =
-                calls.iter().map(|c| format!("{}({})", c.name, c.arguments)).collect();
+            let calls_text: Vec<String> = calls
+                .iter()
+                .map(|c| format!("{}({})", c.name, c.arguments))
+                .collect();
             format!("{text}\n{}", calls_text.join("\n"))
         }
         SessionLogEntry::ToolResults { results, .. } => results
@@ -65,7 +71,9 @@ fn entry_searchable_text(entry: &SessionLogEntry) -> String {
 fn entry_tool_names(entry: &SessionLogEntry) -> Vec<String> {
     match entry {
         SessionLogEntry::ToolCalls { calls, .. } => calls.iter().map(|c| c.name.clone()).collect(),
-        SessionLogEntry::ToolResults { results, .. } => results.iter().map(|r| r.name.clone()).collect(),
+        SessionLogEntry::ToolResults { results, .. } => {
+            results.iter().map(|r| r.name.clone()).collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -153,6 +161,112 @@ pub fn query_log_content(content: &str, session_name: &str, query: &HistoryQuery
     query_entries_with_jaq(&entries, query)
 }
 
+/// Build the tool declaration (name, description, JSON-schema parameters).
+pub fn tool_declaration() -> ToolDeclaration {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "index_min": {"type": "integer", "description": "Minimum log entry seq (inclusive)."},
+            "index_max": {"type": "integer", "description": "Maximum log entry seq (inclusive)."},
+            "type": {"type": "string", "description": "Filter by entry type: message, tool_calls, tool_results, compress, header, data_urls, clear, edit_entries, rewind."},
+            "tool_name": {"type": "string", "description": "Keep only entries referencing this tool name."},
+            "text_regex": {"type": "string", "description": "Keep entries whose rendered text matches this regular expression."},
+            "limit": {"type": "integer", "description": "Maximum number of rows to return."},
+            "jaq": {"type": "string", "description": "Optional jq/jaq expression applied to the array of matched rows for arbitrary filtering or projection. Invalid expressions return an error."}
+        }
+    });
+    ToolDeclaration {
+        name: TOOL_NAME.to_string(),
+        description: "Search this session's own history log, including detail dropped by compaction. \
+Filter by entry index range, type, tool name, or a text regex; optionally refine with a jaq expression. \
+Returns a JSON array of matching log entries (seq, type, text, tool names)."
+            .to_string(),
+        parameters: serde_json::from_value::<JsonSchema>(schema)
+            .expect("session-history tool schema is valid"),
+        mcp_tool_name: None,
+        mcp_server_name: None,
+        call_template: None,
+        result_template: None,
+    }
+}
+
+/// Parse the tool-call arguments JSON into a `HistoryQuery`.
+fn parse_query(arguments: &Value) -> HistoryQuery {
+    let s = |k: &str| {
+        arguments
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let u = |k: &str| {
+        arguments
+            .get(k)
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+    };
+    HistoryQuery {
+        index_min: u("index_min"),
+        index_max: u("index_max"),
+        entry_type: s("type"),
+        tool_name: s("tool_name"),
+        text_regex: s("text_regex"),
+        limit: u("limit"),
+        jaq: s("jaq"),
+    }
+}
+
+/// `ToolProvider` for the session-history tool. Resolves the active session's
+/// on-disk log path from the captured config at call time (own session only).
+// `#[allow(dead_code)]`: the provider struct/impl are unused until the
+// registration task wires them into the tool-call loop. Removed in that task.
+#[allow(dead_code)]
+pub struct SessionHistoryProvider {
+    config: GlobalConfig,
+}
+
+#[allow(dead_code)]
+impl SessionHistoryProvider {
+    pub fn new(config: GlobalConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait]
+impl ToolProvider for SessionHistoryProvider {
+    fn name(&self) -> &str {
+        "session_history"
+    }
+
+    fn has_tool(&self, tool_name: &str) -> bool {
+        tool_name == TOOL_NAME
+    }
+
+    async fn call_tool(
+        &self,
+        _tool_name: &str,
+        arguments: Value,
+        _abort: &AbortSignal,
+    ) -> Result<Value, ToolError> {
+        let (path, name) = {
+            let guard = self.config.read();
+            let session = guard
+                .session
+                .as_ref()
+                .ok_or_else(|| ToolError::Recoverable(anyhow::anyhow!("no active session")))?;
+            let path = session.path.clone().ok_or_else(|| {
+                ToolError::Recoverable(anyhow::anyhow!("session has not been saved yet"))
+            })?;
+            (path, session.id().to_string())
+        };
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            ToolError::Recoverable(anyhow::anyhow!("failed to read session log: {e}"))
+        })?;
+        let query = parse_query(&arguments);
+        let rows = query_log_content(&content, &name, &query).map_err(ToolError::Recoverable)?;
+        Ok(json!({ "content": [{ "type": "text", "text": rows.to_string() }] }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,36 +292,58 @@ mod tests {
         use harnx_core::tool::ToolCall;
         use serde_json::json;
         vec![
-            (0, SessionLogEntry::Message {
-                role: MessageRole::User,
-                content: MessageContent::Text("please run the build".into()),
-                timestamp: None,
-            }),
-            (1, SessionLogEntry::ToolCalls {
-                text: "running it".into(),
-                thought: None,
-                calls: vec![ToolCall { name: "bash".into(), arguments: json!({"cmd":"make"}), id: Some("c1".into()), thought_signature: None }],
-                timestamp: None,
-            }),
-            (2, SessionLogEntry::ToolResults {
-                results: vec![harnx_core::session::ToolOutput {
-                    id: Some("c1".into()), name: "bash".into(),
-                    output: json!({"content":[{"type":"text","text":"build ok"}]}),
-                    content: vec![], switch_agent: None,
-                }],
-                timestamp: None,
-            }),
-            (3, SessionLogEntry::Message {
-                role: MessageRole::Assistant,
-                content: MessageContent::Text("the build passed".into()),
-                timestamp: None,
-            }),
+            (
+                0,
+                SessionLogEntry::Message {
+                    role: MessageRole::User,
+                    content: MessageContent::Text("please run the build".into()),
+                    timestamp: None,
+                },
+            ),
+            (
+                1,
+                SessionLogEntry::ToolCalls {
+                    text: "running it".into(),
+                    thought: None,
+                    calls: vec![ToolCall {
+                        name: "bash".into(),
+                        arguments: json!({"cmd":"make"}),
+                        id: Some("c1".into()),
+                        thought_signature: None,
+                    }],
+                    timestamp: None,
+                },
+            ),
+            (
+                2,
+                SessionLogEntry::ToolResults {
+                    results: vec![harnx_core::session::ToolOutput {
+                        id: Some("c1".into()),
+                        name: "bash".into(),
+                        output: json!({"content":[{"type":"text","text":"build ok"}]}),
+                        content: vec![],
+                        switch_agent: None,
+                    }],
+                    timestamp: None,
+                },
+            ),
+            (
+                3,
+                SessionLogEntry::Message {
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text("the build passed".into()),
+                    timestamp: None,
+                },
+            ),
         ]
     }
 
     #[test]
     fn query_filters_by_type() {
-        let q = HistoryQuery { entry_type: Some("message".into()), ..Default::default() };
+        let q = HistoryQuery {
+            entry_type: Some("message".into()),
+            ..Default::default()
+        };
         let rows = query_entries(&sample_entries(), &q).unwrap();
         let arr = rows.as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -216,30 +352,52 @@ mod tests {
 
     #[test]
     fn query_filters_by_tool_name_and_index_range() {
-        let q = HistoryQuery { tool_name: Some("bash".into()), ..Default::default() };
+        let q = HistoryQuery {
+            tool_name: Some("bash".into()),
+            ..Default::default()
+        };
         let rows = query_entries(&sample_entries(), &q).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 2);
 
-        let q = HistoryQuery { index_min: Some(2), index_max: Some(3), ..Default::default() };
+        let q = HistoryQuery {
+            index_min: Some(2),
+            index_max: Some(3),
+            ..Default::default()
+        };
         let rows = query_entries(&sample_entries(), &q).unwrap();
-        let seqs: Vec<u64> = rows.as_array().unwrap().iter().map(|r| r["seq"].as_u64().unwrap()).collect();
+        let seqs: Vec<u64> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["seq"].as_u64().unwrap())
+            .collect();
         assert_eq!(seqs, vec![2, 3]);
     }
 
     #[test]
     fn query_filters_by_text_regex_and_limit() {
-        let q = HistoryQuery { text_regex: Some("build".into()), ..Default::default() };
+        let q = HistoryQuery {
+            text_regex: Some("build".into()),
+            ..Default::default()
+        };
         let rows = query_entries(&sample_entries(), &q).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 3);
 
-        let q = HistoryQuery { text_regex: Some("build".into()), limit: Some(1), ..Default::default() };
+        let q = HistoryQuery {
+            text_regex: Some("build".into()),
+            limit: Some(1),
+            ..Default::default()
+        };
         let rows = query_entries(&sample_entries(), &q).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn query_applies_jaq_expression() {
-        let q = HistoryQuery { jaq: Some("map(select(.type == \"tool_results\"))".into()), ..Default::default() };
+        let q = HistoryQuery {
+            jaq: Some("map(select(.type == \"tool_results\"))".into()),
+            ..Default::default()
+        };
         let rows = query_entries_with_jaq(&sample_entries(), &q).unwrap();
         let arr = rows.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -248,15 +406,47 @@ mod tests {
 
     #[test]
     fn query_invalid_jaq_is_surfaced_as_error() {
-        let q = HistoryQuery { jaq: Some("this is (not valid jaq".into()), ..Default::default() };
+        let q = HistoryQuery {
+            jaq: Some("this is (not valid jaq".into()),
+            ..Default::default()
+        };
         let err = query_entries_with_jaq(&sample_entries(), &q).unwrap_err();
         assert!(err.to_string().contains("jaq"));
     }
 
     #[test]
+    fn tool_declaration_has_expected_name_and_params() {
+        let decl = tool_declaration();
+        assert_eq!(decl.name, TOOL_NAME);
+        let props = decl
+            .parameters
+            .properties
+            .as_ref()
+            .expect("schema has properties");
+        assert!(props.contains_key("jaq"));
+        assert!(props.contains_key("type"));
+        assert!(props.contains_key("tool_name"));
+    }
+
+    #[test]
+    fn parse_query_maps_arguments() {
+        let q = parse_query(&json!({"type": "message", "limit": 5, "index_min": 2}));
+        assert_eq!(q.entry_type.as_deref(), Some("message"));
+        assert_eq!(q.limit, Some(5));
+        assert_eq!(q.index_min, Some(2));
+        assert_eq!(q.index_max, None);
+        assert_eq!(q.tool_name, None);
+        assert_eq!(q.text_regex, None);
+        assert_eq!(q.jaq, None);
+    }
+
+    #[test]
     fn query_from_log_content_parses_and_filters() {
         let log = "type: header\nmodel: openai:gpt-4o\n---\ntype: message\nrole: user\ncontent: hello world\n";
-        let q = HistoryQuery { entry_type: Some("message".into()), ..Default::default() };
+        let q = HistoryQuery {
+            entry_type: Some("message".into()),
+            ..Default::default()
+        };
         let rows = query_log_content(log, "test", &q).unwrap();
         let arr = rows.as_array().unwrap();
         assert_eq!(arr.len(), 1);
