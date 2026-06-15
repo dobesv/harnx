@@ -630,56 +630,37 @@ impl Tui {
         total as u16
     }
 
+    /// Append a streamed assistant text chunk to the open streaming run,
+    /// which is always the trailing `AssistantText` transcript item. If no
+    /// run is open — at turn start, or because an interleaving item (tool
+    /// call, tool result, notice, source heading, …) became the trailing
+    /// item — a fresh `AssistantText` is started. An interleaving item thus
+    /// breaks the surrounding text into separate blocks for free, with no
+    /// per-event bookkeeping.
     pub(super) fn append_streaming_assistant_chunk(&mut self, chunk: &str) {
-        let mut remainder = chunk;
-        while !remainder.is_empty() {
-            if let Some(idx) = self.app.streaming_assistant_idx {
-                match self.app.transcript.get_mut(idx) {
-                    Some(TranscriptItem::AssistantText { text: existing, .. }) => {
-                        if existing.is_empty() {
-                            if let Some(split_at) = remainder.find('\n') {
-                                let (segment, rest) = remainder.split_at(split_at + 1);
-                                existing.push_str(segment);
-                                remainder = rest;
-                                self.app.streaming_assistant_idx = None;
-                            } else {
-                                existing.push_str(remainder);
-                                break;
-                            }
-                        } else if let Some(last_newline) = existing.rfind('\n') {
-                            let tail = &existing[last_newline + 1..];
-                            if tail.is_empty() {
-                                self.app.streaming_assistant_idx = None;
-                            } else if let Some(split_at) = remainder.find('\n') {
-                                let (segment, rest) = remainder.split_at(split_at + 1);
-                                existing.push_str(segment);
-                                remainder = rest;
-                                self.app.streaming_assistant_idx = None;
-                            } else {
-                                existing.push_str(remainder);
-                                break;
-                            }
-                        } else if let Some(split_at) = remainder.find('\n') {
-                            let (segment, rest) = remainder.split_at(split_at + 1);
-                            existing.push_str(segment);
-                            remainder = rest;
-                            self.app.streaming_assistant_idx = None;
-                        } else {
-                            existing.push_str(remainder);
-                            break;
-                        }
-                    }
-                    _ => self.app.streaming_assistant_idx = None,
-                }
-            } else {
-                self.app.transcript.push(TranscriptItem::AssistantText {
-                    text: String::new(),
-                    seq: None,
-                    timestamp: Some(chrono::Utc::now()),
-                    rendered_cache: None,
-                });
-                self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
-            }
+        let open = self.app.streaming_open
+            && matches!(
+                self.app.transcript.last(),
+                Some(TranscriptItem::AssistantText { .. })
+            );
+        if !open {
+            self.app.transcript.push(TranscriptItem::AssistantText {
+                text: String::new(),
+                seq: None,
+                timestamp: Some(chrono::Utc::now()),
+                rendered_cache: None,
+            });
+            self.app.streaming_open = true;
+        }
+        if let Some(TranscriptItem::AssistantText {
+            text,
+            rendered_cache,
+            ..
+        }) = self.app.transcript.last_mut()
+        {
+            text.push_str(chunk);
+            // Invalidate the cached render so the appended text repaints.
+            *rendered_cache = None;
         }
     }
 
@@ -691,7 +672,7 @@ impl Tui {
     pub(crate) fn clear_transcript(&mut self) {
         self.app.transcript.clear();
         self.app.scroll_state = ratatui_widget_scrolling::ScrollState::new();
-        self.app.streaming_assistant_idx = None;
+        self.app.streaming_open = false;
         self.app.streamed_text_this_turn = false;
     }
 
@@ -1391,7 +1372,13 @@ impl Tui {
             )];
         }
 
-        let streaming_idx = self.app.streaming_assistant_idx;
+        // The open streaming run is always the trailing item; skip its render
+        // cache so in-progress text repaints each frame.
+        let streaming_idx = self
+            .app
+            .streaming_open
+            .then(|| self.app.transcript.len().checked_sub(1))
+            .flatten();
         self.app
             .transcript
             .iter_mut()

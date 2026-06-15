@@ -767,7 +767,7 @@ impl Tui {
                 // Reset streaming index so the next LLM turn creates a fresh
                 // AssistantText item instead of appending to the previous one.
                 // This keeps tool-call rows visually between the two turns.
-                self.app.streaming_assistant_idx = None;
+                self.app.streaming_open = false;
                 self.pin_transcript_to_bottom();
             }
             TuiEvent::PendingMessageConsumed(pending) => {
@@ -911,25 +911,12 @@ impl Tui {
 
         let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
         let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
-        // Tool calls (and plan updates) from sub-agents represent a turn-like
-        // boundary in the sub-agent's output: text streamed *before* the tool
-        // call belongs visually above it, text streamed *after* belongs
-        // visually below.  Reset the streaming-assistant index here so a
-        // subsequent MessageChunk starts a fresh AssistantText rather than
-        // being appended to the text that preceded the tool call.  We
-        // deliberately do NOT reset for display-only events (Notice::Info,
-        // Tool::Completed, Model::Usage, Tool::Update) so that LLM text
-        // chunks with trailing-newline completion still coalesce correctly
-        // across those events.
-        let is_turn_boundary = matches!(
-            &event,
-            AgentEvent::Tool(ToolEvent::Started { .. })
-                | AgentEvent::Tool(ToolEvent::Blocked { .. })
-                | AgentEvent::Plan { .. }
-        );
-        if is_turn_boundary {
-            self.app.streaming_assistant_idx = None;
-        }
+        // No streaming-run bookkeeping is needed here: any event that renders a
+        // visible transcript item (tool call, tool result, notice, plan, …)
+        // becomes the trailing item, which ends the open streaming run on its
+        // own — the next MessageChunk sees a non-AssistantText tail and starts
+        // a fresh block. See `append_streaming_assistant_chunk`.
+        //
         // Handle LogSeqAssigned before any heading/thought side-effects — it
         // is a pure seq-assignment event and should not create stray headings
         // or flush pending thoughts.
@@ -1058,63 +1045,45 @@ impl Tui {
                 *self.shared_pending_message.lock().await = None;
                 self.app.last_ui_output_source = None;
                 let usage_str = format_usage(&usage);
-                if !output.is_empty() && !self.app.streamed_text_this_turn {
-                    if let Some(idx) = self.app.streaming_assistant_idx {
-                        match self.app.transcript.get_mut(idx) {
-                            Some(TranscriptItem::AssistantText {
-                                text: existing,
+                if !output.is_empty() {
+                    if self.app.streamed_text_this_turn {
+                        // We streamed this turn, so the streamed run is the
+                        // trailing block of AssistantText items. Replace it
+                        // with the model's canonical final `output` (collapsing
+                        // any trailing run to a single block) so streamed text
+                        // is never duplicated by the final message.
+                        let tail_start = self
+                            .app
+                            .transcript
+                            .iter()
+                            .rposition(|item| !matches!(item, TranscriptItem::AssistantText { .. }))
+                            .map_or(0, |idx| idx + 1);
+
+                        if tail_start < self.app.transcript.len() {
+                            let mut tail = self.app.transcript.split_off(tail_start);
+                            if let Some(TranscriptItem::AssistantText {
+                                text,
                                 rendered_cache,
                                 ..
-                            }) if !existing.is_empty() => {
-                                if existing != &output {
-                                    *existing = output;
-                                    // Invalidate cached render so the updated text is re-rendered.
-                                    *rendered_cache = None;
-                                }
+                            }) = tail.first_mut()
+                            {
+                                *text = output;
+                                *rendered_cache = None;
                             }
-                            _ => {
-                                self.app.transcript.push(TranscriptItem::AssistantText {
-                                    text: output,
-                                    seq: None,
-                                    timestamp: Some(chrono::Utc::now()),
-                                    rendered_cache: None,
-                                });
-                                self.app.streaming_assistant_idx =
-                                    Some(self.app.transcript.len() - 1);
-                            }
+                            tail.truncate(1);
+                            self.app.transcript.extend(tail);
+                        } else {
+                            self.app.transcript.push(TranscriptItem::AssistantText {
+                                text: output,
+                                seq: None,
+                                timestamp: Some(chrono::Utc::now()),
+                                rendered_cache: None,
+                            });
                         }
                     } else {
-                        self.app.transcript.push(TranscriptItem::AssistantText {
-                            text: output,
-                            seq: None,
-                            timestamp: Some(chrono::Utc::now()),
-                            rendered_cache: None,
-                        });
-                        self.app.streaming_assistant_idx = Some(self.app.transcript.len() - 1);
-                    }
-                    self.pin_transcript_to_bottom();
-                } else if !output.is_empty() {
-                    let tail_start = self
-                        .app
-                        .transcript
-                        .iter()
-                        .rposition(|item| !matches!(item, TranscriptItem::AssistantText { .. }))
-                        .map_or(0, |idx| idx + 1);
-
-                    if tail_start < self.app.transcript.len() {
-                        let mut tail = self.app.transcript.split_off(tail_start);
-                        if let Some(TranscriptItem::AssistantText {
-                            text,
-                            rendered_cache,
-                            ..
-                        }) = tail.first_mut()
-                        {
-                            *text = output;
-                            *rendered_cache = None;
-                        }
-                        tail.truncate(1);
-                        self.app.transcript.extend(tail);
-                    } else {
+                        // Nothing streamed this turn (non-streaming client, or
+                        // an empty stream): append the final text as a fresh
+                        // block.
                         self.app.transcript.push(TranscriptItem::AssistantText {
                             text: output,
                             seq: None,
@@ -1124,7 +1093,7 @@ impl Tui {
                     }
                     self.pin_transcript_to_bottom();
                 }
-                self.app.streaming_assistant_idx = None;
+                self.app.streaming_open = false;
                 self.app.streamed_text_this_turn = false;
                 if !usage_str.is_empty() {
                     self.app
@@ -1152,7 +1121,7 @@ impl Tui {
                 // channel so its content can't leak into the next task.
                 self.current_prompt_abort = None;
                 *self.shared_pending_message.lock().await = None;
-                self.app.streaming_assistant_idx = None;
+                self.app.streaming_open = false;
                 // Symmetric with the Final handler: reset the per-turn
                 // streamed-text flag so a streamed chunk before an error
                 // can't suppress a later turn's final text.
@@ -1270,7 +1239,7 @@ impl Tui {
             }
             AgentEvent::Session(SessionEvent::CompactingCompleted) => {
                 self.app.transcript = session_history_transcript_items(&self.config);
-                self.app.streaming_assistant_idx = None;
+                self.app.streaming_open = false;
                 // A compaction can land mid-turn after some assistant text has
                 // already streamed. The rebuild drops that streamed row, so the
                 // per-turn flag must also reset — otherwise the next
@@ -1332,7 +1301,7 @@ impl Tui {
             // chunks get concatenated onto the parent's AssistantText,
             // producing a single run-on paragraph that mixes content from
             // multiple agents on the top-level row.
-            self.app.streaming_assistant_idx = None;
+            self.app.streaming_open = false;
         }
         if !is_usage {
             self.clear_usage_tracking();
@@ -1385,7 +1354,7 @@ impl Tui {
         self.current_prompt_abort = Some(new_abort.clone());
 
         self.app.llm_busy = true;
-        self.app.streaming_assistant_idx = None;
+        self.app.streaming_open = false;
         self.app.streamed_text_this_turn = false;
 
         let event_tx = self.event_tx.clone();
@@ -1971,7 +1940,7 @@ impl Tui {
         }
 
         self.app.transcript.clear();
-        self.app.streaming_assistant_idx = None;
+        self.app.streaming_open = false;
         self.app.streamed_text_this_turn = false;
         // Reset scroll state so the widget doesn't subtract-overflow when
         // the rebuilt transcript is shorter than the previous one.
