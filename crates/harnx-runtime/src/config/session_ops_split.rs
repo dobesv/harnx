@@ -490,6 +490,17 @@ impl Config {
             None
         };
 
+        // Build the summarizer agent up front (configured compaction_agent, or
+        // the synthetic default), and resolve the compaction tuning params from
+        // it so the snapshot below can use them.
+        let summarizer_agent = match agent_override {
+            Some(agent) => agent.into_config(),
+            None => harnx_core::agent_config::AgentConfig::from_prompt(
+                crate::config::compaction::DEFAULT_COMPACT_SYSTEM_PROMPT,
+            ),
+        };
+        let params = crate::config::compaction::compaction_params(&summarizer_agent);
+
         // 1. Snapshot what we need under a read lock: the transcript of the prefix
         //    to compact, the split point, and the covered log-seq range.
         let (transcript, split, covered, session_id) = {
@@ -500,17 +511,15 @@ impl Config {
             let split = crate::config::compaction::split_index(
                 &session.messages,
                 &model,
-                crate::config::compaction::KEEP_RECENT_TURNS,
-                crate::config::compaction::KEEP_RECENT_TOKENS,
+                params.keep_recent_turns,
+                params.keep_recent_tokens,
             );
             if split == 0 {
                 bail!("Nothing to compact");
             }
             let prefix = &session.messages[..split];
-            let transcript = crate::config::compaction::render_transcript(
-                prefix,
-                crate::config::compaction::TOOL_OUTPUT_MAX_CHARS,
-            );
+            let transcript =
+                crate::config::compaction::render_transcript(prefix, params.tool_output_max_chars);
             let from = prefix.iter().filter_map(|m| m.log_seq).min();
             let to = prefix.iter().filter_map(|m| m.log_seq).max();
             (transcript, split, (from, to, prefix.len()), session_id)
@@ -518,12 +527,6 @@ impl Config {
 
         // 2. Build a controlled summarization request: summarizer system prompt +
         //    the transcript as the user message, WITHOUT the live session.
-        let summarizer_agent = match agent_override {
-            Some(agent) => agent.into_config(),
-            None => harnx_core::agent_config::AgentConfig::from_prompt(
-                crate::config::compaction::DEFAULT_COMPACT_SYSTEM_PROMPT,
-            ),
-        };
         let mut input = harnx_core::input::Input::new(
             transcript.clone(),
             (transcript, vec![]),
