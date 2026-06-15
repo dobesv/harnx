@@ -185,7 +185,11 @@ Ensures sandboxed `go` process sees custom cache locations matching whitelisted 
 
 ## Scope Limitation
 
-`$VAR` expansion applies to CLI `--extra-*` flags, environment variable whitelist paths, and default toolchain paths. MCP per-call tool `inputs`/`outputs` parameters do NOT expand `$VAR` — those are literal paths validated against the working directory. Follow-up work could extend expansion to MCP tool params or narrow help text wording.
+`$VAR` expansion applies to CLI `--extra-*` flags, environment variable whitelist paths, and default toolchain paths.
+
+> **Note (#850):** The per-call tool `inputs`/`outputs` parameters described below were removed from the bash MCP tools; this paragraph is retained for historical context only.
+
+The (now removed) MCP per-call `inputs`/`outputs` parameters did NOT expand `$VAR` — they were literal paths validated against the working directory. `$VAR` expansion remains relevant only for the CLI `--extra-*` flags and toolchain paths noted above.
 
 ## Related Issues
 

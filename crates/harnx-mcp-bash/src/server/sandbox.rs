@@ -35,30 +35,3 @@ pub(crate) fn push_root_write_exec(
     args.push(root.as_os_str().to_os_string());
     writable.push(root.to_path_buf());
 }
-
-/// Push `--read` and `--exec` args for `root`, unless it is `$HOME` or an ancestor.
-#[cfg(unix)]
-pub(crate) fn push_root_read_exec(
-    root: &Path,
-    args: &mut Vec<OsString>,
-    readable: &mut Vec<PathBuf>,
-) {
-    if is_home_or_ancestor(root) {
-        return;
-    }
-    args.push(OsString::from("--read"));
-    args.push(root.as_os_str().to_os_string());
-    args.push(OsString::from("--exec"));
-    args.push(root.as_os_str().to_os_string());
-    readable.push(root.to_path_buf());
-}
-
-/// Push `--exec` arg for `root`, unless it is `$HOME` or an ancestor.
-#[cfg(unix)]
-pub(crate) fn push_root_exec_only(root: &Path, args: &mut Vec<OsString>) {
-    if is_home_or_ancestor(root) {
-        return;
-    }
-    args.push(OsString::from("--exec"));
-    args.push(root.as_os_str().to_os_string());
-}

@@ -16,10 +16,6 @@ pub(crate) struct ExecCommandParams {
     #[serde(default)]
     pub(crate) max_output_bytes: Option<usize>,
     #[serde(default)]
-    pub(crate) inputs: Option<Vec<String>>,
-    #[serde(default)]
-    pub(crate) outputs: Option<Vec<String>>,
-    #[serde(default)]
     pub(crate) env: Option<HashMap<String, String>>,
 }
 
@@ -35,8 +31,6 @@ impl JsonSchema for ExecCommandParams {
         let head_lines = generator.subschema_for::<Option<usize>>();
         let tail_lines = generator.subschema_for::<Option<usize>>();
         let max_output_bytes = generator.subschema_for::<Option<usize>>();
-        let inputs = generator.subschema_for::<Option<Vec<String>>>();
-        let outputs = generator.subschema_for::<Option<Vec<String>>>();
         let env = generator.subschema_for::<Option<HashMap<String, String>>>();
         object_schema_with_desc(
             vec![
@@ -46,8 +40,6 @@ impl JsonSchema for ExecCommandParams {
                 ("head_lines", "Return only the first N lines of combined output. Prefer this over `| head -N` in the command.", head_lines),
                 ("tail_lines", "Return only the last N lines of combined output. Prefer this over `| tail -N` in the command.", tail_lines),
                 ("max_output_bytes", "Truncate output to this many bytes. Prefer this over `| head -c N` in the command.", max_output_bytes),
-                ("inputs", "Paths that the command will read (for sandbox allow-listing).", inputs),
-                ("outputs", "Paths that the command will write (triggers history snapshot).", outputs),
                 ("env", "Additional environment variables for the command. Merged on top of the server's environment; per-call overrides only.", env),
             ],
             &["command"],
@@ -126,10 +118,6 @@ pub(crate) struct SpawnCommandParams {
     #[serde(default)]
     pub(crate) working_dir: Option<String>,
     #[serde(default)]
-    pub(crate) inputs: Option<Vec<String>>,
-    #[serde(default)]
-    pub(crate) outputs: Option<Vec<String>>,
-    #[serde(default)]
     pub(crate) env: Option<HashMap<String, String>>,
 }
 
@@ -141,8 +129,6 @@ impl JsonSchema for SpawnCommandParams {
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
         let command = generator.subschema_for::<String>();
         let working_dir = generator.subschema_for::<Option<String>>();
-        let inputs = generator.subschema_for::<Option<Vec<String>>>();
-        let outputs = generator.subschema_for::<Option<Vec<String>>>();
         let env = generator.subschema_for::<Option<HashMap<String, String>>>();
         object_schema_with_desc(
             vec![
@@ -151,12 +137,6 @@ impl JsonSchema for SpawnCommandParams {
                     "working_dir",
                     "Working directory. Defaults to the project root.",
                     working_dir,
-                ),
-                ("inputs", "Paths the command will read.", inputs),
-                (
-                    "outputs",
-                    "Paths the command will write (triggers history snapshot on wait).",
-                    outputs,
                 ),
                 (
                     "env",

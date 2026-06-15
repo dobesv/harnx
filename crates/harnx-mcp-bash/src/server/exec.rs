@@ -13,7 +13,6 @@ impl BashServer {
             .prepare_exec(
                 &params.command,
                 params.working_dir.as_deref(),
-                params.outputs.as_ref(),
                 params.env.as_ref(),
                 "before exec",
             )
@@ -46,10 +45,6 @@ impl BashServer {
                     command: &params.command,
                     working_dir: &working_dir,
                     exec_dir: &exec_dir,
-                    #[cfg(unix)]
-                    inputs: &params.inputs,
-                    #[cfg(unix)]
-                    outputs: &params.outputs,
                     env: params.env.as_ref(),
                 },
                 Stdio::piped(),
@@ -161,7 +156,6 @@ impl BashServer {
         &self,
         command: &str,
         working_dir: Option<&str>,
-        outputs: Option<&Vec<String>>,
         extra_env: Option<&HashMap<String, String>>,
         snapshot_label: &str,
     ) -> Result<ExecPreparation, ErrorData> {
@@ -173,9 +167,7 @@ impl BashServer {
         }
 
         let working_dir = self.resolve_working_dir(working_dir).await?;
-        let output_paths = self.resolve_output_paths(&working_dir, outputs).await?;
-        let snapshot_decision =
-            Self::snapshot_decision_from_output_paths(command, &working_dir, output_paths.as_ref());
+        let snapshot_decision = Self::snapshot_decision_for_command(command, &working_dir);
         let before_snap_ids = self
             .take_snapshots(&snapshot_decision, &working_dir, snapshot_label)
             .await;
@@ -187,28 +179,11 @@ impl BashServer {
         })
     }
 
-    pub(crate) async fn resolve_output_paths(
-        &self,
-        working_dir: &Path,
-        outputs: Option<&Vec<String>>,
-    ) -> Result<Option<Vec<PathBuf>>, ErrorData> {
-        let roots_guard = self.inner.roots.read().await;
-        let owned_outputs = outputs.cloned();
-        let output_paths = parse_output_path_list(&owned_outputs, &roots_guard, working_dir)?;
-        drop(roots_guard);
-        Ok(output_paths)
-    }
-
-    pub(crate) fn snapshot_decision_from_output_paths(
+    pub(crate) fn snapshot_decision_for_command(
         command: &str,
         working_dir: &Path,
-        output_paths: Option<&Vec<PathBuf>>,
     ) -> SnapshotDecision {
-        match output_paths {
-            None => classify_command(command, working_dir),
-            Some(paths) if paths.is_empty() => SnapshotDecision::ReadOnly,
-            Some(paths) => SnapshotDecision::Targeted(paths.clone()),
-        }
+        classify_command(command, working_dir)
     }
 
     pub(crate) async fn take_snapshots(

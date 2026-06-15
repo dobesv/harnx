@@ -28,7 +28,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<ExecCommandParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }}\n```{% if args.working_dir or args.timeout_secs or args.head_lines or args.tail_lines or args.max_output_bytes or args.inputs or args.outputs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.timeout_secs %}[{{ args.timeout_secs }}s] {% endif %}{% if args.head_lines is not none %}[head:{{ args.head_lines }}] {% endif %}{% if args.tail_lines is not none %}[tail_lines:{{ args.tail_lines }}] {% endif %}{% if args.max_output_bytes is not none %}[:{{ args.max_output_bytes }}b] {% endif %}{% if args.inputs %}[<{{ args.inputs | length }}] {% endif %}{% if args.outputs %}[>{{ args.outputs | length }}]{% endif %}{% endif %}",
+                    "call_template": "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }}\n```{% if args.working_dir or args.timeout_secs or args.head_lines or args.tail_lines or args.max_output_bytes %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.timeout_secs %}[{{ args.timeout_secs }}s] {% endif %}{% if args.head_lines is not none %}[head:{{ args.head_lines }}] {% endif %}{% if args.tail_lines is not none %}[tail_lines:{{ args.tail_lines }}] {% endif %}{% if args.max_output_bytes is not none %}[:{{ args.max_output_bytes }}b] {% endif %}{% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "read_exec_log",
@@ -46,7 +46,7 @@ impl ServerHandler for BashServer {
                 )
                 .with_input_schema::<SpawnCommandParams>()
                 .with_meta(Meta(json!({
-                    "call_template": "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }} &\n```{% if args.working_dir or args.inputs or args.outputs %}\n{% if args.working_dir %}({{ args.working_dir }}) {% endif %}{% if args.inputs %}[<{{ args.inputs | length }}] {% endif %}{% if args.outputs %}[>{{ args.outputs | length }}]{% endif %}{% endif %}",
+                    "call_template": "```{{ args.command | shebang_lang }}\n$ {{ args.command | strip_shebang }} &\n```{% if args.working_dir %}\n({{ args.working_dir }}) {% endif %}",
                 }).as_object().unwrap().clone())),
                 Tool::new(
                     "wait",

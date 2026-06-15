@@ -78,54 +78,6 @@ pub(crate) fn sandbox_run_test_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/harnx-sandbox-exec")
 }
 
-#[cfg(unix)]
-pub(crate) fn parse_input_path_list(
-    list: &Option<Vec<String>>,
-    roots: &[PathBuf],
-    working_dir: &Path,
-) -> Result<Option<Vec<PathBuf>>, ErrorData> {
-    parse_validated_path_list(list, roots, working_dir, validate_path)
-}
-
-pub(crate) fn parse_output_path_list(
-    list: &Option<Vec<String>>,
-    roots: &[PathBuf],
-    working_dir: &Path,
-) -> Result<Option<Vec<PathBuf>>, ErrorData> {
-    parse_validated_path_list(list, roots, working_dir, validate_write_path)
-}
-
-pub(crate) fn parse_validated_path_list(
-    list: &Option<Vec<String>>,
-    roots: &[PathBuf],
-    working_dir: &Path,
-    validator: fn(&str, &[PathBuf]) -> Result<PathBuf, String>,
-) -> Result<Option<Vec<PathBuf>>, ErrorData> {
-    match list {
-        None => Ok(None),
-        Some(strs) => {
-            let mut out = Vec::with_capacity(strs.len());
-            for raw in strs {
-                if raw.trim().is_empty() {
-                    return Err(ErrorData::invalid_params(
-                        "path list contains empty string",
-                        None,
-                    ));
-                }
-                let resolved = if Path::new(raw).is_relative() {
-                    working_dir.join(raw)
-                } else {
-                    PathBuf::from(raw)
-                };
-                let validated = validator(&resolved.to_string_lossy(), roots)
-                    .map_err(|err| ErrorData::invalid_params(err, None))?;
-                out.push(validated);
-            }
-            Ok(Some(out))
-        }
-    }
-}
-
 pub(crate) fn load_bash_env_file() -> Vec<(String, String)> {
     let env_file = harnx_core::config_paths::bash_env_file();
     let Ok(contents) = std::fs::read_to_string(&env_file) else {

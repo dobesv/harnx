@@ -176,6 +176,8 @@ args: ["-e", "EDITOR=true"]
 
 ### Sandbox Configuration
 
+
+The bash MCP sandbox grants project roots read+write+exec access by default. Commands are NOT narrowed by per-call paths; the `bash_exec` and `bash_spawn` tools do not have `inputs` or `outputs` parameters.
 Allow tools to use home-directory caches or persistent configuration:
 
 > **Note:** `~/.cargo/bin` is already included in the default allowlist with read+execute permissions, while `~/.cargo/registry`, `~/.cargo/git`, and `~/.npm` are included with read+write permissions. The examples below are only needed if you override the defaults, need additional paths, or require write access for tool installation.

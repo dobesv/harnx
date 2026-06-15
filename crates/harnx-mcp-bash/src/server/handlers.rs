@@ -1,12 +1,11 @@
 // Auto-split from server.rs for cohesion. See server/mod.rs.
 use super::*;
 
-/// Accumulator for sandbox CLI args plus the readable/writable path sets used
-/// to decide whether the working directory still needs an explicit `--read`.
+/// Accumulator for sandbox CLI args plus the writable path set used to decide
+/// whether the working directory still needs an explicit `--read`.
 #[cfg(unix)]
 pub(crate) struct SandboxAcc {
     pub(crate) args: Vec<OsString>,
-    pub(crate) readable: Vec<PathBuf>,
     pub(crate) writable: Vec<PathBuf>,
 }
 
@@ -15,7 +14,6 @@ impl SandboxAcc {
     pub(crate) fn new(args: Vec<OsString>) -> Self {
         Self {
             args,
-            readable: Vec::new(),
             writable: Vec::new(),
         }
     }
@@ -24,51 +22,10 @@ impl SandboxAcc {
         self.args
     }
 
-    pub(crate) fn add_reads(&mut self, paths: &[PathBuf]) {
-        for path in paths {
-            self.args.push(OsString::from("--read"));
-            self.args.push(path.clone().into_os_string());
-            self.readable.push(path.clone());
-        }
-    }
-
-    pub(crate) fn apply_outputs(
-        &mut self,
-        outputs: Option<&[PathBuf]>,
-        roots: &[PathBuf],
-        inputs_explicit_empty: bool,
-    ) {
-        match outputs {
-            None => {
-                for root in roots {
-                    push_root_write_exec(root, &mut self.args, &mut self.writable);
-                }
-            }
-            Some([]) => {
-                if !inputs_explicit_empty {
-                    for root in roots {
-                        push_root_read_exec(root, &mut self.args, &mut self.readable);
-                    }
-                }
-            }
-            Some(paths) => {
-                for path in paths {
-                    self.args.push(OsString::from("--write"));
-                    self.args.push(path.clone().into_os_string());
-                    self.writable.push(path.clone());
-                }
-                for root in roots {
-                    push_root_exec_only(root, &mut self.args);
-                }
-            }
-        }
-    }
-
     pub(crate) fn ensure_working_dir_readable(&mut self, working_dir: &Path) {
         let covered = self
             .writable
             .iter()
-            .chain(self.readable.iter())
             .any(|path| working_dir.starts_with(path));
         if !covered {
             self.args.push(OsString::from("--read"));
@@ -84,8 +41,6 @@ pub(crate) struct SandboxCommandSpec<'a> {
     pub(crate) working_dir: &'a Path,
     pub(crate) exec_dir: &'a Path,
     pub(crate) command: &'a str,
-    pub(crate) inputs: Option<&'a [PathBuf]>,
-    pub(crate) outputs: Option<&'a [PathBuf]>,
     pub(crate) roots: &'a [PathBuf],
     pub(crate) extra_env: Option<&'a HashMap<String, String>>,
 }
@@ -144,10 +99,6 @@ pub(crate) struct CommandBuildCtx<'a> {
     pub(crate) command: &'a str,
     pub(crate) working_dir: &'a Path,
     pub(crate) exec_dir: &'a Path,
-    #[cfg(unix)]
-    pub(crate) inputs: &'a Option<Vec<String>>,
-    #[cfg(unix)]
-    pub(crate) outputs: &'a Option<Vec<String>>,
     pub(crate) env: Option<&'a HashMap<String, String>>,
 }
 
