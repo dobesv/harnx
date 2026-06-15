@@ -18,6 +18,10 @@ pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 8000;
 pub const DEFAULT_TOOL_OUTPUT_MAX_CHARS: usize = 2000;
 
 /// Resolved compaction tuning values for a single compaction run.
+///
+/// A `keep_recent_turns` of `0` is the degenerate "keep no recent turns
+/// verbatim" case and is safe: `recent_suffix_floor`/`split_index` compare
+/// turn counts with `>=` only, so there is no underflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionParams {
     pub keep_recent_turns: usize,
