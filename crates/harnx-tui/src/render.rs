@@ -817,6 +817,19 @@ impl Tui {
                 let prompt_text = format!("Rewind to entry {}? [y/N]", seq);
                 self.render_simple_modal(frame, screen_size, &prompt_text);
             }
+            ModalState::ConfirmToolUse {
+                tool_name,
+                input_preview,
+                reason,
+            } => {
+                self.render_tool_confirm_modal(
+                    frame,
+                    screen_size,
+                    tool_name,
+                    input_preview,
+                    reason.as_deref(),
+                );
+            }
             ModalState::AgentPicker {
                 agents,
                 selected,
@@ -898,6 +911,71 @@ impl Tui {
                 .border_style(Style::default().fg(Color::Reset)),
         );
 
+        frame.render_widget(modal, modal_area);
+    }
+
+    /// Multi-line confirmation modal for a `PreToolUse` "ask" gate. Shows the
+    /// tool name, optional reason, optional argument preview, and a [y/N] prompt.
+    fn render_tool_confirm_modal(
+        &self,
+        frame: &mut Frame<'_>,
+        screen_size: ratatui::layout::Rect,
+        tool_name: &str,
+        input_preview: &str,
+        reason: Option<&str>,
+    ) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("Allow tool '{tool_name}'?"),
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if let Some(r) = reason.filter(|r| !r.is_empty()) {
+            lines.push(Line::from(vec![
+                Span::styled("Reason: ", dim),
+                Span::styled(r.to_string(), Style::default().fg(Color::Reset)),
+            ]));
+        }
+        if !input_preview.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("Input: ", dim),
+                Span::styled(input_preview.to_string(), dim),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "[y] allow   [n] deny   (Enter/Esc denies)",
+            dim,
+        )));
+
+        let content_width = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.chars().count())
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0) as u16;
+        let modal_width = (content_width + 4)
+            .max(24)
+            .min(screen_size.width.saturating_sub(4));
+        let modal_height = (lines.len() as u16 + 2).min(screen_size.height.saturating_sub(2));
+
+        let modal_x = (screen_size.width.saturating_sub(modal_width)) / 2;
+        let modal_y = (screen_size.height.saturating_sub(modal_height)) / 2;
+        let modal_area = ratatui::layout::Rect::new(modal_x, modal_y, modal_width, modal_height);
+
+        frame.render_widget(ratatui::widgets::Clear, modal_area);
+        let modal = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Tool confirmation")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
         frame.render_widget(modal, modal_area);
     }
 

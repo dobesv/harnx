@@ -251,6 +251,11 @@ pub fn build_tool_eval_context(
         })
         .collect();
     let session_name = guard.session.as_ref().map(|s| s.id().to_string());
+    // Runtime-only TUI confirmation override (falls back to the inquire prompt).
+    let confirm_tool_use_fn: Arc<ConfirmToolUseFn> = guard
+        .tui_confirm_tool_use
+        .clone()
+        .unwrap_or_else(|| Arc::new(default_confirm_tool_use));
     drop(guard);
 
     // Build the provider list in ACP-first order so ACP sub-agent
@@ -280,7 +285,7 @@ pub fn build_tool_eval_context(
         emit_tool_call_fn,
         emit_tool_result_fn,
         emit_tool_blocked_fn,
-        confirm_tool_use_fn: Arc::new(default_confirm_tool_use),
+        confirm_tool_use_fn,
         dispatch_hook_fn,
     }
 }
@@ -533,6 +538,33 @@ mod tests {
         assert_eq!(bare, None);
         let ctx = build_tool_eval_context(&config, None, bare, &persistent_manager);
         assert_eq!(ctx.current_agent_package, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn build_tool_eval_context_uses_tui_confirm_override() {
+        // When the TUI installs a confirmation callback, the eval context must
+        // use it instead of the default inquire prompt (#695).
+        let _guard = crate::client::TestStateGuard::new(None).await;
+        let config = Arc::new(RwLock::new(Config::default()));
+        let persistent_manager = std::sync::Arc::new(tokio::sync::Mutex::new(
+            harnx_hooks::PersistentHookManager::new(),
+        ));
+
+        // Default (no override): the inquire-based prompt is used. In a
+        // non-terminal test process it denies, so this returns false.
+        let ctx = build_tool_eval_context(&config, None, None, &persistent_manager);
+        assert!(!(ctx.confirm_tool_use_fn)(
+            "t",
+            &serde_json::json!({}),
+            None
+        ));
+
+        // With an override installed, the context routes confirmation through it.
+        config
+            .write()
+            .set_tui_confirm_tool_use(Some(Arc::new(|_, _, _| true)));
+        let ctx = build_tool_eval_context(&config, None, None, &persistent_manager);
+        assert!((ctx.confirm_tool_use_fn)("t", &serde_json::json!({}), None));
     }
 
     #[test]

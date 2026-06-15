@@ -787,8 +787,33 @@ impl Tui {
                 self.pin_transcript_to_bottom();
                 self.refresh_input_chrome();
             }
+            TuiEvent::ConfirmToolUse {
+                tool_name,
+                input_preview,
+                reason,
+                reply,
+            } => {
+                // A blocked tool-eval thread is waiting on `reply`. Show the
+                // native modal and remember the channel; answering the modal
+                // (handle_modal_key) sends the decision back.
+                self.app.pending_confirm_reply = Some(reply);
+                self.app.modal = Some(crate::types::ModalState::ConfirmToolUse {
+                    tool_name,
+                    input_preview,
+                    reason,
+                });
+            }
         }
         Ok(())
+    }
+
+    /// Resolve an in-flight tool-use confirmation: send the decision to the
+    /// blocked tool-eval thread and dismiss the modal.
+    fn resolve_tool_confirm(&mut self, allow: bool) {
+        if let Some(reply) = self.app.pending_confirm_reply.take() {
+            let _ = reply.send(allow);
+        }
+        self.app.modal = None;
     }
 
     #[cfg(test)]
@@ -2075,6 +2100,23 @@ impl Tui {
             Some(crate::types::ModalState::AgentPicker { .. })
             | Some(crate::types::ModalState::SessionPicker { .. }) => {
                 self.handle_picker_key(key).await?;
+            }
+            Some(crate::types::ModalState::ConfirmToolUse { .. }) => {
+                match (key.code, key.modifiers) {
+                    // Default is deny ([y/N]): only an explicit 'y' allows the call.
+                    (KeyCode::Char('y') | KeyCode::Char('Y'), KeyModifiers::NONE) => {
+                        self.resolve_tool_confirm(true);
+                    }
+                    // Deny on n/N/Esc/Enter, and on Ctrl+C so the blocked tool-eval
+                    // thread is never left waiting.
+                    (KeyCode::Char('n') | KeyCode::Char('N'), KeyModifiers::NONE)
+                    | (KeyCode::Esc, KeyModifiers::NONE)
+                    | (KeyCode::Enter, KeyModifiers::NONE)
+                    | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        self.resolve_tool_confirm(false);
+                    }
+                    _ => {}
+                }
             }
             Some(_) => match (key.code, key.modifiers) {
                 (KeyCode::Char('y'), KeyModifiers::NONE) | (KeyCode::Enter, KeyModifiers::NONE) => {

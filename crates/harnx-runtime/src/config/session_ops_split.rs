@@ -104,6 +104,15 @@ impl Config {
         self.tui_after_editor = after;
     }
 
+    /// Install (or clear) the TUI's native tool-confirmation callback. See
+    /// `Config::tui_confirm_tool_use`.
+    pub fn set_tui_confirm_tool_use(
+        &mut self,
+        confirm: Option<std::sync::Arc<crate::tool::ConfirmToolUseFn>>,
+    ) {
+        self.tui_confirm_tool_use = confirm;
+    }
+
     pub fn edit_message_range(&mut self, from: usize, to: usize) -> Result<()> {
         let name = match &self.session {
             Some(session) => session.id().to_string(),

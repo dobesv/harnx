@@ -107,6 +107,10 @@ pub(super) struct App {
     pub(super) transcript_selection_anchor: Option<usize>,
     /// Modal dialog state for destructive action confirmations.
     pub(super) modal: Option<ModalState>,
+    /// Reply channel for an in-flight tool-use confirmation. Set alongside a
+    /// `ModalState::ConfirmToolUse`; the blocked tool-eval thread waits on the
+    /// receiver, and answering the modal sends the decision here.
+    pub(super) pending_confirm_reply: Option<std::sync::mpsc::Sender<bool>>,
     pub(super) detail_view_scroll: ratatui_widget_scrolling::ScrollState,
     pub(super) detail_view_open: bool,
     /// Raw YAML from the session log for the focused entry, populated when
@@ -176,6 +180,13 @@ pub(super) enum ModalState {
     ConfirmRewind {
         seq: usize,
         user_text: Option<String>,
+    },
+    /// Confirmation for a tool call gated by a `PreToolUse` "ask" hook.
+    /// The reply channel lives in `App::pending_confirm_reply`.
+    ConfirmToolUse {
+        tool_name: String,
+        input_preview: String,
+        reason: Option<String>,
     },
     /// Agent selection
     AgentPicker {
@@ -309,4 +320,12 @@ pub(crate) enum TuiEvent {
     ToolRoundComplete,
     /// The prompt task consumed the pending message during a tool round.
     PendingMessageConsumed(PendingMessage),
+    /// A `PreToolUse` hook asked for confirmation. The blocked tool-eval thread
+    /// waits on `reply`; the main loop shows a modal and sends the decision back.
+    ConfirmToolUse {
+        tool_name: String,
+        input_preview: String,
+        reason: Option<String>,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
 }
