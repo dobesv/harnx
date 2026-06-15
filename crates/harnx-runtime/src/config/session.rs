@@ -702,17 +702,7 @@ pub fn save(
     // first-turn images persisted before incremental externalization, or
     // legacy sessions loaded with inline base64) so the rewritten transcript
     // never carries inline base64. Idempotent: existing cid refs are skipped.
-    {
-        let dir = crate::config::attachments::attachments_dir_for(session_path);
-        let mut map = std::collections::HashMap::new();
-        for msg in session.compressed_messages.iter_mut() {
-            externalize_message(&dir, &mut msg.content, &mut map);
-        }
-        for msg in session.messages.iter_mut() {
-            externalize_message(&dir, &mut msg.content, &mut map);
-        }
-        session.data_urls.extend(map);
-    }
+    externalize_persisted_messages(session, session_path);
 
     // Write in the new log format.
     let mut content = serde_yaml::to_string(&session.build_header_entry())
@@ -981,15 +971,11 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
     // the cid -> filename map is logged as a DataUrls entry after the
     // ToolResults entry (below) so the ToolCalls/ToolResults pairing on replay
     // is not split.
-    if let Some(dir) = attachments_dir.as_ref() {
-        for slot in pending.tool_results.iter_mut() {
-            if let Err(err) =
-                crate::config::attachments::externalize_parts(dir, &mut slot.content, &mut cid_urls)
-            {
-                log::warn!("tool-result attachment externalization failed: {err}");
-            }
-        }
-    }
+    externalize_tool_result_content(
+        attachments_dir.as_deref(),
+        &mut pending.tool_results,
+        &mut cid_urls,
+    );
 
     let log_results: Vec<harnx_core::session::ToolOutput> = pending
         .tool_results
@@ -1013,16 +999,8 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
     if !appended {
         session.dirty = true;
     }
-    if !cid_urls.is_empty() {
-        if !append_event(
-            session,
-            &SessionLogEntry::DataUrls {
-                urls: cid_urls.clone(),
-            },
-        ) {
-            session.dirty = true;
-        }
-        session.data_urls.extend(cid_urls);
+    if !record_externalized(session, cid_urls) {
+        session.dirty = true;
     }
     session.update_tokens();
     Ok(())
@@ -1093,6 +1071,61 @@ fn externalize_content(
     map
 }
 
+/// Externalize inline image data URIs across a slice of tool results into
+/// `cid:` references, recording `cid -> filename` in `map`. No-op when the
+/// session has no attachments dir yet.
+fn externalize_tool_result_content(
+    dir: Option<&std::path::Path>,
+    results: &mut [crate::tool::ToolResult],
+    map: &mut std::collections::HashMap<String, String>,
+) {
+    let Some(dir) = dir else {
+        return;
+    };
+    for slot in results.iter_mut() {
+        if let Err(err) = crate::config::attachments::externalize_parts(dir, &mut slot.content, map)
+        {
+            log::warn!("tool-result attachment externalization failed: {err}");
+        }
+    }
+}
+
+/// Externalize still-inline image content across every stored message
+/// (compressed + active) into the session's attachments dir, merging the new
+/// `cid -> filename` mappings into the session map. Idempotent — used by the
+/// full-rewrite `save()` to migrate first-turn/legacy inline blobs.
+fn externalize_persisted_messages(session: &mut Session, session_path: &std::path::Path) {
+    let dir = crate::config::attachments::attachments_dir_for(session_path);
+    let mut map = std::collections::HashMap::new();
+    for msg in session.compressed_messages.iter_mut() {
+        externalize_message(&dir, &mut msg.content, &mut map);
+    }
+    for msg in session.messages.iter_mut() {
+        externalize_message(&dir, &mut msg.content, &mut map);
+    }
+    session.data_urls.extend(map);
+}
+
+/// Record freshly externalized `cid -> filename` mappings: append a `DataUrls`
+/// log entry and merge them into the session map. No-op when empty. Returns
+/// whether the append (if any) succeeded.
+fn record_externalized(
+    session: &mut Session,
+    cid_urls: std::collections::HashMap<String, String>,
+) -> bool {
+    if cid_urls.is_empty() {
+        return true;
+    }
+    let appended = append_event(
+        session,
+        &SessionLogEntry::DataUrls {
+            urls: cid_urls.clone(),
+        },
+    );
+    session.data_urls.extend(cid_urls);
+    appended
+}
+
 /// Shared round-opening setup used by both `add_assistant_text` and
 /// `add_tool_calls`: first-turn agent-message injection, user-message
 /// push (skipped on continuation rounds), data-URL persistence, and
@@ -1121,15 +1154,7 @@ fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<boo
         }
         // Seq-less metadata record for the cids written above; appended after
         // the messages so message log_seqs are unaffected.
-        if !cid_urls.is_empty() {
-            all_appended &= append_event(
-                session,
-                &SessionLogEntry::DataUrls {
-                    urls: cid_urls.clone(),
-                },
-            );
-            session.data_urls.extend(cid_urls);
-        }
+        all_appended &= record_externalized(session, cid_urls);
     } else if !is_continuation {
         // `seq` is the message's log-document index. `externalize_content` only
         // writes attachment files + rewrites `content` in memory (it takes
@@ -1151,15 +1176,7 @@ fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<boo
         );
         session.messages.push(user_msg);
         emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
-        if !cid_urls.is_empty() {
-            all_appended &= append_event(
-                session,
-                &SessionLogEntry::DataUrls {
-                    urls: cid_urls.clone(),
-                },
-            );
-            session.data_urls.extend(cid_urls);
-        }
+        all_appended &= record_externalized(session, cid_urls);
     }
     let new_data_urls = input.data_urls();
     if !new_data_urls.is_empty() {
@@ -1217,6 +1234,35 @@ pub fn build_messages(session: &Session, input: &Input) -> Result<Vec<Message>> 
     Ok(messages)
 }
 
+/// Expand the `cid:` image references in a single message's content — both
+/// plain content arrays and tool-result content — to inline `data:` URIs.
+fn expand_message(
+    encoder: &dyn crate::config::attachments::AttachmentEncoder,
+    dir: &std::path::Path,
+    content: &mut MessageContent,
+) {
+    let result = match content {
+        MessageContent::Array(parts) => {
+            crate::config::attachments::expand_parts(encoder, dir, parts)
+        }
+        MessageContent::ToolCalls(tool_calls) => {
+            let mut res = Ok(());
+            for tool_result in tool_calls.tool_results.iter_mut() {
+                if let Err(err) =
+                    crate::config::attachments::expand_parts(encoder, dir, &mut tool_result.content)
+                {
+                    res = Err(err);
+                }
+            }
+            res
+        }
+        MessageContent::Text(_) => Ok(()),
+    };
+    if let Err(err) = result {
+        log::warn!("attachment expansion failed: {err}");
+    }
+}
+
 /// Replace `cid:` image references in outgoing messages with inline `data:`
 /// URIs (base64 backend). Walks both plain content arrays and tool-result
 /// content. No-op when the session has no attachments dir / no cid refs.
@@ -1229,25 +1275,7 @@ fn expand_message_attachments(session: &Session, messages: &mut [Message]) {
     let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(path));
     let encoder = crate::config::attachments::Base64Encoder;
     for message in messages.iter_mut() {
-        match &mut message.content {
-            MessageContent::Array(parts) => {
-                if let Err(err) = crate::config::attachments::expand_parts(&encoder, &dir, parts) {
-                    log::warn!("attachment expansion failed: {err}");
-                }
-            }
-            MessageContent::ToolCalls(tool_calls) => {
-                for result in tool_calls.tool_results.iter_mut() {
-                    if let Err(err) = crate::config::attachments::expand_parts(
-                        &encoder,
-                        &dir,
-                        &mut result.content,
-                    ) {
-                        log::warn!("attachment expansion failed: {err}");
-                    }
-                }
-            }
-            MessageContent::Text(_) => {}
-        }
+        expand_message(&encoder, &dir, &mut message.content);
     }
 }
 

@@ -159,14 +159,16 @@ pub fn externalize_parts(
     map: &mut HashMap<String, String>,
 ) -> Result<()> {
     for part in parts.iter_mut() {
-        if let MessageContentPart::ImageUrl { image_url } = part {
-            if image_url.url.starts_with("data:") {
-                let filename = attachment_filename(&image_url.url);
-                let cid = write_attachment(dir, &image_url.url)?;
-                map.insert(cid.clone(), filename);
-                image_url.url = cid;
-            }
+        let MessageContentPart::ImageUrl { image_url } = part else {
+            continue;
+        };
+        if !image_url.url.starts_with("data:") {
+            continue;
         }
+        let filename = attachment_filename(&image_url.url);
+        let cid = write_attachment(dir, &image_url.url)?;
+        map.insert(cid.clone(), filename);
+        image_url.url = cid;
     }
     Ok(())
 }
@@ -179,21 +181,23 @@ pub fn expand_parts(
     parts: &mut [MessageContentPart],
 ) -> Result<()> {
     for part in parts.iter_mut() {
-        if let MessageContentPart::ImageUrl { image_url } = part {
-            if image_url.url.starts_with(CID_PREFIX) {
-                match encoder.expand(dir, &image_url.url) {
-                    Ok(url) => image_url.url = url,
-                    Err(err) => {
-                        // Never send a raw `cid:` ref to the model (it would be
-                        // rejected) and never fail the whole turn over one lost
-                        // blob: drop the unresolvable image to a text
-                        // placeholder and keep going with the rest.
-                        log::warn!("dropping unresolvable attachment {}: {err}", image_url.url);
-                        *part = MessageContentPart::Text {
-                            text: format!("[unavailable image attachment: {}]", image_url.url),
-                        };
-                    }
-                }
+        let MessageContentPart::ImageUrl { image_url } = part else {
+            continue;
+        };
+        if !image_url.url.starts_with(CID_PREFIX) {
+            continue;
+        }
+        match encoder.expand(dir, &image_url.url) {
+            Ok(url) => image_url.url = url,
+            Err(err) => {
+                // Never send a raw `cid:` ref to the model (it would be
+                // rejected) and never fail the whole turn over one lost blob:
+                // drop the unresolvable image to a text placeholder and keep
+                // going with the rest.
+                log::warn!("dropping unresolvable attachment {}: {err}", image_url.url);
+                *part = MessageContentPart::Text {
+                    text: format!("[unavailable image attachment: {}]", image_url.url),
+                };
             }
         }
     }
