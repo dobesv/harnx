@@ -807,6 +807,37 @@ pub fn compress(session: &mut Session, mut prompt: String) {
     }
 }
 
+/// Compact only the prefix `messages[..keep_from]`, keeping `messages[keep_from..]`
+/// verbatim. The prefix moves to `compressed_messages`; the new message list is
+/// `[summary system message, ...kept suffix]`. The original leading system
+/// prompt (if any) is folded into the summary, matching `compress`.
+pub fn compress_keeping_recent(session: &mut Session, mut prompt: String, keep_from: usize) {
+    let keep_from = keep_from.min(session.messages.len());
+    if let Some(system_prompt) = session.messages.first().and_then(|v| {
+        if MessageRole::System == v.role {
+            let content = v.content.to_text();
+            if !content.is_empty() {
+                return Some(content);
+            }
+        }
+        None
+    }) {
+        prompt = format!("{system_prompt}\n\n{prompt}",);
+    }
+    // Split off the recent suffix to keep verbatim; the remainder is the prefix.
+    let suffix: Vec<Message> = session.messages.split_off(keep_from);
+    session.compressed_messages.append(&mut session.messages);
+    session.messages.push(Message::new(
+        MessageRole::System,
+        MessageContent::Text(prompt.clone()),
+    ));
+    session.messages.extend(suffix);
+    session.update_tokens();
+    if !append_event(session, &SessionLogEntry::Compress { prompt }) {
+        session.dirty = true;
+    }
+}
+
 /// Record an assistant turn that produced plain text (no tool calls).
 /// Handles the first-turn agent setup, optional user-message push, and
 /// continue/regenerate edit modes.  Exactly one `Message(Assistant,
@@ -2904,5 +2935,27 @@ content: second
             session.path.as_ref().unwrap(),
         ));
         assert_eq!(std::fs::read_dir(&dir).unwrap().flatten().count(), 1);
+    }
+
+    #[test]
+    fn compress_keeping_recent_preserves_suffix() {
+        use harnx_core::message::{Message, MessageContent, MessageRole};
+        let mut session = test_session();
+        session.messages = vec![
+            Message::new(MessageRole::System, MessageContent::Text("sys".into())),
+            Message::new(MessageRole::User, MessageContent::Text("old u".into())),
+            Message::new(MessageRole::Assistant, MessageContent::Text("old a".into())),
+            Message::new(MessageRole::User, MessageContent::Text("recent u".into())),
+            Message::new(MessageRole::Assistant, MessageContent::Text("recent a".into())),
+        ];
+        super::compress_keeping_recent(&mut session, "SUMMARY".to_string(), 3);
+
+        assert_eq!(session.compressed_messages.len(), 3);
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[0].role, MessageRole::System);
+        assert!(session.messages[0].content.to_text().contains("SUMMARY"));
+        assert!(session.messages[0].content.to_text().contains("sys"));
+        assert_eq!(session.messages[1].content.to_text(), "recent u");
+        assert_eq!(session.messages[2].content.to_text(), "recent a");
     }
 }
