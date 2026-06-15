@@ -654,6 +654,14 @@ You are a compaction agent.\n";
         assert_eq!(bare.compaction_keep_recent_turns(), None);
         assert_eq!(bare.compaction_keep_recent_tokens(), None);
         assert_eq!(bare.compaction_tool_output_max_chars(), None);
+
+        // Serialize back to front-matter and reparse, exercising the
+        // from_config / skip_serializing_if / is_empty path for the knobs.
+        let exported = agent.export().unwrap();
+        let reparsed = AgentConfig::from_markdown("compactor", &exported).unwrap();
+        assert_eq!(reparsed.compaction_keep_recent_turns(), Some(5));
+        assert_eq!(reparsed.compaction_keep_recent_tokens(), Some(12000));
+        assert_eq!(reparsed.compaction_tool_output_max_chars(), Some(500));
     }
 
     #[test]
