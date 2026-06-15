@@ -598,13 +598,16 @@ impl AgentFrontMatter {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    fn model_is_empty(&self) -> bool {
         self.model_id.is_none()
             && self.model_fallbacks.is_empty()
             && self.retry.is_none()
             && self.temperature.is_none()
             && self.top_p.is_none()
-            && self.use_tools.is_none()
+    }
+
+    fn content_is_empty(&self) -> bool {
+        self.use_tools.is_none()
             && self.description.is_empty()
             && self.version.is_empty()
             && self.variables.is_empty()
@@ -612,10 +615,19 @@ impl AgentFrontMatter {
             && self.documents.is_empty()
             && self.instructions.is_none()
             && self.hooks.is_none()
-            && self.compaction_agent.is_none()
+    }
+
+    fn compaction_is_empty(&self) -> bool {
+        self.compaction_agent.is_none()
             && self.compaction_keep_recent_turns.is_none()
             && self.compaction_keep_recent_tokens.is_none()
             && self.compaction_tool_output_max_chars.is_none()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.model_is_empty()
+            && self.content_is_empty()
+            && self.compaction_is_empty()
             && self.role == AgentRole::Assistant
     }
 }

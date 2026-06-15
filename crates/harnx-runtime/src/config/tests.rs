@@ -606,15 +606,20 @@ async fn test_compact_session_package_bare_compaction_agent_resolves_within_pack
     );
 }
 
-/// compact_session must honor a non-default `compaction_keep_recent_turns`
-/// from the compaction agent's frontmatter: a smaller value keeps fewer recent
-/// turns verbatim and therefore compacts (renders into the transcript) MORE of
-/// the conversation than the default of 3 would. The session here has 4 user
-/// turns; with `compaction_keep_recent_turns: 1` only the last turn is kept
-/// verbatim, so the rendered transcript carries the first 3 user turns (the
-/// default of 3 would keep 3 turns and render only 1).
-#[tokio::test]
-async fn test_compact_session_honors_compaction_keep_recent_turns() {
+/// RAII guards and handles for the keep-recent-turns compaction fixture. The
+/// `_temp`/`_guard`/`_env` fields are held only to keep the temp dir, mock
+/// client, and env override alive for the duration of the test.
+struct KeepRecentTurnsFixture {
+    config: Arc<RwLock<Config>>,
+    mock: Arc<crate::test_utils::MockClient>,
+    _temp: tempfile::TempDir,
+    _guard: crate::client::TestStateGuard<'static>,
+    _env: EnvGuard,
+}
+
+/// Build a session of four user turns whose `compaction_agent` overrides
+/// `compaction_keep_recent_turns` to 1, with a mock summarizer client installed.
+async fn setup_keep_recent_turns_fixture() -> KeepRecentTurnsFixture {
     use crate::client::TestStateGuard;
     use crate::test_utils::{MockClient, MockTurnBuilder};
     use std::io::Write as _;
@@ -661,12 +666,20 @@ async fn test_compact_session_honors_compaction_keep_recent_turns() {
     let _guard = TestStateGuard::new(Some(mock.clone())).await;
     let _env = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
 
-    Config::compact_session(&config).await.unwrap();
+    KeepRecentTurnsFixture {
+        config,
+        mock,
+        _temp: temp,
+        _guard,
+        _env,
+    }
+}
 
-    // The rendered transcript (one user message) covers the compacted prefix.
-    // With keep_recent_turns=1, the last turn (turn 4) is kept verbatim and the
-    // first three turns are compacted, so the transcript carries turns 1–3 and
-    // NOT turn 4. The default of 3 would keep turns 2–4 and render only turn 1.
+/// With keep_recent_turns=1, the last turn (turn 4) is kept verbatim and the
+/// first three turns are compacted, so the single rendered transcript user
+/// message carries turns 1–3 and NOT turn 4. The default of 3 would keep turns
+/// 2–4 and render only turn 1.
+fn assert_first_three_turns_compacted(mock: &crate::test_utils::MockClient) {
     let history = mock.conversation_history();
     assert_eq!(
         history.conversation_history.len(),
@@ -699,9 +712,11 @@ async fn test_compact_session_honors_compaction_keep_recent_turns() {
         !transcript.contains("user turn 4"),
         "the last user turn must be kept verbatim, not compacted; transcript: {transcript:?}"
     );
+}
 
-    // The kept-verbatim suffix lands back in the live session as
-    // [summary_system, U4, A4]: one summary message plus the 2 kept messages.
+/// The kept-verbatim suffix lands back in the live session as
+/// [summary_system, U4, A4]: one summary message plus the 2 kept messages.
+fn assert_kept_suffix_is_summary_plus_last_turn(config: &Arc<RwLock<Config>>) {
     let guard = config.read();
     let session = guard.session.as_ref().unwrap();
     assert_eq!(
@@ -711,6 +726,20 @@ async fn test_compact_session_honors_compaction_keep_recent_turns() {
          messages: {:?}",
         session.messages
     );
+}
+
+/// compact_session must honor a non-default `compaction_keep_recent_turns`
+/// from the compaction agent's frontmatter: a smaller value keeps fewer recent
+/// turns verbatim and therefore compacts (renders into the transcript) MORE of
+/// the conversation than the default of 3 would.
+#[tokio::test]
+async fn test_compact_session_honors_compaction_keep_recent_turns() {
+    let fixture = setup_keep_recent_turns_fixture().await;
+
+    Config::compact_session(&fixture.config).await.unwrap();
+
+    assert_first_three_turns_compacted(&fixture.mock);
+    assert_kept_suffix_is_summary_plus_last_turn(&fixture.config);
 }
 
 /// Regression test for the ACP-server failure where `use_agent_by_name`
