@@ -139,6 +139,35 @@ pub fn render_transcript(messages: &[Message], max_tool_chars: usize) -> String 
     sections.join("\n\n")
 }
 
+/// Earliest index still within both the turn-count and token budgets, scanning
+/// backward from the end.
+fn recent_suffix_floor(
+    messages: &[Message],
+    model: &Model,
+    keep_turns: usize,
+    keep_tokens: usize,
+) -> usize {
+    let len = messages.len();
+    let mut idx = len;
+    let mut turns = 0usize;
+    let mut tokens = 0usize;
+    for i in (0..len).rev() {
+        let t = model.messages_tokens(std::slice::from_ref(&messages[i]));
+        let is_user = messages[i].role == MessageRole::User;
+        let over_turn_budget = is_user && turns >= keep_turns;
+        let over_token_budget = tokens + t > keep_tokens;
+        if over_turn_budget || over_token_budget {
+            break;
+        }
+        tokens += t;
+        if is_user {
+            turns += 1;
+        }
+        idx = i;
+    }
+    idx
+}
+
 /// Index in `messages` where the verbatim recent suffix begins; messages before
 /// it are compacted. Keeps at most `keep_turns` recent user-turns and
 /// `keep_tokens` estimated tokens, snapping the boundary forward to a `User`
@@ -156,22 +185,7 @@ pub fn split_index(
     if len <= 1 {
         return len;
     }
-    let mut idx = len;
-    let mut turns = 0usize;
-    let mut tokens = 0usize;
-    for i in (0..len).rev() {
-        let t = model.messages_tokens(std::slice::from_ref(&messages[i]));
-        let is_user = messages[i].role == MessageRole::User;
-        // Stop before including message i if adding it would exceed either cap.
-        if (is_user && turns >= keep_turns) || tokens + t > keep_tokens {
-            break;
-        }
-        tokens += t;
-        if is_user {
-            turns += 1;
-        }
-        idx = i;
-    }
+    let mut idx = recent_suffix_floor(messages, model, keep_turns, keep_tokens);
     // Snap forward to a User boundary so a kept reply always has its prompt.
     while idx < len && messages[idx].role != MessageRole::User {
         idx += 1;

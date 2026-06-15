@@ -483,9 +483,10 @@ impl Config {
 
         // 1. Snapshot what we need under a read lock: the transcript of the prefix
         //    to compact, the split point, and the covered log-seq range.
-        let (transcript, split, covered) = {
+        let (transcript, split, covered, session_id) = {
             let guard = config.read();
             let session = guard.session.as_ref().context("No session")?;
+            let session_id = session.id.clone();
             let model = session.model().clone();
             let split = crate::config::compaction::split_index(
                 &session.messages,
@@ -503,7 +504,7 @@ impl Config {
             );
             let from = prefix.iter().filter_map(|m| m.log_seq).min();
             let to = prefix.iter().filter_map(|m| m.log_seq).max();
-            (transcript, split, (from, to, prefix.len()))
+            (transcript, split, (from, to, prefix.len()), session_id)
         };
 
         // 2. Build a controlled summarization request: summarizer system prompt +
@@ -527,7 +528,9 @@ impl Config {
         // 3. Append a recovery note and store, keeping the recent suffix verbatim.
         let summary_with_note = append_recovery_note(summary, covered);
         if let Some(session) = config.write().session.as_mut() {
-            crate::config::session::compress_keeping_recent(session, summary_with_note, split);
+            if session.id == session_id {
+                crate::config::session::compress_keeping_recent(session, summary_with_note, split);
+            }
         }
         config.write().discontinuous_last_message();
         Ok(())

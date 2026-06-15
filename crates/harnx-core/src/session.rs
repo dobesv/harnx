@@ -99,11 +99,7 @@ pub enum SessionLogEntry {
     #[serde(rename = "data_urls")]
     DataUrls { urls: HashMap<String, String> },
     #[serde(rename = "compress")]
-    Compress {
-        prompt: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        keep_from: Option<usize>,
-    },
+    Compress { prompt: String },
     #[serde(rename = "clear")]
     Clear,
     #[serde(rename = "edit_entries")]
