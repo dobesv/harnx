@@ -149,8 +149,10 @@ pub fn query_entries_with_jaq(
     let Some(expr) = &query.jaq else {
         return Ok(rows);
     };
-    // `eval_filter` returns `None` only on a parse/compile/runtime error; a
-    // legitimate empty result comes back as `Some([])`.
+    // `eval_filter` returns `None` on a parse/compile/runtime error; surface
+    // that so the agent can fix or drop the expression. A filter that simply
+    // matches nothing does not return `None`, so this won't misfire on
+    // legitimately-empty results.
     harnx_core::jaq::eval_filter(expr, rows)
         .ok_or_else(|| anyhow::anyhow!("invalid jaq expression: {expr}"))
 }
@@ -447,5 +449,25 @@ mod tests {
         let arr = rows.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert!(arr[0]["text"].as_str().unwrap().contains("hello world"));
+    }
+
+    #[test]
+    fn query_surfaces_entries_before_a_compress_boundary() {
+        let log = concat!(
+            "type: header\nmodel: openai:gpt-4o\n",
+            "---\ntype: message\nrole: user\ncontent: original question\n",
+            "---\ntype: compress\nprompt: summary so far\n",
+            "---\ntype: message\nrole: assistant\ncontent: recent answer\n",
+        );
+        let rows = query_log_content(log, "test", &HistoryQuery::default()).unwrap();
+        let arr = rows.as_array().unwrap();
+        // The pre-compaction "original question" entry is still surfaced.
+        assert!(arr.iter().any(|r| r["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("original question"))));
+        assert!(arr.iter().any(|r| r["type"] == "compress"));
+        assert!(arr.iter().any(|r| r["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("recent answer"))));
     }
 }
