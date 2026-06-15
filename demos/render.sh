@@ -34,14 +34,28 @@ fi
 
 cd "$REPO_ROOT"
 
-# Build release binaries if missing — VHS will type `harnx`, so it must be on PATH.
-if [[ ! -x "$REPO_ROOT/target/release/harnx" ]] || [[ ! -x "$REPO_ROOT/target/release/harnx-mock-llm" ]]; then
+# Build release binaries if missing — VHS will type `harnx`, so it must be on
+# PATH, and the agent demo spawns `harnx-mock-mcp` for its faked tool calls.
+if [[ ! -x "$REPO_ROOT/target/release/harnx" ]] \
+  || [[ ! -x "$REPO_ROOT/target/release/harnx-mock-llm" ]] \
+  || [[ ! -x "$REPO_ROOT/target/release/harnx-mock-mcp" ]]; then
   echo "Building release binaries..."
   cargo build --release -p harnx -p harnx-test-bins
 fi
 
 export PATH="$REPO_ROOT/target/release:$PATH"
 export HARNX_CONFIG_DIR="$DEMOS_DIR/config"
+
+# Disable chromium sandbox so that we can run this inside a sandbox
+export VHS_NO_SANDBOX=1
+
+# The demos showcase syntax highlighting, so make sure color is enabled in the
+# recording environment. harnx disables highlighting when NO_COLOR is set
+# (env_split.rs), and resolves truecolor from COLORTERM — a clean CI/sandbox
+# shell often has NO_COLOR=1 and no COLORTERM, which would render code blocks
+# as flat, unhighlighted text. Present a normal color-capable terminal instead.
+unset NO_COLOR
+export COLORTERM=truecolor
 
 # VHS spawns bash inside ttyd, which sources $HOME/.bashrc. Point HOME at an
 # empty dir so the user's shell init doesn't leak into the recording.

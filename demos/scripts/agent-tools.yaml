@@ -1,0 +1,88 @@
+# Canned tool results for the agent coding-session demo, served by
+# harnx-mock-mcp. The mock LLM (demos/scripts/agent-flow.yaml) emits the tool
+# CALLS; this file supplies the faked RESULTS, consumed in order. Nothing here
+# actually runs — it just looks like a real read -> edit -> test session.
+#
+# Keep this in lockstep with agent-flow.yaml: response[0] answers the first
+# tool call, response[1] the second, and so on.
+# Pace each faked tool call so the recording reads like real work (reading,
+# editing, running the test) instead of an instant blip.
+response_delay_ms: 1100
+
+tools:
+  - name: read_file
+    description: Read a file from the project.
+    call_template: "📄 read {{ args.path }}"
+  - name: apply_edit
+    description: Apply an edit to a file and return a unified diff.
+    call_template: "✏️  edit {{ args.path }}"
+  - name: run
+    description: Run a shell command.
+    call_template: "```sh\n$ {{ args.command }}\n```"
+
+responses:
+  # 1) read_file — current text utils module
+  - |
+    ```rust
+    // crates/harnx-runtime/src/utils/text.rs
+
+    /// Shorten `s` to at most `max` chars with a trailing ellipsis.
+    pub fn ellipsize(s: &str, max: usize) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() <= max {
+            return s.to_string();
+        }
+        let head: String = chars[..max.saturating_sub(1)].iter().collect();
+        format!("{head}…")
+    }
+    ```
+
+  # 2) apply_edit — unified diff adding the function + a test
+  - |
+    ```diff
+    --- a/crates/harnx-runtime/src/utils/text.rs
+    +++ b/crates/harnx-runtime/src/utils/text.rs
+    @@ pub fn ellipsize(s: &str, max: usize) -> String {
+         format!("{head}…")
+     }
+    +
+    +/// Shorten `s` to at most `max` chars, keeping the head and tail and
+    +/// joining them with a middle ellipsis (e.g. paths and content types).
+    +pub fn truncate_middle(s: &str, max: usize) -> String {
+    +    let chars: Vec<char> = s.chars().collect();
+    +    if chars.len() <= max {
+    +        return s.to_string();
+    +    }
+    +    let keep = max.saturating_sub(1); // room for the ellipsis
+    +    let head = keep.div_ceil(2);
+    +    let tail = keep - head;
+    +    let start: String = chars[..head].iter().collect();
+    +    let end: String = chars[chars.len() - tail..].iter().collect();
+    +    format!("{start}…{end}")
+    +}
+    +
+    +#[cfg(test)]
+    +mod tests {
+    +    use super::*;
+    +
+    +    #[test]
+    +    fn keeps_head_and_tail() {
+    +        assert_eq!(truncate_middle("application/json", 11), "appli…/json");
+    +    }
+    +}
+    ```
+    Applied 1 edit to `crates/harnx-runtime/src/utils/text.rs` (+22 −0).
+
+  # 3) run — test output
+  - |
+    ```text
+        Finished `test` profile [unoptimized + debuginfo] in 9.84s
+        Running unittests src/lib.rs
+
+    running 1 test
+    test utils::text::tests::keeps_head_and_tail ... ok
+
+    test result: ok. 1 passed; 0 failed; 0 ignored; finished in 0.00s
+    ```
+
+fallback: "(no more scripted responses)"

@@ -1,12 +1,42 @@
-chunk_delay_ms: 35
+# Mock-LLM turns for the agent coding-session demo. One turn is consumed per
+# chat-completion request: the user prompt is turn 1, and each tool round
+# produces another request (turns 2-4). Tool calls reference the dev_* tools
+# served by harnx-mock-mcp (see demos/scripts/agent-tools.yaml for the canned
+# results). Keep the two files in lockstep.
+chunk_delay_ms: 40
 turns:
+  # Turn 1 — acknowledge the task and read the current file.
   - text_chunks:
-      - "Sure! "
-      - "Let me count the Rust source files "
-      - "in this workspace."
+      - "I'll add `truncate_middle` to the text utils. "
+      - "Let me look at the current module first."
+    tool_calls:
+      - id: call_read
+        name: dev_read_file
+        arguments:
+          path: crates/harnx-runtime/src/utils/text.rs
+
+  # Turn 2 — add the function plus a unit test.
   - text_chunks:
-      - "There are **42 Rust files** in the workspace, "
-      - "split across the `crates/` directory. "
-      - "The largest crate is `harnx-tui`, "
-      - "which holds the terminal UI built on ratatui."
+      - "Got it — there's an `ellipsize` helper already. "
+      - "I'll add `truncate_middle` next to it, with a unit test."
+    tool_calls:
+      - id: call_edit
+        name: dev_apply_edit
+        arguments:
+          path: crates/harnx-runtime/src/utils/text.rs
+
+  # Turn 3 — run the new test.
+  - text_chunks:
+      - "Edit applied. Running the new test to confirm it passes."
+    tool_calls:
+      - id: call_run
+        name: dev_run
+        arguments:
+          command: cargo nextest run -p harnx-runtime keeps_head_and_tail
+
+  # Turn 4 — wrap up.
+  - text_chunks:
+      - "Done ✅ Added **`truncate_middle(s, max)`** to "
+      - "`crates/harnx-runtime/src/utils/text.rs` — it keeps the head and tail "
+      - "and joins them with a middle ellipsis — plus a unit test, which passes."
 fallback_text: "(demo complete)"

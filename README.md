@@ -174,7 +174,7 @@ Harnx ships with several built-in MCP servers ready to enable in your config. Se
 
 AI Agent = Instructions (Prompt) + Tools (Function Callings) + Documents (RAG).
 
-<img width="1100" height="520" alt="Image" src="https://github.com/user-attachments/assets/81690302-fb9c-468b-b212-f06042d584ac" />
+<img width="1100" height="760" alt="Image" src="https://github.com/user-attachments/assets/a1cd8de9-b630-40d3-83d1-3ddc53a1bded" />
 
 
 ### Local LLM via llama-server
@@ -244,7 +244,19 @@ A web platform to compare different LLMs side-by-side.
 
 Harnx supports custom dark and light themes, which highlight response text and code blocks.
 
-![harnx-themes](demos/out/themes.gif)
+<p align="center">
+  <img width="49%" alt="harnx-themes Dracula (dark)" src="https://github.com/user-attachments/assets/f0755154-a406-416f-8e4f-8462ed9d0d01" />
+  <img width="49%" alt="harnx-themes Alucard (light)" src="https://github.com/user-attachments/assets/d0d91b12-ec6b-40b3-82c8-1bb83ab97d1f" />
+  <br>
+  <em>Dracula (dark) / Alucard (light)</em>
+</p>
+
+<!--
+  To re-render these GIFs (needs VHS in an environment that allows headless Chromium):
+    ./demos/render.sh themes-dark && ./demos/render.sh themes-light
+  They land in the gitignored demos/out/. Upload both to GitHub user-attachments
+  (drag-and-drop in a PR/issue) and replace the src URLs above.
+-->
 
 ## Documentation
 

@@ -31,5 +31,9 @@ name = "harnx-mock-llm"
 path = "src/bin/harnx-mock-llm/main.rs"
 
 [[bin]]
+name = "harnx-mock-mcp"
+path = "src/bin/harnx-mock-mcp/main.rs"
+
+[[bin]]
 name = "harnx-test-ratatui"
 path = "src/bin/harnx-test-ratatui.rs"
