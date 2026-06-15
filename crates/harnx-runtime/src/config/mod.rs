@@ -1,6 +1,7 @@
 pub mod agent;
 mod agent_ops_split;
 mod attachments;
+mod compaction;
 mod completion_split;
 mod env_split;
 pub mod input;
@@ -89,9 +90,6 @@ const SERVE_ADDR: &str = "127.0.0.1:8000";
 
 const SYNC_MODELS_URL: &str =
     "https://raw.githubusercontent.com/dobesv/harnx/refs/heads/main/models.yaml";
-
-const DEFAULT_COMPACT_PROMPT: &str =
-    "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.";
 
 const RAG_TEMPLATE: &str = r#"Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
 

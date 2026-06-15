@@ -460,7 +460,7 @@ impl Config {
             .compaction_agent()
             .map(str::to_owned);
 
-        let (prompt, agent_override) = if let Some(name) = compaction_agent_name {
+        let agent_override = if let Some(name) = compaction_agent_name {
             let resolved_name =
                 harnx_core::package_namespace::resolve_package_relative_name(&name, active_pkg);
             match config.read().retrieve_agent(&resolved_name) {
@@ -468,33 +468,69 @@ impl Config {
                     if let Err(e) = self::agent::resolve_variables(&mut compaction_agent) {
                         warn!("Failed to resolve variables for compaction_agent '{name}': {e}");
                     }
-                    // Keep the normal compaction prompt text so session-aware
-                    // message building still has non-empty user content, while
-                    // the agent override provides the specialized system prompt.
-                    (DEFAULT_COMPACT_PROMPT.to_string(), Some(compaction_agent))
+                    Some(compaction_agent)
                 }
                 Err(e) => {
                     warn!(
                         "Failed to load compaction_agent '{name}': {e}; falling back to default compaction"
                     );
-                    (DEFAULT_COMPACT_PROMPT.to_string(), None)
+                    None
                 }
             }
         } else {
-            (DEFAULT_COMPACT_PROMPT.to_string(), None)
+            None
         };
 
-        // Build the Input without an agent override so that with_session=true is
-        // preserved — the compaction LLM must see the full session history to
-        // summarise it.  Then swap the agent (model/params/prompt) in place
-        // without disturbing the with_session flag.
-        let mut input = crate::config::input::from_str(config, &prompt, None);
-        if let Some(compaction_agent) = agent_override {
-            crate::config::input::set_agent(&mut input, config, compaction_agent.into_config());
-        }
+        // 1. Snapshot what we need under a read lock: the transcript of the prefix
+        //    to compact, the split point, and the covered log-seq range.
+        let (transcript, split, covered, session_id) = {
+            let guard = config.read();
+            let session = guard.session.as_ref().context("No session")?;
+            let session_id = session.id.clone();
+            let model = session.model().clone();
+            let split = crate::config::compaction::split_index(
+                &session.messages,
+                &model,
+                crate::config::compaction::KEEP_RECENT_TURNS,
+                crate::config::compaction::KEEP_RECENT_TOKENS,
+            );
+            if split == 0 {
+                bail!("Nothing to compact");
+            }
+            let prefix = &session.messages[..split];
+            let transcript = crate::config::compaction::render_transcript(
+                prefix,
+                crate::config::compaction::TOOL_OUTPUT_MAX_CHARS,
+            );
+            let from = prefix.iter().filter_map(|m| m.log_seq).min();
+            let to = prefix.iter().filter_map(|m| m.log_seq).max();
+            (transcript, split, (from, to, prefix.len()), session_id)
+        };
+
+        // 2. Build a controlled summarization request: summarizer system prompt +
+        //    the transcript as the user message, WITHOUT the live session.
+        let summarizer_agent = match agent_override {
+            Some(agent) => agent.into_config(),
+            None => harnx_core::agent_config::AgentConfig::from_prompt(
+                crate::config::compaction::DEFAULT_COMPACT_SYSTEM_PROMPT,
+            ),
+        };
+        let mut input = harnx_core::input::Input::new(
+            transcript.clone(),
+            (transcript, vec![]),
+            summarizer_agent,
+        );
+        input.with_session = false;
+        input.with_agent = true;
+
         let summary = crate::config::input::fetch_chat_text(&input, config).await?;
+
+        // 3. Append a recovery note and store, keeping the recent suffix verbatim.
+        let summary_with_note = append_recovery_note(summary, covered);
         if let Some(session) = config.write().session.as_mut() {
-            crate::config::session::compress(session, summary);
+            if session.id == session_id {
+                crate::config::session::compress_keeping_recent(session, summary_with_note, split);
+            }
         }
         config.write().discontinuous_last_message();
         Ok(())
@@ -506,4 +542,18 @@ impl Config {
             .map(|v| v.compressing())
             .unwrap_or_default()
     }
+}
+
+/// Append a short recovery note describing the compacted range so a future
+/// reader knows the detail is recoverable from the on-disk log.
+fn append_recovery_note(summary: String, covered: (Option<usize>, Option<usize>, usize)) -> String {
+    let (from, to, count) = covered;
+    let range = match (from, to) {
+        (Some(a), Some(b)) => format!(" (log entries {a}–{b})"),
+        _ => String::new(),
+    };
+    format!(
+        "{summary}\n\n[Earlier conversation: {count} message(s){range} were summarized above. \
+The full pre-compaction transcript remains in this session's log on disk.]"
+    )
 }

@@ -390,10 +390,12 @@ async fn test_compact_session_default_includes_session_history() {
     );
 }
 
-/// compact_session with a compaction_agent must also send the session
-/// history — `set_agent` must not drop `with_session`.
+/// compact_session with a compaction_agent sends the conversation as a
+/// rendered transcript (a single user message), NOT the live session history:
+/// `with_session` is false, so the request carries the compaction agent's
+/// system prompt plus the transcript as the user message.
 #[tokio::test]
-async fn test_compact_session_with_compaction_agent_includes_session_history() {
+async fn test_compact_session_with_compaction_agent_sends_rendered_transcript() {
     use crate::client::TestStateGuard;
     use crate::test_utils::{MockClient, MockTurnBuilder};
     use std::io::Write as _;
@@ -455,18 +457,32 @@ async fn test_compact_session_with_compaction_agent_includes_session_history() {
     );
     let messages = &history.conversation_history[0].messages;
 
-    // The session history must be present.
-    let has_history = messages.iter().any(|m| {
-        if let MessageContent::Text(t) = &m.content {
-            t.contains("Rust ownership model")
-        } else {
-            false
-        }
-    });
+    // The conversation is forwarded as a single rendered transcript carried in
+    // a user message — not as the live session's individual role messages.
+    let user_messages: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == MessageRole::User)
+        .filter_map(|m| match &m.content {
+            MessageContent::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        user_messages.len(),
+        1,
+        "exactly one user message (the rendered transcript) is sent; messages: {messages:?}"
+    );
+    let transcript = user_messages[0];
     assert!(
-            has_history,
-            "session history must be forwarded even when a compaction_agent is configured; messages: {messages:?}"
-        );
+        transcript.contains("Rust ownership model"),
+        "the rendered transcript must include the conversation content; transcript: {transcript:?}"
+    );
+    // The transcript is the flattened, role-labeled rendering (not raw live
+    // session messages), so it carries the render_transcript role markers.
+    assert!(
+        transcript.contains("── user ──"),
+        "the user message is a rendered transcript with role labels; transcript: {transcript:?}"
+    );
 
     // The compaction agent's system prompt must also be present.
     let has_system = messages.iter().any(|m| {
