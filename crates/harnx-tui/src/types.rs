@@ -71,7 +71,13 @@ pub(super) struct App {
     pub(super) should_quit: bool,
     pub(super) llm_busy: bool,
     pub(super) scroll_state: ratatui_widget_scrolling::ScrollState,
-    pub(super) streaming_assistant_idx: Option<usize>,
+    /// True while the trailing `AssistantText` transcript item is an open
+    /// streaming run that subsequent `MessageChunk`s should be appended to.
+    /// Set false at every turn boundary (Final, Error, new prompt) so a
+    /// finalized message — or the startup banner — is never appended to.
+    /// Interleaving items (tool calls, notices, headings, …) end a run
+    /// implicitly by becoming the trailing item themselves.
+    pub(super) streaming_open: bool,
     pub(super) streamed_text_this_turn: bool,
     pub(super) cache_valid_width: Option<u16>,
     pub(super) last_ui_output_source: Option<AgentSource>,

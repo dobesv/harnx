@@ -98,7 +98,7 @@ impl Tui {
             should_quit: false,
             llm_busy: false,
             scroll_state: ratatui_widget_scrolling::ScrollState::new(),
-            streaming_assistant_idx: None,
+            streaming_open: false,
             streamed_text_this_turn: false,
             cache_valid_width: None,
             last_ui_output_source: None,

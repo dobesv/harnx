@@ -471,7 +471,9 @@ async fn streaming_chunks_accumulate_across_interleaved_ui_output() {
             _ => None,
         })
         .collect();
-    assert_eq!(assistant_entries, vec!["Hello\n", "world\n", "Again"]);
+    // A streamed run accumulates verbatim until an interleaving item (here the
+    // "tool output" notice) ends it; the next chunk starts a fresh block below.
+    assert_eq!(assistant_entries, vec!["Hello\nworld", "\nAgain"]);
     assert!(tui
         .app
         .transcript
@@ -633,9 +635,11 @@ async fn final_only_coalesces_trailing_streamed_run_after_interruption() {
             _ => None,
         })
         .collect();
+    // The pre-interruption run accumulated verbatim into one block; the notice
+    // ended it; Final coalesces only the trailing run into the canonical block.
     assert_eq!(
         assistant_entries,
-        vec!["```rust\n", "fn first() {}\n", full_block]
+        vec!["```rust\nfn first() {}\n", full_block]
     );
     assert!(transcript
         .iter()
@@ -7925,7 +7929,7 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
             timestamp: None,
         },
     ];
-    tui.app.streaming_assistant_idx = Some(1);
+    tui.app.streaming_open = true;
     tui.app.last_usage_transcript_idx = Some(2);
     tui.app.last_usage_source = Some(AgentSource {
         agent: "primary".to_string(),
@@ -8003,7 +8007,7 @@ async fn render_agent_event_compacting_completed_reconciles_live_transcript() {
                 && *to_seq == Some(2)
     ));
     assert!(tui.app.transcript[0].is_navigable());
-    assert_eq!(tui.app.streaming_assistant_idx, None);
+    assert!(!tui.app.streaming_open);
     assert_eq!(tui.app.last_usage_transcript_idx, None);
     assert_eq!(tui.app.last_usage_source, None);
     assert_eq!(tui.app.transcript_focus, None);
