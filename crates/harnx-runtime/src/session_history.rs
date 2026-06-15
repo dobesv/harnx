@@ -217,14 +217,10 @@ fn parse_query(arguments: &Value) -> HistoryQuery {
 
 /// `ToolProvider` for the session-history tool. Resolves the active session's
 /// on-disk log path from the captured config at call time (own session only).
-// `#[allow(dead_code)]`: the provider struct/impl are unused until the
-// registration task wires them into the tool-call loop. Removed in that task.
-#[allow(dead_code)]
 pub struct SessionHistoryProvider {
     config: GlobalConfig,
 }
 
-#[allow(dead_code)]
 impl SessionHistoryProvider {
     pub fn new(config: GlobalConfig) -> Self {
         Self { config }

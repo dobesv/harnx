@@ -262,6 +262,9 @@ pub fn build_tool_eval_context(
     if let Some(mcp) = mcp_manager {
         providers.push(mcp as Arc<dyn ToolProvider>);
     }
+    providers.push(Arc::new(crate::session_history::SessionHistoryProvider::new(
+        config.clone(),
+    )) as Arc<dyn ToolProvider>);
 
     let dispatch_hook_fn = build_dispatch_hook_fn(
         &hooks,

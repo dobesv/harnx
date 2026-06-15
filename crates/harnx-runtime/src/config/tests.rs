@@ -1087,6 +1087,34 @@ fn handoff_tool_declarations_are_package_aware_and_valid() {
 }
 
 #[test]
+fn session_history_tool_declaration_is_gated_by_use_tools() {
+    let config = Config::default();
+    let history_name = crate::session_history::TOOL_NAME;
+
+    let selected = config
+        .tool_declarations_for_use_tools(Some(history_name), None)
+        .0;
+    assert!(
+        selected.iter().any(|d| d.name == history_name),
+        "explicitly selecting the tool should include its declaration"
+    );
+
+    let unrelated = config
+        .tool_declarations_for_use_tools(Some("some_unrelated_tool"), None)
+        .0;
+    assert!(
+        !unrelated.iter().any(|d| d.name == history_name),
+        "an unrelated selector must not include the session-history declaration"
+    );
+
+    let wildcard = config.tool_declarations_for_use_tools(Some("*"), None).0;
+    assert!(
+        wildcard.iter().any(|d| d.name == history_name),
+        "a wildcard selector should include the session-history declaration"
+    );
+}
+
+#[test]
 fn dynamic_provider_model_init_sets_client_name_from_provider() {
     struct ProviderGuard(Option<std::ffi::OsString>);
     impl Drop for ProviderGuard {
