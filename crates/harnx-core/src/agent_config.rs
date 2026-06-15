@@ -650,7 +650,8 @@ You are a compaction agent.\n";
         assert_eq!(agent.compaction_tool_output_max_chars(), Some(500));
 
         // Absent → None.
-        let bare = AgentConfig::from_markdown("plain", "---\nmodel: openai:gpt-4o\n---\nhi\n").unwrap();
+        let bare =
+            AgentConfig::from_markdown("plain", "---\nmodel: openai:gpt-4o\n---\nhi\n").unwrap();
         assert_eq!(bare.compaction_keep_recent_turns(), None);
         assert_eq!(bare.compaction_keep_recent_tokens(), None);
         assert_eq!(bare.compaction_tool_output_max_chars(), None);
