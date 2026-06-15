@@ -1,5 +1,6 @@
 pub mod agent;
 mod agent_ops_split;
+mod attachments;
 mod completion_split;
 mod env_split;
 pub mod input;
@@ -717,6 +718,11 @@ impl Config {
         match file_ext {
             Some(ext) => {
                 let path = dir.join(format!("{name}{ext}"));
+                if kind == "session" {
+                    if let Err(err) = crate::config::attachments::remove_attachments_dir(&path) {
+                        log::warn!("failed to remove attachments for session '{name}': {err}");
+                    }
+                }
                 remove_file(&path).with_context(|| fail(&path))
             }
             None => {

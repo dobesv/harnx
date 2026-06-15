@@ -178,6 +178,9 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compressed_messages: Vec<Message>,
     pub messages: Vec<Message>,
+    /// Maps an attachment reference (`cid:<sha256>`) to the relative filename
+    /// of the blob stored under the session's `{id}.attachments/` directory.
+    /// (Historically this mapped `sha256(data_uri)` to a source file path.)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub data_urls: HashMap<String, String>,
 
