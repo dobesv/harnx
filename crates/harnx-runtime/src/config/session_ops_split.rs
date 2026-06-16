@@ -411,11 +411,20 @@ impl Config {
 
     pub fn maybe_compact_session(config: GlobalConfig) {
         let mut need_compact = false;
+        // Instrumentation for the intermittent OOM (#842), which the user has
+        // seen correlate with compaction at the end of a turn. Record the
+        // session size at trigger time and flag a re-entrant trigger (a fresh
+        // compaction starting while a previous one is still running), which
+        // would point at overlapping compaction tasks as the memory source.
+        let mut msg_count = 0usize;
+        let mut already_compacting = false;
         {
             let mut config = config.write();
             let compress_threshold = config.compress_threshold;
             if let Some(session) = config.session.as_mut() {
                 if session.need_compress(compress_threshold) {
+                    already_compacting = session.compressing();
+                    msg_count = session.messages.len();
                     session.set_compressing(true);
                     need_compact = true;
                 }
@@ -424,6 +433,14 @@ impl Config {
         if !need_compact {
             return;
         }
+        if already_compacting {
+            log::warn!(
+                "compaction: triggered while a previous compaction is still in \
+                 progress (messages={msg_count}) — overlapping compaction tasks"
+            );
+        }
+        log::info!("compaction: started (messages={msg_count})");
+        let started = std::time::Instant::now();
         // Use SessionEvent for consistent TUI/CLI handling.
         // The TUI will render CompactingStarted/CompactingCompleted as transcript items.
         harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
@@ -436,12 +453,19 @@ impl Config {
             }
             match &result {
                 Ok(()) => {
+                    log::info!(
+                        "compaction: completed in {:?} (messages_before={msg_count})",
+                        started.elapsed()
+                    );
                     harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
                         harnx_core::event::SessionEvent::CompactingCompleted,
                     ));
                 }
                 Err(err) => {
-                    warn!("Failed to compact the session: {err}");
+                    warn!(
+                        "Failed to compact the session after {:?}: {err}",
+                        started.elapsed()
+                    );
                     harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
                         harnx_core::event::SessionEvent::CompactingFailed(err.to_string()),
                     ));
