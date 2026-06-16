@@ -22,14 +22,72 @@ use harnx_runtime::config::{
 };
 use harnx_runtime::tool::ToolDeclaration;
 use harnx_runtime::utils::create_abort_signal;
+use log::warn;
 use ratatui::Terminal;
 #[cfg(test)]
 use ratatui_textarea::Input as TextInput;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
+
+/// How often the memory watchdog samples RSS. Cheap; only logs on threshold
+/// crossings.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+/// First RSS threshold (bytes) the watchdog warns at; it then doubles on each
+/// crossing. 512 MiB sits above normal sessions so quiet runs log nothing.
+const WATCHDOG_RSS_FLOOR: u64 = 512 * 1024 * 1024;
+/// Draining at least this many events from `event_rx` in a single tick is
+/// treated as a producer flooding the channel and is logged.
+const WATCHDOG_EVENT_DRAIN: usize = 2_000;
+
+/// Best-effort resident-set size of this process in bytes (Linux only).
+/// Returns `None` on other platforms or if `/proc` is unreadable. Used purely
+/// by the memory watchdog to localize the #842 OOM: if RSS climbs while the
+/// transcript stays small, the leak is outside the transcript.
+#[cfg(target_os = "linux")]
+fn process_rss_bytes() -> Option<u64> {
+    // /proc/self/statm field 2 (0-indexed 1) is resident pages. Page size is
+    // assumed 4 KiB — fine for an order-of-magnitude diagnostic.
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(resident_pages.saturating_mul(4096))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_rss_bytes() -> Option<u64> {
+    None
+}
+
+/// (item count, summed text bytes) for the transcript — a coarse proxy for how
+/// much of the process's memory lives in transcript items. Ignores cached
+/// renders and tool-call bodies; the text fields dominate.
+fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
+    let bytes = items
+        .iter()
+        .map(|item| match item {
+            TranscriptItem::SystemText(s)
+            | TranscriptItem::ErrorText(s)
+            | TranscriptItem::ThoughtText(s)
+            | TranscriptItem::StatusLine(s)
+            | TranscriptItem::UsageLine(s)
+            | TranscriptItem::AttachmentHeader(s)
+            | TranscriptItem::AttachmentItem(s)
+            | TranscriptItem::AttachmentPreviewLine(s)
+            | TranscriptItem::MutationNotice(s) => s.len(),
+            TranscriptItem::UserText { text, .. }
+            | TranscriptItem::AssistantText { text, .. }
+            | TranscriptItem::ToolResultMarkdown { text, .. } => text.len(),
+            TranscriptItem::CompactionMarker {
+                text, detail_text, ..
+            } => text.len() + detail_text.len(),
+            TranscriptItem::ToolCall { tool_name, .. } => tool_name.len(),
+            TranscriptItem::Plan(_) | TranscriptItem::SourceHeading(_) => 0,
+        })
+        .sum();
+    (items.len(), bytes)
+}
 
 impl Tui {
     #[cfg(test)]
@@ -284,6 +342,15 @@ impl Tui {
         self.install_external_editor_bridge();
         self.install_tool_confirm_bridge();
         let mut last_tick = Instant::now();
+        // Memory watchdog for the intermittent OOM (#842). Cheap in the common
+        // case: once a second we read RSS and only emit a (warn-level) line
+        // when it crosses the next doubling threshold, so normal sessions log
+        // nothing. When it does fire it records whether the growth is in the
+        // transcript / event channel (the render path) or elsewhere
+        // (compaction task, streaming buffers), which is what we can't tell
+        // from the OOM alone.
+        let mut last_watchdog = Instant::now();
+        let mut rss_warn_threshold: u64 = WATCHDOG_RSS_FLOOR;
         loop {
             // After an external editor exits, the terminal buffer is stale.
             // Clear it to force ratatui to repaint every cell from scratch.
@@ -318,8 +385,47 @@ impl Tui {
                 }
             }
 
+            let mut drained = 0usize;
             while let Ok(evt) = self.event_rx.try_recv() {
                 self.handle_tui_event(evt).await?;
+                drained += 1;
+            }
+            if drained >= WATCHDOG_EVENT_DRAIN {
+                // A single tick draining this many events means a producer is
+                // flooding the channel faster than the UI consumes it — the
+                // prime suspect for unbounded transcript growth.
+                warn!(
+                    "tui-watchdog: drained {drained} events in one tick; \
+                     event_rx_backlog={} transcript_items={} llm_busy={} compacting={}",
+                    self.event_rx.len(),
+                    self.app.transcript.len(),
+                    self.app.llm_busy,
+                    self.config.read().is_compacting_session(),
+                );
+            }
+
+            if last_watchdog.elapsed() >= WATCHDOG_INTERVAL {
+                last_watchdog = Instant::now();
+                if let Some(rss) = process_rss_bytes() {
+                    if rss >= rss_warn_threshold {
+                        let (items, text_bytes) = transcript_footprint(&self.app.transcript);
+                        warn!(
+                            "tui-watchdog: RSS={}MiB transcript_items={items} \
+                             transcript_text={}MiB event_rx_backlog={} \
+                             llm_busy={} compacting={}",
+                            rss / (1024 * 1024),
+                            text_bytes / (1024 * 1024),
+                            self.event_rx.len(),
+                            self.app.llm_busy,
+                            self.config.read().is_compacting_session(),
+                        );
+                        // Raise the bar past current RSS so we log the climb
+                        // (one line per doubling) rather than every second.
+                        while rss_warn_threshold <= rss {
+                            rss_warn_threshold = rss_warn_threshold.saturating_mul(2);
+                        }
+                    }
+                }
             }
 
             if last_tick.elapsed() >= TICK_RATE {
