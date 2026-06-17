@@ -1178,6 +1178,52 @@ async fn sub_agent_thinking_stream_coalesces_into_paragraphs_around_tool_calls()
 }
 
 #[tokio::test]
+async fn whitespace_only_thought_chunk_is_preserved_in_tui() {
+    let config = test_config();
+    let persistent = std::sync::Arc::new(tokio::sync::Mutex::new(
+        harnx_hooks::PersistentHookManager::new(),
+    ));
+    let mut tui = Tui::init(&config, harnx_hooks::AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // Send a thought chunk with only a newline
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::ThoughtChunk {
+            blocks: vec![ContentBlock::Text("\n".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(tui.app.pending_thought_text, "\n");
+}
+
+#[tokio::test]
+async fn thought_chunk_with_think_tags_is_stripped_and_dropped_if_empty() {
+    let config = test_config();
+    let persistent = std::sync::Arc::new(tokio::sync::Mutex::new(
+        harnx_hooks::PersistentHookManager::new(),
+    ));
+    let mut tui = Tui::init(&config, harnx_hooks::AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // Send a thought chunk with only <think> tags
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::ThoughtChunk {
+            blocks: vec![ContentBlock::Text("<think></think>".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    assert!(tui.app.pending_thought_text.is_empty());
+}
+
+#[tokio::test]
 async fn llm_multiline_text_renders_without_extra_blank_lines() {
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));

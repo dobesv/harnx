@@ -137,7 +137,12 @@ impl AcpNotificationClient {
         let event: Option<AgentEvent> = match args.update {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 let text = chunk_text(&chunk.content);
-                if text.trim().is_empty() {
+                // Only drop genuinely empty chunks. Whitespace-only chunks
+                // (e.g. a lone "\n" between streamed list items or paragraphs)
+                // are meaningful: stripping them concatenates adjacent chunks
+                // and corrupts the rendered markdown (see issue #862, where
+                // "1. Confirm\n2. Confirm" rendered as "1. Confirm2. Confirm").
+                if text.is_empty() {
                     None
                 } else {
                     message_text = Some(text.clone());
@@ -148,7 +153,9 @@ impl AcpNotificationClient {
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
                 let text = chunk_text(&chunk.content);
-                if text.trim().is_empty() {
+                // See AgentMessageChunk above: preserve whitespace-only chunks
+                // so streamed thoughts keep their newlines/spacing.
+                if text.is_empty() {
                     None
                 } else {
                     Some(AgentEvent::Model(ModelEvent::ThoughtChunk {
@@ -1548,5 +1555,166 @@ mod tests {
             }
             other => panic!("unexpected forwarded event: {other:?}"),
         }
+    }
+
+    /// Regression test for issue #862: whitespace-only message chunks (e.g. a
+    /// lone "\n" streamed between list items) must NOT be dropped. Dropping them
+    /// concatenated adjacent chunks, rendering "1. Confirm\n2. Confirm" as
+    /// "1. Confirm2. Confirm" in the TUI.
+    #[tokio::test]
+    async fn whitespace_only_message_chunk_is_forwarded_not_stripped() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions.clone(),
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        // Stream chunks the way an agent emits a numbered list: text, then
+        // standalone whitespace separators (newline, spaces, mixed), then more
+        // text. Every whitespace-only chunk must survive so spacing is intact.
+        let pieces = ["1. Confirm", "\n", "2. Confirm", " ", "(tab\t)", "\n \t "];
+        for piece in pieces {
+            let notification = SessionNotification::new(
+                SessionId::new("outer-session"),
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(piece.into())),
+            );
+            client.session_notification(notification).await.unwrap();
+        }
+
+        let mut received = String::new();
+        for _ in 0..pieces.len() {
+            let forwarded = chunk_rx.recv().await.expect("forwarded chunk");
+            match forwarded {
+                NestedAcpEvent::Agent(
+                    AgentEvent::Model(ModelEvent::MessageChunk { blocks }),
+                    _,
+                ) => {
+                    for b in &blocks {
+                        if let ContentBlock::Text(t) = b {
+                            received.push_str(t);
+                        }
+                    }
+                }
+                other => panic!("unexpected nested ACP event: {other:?}"),
+            }
+        }
+
+        // All whitespace (newline, spaces, tab) must be preserved verbatim so
+        // markdown renders the two list items on separate lines.
+        let expected = "1. Confirm\n2. Confirm (tab\t)\n \t ";
+        assert_eq!(received, expected);
+
+        // The accumulated response_text must also retain the whitespace.
+        let sessions = sessions.read().await;
+        let state = sessions
+            .get("outer-session")
+            .expect("session state recorded");
+        assert_eq!(state.response_text, expected);
+    }
+
+    /// Regression test for issue #862, thought-chunk path: whitespace-only
+    /// `AgentThoughtChunk`s (e.g. a lone "\n" between streamed thought lines)
+    /// must NOT be dropped, otherwise thoughts concatenate the same way.
+    #[tokio::test]
+    async fn whitespace_only_thought_chunk_is_forwarded_not_stripped() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        for piece in ["Step one", "\n", "Step two"] {
+            let notification = SessionNotification::new(
+                SessionId::new("outer-session"),
+                SessionUpdate::AgentThoughtChunk(ContentChunk::new(piece.into())),
+            );
+            client.session_notification(notification).await.unwrap();
+        }
+
+        let mut received = String::new();
+        for _ in 0..3 {
+            let forwarded = chunk_rx.recv().await.expect("forwarded thought chunk");
+            match forwarded {
+                NestedAcpEvent::Agent(
+                    AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }),
+                    _,
+                ) => {
+                    for b in &blocks {
+                        if let ContentBlock::Text(t) = b {
+                            received.push_str(t);
+                        }
+                    }
+                }
+                other => panic!("unexpected nested ACP event: {other:?}"),
+            }
+        }
+
+        assert_eq!(received, "Step one\nStep two");
+    }
+
+    /// A genuinely empty thought chunk ("") is still dropped.
+    #[tokio::test]
+    async fn empty_thought_chunk_is_dropped() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::AgentThoughtChunk(ContentChunk::new("".into())),
+        );
+        client.session_notification(notification).await.unwrap();
+
+        assert!(
+            chunk_rx.try_recv().is_err(),
+            "empty thought chunk should not be forwarded"
+        );
+    }
+
+    /// A genuinely empty chunk ("") carries no content and is still dropped.
+    #[tokio::test]
+    async fn empty_message_chunk_is_dropped() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new("".into())),
+        );
+        client.session_notification(notification).await.unwrap();
+
+        assert!(
+            chunk_rx.try_recv().is_err(),
+            "empty chunk should not be forwarded"
+        );
     }
 }
