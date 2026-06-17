@@ -4,6 +4,10 @@ stream: true
 
 # ---- behavior ----
 save_session: true
+# Number of days of inactivity after which old sessions (transcript + attachments)
+# are automatically deleted. Unset or 0 disables cleanup. Cleanup runs at startup
+# and hourly in all modes. Activity is based on filesystem mtime.
+cleanup_inactive_sessions_days: 14
 keybindings: emacs
 
 # ---- tool-use ----

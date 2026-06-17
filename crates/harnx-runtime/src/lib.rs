@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod session_cleanup;
 pub mod session_history;
 pub mod test_utils;
 pub mod tool;

@@ -21,7 +21,7 @@ use crate::config::{
     WorkingMode,
 };
 use crate::tui::{TranscriptItem, Tui};
-use harnx_core::event::AgentSource;
+use harnx_core::event::{AgentEvent, AgentSource, NoticeEvent};
 use harnx_hooks::{
     dispatch_hooks_with_count_and_manager, dispatch_hooks_with_managers, drain_async_results,
     inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
@@ -34,6 +34,9 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use parking_lot::RwLock;
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
+
+use harnx_core::sink::emit_agent_event;
+use harnx_runtime::session_cleanup::{humanize_bytes, run_cleanup, CleanupStats};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -197,6 +200,27 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         println!("{info}");
         return Ok(());
     }
+
+    // Spawn session cleanup background task if enabled.
+    // MUST run before the serve branch so cleanup runs in ALL modes (TUI, CLI, Serve).
+    // The task is best-effort and never panics; deletions are fault-tolerant.
+    let cleanup_days = config.read().cleanup_inactive_sessions_days;
+    if let Some(days) = cleanup_days {
+        if days > 0 {
+            let config_clone = Arc::clone(&config);
+            tokio::spawn(async move {
+                // tokio::time::interval fires its first tick immediately, so cleanup runs
+                // once at startup and then every hour thereafter.
+                let mut interval = tokio::time::interval(Duration::from_secs(3600));
+                loop {
+                    interval.tick().await;
+                    let stats = run_cleanup(&config_clone, days).await;
+                    emit_cleanup_summary(stats);
+                }
+            });
+        }
+    }
+
     if let Some(addr) = cli.serve {
         return serve::run(config, addr).await;
     }
@@ -1006,4 +1030,30 @@ mod resume_tests {
             "harnx -a 'my agent' -s 'my session'"
         );
     }
+}
+
+/// Emit cleanup summary if sessions were removed.
+/// In TUI/CLI mode, `emit_agent_event` buffers the event until a sink is installed,
+/// then replays it to the transcript.
+///
+/// In serve mode there is no interactive transcript sink. The event will be buffered
+/// but never delivered to a user-visible destination. For serve mode visibility,
+/// we log the summary directly using `log::info!`. This dual-path ensures the message
+/// appears in user-facing transcripts (TUI/CLI) AND in server logs (serve mode).
+fn emit_cleanup_summary(stats: CleanupStats) {
+    if stats.sessions_removed == 0 {
+        return;
+    }
+    let msg = format!(
+        "Note: cleaned up {} old sessions, {} disk freed",
+        stats.sessions_removed,
+        humanize_bytes(stats.bytes_freed)
+    );
+    // Always emit via agent event sink for TUI/CLI visibility.
+    // The function returns true if the event was delivered or buffered.
+    emit_agent_event(AgentEvent::Notice(NoticeEvent::Info(msg.clone())));
+    // Also log for serve mode visibility, since serve has no transcript sink.
+    // In TUI/CLI this creates a minor duplication (transcript + log), but the
+    // log is typically suppressed at INFO level in interactive use anyway.
+    log::info!("{msg}");
 }

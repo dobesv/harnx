@@ -55,6 +55,7 @@ pub struct ConfigData {
     pub use_tools: Option<Vec<String>>,
 
     pub save_session: Option<bool>,
+    pub cleanup_inactive_sessions_days: Option<u64>,
     pub compress_threshold: usize,
 
     pub rag_embedding_model: Option<String>,
@@ -102,6 +103,7 @@ impl Default for ConfigData {
             use_tools: None,
 
             save_session: Some(true),
+            cleanup_inactive_sessions_days: None,
             compress_threshold: 180000,
 
             rag_embedding_model: None,
