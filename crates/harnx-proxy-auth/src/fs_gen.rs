@@ -67,7 +67,9 @@ fn run_fs_script(script: &str, vars: &crate::filter::JaqVars, input: Value) -> R
         std::iter::once(Ok::<_, String>(jaq_input)),
         |value| Ok::<_, String>(Some(value)),
         |result| {
-            output = Some(result);
+            // `Exn` borrows from the filter execution; convert to an owned
+            // string before it escapes the closure.
+            output = Some(result.map_err(crate::filter::exn_to_string));
             Ok(())
         },
     )

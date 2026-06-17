@@ -8,6 +8,19 @@ use serde_json::Value;
 
 pub struct CompiledFilter(data::Filter);
 
+/// Render a jaq runtime exception as a human-readable string.
+///
+/// As of jaq-core 3.x (jaq-all 0.2), `Exn` no longer implements `Display`.
+/// Errors carry a `Display`able `Error` payload (obtained via `get_err`);
+/// other exception variants (halt/break) are internal control flow and are
+/// rendered with their `Debug` representation as a fallback.
+pub(crate) fn exn_to_string(exn: jaq_core::Exn<'_, json::Val>) -> String {
+    match exn.get_err() {
+        Ok(error) => error.to_string(),
+        Err(other) => format!("{other:?}"),
+    }
+}
+
 const SENTINEL_VAR_NAMES: [&str; 5] = [
     "fake_uuid_key",
     "fake_base64_key",
@@ -150,7 +163,9 @@ pub fn apply_filter_with_vars(
         std::iter::once(Ok::<_, String>(input)),
         |value| Ok::<_, String>(Some(value)),
         |result| {
-            output = Some(result);
+            // `Exn` borrows from the filter execution, so it cannot escape this
+            // closure. Convert any error to an owned string before storing it.
+            output = Some(result.map_err(exn_to_string));
             Ok(())
         },
     )
@@ -203,7 +218,9 @@ fn run_env_script(script: &str, vars: &JaqVars) -> Result<serde_json::Map<String
         std::iter::once(Ok::<_, String>(input)),
         |value| Ok::<_, String>(Some(value)),
         |result| {
-            output = Some(result);
+            // `Exn` borrows from the filter execution; convert to an owned
+            // string before it escapes the closure.
+            output = Some(result.map_err(exn_to_string));
             Ok(())
         },
     )
@@ -342,6 +359,45 @@ mod tests {
             .err()
             .expect("invalid filter should error");
         assert!(err.to_string().contains("compile error"));
+    }
+
+    #[test]
+    fn apply_surfaces_runtime_error_message() {
+        // A filter that compiles fine but raises a runtime error via `error/1`.
+        // This exercises the `Some(Err(error))` arm in `apply_filter_with_vars`,
+        // which renders the borrowed `jaq_core::Exn` through `exn_to_string`.
+        let vars = sentinel_vars();
+        let filter = compile_with_vars("error(\"boom\")", &vars).expect("error filter compiles");
+
+        let err = apply_filter_with_vars(&filter, request_json(), &vars)
+            .expect_err("runtime error should propagate");
+        let message = err.to_string();
+        assert!(
+            message.contains("jaq filter runtime error"),
+            "unexpected error context: {message}"
+        );
+        // The rendered Exn must carry the human-readable payload, not a Debug blob.
+        assert!(
+            message.contains("boom"),
+            "runtime error message should include the raised value: {message}"
+        );
+    }
+
+    #[test]
+    fn env_script_surfaces_runtime_error_message() {
+        // Same coverage for the env-script path in `run_env_script`.
+        let vars = sentinel_vars();
+        let err = eval_env_scripts(&["error(\"env boom\")".to_owned()], &vars)
+            .expect_err("env script runtime error should propagate");
+        let message = err.to_string();
+        assert!(
+            message.contains("jaq env script runtime error"),
+            "unexpected error context: {message}"
+        );
+        assert!(
+            message.contains("env boom"),
+            "env runtime error message should include the raised value: {message}"
+        );
     }
 
     #[test]
