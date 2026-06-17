@@ -3917,6 +3917,7 @@ dependencies = [
  "dirs",
  "duct",
  "fancy-regex 0.18.0",
+ "filetime",
  "futures-util",
  "fuzzy-matcher",
  "globset",

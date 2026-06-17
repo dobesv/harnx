@@ -31,6 +31,7 @@ pub use self::agent::{
     complete_agent_variables, list_agents, list_assistant_agents, Agent, AgentConfig,
     AgentVariables,
 };
+pub(crate) use self::attachments::attachments_dir_for;
 pub use self::input::Input;
 pub use self::patches_split::acp_server_display_name;
 pub use self::patches_split::mcp_server_display_name;
