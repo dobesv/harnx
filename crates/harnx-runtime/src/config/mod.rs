@@ -183,7 +183,7 @@ fn handoff_tool_declarations_for_agents(
                 crate::tool::JsonSchema {
                     type_value: Some("string".to_string()),
                     description: Some(
-                        "Optional target session ID. If provided, the handoff reuses that session; if omitted, the current interactive session is reused.".to_string(),
+                        "Optional target session ID selecting which session the target agent starts under. Handoff clears conversation history, so even when a session is reused its prior messages are not visible to the target agent. Do not rely on earlier context being available — pass everything the target needs in `prompt`.".to_string(),
                     ),
                     ..Default::default()
                 },
@@ -191,7 +191,7 @@ fn handoff_tool_declarations_for_agents(
             ToolDeclaration {
                 name: format!("{display_name}_session_handoff"),
                 description: format!(
-                    "Exit the current interactive agent session and hand off to the '{agent_name}' agent. Resolves the target session internally (reusing session_id when provided, otherwise the current session), then continues interaction in that agent session with the supplied prompt."
+                    "Exit the current agent session and hand off to the '{agent_name}' agent, which starts fresh. Prior conversation history is not carried over — it is intentionally cleared on handoff. Only the `prompt` argument provides context to the target agent, so include everything it needs there."
                 ),
                 parameters: crate::tool::JsonSchema {
                     type_value: Some("object".to_string()),

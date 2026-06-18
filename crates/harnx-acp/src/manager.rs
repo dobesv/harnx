@@ -237,7 +237,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
         ToolDeclaration {
             name: format!("{server_name}_session_prompt"),
             description: format!(
-                "Send a prompt to the '{server_name}' ACP agent. Auto-creates a session if session_id is not provided.  Use the session_id from a prior prompt call to continue the same conversation."
+                "Send a prompt to the '{server_name}' ACP agent. To continue a prior conversation, you must pass the session_id returned by an earlier prompt call or by session_new; the remote agent keeps context under that session_id. If you omit session_id, this starts a new empty session with no prior context."
             ),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -256,7 +256,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
                         JsonSchema {
                             type_value: Some("string".to_string()),
                             description: Some(
-                                "Session ID from a previous session_new call or a prior prompt call. If omitted, a new session is created automatically.".to_string(),
+                                "Session ID returned by a prior prompt call or by session_new. Pass it to preserve context from earlier turns; if omitted, a new empty session is created and no prior context is available.".to_string(),
                             ),
                             ..Default::default()
                         },
@@ -273,7 +273,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
         },
         ToolDeclaration {
             name: format!("{server_name}_session_load"),
-            description: format!("Load an existing session on the '{server_name}' ACP agent"),
+            description: format!("Load an existing session on the '{server_name}' ACP agent and resume its prior context"),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some({
