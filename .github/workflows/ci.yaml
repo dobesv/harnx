@@ -34,7 +34,7 @@ jobs:
       INSTA_UPDATE: "no"
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Install Rust Toolchain Components
       uses: dtolnay/rust-toolchain@stable
@@ -77,7 +77,7 @@ jobs:
     name: Lint Dockerfiles
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
