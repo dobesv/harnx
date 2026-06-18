@@ -10,7 +10,7 @@ use agent_client_protocol::schema::{
     SessionNotification, SessionUpdate, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
     WriteTextFileRequest, WriteTextFileResponse,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, PlanEntry, ToolEvent, ToolKind, ToolStatus,
 };
@@ -28,6 +28,34 @@ use tokio::task::LocalSet;
 
 /// Timeout for the initial connection handshake with the ACP server.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Session-id sentinel used for generic subprocess liveness signals that are
+/// not tied to a specific session (inbound requests, stderr output). Real ACP
+/// session IDs are never empty, so the empty string unambiguously marks a
+/// "still alive" heartbeat that resets the `session_prompt` idle timer
+/// regardless of which session is active (see issue #874).
+const LIVENESS_SENTINEL: &str = "";
+
+/// Decide whether an `activity_rx` recv result should reset the prompt idle
+/// timer.
+///
+/// Returns `true` when the event proves the subprocess is still alive:
+/// - an `Ok` whose session id matches the active prompt, OR is the generic
+///   liveness sentinel (empty string) emitted by inbound requests / stderr;
+/// - a `Lagged` error, since broadcast overflow means we missed liveness
+///   messages under heavy activity — itself proof of liveness.
+///
+/// Returns `false` for unrelated session ids and for a `Closed` channel.
+fn idle_activity_resets_timer(
+    result: &Result<String, broadcast::error::RecvError>,
+    session_id: &str,
+) -> bool {
+    match result {
+        Ok(sid) => sid == session_id || sid == LIVENESS_SENTINEL,
+        Err(broadcast::error::RecvError::Lagged(_)) => true,
+        Err(broadcast::error::RecvError::Closed) => false,
+    }
+}
 
 pub struct AcpClient {
     name: String,
@@ -257,10 +285,23 @@ impl AcpNotificationClient {
         Ok(())
     }
 
+    /// Emit a generic liveness signal that is not tied to a specific session.
+    ///
+    /// Any inbound traffic from the subprocess (requests, stderr output) proves
+    /// the remote agent is still alive even when it is not streaming
+    /// `session/update` notifications for the active prompt. We tag these with
+    /// an empty session id sentinel so the `session_prompt` idle timer can
+    /// reset on them regardless of which session is currently active (see
+    /// issue #874).
+    fn signal_liveness(&self) {
+        let _ = self.activity_tx.send(LIVENESS_SENTINEL.to_string());
+    }
+
     async fn request_permission(
         &self,
         _args: RequestPermissionRequest,
     ) -> acp::Result<RequestPermissionResponse> {
+        self.signal_liveness();
         Err(acp::Error::method_not_found())
     }
 
@@ -268,6 +309,7 @@ impl AcpNotificationClient {
         &self,
         _args: WriteTextFileRequest,
     ) -> acp::Result<WriteTextFileResponse> {
+        self.signal_liveness();
         Err(acp::Error::method_not_found())
     }
 
@@ -275,6 +317,7 @@ impl AcpNotificationClient {
         &self,
         _args: ReadTextFileRequest,
     ) -> acp::Result<ReadTextFileResponse> {
+        self.signal_liveness();
         Err(acp::Error::method_not_found())
     }
 
@@ -282,6 +325,7 @@ impl AcpNotificationClient {
         &self,
         _args: CreateTerminalRequest,
     ) -> acp::Result<CreateTerminalResponse> {
+        self.signal_liveness();
         Err(acp::Error::method_not_found())
     }
 
@@ -289,10 +333,12 @@ impl AcpNotificationClient {
         &self,
         _args: WaitForTerminalExitRequest,
     ) -> acp::Result<WaitForTerminalExitResponse> {
+        self.signal_liveness();
         Err(acp::Error::method_not_found())
     }
 
     async fn kill_terminal(&self, _args: KillTerminalRequest) -> acp::Result<KillTerminalResponse> {
+        self.signal_liveness();
         Err(acp::Error::method_not_found())
     }
 }
@@ -460,16 +506,31 @@ impl AcpClient {
                     })?;
                 }
                 _ = &mut overall_timeout => {
-                    return Err(anyhow!("ACP server '{}' timed out during session/prompt (overall timeout)", self.name));
+                    // Best-effort cancel so the subprocess stops abandoned work
+                    // (issue #874). Fire-and-forget to avoid adding latency.
+                    self.request_session_cancel_best_effort(&session_id).await;
+                    bail!("ACP server '{}' timed out during session/prompt (overall timeout)", self.name);
                 }
                 _ = &mut idle_timeout => {
-                    return Err(anyhow!("ACP server '{}' timed out during session/prompt (idle timeout)", self.name));
+                    // The remote agent may still be working (long, quiet tool
+                    // runs can exceed the idle window). Proactively cancel the
+                    // session so the subprocess stops abandoned work instead of
+                    // producing a result nobody consumes (issue #874). Cancel is
+                    // fire-and-forget so it adds no latency to surfacing the error.
+                    self.request_session_cancel_best_effort(&session_id).await;
+                    bail!(
+                        "ACP server '{}' timed out during session/prompt (idle timeout); \
+                         the remote agent may still be running",
+                        self.name
+                    );
                 }
                 result = activity_rx.recv() => {
-                    if let Ok(sid) = result {
-                        if sid == session_id {
-                            idle_timeout.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
-                        }
+                    // Reset the idle timer on any liveness signal: an update for
+                    // this session, a generic liveness sentinel from inbound
+                    // requests / subprocess stderr, or broadcast overflow
+                    // (Lagged). See `idle_activity_resets_timer` (issue #874).
+                    if idle_activity_resets_timer(&result, &session_id) {
+                        idle_timeout.as_mut().reset(tokio::time::Instant::now() + self.idle_timeout);
                     }
                 }
             }
@@ -518,6 +579,25 @@ impl AcpClient {
                     self.name
                 )
             })?
+    }
+
+    /// Fire-and-forget `session/cancel`: enqueue a cancel command for the
+    /// session without awaiting its response.
+    ///
+    /// Used by the `session_prompt` timeout branches (issue #874) so that
+    /// cancelling abandoned remote work does not add a second timeout's worth of
+    /// latency before the timeout error is surfaced to the caller. Best-effort:
+    /// failures to enqueue are ignored because we are already returning an
+    /// error.
+    async fn request_session_cancel_best_effort(&self, session_id: &str) {
+        let Ok(tx) = self.worker_sender().await else {
+            return;
+        };
+        let (respond_to, _response_rx) = oneshot::channel();
+        let _ = tx.send(WorkerCommand::CancelSession {
+            session_id: session_id.to_owned(),
+            respond_to,
+        });
     }
 
     pub async fn set_chunk_forwarder(&self, id: u64, tx: mpsc::UnboundedSender<NestedAcpEvent>) {
@@ -643,9 +723,20 @@ async fn worker_main(
 
     if let Some(stderr) = child.stderr.take() {
         let server_name = name.clone();
+        // Subprocess stderr output is a liveness signal: the remote agent is
+        // still running even if it is not streaming `session/update`
+        // notifications. Reset the prompt idle timer on it (issue #874).
+        //
+        // Note: this is line-buffered, so a subprocess that writes stderr bytes
+        // without a trailing newline for longer than the idle window will not
+        // emit a liveness signal from those bytes. Inbound ACP requests and
+        // `session/update` notifications remain the primary liveness sources;
+        // stderr is a best-effort supplement. Accepted residual risk.
+        let stderr_activity_tx = activity_tx.clone();
         tokio::task::spawn_local(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                let _ = stderr_activity_tx.send(LIVENESS_SENTINEL.to_string());
                 log::debug!("[acp:{}] {}", server_name, line);
             }
         });
@@ -1716,5 +1807,189 @@ mod tests {
             chunk_rx.try_recv().is_err(),
             "empty chunk should not be forwarded"
         );
+    }
+
+    /// Generic liveness signals (emitted by inbound requests and subprocess
+    /// stderr) are tagged with an empty session id sentinel so the
+    /// `session_prompt` idle timer resets on them regardless of which session
+    /// is active. Regression test for issue #874.
+    #[tokio::test]
+    async fn signal_liveness_emits_empty_session_id_sentinel() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (activity_tx, mut activity_rx) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        client.signal_liveness();
+
+        let sid = activity_rx
+            .try_recv()
+            .expect("liveness signal should be broadcast");
+        assert_eq!(
+            sid, "",
+            "generic liveness must use the empty session id sentinel so the idle timer resets regardless of session"
+        );
+    }
+
+    /// A `session/update` notification still emits an activity signal tagged
+    /// with its own session id, so the idle timer resets for the matching
+    /// session (existing behavior, kept alongside the #874 generic signal).
+    #[tokio::test]
+    async fn session_notification_emits_matching_session_id_activity() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (activity_tx, mut activity_rx) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions,
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new("hi".into())),
+        );
+        client.session_notification(notification).await.unwrap();
+
+        let sid = activity_rx
+            .try_recv()
+            .expect("session notification should broadcast activity");
+        assert_eq!(
+            sid, "outer-session",
+            "session notifications must be tagged with their session id"
+        );
+    }
+
+    // ---- session_prompt idle-timer decision logic (issue #874) ----
+
+    #[test]
+    fn idle_activity_resets_on_matching_session_id() {
+        let result: Result<String, broadcast::error::RecvError> = Ok("sess-1".to_string());
+        assert!(
+            idle_activity_resets_timer(&result, "sess-1"),
+            "activity for the active session must reset the idle timer"
+        );
+    }
+
+    #[test]
+    fn idle_activity_resets_on_generic_liveness_sentinel() {
+        // Empty-string sentinel = generic liveness from inbound requests/stderr.
+        let result: Result<String, broadcast::error::RecvError> = Ok(LIVENESS_SENTINEL.to_string());
+        assert!(
+            idle_activity_resets_timer(&result, "sess-1"),
+            "generic liveness sentinel must reset the idle timer regardless of active session"
+        );
+    }
+
+    #[test]
+    fn idle_activity_ignores_unrelated_session_id() {
+        let result: Result<String, broadcast::error::RecvError> = Ok("other-session".to_string());
+        assert!(
+            !idle_activity_resets_timer(&result, "sess-1"),
+            "a non-empty, non-matching session id must NOT reset the idle timer"
+        );
+    }
+
+    #[test]
+    fn idle_activity_resets_on_lagged() {
+        // Broadcast overflow under heavy activity is itself proof of liveness.
+        let result: Result<String, broadcast::error::RecvError> =
+            Err(broadcast::error::RecvError::Lagged(7));
+        assert!(
+            idle_activity_resets_timer(&result, "sess-1"),
+            "Lagged (broadcast overflow) must reset the idle timer"
+        );
+    }
+
+    #[test]
+    fn idle_activity_does_not_reset_on_closed() {
+        let result: Result<String, broadcast::error::RecvError> =
+            Err(broadcast::error::RecvError::Closed);
+        assert!(
+            !idle_activity_resets_timer(&result, "sess-1"),
+            "a closed activity channel must NOT reset the idle timer"
+        );
+    }
+
+    /// On idle timeout, `session_prompt` must send `session/cancel` for the
+    /// active session before returning the (softened) idle-timeout error, so the
+    /// remote subprocess stops abandoned work (issue #874). A short 1s idle
+    /// timeout (well under the 30s overall timeout) keeps the test fast while
+    /// still exercising the real timeout branch.
+    #[tokio::test]
+    async fn session_prompt_cancels_session_on_idle_timeout() {
+        let config = AcpServerConfig {
+            name: "mock-idle".to_string(),
+            command: "__harnx_test_nonexistent_binary__".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            enabled: true,
+            description: None,
+            idle_timeout_secs: 1,
+            operation_timeout_secs: 30,
+            package: None,
+        };
+        let client = AcpClient::new(config);
+
+        // Inject a live worker handle so `connect()` short-circuits to Ok and
+        // `session_prompt` proceeds into its select loop. Keep `dead_tx` alive
+        // so `dead_rx.try_recv()` reports Empty (worker considered alive).
+        let (tx, mut rx) = mpsc::unbounded_channel::<WorkerCommand>();
+        let (abort_tx, _abort_rx) = oneshot::channel::<()>();
+        let (dead_tx, dead_rx) = oneshot::channel::<()>();
+        let join = thread::spawn(|| {});
+        *client.worker.lock().await = Some(AcpWorkerHandle {
+            tx,
+            join,
+            abort_tx,
+            dead_rx,
+        });
+        *client.connected.write().await = true;
+
+        // The worker rx is never serviced, so no response ever arrives: the
+        // idle timer fires first. session_cancel's own response also never
+        // arrives, but its timeout is ignored by session_prompt.
+        let result = client.session_prompt(Some("sess-cancel"), "hello").await;
+
+        let err = result.expect_err("session_prompt must error on idle timeout");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("idle timeout"),
+            "expected idle-timeout error, got: {msg}"
+        );
+        assert!(
+            msg.contains("may still be running"),
+            "idle-timeout error should hint the remote may still be running, got: {msg}"
+        );
+
+        // Drain the worker command queue: it must contain the initial Prompt and
+        // a CancelSession for the active session id.
+        let mut saw_prompt = false;
+        let mut saw_cancel_for_session = false;
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                WorkerCommand::Prompt { session_id, .. } => {
+                    assert_eq!(session_id, "sess-cancel");
+                    saw_prompt = true;
+                }
+                WorkerCommand::CancelSession { session_id, .. } if session_id == "sess-cancel" => {
+                    saw_cancel_for_session = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_prompt, "expected an initial Prompt command");
+        assert!(
+            saw_cancel_for_session,
+            "expected a CancelSession command for the active session on idle timeout"
+        );
+
+        drop(dead_tx);
     }
 }
