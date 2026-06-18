@@ -178,6 +178,26 @@ pub trait Client: Sync + Send {
 
     fn model_mut(&mut self) -> &mut Model;
 
+    /// Returns true if this client expands `cid:` attachment references internally
+    /// during request build (e.g., via File API upload), rather than relying on
+    /// the runtime base64 pre-pass.
+    ///
+    /// When true:
+    /// - Runtime skips the base64 expansion pre-pass for this client
+    /// - Raw `cid:` references are preserved in message ImageUrl parts
+    /// - `ChatCompletionsData.attachments_dir` is set so the client can read blobs
+    ///
+    /// When false (default):
+    /// - Runtime base64 pre-pass expands all `cid:` refs before the client sees them
+    /// - Client receives `data:` URLs which it handles according to its protocol
+    ///
+    /// Note: Implementations must be callable through the trait object, so inherent
+    /// methods with the same signature won't be used unless the trait default is
+    /// explicitly overridden in an `impl Client for ...` block.
+    fn expands_attachments_internally(&self) -> bool {
+        false
+    }
+
     fn build_client(&self, ctx: &ClientCallContext<'_>) -> Result<ReqwestClient> {
         let mut builder = ReqwestClient::builder();
         let extra = self.extra_config();

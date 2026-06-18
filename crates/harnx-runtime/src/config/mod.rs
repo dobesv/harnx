@@ -32,6 +32,7 @@ pub use self::agent::{
     AgentVariables,
 };
 pub(crate) use self::attachments::attachments_dir_for;
+pub use self::attachments::{write_attachment, Base64Encoder};
 pub use self::input::Input;
 pub use self::patches_split::acp_server_display_name;
 pub use self::patches_split::mcp_server_display_name;
@@ -42,6 +43,10 @@ use self::session::Session;
 pub use self::session_meta::{
     build_picker_context, find_matching_session, parse_session_meta, sort_sessions_for_picker,
     PickerContext, SessionMeta,
+};
+pub use harnx_core::attachments::{
+    expand_passthrough_reference, read_attachment, AttachmentRefCache, CachedRef,
+    ExpandedAttachment, CID_PREFIX,
 };
 pub use harnx_core::last_message::LastMessage;
 #[allow(unused_imports)]

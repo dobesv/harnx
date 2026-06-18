@@ -31,6 +31,12 @@ macro_rules! register_client {
             impl $client {
                 pub const NAME: &'static str = $name;
 
+                /// Test-only constructor for integration tests.
+                /// Creates a client directly from config and model without requiring the init() path.
+                pub fn from_config_for_test(config: $config, model: $crate::Model) -> Self {
+                    Self { config, model }
+                }
+
                 pub fn init(clients: &[ClientConfig], model: &$crate::Model) -> Option<Box<dyn Client>> {
                     let config = clients.iter().find_map(|client_config| {
                         if let ClientConfig::$config(c) = client_config {

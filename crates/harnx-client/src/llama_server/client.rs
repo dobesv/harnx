@@ -368,6 +368,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: false,
+            attachments_dir: None,
         };
 
         let body = openai_build_chat_completions_body(data, &model);
@@ -458,6 +459,7 @@ mod tests {
                 result_template: None,
             }]),
             stream: false,
+            attachments_dir: None,
         };
 
         let body = openai_build_chat_completions_body(data, &model);
@@ -495,6 +497,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: true,
+                attachments_dir: None,
         };
 
         let mut body = openai_build_chat_completions_body(data, &model);

@@ -40,8 +40,13 @@ pub async fn chat_completions_with_input(
         let content = crate::config::input::echo_messages(&input, config)?;
         return Ok(ChatCompletionsOutput::new(&content));
     }
-    let data =
-        crate::config::input::prepare_completion_data(&input, config, client.model(), false)?;
+    let data = crate::config::input::prepare_completion_data(
+        &input,
+        config,
+        client.model(),
+        false,
+        client,
+    )?;
     harnx_engine::chat_completions::chat_completions_with_data(client, data, ctx).await
 }
 
@@ -61,7 +66,8 @@ pub async fn chat_completions_streaming_with_input(
         handler.done();
         return Ok(());
     }
-    let data = crate::config::input::prepare_completion_data(input, config, client.model(), true)?;
+    let data =
+        crate::config::input::prepare_completion_data(input, config, client.model(), true, client)?;
     harnx_engine::chat_completions::chat_completions_streaming_with_data(client, data, handler, ctx)
         .await
 }
@@ -133,7 +139,13 @@ pub async fn call_chat_completions(
         return Ok((content, None, vec![], usage));
     }
 
-    let data = crate::config::input::prepare_completion_data(input, config, client.model(), false)?;
+    let data = crate::config::input::prepare_completion_data(
+        input,
+        config,
+        client.model(),
+        false,
+        client,
+    )?;
 
     let engine_ret = abortable_run_with_spinner(
         harnx_engine::chat_completions::run_chat_completion(
@@ -192,7 +204,8 @@ pub async fn call_chat_completions_streaming(
         return Ok((content, None, vec![], CompletionTokenUsage::default()));
     }
 
-    let data = crate::config::input::prepare_completion_data(input, config, client.model(), true)?;
+    let data =
+        crate::config::input::prepare_completion_data(input, config, client.model(), true, client)?;
     let (tx, rx) = unbounded_channel();
     let handler = SseHandler::new(tx, abort_signal.clone());
 

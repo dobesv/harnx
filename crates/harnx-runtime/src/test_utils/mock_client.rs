@@ -319,6 +319,9 @@ pub struct MockClient {
     patch_config: Option<RequestPatches>,
     default_turn: Option<MockTurn>,
     state: RwLock<MockClientState>,
+    /// Controls whether this mock client expands attachments internally.
+    /// When true, the runtime skips the base64 pre-pass and passes raw `cid:` refs.
+    expands_attachments: bool,
 }
 
 impl MockClient {
@@ -373,6 +376,10 @@ impl Client for MockClient {
 
     fn model_mut(&mut self) -> &mut Model {
         &mut self.model
+    }
+
+    fn expands_attachments_internally(&self) -> bool {
+        self.expands_attachments
     }
 
     async fn chat_completions_inner(
@@ -432,6 +439,7 @@ pub struct MockClientBuilder {
     patch_config: Option<RequestPatches>,
     turns: Vec<MockTurn>,
     default_turn: Option<MockTurn>,
+    expands_attachments: bool,
 }
 
 impl Default for MockClientBuilder {
@@ -444,6 +452,7 @@ impl Default for MockClientBuilder {
             patch_config: None,
             turns: vec![],
             default_turn: None,
+            expands_attachments: false,
         }
     }
 }
@@ -476,6 +485,13 @@ impl MockClientBuilder {
     /// Set the request patch configuration.
     pub fn patch_config(mut self, patch_config: RequestPatches) -> Self {
         self.patch_config = Some(patch_config);
+        self
+    }
+
+    /// Set whether this mock client expands attachments internally.
+    /// When true, the runtime will skip the base64 pre-pass and pass raw `cid:` refs.
+    pub fn expands_attachments_internally(mut self, expands: bool) -> Self {
+        self.expands_attachments = expands;
         self
     }
 
@@ -539,6 +555,7 @@ impl MockClientBuilder {
             extra_config: self.extra_config,
             patch_config: self.patch_config,
             default_turn: self.default_turn,
+            expands_attachments: self.expands_attachments,
             state: RwLock::new(MockClientState {
                 turns: self.turns.into(),
                 conversation_history: vec![],
@@ -575,6 +592,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: true,
+            attachments_dir: None,
         };
         let reqwest_client = ReqwestClient::new();
         let (tx, mut rx) = unbounded_channel();
@@ -618,6 +636,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: false,
+            attachments_dir: None,
         };
 
         let first = client

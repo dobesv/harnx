@@ -13,9 +13,11 @@
 extern crate log;
 
 pub mod access_token;
+pub mod claude_upload;
 pub mod client;
 #[macro_use]
 pub mod macros;
+pub mod gemini_upload;
 pub mod model;
 pub mod stream;
 

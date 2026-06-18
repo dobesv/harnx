@@ -477,6 +477,7 @@ fn build_chat_completions_body(data: ChatCompletionsData, model: &Model) -> Resu
         top_p,
         functions,
         stream: _,
+        attachments_dir: _,  // Bedrock uses the runtime base64 pre-pass
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -1198,6 +1199,7 @@ mod tests {
                 top_p: None,
                 functions: None,
                 stream: true,
+                attachments_dir: None,
             },
             &model,
         )
@@ -1418,6 +1420,7 @@ mod tests {
                 top_p: None,
                 functions: None,
                 stream: false,
+            attachments_dir: None,
             },
             &model,
         )

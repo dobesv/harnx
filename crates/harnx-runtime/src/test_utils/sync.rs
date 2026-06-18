@@ -256,6 +256,7 @@ mod tests {
                 top_p: None,
                 functions: None,
                 stream: false,
+                attachments_dir: None,
             };
             let _ = consumer_client
                 .chat_completions_inner(&reqwest_client, data)

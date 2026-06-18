@@ -3,13 +3,15 @@ use crate::claude::*;
 use crate::openai::*;
 use crate::*;
 use harnx_core::tool::ToolCall;
+pub use crate::gemini_upload::GeminiAttachmentEncoder;
+use harnx_core::attachments::ExpandedAttachment;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Duration, Utc};
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{path::PathBuf, str::FromStr};
+use std::{path::PathBuf, str::FromStr, collections::HashMap};
 
 impl VertexAIClient {
     config_get_fn!(project_id, get_project_id);
@@ -116,9 +118,11 @@ fn prepare_chat_completions(
     };
 
     let body = match model_category {
-        ModelCategory::Gemini => gemini_build_chat_completions_body(data, &self_.model)?,
+        // Vertex AI does NOT support Gemini Files API; images must be base64-inlined.
+        // The runtime base64 pre-pass handles this (expands all cid: to data: URLs).
+        ModelCategory::Gemini => gemini_build_chat_completions_body(data, &self_.model, HashMap::new())?,
         ModelCategory::Claude => {
-            let mut body = claude_build_chat_completions_body(data, &self_.model)?;
+            let mut body = claude_build_chat_completions_body(data, &self_.model, &HashMap::new())?;
             if let Some(body_obj) = body.as_object_mut() {
                 body_obj.remove("model");
             }
@@ -352,9 +356,16 @@ fn gemini_extract_chat_completions_text(data: &Value) -> Result<ChatCompletionsO
     Ok(output)
 }
 
+/// Builds the request body for Gemini chat completions.
+/// 
+/// For Gemini native (API key auth): expands `cid:` refs to `fileData` (via pre-expansion)
+/// or `inlineData` (fallback). The caller pre-expands cid: refs and passes the map.
+///
+/// For Vertex AI: empty map is passed; runtime pre-pass already inlined all images.
 pub fn gemini_build_chat_completions_body(
     data: ChatCompletionsData,
     model: &Model,
+    expanded_attachments: HashMap<String, ExpandedAttachment>,
 ) -> Result<Value> {
     let ChatCompletionsData {
         mut messages,
@@ -362,9 +373,37 @@ pub fn gemini_build_chat_completions_body(
         top_p,
         functions,
         stream: _,
+        attachments_dir: _,  // Already used for expansion, don't need it here
     } = data;
 
+    // Use ExpandedAttachment to emit proper JSON
+    use harnx_core::attachments::CID_PREFIX;
+
     let system_message = extract_system_message(&mut messages);
+
+    let attachment_placeholder = |_url: &str| {
+        json!({
+            "text": format!(
+                "[attachment unavailable: missing expanded attachment]"
+            )
+        })
+    };
+    let attachment_part = |url: &str| {
+        if let Some(expanded) = expanded_attachments.get(url) {
+            match expanded {
+                ExpandedAttachment::RemoteRef {
+                    ref_id,
+                    mime_type,
+                    ..
+                } => json!({ "fileData": { "mimeType": mime_type, "fileUri": ref_id } }),
+                ExpandedAttachment::DataUri { data, mime_type } => {
+                    json!({ "inlineData": { "mimeType": mime_type, "data": data } })
+                }
+            }
+        } else {
+            attachment_placeholder(url)
+        }
+    };
 
     let mut network_image_urls = vec![];
     let contents: Vec<Value> = messages
@@ -386,7 +425,9 @@ pub fn gemini_build_chat_completions_body(
                             .map(|item| match item {
                                 MessageContentPart::Text { text } => json!({"text": text}),
                                 MessageContentPart::ImageUrl { image_url: ImageUrl { url } } => {
-                                    if let Some((mime_type, data)) = url.strip_prefix("data:").and_then(|v| v.split_once(";base64,")) {
+                                    if url.starts_with(CID_PREFIX) {
+                                        attachment_part(&url)
+                                    } else if let Some((mime_type, data)) = url.strip_prefix("data:").and_then(|v| v.split_once(";base64,")) {
                                         json!({ "inlineData": { "mimeType": mime_type, "data": data } })
                                     } else {
                                         network_image_urls.push(url.clone());
@@ -444,15 +485,25 @@ pub fn gemini_build_chat_completions_body(
                             image_url: ImageUrl { url },
                         } = part
                         {
-                            if let Some((mime_type, data)) =
-                                url.strip_prefix("data:").and_then(|v| v.split_once(";base64,"))
+                            if url.starts_with(CID_PREFIX)
+                                || url.strip_prefix("data:")
+                                    .and_then(|v| v.split_once(";base64,"))
+                                    .is_some()
                             {
                                 function_parts.push(
                                     json!({ "text": format!("[Tool {} returned image]", tool_result.call.name) }),
                                 );
-                                function_parts.push(json!({
-                                    "inlineData": { "mimeType": mime_type, "data": data }
-                                }));
+                                function_parts.push(if url.starts_with(CID_PREFIX) {
+                                    attachment_part(url)
+                                } else if let Some((mime_type, data)) =
+                                    url.strip_prefix("data:").and_then(|v| v.split_once(";base64,"))
+                                {
+                                    json!({
+                                        "inlineData": { "mimeType": mime_type, "data": data }
+                                    })
+                                } else {
+                                    unreachable!()
+                                });
                             }
                         }
                     }
@@ -677,8 +728,10 @@ mod tests {
                 top_p: None,
                 functions: None,
                 stream: true,
+                attachments_dir: None,
             },
             &Model::new("gemini", "gemini-2.5-pro"),
+            HashMap::new(),
         )
         .unwrap();
 
@@ -726,8 +779,10 @@ mod tests {
                 top_p: None,
                 functions: None,
                 stream: true,
+                attachments_dir: None,
             },
             &Model::new("gemini", "gemini-2.5-pro"),
+            HashMap::new(),
         )
         .unwrap();
 
@@ -887,8 +942,10 @@ mod tests {
                 top_p: None,
                 functions: None,
                 stream: true,
+                attachments_dir: None,
             },
             &model,
+            HashMap::new(),
         )
         .unwrap();
 
@@ -911,5 +968,287 @@ mod tests {
             fcall_part["thoughtSignature"], "sig_gemini_xyz",
             "thoughtSignature must be echoed verbatim alongside the functionCall"
         );
+    }
+}
+
+// Unit tests for attachment expansion emission
+#[cfg(test)]
+mod attachment_emission_tests {
+    use super::*;
+    use harnx_core::attachments::ExpandedAttachment;
+    use harnx_core::message::{
+        ImageUrl, Message, MessageContent, MessageContentPart, MessageContentToolCalls,
+        MessageRole,
+    };
+    use harnx_core::tool::{ToolCall, ToolResult};
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn gemini_body_emits_file_data_for_cached_remote_ref() {
+        // Pre-seed expanded attachments with a RemoteRef
+        let mut expanded = HashMap::new();
+        let cid = "cid:abc123".to_string();
+        let ref_id = "https://files.googleapis.com/v1/files/xyz789".to_string();
+        expanded.insert(
+            cid.clone(),
+            ExpandedAttachment::RemoteRef {
+                ref_id: ref_id.clone(),
+                mime_type: "image/png".to_string(),
+                expires_at: Some(Utc::now() + Duration::hours(48)),
+            },
+        );
+
+        // Build message referencing the cid
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: MessageContent::Array(vec![
+                MessageContentPart::Text { text: "Describe this image".to_string() },
+                MessageContentPart::ImageUrl { image_url: ImageUrl { url: cid.clone() } },
+            ]),
+            ..Default::default()
+        }];
+
+        let body = gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: Some(std::path::PathBuf::from("/tmp/attachments")),
+            },
+            &Model::new("gemini", "gemini-2.5-pro"),
+            expanded,
+        ).unwrap();
+
+        // Verify fileData emission
+        let contents = body["contents"].as_array().unwrap();
+        let user_turn = contents.iter().find(|c| c["role"] == "user").unwrap();
+        let parts = user_turn["parts"].as_array().unwrap();
+        
+        // Find the fileData part
+        let file_data_part = parts.iter().find(|p| p.get("fileData").is_some()).expect("should have fileData");
+        let file_data = file_data_part["fileData"].as_object().unwrap();
+        
+        assert_eq!(file_data["fileUri"], ref_id);
+        assert_eq!(file_data["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn gemini_body_emits_file_data_for_tool_result_cid_image() {
+        let top_level_cid = "cid:top-level".to_string();
+        let tool_cid = "cid:tool-result".to_string();
+        let ref_id = "https://files.example/tool-result";
+        let mut expanded = HashMap::new();
+        expanded.insert(
+            top_level_cid.clone(),
+            ExpandedAttachment::RemoteRef {
+                ref_id: "https://files.example/top-level".to_string(),
+                mime_type: "image/png".to_string(),
+                expires_at: None,
+            },
+        );
+        expanded.insert(
+            tool_cid.clone(),
+            ExpandedAttachment::RemoteRef {
+                ref_id: ref_id.to_string(),
+                mime_type: "image/png".to_string(),
+                expires_at: None,
+            },
+        );
+
+        let tool_call = ToolCall::new("show_image".to_string(), json!({}), None, None);
+        let mut tool_result = ToolResult::new(tool_call, json!({"status": "ok"}));
+        tool_result.content = vec![MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: tool_cid.clone(),
+            },
+        }];
+
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                    image_url: ImageUrl { url: top_level_cid },
+                }]),
+            ),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![tool_result],
+                    String::new(),
+                    None,
+                )),
+            ),
+        ];
+
+        let body = gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: Some(std::path::PathBuf::from("/tmp/attachments")),
+            },
+            &Model::new("gemini", "gemini-2.5-pro"),
+            expanded,
+        )
+        .unwrap();
+
+        let contents = body["contents"].as_array().unwrap();
+        let function_turn = contents
+            .iter()
+            .find(|c| c["role"] == "function")
+            .expect("should have function turn");
+        let parts = function_turn["parts"].as_array().unwrap();
+
+        assert!(parts.iter().any(|p| p["text"] == "[Tool show_image returned image]"));
+        let file_data = parts
+            .iter()
+            .find_map(|p| p.get("fileData"))
+            .expect("should have tool-result fileData");
+        assert_eq!(file_data["fileUri"], ref_id);
+        assert_eq!(file_data["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn gemini_body_degrades_missing_expanded_tool_result_cid_image() {
+        let cid = "cid:missing-tool-result".to_string();
+        let tool_call = ToolCall::new("show_image".to_string(), json!({}), None, None);
+        let mut tool_result = ToolResult::new(tool_call, json!({"status": "ok"}));
+        tool_result.content = vec![MessageContentPart::ImageUrl {
+            image_url: ImageUrl { url: cid.clone() },
+        }];
+
+        let body = gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages: vec![Message::new(
+                    MessageRole::Tool,
+                    MessageContent::ToolCalls(MessageContentToolCalls::new(
+                        vec![tool_result],
+                        String::new(),
+                        None,
+                    )),
+                )],
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: Some(std::path::PathBuf::from("/tmp/attachments")),
+            },
+            &Model::new("gemini", "gemini-2.5-pro"),
+            HashMap::new(),
+        )
+        .expect("missing expanded attachment should degrade, not bail");
+
+        let body_text = body.to_string();
+        assert!(!body_text.contains(&cid));
+
+        let contents = body["contents"].as_array().unwrap();
+        let function_turn = contents
+            .iter()
+            .find(|c| c["role"] == "function")
+            .expect("should have function turn");
+        let parts = function_turn["parts"].as_array().unwrap();
+        assert!(parts.iter().any(|p| p["text"] == "[Tool show_image returned image]"));
+        assert!(parts.iter().any(|p| {
+            p["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("attachment unavailable"))
+        }));
+    }
+
+    #[test]
+    fn gemini_body_degrades_missing_expanded_top_level_array_cid_image() {
+        let cid = "cid:missing-top-level".to_string();
+        let body = gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages: vec![Message::new(
+                    MessageRole::User,
+                    MessageContent::Array(vec![
+                        MessageContentPart::Text {
+                            text: "describe this".to_string(),
+                        },
+                        MessageContentPart::ImageUrl {
+                            image_url: ImageUrl { url: cid.clone() },
+                        },
+                    ]),
+                )],
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: Some(std::path::PathBuf::from("/tmp/attachments")),
+            },
+            &Model::new("gemini", "gemini-2.5-pro"),
+            HashMap::new(),
+        )
+        .expect("missing expanded top-level attachment should degrade, not bail");
+
+        let body_text = body.to_string();
+        assert!(!body_text.contains(&cid));
+
+        let contents = body["contents"].as_array().unwrap();
+        let user_turn = contents
+            .iter()
+            .find(|c| c["role"] == "user")
+            .expect("should have user turn");
+        let parts = user_turn["parts"].as_array().unwrap();
+        assert!(parts.iter().any(|p| p["text"] == "describe this"));
+        assert!(parts.iter().any(|p| {
+            p["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("attachment unavailable"))
+        }));
+    }
+
+    #[test]
+    fn gemini_body_emits_inline_data_for_data_uri_fallback() {
+        // Pre-seed expanded attachments with a DataUri (base64 fallback)
+        let mut expanded = HashMap::new();
+        let cid = "cid:deadbeef".to_string();
+        expanded.insert(
+            cid.clone(),
+            ExpandedAttachment::DataUri {
+                data: "QUJDREVGR0g=".to_string(),
+                mime_type: "image/jpeg".to_string(),
+            },
+        );
+
+        // Build message referencing the cid
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: MessageContent::Array(vec![
+                MessageContentPart::Text { text: "What's in this image?".to_string() },
+                MessageContentPart::ImageUrl { image_url: ImageUrl { url: cid.clone() } },
+            ]),
+            ..Default::default()
+        }];
+
+        let body = gemini_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: Some(std::path::PathBuf::from("/tmp/attachments")),
+            },
+            &Model::new("gemini", "gemini-2.5-pro"),
+            expanded,
+        ).unwrap();
+
+        // Verify inlineData emission
+        let contents = body["contents"].as_array().unwrap();
+        let user_turn = contents.iter().find(|c| c["role"] == "user").unwrap();
+        let parts = user_turn["parts"].as_array().unwrap();
+        
+        // Find the inlineData part
+        let inline_data_part = parts.iter().find(|p| p.get("inlineData").is_some()).expect("should have inlineData");
+        let inline_data = inline_data_part["inlineData"].as_object().unwrap();
+        
+        assert_eq!(inline_data["data"], "QUJDREVGR0g=");
+        assert_eq!(inline_data["mimeType"], "image/jpeg");
     }
 }

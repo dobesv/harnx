@@ -336,6 +336,7 @@ impl Server {
             top_p,
             functions,
             stream,
+            attachments_dir: None, // harnx-serve doesn't have session attachment dirs
         };
 
         if stream {

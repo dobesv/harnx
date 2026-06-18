@@ -325,6 +325,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         top_p,
         functions,
         stream,
+        attachments_dir: _,  // OpenAI uses the runtime base64 pre-pass
     } = data;
 
     let messages_len = messages.len();
@@ -567,6 +568,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: false,
+            attachments_dir: None,
         };
         let model = harnx_core::model::Model::new("openai", "gpt-4o");
         openai_build_chat_completions_body(data, &model)
@@ -794,6 +796,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: false,
+            attachments_dir: None,
         };
         let body = openai_build_chat_completions_body(data, &model);
         assert!(
@@ -815,6 +818,7 @@ mod tests {
             top_p: None,
             functions: None,
             stream: false,
+            attachments_dir: None,
         };
         let body = openai_build_chat_completions_body(data, &model);
         assert!(
@@ -824,6 +828,59 @@ mod tests {
         assert!(
             body.get("max_completion_tokens").is_none(),
             "should not set max_completion_tokens without a null-max_tokens patch"
+        );
+    }
+
+    #[test]
+    fn openai_remains_base64_only_for_images() {
+        let client = OpenAIClient {
+            config: harnx_core::provider_config::openai::OpenAIConfig {
+                name: "test-openai".into(),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+            model: harnx_core::model::Model::new("openai", "gpt-4o"),
+        };
+        assert!(
+            !client.expands_attachments_internally(),
+            "OpenAIClient.expands_attachments_internally() must remain false"
+        );
+
+        let data_url = "data:image/png;base64,QUJDRA==".to_string();
+        let data = ChatCompletionsData {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: data_url.clone(),
+                    },
+                }]),
+            )],
+            temperature: None,
+            top_p: None,
+            functions: None,
+            stream: false,
+            attachments_dir: None,
+        };
+
+        let request = prepare_chat_completions(&client, data).expect("request should build");
+        assert!(
+            request.url.ends_with("/chat/completions"),
+            "OpenAI request should target chat/completions"
+        );
+        assert_eq!(
+            request.body["messages"],
+            json!([
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": { "url": data_url }
+                        }
+                    ]
+                }
+            ])
         );
     }
 }
