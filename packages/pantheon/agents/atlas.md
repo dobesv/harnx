@@ -55,6 +55,7 @@ use_tools:
 - time_wait
 - time_wait_until
 - zosimus_session_prompt
+- harnx_agent_session_history_read
 description: "Plan execution orchestrator \u2014 manages plans and todos in local,\
   \ distributes tasks to Pantheon specialist agents, and shares context via plan notes.\
   \ Verifies every delegation independently. Named after Atlas (AT-lus), the Titan\

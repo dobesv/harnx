@@ -20,6 +20,7 @@ use_tools:
 - plans_list_tasks
 - plans_update_note
 - fs_rollback_file
+- harnx_agent_session_history_read
 description: "Pragmatic engineer \u2014 evaluates code review findings through the\
   \ lens of real-world production impact, blast radius, and failure modes. Named after\
   \ Aeacus (EE-uh-kus), keeper of the Underworld's records who ensured completeness.\n"

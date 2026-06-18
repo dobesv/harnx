@@ -20,6 +20,7 @@ use_tools:
 - plans_list_tasks
 - plans_update_note
 - fs_rollback_file
+- harnx_agent_session_history_read
 description: "Plan reviewer \u2014 verifies that implementation plans are executable\
   \ and that file references are valid. Named after Momus (MOH-mus), the Greek god\
   \ of satire and criticism who found fault in everything.\n"

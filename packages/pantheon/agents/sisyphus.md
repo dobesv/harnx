@@ -54,6 +54,7 @@ use_tools:
 - time_wait
 - time_wait_until
 - zosimus_session_prompt
+- harnx_agent_session_history_read
 description: "Task executor \u2014 handles tasks from users. For complex work,\
   \ creates local plans and executes them directly or delegates to Pantheon specialists.\
   \ Writes code directly in the project directory. Named after Sisyphus (SIS-ih-fus).\n"

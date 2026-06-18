@@ -18,6 +18,7 @@ use_tools:
 - plans_list_notes
 - plans_update_note
 - fs_rollback_file
+- harnx_agent_session_history_read
 description: "UI/UX and accessibility specialist — evaluates design system compliance, responsive design, WCAG accessibility, ARIA usage, keyboard navigation, and user experience patterns. Named after Erato (EH-ruh-toh), the Muse of love poetry — ensuring the UI is lovable and accessible to all.\n"
 version: '0.2.4'
 variables:

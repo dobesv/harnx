@@ -20,6 +20,7 @@ use_tools:
 - plans_list_notes
 - plans_update_note
 - fs_rollback_file
+- harnx_agent_session_history_read
 description: "Security vulnerability specialist \u2014 identifies injection risks,\
   \ authentication flaws, authorization gaps, secrets exposure, input validation issues,\
   \ and supply chain risks. Named after Melpomene (mel-POM-uh-nee), the Muse of tragedy\

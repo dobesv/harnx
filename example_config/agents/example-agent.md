@@ -12,6 +12,7 @@ use_tools:                       # Which MCP tools to allow
   - ListDirectory
   - Read
   - Write
+  - harnx_agent_session_history_read
 description: ""                  # Short description of the agent
 version: ""                      # Agent version string
 compaction_agent: example-compaction-agent  # Agent to use for context compression (uses its model/system prompt)

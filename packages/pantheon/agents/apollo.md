@@ -27,6 +27,7 @@ use_tools:
 - plans_update_note
 - plans_update_task
 - pytheas_session_prompt
+- harnx_agent_session_history_read
 description: "Creative coding and innovative solutions specialist — provides the creative spark for novel UX and 'out-of-the-box' logic. Named after Apollo (uh-POL-oh), God of the Arts.\n"
 version: '0.2.4'
 variables:

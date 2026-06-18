@@ -26,6 +26,7 @@ use_tools:
 - plans_update_note
 - plans_update_task
 - pytheas_session_prompt
+- harnx_agent_session_history_read
 description: "Complex multi-faceted strategy and execution specialist — commands the field when a high-effort task is too complex for a specialist. Named after Athena (uh-THEE-nuh), Goddess of Strategic Warfare.\n"
 version: '0.2.4'
 variables:
