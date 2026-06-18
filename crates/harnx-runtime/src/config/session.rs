@@ -1326,8 +1326,9 @@ pub fn echo_messages(session: &Session, input: &Input) -> String {
 /// back into inline `data:` URIs for transmission. Expansion is transient —
 /// it affects only the returned messages, never the stored session.
 pub fn build_messages(session: &Session, input: &Input) -> Result<Vec<Message>> {
-    let mut messages = build_messages_inner(session, input)?;
-    expand_message_attachments(session, &mut messages);
+    let messages = build_messages_inner(session, input)?;
+    // No longer call expand_message_attachments here - it's now conditional
+    // based on client capability, called from prepare_completion_data
     Ok(messages)
 }
 
@@ -1363,12 +1364,20 @@ fn expand_message(
 /// Replace `cid:` image references in outgoing messages with inline `data:`
 /// URIs (base64 backend). Walks both plain content arrays and tool-result
 /// content. No-op when the session has no attachments dir / no cid refs.
-fn expand_message_attachments(session: &Session, messages: &mut [Message]) {
+///
+/// NOTE: This function is NO LONGER called from `build_messages`. The base64
+/// pre-pass is now conditional on the client capability:
+/// - For clients with `expands_attachments_internally() == true` (Gemini native),
+///   `prepare_completion_data` skips this entirely, leaving raw `cid:` refs.
+/// - For all other providers, this is called from `prepare_completion_data` to
+///   expand `cid:` refs to base64 data: URLs before the client sees them.
+pub(crate) fn expand_message_attachments(session: &Session, messages: &mut [Message]) {
     // A `cid:` ref only ever enters a message via the externalize-on-save path,
     // which requires a session path — so no path means no refs to expand.
     let Some(path) = session.path.as_ref() else {
         return;
     };
+
     let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(path));
     let encoder = crate::config::attachments::Base64Encoder;
     for message in messages.iter_mut() {
@@ -2329,13 +2338,21 @@ results:
 
         let tmp = TempDir::new().unwrap();
         let mut session = test_session();
+        // The session needs a path for cid: refs to be persisted
         session.set_sessions_dir(tmp.path().to_path_buf());
+        let session_path = tmp
+            .path()
+            .join("test-session.yaml")
+            .to_string_lossy()
+            .to_string();
+        session.path = Some(session_path);
 
         let config = Config::default();
         let agent = config.extract_agent();
         let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
         let input = crate::config::input::from_str(&global_config, "inspect image", Some(agent));
 
+        // Start with a data: URL - will be converted to cid: when persisted
         let data_uri = "data:image/png;base64,AAAA".to_string();
         let call = ToolCall {
             name: "read".to_string(),
@@ -2363,6 +2380,8 @@ results:
         super::add_tool_calls(&mut session, &input, "reading...", None, &[call]).unwrap();
         super::add_tool_results(&mut session, &[result]).unwrap();
 
+        // build_messages no longer expands cid: refs - that's now done in
+        // prepare_completion_data based on client capability
         let messages = super::build_messages(&session, &input).unwrap();
         let tool_message = messages
             .iter()
@@ -2373,8 +2392,16 @@ results:
         };
         assert_eq!(tool_calls.tool_results.len(), 1);
         assert_eq!(tool_calls.tool_results[0].content.len(), 1);
+        // The URL will be a cid: ref since the message was persisted to disk
         match &tool_calls.tool_results[0].content[0] {
-            MessageContentPart::ImageUrl { image_url } => assert_eq!(image_url.url, data_uri),
+            MessageContentPart::ImageUrl { image_url } => {
+                // After persistence, data: URLs become cid: refs
+                assert!(
+                    image_url.url.starts_with("cid:"),
+                    "Expected cid: ref, got {}",
+                    image_url.url
+                );
+            }
             other => panic!("expected ImageUrl content part, got {other:#?}"),
         }
         assert_eq!(

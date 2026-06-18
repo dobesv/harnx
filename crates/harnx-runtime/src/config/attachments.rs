@@ -2,25 +2,18 @@
 //! session transcripts. Blobs live in a per-session `{id}.attachments/`
 //! directory and are referenced from message content as `cid:<sha256>`,
 //! keeping multi-megabyte base64 out of the transcript and out of memory at
-//! rest. The wire encoding is pluggable (`AttachmentEncoder`); only the
-//! base64 backend ships today, with provider upload-API backends to follow.
+//! rest. Runtime owns session-local blob storage and provider-specific wire
+//! encoders; shared expansion/cache scaffolding lives in `harnx-core`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use harnx_core::crypto::{base64_decode, base64_encode, sha256};
+use harnx_core::attachments::{
+    cid_for_data_url, expand_passthrough_reference, read_attachment, ExpandedAttachment, CID_PREFIX,
+};
+use harnx_core::crypto::base64_decode;
 use harnx_core::message::MessageContentPart;
-
-/// Prefix marking a content reference in `ImageUrl.url`.
-pub const CID_PREFIX: &str = "cid:";
-
-/// Compute the content id for an inline `data:` URI. The id is the SHA-256
-/// of the full data URI string (consistent with the existing `data_urls`
-/// keying), so identical blobs collapse to one id.
-pub fn cid_for_data_url(data_url: &str) -> String {
-    format!("{CID_PREFIX}{}", sha256(data_url))
-}
 
 /// Map a data URI's MIME type to a file extension. Defaults to `bin` for
 /// unrecognised types.
@@ -41,122 +34,74 @@ pub fn extension_for_data_url(data_url: &str) -> &'static str {
 /// The attachments directory for a session given its `.yaml` transcript path:
 /// `<dir>/<stem>.attachments/`.
 pub fn attachments_dir_for(session_yaml_path: &Path) -> PathBuf {
+    let parent = session_yaml_path.parent().unwrap_or_else(|| Path::new("."));
     let stem = session_yaml_path
         .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let parent = session_yaml_path.parent().unwrap_or_else(|| Path::new("."));
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
     parent.join(format!("{stem}.attachments"))
 }
 
-/// The content-addressed filename (`<sha256>.<ext>`) for an inline `data:`
-/// URI. Single source of truth shared by the writer and the `cid -> filename`
-/// map, so the recorded filename can never drift from the file on disk.
-fn attachment_filename(data_url: &str) -> String {
-    format!("{}.{}", sha256(data_url), extension_for_data_url(data_url))
+/// Parse an inline data URI into (`mime_type`, `raw_bytes`). Only `;base64,`
+/// form is supported because that's what upstream message schemas already use
+/// for image parts.
+fn parse_data_url(data_url: &str) -> Result<(&str, Vec<u8>)> {
+    let rest = data_url
+        .strip_prefix("data:")
+        .ok_or_else(|| anyhow::anyhow!("attachment must be a data: URI"))?;
+    let (mime, b64) = rest
+        .split_once(";base64,")
+        .ok_or_else(|| anyhow::anyhow!("attachment data URI must contain ;base64,"))?;
+    let bytes = base64_decode(b64).context("invalid base64 in data URI")?;
+    Ok((mime, bytes))
 }
 
-/// Split a `data:<mime>;base64,<payload>` URI into (mime, payload).
-fn split_data_url(data_url: &str) -> Option<(&str, &str)> {
-    let rest = data_url.strip_prefix("data:")?;
-    let (meta, payload) = rest.split_once(',')?;
-    let mime = meta.split(';').next().unwrap_or("");
-    Some((mime, payload))
-}
-
-/// Write the decoded bytes of an inline `data:` URI to the attachments dir as
-/// `<sha256>.<ext>` and return the `cid:<sha256>` reference. Idempotent:
-/// because the filename is the content hash, an identical blob maps to the
-/// same path. The write uses `create_new` so concurrent callers can't race on
-/// the same path — `AlreadyExists` means the (byte-identical) blob is already
-/// stored, so it is a successful no-op. Non-`data:` URLs are returned
-/// unchanged as their own reference (they are already external).
+/// Persist one inline `data:` URI into session attachment store. Returns the
+/// stable `cid:<sha256>` reference for transcript storage.
 pub fn write_attachment(dir: &Path, data_url: &str) -> Result<String> {
-    use std::io::Write;
-
-    if !data_url.starts_with("data:") {
-        return Ok(data_url.to_string());
-    }
     let cid = cid_for_data_url(data_url);
+    let (_, bytes) = parse_data_url(data_url)?;
+    let ext = extension_for_data_url(data_url);
     std::fs::create_dir_all(dir)
         .with_context(|| format!("Failed to create attachments dir {}", dir.display()))?;
-    let file_path = dir.join(attachment_filename(data_url));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&file_path)
-    {
-        Ok(mut file) => {
-            let (_mime, payload) =
-                split_data_url(data_url).ok_or_else(|| anyhow::anyhow!("malformed data URI"))?;
-            let bytes = base64_decode(payload).context("failed to decode attachment base64")?;
-            file.write_all(&bytes)
-                .with_context(|| format!("Failed to write attachment {}", file_path.display()))?;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("Failed to create attachment {}", file_path.display()));
-        }
+
+    let hash = cid.trim_start_matches(CID_PREFIX);
+    let path = dir.join(format!("{hash}.{ext}"));
+    if !path.exists() {
+        std::fs::write(&path, bytes)
+            .with_context(|| format!("Failed to write attachment {}", path.display()))?;
     }
     Ok(cid)
 }
 
-/// Produces the on-the-wire representation of a `cid:` reference for an LLM
-/// request. The base64 backend ships today; provider upload-API backends
-/// (Anthropic Files, Gemini File API, …) are a planned follow-up.
 pub trait AttachmentEncoder {
-    /// Resolve a reference (`cid:<hash>`, an inline `data:` URI, or an external
-    /// URL) into the value to send to the model.
-    fn expand(&self, dir: &Path, reference: &str) -> Result<String>;
+    /// Expand a transcript-stored image reference into provider wire form.
+    fn expand(&self, dir: &Path, reference: &str) -> Result<ExpandedAttachment>;
 }
 
-/// Re-inlines attachment bytes as a `data:` URI. Transient — the result is
-/// placed in the outgoing request only, never re-stored.
 pub struct Base64Encoder;
 
 impl AttachmentEncoder for Base64Encoder {
-    fn expand(&self, dir: &Path, reference: &str) -> Result<String> {
-        let Some(hash) = reference.strip_prefix(CID_PREFIX) else {
-            // Inline data URI or external URL — already wire-ready.
-            return Ok(reference.to_string());
-        };
-        // Find the single file whose stem matches the hash.
-        let entry = std::fs::read_dir(dir)
-            .with_context(|| format!("attachments dir missing: {}", dir.display()))?
-            .flatten()
-            .find(|e| {
-                e.path()
-                    .file_stem()
-                    .map(|s| s.to_string_lossy() == *hash)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| anyhow::anyhow!("attachment not found for {reference}"))?;
-        let path = entry.path();
-        let ext = path
-            .extension()
-            .map(|e| e.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let mime = match ext.as_str() {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "webp" => "image/webp",
-            "gif" => "image/gif",
-            _ => "application/octet-stream",
-        };
-        let bytes = std::fs::read(&path)
-            .with_context(|| format!("Failed to read attachment {}", path.display()))?;
-        Ok(format!("data:{mime};base64,{}", base64_encode(bytes)))
+    fn expand(&self, dir: &Path, reference: &str) -> Result<ExpandedAttachment> {
+        if !reference.starts_with(CID_PREFIX) {
+            return Ok(expand_passthrough_reference(reference));
+        }
+
+        let (bytes, mime_type) = read_attachment(dir, reference)?;
+        Ok(ExpandedAttachment::DataUri {
+            data: harnx_core::crypto::base64_encode(&bytes),
+            mime_type,
+        })
     }
 }
 
-/// Rewrite every inline-`data:` image part in `parts` to a `cid:` reference,
-/// writing the bytes to `dir` and recording `cid -> filename` in `map`.
-/// Parts already holding a `cid:`/external URL are left unchanged.
+/// Replace inline data-URI image parts with persisted `cid:` references and
+/// record the original filename mapping for UI/export. Non-image parts and
+/// already-externalized refs are left untouched.
 pub fn externalize_parts(
     dir: &Path,
     parts: &mut [MessageContentPart],
-    map: &mut HashMap<String, String>,
+    cid_to_filename: &mut HashMap<String, String>,
 ) -> Result<()> {
     for part in parts.iter_mut() {
         let MessageContentPart::ImageUrl { image_url } = part else {
@@ -165,16 +110,20 @@ pub fn externalize_parts(
         if !image_url.url.starts_with("data:") {
             continue;
         }
-        let filename = attachment_filename(&image_url.url);
         let cid = write_attachment(dir, &image_url.url)?;
-        map.insert(cid.clone(), filename);
+        let ext = extension_for_data_url(&image_url.url);
+        cid_to_filename.insert(
+            cid.clone(),
+            format!("{}.{}", cid.trim_start_matches(CID_PREFIX), ext),
+        );
         image_url.url = cid;
     }
     Ok(())
 }
 
-/// Replace every `cid:` image reference in `parts` with its inline `data:`
-/// URI for transmission. Used on the send path only.
+/// Expand persisted `cid:` image refs into provider wire format using
+/// attachment encoder. Missing blobs degrade to text placeholder instead of
+/// failing whole transcript load.
 pub fn expand_parts(
     encoder: &dyn AttachmentEncoder,
     dir: &Path,
@@ -188,15 +137,18 @@ pub fn expand_parts(
             continue;
         }
         match encoder.expand(dir, &image_url.url) {
-            Ok(url) => image_url.url = url,
+            Ok(ExpandedAttachment::DataUri { data, mime_type }) => {
+                image_url.url = format!("data:{mime_type};base64,{data}");
+            }
+            Ok(ExpandedAttachment::RemoteRef { ref_id, .. }) => {
+                image_url.url = ref_id;
+            }
             Err(err) => {
-                // Never send a raw `cid:` ref to the model (it would be
-                // rejected) and never fail the whole turn over one lost blob:
-                // drop the unresolvable image to a text placeholder and keep
-                // going with the rest.
-                log::warn!("dropping unresolvable attachment {}: {err}", image_url.url);
                 *part = MessageContentPart::Text {
-                    text: format!("[unavailable image attachment: {}]", image_url.url),
+                    text: format!(
+                        "[attachment unavailable: {}]",
+                        err.to_string().replace('\n', " ")
+                    ),
                 };
             }
         }
@@ -204,8 +156,8 @@ pub fn expand_parts(
     Ok(())
 }
 
-/// Remove a session's attachments directory if it exists. Safe to call when
-/// the directory was never created.
+/// Best-effort cleanup of attachment sidecar dir when session is deleted or
+/// compacted away.
 pub fn remove_attachments_dir(session_yaml_path: &Path) -> Result<()> {
     let dir = attachments_dir_for(session_yaml_path);
     match std::fs::remove_dir_all(&dir) {
@@ -222,14 +174,7 @@ pub fn remove_attachments_dir(session_yaml_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cid_is_stable_and_prefixed() {
-        let url = "data:image/png;base64,QUJD";
-        let cid = cid_for_data_url(url);
-        assert!(cid.starts_with(CID_PREFIX));
-        assert_eq!(cid, cid_for_data_url(url), "cid must be deterministic");
-    }
+    use harnx_core::message::ImageUrl;
 
     #[test]
     fn extension_is_derived_from_mime() {
@@ -255,12 +200,10 @@ mod tests {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("s.attachments");
-        // 3 bytes "ABC" base64 == "QUJD"
         let data_url = "data:image/png;base64,QUJD".to_string();
 
         let cid = write_attachment(&dir, &data_url).unwrap();
         assert!(cid.starts_with(CID_PREFIX));
-        // The file is named <sha256>.<ext> inside the dir.
         let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
         assert_eq!(entries.len(), 1, "exactly one attachment file written");
         assert!(entries[0].file_name().to_string_lossy().ends_with(".png"));
@@ -268,15 +211,51 @@ mod tests {
         let encoder = Base64Encoder;
         let restored = encoder.expand(&dir, &cid).unwrap();
         assert_eq!(
-            restored, data_url,
-            "expand reproduces the original data URI"
+            restored,
+            ExpandedAttachment::DataUri {
+                data: "QUJD".into(),
+                mime_type: "image/png".into(),
+            },
+            "expand reproduces data URI payload and MIME"
         );
 
-        // Writing the same blob again is idempotent (no duplicate file).
         let cid2 = write_attachment(&dir, &data_url).unwrap();
         assert_eq!(cid, cid2);
         let count = std::fs::read_dir(&dir).unwrap().flatten().count();
         assert_eq!(count, 1, "duplicate blob does not create a second file");
+    }
+
+    #[test]
+    fn expand_non_cid_data_url_splits_fields() {
+        let encoder = Base64Encoder;
+        let expanded = encoder
+            .expand(Path::new("."), "data:image/png;base64,QUJD")
+            .unwrap();
+
+        assert_eq!(
+            expanded,
+            ExpandedAttachment::DataUri {
+                data: "QUJD".into(),
+                mime_type: "image/png".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn expand_non_cid_remote_url_keeps_reference() {
+        let encoder = Base64Encoder;
+        let expanded = encoder
+            .expand(Path::new("."), "https://example.com/image.png")
+            .unwrap();
+
+        assert_eq!(
+            expanded,
+            ExpandedAttachment::RemoteRef {
+                ref_id: "https://example.com/image.png".into(),
+                mime_type: String::new(),
+                expires_at: None,
+            }
+        );
     }
 
     #[test]
@@ -286,20 +265,18 @@ mod tests {
         let yaml = tmp.path().join("abc.yaml");
         let dir = attachments_dir_for(&yaml);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("x.png"), b"x").unwrap();
+        std::fs::write(dir.join("foo.bin"), b"x").unwrap();
 
         remove_attachments_dir(&yaml).unwrap();
         assert!(!dir.exists());
-        // Second call is a no-op, not an error.
         remove_attachments_dir(&yaml).unwrap();
     }
 
     #[test]
     fn expand_parts_drops_unresolvable_cid() {
-        use harnx_core::message::{ImageUrl, MessageContentPart};
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("missing.attachments"); // never created
+        let dir = tmp.path().join("missing.attachments");
         let mut parts = vec![MessageContentPart::ImageUrl {
             image_url: ImageUrl {
                 url: "cid:deadbeef".into(),
@@ -315,8 +292,6 @@ mod tests {
 
     #[test]
     fn externalize_then_expand_parts_round_trips() {
-        use harnx_core::message::{ImageUrl, MessageContentPart};
-        use std::collections::HashMap;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -334,7 +309,6 @@ mod tests {
         let mut map = HashMap::new();
         externalize_parts(&dir, &mut parts, &mut map).unwrap();
 
-        // The image part now holds a cid: reference, not the base64.
         match &parts[1] {
             MessageContentPart::ImageUrl { image_url } => {
                 assert!(image_url.url.starts_with(CID_PREFIX));
@@ -345,17 +319,15 @@ mod tests {
         assert_eq!(map.len(), 1, "cid -> filename recorded");
         assert!(
             map.values().next().unwrap().ends_with(".png"),
-            "recorded filename carries the image extension"
+            "recorded filename carries image extension"
         );
 
-        // Expansion restores the data URI in-place.
         let encoder = Base64Encoder;
         expand_parts(&encoder, &dir, &mut parts).unwrap();
         match &parts[1] {
             MessageContentPart::ImageUrl { image_url } => assert_eq!(image_url.url, data_url),
             other => panic!("expected ImageUrl, got {other:#?}"),
         }
-        // Non-image parts are left untouched throughout.
         match &parts[0] {
             MessageContentPart::Text { text } => assert_eq!(text, "hi"),
             other => panic!("expected Text, got {other:#?}"),

@@ -1,10 +1,13 @@
 use crate::*;
+use crate::claude_upload::{AnthropicAttachmentEncoder, ANTHROPIC_FILES_BETA_HEADER_VALUE};
 
+use harnx_core::attachments::{collect_cid_refs, shared_attachment_cache, ExpandedAttachment, CID_PREFIX};
 use harnx_core::text::strip_think_tag;
 
 use anyhow::{bail, Context, Result};
-use reqwest::RequestBuilder;
+use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 const API_BASE: &str = "https://api.anthropic.com/v1";
 
@@ -15,39 +18,111 @@ impl ClaudeClient {
     pub const PROMPTS: [PromptAction<'static>; 1] = [("api_key", "API Key", None)];
 }
 
-impl_client_trait!(
-    ClaudeClient,
-    (
-        prepare_chat_completions,
-        claude_chat_completions,
-        claude_chat_completions_streaming
-    ),
-    (noop_prepare_embeddings, noop_embeddings),
-    (noop_prepare_rerank, noop_rerank),
-);
+#[async_trait::async_trait]
+impl Client for ClaudeClient {
+    client_common_fns!();
 
-fn prepare_chat_completions(
-    self_: &ClaudeClient,
-    data: ChatCompletionsData,
-) -> Result<RequestData> {
-    let api_key = self_.get_api_key()?;
-    let api_base = self_
-        .get_api_base()
-        .unwrap_or_else(|_| API_BASE.to_string());
-
-    let url = format!("{}/messages", api_base.trim_end_matches('/'));
-    let body = claude_build_chat_completions_body(data, &self_.model)?;
-
-    let mut request_data = RequestData::new(url, body);
-
-    request_data.header("anthropic-version", "2023-06-01");
-    if api_key.starts_with("sk-ant-oat") {
-        request_data.bearer_auth(api_key);
-    } else {
-        request_data.header("x-api-key", api_key);
+    fn expands_attachments_internally(&self) -> bool {
+        true
     }
 
-    Ok(request_data)
+    async fn chat_completions_inner(
+        &self,
+        client: &ReqwestClient,
+        data: ChatCompletionsData,
+    ) -> Result<ChatCompletionsOutput> {
+        let builder = self.prepare_and_build_request(client, data).await?;
+        claude_chat_completions(builder, &self.model).await
+    }
+
+    async fn chat_completions_streaming_inner(
+        &self,
+        client: &ReqwestClient,
+        handler: &mut SseHandler,
+        data: ChatCompletionsData,
+    ) -> Result<()> {
+        let builder = self.prepare_and_build_request(client, data).await?;
+        claude_chat_completions_streaming(builder, handler, &self.model).await
+    }
+
+    async fn embeddings_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &EmbeddingsData,
+    ) -> Result<EmbeddingsOutput> {
+        let request_data = noop_prepare_embeddings(self, data)?;
+        let builder = self.request_builder(client, request_data)?;
+        noop_embeddings(builder, self.model()).await
+    }
+
+    async fn rerank_inner(
+        &self,
+        client: &ReqwestClient,
+        data: &RerankData,
+    ) -> Result<RerankOutput> {
+        let request_data = noop_prepare_rerank(self, data)?;
+        let builder = self.request_builder(client, request_data)?;
+        noop_rerank(builder, self.model()).await
+    }
+}
+
+impl ClaudeClient {
+    async fn prepare_and_build_request(
+        &self,
+        client: &ReqwestClient,
+        data: ChatCompletionsData,
+    ) -> Result<RequestBuilder> {
+        let api_key = self.get_api_key()?;
+        let api_base = self
+            .get_api_base()
+            .unwrap_or_else(|_| API_BASE.to_string());
+
+        let expanded_attachments = if self.model.supports_vision() && data.attachments_dir.is_some() {
+            let dir = data.attachments_dir.clone().unwrap();
+            let cache = shared_attachment_cache(self.name());
+            let encoder = AnthropicAttachmentEncoder::new_with_cache(
+                client.clone(),
+                api_key.clone(),
+                api_base.clone(),
+                cache,
+            );
+            let cid_refs = collect_cid_refs(&data.messages);
+            let mut map = HashMap::new();
+            for cid in cid_refs {
+                match encoder.expand(&dir, &cid).await {
+                    Ok(expanded) => {
+                        map.insert(cid, expanded);
+                    }
+                    Err(err) => {
+                        warn!("Failed to expand Claude attachment {}: {}", cid, err);
+                    }
+                }
+            }
+            map
+        } else {
+            HashMap::new()
+        };
+
+        let uses_file_api = expanded_attachments.values().any(|attachment| {
+            matches!(attachment, ExpandedAttachment::RemoteRef { ref_id, .. } if ref_id.starts_with("file_"))
+        });
+
+        let url = format!("{}/messages", api_base.trim_end_matches('/'));
+        let body = claude_build_chat_completions_body(data, &self.model, &expanded_attachments)?;
+
+        let mut request_data = RequestData::new(url, body);
+        request_data.header("anthropic-version", "2023-06-01");
+        if uses_file_api {
+            request_data.header("anthropic-beta", ANTHROPIC_FILES_BETA_HEADER_VALUE);
+        }
+        if api_key.starts_with("sk-ant-oat") {
+            request_data.bearer_auth(api_key);
+        } else {
+            request_data.header("x-api-key", api_key);
+        }
+
+        self.request_builder(client, request_data)
+    }
 }
 
 pub async fn claude_chat_completions(
@@ -271,9 +346,61 @@ pub async fn claude_chat_completions_streaming(
     sse_stream(builder, handle).await
 }
 
+fn claude_attachment_placeholder() -> Value {
+    json!({
+        "type": "text",
+        "text": "[attachment unavailable: missing expanded attachment]",
+    })
+}
+
+fn claude_attachment_part(
+    url: &str,
+    expanded_attachments: &HashMap<String, ExpandedAttachment>,
+    network_image_urls: &mut Vec<String>,
+) -> Value {
+    if url.starts_with(CID_PREFIX) {
+        return match expanded_attachments.get(url) {
+            Some(ExpandedAttachment::RemoteRef { ref_id, .. }) => json!({
+                "type": "image",
+                "source": {
+                    "type": "file",
+                    "file_id": ref_id,
+                }
+            }),
+            Some(ExpandedAttachment::DataUri { data, mime_type }) => json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": data,
+                }
+            }),
+            None => claude_attachment_placeholder(),
+        };
+    }
+
+    if let Some((mime_type, data)) = url
+        .strip_prefix("data:")
+        .and_then(|v| v.split_once(";base64,"))
+    {
+        json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime_type,
+                "data": data,
+            }
+        })
+    } else {
+        network_image_urls.push(url.to_string());
+        json!({ "url": url })
+    }
+}
+
 pub fn claude_build_chat_completions_body(
     data: ChatCompletionsData,
     model: &Model,
+    expanded_attachments: &HashMap<String, ExpandedAttachment>,
 ) -> Result<Value> {
     let ChatCompletionsData {
         mut messages,
@@ -281,6 +408,7 @@ pub fn claude_build_chat_completions_body(
         top_p,
         functions,
         stream,
+        attachments_dir: _,  // Claude uses the runtime base64 pre-pass
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -310,24 +438,11 @@ pub fn claude_build_chat_completions_body(
                             }
                             MessageContentPart::ImageUrl {
                                 image_url: ImageUrl { url },
-                            } => {
-                                if let Some((mime_type, data)) = url
-                                    .strip_prefix("data:")
-                                    .and_then(|v| v.split_once(";base64,"))
-                                {
-                                    json!({
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": mime_type,
-                                            "data": data,
-                                        }
-                                    })
-                                } else {
-                                    network_image_urls.push(url.clone());
-                                    json!({ "url": url })
-                                }
-                            }
+                            } => claude_attachment_part(
+                                &url,
+                                expanded_attachments,
+                                &mut network_image_urls,
+                            )
                         })
                         .collect();
                     vec![json!({
@@ -381,19 +496,11 @@ pub fn claude_build_chat_completions_body(
                                     image_url: crate::ImageUrl { url },
                                 } = part
                                 {
-                                    if let Some((mime, data)) = url
-                                        .strip_prefix("data:")
-                                        .and_then(|v| v.split_once(";base64,"))
-                                    {
-                                        blocks.push(json!({
-                                            "type": "image",
-                                            "source": {
-                                                "type": "base64",
-                                                "media_type": mime,
-                                                "data": data,
-                                            }
-                                        }));
-                                    }
+                                    blocks.push(claude_attachment_part(
+                                        url,
+                                        expanded_attachments,
+                                        &mut network_image_urls,
+                                    ));
                                 }
                             }
                             json!(blocks)
@@ -552,6 +659,112 @@ mod tests {
     use super::*;
 
     #[test]
+    fn claude_array_attachment_uses_file_source_for_remote_ref() {
+        use harnx_core::message::ImageUrl;
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        let messages = vec![Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "cid:top".into(),
+                },
+            }]),
+        )];
+        let mut expanded = HashMap::new();
+        expanded.insert(
+            "cid:top".into(),
+            ExpandedAttachment::RemoteRef {
+                ref_id: "file_123".into(),
+                mime_type: "image/png".into(),
+                expires_at: None,
+            },
+        );
+
+        let body = claude_build_chat_completions_body(
+            ChatCompletionsData {
+                messages,
+                temperature: None,
+                top_p: None,
+                functions: None,
+                stream: false,
+                attachments_dir: None,
+            },
+            &model,
+            &expanded,
+        )
+        .unwrap();
+
+        assert_eq!(body["messages"][0]["content"][0]["source"]["file_id"], "file_123");
+    }
+
+    #[test]
+    fn claude_tool_result_attachment_uses_file_source_for_remote_ref() {
+        use harnx_core::message::{ImageUrl, MessageContentToolCalls};
+        use harnx_core::tool::ToolResult;
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        let tool_call = ToolCall::new("show_image".to_string(), json!({}), Some("toolu_1".into()), None);
+        let mut tool_result = ToolResult::new(tool_call, json!("output text"));
+        tool_result.content = vec![MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "cid:tool".into(),
+            },
+        }];
+        let messages = vec![
+            Message::new(MessageRole::User, MessageContent::Text("show".into())),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(MessageContentToolCalls::new(vec![tool_result], String::new(), None)),
+            ),
+        ];
+        let mut expanded = HashMap::new();
+        expanded.insert(
+            "cid:tool".into(),
+            ExpandedAttachment::RemoteRef {
+                ref_id: "file_abc".into(),
+                mime_type: "image/png".into(),
+                expires_at: None,
+            },
+        );
+        let body = claude_build_chat_completions_body(ChatCompletionsData { messages, temperature: None, top_p: None, functions: None, stream: false, attachments_dir: None }, &model, &expanded).unwrap();
+        let user_msg = body["messages"].as_array().unwrap().iter().find(|m| m["role"] == "user" && m["content"].as_array().is_some_and(|c| !c.is_empty() && c[0].get("type").is_some_and(|t| t == "tool_result"))).unwrap();
+        assert_eq!(user_msg["content"][0]["content"][1]["source"]["file_id"], "file_abc");
+    }
+
+    #[test]
+    fn claude_attachment_uses_base64_source_for_data_uri() {
+        use harnx_core::message::ImageUrl;
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        let messages = vec![Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "cid:data".into(),
+                },
+            }]),
+        )];
+        let mut expanded = HashMap::new();
+        expanded.insert("cid:data".into(), ExpandedAttachment::DataUri { data: "QUJD".into(), mime_type: "image/png".into() });
+        let body = claude_build_chat_completions_body(ChatCompletionsData { messages, temperature: None, top_p: None, functions: None, stream: false, attachments_dir: None }, &model, &expanded).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["source"]["type"], "base64");
+    }
+
+    #[test]
+    fn claude_missing_cid_degrades_to_placeholder() {
+        use harnx_core::message::ImageUrl;
+        let model = Model::new("claude", "claude-3-5-sonnet");
+        let messages = vec![Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![MessageContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "cid:missing".into(),
+                },
+            }]),
+        )];
+        let body = claude_build_chat_completions_body(ChatCompletionsData { messages, temperature: None, top_p: None, functions: None, stream: false, attachments_dir: None }, &model, &HashMap::new()).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["text"], "[attachment unavailable: missing expanded attachment]");
+    }
+
+    #[test]
     fn deserialize_system_prompt_prefix_array() {
         let yaml = r#"
 system_prompt_prefix:
@@ -666,9 +879,10 @@ system_prompt_prefix:
             top_p: None,
             functions: None,
             stream: false,
+            attachments_dir: None,
         };
 
-        let body = claude_build_chat_completions_body(data, &model).unwrap();
+        let body = claude_build_chat_completions_body(data, &model, &HashMap::new()).unwrap();
         let msgs = body["messages"].as_array().expect("messages array");
 
         // Find the assistant turn — it follows the user message in the array.
@@ -871,8 +1085,10 @@ system_prompt_prefix:
                 top_p: None,
                 functions: None,
                 stream: true,
+                attachments_dir: None,
             },
             &model,
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -1097,9 +1313,10 @@ system_prompt_prefix:
             top_p: None,
             functions: None,
             stream: false,
+            attachments_dir: None,
         };
 
-        let body = claude_build_chat_completions_body(data, &model).unwrap();
+        let body = claude_build_chat_completions_body(data, &model, &HashMap::new()).unwrap();
 
         let system = body["system"].as_array().expect("system should be an array");
         assert_eq!(system.len(), 3);
@@ -1270,8 +1487,10 @@ system_prompt_prefix:
                 top_p: None,
                 functions: None,
                 stream: false,
+            attachments_dir: None,
             },
             &model,
+            &HashMap::new(),
         )
         .unwrap();
 
@@ -1340,8 +1559,10 @@ system_prompt_prefix:
                 top_p: None,
                 functions: None,
                 stream: false,
+            attachments_dir: None,
             },
             &model,
+            &HashMap::new(),
         )
         .unwrap();
 

@@ -6,6 +6,7 @@
 pub mod abort;
 pub mod agent_config;
 pub mod api_types;
+pub mod attachments;
 pub mod cli;
 pub mod config_data;
 pub mod config_paths;

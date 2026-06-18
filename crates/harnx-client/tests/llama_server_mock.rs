@@ -65,6 +65,7 @@ async fn llama_server_mock_e2e_lifecycle() -> Result<()> {
                 top_p: None,
                 functions: None,
                 stream: false,
+                attachments_dir: None,
             },
         )
         .await?;
@@ -80,6 +81,7 @@ async fn llama_server_mock_e2e_lifecycle() -> Result<()> {
             top_p: None,
             functions: None,
             stream: true,
+            attachments_dir: None,
         },
     )
     .await?;
@@ -98,6 +100,7 @@ async fn llama_server_mock_e2e_lifecycle() -> Result<()> {
                 top_p: None,
                 functions: Some(vec![tool_declaration()]),
                 stream: false,
+                attachments_dir: None,
             },
         )
         .await?;
@@ -215,6 +218,7 @@ async fn llama_server_mock_multi_model_distinct_processes() -> Result<()> {
                 top_p: None,
                 functions: None,
                 stream: false,
+                attachments_dir: None,
             },
         )
         .await?;
@@ -230,6 +234,7 @@ async fn llama_server_mock_multi_model_distinct_processes() -> Result<()> {
                 top_p: None,
                 functions: None,
                 stream: false,
+                attachments_dir: None,
             },
         )
         .await?;
@@ -316,6 +321,7 @@ async fn llama_server_mock_hf_repo_only() -> Result<()> {
                 top_p: None,
                 functions: None,
                 stream: false,
+                attachments_dir: None,
             },
         )
         .await?;
@@ -375,6 +381,7 @@ async fn llama_server_mock_name_as_hf_repo() -> Result<()> {
                 top_p: None,
                 functions: None,
                 stream: false,
+                attachments_dir: None,
             },
         )
         .await?;

@@ -25,6 +25,11 @@ pub struct ChatCompletionsData {
     pub top_p: Option<f64>,
     pub functions: Option<Vec<ToolDeclaration>>,
     pub stream: bool,
+    /// Attachments directory for providers that expand attachments internally.
+    /// When set, `cid:` references in ImageUrl parts remain raw (not pre-expanded to base64)
+    /// and the provider client reads blobs from this directory during request build.
+    /// `None` means either no session (one-shot) or runtime pre-pass already inlined images.
+    pub attachments_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
