@@ -44,15 +44,43 @@ pub fn setup_logger(is_server: bool) -> Result<()> {
         ))
         .set_thread_level(LevelFilter::Off)
         .build();
+    let log_target = match &log_path {
+        Some(p) => p.display().to_string(),
+        None => "stderr".to_string(),
+    };
     match log_path {
         None => {
             SimpleLogger::init(log_level, config)?;
         }
         Some(log_path) => {
             ensure_parent_exists(&log_path)?;
-            let log_file = std::fs::File::create(log_path)?;
+            // Open in append mode (not truncate). Several harnx processes — the
+            // interactive binary plus every `harnx-acp-server` sub-agent it
+            // spawns — inherit the same `HARNX_LOG_PATH` and write to one file.
+            // `File::create` gives each process an independent offset starting
+            // at 0, so they clobber each other and the kernel zero-fills the
+            // gaps, producing the giant NUL runs in #880. `O_APPEND` makes every
+            // write land atomically at EOF, so concurrent writers interleave
+            // cleanly at line granularity instead. The file is no longer
+            // truncated per run; rotate or delete it yourself when it grows.
+            let log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)?;
             WriteLogger::init(log_level, config, log_file)?;
         }
     }
+    // Stamp every process's startup so a shared log can be attributed per-PID
+    // and so the running build is verifiable (which mattered when debugging the
+    // #842 OOM: a log with no watchdog lines could mean an old binary). Emitted
+    // after init so it lands in the log itself.
+    log::info!(
+        "harnx start: v{} build={} pid={} level={} log={}",
+        env!("CARGO_PKG_VERSION"),
+        env!("HARNX_BUILD_SHA"),
+        std::process::id(),
+        log_level,
+        log_target,
+    );
     Ok(())
 }
