@@ -2946,6 +2946,88 @@ async fn test_streaming_error_shows_full_cause_chain_in_transcript() {
     );
 }
 
+/// Regression test for issue #199: a pending (queued) message must NOT be
+/// auto-replayed when a ModelEvent::Error arrives. Auto-replaying the same
+/// input that just failed would loop forever for persistent failures. Instead
+/// the pending message is restored as an editable draft and the user is told to
+/// press Enter to retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pending_message_not_replayed_on_error() {
+    let config = test_config_with_mock_client_and_agent(
+        "test-agent",
+        Some("pending-replay-on-error-session"),
+    );
+    let mut harness = TuiTestHarness::with_config(config).await;
+    harness.tui().clear_transcript();
+
+    // Simulate a message queued mid-prompt, with a non-default paste_count so we
+    // can confirm the full draft state (not just text) is restored on error.
+    harness.tui().app.llm_busy = true;
+    harness.tui().app.paste_count = 3;
+    harness
+        .tui()
+        .queue_pending_message("retry me".to_string())
+        .await;
+    assert!(
+        harness.tui().app.pending_message.is_some(),
+        "precondition: a pending message should be queued"
+    );
+    // queue_pending_message snapshots paste_count into the pending message; reset
+    // the live value so the assertion below proves it was restored, not leftover.
+    harness.tui().app.paste_count = 0;
+
+    // Deliver an error for the in-flight prompt.
+    harness
+        .tui()
+        .event_tx
+        .send(TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::Error("boom".to_string())),
+            None,
+        ))
+        .unwrap();
+    harness.drain_and_settle().await.unwrap();
+
+    // The pending message must be cleared (not auto-replayed) and its shared
+    // copy must be cleared too, so it can't leak into a later task.
+    assert!(
+        harness.tui().app.pending_message.is_none(),
+        "pending message should be cleared after error, not auto-replayed"
+    );
+    assert!(
+        harness.tui().shared_pending_message.lock().await.is_none(),
+        "shared pending message should be cleared after error"
+    );
+
+    // The LLM-busy flag must be reset so the UI is unblocked for the retry.
+    assert!(
+        !harness.tui().app.llm_busy,
+        "llm_busy should be reset to false after error"
+    );
+
+    // The queued text is restored as an editable draft for the user.
+    assert_eq!(
+        harness.tui().app.input.lines().join("\n"),
+        "retry me",
+        "queued text should be restored to the input as a draft"
+    );
+
+    // Full draft state (not just text) is restored, e.g. paste_count.
+    assert_eq!(
+        harness.tui().app.paste_count,
+        3,
+        "paste_count should be restored from the pending message"
+    );
+
+    // A system notice instructs the user to press Enter to retry.
+    let has_retry_notice = harness.tui().app.transcript.iter().any(|entry| {
+        matches!(entry, TranscriptItem::SystemText(text) if text.contains("Press Enter to retry"))
+    });
+    assert!(
+        has_retry_notice,
+        "transcript should contain a 'Press Enter to retry' notice after error"
+    );
+}
+
 /// Test cancellation during tool call execution.
 /// When user presses Ctrl+C while a tool is executing, the tool should be aborted.
 #[tokio::test(flavor = "multi_thread")]
