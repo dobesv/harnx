@@ -13,6 +13,14 @@ use harnx_runtime::config::{load_env_file, Config, WorkingMode};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+/// Heap-usage guard: aborts with a backtrace if live heap exceeds
+/// `HARNX_HEAP_LIMIT_MB` (default 4 GiB). Sub-agents spawned in a pantheon
+/// session run as these processes, so they get the same #842 protection as the
+/// main binary. The backtrace goes to stderr + the log file, never stdout, so
+/// the ACP JSON-RPC stream is unaffected.
+#[global_allocator]
+static GLOBAL_ALLOC: harnx_core::alloc_guard::HeapGuard = harnx_core::alloc_guard::HeapGuard;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "harnx ACP agent server (stdio)", long_about = None)]
 struct Cli {
@@ -35,6 +43,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     setup_logger(true)?;
+    harnx_core::alloc_guard::init_from_env();
 
     let config = Arc::new(RwLock::new(
         Config::init(
