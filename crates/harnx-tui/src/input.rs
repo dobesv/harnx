@@ -1128,17 +1128,23 @@ impl Tui {
                 self.app.streamed_text_this_turn = false;
                 self.app.last_ui_output_source = None;
                 self.app.transcript.push(TranscriptItem::ErrorText(err));
+
+                // Do NOT auto-replay the pending message on error. Replaying the
+                // exact input that just failed would loop forever for persistent
+                // failures (invalid input, repeated network errors). Instead,
+                // restore it as an editable draft so the user can review/edit and
+                // resubmit it with Enter, breaking the retry loop (issue #199).
+                if let Some(pending) = self.app.pending_message.take() {
+                    self.set_input_text(&pending.text);
+                    self.app.attachments = pending.attachments;
+                    self.app.attachment_dir = pending.attachment_dir;
+                    self.app.paste_count = pending.paste_count;
+                    self.app.transcript.push(TranscriptItem::SystemText(
+                        "Queued message not sent due to error. Press Enter to retry.".to_string(),
+                    ));
+                }
                 self.pin_transcript_to_bottom();
                 self.refresh_input_chrome();
-
-                if let Some(pending) = self.app.pending_message.take() {
-                    if let Err(err) = self.submit_pending_message(pending).await {
-                        self.app
-                            .transcript
-                            .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
-                        self.pin_transcript_to_bottom();
-                    }
-                }
                 vec![]
             }
             AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
