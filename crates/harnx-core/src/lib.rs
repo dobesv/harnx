@@ -5,6 +5,7 @@
 
 pub mod abort;
 pub mod agent_config;
+pub mod alloc_guard;
 pub mod api_types;
 pub mod attachments;
 pub mod cli;

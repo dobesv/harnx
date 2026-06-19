@@ -6,6 +6,13 @@ mod serve;
 #[macro_use]
 extern crate log;
 
+/// Heap-usage guard installed as the process allocator: aborts with a backtrace
+/// if live heap exceeds `HARNX_HEAP_LIMIT_MB`. Disarmed (plain passthrough to
+/// the system allocator) when that env var is unset. Diagnostic for the #842
+/// runaway-allocation OOM.
+#[global_allocator]
+static GLOBAL_ALLOC: harnx_core::alloc_guard::HeapGuard = harnx_core::alloc_guard::HeapGuard;
+
 #[cfg(test)]
 pub mod test_utils;
 
@@ -59,6 +66,7 @@ async fn main() -> Result<()> {
         || cli.list_macros
         || cli.list_sessions;
     setup_logger(working_mode.is_serve())?;
+    harnx_core::alloc_guard::init_from_env();
     let config = Arc::new(RwLock::new(
         Config::init(working_mode, info_flag, cli.mcp_root.clone()).await?,
     ));
