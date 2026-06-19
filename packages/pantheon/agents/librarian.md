@@ -8,6 +8,7 @@ use_tools:
 - exa_web_search_exa
 - fetch_fetch_markdown
 - grep_grep_query
+- harnx_agent_session_history_read
 description: "External knowledge researcher \u2014 searches the web, library documentation,\
   \ and public GitHub repositories to find best practices, patterns, API references,\
   \ and solutions to technical questions.\n"

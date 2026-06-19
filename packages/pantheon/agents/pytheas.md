@@ -21,6 +21,7 @@ use_tools:
 - plans_list_tasks
 - plans_update_note
 - fs_rollback_file
+- harnx_agent_session_history_read
 description: "Reconnaissance and research agent — explores codebases, fetches GitHub PR/issue context (Jira and GitHub Issues), and caches findings as plan notes for other agents. Performs fast code analysis using ripgrep, ast-grep, and file inspection. Named after Pytheas (pih-THEE-us) of Massalia, the Greek explorer who sailed beyond the known world.\n"
 version: '0.2.4'
 variables:

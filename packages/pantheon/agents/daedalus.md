@@ -25,6 +25,7 @@ use_tools:
 - plans_update_task
 - pytheas_session_prompt
 - zosimus_session_prompt
+- harnx_agent_session_history_read
 description: "Strategic planner \u2014 interviews users, delegates pre-analysis to\
   \ Metis, research to Explore/Librarian/Oracle, produces plans reviewed by Momus,\
   \ then hands off to Atlas for execution. Named after Daedalus (DED-uh-lus), the\

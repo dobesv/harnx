@@ -46,6 +46,7 @@ use_tools:
   - time_get_current_time
   - time_wait
   - time_wait_until
+  - harnx_agent_session_history_read
 description: >
   Full-stack coding assistant — reads code, writes code, runs tests, searches
   the web for docs, and manages local plans to track multi-step tasks.

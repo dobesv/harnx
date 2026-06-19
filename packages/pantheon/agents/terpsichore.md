@@ -18,6 +18,7 @@ use_tools:
 - plans_list_notes
 - plans_update_note
 - fs_rollback_file
+- harnx_agent_session_history_read
 description: "Refactoring and completeness specialist — identifies missed simplification opportunities, partial fixes, incomplete implementations, and unaddressed edge cases. Named after Terpsichore (turp-SIK-uh-ree), the Muse of dance — ensuring code moves elegantly.\n"
 version: '0.2.4'
 variables:

@@ -18,6 +18,7 @@ use_tools:
 - plans_list_notes
 - plans_update_note
 - fs_rollback_file
+- harnx_agent_session_history_read
 description: "Reliability specialist \u2014 reviews error handling, retry logic, circuit\
   \ breakers, timeouts, health checks, graceful degradation, and async handler safety.\
   \ Named after Nemesis (NEM-uh-sis), goddess of retribution who ensures hubris does\

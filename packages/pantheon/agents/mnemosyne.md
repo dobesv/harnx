@@ -23,6 +23,7 @@ use_tools:
 - plans_list_notes
 - plans_update_note
 - time_get_current_time
+- harnx_agent_session_history_read
 description: "Knowledge compounding specialist \u2014 captures learnings, decisions,\
   \ and solutions from completed tasks into structured docs/solutions/ entries for\
   \ future reference. Named after Mnemosyne (neh-MOZ-ih-nee), Titan of Memory and\

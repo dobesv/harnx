@@ -26,6 +26,7 @@ use_tools:
 - plans_update_note
 - plans_update_task
 - pytheas_session_prompt
+- harnx_agent_session_history_read
 description: "Quick tasks and minor bugs specialist — handles the small, fast, 'blink-and-you-miss-it' fixes with rapid turnaround. Named after Hermes (HER-meez), the Winged Messenger.\n"
 version: '0.2.4'
 variables:

@@ -20,6 +20,7 @@ use_tools:
 - plans_update_note
 - pytheas_session_prompt
 - fs_rollback_file
+- harnx_agent_session_history_read
 description: "Architecture and big picture specialist \u2014 evaluates cross-cutting\
   \ concerns, dependency direction, design pattern adherence, API contract consistency,\
   \ and system-wide impact. Named after Urania (yoo-RAY-nee-uh), the Muse of astronomy\

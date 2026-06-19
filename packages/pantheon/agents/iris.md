@@ -26,6 +26,7 @@ use_tools:
 - plans_update_note
 - plans_update_task
 - pytheas_session_prompt
+- harnx_agent_session_history_read
 description: "Visual engineering, frontend, and UI/UX specialist — bridges the gap between the invisible code and the visible UI. Named after Iris (EYE-ris), Goddess of the Rainbow.\n"
 version: '0.2.4'
 variables:
