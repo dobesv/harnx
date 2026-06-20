@@ -623,7 +623,7 @@ mod tests {
             env: HashMap::new(),
             enabled: true,
             description: None,
-            idle_timeout_secs: 300,
+            idle_timeout_secs: 600,
             operation_timeout_secs: 3600,
             package: None,
         }
@@ -671,7 +671,7 @@ command: agent
         assert!(config.env.is_empty());
         assert!(config.enabled);
         assert!(config.description.is_none());
-        assert_eq!(config.idle_timeout_secs, 300);
+        assert_eq!(config.idle_timeout_secs, 600);
         assert_eq!(config.operation_timeout_secs, 3600);
     }
 

@@ -8,6 +8,9 @@ use serde_json::Value;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 120;
+
 #[allow(unused_imports)]
 pub use harnx_core::api_types::{
     ChatCompletionsData, ChatCompletionsOutput, CompletionTokenUsage, EmbeddingsData,
@@ -166,6 +169,11 @@ fn set_proxy(mut builder: reqwest::ClientBuilder, proxy: &str) -> Result<reqwest
     Ok(builder)
 }
 
+fn resolve_timeout_secs(configured: Option<u64>, default: u64) -> u64 {
+    // reqwest treats 0 as infinite timeout; coerce it back to default so protections stay on.
+    configured.filter(|&secs| secs > 0).unwrap_or(default)
+}
+
 #[async_trait::async_trait]
 pub trait Client: Sync + Send {
     fn extra_config(&self) -> Option<&ExtraConfig>;
@@ -201,7 +209,14 @@ pub trait Client: Sync + Send {
     fn build_client(&self, ctx: &ClientCallContext<'_>) -> Result<ReqwestClient> {
         let mut builder = ReqwestClient::builder();
         let extra = self.extra_config();
-        let timeout = extra.and_then(|v| v.connect_timeout).unwrap_or(10);
+        let connect_timeout = resolve_timeout_secs(
+            extra.and_then(|v| v.connect_timeout),
+            DEFAULT_CONNECT_TIMEOUT_SECS,
+        );
+        let read_timeout = resolve_timeout_secs(
+            extra.and_then(|v| v.read_timeout),
+            DEFAULT_READ_TIMEOUT_SECS,
+        );
         if let Some(proxy) = extra.and_then(|v| v.proxy.as_deref()) {
             builder = set_proxy(builder, proxy)?;
         }
@@ -235,7 +250,8 @@ pub trait Client: Sync + Send {
             warn!("'client_key' is set but 'client_cert' is missing; mTLS identity will not be configured");
         }
         let client = builder
-            .connect_timeout(Duration::from_secs(timeout))
+            .connect_timeout(Duration::from_secs(connect_timeout))
+            .read_timeout(Duration::from_secs(read_timeout))
             .build()
             .with_context(|| "Failed to build client")?;
         Ok(client)
@@ -512,6 +528,7 @@ pub fn json_str_from_map<'a>(
 #[cfg(test)]
 mod request_data_tests {
     use super::RequestData;
+    use harnx_core::provider_config::openai::OpenAIConfig;
     use indexmap::IndexMap;
     use serde_json::json;
 
@@ -650,5 +667,41 @@ mod request_data_tests {
 
         assert_eq!(output["body"]["max_tokens"].as_i64(), Some(100));
         assert_eq!(output["body"]["temperature"].as_f64(), Some(0.5));
+    }
+
+    #[test]
+    fn extra_config_deserializes_read_timeout() {
+        let yaml = r#"
+type: openai
+extra:
+  connect_timeout: 7
+  read_timeout: 45
+"#;
+
+        let config: OpenAIConfig = serde_yaml::from_str(yaml).expect("parse OpenAI config");
+        let extra = config.extra.expect("extra config");
+
+        assert_eq!(extra.connect_timeout, Some(7));
+        assert_eq!(extra.read_timeout, Some(45));
+    }
+
+    #[test]
+    fn resolve_timeout_secs_coerces_zero_to_default() {
+        assert_eq!(
+            super::resolve_timeout_secs(Some(0), super::DEFAULT_CONNECT_TIMEOUT_SECS),
+            super::DEFAULT_CONNECT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            super::resolve_timeout_secs(Some(0), super::DEFAULT_READ_TIMEOUT_SECS),
+            super::DEFAULT_READ_TIMEOUT_SECS
+        );
+        assert_eq!(
+            super::resolve_timeout_secs(Some(7), super::DEFAULT_CONNECT_TIMEOUT_SECS),
+            7
+        );
+        assert_eq!(
+            super::resolve_timeout_secs(None, super::DEFAULT_READ_TIMEOUT_SECS),
+            super::DEFAULT_READ_TIMEOUT_SECS
+        );
     }
 }

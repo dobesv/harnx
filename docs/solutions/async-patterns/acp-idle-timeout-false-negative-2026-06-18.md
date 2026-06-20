@@ -1,10 +1,11 @@
 ---
 title: "False-negative ACP idle timeout during long quiet remote work"
 date: 2026-06-18
+last_updated: 2026-06-19
 category: async-patterns
 problem_type: logic_error
-component: harnx-acp
-root_cause: "session_prompt idle timer reset only on session-matched session/update notifications; quiet long tool runs trip a spurious timeout"
+component: harnx-acp, harnx-client
+root_cause: "missing HTTP read_timeout caused LLM provider stalls to hang indefinitely, surfacing as misleading ACP idle timeout; prior liveness-sentinel fix addressed spurious timeouts during quiet-but-progressing work, but not the deeper transport-layer gap"
 resolution_type: code_fix
 severity: high
 tags:
@@ -15,6 +16,10 @@ tags:
   - acp
   - liveness
   - heartbeat
+  - reqwest
+  - http-client
+  - read-timeout
+  - layered-timeout
 plan_ref: acp-idle-timeout-874
 ---
 
@@ -123,6 +128,58 @@ session-matched updates.
 - Fire-and-forget cancellation stops abandoned remote work without making the
   caller wait a second timeout.
 
+
+## Follow-up: Deeper Root Cause — Missing HTTP Read Timeout
+
+The prior fix (liveness sentinel resetting the ACP idle timer on stderr/inbound-request heartbeats) addressed **spurious** idle timeouts during quiet-but-progressing work, but the issue recurred. Investigation revealed a deeper transport-layer gap.
+
+### Symptoms (Recurring)
+
+- ACP idle timeout fires even when the agent subprocess is healthy and making no requests.
+- No stderr activity, no session/update, no inbound requests — complete radio silence.
+- Liveness heartbeats never fire because the subprocess itself is stalled waiting on a hung LLM provider call.
+
+### Root Cause
+
+The LLM HTTP client (`crates/harnx-client/src/client.rs::build_client`) set **only** `connect_timeout` (10s) — **no read/overall timeout**. A stalled LLM provider (TCP/TLS connected but sending no bytes, common when streaming SSE hangs upstream) hangs **indefinitely**. The agent subprocess then goes fully silent (no stderr, no session/update, no inbound requests), so liveness heartbeats never fire and the parent's ACP idle timer trips with a misleading "idle timeout" error.
+
+**The idle timeout was the symptom; the missing LLM read timeout was the cause.**
+
+### Solution
+
+1. **Add `read_timeout` to HTTP client.** Added `read_timeout: Option<u64>` to `ExtraConfig` (harnx-core/src/api_types.rs); `build_client` applies reqwest `.read_timeout(120s default)`.
+
+2. **Correct timeout semantics.** reqwest `.read_timeout()` is a **per-read inactivity** timeout (fires only when no bytes arrive for the window), so it does **not** kill long-but-progressing streaming responses — only true stalls. This is why `.read_timeout()` is correct here and a total `.timeout()` would be **wrong** (it would kill healthy long generations).
+
+3. **Coerce zero to default.** `0` must be coerced to the default because reqwest treats a 0-duration timeout as infinite (silently disabling protection). Added a `resolve_timeout_secs` helper:
+
+   ```rust
+   fn resolve_timeout_secs(configured: Option<u64>, default: u64) -> u64 {
+       // reqwest treats 0 as infinite timeout; coerce it back to default.
+       configured.filter(|&secs| secs > 0).unwrap_or(default)
+   }
+   ```
+
+4. **Raise ACP backstop.** Raised ACP `idle_timeout_secs` default 300→600s, documented as a backstop now that the LLM layer fails fast.
+
+### Why This Works
+
+- Layered timeouts catch distinct failure modes:
+  - **HTTP read_timeout (120s)**: Primary — catches stalled provider reads, surfaces as provider/API error.
+  - **ACP idle_timeout (600s)**: Backstop — catches fully silent subprocess hangs (e.g., process wedged before making HTTP call).
+  - **operation_timeout (3600s)**: Hard ceiling — total session lifetime wall.
+
+- Per-read inactivity semantics ensure healthy long streams continue; only true dead air triggers.
+- Error attribution now distinguishes: "Failed to call chat-completions api ... operation timed out" vs "ACP server idle timeout".
+
+### Known Gap
+
+`LlamaServerClient` uses hyper over a Unix socket, bypassing reqwest, so it ignores `read_timeout`. A hung local llama-server still falls through to the ACP backstop. This is a known remaining gap and the subject of a follow-up issue.
+
+### Generalizable Lesson
+
+**Layered timeouts are essential.** A missing transport-layer timeout surfaces as a misleading higher-layer timeout. When diagnosing "misleading timeout" bugs, check each layer from bottom (transport) to top (process/application).
+
 ## Prevention Strategies
 
 **Code Review Checklist:**
@@ -131,12 +188,16 @@ session-matched updates.
 - [ ] Timeout branches that abandon remote work also request cancellation.
 - [ ] Cancellation on a timeout path is best-effort (no second blocking await).
 - [ ] Magic sentinels are named constants with a documented invariant.
+- [ ] All HTTP clients have both connect and read timeouts configured.
+- [ ] Read timeouts use per-read inactivity semantics (not total request deadline) for streaming workloads.
 
 **Testability:**
 - Extract `select!`-arm decision logic into pure functions and unit-test the
   truth table (matching id, sentinel, unrelated id, `Lagged`, `Closed`).
 - For the timeout path itself, inject a worker handle and a short timeout, then
   assert the error text and that a `CancelSession` command was enqueued.
+- For HTTP timeout configuration, verify deserialization and that zero values are
+  coerced to defaults (per `resolve_timeout_secs`).
 
 ## Related Issues
 
