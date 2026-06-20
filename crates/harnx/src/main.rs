@@ -21,11 +21,11 @@ pub use harnx_mcp::safety as mcp_safety;
 pub use harnx_runtime::{client, commands, config, tool};
 pub use harnx_tui as tui;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, Commands, InfoSubcommands};
 use crate::client::{list_models, retry::call_with_retry_and_fallback, ModelType};
 use crate::config::{
-    list_agents, list_assistant_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
-    WorkingMode,
+    list_agents, list_assistant_agents, load_env_file, macro_execute, render_agent_dump,
+    render_session_dump, Config, GlobalConfig, Input, WorkingMode,
 };
 use crate::tui::{TranscriptItem, Tui};
 use harnx_core::event::{AgentEvent, AgentSource, NoticeEvent};
@@ -49,6 +49,12 @@ use harnx_runtime::session_cleanup::{humanize_bytes, run_cleanup, CleanupStats};
 async fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
+    if let Some(command) = &cli.command {
+        setup_logger(false)?;
+        harnx_core::alloc_guard::init_from_env();
+        return run_command(command).await;
+    }
+
     let text = cli.text()?;
     let working_mode = if cli.serve.is_some() {
         WorkingMode::Serve
@@ -75,6 +81,28 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+async fn run_command(command: &Commands) -> Result<()> {
+    match command {
+        Commands::Info(info_args) => match &info_args.command {
+            InfoSubcommands::Agent { name } => {
+                let mut config = Config::init(WorkingMode::Cmd, true, vec![]).await?;
+                config.init_mcp_manager();
+                let out = render_agent_dump(&config, name)?;
+                println!("{out}");
+                Ok(())
+            }
+            InfoSubcommands::Session {
+                agent_name,
+                session_id,
+            } => {
+                let out = render_session_dump(Some(agent_name.as_str()), session_id)?;
+                println!("{out}");
+                Ok(())
+            }
+        },
+    }
 }
 
 async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {

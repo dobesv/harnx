@@ -114,7 +114,11 @@ fn normalize_screen(contents: &str) -> String {
         .map(|line| line.trim_end())
         .collect::<Vec<_>>()
         .join("\n");
-    mask_harnx_version(&trimmed)
+    normalize_snapshot_text(&trimmed)
+}
+
+fn normalize_snapshot_text(s: &str) -> String {
+    mask_harnx_version(s)
 }
 
 /// Replace the literal version in the welcome banner (and anywhere else
@@ -863,6 +867,7 @@ async fn info_session_without_session_renders_in_tui_snapshot() {
 
     let rendered = normalize_screen(&harness.screen_contents());
     assert!(!rendered.is_empty());
+    assert!(harness.tui().app.detail_view_open);
     insta::assert_snapshot!("info_session_without_session_in_tui", rendered);
 }
 
@@ -890,8 +895,111 @@ async fn info_session_with_session_renders_in_tui_snapshot() {
     harness.render();
 
     let rendered = normalize_screen(&harness.screen_contents());
-    assert!(rendered.contains("info-session-with-session-test"));
+    assert!(harness.tui().app.detail_view_open);
     insta::assert_snapshot!("info_session_with_session_in_tui", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn info_agent_overlay_renders_in_tui_snapshot() {
+    let mut harness = TuiTestHarness::with_size(72, 20).await;
+    {
+        let mut guard = harness.tui().config.write();
+        guard.clients = vec![ClientConfig::Unknown];
+        let model = MockClient::builder().build().model().clone();
+        guard.model = model.clone();
+        guard.tools = harnx_runtime::tool::Tools::init_from_mcp(Some(vec![
+            harnx_runtime::tool::ToolDeclaration {
+                name: "alpha_tool".to_string(),
+                description: "Alpha tool".to_string(),
+                parameters: Default::default(),
+                mcp_tool_name: None,
+                mcp_server_name: None,
+                call_template: None,
+                result_template: None,
+            },
+            harnx_runtime::tool::ToolDeclaration {
+                name: "beta_tool".to_string(),
+                description: "Beta tool".to_string(),
+                parameters: Default::default(),
+                mcp_tool_name: None,
+                mcp_server_name: None,
+                call_template: None,
+                result_template: None,
+            },
+        ]));
+        let mut agent = harnx_runtime::config::Agent::new(
+            harnx_runtime::config::AgentConfig::from_markdown(
+                "overlay-agent",
+                r#"---
+model: mock:mock-model
+use_tools:
+  - "*"
+variables:
+  - name: project_name
+    description: Project name
+    default: harnx
+---
+Overlay {{project_name}} for {{agent.name}}."#,
+            )
+            .unwrap(),
+        );
+        agent.set_name("overlay-agent");
+        agent.set_model(model);
+        guard.agent = Some(agent);
+    }
+
+    let initial_transcript_len = harness.tui().app.transcript.len();
+    harness.tui().run_command(".info agent").await.unwrap();
+    harness.render();
+
+    assert!(harness.tui().app.detail_view_open);
+    assert_eq!(harness.tui().app.transcript.len(), initial_transcript_len);
+
+    let rendered = normalize_screen(&harness.screen_contents());
+    insta::assert_snapshot!("info_agent_overlay_in_tui", rendered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn info_session_overlay_renders_in_tui_snapshot() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut harness = TuiTestHarness::with_size(72, 20).await;
+    harness.tui().config = config.clone();
+    harness.tui().persistent_manager = persistent;
+
+    harness
+        .tui()
+        .run_command(".session overlay-session-test")
+        .await
+        .unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+
+    let initial_transcript_len = harness.tui().app.transcript.len();
+    harness.tui().run_command(".info session").await.unwrap();
+    while let Ok(event) = harness.tui().event_rx.try_recv() {
+        harness.tui().handle_tui_event(event).await.unwrap();
+    }
+    harness.render();
+
+    assert!(harness.tui().app.detail_view_open);
+    assert_eq!(harness.tui().app.transcript.len(), initial_transcript_len);
+
+    let rendered = normalize_snapshot_text(&harness.screen_contents());
+    let rendered = rendered
+        .replace(
+            "working_dir: /mnt/projects/ai-tools/harnx",
+            "working_dir: [WORKING_DIR]",
+        )
+        .replace(
+            &format!(
+                "path: {}/agents/overlay-session-test/sessions/overlay-session-test.yaml",
+                std::env::temp_dir().display()
+            ),
+            "path: [SESSION_PATH]",
+        );
+    insta::assert_snapshot!("info_session_overlay_in_tui", rendered);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -8303,4 +8411,109 @@ async fn enter_on_compaction_marker_opens_full_detail_view() {
             && text.contains("── assistant ──")
             && text.contains("Old answer")
     }));
+}
+
+#[tokio::test]
+async fn test_info_agent_opens_detail_view() {
+    let mut harness = TuiTestHarness::with_size(80, 24).await;
+    let tui = harness.tui();
+
+    // Give it a mock agent so it doesn't fail
+    {
+        let mut guard = tui.config.write();
+        let mut agent = harnx_runtime::config::Agent::default();
+        agent.set_name("test-agent");
+
+        guard.agent = Some(agent);
+    }
+
+    let initial_transcript_len = tui.app.transcript.len();
+
+    tui.run_command(".info agent").await.unwrap();
+
+    assert!(
+        tui.app.detail_view_open,
+        "Detail view should be open after .info agent"
+    );
+    assert!(
+        tui.app.detail_view_text.is_some(),
+        "Detail view text should be populated"
+    );
+    let text = tui.app.detail_view_text.as_ref().unwrap();
+    assert!(
+        text.contains("Hello world") || text.contains("test-agent") || text.contains("Error:"),
+        "Detail view should contain agent info or error"
+    );
+
+    // Ensure transcript was NOT modified
+    assert_eq!(
+        tui.app.transcript.len(),
+        initial_transcript_len,
+        "Transcript should not be appended to"
+    );
+}
+
+#[tokio::test]
+async fn test_info_session_opens_detail_view() {
+    let mut harness = TuiTestHarness::with_size(80, 24).await;
+    let tui = harness.tui();
+
+    // Let's test `.info session` without args, which should fallback to active session,
+    // or fail and display error in detail view since no active session exists.
+    let initial_transcript_len = tui.app.transcript.len();
+
+    tui.run_command(".info session").await.unwrap();
+
+    assert!(
+        tui.app.detail_view_open,
+        "Detail view should be open after .info session"
+    );
+    assert!(
+        tui.app.detail_view_text.is_some(),
+        "Detail view text should be populated"
+    );
+    let text = tui.app.detail_view_text.as_ref().unwrap();
+    assert!(
+        text.contains("Error:") || text.contains("No active session"),
+        "Should show error since no session is active"
+    );
+
+    // Ensure transcript was NOT modified
+    assert_eq!(
+        tui.app.transcript.len(),
+        initial_transcript_len,
+        "Transcript should not be appended to"
+    );
+}
+
+#[tokio::test]
+async fn test_info_session_single_arg_with_active_agent() {
+    let config = test_config_with_mock_client_and_agent("test-agent", None);
+    let mut harness = TuiTestHarness::with_size(80, 24).await;
+    harness.tui().config = config;
+
+    let tui = harness.tui();
+
+    // With active agent but no active session, `.info session some-id` should work
+    // by pairing the active agent with `some-id`.
+    tui.run_command(".info session some-id").await.unwrap();
+
+    assert!(
+        tui.app.detail_view_open,
+        "Detail view should be open after .info session some-id"
+    );
+    assert!(
+        tui.app.detail_view_text.is_some(),
+        "Detail view text should be populated"
+    );
+    let text = tui.app.detail_view_text.as_ref().unwrap();
+    assert!(
+        !text.contains("insufficient arguments"),
+        "Should not complain about insufficient arguments when single arg provided with active agent. Text: {}",
+        text
+    );
+    assert!(
+        !text.contains("No active session or insufficient arguments"),
+        "Should not give the default usage error"
+    );
 }

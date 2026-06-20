@@ -1,0 +1,21 @@
+---
+source: crates/harnx-runtime/src/config/agent_tests.rs
+expression: rendered
+---
+---
+model: openai:gpt-4o
+use_tools:
+- alpha_tool
+- beta_tool
+- snapshot-agent_session_handoff
+- harnx_agent_session_history_read
+variables:
+- name: project_name
+  description: Project name
+  default: harnx
+conversation_starters:
+- Show rendered prompt
+role: assistant
+---
+
+Project harnx belongs to snapshot-agent.

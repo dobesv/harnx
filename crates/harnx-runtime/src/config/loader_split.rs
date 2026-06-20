@@ -65,7 +65,7 @@ impl Config {
         Ok(config)
     }
 
-    fn load_from_file(config_path: &Path) -> Result<Self> {
+    pub(super) fn load_from_file(config_path: &Path) -> Result<Self> {
         let err = || format!("Failed to load config at '{}'", config_path.display());
         let data: ConfigData = if config_path.exists() {
             let content = read_to_string(config_path).with_context(err)?;

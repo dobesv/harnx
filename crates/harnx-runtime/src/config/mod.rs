@@ -13,6 +13,7 @@ mod persistence_split;
 mod rag_split;
 mod servers_split;
 pub mod session;
+mod session_dump;
 mod session_log_split;
 pub mod session_meta;
 mod session_ops_split;
@@ -21,6 +22,7 @@ mod settings_split;
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;
 pub(crate) use self::persistence_split::collect_tool_calls;
+pub use self::session_dump::render_session_dump;
 pub(crate) use self::session_log_split::{
     adjust_range_for_tool_pairs, split_session_log_documents, validate_edited_session_documents,
     validate_tool_pair_integrity,
@@ -28,8 +30,8 @@ pub(crate) use self::session_log_split::{
 
 pub use self::agent::TEMP_AGENT_NAME;
 pub use self::agent::{
-    complete_agent_variables, list_agents, list_assistant_agents, Agent, AgentConfig,
-    AgentVariables,
+    apply_package_agent_transforms, complete_agent_variables, list_agents, list_assistant_agents,
+    render_agent_dump, Agent, AgentConfig, AgentVariables,
 };
 pub(crate) use self::attachments::attachments_dir_for;
 pub use self::attachments::{write_attachment, Base64Encoder};
@@ -1146,6 +1148,20 @@ impl Config {
             agent.set_session_variables(variables.clone());
         }
         Ok(())
+    }
+
+    pub fn expand_use_tools(
+        &self,
+        use_tools: Option<&[String]>,
+        active_pkg: Option<&str>,
+    ) -> Vec<String> {
+        let selectors = use_tools.map(|selectors| selectors.join(","));
+        let (declarations, _) =
+            self.tool_declarations_for_use_tools(selectors.as_deref(), active_pkg);
+        declarations
+            .into_iter()
+            .map(|declaration| declaration.name)
+            .collect()
     }
 
     pub fn tool_declarations_for_use_tools(

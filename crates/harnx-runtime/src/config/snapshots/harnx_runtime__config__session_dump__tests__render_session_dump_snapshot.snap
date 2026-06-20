@@ -1,0 +1,32 @@
+---
+source: crates/harnx-runtime/src/config/session_dump.rs
+expression: normalize_session_dump_for_snapshot(&dump)
+---
+model: openai:test-model
+tokens:
+  total_tokens: 19
+  max_input_tokens: 4096
+  total/max: 0.46%
+agent_variables:
+  topic: forge
+  phase: alpha
+messages:
+- role: user
+  content: hello
+- role: assistant
+  content: hi there
+snapshot:
+  id: snapshots/render
+  path: [TMP]/agents/smith/sessions/snapshots/render.yaml
+  session_id: session-123
+  working_dir: [TMP]/work
+  git_branch: main
+  git_remote: origin
+  terminal_session_id: term-1
+  agent_name: smith
+  save_session: true
+  compress_threshold: 42
+  model_fallbacks:
+  - openai:fallback
+  compaction_agent: smith-compactor
+  log_entry_count: 4

@@ -44,7 +44,7 @@ openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
 .session                 Start or switch to a session
 .empty session           Clear session messages
 .compact session         Compact session messages using configured compaction agent
-.info session            Show session info
+.info session [<agent> <id>] Show session state in overlay
 .edit session            Modify current session
 .save session            Save current session to file
 ```
@@ -53,7 +53,7 @@ openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
 
 ```
 .agent                   Switch to an agent
-.info agent              Show agent info
+.info agent [<name>]     Show rendered agent in overlay
 .edit agent              Edit agent .md file
 .save agent [name]       Save current agent to file
 .starter                 Use a conversation starter
@@ -66,7 +66,7 @@ openai:gpt-4o     128000 /     4096  |       5 /     15    👁 ⚒
 .edit rag-docs           Add or remove documents from an existing RAG
 .rebuild rag             Rebuild RAG for document changes
 .sources rag             Show citation sources used in last query
-.info rag                Show RAG info
+.info rag                Show RAG info (in transcript)
 .exit rag                Leave RAG
 ```
 
@@ -133,13 +133,16 @@ If the response is interrupted or unsatisfactory, you can regenerate it with `.r
 
 ### `.info` - display system/session/agent/RAG info
 
-```
-.info                    Show system info
-.info session            Show session info
-.info agent              Show agent info
-.info rag                Show RAG info
-.info tools              List available tools and their active state
-```
+The `.info agent` and `.info session` commands display detailed information in a fullscreen scrollable overlay. Press `Esc` to close, and use arrow keys or `PgUp`/`PgDn` to scroll.
+
+- **`.info agent [<name>]`**: Shows the fully-rendered agent configuration (patches applied, prompt interpolated, and tools expanded).
+  - If `<name>` is omitted, it defaults to the active agent.
+  - **Note:** This replaces the old raw source view. To view the raw agent file, use `cat ~/.config/harnx/agents/<name>.md`.
+  - During expansion, if an MCP server fails, a warning is logged to stderr and the process continues with remaining tools.
+- **`.info session [<agent> <id>]`**: Shows the session state (history, tokens, variables, etc.).
+  - If arguments are omitted and a session is active, it shows the active session.
+  - Does **not** include the system prompt and does **not** launch MCP servers.
+- **`.info`**, **`.info rag`**, **`.info tools`**: These commands continue to append information directly to the chat transcript.
 
 ### `.exit` - exit the current scope
 

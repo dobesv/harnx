@@ -87,7 +87,7 @@ fn load_with_qualified_name_from_contents(
 /// (e.g. `fs_read_file`).  The MCP manager is scoped to the active agent at
 /// runtime, so same-package servers are already registered under their bare
 /// names — no rewriting needed here.
-fn apply_package_agent_transforms(
+pub fn apply_package_agent_transforms(
     config: &mut AgentConfig,
     pkg_name: &str,
     agent_stem: &str,
@@ -632,6 +632,95 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
         }
     }
     vec![]
+}
+
+/// Render a fully-rendered agent dump (agent-md format) for an arbitrary agent.
+///
+/// This is the orchestration function reused by both CLI and TUI to ensure
+/// consistent behavior. The pipeline is:
+/// 1. Load agent config by name (from file or builtin)
+/// 2. Apply package patches via `apply_package_agent_transforms`
+/// 3. Expand `use_tools` via `Config::expand_use_tools`
+/// 4. Assemble via `AgentConfig::export_rendered`
+///
+/// The caller must provide a `Config` with `mcp_manager` already initialized
+/// (via `init_mcp_manager()` or by the TUI's existing runtime). This ensures
+/// both CLI and TUI can use the same function without requiring a live session.
+///
+/// # Errors
+///
+/// Returns a clear error if the agent is not found.
+///
+/// # Example (CLI usage)
+///
+/// ```ignore
+/// let mut config = Config::load_from_file(&Config::config_file())?;
+/// config.init_mcp_manager();
+/// let rendered = render_agent_dump(&config, "my-agent")?;
+/// println!("{}", rendered);
+/// ```
+///
+/// # Example (TUI usage)
+///
+/// ```ignore
+/// // TUI already has a GlobalConfig with mcp_manager initialized
+/// let config = global_config.read();
+/// let rendered = render_agent_dump(&config, "some-agent")?;
+/// ```
+pub fn render_agent_dump(config: &Config, agent_name: &str) -> Result<String> {
+    // Step 1: Load agent config by name
+    let agent_file_path = Config::agent_file(agent_name);
+    let mut agent_config = if agent_file_path.exists() {
+        let contents = read_to_string(&agent_file_path).with_context(|| {
+            format!(
+                "Failed to read agent file at '{}'",
+                agent_file_path.display()
+            )
+        })?;
+        AgentConfig::from_markdown(agent_name, &contents)?
+    } else {
+        // Try builtin agent
+        AgentConfig::builtin_markdown(agent_name)
+            .map(|content| AgentConfig::from_markdown(agent_name, content))
+            .ok_or_else(|| anyhow!("agent '{}' not found", agent_name))??
+    };
+
+    // Step 2: Apply package patches (must happen BEFORE interpolation)
+    if let Some((pkg, stem)) = agent_name.split_once('/') {
+        apply_package_agent_transforms(&mut agent_config, pkg, stem)?;
+    }
+
+    // Step 3: Resolve file-backed variable defaults (like resolve_file_defaults)
+    let agent_dir = agent_file_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(Config::agents_config_dir);
+
+    // Load file-backed variable defaults
+    resolve_file_backed_variables(agent_config.variables_mut(), &agent_dir)?;
+
+    // Step 4: Initialize shared_variables for template interpolation
+    // Use agent_variables if provided via CLI, otherwise use file-backed defaults
+    let shared_variables = if let Some(variables) = &config.agent_variables {
+        variables.clone()
+    } else {
+        // Initialize from defined_variables with file defaults
+        let mut vars = AgentVariables::default();
+        for v in agent_config.defined_variables() {
+            if let Some(default) = &v.default {
+                vars.insert(v.name.clone(), default.clone());
+            }
+        }
+        vars
+    };
+    agent_config.set_shared_variables(shared_variables);
+
+    // Step 5: Expand use_tools via Config::expand_use_tools
+    let active_pkg = harnx_core::package_namespace::pkg_from_qualified(agent_name);
+    let expanded_tools = config.expand_use_tools(agent_config.use_tools().as_deref(), active_pkg);
+
+    // Step 6: Export rendered (interpolates body internally)
+    agent_config.export_rendered(&expanded_tools)
 }
 
 #[cfg(test)]
