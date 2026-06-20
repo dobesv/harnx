@@ -161,8 +161,80 @@ mod tests {
     use crate::config::{paths, test_support::EnvGuard};
     use harnx_core::config_paths::{agent_data_dir, state_dir};
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    #[derive(Clone, Copy)]
+    enum SessionScope<'a> {
+        RequestedAgent(&'a str),
+        TopLevel,
+    }
+
+    struct SessionDumpTestEnv {
+        _tmp: TempDir,
+        _data: EnvGuard,
+        _state: EnvGuard,
+        sessions_dir: PathBuf,
+    }
+
+    struct SessionDumpCase<'a> {
+        scope: SessionScope<'a>,
+        session_id: &'a str,
+        header_agent_name: &'a str,
+        message_role: &'a str,
+        message_content: &'a str,
+    }
+
+    impl<'a> SessionDumpCase<'a> {
+        fn create(self) -> (SessionDumpTestEnv, Option<&'a str>, &'a str) {
+            let env = SessionDumpTestEnv::new(self.scope);
+            env.write_session(
+                self.session_id,
+                &format!(
+                    "---\ntype: header\nmodel: openai:test-model\nsession_id: test-session\nworking_dir: /tmp/work\nagent_name: {}\n---\ntype: message\nrole: {}\ncontent: {}\n",
+                    self.header_agent_name, self.message_role, self.message_content,
+                ),
+            );
+            let requested_agent = match self.scope {
+                SessionScope::RequestedAgent(agent_name) => Some(agent_name),
+                SessionScope::TopLevel => None,
+            };
+            (env, requested_agent, self.session_id)
+        }
+    }
+
+    impl SessionDumpTestEnv {
+        fn new(scope: SessionScope<'_>) -> Self {
+            let tmp = TempDir::new().unwrap();
+            let data = EnvGuard::new("HARNX_DATA_DIR", tmp.path());
+            let state = EnvGuard::new("HARNX_STATE_DIR", tmp.path());
+            write_test_config();
+            let sessions_dir = match scope {
+                SessionScope::RequestedAgent(agent_name) => {
+                    agent_data_dir(agent_name).join("sessions")
+                }
+                SessionScope::TopLevel => state_dir().join("sessions"),
+            };
+            Self {
+                _tmp: tmp,
+                _data: data,
+                _state: state,
+                sessions_dir,
+            }
+        }
+
+        fn write_session(&self, relative_path: impl AsRef<Path>, contents: &str) {
+            let session_path = self
+                .sessions_dir
+                .join(relative_path.as_ref())
+                .with_extension("yaml");
+            if let Some(parent) = session_path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(session_path, contents).unwrap();
+        }
+    }
 
     fn normalize_session_dump_for_snapshot(dump: &str) -> String {
         dump.lines()
@@ -321,99 +393,88 @@ content: hi there
         );
     }
 
-    #[test]
-    fn render_session_dump_warns_on_agent_mismatch_and_continues() {
+    enum SessionDumpScenarioCheck<'a> {
+        Contains(&'a str),
+        Omits(&'a str),
+    }
+
+    struct SessionDumpScenario<'a> {
+        name: &'a str,
+        case: SessionDumpCase<'a>,
+        checks: &'a [SessionDumpScenarioCheck<'a>],
+    }
+
+    fn assert_session_dump_scenario(scenario: SessionDumpScenario<'_>) {
         let _lock = env_lock();
-        let tmp = TempDir::new().unwrap();
-        let _data = EnvGuard::new("HARNX_DATA_DIR", tmp.path());
-        let _state = EnvGuard::new("HARNX_STATE_DIR", tmp.path());
-        write_test_config();
+        let (_env, requested_agent, session_id) = scenario.case.create();
+        let dump = render_session_dump(requested_agent, session_id)
+            .unwrap_or_else(|err| panic!("scenario {} failed: {err}", scenario.name));
 
-        let sessions_dir = state_dir().join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        let session_path = sessions_dir.join("mismatch.yaml");
-        fs::write(
-            &session_path,
-            r#"---
-type: header
-model: openai:test-model
-session_id: session-top
-working_dir: /tmp/work
-agent_name: other-agent
----
-type: message
-role: user
-content: mismatch ok
-"#,
-        )
-        .unwrap();
-
-        let dump = render_session_dump(None, "mismatch").unwrap();
-        assert!(dump.contains("content: mismatch ok"));
-        assert!(dump.contains("agent_name: other-agent"));
+        for check in scenario.checks {
+            match check {
+                SessionDumpScenarioCheck::Contains(expected_fragment) => assert!(
+                    dump.contains(expected_fragment),
+                    "scenario {} missing fragment {expected_fragment:?}\n{dump}",
+                    scenario.name,
+                ),
+                SessionDumpScenarioCheck::Omits(unexpected_fragment) => assert!(
+                    !dump.contains(unexpected_fragment),
+                    "scenario {} unexpectedly contained fragment {unexpected_fragment:?}\n{dump}",
+                    scenario.name,
+                ),
+            }
+        }
     }
 
     #[test]
-    fn render_session_dump_warns_on_requested_agent_mismatch_and_continues() {
-        let _lock = env_lock();
-        let tmp = TempDir::new().unwrap();
-        let _data = EnvGuard::new("HARNX_DATA_DIR", tmp.path());
-        let _state = EnvGuard::new("HARNX_STATE_DIR", tmp.path());
-        write_test_config();
+    fn render_session_dump_scenarios() {
+        let scenarios = [
+            SessionDumpScenario {
+                name: "warns_on_agent_mismatch_and_continues",
+                case: SessionDumpCase {
+                    scope: SessionScope::TopLevel,
+                    session_id: "mismatch",
+                    header_agent_name: "other-agent",
+                    message_role: "user",
+                    message_content: "mismatch ok",
+                },
+                checks: &[
+                    SessionDumpScenarioCheck::Contains("content: mismatch ok"),
+                    SessionDumpScenarioCheck::Contains("agent_name: other-agent"),
+                ],
+            },
+            SessionDumpScenario {
+                name: "warns_on_requested_agent_mismatch_and_continues",
+                case: SessionDumpCase {
+                    scope: SessionScope::RequestedAgent("smith"),
+                    session_id: "mismatch-agent",
+                    header_agent_name: "other-agent",
+                    message_role: "assistant",
+                    message_content: "still loads",
+                },
+                checks: &[
+                    SessionDumpScenarioCheck::Contains("content: still loads"),
+                    SessionDumpScenarioCheck::Omits("system_prompt"),
+                ],
+            },
+            SessionDumpScenario {
+                name: "loads_clients_from_disk_without_mcp_init",
+                case: SessionDumpCase {
+                    scope: SessionScope::RequestedAgent("smith"),
+                    session_id: "disk-config",
+                    header_agent_name: "smith",
+                    message_role: "user",
+                    message_content: "disk config path",
+                },
+                checks: &[
+                    SessionDumpScenarioCheck::Contains("model: openai:test-model"),
+                    SessionDumpScenarioCheck::Contains("content: disk config path"),
+                ],
+            },
+        ];
 
-        let sessions_dir = agent_data_dir("smith").join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        let session_path = sessions_dir.join("mismatch-agent.yaml");
-        fs::write(
-            &session_path,
-            r#"---
-type: header
-model: openai:test-model
-session_id: session-abc
-working_dir: /tmp/work
-agent_name: other-agent
----
-type: message
-role: assistant
-content: still loads
-"#,
-        )
-        .unwrap();
-
-        let dump = render_session_dump(Some("smith"), "mismatch-agent").unwrap();
-        assert!(dump.contains("content: still loads"));
-        assert!(!dump.contains("system_prompt"));
-    }
-
-    #[test]
-    fn render_session_dump_loads_clients_from_disk_without_mcp_init() {
-        let _lock = env_lock();
-        let tmp = TempDir::new().unwrap();
-        let _data = EnvGuard::new("HARNX_DATA_DIR", tmp.path());
-        let _state = EnvGuard::new("HARNX_STATE_DIR", tmp.path());
-        write_test_config();
-
-        let sessions_dir = agent_data_dir("smith").join("sessions");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        let session_path = sessions_dir.join("disk-config.yaml");
-        fs::write(
-            &session_path,
-            r#"---
-type: header
-model: openai:test-model
-session_id: session-disk
-working_dir: /tmp/work
-agent_name: smith
----
-type: message
-role: user
-content: disk config path
-"#,
-        )
-        .unwrap();
-
-        let dump = render_session_dump(Some("smith"), "disk-config").unwrap();
-        assert!(dump.contains("model: openai:test-model"));
-        assert!(dump.contains("content: disk config path"));
+        for scenario in scenarios {
+            assert_session_dump_scenario(scenario);
+        }
     }
 }
