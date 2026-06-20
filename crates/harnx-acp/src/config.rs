@@ -6,7 +6,7 @@ fn default_true() -> bool {
 }
 
 fn default_idle_timeout() -> u64 {
-    300
+    600
 }
 
 fn default_operation_timeout() -> u64 {
@@ -26,6 +26,8 @@ pub struct AcpServerConfig {
     pub enabled: bool,
     #[serde(default)]
     pub description: Option<String>,
+    /// ACP subprocess idle backstop in seconds. LLM HTTP client read timeouts should
+    /// fail stalled requests first; this only catches fully silent subprocess hangs.
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
     #[serde(default = "default_operation_timeout")]

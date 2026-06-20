@@ -12,6 +12,8 @@ use crate::tool::{ToolCall, ToolDeclaration};
 pub struct ExtraConfig {
     pub proxy: Option<String>,
     pub connect_timeout: Option<u64>,
+    /// Per-read inactivity timeout in seconds for provider HTTP responses.
+    pub read_timeout: Option<u64>,
     pub accept_invalid_certs: Option<bool>,
     pub ca_cert: Option<String>,
     pub client_cert: Option<String>,

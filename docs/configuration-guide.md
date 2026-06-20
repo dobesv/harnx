@@ -75,10 +75,15 @@ For a complete list of supported providers and their specific configuration opti
 type: openai              # Provider type (openai, claude, gemini, etc.)
 api_key: sk-...           # Optional if <NAME>_API_KEY env var is set
 api_base: https://...     # Optional custom endpoint
+extra:
+  connect_timeout: 10     # seconds to establish TCP/TLS connection (default 10)
+  read_timeout: 120       # seconds of read inactivity before stalled response fails (default 120)
 patches:                  # Patch API requests using jq expressions
   chat_completions:
     - '.body.cache_control = {"type":"ephemeral"}'
 ```
+
+`extra.connect_timeout` sets how long Harnx waits to establish TCP/TLS connection before request fails. `extra.read_timeout` is per-read inactivity timeout, not cap on total stream duration, so long-but-progressing streaming responses are allowed to continue. Use it so stalled LLM provider surfaces clear error instead of hanging until ACP idle backstop fires.
 
 ### Per-Model Patches
 
