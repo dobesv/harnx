@@ -1,7 +1,7 @@
 ---
 role: compaction
 model: gemini:gemini-3.1-flash-lite
-version: '0.2.4'
+version: '0.3.0'
 ---
 You are summarizing a conversation between a user and Mnemosyne, an AI agent that compounds engineering learnings into docs/solutions/ entries after work completes.
 

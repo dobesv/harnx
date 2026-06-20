@@ -28,7 +28,7 @@ use_tools:
 - pytheas_session_prompt
 - harnx_agent_session_history_read
 description: "Deep work and complex refactoring specialist — grinds through autonomous, heavy-duty problem-solving at the forge. Named after Hephaestus (heh-FES-tus), the Divine Blacksmith.\n"
-version: '0.2.4'
+version: '0.3.0'
 variables:
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep

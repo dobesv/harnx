@@ -11,6 +11,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.33.0 (2026-06-20)
+
+### Breaking Changes
+
+- The --acp <agent> flag has been removed from the harnx
+binary. Use the standalone harnx-acp-server <agent> binary instead.
+- derive client name from filename stem and ignore in-file name field (#824)
+
+#### Move ACP support out of the `harnx` binary and fix same-package pantheon delegation.
+
+- **Breaking:** The `harnx --acp <agent>` flag has been removed (no backward compatibility). Serving an agent over ACP is now done with the standalone `harnx-acp-server <agent>` binary. Internally generated ACP subagent servers are auto-registered to spawn `harnx-acp-server <agent>` instead of `harnx --acp <agent>`; the server binary is resolved as a sibling of the running `harnx` executable, falling back to `harnx-acp-server` on `PATH` (#550).
+- **Fix:** Same-package pantheon delegation no longer drops the package prefix on spawn. Auto-registered ACP servers now keep the package-qualified spawn target (e.g. `pantheon/aristarchus`) in their `args`, independent of the per-agent display-name rewrite that exposes same-package peers under their bare name. Package-loaded `acp_servers/*.yaml` whose `args` reference the bare server stem are normalized to the qualified `<package>/<name>` target. This fixes delegation between two agents in the same package once same-named top-level agents are removed (#804).
+
+#### Client names are now derived from the YAML filename stem instead of a `name:` field in the file contents.
+
+- A client defined in `clients/<name>.yaml` is named `<name>` (extension stripped, verbatim — no lowercasing). For package clients the name is `<package>/<stem>`.
+- A `name:` field inside a client spec is now ignored (silently skipped); the filename is the sole source of the client name. There is no migration — rename the file if you relied on a differing `name:` field. This mirrors how MCP/ACP server specs are already named (#823).
+- The provider-default fallback (e.g. defaulting an unnamed client to `openai`) has been removed; dynamic clients created from a `provider:model` selection are still named after their provider.
+
+### Features
+
+- auto-whitelist Go caches and support arbitrary $VAR expansion (#800)
+- extract ACP server and fix same-package delegation (#810)
+- add llama-server LLM provider for local GGUF models (#817)
+- support per-model GGUF configuration and HuggingFace auto-download (#821)
+- view compaction result details (#828)
+- auto-whitelist Homebrew prefix and fix /usr/local defaults (#831)
+- externalize image attachments to content-addressed files (cid refs) (#843)
+- flattened-text summarization keeping recent turns verbatim (#846)
+- harnx_agent_session_history_read tool (#851)
+- configurable keep-recent/truncation knobs on the compaction agent (#857)
+- instrument the intermittent OOM (#842) with a memory watchdog (#864)
+- add automatic session garbage collection and cleanup (#868)
+- implement provider-side upload-by-reference for attachments (#871)
+- grant session-history tool to compaction-enabled agents (#879)
+- add info agent and info session commands to CLI and TUI (#886)
+- Add `llama-server` provider for managing local llama.cpp subprocesses over Unix domain sockets.
+- Add upload-by-reference attachment encoding for the Gemini and Anthropic providers. Historical image attachments stored as `cid:` references are now uploaded once to the provider Files API (Gemini File API / Anthropic Files API) and reused across turns via an in-memory cache (keyed by content id, with expiry where the provider sets one), instead of re-inlining base64 every turn. Falls back to base64 inline content when upload is unsupported or fails. OpenAI remains base64-only because the Chat Completions API cannot reference uploaded images by file id. Backends without a Files API (Vertex, Bedrock, Ollama, etc.) continue to use base64. No change to the on-disk transcript format.
+- Add a heap-usage guard to catch the intermittent runaway-allocation OOM (#842). The `harnx` and `harnx-acp-server` binaries install a global allocator that tracks live heap and, the instant it crosses a ceiling, captures a backtrace (whose top frames are the runaway allocation site), writes it to stderr and the log file, then aborts — before the process exhausts the machine and is OOM-killed with no stack. It is armed by default at 4096 MiB; set `HARNX_HEAP_LIMIT_MB` to change the ceiling, or `HARNX_HEAP_LIMIT_MB=0` to disable it. When disarmed it is a passthrough to the system allocator.
+- Add `harnx info` subcommand to CLI and improve `.info` in TUI to inspect fully-rendered agent configurations and session states.
+- Add automatic cleanup of inactive sessions (#847). A new opt-in config key `cleanup_inactive_sessions_days` automatically deletes inactive session transcripts and their attachments after a configurable number of days. Activity is based on filesystem mtime; unset or 0 disables cleanup. Runs once at startup and hourly thereafter in all modes (TUI, CLI, serve); best-effort and fault-tolerant.
+
+#### Auto-whitelist Go build caches and support arbitrary `$VAR` expansion in sandbox whitelist paths.
+
+- The bash sandbox now grants read+write (but not execute) access to `GOMODCACHE` and `GOCACHE` when those environment variables are set, and forwards both to the sandboxed process. This fixes `go build`/`go test` failing with `read-only file system` when a custom cache location is configured. Caches hold source, `.a` archives, and build logs only — no executables — so execute access is intentionally withheld.
+- Sandbox whitelist arguments (`--extra-read`/`--extra-write`/`--extra-exec`/`--extra-rwx`) now expand arbitrary `$VAR` references from the environment in addition to the existing pseudo-vars (`$GIT_ROOT`, etc.). A leading `$NAME` or `$NAME/...` resolves to the environment value; unset variables are left literal. Pseudo-vars still take precedence. The home-directory exposure guard continues to apply at the call sites.
+- Deduplicated the Go/toolchain default-path logic so `harnx-sandbox-run` and `harnx-sandbox-common` share one implementation. As part of this, the `.exists()` gating was dropped for toolchain env-relative paths (`CARGO_HOME`/`GOROOT`/`GOPATH`/`GOBIN` and the new cache vars): they are now whitelisted unconditionally when the variable is set, since cache directories often don't exist on first run.
+
+#### Auto-whitelist the Homebrew install prefix in the default sandbox allowlist so Homebrew-managed tools work without manual overrides.
+
+- The Homebrew prefix is granted read+execute (never write) by default. The location is resolved dynamically: `HOMEBREW_PREFIX` is honoured when set, otherwise a compile-time platform default is used (`/opt/homebrew` on macOS, `/home/linuxbrew/.linuxbrew` on Linux). No runtime OS detection is performed.
+- Fix a `/usr/local` static-path oversight: `/usr/local` is now readable on both Linux and macOS, and `/usr/local/lib` is now executable on Linux (macOS already had it) so dynamically linked binaries can load their dylibs (#818).
+
+#### Updated `llama-server` provider to support per-model GGUF configuration and HuggingFace auto-download.
+
+- Models in `models[]` now specify their own `model_path`, `hf_repo`, and tuning knobs (`ctx_size`, `n_gpu_layers`, `threads`, `extra_args`, `socket_path`).
+- Added support for HuggingFace auto-download via the `-hf` flag in `llama-server`.
+- Model source resolution precedence: `model_path` (local) -> `hf_repo` (HuggingFace) -> model `name` as the HuggingFace repo spec.
+- Multi-model support: one provider config can now serve multiple models, each in its own lazily-spawned `llama-server` subprocess.
+
+### Fixes
+
+- install over running binaries without ETXTBSY (#798)
+- scope managers to package on async agent activation (#826) (#832)
+- stop leaking unfiltered tool list into agent system prompt (#863)
+- preserve whitespace-only streaming chunks (#867)
+- append-mode log file (#880) + heap-usage guard for the #842 OOM (#881)
+- add LLM read timeout so stalled requests fail clearly instead of false ACP idle timeout (#874) (#887)
+- Fix false ACP idle timeout in session_prompt by resetting the timer on any subprocess liveness.
+- Grant the `harnx_agent_session_history_read` tool to every bundled agent configured with a `compaction_agent`, so they can search their pre-compaction session history after a compaction.
+- Fix the log file filling with NUL bytes (#880). harnx and the `harnx-acp-server` sub-agents it spawns share one `HARNX_LOG_PATH`; opening it with `File::create` gave each process an independent, truncating file offset, so concurrent writers clobbered each other and the kernel zero-filled the gaps. The log is now opened in append mode (`O_APPEND`), so every write lands atomically at end-of-file and concurrent processes interleave cleanly at line granularity. The file is no longer truncated per run. Each process also logs a `harnx start: v… build=<git sha> pid=… level=… log=…` line at startup so a shared log can be attributed per PID and the running build is verifiable.
+- Add a configurable read (inactivity) timeout for LLM provider HTTP requests so stalled responses fail with a clear error instead of hanging until the ACP idle timeout; raise the default ACP idle timeout to 600s as a backstop.
+- Remove the `inputs`/`outputs` parameters from the bash MCP tools (`bash_exec`/`bash_spawn`). The sandbox no longer narrows project roots per call — roots always get read+write+exec — fixing `cargo` build failures in sub-agents (#850). Legacy calls that still pass `inputs`/`outputs` are accepted and ignored.
+- Clarify generated tool descriptions for session delegation and agent handoff so agents understand session context semantics (#837). The `session_prompt` ACP tool now states that continuing a prior conversation requires passing the `session_id` returned by an earlier prompt call, and that omitting it starts a new empty session with no prior context. The `handoff` tool description is corrected to reflect that the target agent always starts fresh — prior conversation history is intentionally cleared, and only the `prompt` argument carries context. Documentation-string changes only; no behavior changes.
+- Fix an infinite retry loop in the TUI when a queued message failed to send. Errored messages are now restored as editable drafts instead of being automatically replayed.
+- Add diagnostic instrumentation for the intermittent out-of-memory crash (#842). The TUI event loop now runs a low-overhead memory watchdog that, once per second, logs (at `warn`) a snapshot of process RSS, transcript item count and text size, and the event-channel backlog whenever RSS crosses a doubling threshold — plus a warning when a single tick drains an abnormal number of events (a flooding producer). Compaction now logs when it starts and finishes (with duration) and flags a compaction triggered while another is still running. These surface in the harnx log file, so the next occurrence shows whether the growth is in the transcript/event path or elsewhere. Enable logging (set a non-`off` log level; `info` captures compaction detail) to collect it.
+- Simplify TUI streamed-assistant-text accumulation. Streamed text now coalesces into a single transcript block per unbroken run; an interleaving item (tool call, tool result, notice, source heading) ends the run so the following text starts a fresh block below it. This replaces the previous per-line splitting and the index-based bookkeeping (`streaming_assistant_idx`) with a single open/closed flag and a "look at the trailing item" rule, removing a fragile multi-branch loop.
+- Fix `cargo xtask install` failing with "Text file busy" (ETXTBSY) when a target binary is currently running. The installer now copies to a temp file and atomically renames it over the destination, matching the old `cp -f` behaviour so install works without stopping existing harnx processes.
+
+#### Fix package agents losing their delegation tools when activated directly (#826).
+
+When a package agent (e.g. `pantheon/atlas`) was activated through the async
+`Config::use_agent` path — used by `--agent`, handoff `switch_agent`, and the
+ACP server — the MCP/ACP managers were never re-scoped to the agent's package.
+They stayed in the global scope left by `Config::init`, so every package server
+was emitted with a `<package>__` prefix. Two visible symptoms resulted:
+
+- The agent's own same-package ACP delegation tools were emitted as
+  `<package>__<peer>_session_prompt` instead of the bare `<peer>_session_prompt`
+  its `use_tools` allow-list references, so they were filtered out and the agent
+  could not delegate.
+- Same-package MCP tools leaked in under both `<package>__*` and sibling-package
+  namespaces (e.g. `coding__*`) instead of their bare same-package names.
+
+The intermittency depended on which activation path ran: the synchronous
+`use_agent_obj` path already scoped the managers, while the async `use_agent`
+path did not. `use_agent` now mirrors `use_agent_obj` and re-scopes the managers
+to the incoming agent's package before the agent's tools are snapshotted.
+
+#### Fix two TUI rendering issues:
+
+- Tool-use confirmation prompts (`PreToolUse` hooks returning `ask`) now render as a native ratatui modal instead of an `inquire` terminal prompt that collided with the alternate-screen TUI, producing garbled, interleaved output (#695). Answer with `y` to allow; `n`/`Esc`/`Enter` deny.
+- The agent welcome banner no longer prints a dangling `v` when an agent has no `version` set — the header now reads `# agent-name` instead of `# agent-name v`.
+
 ## 0.32.5 (2026-06-10)
 
 ### Fixes

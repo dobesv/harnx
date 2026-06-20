@@ -1,6 +1,42 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.3.0 (2026-06-20)
+
+### Breaking Changes
+
+- The --acp <agent> flag has been removed from the harnx
+binary. Use the standalone harnx-acp-server <agent> binary instead.
+- derive client name from filename stem and ignore in-file name field (#824)
+
+### Features
+
+- auto-whitelist Go caches and support arbitrary $VAR expansion (#800)
+- extract ACP server and fix same-package delegation (#810)
+- add llama-server LLM provider for local GGUF models (#817)
+- support per-model GGUF configuration and HuggingFace auto-download (#821)
+- view compaction result details (#828)
+- auto-whitelist Homebrew prefix and fix /usr/local defaults (#831)
+- externalize image attachments to content-addressed files (cid refs) (#843)
+- flattened-text summarization keeping recent turns verbatim (#846)
+- harnx_agent_session_history_read tool (#851)
+- configurable keep-recent/truncation knobs on the compaction agent (#857)
+- instrument the intermittent OOM (#842) with a memory watchdog (#864)
+- add automatic session garbage collection and cleanup (#868)
+- implement provider-side upload-by-reference for attachments (#871)
+- grant session-history tool to compaction-enabled agents (#879)
+- add info agent and info session commands to CLI and TUI (#886)
+
+### Fixes
+
+- install over running binaries without ETXTBSY (#798)
+- scope managers to package on async agent activation (#826) (#832)
+- stop leaking unfiltered tool list into agent system prompt (#863)
+- preserve whitespace-only streaming chunks (#867)
+- append-mode log file (#880) + heap-usage guard for the #842 OOM (#881)
+- add LLM read timeout so stalled requests fail clearly instead of false ACP idle timeout (#874) (#887)
+- Grant the `harnx_agent_session_history_read` tool to every bundled agent configured with a `compaction_agent`, so they can search their pre-compaction session history after a compaction.
+
 ## 0.2.4 (2026-06-10)
 
 ### Fixes

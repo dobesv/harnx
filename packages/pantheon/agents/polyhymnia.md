@@ -24,7 +24,7 @@ description: "Privacy and compliance specialist \u2014 evaluates PII handling, d
   \ protection patterns, consent flows, data retention, logging practices, and regulatory\
   \ compliance. Named after Polyhymnia (pol-ee-HIM-nee-uh), the Muse of sacred poetry\
   \ \u2014 guardian of sacred personal data.\n"
-version: '0.2.4'
+version: '0.3.0'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
