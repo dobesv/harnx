@@ -3966,6 +3966,7 @@ dependencies = [
  "http 1.4.2",
  "indexmap 2.14.0",
  "inquire",
+ "insta",
  "is-terminal",
  "libc",
  "log",

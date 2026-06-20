@@ -16,6 +16,14 @@ impl EnvGuard {
         unsafe { std::env::set_var(key, value) };
         Self { key, prev }
     }
+
+    pub(super) fn new_file(key: &'static str, value: &std::path::Path) -> Self {
+        let prev = std::env::var_os(key);
+        // SAFETY: test-only; concurrent env mutation is prevented by the
+        // global test lock held by the caller while the guard is alive.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, prev }
+    }
 }
 impl Drop for EnvGuard {
     fn drop(&mut self) {

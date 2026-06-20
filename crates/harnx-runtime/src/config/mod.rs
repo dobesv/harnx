@@ -13,6 +13,7 @@ mod persistence_split;
 mod rag_split;
 mod servers_split;
 pub mod session;
+mod session_dump;
 mod session_log_split;
 pub mod session_meta;
 mod session_ops_split;
@@ -21,6 +22,7 @@ mod settings_split;
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;
 pub(crate) use self::persistence_split::collect_tool_calls;
+pub use self::session_dump::render_session_dump;
 pub(crate) use self::session_log_split::{
     adjust_range_for_tool_pairs, split_session_log_documents, validate_edited_session_documents,
     validate_tool_pair_integrity,
@@ -28,8 +30,8 @@ pub(crate) use self::session_log_split::{
 
 pub use self::agent::TEMP_AGENT_NAME;
 pub use self::agent::{
-    complete_agent_variables, list_agents, list_assistant_agents, Agent, AgentConfig,
-    AgentVariables,
+    apply_package_agent_transforms, complete_agent_variables, list_agents, list_assistant_agents,
+    render_agent_dump, Agent, AgentConfig, AgentVariables,
 };
 pub(crate) use self::attachments::attachments_dir_for;
 pub use self::attachments::{write_attachment, Base64Encoder};
@@ -1146,6 +1148,64 @@ impl Config {
             agent.set_session_variables(variables.clone());
         }
         Ok(())
+    }
+
+    pub fn expand_use_tools(
+        &self,
+        use_tools: Option<&[String]>,
+        active_pkg: Option<&str>,
+    ) -> Vec<String> {
+        // Handle None or empty selectors → empty list (no tools)
+        let use_tools = match use_tools {
+            Some(selectors) if !selectors.is_empty() => selectors,
+            _ => return Vec::new(),
+        };
+
+        let selectors_str = use_tools.join(",");
+        let expanded_selectors = split_tool_selectors(&selectors_str)
+            .into_iter()
+            .flat_map(|selector| {
+                let selector = selector.trim();
+                self.toolsets
+                    .get(selector)
+                    .cloned()
+                    .unwrap_or_else(|| vec![selector.to_string()])
+            })
+            .collect::<Vec<String>>();
+
+        // Wildcard "*" → all tools (use tool_declarations_for_use_tools unchanged)
+        if expanded_selectors.iter().any(|s| s.trim() == "*") {
+            let (declarations, _) =
+                self.tool_declarations_for_use_tools(Some(&selectors_str), active_pkg);
+            return declarations
+                .into_iter()
+                .map(|declaration| declaration.name)
+                .collect();
+        }
+
+        // Explicit selectors → filter declarations to matched names only
+        let selected_names: HashSet<&str> = expanded_selectors
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s as &str)
+            .collect();
+
+        let (declarations, _) =
+            self.tool_declarations_for_use_tools(Some(&selectors_str), active_pkg);
+
+        // Return only tools whose names are in the selected set (plus runtime-injected tools)
+        declarations
+            .into_iter()
+            .filter(|declaration| {
+                // Accept if explicitly selected by name
+                selected_names.contains(declaration.name.as_str()) ||
+                // Accept runtime-injected tools (MCP/ACP tools not in original builtin list)
+                declaration.mcp_server_name.is_some() ||
+                declaration.mcp_tool_name.is_some()
+            })
+            .map(|declaration| declaration.name)
+            .collect()
     }
 
     pub fn tool_declarations_for_use_tools(

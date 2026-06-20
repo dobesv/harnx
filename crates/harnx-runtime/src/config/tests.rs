@@ -4,6 +4,7 @@
 use super::test_support::EnvGuard;
 use super::*;
 use harnx_core::message::MessageRole;
+use std::sync::{Mutex, OnceLock};
 
 #[test]
 fn test_render_status_line() {
@@ -1092,6 +1093,168 @@ async fn use_agent_scopes_managers_to_package_for_delegation_tools() {
         !names.iter().any(|n| n.starts_with("pantheon__")),
         "after use_agent, same-package ACP tools must NOT be `pantheon__`-prefixed; got {names:?}"
     );
+}
+
+static LOG_CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn lock_log_capture() -> std::sync::MutexGuard<'static, ()> {
+    LOG_CAPTURE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+#[test]
+fn expand_use_tools_wildcard_returns_concrete_names() {
+    let config = Config {
+        tools: crate::tool::Tools::init_from_mcp(Some(vec![
+            make_tool_decl("alpha_tool"),
+            make_tool_decl("beta_tool"),
+        ])),
+        ..Config::default()
+    };
+
+    let expanded = config.expand_use_tools(Some(&["*".to_string()]), None);
+
+    assert_eq!(
+        expanded,
+        vec!["alpha_tool", "beta_tool", crate::session_history::TOOL_NAME,]
+    );
+}
+
+#[test]
+fn expand_use_tools_empty_is_graceful() {
+    let config = Config::default();
+
+    let expanded = config.expand_use_tools(None, None);
+
+    assert!(expanded.is_empty());
+}
+
+#[test]
+fn expand_use_tools_mcp_failure_logs_warning_and_continues() {
+    let _log_guard = lock_log_capture();
+    let temp = tempfile::TempDir::new().unwrap();
+    let log_file = temp.path().join("expand-use-tools.log");
+    let _log_path = EnvGuard::new_file("HARNX_LOG_PATH", &log_file);
+    let prev_level = std::env::var_os("HARNX_LOG_LEVEL");
+    // SAFETY: test-only; this test serializes env + logger-adjacent state.
+    unsafe { std::env::set_var("HARNX_LOG_LEVEL", "debug") };
+    let _ = crate::bootstrap::setup_logger(false);
+
+    let mut config = Config {
+        tools: crate::tool::Tools::init_from_mcp(Some(vec![make_tool_decl("local_tool")])),
+        mcp_servers: vec![harnx_mcp::McpServerConfig {
+            name: "broken".to_string(),
+            command: std::env::current_exe().unwrap().display().to_string(),
+            args: vec!["--definitely-not-a-valid-harnx-flag".to_string()],
+            env: std::collections::HashMap::new(),
+            roots: vec![],
+            enabled: true,
+            description: None,
+            rename_tools: std::collections::HashMap::new(),
+            tool_templates: std::collections::HashMap::new(),
+            hooks: None,
+            package: None,
+        }],
+        ..Config::default()
+    };
+    config.reinit_managers_for_agent(None);
+
+    let expanded = config.expand_use_tools(Some(&["*".to_string()]), None);
+
+    match prev_level {
+        Some(value) => unsafe { std::env::set_var("HARNX_LOG_LEVEL", value) },
+        None => unsafe { std::env::remove_var("HARNX_LOG_LEVEL") },
+    }
+
+    assert_eq!(
+        expanded,
+        vec!["local_tool", crate::session_history::TOOL_NAME]
+    );
+    let log = std::fs::read_to_string(log_file).unwrap_or_default();
+    assert!(
+        log.contains("MCP server 'broken' connection failed"),
+        "expected MCP warning in log, got: {log}"
+    );
+}
+
+// ── expand_use_tools regression tests (#886 filtering) ──────────────────────
+
+/// Regression test for #886: explicit selector must return ONLY that tool,
+/// not ALL builtin tools (the bug was that tool_declarations_for_use_tools
+/// starts from ALL builtins and only ADDS MCP/ACP/handoff tools, never filtering).
+#[test]
+fn expand_use_tools_explicit_selector_returns_only_that_tool() {
+    let config = Config {
+        tools: crate::tool::Tools::init_from_mcp(Some(vec![
+            make_tool_decl("fs_read"),
+            make_tool_decl("fs_write"),
+            make_tool_decl("bash_exec"),
+            make_tool_decl("fetch_fetch_markdown"),
+        ])),
+        ..Config::default()
+    };
+
+    // Explicit selector => only fs_read, NOT all builtins
+    let expanded = config.expand_use_tools(Some(&["fs_read".to_string()]), None);
+
+    // Should have ONLY fs_read (bug was: would have ALL builtins)
+    assert_eq!(expanded, vec!["fs_read"]);
+}
+
+/// Wildcard '*' must still return all available tools.
+#[test]
+fn expand_use_tools_wildcard_returns_all_tools() {
+    let config = Config {
+        tools: crate::tool::Tools::init_from_mcp(Some(vec![
+            make_tool_decl("alpha_tool"),
+            make_tool_decl("beta_tool"),
+        ])),
+        ..Config::default()
+    };
+
+    let expanded = config.expand_use_tools(Some(&["*".to_string()]), None);
+
+    // Wildcard returns all tools
+    assert!(expanded.contains(&"alpha_tool".to_string()));
+    assert!(expanded.contains(&"beta_tool".to_string()));
+    assert!(expanded.contains(&crate::session_history::TOOL_NAME.to_string()));
+}
+
+/// Empty selectors list should return empty (no tools).
+#[test]
+fn expand_use_tools_empty_list_returns_empty() {
+    let config = Config {
+        tools: crate::tool::Tools::init_from_mcp(Some(vec![make_tool_decl("fs_read")])),
+        ..Config::default()
+    };
+
+    let expanded = config.expand_use_tools(Some(&[]), None);
+    assert!(expanded.is_empty());
+}
+
+/// Multiple explicit selectors return only those selected (no others).
+#[test]
+fn expand_use_tools_multiple_explicit_selectors_returns_only_those() {
+    let config = Config {
+        tools: crate::tool::Tools::init_from_mcp(Some(vec![
+            make_tool_decl("fs_read"),
+            make_tool_decl("fs_write"),
+            make_tool_decl("bash_exec"),
+        ])),
+        ..Config::default()
+    };
+
+    let expanded = config.expand_use_tools(
+        Some(&["fs_read".to_string(), "bash_exec".to_string()]),
+        None,
+    );
+
+    // Should have exactly fs_read and bash_exec
+    assert_eq!(expanded.len(), 2);
+    assert!(expanded.contains(&"fs_read".to_string()));
+    assert!(expanded.contains(&"bash_exec".to_string()));
 }
 
 // ── SessionHistoryProvider::call_tool end-to-end ─────────────────────────

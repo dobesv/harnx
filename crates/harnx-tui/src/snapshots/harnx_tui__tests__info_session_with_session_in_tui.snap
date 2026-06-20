@@ -1,15 +1,10 @@
 ---
 source: crates/harnx-tui/src/tests.rs
-assertion_line: 731
 expression: rendered
 ---
-Welcome to harnx [VERSION]  •  Type .help for commands, Tab to
-complete.
-💬  info-session-with-session-test
-model               mock:mock-model (vision: false)
-save_session        true
-tokens              0
-turns               0
+Compacted session───────────────────────────────────────────
+Error: session 'info-session-with-session-test' not found
+for agent '<top-level>'
 
 
 
@@ -18,4 +13,10 @@ turns               0
 
 
 
-• 💬  info-session-with-session-test
+
+
+
+
+
+────────────────────────────────────────────────────────────
+ ↑↓/scroll  e/edit  d/delete  r/rewind  c/copy  ESC/back

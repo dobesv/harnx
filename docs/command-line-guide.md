@@ -51,9 +51,9 @@ harnx -s session1                              # Use session 'session1'
 harnx -a agent1                                # Use agent 'agent1'
 harnx --rag rag1                               # Use RAG 'rag1'
 
+harnx info agent agent1                        # View agent info
+harnx info session agent1 session1             # View session info
 harnx --info                                   # View system info
-harnx -s session1 --info                       # View session info
-harnx -a agent1 --info                         # View agent info
 harnx --rag rag1 --info                        # View RAG info
 
 harnx --macro macro1                           # Execute macro 'macro1'
@@ -112,3 +112,21 @@ $ harnx --serve 0.0.0.0
 $ harnx --serve 8080
 $ harnx --serve 0.0.0.0:8080
 ```
+
+## Inspect Agents and Sessions
+
+Use the `info` subcommand to inspect the state of agents and sessions.
+
+### `harnx info agent <name>`
+
+Prints the fully-rendered agent configuration to stdout. This includes:
+- YAML front-matter with package patches applied and `use_tools` wildcards expanded to concrete tool names via live MCP servers.
+- The system prompt with all variables and templates (MiniJinja) interpolated.
+
+If an MCP server fails during tool expansion, a warning is logged to stderr, and the command continues with the remaining tools.
+
+### `harnx info session <agent-name> <session-id>`
+
+Prints the session state (model, tokens, variables, history, and snapshots) to stdout.
+- This command does **not** include the system prompt.
+- It does **not** launch MCP servers.

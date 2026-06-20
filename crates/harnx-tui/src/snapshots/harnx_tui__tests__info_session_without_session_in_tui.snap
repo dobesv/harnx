@@ -2,9 +2,9 @@
 source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
-Welcome to harnx [VERSION]  •  Type .help for commands, Tab to
-complete.
-error: No session
+Compacted session───────────────────────────────────────────
+Error: No active session or insufficient arguments. Usage:
+.info session [<agent> <id>]
 
 
 
@@ -13,4 +13,6 @@ error: No session
 
 
 
-• Input
+
+────────────────────────────────────────────────────────────
+ ↑↓/scroll  e/edit  d/delete  r/rewind  c/copy  ESC/back

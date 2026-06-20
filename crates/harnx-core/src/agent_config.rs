@@ -232,6 +232,26 @@ impl AgentConfig {
         }
     }
 
+    pub fn export_rendered(&self, expanded_tools: &[String]) -> Result<String> {
+        let mut metadata = AgentFrontMatter::from_config(self);
+        metadata.use_tools = Some(expanded_tools.to_vec());
+        // Clear instructions so the rendered body is the single source of the prompt.
+        // Without this, interpolated_instructions() would prefer the raw `instructions`
+        // field over the body on reparse via from_markdown, reintroducing template vars.
+        metadata.instructions = None;
+        let body = self.interpolated_instructions()?;
+        if metadata.is_empty() {
+            Ok(format!("{}\n", body))
+        } else {
+            let metadata = serialize_frontmatter(&metadata)?;
+            if body.is_empty() {
+                Ok(format!("---\n{}\n---\n", metadata))
+            } else {
+                Ok(format!("---\n{}\n---\n\n{}\n", metadata, body))
+            }
+        }
+    }
+
     pub fn banner(&self) -> String {
         let starters = if self.conversation_starters.is_empty() {
             String::new()
@@ -713,6 +733,29 @@ You are a compaction agent.\n";
         agent.set_shared_variables(variables);
         let result = agent.interpolated_instructions().unwrap();
         assert_eq!(result, "Hello harnx");
+    }
+
+    #[test]
+    fn export_rendered_roundtrips_with_interpolated_body_and_expanded_tools() {
+        let content = "---\nmodel: openai:gpt-4o\nuse_tools:\n  - fs:*\nvariables:\n  - name: project_name\n    description: Project name\nconversation_starters:\n  - Say hi\n---\nHello {{project_name}} from {{agent.name}}.";
+        let mut agent = AgentConfig::from_markdown("render-agent", content).unwrap();
+        let mut variables = AgentVariables::default();
+        variables.insert("project_name".to_string(), "harnx".to_string());
+        agent.set_shared_variables(variables);
+        let expanded_tools = vec!["fs_read".to_string(), "fs_write".to_string()];
+
+        let exported = agent.export_rendered(&expanded_tools).unwrap();
+
+        assert!(exported.contains("use_tools:\n- fs_read\n- fs_write\n"));
+        assert!(exported.contains("\n\nHello harnx from render-agent.\n"));
+        assert!(!exported.contains("{{project_name}}"));
+        let reparsed = AgentConfig::from_markdown("render-agent", &exported).unwrap();
+        assert_eq!(reparsed.use_tools, Some(expanded_tools));
+        assert_eq!(reparsed.prompt, "Hello harnx from render-agent.");
+        assert_eq!(
+            reparsed.interpolated_instructions().unwrap(),
+            "Hello harnx from render-agent."
+        );
     }
 
     #[test]

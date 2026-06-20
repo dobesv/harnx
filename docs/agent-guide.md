@@ -298,7 +298,7 @@ harnx --agent coder --agent-variable language=rust "write a web server"
 
 ```
 .agent <name>        Switch to an agent
-.info agent          Show current agent info
+.info agent [<name>] Show fully-rendered agent config (interpolated)
 .edit agent          Edit the agent's .md file
 .save agent [name]   Save current agent configuration
 ```
