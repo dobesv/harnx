@@ -2101,6 +2101,23 @@ impl Tui {
             || line_cmd.starts_with(".delete message ")
             || line_cmd.starts_with(".rewind ");
 
+        self.finish_command(
+            result,
+            clean,
+            (line, prev_session, prev_agent, is_mutation_command),
+        )
+        .await;
+
+        Ok(())
+    }
+
+    async fn finish_command(
+        &mut self,
+        result: Result<harnx_runtime::commands::CommandOutcome>,
+        clean: String,
+        ctx: (&str, Option<String>, Option<String>, bool),
+    ) {
+        let (line, prev_session, prev_agent, is_mutation_command) = ctx;
         match result {
             Ok(outcome) => {
                 self.maybe_open_picker_after_command(outcome, prev_agent.clone())
@@ -2133,7 +2150,6 @@ impl Tui {
                     .push(TranscriptItem::ErrorText(pretty_error_string(&err)));
             }
         }
-        Ok(())
     }
 }
 
