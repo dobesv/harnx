@@ -17,9 +17,9 @@ messages:
   content: hi there
 snapshot:
   id: snapshots/render
-  path: [TMP]/agents/smith/sessions/snapshots/render.yaml
+  path: [SESSION_PATH]
   session_id: session-123
-  working_dir: [TMP]/work
+  working_dir: [WORKING_DIR]
   git_branch: main
   git_remote: origin
   terminal_session_id: term-1

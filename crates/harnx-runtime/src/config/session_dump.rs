@@ -165,23 +165,19 @@ mod tests {
     use tempfile::TempDir;
 
     fn normalize_session_dump_for_snapshot(dump: &str) -> String {
-        let dump = dump.to_string();
-        let temp_dir = std::env::temp_dir().display().to_string();
-        let dump = dump.replace(&temp_dir, "[TMP]");
-        let dump = dump
-            .lines()
+        dump.lines()
             .filter(|line| !line.starts_with("assertion_line: "))
+            .map(|line| {
+                if line.starts_with("  path: ") {
+                    "  path: [SESSION_PATH]"
+                } else if line.starts_with("  working_dir: ") {
+                    "  working_dir: [WORKING_DIR]"
+                } else {
+                    line
+                }
+            })
             .collect::<Vec<_>>()
-            .join("\n");
-        let start = dump.find("path: [TMP]/").unwrap_or(0);
-        if let Some(rel_end) = dump[start..].find("/agents/") {
-            let prefix_end = start + rel_end;
-            let mut normalized = dump.clone();
-            normalized.replace_range(start + "path: ".len()..prefix_end, "[TMP]");
-            normalized
-        } else {
-            dump
-        }
+            .join("\n")
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
