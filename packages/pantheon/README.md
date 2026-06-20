@@ -56,7 +56,7 @@ long conversations within token limits.
 Install from GHCR (replace `v0.1.0` with the current release):
 
 ```sh
-harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.2.4
+harnx-pkg add ghcr.io/dobesv/harnx-packages/pantheon v0.3.0
 ```
 
 Then set your API keys in `~/.local/share/harnx/.env`:
