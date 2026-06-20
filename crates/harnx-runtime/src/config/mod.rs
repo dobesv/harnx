@@ -1155,11 +1155,55 @@ impl Config {
         use_tools: Option<&[String]>,
         active_pkg: Option<&str>,
     ) -> Vec<String> {
-        let selectors = use_tools.map(|selectors| selectors.join(","));
+        // Handle None or empty selectors → empty list (no tools)
+        let use_tools = match use_tools {
+            Some(selectors) if !selectors.is_empty() => selectors,
+            _ => return Vec::new(),
+        };
+
+        let selectors_str = use_tools.join(",");
+        let expanded_selectors = split_tool_selectors(&selectors_str)
+            .into_iter()
+            .flat_map(|selector| {
+                let selector = selector.trim();
+                self.toolsets
+                    .get(selector)
+                    .cloned()
+                    .unwrap_or_else(|| vec![selector.to_string()])
+            })
+            .collect::<Vec<String>>();
+
+        // Wildcard "*" → all tools (use tool_declarations_for_use_tools unchanged)
+        if expanded_selectors.iter().any(|s| s.trim() == "*") {
+            let (declarations, _) =
+                self.tool_declarations_for_use_tools(Some(&selectors_str), active_pkg);
+            return declarations
+                .into_iter()
+                .map(|declaration| declaration.name)
+                .collect();
+        }
+
+        // Explicit selectors → filter declarations to matched names only
+        let selected_names: HashSet<&str> = expanded_selectors
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s as &str)
+            .collect();
+
         let (declarations, _) =
-            self.tool_declarations_for_use_tools(selectors.as_deref(), active_pkg);
+            self.tool_declarations_for_use_tools(Some(&selectors_str), active_pkg);
+
+        // Return only tools whose names are in the selected set (plus runtime-injected tools)
         declarations
             .into_iter()
+            .filter(|declaration| {
+                // Accept if explicitly selected by name
+                selected_names.contains(declaration.name.as_str()) ||
+                // Accept runtime-injected tools (MCP/ACP tools not in original builtin list)
+                declaration.mcp_server_name.is_some() ||
+                declaration.mcp_tool_name.is_some()
+            })
             .map(|declaration| declaration.name)
             .collect()
     }

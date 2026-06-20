@@ -235,6 +235,10 @@ impl AgentConfig {
     pub fn export_rendered(&self, expanded_tools: &[String]) -> Result<String> {
         let mut metadata = AgentFrontMatter::from_config(self);
         metadata.use_tools = Some(expanded_tools.to_vec());
+        // Clear instructions so the rendered body is the single source of the prompt.
+        // Without this, interpolated_instructions() would prefer the raw `instructions`
+        // field over the body on reparse via from_markdown, reintroducing template vars.
+        metadata.instructions = None;
         let body = self.interpolated_instructions()?;
         if metadata.is_empty() {
             Ok(format!("{}\n", body))

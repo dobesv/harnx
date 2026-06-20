@@ -700,19 +700,20 @@ pub fn render_agent_dump(config: &Config, agent_name: &str) -> Result<String> {
     resolve_file_backed_variables(agent_config.variables_mut(), &agent_dir)?;
 
     // Step 4: Initialize shared_variables for template interpolation
-    // Use agent_variables if provided via CLI, otherwise use file-backed defaults
-    let shared_variables = if let Some(variables) = &config.agent_variables {
-        variables.clone()
-    } else {
-        // Initialize from defined_variables with file defaults
-        let mut vars = AgentVariables::default();
-        for v in agent_config.defined_variables() {
-            if let Some(default) = &v.default {
-                vars.insert(v.name.clone(), default.clone());
-            }
+    // Start from defined-variable defaults, then overlay CLI-provided agent_variables
+    // (CLI values win; unspecified vars keep their defaults). This ensures a single
+    // CLI override doesn't wipe out other defaults (which would make MiniJinja
+    // Strict-undefined interpolation fail).
+    let mut shared_variables = AgentVariables::default();
+    for v in agent_config.defined_variables() {
+        if let Some(default) = &v.default {
+            shared_variables.insert(v.name.clone(), default.clone());
         }
-        vars
-    };
+    }
+    if let Some(variables) = &config.agent_variables {
+        // Overlay CLI-provided values on top of defaults (CLI wins)
+        shared_variables.extend(variables.clone());
+    }
     agent_config.set_shared_variables(shared_variables);
 
     // Step 5: Expand use_tools via Config::expand_use_tools
@@ -726,3 +727,7 @@ pub fn render_agent_dump(config: &Config, agent_name: &str) -> Result<String> {
 #[cfg(test)]
 #[path = "agent_tests.rs"]
 mod agent_tests;
+
+#[cfg(test)]
+#[path = "agent_dump_tests.rs"]
+mod agent_dump_tests;

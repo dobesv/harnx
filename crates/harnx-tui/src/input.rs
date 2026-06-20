@@ -1960,93 +1960,103 @@ impl Tui {
         self.pin_transcript_to_bottom();
     }
 
-    pub(super) async fn run_command(&mut self, line: &str) -> Result<()> {
-        let line_cmd = line.trim_start();
+    fn try_handle_info_overlay(&mut self, line_cmd: &str) -> bool {
+        let is_info_agent =
+            line_cmd.starts_with(".info agent") || line_cmd.starts_with("/info agent");
+        let is_info_session =
+            line_cmd.starts_with(".info session") || line_cmd.starts_with("/info session");
 
-        // Intercept `.info agent` and `.info session` commands to render their output
-        // into the detail-view overlay instead of the transcript.
-        let is_info_cmd = line_cmd.starts_with(".info agent")
-            || line_cmd.starts_with(".info session")
-            || line_cmd.starts_with("/info agent")
-            || line_cmd.starts_with("/info session");
+        if !is_info_agent && !is_info_session {
+            return false;
+        }
 
-        if is_info_cmd {
-            let tokens = match shell_words::split(line_cmd) {
-                Ok(t) => t,
-                Err(_) => {
-                    self.app.transcript.push(TranscriptItem::ErrorText(
-                        "Unclosed quotes in command".to_string(),
-                    ));
-                    return Ok(());
-                }
-            };
+        let Ok(tokens) = shell_words::split(line_cmd) else {
+            self.app.transcript.push(TranscriptItem::ErrorText(
+                "Unclosed quotes in command".to_string(),
+            ));
+            return true;
+        };
 
-            if tokens.len() >= 2 {
-                let cmd = tokens[0].as_str();
-                let subcmd = tokens[1].as_str();
-                if (cmd == ".info" || cmd == "/info") && (subcmd == "agent" || subcmd == "session")
-                {
-                    let result: anyhow::Result<String> = if subcmd == "agent" {
-                        let agent_name = if tokens.len() > 2 {
-                            tokens[2].clone()
-                        } else {
-                            match self.config.read().agent.as_ref() {
-                                Some(a) => a.name().to_string(),
-                                None => String::new(),
-                            }
-                        };
+        let result = if is_info_agent {
+            self.resolve_info_agent_target(&tokens)
+                .and_then(|agent_name| {
+                    let cfg = self.config.read();
+                    harnx_runtime::config::render_agent_dump(&cfg, &agent_name)
+                })
+        } else {
+            self.resolve_info_session_target(&tokens)
+                .and_then(|(agent_name, session_id)| {
+                    harnx_runtime::config::render_session_dump(agent_name.as_deref(), &session_id)
+                })
+        };
 
-                        if agent_name.is_empty() {
-                            Err(anyhow::anyhow!("No active agent and no agent name provided. Usage: .info agent [<name>]"))
-                        } else {
-                            let cfg = self.config.read();
-                            harnx_runtime::config::render_agent_dump(&cfg, &agent_name)
-                        }
-                    } else {
-                        // session
-                        let (agent_name, session_id) = if tokens.len() > 3 {
-                            (Some(tokens[2].clone()), tokens[3].clone())
-                        } else if tokens.len() == 3 {
-                            let cfg = self.config.read();
-                            let a = cfg.agent.as_ref().map(|x| x.name().to_string());
-                            (a, tokens[2].clone())
-                        } else {
-                            let cfg = self.config.read();
-                            let a = cfg.agent.as_ref().map(|x| x.name().to_string());
-                            let s = cfg.session.as_ref().map(|x| x.id().to_string());
-                            match (a, s) {
-                                (Some(agent), Some(session)) => (Some(agent), session),
-                                _ => (None, String::new()),
-                            }
-                        };
+        let display_text = result.unwrap_or_else(|err| format!("Error: {}", err));
+        self.open_info_overlay(display_text);
+        true
+    }
 
-                        if agent_name.is_none() || session_id.is_empty() {
-                            Err(anyhow::anyhow!("No active session or insufficient arguments. Usage: .info session [<agent> <id>]"))
-                        } else {
-                            harnx_runtime::config::render_session_dump(
-                                agent_name.as_deref(),
-                                &session_id,
-                            )
-                        }
-                    };
-
-                    let display_text = match result {
-                        Ok(rendered) => rendered,
-                        Err(err) => format!("Error: {}", err),
-                    };
-
-                    self.app.detail_view_scroll = {
-                        let mut s = ratatui_widget_scrolling::ScrollState::new();
-                        s.follow = false;
-                        s
-                    };
-                    self.app.detail_view_text = Some(display_text);
-                    self.app.detail_view_raw_yaml = None;
-                    self.app.detail_view_open = true;
-
-                    return Ok(());
-                }
+    fn resolve_info_agent_target(&self, tokens: &[String]) -> anyhow::Result<String> {
+        let agent_name = if tokens.len() > 2 {
+            tokens[2].clone()
+        } else {
+            match self.config.read().agent.as_ref() {
+                Some(a) => a.name().to_string(),
+                None => String::new(),
             }
+        };
+
+        if agent_name.is_empty() {
+            Err(anyhow::anyhow!(
+                "No active agent and no agent name provided. Usage: .info agent [<name>]"
+            ))
+        } else {
+            Ok(agent_name)
+        }
+    }
+
+    fn resolve_info_session_target(
+        &self,
+        tokens: &[String],
+    ) -> anyhow::Result<(Option<String>, String)> {
+        let (agent_name, session_id) = if tokens.len() > 3 {
+            (Some(tokens[2].clone()), tokens[3].clone())
+        } else if tokens.len() == 3 {
+            let cfg = self.config.read();
+            let a = cfg.agent.as_ref().map(|x| x.name().to_string());
+            (a, tokens[2].clone())
+        } else {
+            let cfg = self.config.read();
+            let a = cfg.agent.as_ref().map(|x| x.name().to_string());
+            let s = cfg.session.as_ref().map(|x| x.id().to_string());
+            match (a, s) {
+                (a_opt, Some(session)) => (a_opt, session),
+                _ => (None, String::new()),
+            }
+        };
+
+        if session_id.is_empty() {
+            Err(anyhow::anyhow!(
+                "No active session or insufficient arguments. Usage: .info session [<agent> <id>]"
+            ))
+        } else {
+            Ok((agent_name, session_id))
+        }
+    }
+
+    fn open_info_overlay(&mut self, text: String) {
+        self.app.detail_view_scroll = {
+            let mut s = ratatui_widget_scrolling::ScrollState::new();
+            s.follow = false;
+            s
+        };
+        self.app.detail_view_text = Some(text);
+        self.app.detail_view_raw_yaml = None;
+        self.app.detail_view_open = true;
+    }
+
+    pub(super) async fn run_command(&mut self, line: &str) -> Result<()> {
+        if self.try_handle_info_overlay(line.trim_start()) {
+            return Ok(());
         }
         let prev_session = self
             .config

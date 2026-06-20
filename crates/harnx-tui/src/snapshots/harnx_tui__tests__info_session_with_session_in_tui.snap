@@ -3,8 +3,8 @@ source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
 Compacted session───────────────────────────────────────────
-Error: No active session or insufficient arguments. Usage:
-.info session [<agent> <id>]
+Error: session 'info-session-with-session-test' not found
+for agent '<top-level>'
 
 
 

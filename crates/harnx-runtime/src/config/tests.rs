@@ -1179,6 +1179,84 @@ fn expand_use_tools_mcp_failure_logs_warning_and_continues() {
     );
 }
 
+// ── expand_use_tools regression tests (#886 filtering) ──────────────────────
+
+/// Regression test for #886: explicit selector must return ONLY that tool,
+/// not ALL builtin tools (the bug was that tool_declarations_for_use_tools
+/// starts from ALL builtins and only ADDS MCP/ACP/handoff tools, never filtering).
+#[test]
+fn expand_use_tools_explicit_selector_returns_only_that_tool() {
+    let config = Config {
+        tools: crate::tool::Tools::init_from_mcp(Some(vec![
+            make_tool_decl("fs_read"),
+            make_tool_decl("fs_write"),
+            make_tool_decl("bash_exec"),
+            make_tool_decl("fetch_fetch_markdown"),
+        ])),
+        ..Config::default()
+    };
+
+    // Explicit selector => only fs_read, NOT all builtins
+    let expanded = config.expand_use_tools(Some(&["fs_read".to_string()]), None);
+
+    // Should have ONLY fs_read (bug was: would have ALL builtins)
+    assert_eq!(expanded, vec!["fs_read"]);
+}
+
+/// Wildcard '*' must still return all available tools.
+#[test]
+fn expand_use_tools_wildcard_returns_all_tools() {
+    let config = Config {
+        tools: crate::tool::Tools::init_from_mcp(Some(vec![
+            make_tool_decl("alpha_tool"),
+            make_tool_decl("beta_tool"),
+        ])),
+        ..Config::default()
+    };
+
+    let expanded = config.expand_use_tools(Some(&["*".to_string()]), None);
+
+    // Wildcard returns all tools
+    assert!(expanded.contains(&"alpha_tool".to_string()));
+    assert!(expanded.contains(&"beta_tool".to_string()));
+    assert!(expanded.contains(&crate::session_history::TOOL_NAME.to_string()));
+}
+
+/// Empty selectors list should return empty (no tools).
+#[test]
+fn expand_use_tools_empty_list_returns_empty() {
+    let config = Config {
+        tools: crate::tool::Tools::init_from_mcp(Some(vec![make_tool_decl("fs_read")])),
+        ..Config::default()
+    };
+
+    let expanded = config.expand_use_tools(Some(&[]), None);
+    assert!(expanded.is_empty());
+}
+
+/// Multiple explicit selectors return only those selected (no others).
+#[test]
+fn expand_use_tools_multiple_explicit_selectors_returns_only_those() {
+    let config = Config {
+        tools: crate::tool::Tools::init_from_mcp(Some(vec![
+            make_tool_decl("fs_read"),
+            make_tool_decl("fs_write"),
+            make_tool_decl("bash_exec"),
+        ])),
+        ..Config::default()
+    };
+
+    let expanded = config.expand_use_tools(
+        Some(&["fs_read".to_string(), "bash_exec".to_string()]),
+        None,
+    );
+
+    // Should have exactly fs_read and bash_exec
+    assert_eq!(expanded.len(), 2);
+    assert!(expanded.contains(&"fs_read".to_string()));
+    assert!(expanded.contains(&"bash_exec".to_string()));
+}
+
 // ── SessionHistoryProvider::call_tool end-to-end ─────────────────────────
 
 /// Exercises the full `call_tool` path of `SessionHistoryProvider`: build a

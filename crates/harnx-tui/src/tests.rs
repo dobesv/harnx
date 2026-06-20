@@ -8413,6 +8413,22 @@ async fn enter_on_compaction_marker_opens_full_detail_view() {
     }));
 }
 
+fn assert_info_overlay_open(tui: &crate::Tui, initial_transcript_len: Option<usize>) -> &str {
+    assert!(tui.app.detail_view_open, "Detail view should be open");
+    assert!(
+        tui.app.detail_view_text.is_some(),
+        "Detail view text should be populated"
+    );
+    if let Some(len) = initial_transcript_len {
+        assert_eq!(
+            tui.app.transcript.len(),
+            len,
+            "Transcript should not be appended to"
+        );
+    }
+    tui.app.detail_view_text.as_ref().unwrap()
+}
+
 #[tokio::test]
 async fn test_info_agent_opens_detail_view() {
     let mut harness = TuiTestHarness::with_size(80, 24).await;
@@ -8431,25 +8447,10 @@ async fn test_info_agent_opens_detail_view() {
 
     tui.run_command(".info agent").await.unwrap();
 
-    assert!(
-        tui.app.detail_view_open,
-        "Detail view should be open after .info agent"
-    );
-    assert!(
-        tui.app.detail_view_text.is_some(),
-        "Detail view text should be populated"
-    );
-    let text = tui.app.detail_view_text.as_ref().unwrap();
+    let text = assert_info_overlay_open(tui, Some(initial_transcript_len));
     assert!(
         text.contains("Hello world") || text.contains("test-agent") || text.contains("Error:"),
         "Detail view should contain agent info or error"
-    );
-
-    // Ensure transcript was NOT modified
-    assert_eq!(
-        tui.app.transcript.len(),
-        initial_transcript_len,
-        "Transcript should not be appended to"
     );
 }
 
@@ -8464,25 +8465,10 @@ async fn test_info_session_opens_detail_view() {
 
     tui.run_command(".info session").await.unwrap();
 
-    assert!(
-        tui.app.detail_view_open,
-        "Detail view should be open after .info session"
-    );
-    assert!(
-        tui.app.detail_view_text.is_some(),
-        "Detail view text should be populated"
-    );
-    let text = tui.app.detail_view_text.as_ref().unwrap();
+    let text = assert_info_overlay_open(tui, Some(initial_transcript_len));
     assert!(
         text.contains("Error:") || text.contains("No active session"),
         "Should show error since no session is active"
-    );
-
-    // Ensure transcript was NOT modified
-    assert_eq!(
-        tui.app.transcript.len(),
-        initial_transcript_len,
-        "Transcript should not be appended to"
     );
 }
 
@@ -8498,15 +8484,7 @@ async fn test_info_session_single_arg_with_active_agent() {
     // by pairing the active agent with `some-id`.
     tui.run_command(".info session some-id").await.unwrap();
 
-    assert!(
-        tui.app.detail_view_open,
-        "Detail view should be open after .info session some-id"
-    );
-    assert!(
-        tui.app.detail_view_text.is_some(),
-        "Detail view text should be populated"
-    );
-    let text = tui.app.detail_view_text.as_ref().unwrap();
+    let text = assert_info_overlay_open(tui, None);
     assert!(
         !text.contains("insufficient arguments"),
         "Should not complain about insufficient arguments when single arg provided with active agent. Text: {}",
@@ -8515,5 +8493,29 @@ async fn test_info_session_single_arg_with_active_agent() {
     assert!(
         !text.contains("No active session or insufficient arguments"),
         "Should not give the default usage error"
+    );
+}
+#[tokio::test]
+async fn test_info_session_single_arg_no_active_agent() {
+    let mut harness = TuiTestHarness::with_size(80, 24).await;
+    let tui = harness.tui();
+
+    // No active agent, no active session. .info session some-id should be treated as top-level session.
+    tui.run_command(".info session some-id").await.unwrap();
+
+    let text = assert_info_overlay_open(tui, None);
+    assert!(
+        !text.contains("insufficient arguments"),
+        "Should not complain about insufficient arguments when single arg provided without active agent. Text: {}",
+        text
+    );
+    assert!(
+        !text.contains("No active session or insufficient arguments"),
+        "Should not give the default usage error"
+    );
+    assert!(
+        text.contains("Error:"),
+        "Should attempt to look up session and likely fail with 'Error: ... not found' instead of usage error. Text: {}",
+        text
     );
 }

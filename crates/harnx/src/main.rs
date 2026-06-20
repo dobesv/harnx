@@ -63,14 +63,7 @@ async fn main() -> Result<()> {
     } else {
         WorkingMode::Cmd
     };
-    let info_flag = cli.info
-        || cli.sync_models
-        || cli.list_models
-        || cli.list_agents
-        || cli.list_assistant_agents
-        || cli.list_rags
-        || cli.list_macros
-        || cli.list_sessions;
+    let info_flag = legacy_info_flag(&cli);
     setup_logger(working_mode.is_serve())?;
     harnx_core::alloc_guard::init_from_env();
     let config = Arc::new(RwLock::new(
@@ -103,6 +96,17 @@ async fn run_command(command: &Commands) -> Result<()> {
             }
         },
     }
+}
+
+fn legacy_info_flag(cli: &Cli) -> bool {
+    cli.info
+        || cli.sync_models
+        || cli.list_models
+        || cli.list_agents
+        || cli.list_assistant_agents
+        || cli.list_rags
+        || cli.list_macros
+        || cli.list_sessions
 }
 
 async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {

@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::client::MessageRole;
+use crate::client::{Message, MessageRole};
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
@@ -54,7 +54,28 @@ fn load_config_for_session_dump() -> Result<Config> {
 fn build_session_dump(session: &Session) -> Result<String> {
     let mut data = serde_json::Map::new();
     data.insert("model".to_string(), serde_json::json!(session.model().id()));
+    data.insert(
+        "tokens".to_string(),
+        serde_json::Value::Object(build_session_tokens(session)),
+    );
+    data.insert(
+        "agent_variables".to_string(),
+        serde_json::to_value(session.agent_variables())?,
+    );
+    data.insert(
+        "messages".to_string(),
+        serde_json::to_value(build_session_messages(session))?,
+    );
+    data.insert(
+        "snapshot".to_string(),
+        serde_json::Value::Object(build_session_snapshot(session)),
+    );
 
+    serde_yaml::to_string(&serde_json::Value::Object(data))
+        .context("Unable to render state-only session dump")
+}
+
+fn build_session_tokens(session: &Session) -> serde_json::Map<String, serde_json::Value> {
     let mut tokens = serde_json::Map::new();
     let (total_tokens, percent) = session.tokens_usage();
     tokens.insert("total_tokens".to_string(), serde_json::json!(total_tokens));
@@ -70,22 +91,20 @@ fn build_session_dump(session: &Session) -> Result<String> {
             serde_json::json!(format!("{percent}%")),
         );
     }
-    data.insert("tokens".to_string(), serde_json::Value::Object(tokens));
+    tokens
+}
 
-    data.insert(
-        "agent_variables".to_string(),
-        serde_json::to_value(session.agent_variables())?,
-    );
-
-    let messages: Vec<_> = session
+fn build_session_messages(session: &Session) -> Vec<Message> {
+    session
         .compressed_messages
         .iter()
         .chain(session.messages.iter())
         .filter(|message| !matches!(message.role, MessageRole::System))
         .cloned()
-        .collect();
-    data.insert("messages".to_string(), serde_json::to_value(messages)?);
+        .collect()
+}
 
+fn build_session_snapshot(session: &Session) -> serde_json::Map<String, serde_json::Value> {
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("id".to_string(), serde_json::json!(session.id()));
     snapshot.insert("path".to_string(), serde_json::json!(session.path));
@@ -133,13 +152,10 @@ fn build_session_dump(session: &Session) -> Result<String> {
         "log_entry_count".to_string(),
         serde_json::json!(session.log_entry_count),
     );
-    data.insert("snapshot".to_string(), serde_json::Value::Object(snapshot));
-
-    serde_yaml::to_string(&serde_json::Value::Object(data))
-        .context("Unable to render state-only session dump")
+    snapshot
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::render_session_dump;
     use crate::config::{paths, test_support::EnvGuard};
@@ -168,7 +184,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         match LOCK.get_or_init(|| Mutex::new(())).lock() {
@@ -193,7 +208,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn render_session_dump_resolves_scope_and_omits_system_prompt() {
         let _lock = env_lock();
         let tmp = TempDir::new().unwrap();
@@ -242,7 +256,6 @@ content: hi there
     }
 
     #[test]
-    #[cfg(unix)]
     fn render_session_dump_snapshot_is_stable_and_omits_system_prompt() {
         let _lock = env_lock();
         let tmp = TempDir::new().unwrap();
@@ -298,7 +311,6 @@ content: hi there
     }
 
     #[test]
-    #[cfg(unix)]
     fn render_session_dump_reports_missing_session_clearly() {
         let _lock = env_lock();
         let tmp = TempDir::new().unwrap();
@@ -314,7 +326,6 @@ content: hi there
     }
 
     #[test]
-    #[cfg(unix)]
     fn render_session_dump_warns_on_agent_mismatch_and_continues() {
         let _lock = env_lock();
         let tmp = TempDir::new().unwrap();
@@ -330,7 +341,7 @@ content: hi there
             r#"---
 type: header
 model: openai:test-model
-session_id: session-123
+session_id: session-top
 working_dir: /tmp/work
 agent_name: other-agent
 ---
@@ -347,7 +358,6 @@ content: mismatch ok
     }
 
     #[test]
-    #[cfg(unix)]
     fn render_session_dump_warns_on_requested_agent_mismatch_and_continues() {
         let _lock = env_lock();
         let tmp = TempDir::new().unwrap();
@@ -380,7 +390,6 @@ content: still loads
     }
 
     #[test]
-    #[cfg(unix)]
     fn render_session_dump_loads_clients_from_disk_without_mcp_init() {
         let _lock = env_lock();
         let tmp = TempDir::new().unwrap();
