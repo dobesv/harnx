@@ -16,6 +16,22 @@ birdcage = { workspace = true }
 gix = { workspace = true }
 tempfile = "3"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+bitflags = { workspace = true }
+libc = { workspace = true }
+
 [[bin]]
 name = "harnx-sandbox-exec"
 path = "src/bin/sandbox_exec.rs"
+
+# Test helper invoked by `tests/macos_tty.rs`. Reads stdin termios and writes
+# them back, exiting 0 on success. Not intended for general consumption — the
+# README documents `cargo install --path ... --bin harnx-sandbox-exec` which
+# skips this helper.
+#
+# Name uses underscores rather than the project-standard hyphen because cargo
+# exposes the bin path to integration tests via `CARGO_BIN_EXE_<name>`, and
+# rustc's `env!()` cannot expand environment variable names that contain `-`.
+[[bin]]
+name = "harnx_tty_probe"
+path = "src/bin/tty_probe.rs"

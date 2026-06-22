@@ -1,18 +1,28 @@
 //! Sandbox execution CLI wrapper.
 //!
-//! Configures birdcage sandbox and spawns supplied command.
+//! Configures a birdcage sandbox (Linux) or our own Seatbelt profile (macOS)
+//! and spawns the supplied command. macOS uses an in-tree profile builder so
+//! we can include `(allow file-ioctl)`, which birdcage 0.8.1 omits; see
+//! [`crate::macos_sandbox`].
 
 #[cfg(unix)]
 use std::env;
 #[cfg(unix)]
 use std::ffi::{OsStr, OsString};
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::path::Path;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(unix)]
 use std::process;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use birdcage::{process::Command, Birdcage, Exception, Sandbox};
+
+#[cfg(target_os = "macos")]
+use harnx_sandbox_common::macos_sandbox::MacSandbox;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 #[cfg(unix)]
 struct SandboxConfig {
@@ -130,7 +140,7 @@ fn parse_args() -> Result<Option<SandboxConfig>, String> {
     Err("sandbox-exec: missing -- before command".to_string())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn add_path_exception(
     sandbox: &mut Birdcage,
     path: &Path,
@@ -151,12 +161,66 @@ fn add_path_exception(
         })
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn add_write_exception(sandbox: &mut Birdcage, path: &Path) -> Result<(), String> {
     add_path_exception(sandbox, path, Exception::WriteAndRead)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn run() -> Result<i32, String> {
+    let Some(config) = parse_args()? else {
+        print_usage();
+        return Ok(0);
+    };
+
+    let mut sandbox = MacSandbox::new();
+
+    for path in &config.exec_paths {
+        sandbox.allow_execute_and_read(path)?;
+    }
+    for path in &config.write_paths {
+        sandbox.allow_write_and_read(path)?;
+    }
+    for path in &config.read_paths {
+        sandbox.allow_read(path)?;
+    }
+    if !config.no_network {
+        sandbox.allow_networking();
+    }
+
+    for (key, value) in &config.env_vars {
+        // Put the value in the current process env so MacSandbox's
+        // env-restriction step preserves it for the child.
+        //
+        // SAFETY: `env::set_var` mutates process-global state. This binary
+        // runs single-threaded up to here (`parse_args` and the sandbox
+        // setup never spawn threads, and `MacSandbox::apply_and_spawn` has
+        // not been called yet), so no other thread can be observing the
+        // environment concurrently.
+        unsafe { env::set_var(key, value) };
+        sandbox.allow_env(key.clone());
+    }
+
+    let mut command = {
+        let mut command = Command::new(&config.command[0]);
+        if let Some(working_dir) = &config.working_dir {
+            command.current_dir(working_dir);
+        }
+        command
+    };
+    command.args(&config.command[1..]);
+
+    let mut child = sandbox
+        .apply_and_spawn(command)
+        .map_err(|error| format!("sandbox-exec: failed to spawn process: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("sandbox-exec: failed to wait for child: {error}"))?;
+
+    Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn run() -> Result<i32, String> {
     let Some(config) = parse_args()? else {
         print_usage();
@@ -204,16 +268,6 @@ fn run() -> Result<i32, String> {
             })?;
     }
 
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new(&config.command[0]);
-        if let Some(working_dir) = &config.working_dir {
-            command.current_dir(working_dir);
-        }
-        command
-    };
-
-    #[cfg(not(target_os = "macos"))]
     let mut command = if let Some(working_dir) = &config.working_dir {
         // birdcage::process::Command on Linux lacks current_dir; rely on GNU env's
         // --chdir extension for now. Known limitation on Alpine/Busybox systems.
@@ -254,7 +308,10 @@ fn main() {
     std::process::exit(1);
 }
 
-#[cfg(all(test, unix))]
+// These tests exercise birdcage's `add_path_exception` / `add_write_exception`
+// helpers, which are linux-only after the macOS path moved to `MacSandbox`.
+// `MacSandbox`'s equivalents are covered by unit tests in `macos_sandbox.rs`.
+#[cfg(all(test, unix, not(target_os = "macos")))]
 mod tests {
     use super::*;
     use std::env;

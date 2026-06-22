@@ -22,7 +22,7 @@ For a higher-level wrapper with sensible defaults and hook support, see
 To install `harnx-sandbox-exec` from the `harnx` workspace:
 
 ```sh
-cargo install --path crates/harnx-sandbox-common
+cargo install --path crates/harnx-sandbox-common --bin harnx-sandbox-exec
 ```
 
 ## Usage

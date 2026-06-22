@@ -4,6 +4,8 @@ pub mod config;
 pub mod defaults;
 #[cfg(unix)]
 pub mod home_guard;
+#[cfg(target_os = "macos")]
+pub mod macos_sandbox;
 pub mod path_expand;
 #[cfg(unix)]
 pub mod root_detection;
