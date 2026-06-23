@@ -11,6 +11,7 @@ use harnx_core::{
 fn tool_calls_yaml(call_ids: &[&str]) -> String {
     serde_yaml::to_string(&SessionLogEntry::ToolCalls {
         timestamp: None,
+        fence_token: None,
         text: String::new(),
         thought: None,
         calls: call_ids
@@ -54,7 +55,9 @@ fn tool_results_yaml_with_optional_ids(result_ids: &[Option<String>]) -> String 
 
 fn user_yaml(text: &str) -> String {
     serde_yaml::to_string(&SessionLogEntry::Message {
+        id: None,
         timestamp: None,
+        fence_token: None,
         role: MessageRole::User,
         content: MessageContent::Text(text.to_string()),
     })
@@ -63,11 +66,40 @@ fn user_yaml(text: &str) -> String {
 
 fn assistant_yaml(text: &str) -> String {
     serde_yaml::to_string(&SessionLogEntry::Message {
+        id: None,
         timestamp: None,
+        fence_token: None,
         role: MessageRole::Assistant,
         content: MessageContent::Text(text.to_string()),
     })
     .unwrap()
+}
+
+/// Build a `Config` wired with a dummy `test:model` client and an isolated
+/// sessions dir, for the message-edit tests.
+fn editor_test_config(sessions_dir: std::path::PathBuf) -> Config {
+    let mut config = Config {
+        sessions_dir_override: Some(sessions_dir),
+        working_mode: WorkingMode::Cmd,
+        ..Config::default()
+    };
+    config
+        .clients
+        .push(harnx_client::ClientConfig::OpenAICompatibleConfig(
+            harnx_core::provider_config::openai_compatible::OpenAICompatibleConfig {
+                name: "test".to_string(),
+                api_base: None,
+                api_key: None,
+                models: vec![],
+                patches: None,
+                extra: None,
+                system_prompt_prefix: None,
+                package: None,
+            },
+        ));
+    config.model = harnx_client::Model::new("test", "model");
+    config.model_id = "test:model".to_string();
+    config
 }
 
 #[test]
@@ -190,34 +222,16 @@ fn edit_message_range_supports_reordering_plain_messages() {
     std::env::set_var("EDITOR", "true");
 
     let result = (|| -> Result<()> {
-        let mut config = Config {
-            sessions_dir_override: Some(tmp.path().to_path_buf()),
-            working_mode: WorkingMode::Cmd,
-            ..Config::default()
-        };
-        config
-            .clients
-            .push(harnx_client::ClientConfig::OpenAICompatibleConfig(
-                harnx_core::provider_config::openai_compatible::OpenAICompatibleConfig {
-                    name: "test".to_string(),
-                    api_base: None,
-                    api_key: None,
-                    models: vec![],
-                    patches: None,
-                    extra: None,
-                    system_prompt_prefix: None,
-                    package: None,
-                },
-            ));
-        config.model = harnx_client::Model::new("test", "model");
-        config.model_id = "test:model".to_string();
+        let mut config = editor_test_config(tmp.path().to_path_buf());
         config.use_session(Some("reorder"))?;
 
         let session = config.session.as_mut().context("No session")?;
         assert!(crate::config::session::append_event(
             session,
             &SessionLogEntry::Message {
+                id: None,
                 timestamp: None,
+                fence_token: None,
                 role: MessageRole::User,
                 content: MessageContent::Text("first".to_string()),
             },
@@ -225,7 +239,9 @@ fn edit_message_range_supports_reordering_plain_messages() {
         assert!(crate::config::session::append_event(
             session,
             &SessionLogEntry::Message {
+                id: None,
                 timestamp: None,
+                fence_token: None,
                 role: MessageRole::Assistant,
                 content: MessageContent::Text("second".to_string()),
             },
@@ -284,6 +300,7 @@ fn make_docs(entries: &[SessionLogEntry]) -> Vec<String> {
 fn tool_calls_entry(id: &str) -> SessionLogEntry {
     SessionLogEntry::ToolCalls {
         timestamp: None,
+        fence_token: None,
         text: String::new(),
         thought: None,
         calls: vec![ToolCall {
@@ -310,7 +327,9 @@ fn tool_results_entry(id: &str) -> SessionLogEntry {
 
 fn user_entry(text: &str) -> SessionLogEntry {
     SessionLogEntry::Message {
+        id: None,
         timestamp: None,
+        fence_token: None,
         role: MessageRole::User,
         content: MessageContent::Text(text.to_string()),
     }

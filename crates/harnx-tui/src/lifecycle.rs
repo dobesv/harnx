@@ -803,6 +803,8 @@ mod tests {
             mcp_server_name: None,
             call_template: Some("${{ args.command }}".to_string()),
             result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
         };
         decl_map.insert(decl.name.clone(), decl);
 
@@ -857,6 +859,8 @@ mod tests {
             mcp_server_name: None,
             call_template: None,
             result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
         };
         let mut decl_map = HashMap::new();
         decl_map.insert(decl.name.clone(), decl);

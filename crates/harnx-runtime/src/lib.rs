@@ -11,15 +11,28 @@
 extern crate log;
 
 pub mod agent_loop;
+pub mod async_session_log;
 pub mod bootstrap;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod nats_admin;
+pub mod nats_client_session;
+pub mod nats_event_sink;
+pub mod nats_lease;
+pub mod nats_metrics;
+pub mod nats_session_log;
+pub mod nats_worker;
 pub mod session_cleanup;
 pub mod session_history;
 pub mod test_utils;
 pub mod tool;
 pub mod utils;
+
+// Re-export thin-client types for frontends
+pub use nats_client_session::{
+    send_control_command, ThinClientConfig, ThinClientSession, ThinClientTurnResult,
+};
 
 pub use agent_loop::{
     run_agent_loop, AgentCallFn, AgentLoopContext, OnTextResponseFn, OnToolRoundFn,

@@ -1380,7 +1380,22 @@ impl Tui {
         };
 
         let handle = tokio::spawn(async move {
-            let result: Result<()> = Self::run_prompt_task(msg, ctx).await;
+            // Check if we're running a remote agent
+            // Clone remote_agent before spawning to avoid holding lock across await
+            let remote_agent = {
+                let guard = ctx.config.read();
+                guard.remote_agent.clone()
+            };
+            // Guard is dropped here before any await
+
+            let result: Result<()> = if let Some((agent, cluster)) = remote_agent {
+                // Run remote agent via NATS thin-client
+                Self::run_remote_prompt_task(msg, ctx, agent, cluster).await
+            } else {
+                // Run local agent
+                Self::run_prompt_task(msg, ctx).await
+            };
+
             if let Err(err) = result {
                 use harnx_core::event::{AgentEvent, ModelEvent};
                 let _ = event_tx.send(TuiEvent::Agent(

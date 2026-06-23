@@ -38,6 +38,16 @@ pub struct Input {
     /// mid-tool-loop).  Appended as a trailing User message in
     /// `build_messages()`.
     pub injected_user_text: Option<String>,
+    /// When true, `begin_turn` must NOT append the turn's user message to the
+    /// session log. Used by the NATS HA worker: in distributed mode clients
+    /// append user `Message` entries to the durable log themselves, and the
+    /// worker derives its turn input by reading those already-logged messages.
+    /// Re-appending them would duplicate the user message AND reorder the
+    /// assistant barrier past any concurrently-arrived messages (burying them
+    /// before the barrier so they are never answered). The user messages are
+    /// already present in the loaded `session.messages`, so the LLM still sees
+    /// them; only the redundant durable append is suppressed.
+    pub skip_user_log_append: bool,
 }
 
 impl Input {
@@ -62,6 +72,7 @@ impl Input {
             with_agent: false,
             inject_system_prompt: false,
             injected_user_text: None,
+            skip_user_log_append: false,
         }
     }
 

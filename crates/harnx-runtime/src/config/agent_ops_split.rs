@@ -1,6 +1,16 @@
 //! Agent lifecycle methods extracted from config/mod.rs for code health.
 use super::*;
 
+struct UseRemoteAgentParams<'a> {
+    config: &'a GlobalConfig,
+    agent: &'a str,
+    cluster: &'a str,
+    session_name: Option<&'a str>,
+    _abort_signal: AbortSignal,
+}
+
+use harnx_core::agent_ref::AgentRef;
+
 impl Config {
     pub fn use_prompt(&mut self, prompt: &str) -> Result<()> {
         let mut agent = Agent::new(AgentConfig::from_prompt(prompt));
@@ -224,6 +234,64 @@ impl Config {
         session_name: Option<&str>,
         abort_signal: AbortSignal,
     ) -> Result<()> {
+        match AgentRef::parse(agent_name) {
+            AgentRef::Local(agent_name) => {
+                Self::use_local_agent(config, agent_name.as_ref(), session_name, abort_signal).await
+            }
+            AgentRef::Remote { agent, cluster } => {
+                Self::use_remote_agent(UseRemoteAgentParams {
+                    config,
+                    agent: &agent,
+                    cluster: &cluster,
+                    session_name,
+                    _abort_signal: abort_signal,
+                })
+                .await
+            }
+        }
+    }
+
+    /// Activate a remote agent through NATS thin-client mode.
+    ///
+    /// This sets up the session for remote execution. The actual turn is driven
+    /// by the frontend calling `run_remote_agent_turn` when user input arrives.
+    async fn use_remote_agent(params: UseRemoteAgentParams<'_>) -> Result<()> {
+        let UseRemoteAgentParams {
+            config,
+            agent,
+            cluster,
+            session_name,
+            _abort_signal,
+        } = params;
+        // For now, remote agents are activated lazily when the first prompt arrives.
+        // We just validate the cluster exists and prepare metadata.
+        {
+            let cfg = config.read();
+            // Validate cluster exists
+            cfg.nats_server(cluster)
+                .map_err(|e| anyhow::anyhow!("remote agent validation failed: {e}"))?;
+        }
+
+        // Store remote agent metadata in config for use during prompt processing
+        // The actual ThinClientSession is created when the user sends a prompt
+        config
+            .write()
+            .set_remote_agent(agent.to_string(), cluster.to_string());
+
+        // If a session name was provided, set it (this is for future resume/attach)
+        if let Some(session) = session_name {
+            config.write().use_session(Some(session))?;
+        }
+
+        Ok(())
+    }
+
+    async fn use_local_agent(
+        config: &GlobalConfig,
+        agent_name: &str,
+        session_name: Option<&str>,
+        abort_signal: AbortSignal,
+    ) -> Result<()> {
         if !config.read().tool_use {
             bail!("Please enable tool use before using the agent.");
         }
@@ -284,6 +352,8 @@ impl Config {
             // Restore global (no-agent) manager view: all package servers prefixed.
             self.reinit_managers_for_agent(None);
         }
+        // Clear remote agent metadata too
+        self.remote_agent.take();
         Ok(())
     }
 }

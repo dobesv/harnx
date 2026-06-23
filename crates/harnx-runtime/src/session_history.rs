@@ -38,6 +38,7 @@ pub fn entry_type(entry: &SessionLogEntry) -> &'static str {
         SessionLogEntry::DataUrls { .. } => "data_urls",
         SessionLogEntry::Compress { .. } => "compress",
         SessionLogEntry::Clear => "clear",
+        SessionLogEntry::Cancel { .. } => "cancel",
         SessionLogEntry::EditEntries { .. } => "edit_entries",
         SessionLogEntry::Rewind { .. } => "rewind",
         SessionLogEntry::Unknown => "unknown",
@@ -189,6 +190,8 @@ Returns a JSON array of matching log entries (seq, type, text, tool names)."
         mcp_server_name: None,
         call_template: None,
         result_template: None,
+        idempotent_hint: None,
+        read_only_hint: None,
     }
 }
 
@@ -274,9 +277,11 @@ mod tests {
     fn entry_type_maps_variants() {
         assert_eq!(
             entry_type(&SessionLogEntry::Message {
+                id: None,
                 role: MessageRole::User,
                 content: MessageContent::Text("hi".into()),
                 timestamp: None,
+                fence_token: None,
             }),
             "message"
         );
@@ -293,9 +298,11 @@ mod tests {
             (
                 0,
                 SessionLogEntry::Message {
+                    id: None,
                     role: MessageRole::User,
                     content: MessageContent::Text("please run the build".into()),
                     timestamp: None,
+                    fence_token: None,
                 },
             ),
             (
@@ -310,6 +317,7 @@ mod tests {
                         thought_signature: None,
                     }],
                     timestamp: None,
+                    fence_token: None,
                 },
             ),
             (
@@ -328,9 +336,11 @@ mod tests {
             (
                 3,
                 SessionLogEntry::Message {
+                    id: None,
                     role: MessageRole::Assistant,
                     content: MessageContent::Text("the build passed".into()),
                     timestamp: None,
+                    fence_token: None,
                 },
             ),
         ]

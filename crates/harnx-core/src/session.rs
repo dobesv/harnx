@@ -67,10 +67,14 @@ pub enum SessionLogEntry {
     },
     #[serde(rename = "message")]
     Message {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         role: MessageRole,
         content: MessageContent,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timestamp: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fence_token: Option<u64>,
     },
     /// Assistant turn that issued tool calls. The text/thought are the
     /// LLM's prose preceding the calls. This entry is written
@@ -88,7 +92,11 @@ pub enum SessionLogEntry {
         calls: Vec<ToolCall>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timestamp: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fence_token: Option<u64>,
     },
+    #[serde(rename = "cancel")]
+    Cancel { fence_token: u64 },
     /// Results for the immediately preceding `ToolCalls` entry.
     #[serde(rename = "tool_results")]
     ToolResults {
@@ -118,6 +126,43 @@ pub enum SessionLogEntry {
     },
     #[serde(other)]
     Unknown,
+}
+
+impl SessionLogEntry {
+    /// Stamp the fence token on worker-originated entries that carry one
+    /// (`Message`, `ToolCalls`). Other variants are left unchanged: `Cancel`
+    /// carries its fence at construction (control plane), and client-originated
+    /// entries (`UserMessage`) are intentionally unfenced.
+    pub fn set_fence_token(&mut self, fence: u64) {
+        match self {
+            SessionLogEntry::Message { fence_token, .. }
+            | SessionLogEntry::ToolCalls { fence_token, .. } => {
+                *fence_token = Some(fence);
+            }
+            _ => {}
+        }
+    }
+
+    /// Fence token carried by this entry, if any. `Message`/`ToolCalls` carry an
+    /// optional fence; `Cancel` always carries one. All other variants are
+    /// unfenced and return `None`.
+    pub fn fence_token(&self) -> Option<u64> {
+        match self {
+            SessionLogEntry::Message { fence_token, .. }
+            | SessionLogEntry::ToolCalls { fence_token, .. } => *fence_token,
+            SessionLogEntry::Cancel { fence_token } => Some(*fence_token),
+            _ => None,
+        }
+    }
+}
+
+/// Highest fence token stamped on any worker-originated entry in the slice.
+///
+/// Used on resume to fail-safe: if a worker observes a fence greater than the
+/// KV revision it currently holds, a newer worker has taken over and the
+/// resuming worker must abort before writing.
+pub fn max_worker_fence_token(entries: &[SessionLogEntry]) -> Option<u64> {
+    entries.iter().filter_map(|e| e.fence_token()).max()
 }
 
 /// A single tool-call result as persisted in the session log. Matches
@@ -206,6 +251,8 @@ pub struct Session {
     pub tokens: usize,
     #[serde(skip)]
     pub completion_usage: CompletionTokenUsage,
+    #[serde(skip)]
+    pub runtime: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl Session {
@@ -533,9 +580,11 @@ mod tests {
     #[test]
     fn session_log_entry_message_timestamp_serde_round_trip() {
         let entry = SessionLogEntry::Message {
+            id: None,
             role: MessageRole::User,
             content: MessageContent::Text("hello".to_string()),
             timestamp: Some(Utc::now()),
+            fence_token: None,
         };
 
         let yaml = serde_yaml::to_string(&entry).unwrap();
@@ -549,6 +598,7 @@ mod tests {
                 role,
                 content,
                 timestamp,
+                ..
             } => {
                 assert_eq!(role, MessageRole::User);
                 assert!(timestamp.is_some());
@@ -572,6 +622,7 @@ mod tests {
                 role,
                 content,
                 timestamp,
+                ..
             } => {
                 assert_eq!(role, MessageRole::User);
                 assert!(timestamp.is_none());
@@ -591,6 +642,7 @@ mod tests {
             thought: None,
             calls: vec![],
             timestamp: Some(Utc::now()),
+            fence_token: None,
         };
 
         let yaml = serde_yaml::to_string(&entry).unwrap();
@@ -709,6 +761,112 @@ content: replacement two
             SessionLogEntry::Rewind { after_seq } => assert_eq!(after_seq, 7),
             other => panic!("expected rewind, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_log_entry_removed_set_pending_message_deserializes_as_unknown() {
+        let yaml = "type: set_pending_message\ntext: pending assistant text\n";
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(round_tripped, SessionLogEntry::Unknown));
+    }
+
+    #[test]
+    fn session_log_entry_cancel_serde_round_trip() {
+        let entry = SessionLogEntry::Cancel { fence_token: 42 };
+
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: SessionLogEntry = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(yaml, "type: cancel\nfence_token: 42\n");
+        match round_tripped {
+            SessionLogEntry::Cancel { fence_token } => {
+                assert_eq!(fence_token, 42);
+            }
+            other => panic!("expected cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_log_entry_none_fence_token_is_not_serialized() {
+        let assistant_message = SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("hello".to_string()),
+            timestamp: None,
+            fence_token: None,
+        };
+        let tool_calls = SessionLogEntry::ToolCalls {
+            text: "working".to_string(),
+            thought: None,
+            calls: vec![],
+            timestamp: None,
+            fence_token: None,
+        };
+
+        let assistant_yaml = serde_yaml::to_string(&assistant_message).unwrap();
+        let tool_calls_yaml = serde_yaml::to_string(&tool_calls).unwrap();
+
+        assert!(!assistant_yaml.contains("fence_token:"));
+        assert!(!tool_calls_yaml.contains("fence_token:"));
+    }
+
+    #[test]
+    fn set_fence_token_stamps_only_message_and_tool_calls() {
+        let mut msg = SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("x".to_string()),
+            timestamp: None,
+            fence_token: None,
+        };
+        msg.set_fence_token(7);
+        assert_eq!(msg.fence_token(), Some(7));
+
+        let mut calls = SessionLogEntry::ToolCalls {
+            text: String::new(),
+            thought: None,
+            calls: vec![],
+            timestamp: None,
+            fence_token: None,
+        };
+        calls.set_fence_token(9);
+        assert_eq!(calls.fence_token(), Some(9));
+    }
+
+    #[test]
+    fn cancel_entry_reports_its_fence_token() {
+        let cancel = SessionLogEntry::Cancel { fence_token: 5 };
+        assert_eq!(cancel.fence_token(), Some(5));
+    }
+
+    #[test]
+    fn max_worker_fence_token_finds_highest() {
+        let entries = vec![
+            SessionLogEntry::Message {
+                id: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("u".to_string()),
+                timestamp: None,
+                fence_token: None,
+            },
+            SessionLogEntry::Message {
+                id: None,
+                role: MessageRole::Assistant,
+                content: MessageContent::Text("a".to_string()),
+                timestamp: None,
+                fence_token: Some(3),
+            },
+            SessionLogEntry::ToolCalls {
+                text: String::new(),
+                thought: None,
+                calls: vec![],
+                timestamp: None,
+                fence_token: Some(8),
+            },
+            SessionLogEntry::Cancel { fence_token: 6 },
+        ];
+        assert_eq!(max_worker_fence_token(&entries), Some(8));
+        assert_eq!(max_worker_fence_token(&[]), None);
     }
 
     #[test]

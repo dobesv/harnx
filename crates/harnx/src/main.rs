@@ -21,7 +21,9 @@ pub use harnx_mcp::safety as mcp_safety;
 pub use harnx_runtime::{client, commands, config, tool};
 pub use harnx_tui as tui;
 
-use crate::cli::{Cli, Commands, InfoSubcommands};
+use crate::cli::{
+    Cli, Commands, DeleteSessionArgs, InfoSubcommands, SessionSubcommands, WorkerArgs,
+};
 use crate::client::{list_models, retry::call_with_retry_and_fallback, ModelType};
 use crate::config::{
     list_agents, list_assistant_agents, load_env_file, macro_execute, render_agent_dump,
@@ -95,7 +97,57 @@ async fn run_command(command: &Commands) -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Session(session_args) => match &session_args.command {
+            SessionSubcommands::Delete(delete_args) => {
+                run_session_delete_command(delete_args).await
+            }
+        },
+        Commands::Worker(worker_args) => run_worker_command(worker_args).await,
     }
+}
+
+async fn run_session_delete_command(delete_args: &DeleteSessionArgs) -> Result<()> {
+    let config = Config::init(WorkingMode::Cmd, true, vec![]).await?;
+    let result = harnx_runtime::nats_admin::delete_remote_session(
+        &config,
+        &delete_args.cluster,
+        &delete_args.session_id,
+    )
+    .await?;
+
+    if result.removed_anything() {
+        println!(
+            "Deleted remote session '{}' on cluster '{}' (stream_deleted={}, lease_deleted={})",
+            delete_args.session_id,
+            delete_args.cluster,
+            result.stream_deleted,
+            result.lease_deleted
+        );
+    } else {
+        println!(
+            "Remote session '{}' on cluster '{}' not found; nothing to delete.",
+            delete_args.session_id, delete_args.cluster
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_worker_command(worker_args: &WorkerArgs) -> Result<()> {
+    let config = Arc::new(RwLock::new(
+        Config::init(WorkingMode::Cmd, true, vec![]).await?,
+    ));
+    let worker_id = worker_args
+        .worker_id
+        .clone()
+        .unwrap_or_else(harnx_runtime::nats_worker::new_remote_session_id);
+    let daemon =
+        harnx_runtime::nats_worker::WorkerDaemonConfig::new(worker_args.cluster.clone(), worker_id);
+    let call_fn: harnx_runtime::agent_loop::AgentCallFn =
+        std::sync::Arc::new(|input, config, abort| {
+            Box::pin(call_with_retry_and_fallback(input, config, abort))
+        });
+    harnx_runtime::nats_worker::run_worker_daemon(config, daemon, Some(call_fn)).await
 }
 
 fn legacy_info_flag(cli: &Cli) -> bool {

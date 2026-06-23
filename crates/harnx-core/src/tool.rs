@@ -115,6 +115,14 @@ pub struct ToolDeclaration {
     pub call_template: Option<String>,
     #[serde(skip, default)]
     pub result_template: Option<String>,
+    /// MCP tool annotation: if true, calling this tool repeatedly with the same
+    /// arguments has no additional effect. Runtime metadata only (not persisted).
+    #[serde(skip, default)]
+    pub idempotent_hint: Option<bool>,
+    /// MCP tool annotation: if true, the tool does not modify its environment.
+    /// Runtime metadata only (not persisted).
+    #[serde(skip, default)]
+    pub read_only_hint: Option<bool>,
 }
 
 /// Map a shebang interpreter name to a Markdown code-fence language label.

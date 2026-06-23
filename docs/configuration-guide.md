@@ -146,6 +146,23 @@ env:
 idle_timeout_secs: 600
 ```
 
+## NATS Servers (`nats_servers/`)
+
+Harnx supports high-availability distributed mode via NATS. Each cluster is defined in a file like `nats_servers/local.yaml`.
+
+The **filename** (without `.yaml`) is used as the cluster key (e.g., `agent@local`).
+
+```yaml
+url: "nats://localhost:4222" # NATS server URL
+token: "${NATS_TOKEN}"       # Optional auth token
+tls: true                    # Enable TLS
+tls_cert: "/path/to/cert"    # Optional client cert
+tls_key: "/path/to/key"      # Optional client key
+# tls_ca: "/path/to/ca"      # Optional CA (Note: not supported with client cert)
+```
+
+See the [NATS HA Guide](nats-ha.md) for more details.
+
 ## Example Configuration
 
 A comprehensive reference for the new folder structure and common provider/server examples can be found in the repository at:

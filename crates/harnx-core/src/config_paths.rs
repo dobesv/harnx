@@ -46,6 +46,9 @@ pub const AGENTS_DIR_NAME: &str = "agents";
 /// Subdirectory holding per-client YAML files.
 pub const CLIENTS_DIR_NAME: &str = "clients";
 
+/// Subdirectory holding per-cluster NATS server configs.
+pub const NATS_SERVERS_DIR_NAME: &str = "nats_servers";
+
 /// Subdirectory holding per-MCP-server YAML files.
 pub const MCP_SERVERS_DIR_NAME: &str = "mcp_servers";
 
@@ -181,6 +184,11 @@ pub fn clients_dir() -> PathBuf {
     config_dir_path().join(CLIENTS_DIR_NAME)
 }
 
+/// Subdirectory holding per-cluster NATS server YAML files.
+pub fn nats_servers_dir() -> PathBuf {
+    config_dir_path().join(NATS_SERVERS_DIR_NAME)
+}
+
 /// Subdirectory holding per-MCP-server YAML files.
 pub fn mcp_servers_dir() -> PathBuf {
     config_dir_path().join(MCP_SERVERS_DIR_NAME)
@@ -224,6 +232,11 @@ pub fn package_patch_file(name: &str) -> PathBuf {
 /// Path to a specific macro file by name (extension `.yaml`).
 pub fn macro_file(name: &str) -> PathBuf {
     macros_dir().join(format!("{name}.yaml"))
+}
+
+/// Per-cluster NATS server config file under [`nats_servers_dir()`].
+pub fn nats_server_file(name: &str) -> PathBuf {
+    nats_servers_dir().join(format!("{name}.yaml"))
 }
 
 /// Path to the `.env` file loaded at startup. Overridable via `HARNX_ENV_FILE`.
@@ -442,6 +455,21 @@ mod tests {
         assert_eq!(
             got.file_name().and_then(|s| s.to_str()),
             Some("some_macro.yaml")
+        );
+    }
+
+    #[test]
+    fn nats_server_file_uses_nats_servers_dir_and_yaml_extension() {
+        let got = nats_server_file("foo");
+        let tail: Vec<_> = got
+            .iter()
+            .rev()
+            .take(2)
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            tail,
+            vec!["foo.yaml".to_string(), NATS_SERVERS_DIR_NAME.to_string()]
         );
     }
 

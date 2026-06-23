@@ -304,3 +304,48 @@ async fn test_compact_session_honors_compaction_keep_recent_turns() {
         "expected the summary plus the one kept turn (2 messages)"
     );
 }
+
+#[tokio::test]
+async fn test_apply_compaction_summary_skips_swapped_session() {
+    let config = with_session(
+        Config {
+            data: ConfigData {
+                stream: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        vec![
+            (MessageRole::User, "first prompt".to_string()),
+            (MessageRole::Assistant, "first reply".to_string()),
+            (MessageRole::User, "second prompt".to_string()),
+            (MessageRole::Assistant, "second reply".to_string()),
+        ],
+    );
+    let original_session = config.read().session.as_ref().unwrap().clone();
+    let original_id = original_session.id.clone();
+    let original_message_len = original_session.messages.len();
+    let original_continuous = config
+        .read()
+        .last_message
+        .as_ref()
+        .map(|last| last.continuous);
+    let split = 2;
+
+    let mut swapped_session = original_session.clone();
+    swapped_session.id = "swapped-session".to_string();
+    config.write().session = Some(swapped_session);
+
+    let applied =
+        Config::apply_compaction_summary(&config, &original_id, "summary".to_string(), split);
+
+    let guard = config.read();
+    let active = guard.session.as_ref().unwrap();
+    assert!(!applied, "session swap must skip stale compaction result");
+    assert_eq!(active.id, "swapped-session");
+    assert_eq!(active.messages.len(), original_message_len);
+    assert_eq!(
+        guard.last_message.as_ref().map(|last| last.continuous),
+        original_continuous
+    );
+}

@@ -473,6 +473,8 @@ fn tool_declaration() -> ToolDeclaration {
         mcp_server_name: None,
         call_template: None,
         result_template: None,
+        idempotent_hint: None,
+        read_only_hint: None,
     }
 }
 

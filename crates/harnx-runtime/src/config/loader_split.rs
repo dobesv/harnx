@@ -65,7 +65,7 @@ impl Config {
         Ok(config)
     }
 
-    pub(super) fn load_from_file(config_path: &Path) -> Result<Self> {
+    pub(crate) fn load_from_file(config_path: &Path) -> Result<Self> {
         let err = || format!("Failed to load config at '{}'", config_path.display());
         let data: ConfigData = if config_path.exists() {
             let content = read_to_string(config_path).with_context(err)?;
@@ -83,6 +83,8 @@ impl Config {
         };
         let config_dir = config_path.parent().unwrap_or(config_path);
         config.clients = Self::load_clients_from_dir(&config_dir.join(paths::CLIENTS_DIR_NAME))?;
+        config.nats_servers =
+            Self::load_nats_servers_from_dir(&config_dir.join(paths::NATS_SERVERS_DIR_NAME))?;
         config.mcp_servers =
             Self::load_mcp_servers_from_dir(&config_dir.join(paths::MCP_SERVERS_DIR_NAME))?;
         config.acp_servers =
@@ -253,6 +255,8 @@ impl Config {
         config.clients = vec![client];
 
         let config_dir = Self::config_dir();
+        config.nats_servers =
+            Self::load_nats_servers_from_dir(&config_dir.join(paths::NATS_SERVERS_DIR_NAME))?;
         config.mcp_servers =
             Self::load_mcp_servers_from_dir(&config_dir.join(paths::MCP_SERVERS_DIR_NAME))?;
         config.acp_servers =

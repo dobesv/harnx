@@ -28,6 +28,15 @@ impl Config {
             // on the first event (avoids creating empty files in tests).
             // Must be set before any add_message() call that triggers logging.
             session.set_sessions_dir(sessions_dir);
+            if session.runtime.is_none() {
+                let session_path = self.session_file(&session.id);
+                session.runtime = Some(Arc::new(Arc::new(self::session::FileSessionLogSink::new(
+                    &session_path,
+                    &session.id,
+                    session.build_header_entry(),
+                ))
+                    as Arc<dyn self::session::SessionAppendSink>));
+            }
             if session.is_empty() {
                 new_session = true;
                 if let Some(LastMessage {
@@ -409,188 +418,10 @@ impl Config {
         }
     }
 
-    pub fn maybe_compact_session(config: GlobalConfig) {
-        let mut need_compact = false;
-        // Instrumentation for the intermittent OOM (#842), which the user has
-        // seen correlate with compaction at the end of a turn. Record the
-        // session size at trigger time and flag a re-entrant trigger (a fresh
-        // compaction starting while a previous one is still running), which
-        // would point at overlapping compaction tasks as the memory source.
-        let mut msg_count = 0usize;
-        let mut already_compacting = false;
-        {
-            let mut config = config.write();
-            let compress_threshold = config.compress_threshold;
-            if let Some(session) = config.session.as_mut() {
-                if session.need_compress(compress_threshold) {
-                    already_compacting = session.compressing();
-                    msg_count = session.messages.len();
-                    session.set_compressing(true);
-                    need_compact = true;
-                }
-            }
-        };
-        if !need_compact {
-            return;
-        }
-        if already_compacting {
-            log::warn!(
-                "compaction: triggered while a previous compaction is still in \
-                 progress (messages={msg_count}) — overlapping compaction tasks"
-            );
-        }
-        log::info!("compaction: started (messages={msg_count})");
-        let started = std::time::Instant::now();
-        // Use SessionEvent for consistent TUI/CLI handling.
-        // The TUI will render CompactingStarted/CompactingCompleted as transcript items.
-        harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
-            harnx_core::event::SessionEvent::CompactingStarted,
-        ));
-        tokio::spawn(async move {
-            let result = Config::compact_session(&config).await;
-            if let Some(session) = config.write().session.as_mut() {
-                session.set_compressing(false);
-            }
-            match &result {
-                Ok(()) => {
-                    log::info!(
-                        "compaction: completed in {:?} (messages_before={msg_count})",
-                        started.elapsed()
-                    );
-                    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
-                        harnx_core::event::SessionEvent::CompactingCompleted,
-                    ));
-                }
-                Err(err) => {
-                    warn!(
-                        "Failed to compact the session after {:?}: {err}",
-                        started.elapsed()
-                    );
-                    harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Session(
-                        harnx_core::event::SessionEvent::CompactingFailed(err.to_string()),
-                    ));
-                }
-            }
-        });
-    }
-
-    pub async fn compact_session(config: &GlobalConfig) -> Result<()> {
-        match config.read().session.as_ref() {
-            Some(session) => {
-                if !session.has_user_messages() {
-                    bail!("No need to compact since there are no messages in the session")
-                }
-            }
-            None => bail!("No session"),
-        }
-
-        // Check if the current agent has a compaction_agent configured
-        let active_agent_name = config.read().extract_agent().name().to_string();
-        let active_pkg = harnx_core::package_namespace::pkg_from_qualified(&active_agent_name);
-        let compaction_agent_name = config
-            .read()
-            .extract_agent()
-            .compaction_agent()
-            .map(str::to_owned);
-
-        let agent_override = if let Some(name) = compaction_agent_name {
-            let resolved_name =
-                harnx_core::package_namespace::resolve_package_relative_name(&name, active_pkg);
-            match config.read().retrieve_agent(&resolved_name) {
-                Ok(mut compaction_agent) => {
-                    if let Err(e) = self::agent::resolve_variables(&mut compaction_agent) {
-                        warn!("Failed to resolve variables for compaction_agent '{name}': {e}");
-                    }
-                    Some(compaction_agent)
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to load compaction_agent '{name}': {e}; falling back to default compaction"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Build the summarizer agent up front (configured compaction_agent, or
-        // the synthetic default), and resolve the compaction tuning params from
-        // it so the snapshot below can use them.
-        let summarizer_agent = match agent_override {
-            Some(agent) => agent.into_config(),
-            None => harnx_core::agent_config::AgentConfig::from_prompt(
-                crate::config::compaction::DEFAULT_COMPACT_SYSTEM_PROMPT,
-            ),
-        };
-        let params = crate::config::compaction::compaction_params(&summarizer_agent);
-
-        // 1. Snapshot what we need under a read lock: the transcript of the prefix
-        //    to compact, the split point, and the covered log-seq range.
-        let (transcript, split, covered, session_id) = {
-            let guard = config.read();
-            let session = guard.session.as_ref().context("No session")?;
-            let session_id = session.id.clone();
-            let model = session.model().clone();
-            let split = crate::config::compaction::split_index(
-                &session.messages,
-                &model,
-                params.keep_recent_turns,
-                params.keep_recent_tokens,
-            );
-            if split == 0 {
-                bail!("Nothing to compact");
-            }
-            let prefix = &session.messages[..split];
-            let transcript =
-                crate::config::compaction::render_transcript(prefix, params.tool_output_max_chars);
-            let from = prefix.iter().filter_map(|m| m.log_seq).min();
-            let to = prefix.iter().filter_map(|m| m.log_seq).max();
-            (transcript, split, (from, to, prefix.len()), session_id)
-        };
-
-        // 2. Build a controlled summarization request: summarizer system prompt +
-        //    the transcript as the user message, WITHOUT the live session.
-        let mut input = harnx_core::input::Input::new(
-            transcript.clone(),
-            (transcript, vec![]),
-            summarizer_agent,
-        );
-        input.with_session = false;
-        input.with_agent = true;
-
-        let summary = crate::config::input::fetch_chat_text(&input, config).await?;
-
-        // 3. Append a recovery note and store, keeping the recent suffix verbatim.
-        let summary_with_note = append_recovery_note(summary, covered);
-        if let Some(session) = config.write().session.as_mut() {
-            if session.id == session_id {
-                crate::config::session::compress_keeping_recent(session, summary_with_note, split);
-            }
-        }
-        config.write().discontinuous_last_message();
-        Ok(())
-    }
-
     pub fn is_compacting_session(&self) -> bool {
         self.session
             .as_ref()
             .map(|v| v.compressing())
             .unwrap_or_default()
     }
-}
-
-/// Append a short recovery note describing the compacted range so a future
-/// reader knows the detail is recoverable from the on-disk log.
-fn append_recovery_note(summary: String, covered: (Option<usize>, Option<usize>, usize)) -> String {
-    let (from, to, count) = covered;
-    let range = match (from, to) {
-        (Some(a), Some(b)) => format!(" (log entries {a}–{b})"),
-        _ => String::new(),
-    };
-    format!(
-        "{summary}\n\n[Earlier conversation: {count} message(s){range} were summarized above. \
-The full pre-compaction transcript remains in this session's log; use the \
-`harnx_agent_session_history_read` tool to search it by entry index, type, tool name, or text.]"
-    )
 }

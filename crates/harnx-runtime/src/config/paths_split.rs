@@ -34,6 +34,10 @@ impl Config {
         paths::macro_file(name)
     }
 
+    pub fn nats_server_file(name: &str) -> PathBuf {
+        paths::nats_server_file(name)
+    }
+
     pub fn env_file() -> PathBuf {
         paths::env_file()
     }

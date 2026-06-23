@@ -916,6 +916,8 @@ async fn info_agent_overlay_renders_in_tui_snapshot() {
                 mcp_server_name: None,
                 call_template: None,
                 result_template: None,
+                idempotent_hint: None,
+                read_only_hint: None,
             },
             harnx_runtime::tool::ToolDeclaration {
                 name: "beta_tool".to_string(),
@@ -925,6 +927,8 @@ async fn info_agent_overlay_renders_in_tui_snapshot() {
                 mcp_server_name: None,
                 call_template: None,
                 result_template: None,
+                idempotent_hint: None,
+                read_only_hint: None,
             },
         ]));
         let mut agent = harnx_runtime::config::Agent::new(
