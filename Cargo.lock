@@ -4035,7 +4035,9 @@ version = "0.33.0"
 dependencies = [
  "anyhow",
  "birdcage",
+ "bitflags 2.13.0",
  "gix",
+ "libc",
  "log",
  "tempfile",
 ]
