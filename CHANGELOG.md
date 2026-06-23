@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.33.1 (2026-06-23)
+
+### Fixes
+
+- allow file-ioctl on macOS so TUIs can enter raw mode (#897)
+
+#### Fix interactive TUIs (claude, gemini, bash readline) failing inside `harnx-sandbox-run` on macOS.
+
+birdcage 0.8.1's default Seatbelt profile omits `(allow file-ioctl)`, which causes `tcsetattr` to return EPERM inside the sandbox. As a result, every TUI launched via `harnx-sandbox-run` (or any consumer of `harnx-sandbox-common`) silently loses raw mode: arrow keys leak as literal `^[[A`/`^[OB`, terminal DA1 responses appear in input fields, and trust/confirmation prompts become unnavigable.
+
+birdcage's public `Exception` API only grants path/env/network exceptions — there's no surface for adding operation-level rules like `file-ioctl`, so the macOS sandbox path is now implemented in-tree as `harnx_sandbox_common::macos_sandbox::MacSandbox`. The new profile mirrors birdcage's macOS rule generation (identical deny-then-allow ordering, identical subpath escaping) with one extra line in the default header: `(allow file-ioctl)`. Linux continues to use birdcage unchanged.
+
 ## 0.33.0 (2026-06-20)
 
 ### Breaking Changes

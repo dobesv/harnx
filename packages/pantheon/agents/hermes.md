@@ -28,7 +28,7 @@ use_tools:
 - pytheas_session_prompt
 - harnx_agent_session_history_read
 description: "Quick tasks and minor bugs specialist — handles the small, fast, 'blink-and-you-miss-it' fixes with rapid turnaround. Named after Hermes (HER-meez), the Winged Messenger.\n"
-version: '0.3.0'
+version: '0.3.1'
 variables:
 - name: ast_grep_rewrite
   description: Guide for structural code rewrite with ast-grep

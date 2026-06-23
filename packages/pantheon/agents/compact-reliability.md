@@ -1,7 +1,7 @@
 ---
 role: compaction
 model: gemini:gemini-3.1-flash-lite
-version: '0.3.0'
+version: '0.3.1'
 ---
 You are summarizing a conversation between a user and an AI reliability review agent that analyzes pull requests and codebases for error handling, retry logic, timeouts, and resilience issues.
 

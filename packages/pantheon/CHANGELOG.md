@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the `pantheon` agent package will be documented here.
+## 0.3.1 (2026-06-23)
+
+### Fixes
+
+- allow file-ioctl on macOS so TUIs can enter raw mode (#897)
+
 ## 0.3.0 (2026-06-20)
 
 ### Breaking Changes

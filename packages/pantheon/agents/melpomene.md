@@ -25,7 +25,7 @@ description: "Security vulnerability specialist \u2014 identifies injection risk
   \ authentication flaws, authorization gaps, secrets exposure, input validation issues,\
   \ and supply chain risks. Named after Melpomene (mel-POM-uh-nee), the Muse of tragedy\
   \ \u2014 preventing security tragedies.\n"
-version: '0.3.0'
+version: '0.3.1'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
