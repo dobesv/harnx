@@ -185,6 +185,45 @@ impl HarnxAgent {
     pub async fn set_connection(&self, conn: acp::ConnectionTo<acp::Client>) {
         *self.connection.lock().await = Some(conn);
     }
+
+    /// Build the local-agent turn input: select the agent + session on the
+    /// forked prompt config, resolve agent variables, and construct the `Input`
+    /// from the user's prompt text. Only used for local agent refs (remote
+    /// thin-client mode drives the turn over NATS instead).
+    fn build_local_input(
+        &self,
+        prompt_config: &GlobalConfig,
+        session_key: &str,
+        prompt_text: &str,
+    ) -> acp::Result<harnx_runtime::config::Input> {
+        {
+            let mut config = prompt_config.write();
+            config
+                .use_agent_by_name(&self.agent_name)
+                .map_err(|e| acp::Error::new(-32603, format!("Failed to set agent: {e}")))?;
+            config
+                .use_session(Some(session_key))
+                .map_err(|e| acp::Error::new(-32603, format!("Failed to use session: {e}")))?;
+        }
+
+        // Build a fresh agent for the input. The forked prompt config keeps
+        // per-request session state isolated while still sharing Arc-backed
+        // runtime resources cloned from the base config.
+        let mut agent = prompt_config
+            .read()
+            .retrieve_agent(&self.agent_name)
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to retrieve agent: {e}")))?;
+        if let Err(e) = harnx_runtime::config::agent::resolve_variables(&mut agent) {
+            warn!(
+                "Failed to resolve variables for agent '{}': {e}",
+                self.agent_name
+            );
+        }
+
+        let mut input = harnx_runtime::config::input::from_str(prompt_config, prompt_text, None);
+        harnx_runtime::config::input::set_agent(&mut input, prompt_config, agent.into_config());
+        Ok(input)
+    }
 }
 
 impl HarnxAgent {
@@ -240,12 +279,7 @@ impl HarnxAgent {
 
     async fn prompt(&self, args: PromptRequest) -> acp::Result<PromptResponse> {
         let session_key = args.session_id.0.to_string();
-        let prompt_text: String = args
-            .prompt
-            .iter()
-            .map(content_block_to_text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let prompt_text = prompt_blocks_to_text(&args.prompt);
 
         let (abort_signal, cancel_notify, prompt_lock) = {
             let sessions = self.sessions.lock().await;
@@ -272,36 +306,23 @@ impl HarnxAgent {
         // yet observed, effectively un-cancelling it against user intent.
         abort_signal.reset();
 
+        // P4.2: remote agents (`agent@cluster`) run in thin-client mode — the
+        // turn is driven over NATS by a worker daemon, not by a local agent
+        // loop. Detect from the configured agent name; local refs are unchanged.
+        let remote_agent = parse_remote_agent(&self.agent_name);
+
         let prompt_config: GlobalConfig = Arc::new(parking_lot::RwLock::new({
             let shared_config = self.config.read();
             shared_config.fork_session_scope()
         }));
-        {
-            let mut config = prompt_config.write();
-            config
-                .use_agent_by_name(&self.agent_name)
-                .map_err(|e| acp::Error::new(-32603, format!("Failed to set agent: {e}")))?;
-            config
-                .use_session(Some(&session_key))
-                .map_err(|e| acp::Error::new(-32603, format!("Failed to use session: {e}")))?;
-        }
-
-        // Build a fresh agent for the input. The forked prompt config keeps
-        // per-request session state isolated while still sharing Arc-backed
-        // runtime resources cloned from the base config.
-        let mut agent = prompt_config
-            .read()
-            .retrieve_agent(&self.agent_name)
-            .map_err(|e| acp::Error::new(-32603, format!("Failed to retrieve agent: {e}")))?;
-        if let Err(e) = harnx_runtime::config::agent::resolve_variables(&mut agent) {
-            warn!(
-                "Failed to resolve variables for agent '{}': {e}",
-                self.agent_name
-            );
-        }
-
-        let mut input = harnx_runtime::config::input::from_str(&prompt_config, &prompt_text, None);
-        harnx_runtime::config::input::set_agent(&mut input, &prompt_config, agent.into_config());
+        // Local-agent setup (agent resolution + input building) only applies to
+        // local refs. For remote thin-client mode the worker resolves the agent
+        // and the input is the user's prompt text posted to the NATS log.
+        let input = if remote_agent.is_none() {
+            Some(self.build_local_input(&prompt_config, &session_key, &prompt_text)?)
+        } else {
+            None
+        };
 
         // Install a per-prompt AgentEventSink for streaming chunks
         // (MessageChunk events) and tool calls (ToolEvent::Started).
@@ -557,16 +578,51 @@ impl HarnxAgent {
         // point still route to this prompt's sink. `loop_result` is
         // `Option<Result<()>>`: `None` means the grace-cancel arm won, a
         // `Some` carries the agent loop's own result.
+        // Clone the sink for the remote driver before `sink` is moved into the
+        // scoped-sink wrapper used by the local path.
+        let remote_sink = sink.clone();
         let loop_result = harnx_core::sink::with_agent_event_sink(sink, async {
-            // Box the agent-loop future before racing it. `run_agent_loop`
-            // produces a very large future; embedding it inline in `select!`
-            // (which itself lives inside the prompt future + LocalSet frames)
-            // can overflow the thread stack before the first poll. Pinning it
-            // on the heap keeps the synchronous stack frame small.
-            let mut run_loop = Box::pin(harnx_runtime::run_agent_loop(&loop_ctx, input));
-            tokio::select! {
-                r = &mut run_loop => Some(r),
-                _ = grace_cancel => None,
+            match &remote_agent {
+                // Remote thin-client mode (P4.2): drive the turn over NATS via a
+                // worker daemon. Events render through the same `remote_sink`
+                // (an AcpChunkSink), so chunks reach the parent identically.
+                Some((agent, cluster)) => {
+                    let thin_cfg = harnx_runtime::ThinClientConfig {
+                        cluster: cluster.clone(),
+                        agent: agent.clone(),
+                        session_id: Some(session_key.clone()),
+                    };
+                    let mut run_remote = Box::pin(async {
+                        let session = harnx_runtime::ThinClientSession::from_global_config(
+                            thin_cfg,
+                            &prompt_config,
+                            abort_signal.clone(),
+                        )
+                        .await?;
+                        session
+                            .run_turn(&prompt_text, remote_sink, None)
+                            .await
+                            .map(|_| ())
+                    });
+                    tokio::select! {
+                        r = &mut run_remote => Some(r),
+                        _ = grace_cancel => None,
+                    }
+                }
+                // Local mode: run the agent loop in-process.
+                None => {
+                    // Box the agent-loop future before racing it. `run_agent_loop`
+                    // produces a very large future; embedding it inline in `select!`
+                    // (which itself lives inside the prompt future + LocalSet frames)
+                    // can overflow the thread stack before the first poll. Pinning it
+                    // on the heap keeps the synchronous stack frame small.
+                    let input = input.expect("local mode always builds input");
+                    let mut run_loop = Box::pin(harnx_runtime::run_agent_loop(&loop_ctx, input));
+                    tokio::select! {
+                        r = &mut run_loop => Some(r),
+                        _ = grace_cancel => None,
+                    }
+                }
             }
         })
         .await;
@@ -583,11 +639,7 @@ impl HarnxAgent {
         drop(loop_ctx);
         let _ = fwd_task.await;
 
-        match loop_result {
-            Ok(()) => Ok(PromptResponse::new(StopReason::EndTurn)),
-            Err(_e) if abort_signal.aborted() => Ok(PromptResponse::new(StopReason::Cancelled)),
-            Err(e) => Err(acp::Error::new(-32603, format!("Agent loop error: {e:#}"))),
-        }
+        prompt_stop_response(loop_result, &abort_signal)
     }
 
     async fn cancel(&self, args: CancelNotification) -> acp::Result<()> {
@@ -625,6 +677,39 @@ fn meta_from_source(source: &AgentSource) -> Option<serde_json::Map<String, serd
         );
     }
     Some(map)
+}
+
+/// Map a completed agent-loop result to the ACP prompt response, treating
+/// errors that coincide with an aborted signal as a cancellation.
+fn prompt_stop_response(
+    loop_result: anyhow::Result<()>,
+    abort_signal: &AbortSignal,
+) -> acp::Result<PromptResponse> {
+    match loop_result {
+        Ok(()) => Ok(PromptResponse::new(StopReason::EndTurn)),
+        Err(_e) if abort_signal.aborted() => Ok(PromptResponse::new(StopReason::Cancelled)),
+        Err(e) => Err(acp::Error::new(-32603, format!("Agent loop error: {e:#}"))),
+    }
+}
+
+/// Join the text of all ACP prompt content blocks into a single string.
+fn prompt_blocks_to_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .map(content_block_to_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Detect a remote (`agent@cluster`) thin-client ref, returning the owned
+/// `(agent, cluster)` pair. Local refs return `None`.
+fn parse_remote_agent(agent_name: &str) -> Option<(String, String)> {
+    match harnx_core::agent_ref::AgentRef::parse(agent_name) {
+        harnx_core::agent_ref::AgentRef::Remote { agent, cluster } => {
+            Some((agent.into_owned(), cluster.into_owned()))
+        }
+        harnx_core::agent_ref::AgentRef::Local(_) => None,
+    }
 }
 
 fn content_block_to_text(content: &ContentBlock) -> String {

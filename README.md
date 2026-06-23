@@ -266,6 +266,7 @@ Harnx supports custom dark and light themes, which highlight response text and c
 - [Macro Guide](docs/macro-guide.md)
 - [RAG Guide](docs/rag-guide.md)
 - [Environment Variables](docs/environment-variables.md)
+- [NATS HA Deployment Guide](docs/nats-ha.md)
 - [Configuration Guide](docs/configuration-guide.md)
 - [Tool Confirmation Guide](docs/tool-confirmation-guide.md)
 - [Custom Theme](docs/custom-theme.md)

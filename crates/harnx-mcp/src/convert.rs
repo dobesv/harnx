@@ -4,6 +4,8 @@ use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use serde_json::Value;
 
+use rmcp::model::ToolAnnotations;
+
 /// Bundle of display templates for a tool.
 #[derive(Debug, Clone, Default)]
 pub struct ToolTemplates {
@@ -17,6 +19,7 @@ pub fn mcp_tool_to_declaration(
     tool_description: &str,
     input_schema: &Value,
     templates: ToolTemplates,
+    annotations: Option<&ToolAnnotations>,
 ) -> Result<ToolDeclaration> {
     Ok(ToolDeclaration {
         name: display_name.to_string(),
@@ -26,6 +29,8 @@ pub fn mcp_tool_to_declaration(
         mcp_server_name: None,
         call_template: templates.call_template,
         result_template: templates.result_template,
+        idempotent_hint: annotations.and_then(|a| a.idempotent_hint),
+        read_only_hint: annotations.and_then(|a| a.read_only_hint),
     })
 }
 
@@ -225,6 +230,7 @@ mod tests {
             "Read a file from disk",
             &schema,
             ToolTemplates::default(),
+            None,
         )
         .expect("convert tool");
 

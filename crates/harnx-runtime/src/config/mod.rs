@@ -7,6 +7,7 @@ mod env_split;
 pub mod input;
 mod loader_split;
 mod macros_split;
+mod nats_split;
 mod patches_split;
 mod paths_split;
 mod persistence_split;
@@ -14,13 +15,16 @@ mod rag_split;
 mod servers_split;
 pub mod session;
 mod session_dump;
+mod session_externalize;
 mod session_log_split;
 pub mod session_meta;
+mod session_ops_compaction;
 mod session_ops_split;
 mod settings_split;
 
 pub use self::env_split::load_env_file;
 pub use self::macros_split::macro_execute;
+pub use self::nats_split::NatsServerConfig;
 pub(crate) use self::persistence_split::collect_tool_calls;
 pub use self::session_dump::render_session_dump;
 pub(crate) use self::session_log_split::{
@@ -205,6 +209,8 @@ fn handoff_tool_declarations_for_agents(
                 mcp_server_name: None,
                 call_template: None,
                 result_template: None,
+                idempotent_hint: None,
+                read_only_hint: None,
             }
         })
         .collect();
@@ -218,6 +224,7 @@ pub struct Config {
     // Server-config vectors (types live in dependent crates — stay here,
     // not in ConfigData, to avoid reverse deps from harnx-core).
     pub clients: Vec<ClientConfig>,
+    pub nats_servers: Vec<NatsServerConfig>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub acp_servers: Vec<AcpServerConfig>,
 
@@ -240,6 +247,10 @@ pub struct Config {
     pub session: Option<Session>,
     pub rag: Option<Arc<Rag>>,
     pub agent: Option<Agent>,
+    /// Remote agent metadata for NATS thin-client mode.
+    /// When set, the agent runs on a remote worker and this client
+    /// drives the turn via `ThinClientSession`.
+    pub remote_agent: Option<(String, String)>, // (agent_name, cluster)
     pub tui_before_editor: Option<Box<dyn FnMut() + Send + Sync>>,
     pub tui_after_editor: Option<Box<dyn FnMut() + Send + Sync>>,
     /// Runtime-only override for tool-use confirmation prompts. When set (the
@@ -300,6 +311,7 @@ impl Clone for Config {
         Self {
             data: self.data.clone(),
             clients: self.clients.clone(),
+            nats_servers: self.nats_servers.clone(),
             mcp_servers: self.mcp_servers.clone(),
             acp_servers: self.acp_servers.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
@@ -318,6 +330,7 @@ impl Clone for Config {
             session: self.session.clone(),
             rag: self.rag.clone(),
             agent: self.agent.clone(),
+            remote_agent: self.remote_agent.clone(),
             tui_before_editor: None,
             tui_after_editor: None,
             tui_confirm_tool_use: None,
@@ -346,6 +359,7 @@ impl Config {
         Config {
             data: self.data.clone(),
             clients: self.clients.clone(),
+            nats_servers: self.nats_servers.clone(),
             mcp_servers: self.mcp_servers.clone(),
             acp_servers: self.acp_servers.clone(),
             model_cooldowns: self.model_cooldowns.clone(),
@@ -364,6 +378,7 @@ impl Config {
             session: None,
             rag: self.rag.clone(),
             agent: self.agent.clone(),
+            remote_agent: self.remote_agent.clone(),
             // ACP server prompt path never invokes editor hooks. Drop them so
             // forked prompt configs can own isolated session state without
             // trying to clone `FnMut` trait objects.
@@ -382,6 +397,7 @@ impl Default for Config {
             data: ConfigData::default(),
 
             clients: vec![],
+            nats_servers: vec![],
             mcp_servers: vec![],
             acp_servers: vec![],
 
@@ -403,6 +419,7 @@ impl Default for Config {
             session: None,
             rag: None,
             agent: None,
+            remote_agent: None,
             tui_before_editor: None,
             tui_after_editor: None,
             tui_confirm_tool_use: None,
@@ -429,6 +446,16 @@ pub(super) fn path_is_home_or_ancestor(path: &Path) -> bool {
 }
 
 impl Config {
+    /// Set remote agent metadata for NATS thin-client mode.
+    pub fn set_remote_agent(&mut self, agent: String, cluster: String) {
+        self.remote_agent = Some((agent, cluster));
+    }
+
+    /// Check if this config is running in remote-agent mode.
+    pub fn is_remote_agent(&self) -> bool {
+        self.remote_agent.is_some()
+    }
+
     pub fn state(&self) -> StateFlags {
         let mut flags = StateFlags::empty();
         if let Some(session) = &self.session {
@@ -1362,3 +1389,5 @@ mod session_edit_tests;
 mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_extra;

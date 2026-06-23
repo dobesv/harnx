@@ -457,6 +457,8 @@ mod tests {
                 mcp_server_name: None,
                 call_template: None,
                 result_template: None,
+                idempotent_hint: None,
+                read_only_hint: None,
             }]),
             stream: false,
             attachments_dir: None,

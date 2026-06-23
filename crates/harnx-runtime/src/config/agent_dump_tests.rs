@@ -116,6 +116,8 @@ fn make_tool_declaration(name: &str, description: &str) -> crate::tool::ToolDecl
         mcp_server_name: None,
         call_template: None,
         result_template: None,
+        idempotent_hint: None,
+        read_only_hint: None,
     }
 }
 

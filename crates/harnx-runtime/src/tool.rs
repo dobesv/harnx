@@ -44,6 +44,7 @@ pub async fn execute_tool_round(
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
 ) -> Result<Vec<ToolResult>> {
     let dry_run = config.read().dry_run;
+
     if !dry_run {
         config.write().save_session_tool_calls(
             input,
@@ -52,6 +53,7 @@ pub async fn execute_tool_round(
             &tool_calls,
         )?;
     }
+
     let agent_use_tools = input.agent().use_tools().map(|v| v.join(","));
     // Derive the active agent's package (e.g. `pantheon` for `pantheon/daedalus`)
     // so bare `_session_handoff` targets resolve to the same package (#709).
@@ -663,6 +665,8 @@ mod tests {
             mcp_server_name: None,
             call_template: call_template.map(String::from),
             result_template: result_template.map(String::from),
+            idempotent_hint: None,
+            read_only_hint: None,
         }
     }
 

@@ -279,55 +279,7 @@ impl McpClient {
         let functions = tools_result
             .tools
             .into_iter()
-            .map(|tool| {
-                let input_schema = Value::Object((*tool.input_schema).clone());
-                let server_tool_name = tool.name.to_string();
-                let final_name = if let Some(renamed) =
-                    self.config.rename_tools.get(server_tool_name.as_str())
-                {
-                    renamed.clone()
-                } else {
-                    format!("{}_{}", self.name, server_tool_name)
-                };
-
-                // Extract _meta templates (server-provided)
-                let meta_call_tmpl = tool
-                    .meta
-                    .as_ref()
-                    .and_then(|m| m.0.get("call_template"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let meta_result_tmpl = tool
-                    .meta
-                    .as_ref()
-                    .and_then(|m| m.0.get("result_template"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                // Apply config override (higher precedence)
-                let cfg_templates: Option<&ToolDisplayTemplates> =
-                    self.config.tool_templates.get(&server_tool_name);
-                let call_template = cfg_templates
-                    .and_then(|t| t.call_template.clone())
-                    .or(meta_call_tmpl);
-                let result_template = cfg_templates
-                    .and_then(|t| t.result_template.clone())
-                    .or(meta_result_tmpl);
-                let templates = ToolTemplates {
-                    call_template,
-                    result_template,
-                };
-
-                let mut declaration = mcp_tool_to_declaration(
-                    &final_name,
-                    &server_tool_name,
-                    tool.description.as_deref().unwrap_or_default(),
-                    &input_schema,
-                    templates,
-                )?;
-                declaration.mcp_server_name = Some(self.name.clone());
-                Ok(declaration)
-            })
+            .map(|tool| self.build_tool_declaration(tool))
             .collect::<Result<Vec<_>>>()?;
 
         *self.tools.write() = functions;
@@ -335,6 +287,59 @@ impl McpClient {
         *self.service.write() = Some(service);
 
         Ok(())
+    }
+
+    /// Convert a single MCP `Tool` advertised by the server into a harnx
+    /// `ToolDeclaration`, applying tool renames and call/result display
+    /// templates (server `_meta` overridden by local config).
+    fn build_tool_declaration(&self, tool: rmcp::model::Tool) -> Result<ToolDeclaration> {
+        let input_schema = Value::Object((*tool.input_schema).clone());
+        let server_tool_name = tool.name.to_string();
+        let final_name =
+            if let Some(renamed) = self.config.rename_tools.get(server_tool_name.as_str()) {
+                renamed.clone()
+            } else {
+                format!("{}_{}", self.name, server_tool_name)
+            };
+
+        // Extract _meta templates (server-provided)
+        let meta_call_tmpl = tool
+            .meta
+            .as_ref()
+            .and_then(|m| m.0.get("call_template"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let meta_result_tmpl = tool
+            .meta
+            .as_ref()
+            .and_then(|m| m.0.get("result_template"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // Apply config override (higher precedence)
+        let cfg_templates: Option<&ToolDisplayTemplates> =
+            self.config.tool_templates.get(&server_tool_name);
+        let call_template = cfg_templates
+            .and_then(|t| t.call_template.clone())
+            .or(meta_call_tmpl);
+        let result_template = cfg_templates
+            .and_then(|t| t.result_template.clone())
+            .or(meta_result_tmpl);
+        let templates = ToolTemplates {
+            call_template,
+            result_template,
+        };
+
+        let mut declaration = mcp_tool_to_declaration(
+            &final_name,
+            &server_tool_name,
+            tool.description.as_deref().unwrap_or_default(),
+            &input_schema,
+            templates,
+            tool.annotations.as_ref(),
+        )?;
+        declaration.mcp_server_name = Some(self.name.clone());
+        Ok(declaration)
     }
 
     pub async fn disconnect(&self) -> Result<()> {
@@ -718,6 +723,7 @@ mod tests {
                 "Read",
                 &json!({}),
                 ToolTemplates::default(),
+                None,
             )
             .unwrap(),
             mcp_tool_to_declaration(
@@ -726,6 +732,7 @@ mod tests {
                 "Write",
                 &json!({}),
                 ToolTemplates::default(),
+                None,
             )
             .unwrap(),
         ];
@@ -754,6 +761,7 @@ mod tests {
                     "desc",
                     &json!({}),
                     ToolTemplates::default(),
+                    None,
                 )
                 .unwrap()
             })
@@ -834,6 +842,7 @@ mod tests {
             "desc",
             &json!({}),
             ToolTemplates::default(),
+            None,
         )
         .unwrap()];
         *client.connection_failed.write() = true;
@@ -880,6 +889,7 @@ mod tests {
             "Read mock file contents.",
             &json!({}),
             ToolTemplates::default(),
+            None,
         )
         .unwrap()];
         *client.service.write() = Some(client_service);

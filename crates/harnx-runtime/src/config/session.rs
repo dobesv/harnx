@@ -1,11 +1,46 @@
 use super::input::*;
+use super::session_externalize::{
+    externalize_content, externalize_persisted_messages, externalize_tool_result_content,
+    record_externalized,
+};
 use super::*;
 
 pub use harnx_core::session::{Session, SessionLogEntry};
 
+use std::any::Any;
+use std::sync::{Arc, Mutex};
+
+pub trait SessionAppendSink: Send + Sync + Any {
+    fn append(&self, entry: &SessionLogEntry) -> Result<u64>;
+}
+
+#[derive(Debug)]
+pub(crate) struct FileSessionLogSink {
+    log: Mutex<FileSessionLog>,
+}
+
+impl FileSessionLogSink {
+    pub(crate) fn new(path: &Path, session_name: &str, header: SessionLogEntry) -> Self {
+        Self {
+            log: Mutex::new(FileSessionLog::new_with_header(path, session_name, header)),
+        }
+    }
+}
+
+impl SessionAppendSink for FileSessionLogSink {
+    fn append(&self, entry: &SessionLogEntry) -> Result<u64> {
+        let mut log = self
+            .log
+            .lock()
+            .map_err(|_| anyhow::anyhow!("file session log sink mutex poisoned"))?;
+        log.append_event(entry)
+    }
+}
+
 use crate::client::{CompletionTokenUsage, Message, MessageContent, MessageRole};
 use harnx_core::{
     event::{AgentEvent, SessionEvent},
+    session_log::SessionLog,
     sink::emit_agent_event,
 };
 
@@ -76,8 +111,18 @@ pub fn load(config: &Config, name: &str, path: &Path) -> Result<Session> {
 }
 
 fn load_from_log(config: &Config, name: &str, path: &Path, content: &str) -> Result<Session> {
-    let raw_entries = collect_raw_log_entries(content, name)?;
-    let mut session = replay_log_entries(&raw_entries, name)?;
+    let log = FileSessionLog::new(path, name);
+    let raw_entries = log.load_events()?;
+    debug_assert_eq!(
+        raw_entries.len(),
+        collect_raw_log_entries(content, name)?.len(),
+        "FileSessionLog::load_events changed entry count"
+    );
+    let replay_entries: Vec<_> = raw_entries
+        .iter()
+        .map(|(seq, entry)| (*seq as usize, entry.clone()))
+        .collect();
+    let mut session = replay_log_entries_for_external(&replay_entries, name)?;
     session.log_entry_count = raw_entries.len();
 
     session.model =
@@ -113,103 +158,14 @@ fn build_effective_log_entries(
     raw_entries: &[(usize, SessionLogEntry)],
     name: &str,
 ) -> Vec<(usize, SessionLogEntry)> {
-    let mut effective_entries = Vec::new();
-
-    for (seq, entry) in raw_entries {
-        match entry {
-            SessionLogEntry::Rewind { after_seq } => {
-                if *after_seq >= *seq {
-                    log::warn!(
-                        "Skipping rewind entry #{seq} in session {name}: after_seq {after_seq} must be less than current seq"
-                    );
-                    continue;
-                }
-                if !effective_entries
-                    .iter()
-                    .any(|(existing_seq, _)| existing_seq == after_seq)
-                {
-                    log::warn!(
-                        "Skipping rewind entry #{seq} in session {name}: after_seq {after_seq} not present in replay state"
-                    );
-                    continue;
-                }
-                effective_entries.retain(|(existing_seq, _)| *existing_seq <= *after_seq);
-            }
-            SessionLogEntry::EditEntries {
-                from,
-                to,
-                replacements,
-            } => {
-                if from > to {
-                    log::warn!(
-                        "Skipping edit_entries entry #{seq} in session {name}: invalid range [{from}, {to}]"
-                    );
-                    continue;
-                }
-                if *to >= *seq {
-                    log::warn!(
-                        "Skipping edit_entries entry #{seq} in session {name}: range [{from}, {to}] must reference earlier entries only"
-                    );
-                    continue;
-                }
-
-                let Some(start_idx) = effective_entries
-                    .iter()
-                    .position(|(existing_seq, _)| existing_seq == from)
-                else {
-                    log::warn!(
-                        "Skipping edit_entries entry #{seq} in session {name}: from seq {from} not present in replay state"
-                    );
-                    continue;
-                };
-                let Some(end_idx) = effective_entries
-                    .iter()
-                    .rposition(|(existing_seq, _)| existing_seq == to)
-                else {
-                    log::warn!(
-                        "Skipping edit_entries entry #{seq} in session {name}: to seq {to} not present in replay state"
-                    );
-                    continue;
-                };
-                if start_idx > end_idx {
-                    log::warn!(
-                        "Skipping edit_entries entry #{seq} in session {name}: range [{from}, {to}] not in replay order"
-                    );
-                    continue;
-                }
-
-                let parsed_replacements: Vec<_> = replacements
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(replacement_idx, replacement)| {
-                        match serde_yaml::from_str::<SessionLogEntry>(replacement) {
-                            Ok(parsed) => {
-                                // Replacements inherit EditEntries seq because originals are
-                                // logically removed from effective stream. Future rewind/edit
-                                // operations must target mutation seq, not replaced seqs.
-                                Some((*seq, parsed))
-                            },
-                            Err(err) => {
-                                log::warn!(
-                                    "Skipping replacement #{replacement_idx} in edit_entries entry #{seq} for session {name}: {err}"
-                                );
-                                None
-                            }
-                        }
-                    })
-                    .collect();
-
-                effective_entries.splice(start_idx..=end_idx, parsed_replacements);
-            }
-            SessionLogEntry::Unknown => {}
-            _ => effective_entries.push((*seq, entry.clone())),
-        }
-    }
-
-    effective_entries
+    // Delegate to the canonical implementation in harnx-core
+    harnx_core::session_reconstruct::apply_log_mutations_with_name(raw_entries, name)
 }
 
-fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> Result<Session> {
+pub(crate) fn replay_log_entries_for_external(
+    raw_entries: &[(usize, SessionLogEntry)],
+    name: &str,
+) -> Result<Session> {
     let effective_entries = build_effective_log_entries(raw_entries, name);
     let mut session = Session::default();
 
@@ -261,6 +217,7 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                 role,
                 content,
                 timestamp,
+                ..
             } => {
                 if let Some(pending) = pending.take() {
                     session
@@ -283,6 +240,7 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                 thought,
                 calls,
                 timestamp,
+                ..
             } => {
                 if let Some(pending) = pending.take() {
                     session
@@ -338,6 +296,7 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
                 session.compressed_messages.clear();
                 session.data_urls.clear();
             }
+            SessionLogEntry::Cancel { .. } => {}
             SessionLogEntry::EditEntries { .. }
             | SessionLogEntry::Rewind { .. }
             | SessionLogEntry::Unknown => {}
@@ -360,7 +319,8 @@ fn replay_log_entries(raw_entries: &[(usize, SessionLogEntry)], name: &str) -> R
 #[cfg(test)]
 fn load_from_log_for_test(content: &str) -> Session {
     let raw_entries = collect_raw_log_entries(content, "test").expect("valid log entries");
-    let mut session = replay_log_entries(&raw_entries, "test").expect("replay should succeed");
+    let mut session =
+        replay_log_entries_for_external(&raw_entries, "test").expect("replay should succeed");
     session.log_entry_count = raw_entries.len();
     session
 }
@@ -451,6 +411,105 @@ fn assemble_tool_message(
     )
 }
 
+#[derive(Debug)]
+pub(crate) struct FileSessionLog {
+    path: std::path::PathBuf,
+    session_name: String,
+    next_seq: Option<u64>,
+    initial_header: Option<SessionLogEntry>,
+}
+
+impl FileSessionLog {
+    fn new(path: &Path, session_name: &str) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            session_name: session_name.to_string(),
+            next_seq: None,
+            initial_header: None,
+        }
+    }
+
+    fn new_with_header(path: &Path, session_name: &str, header: SessionLogEntry) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            session_name: session_name.to_string(),
+            next_seq: None,
+            initial_header: Some(header),
+        }
+    }
+}
+
+impl SessionLog for FileSessionLog {
+    fn append_event(&mut self, entry: &SessionLogEntry) -> Result<u64> {
+        let assigned_seq = match self.next_seq {
+            Some(seq) => seq,
+            None => match self.load_events() {
+                Ok(entries) => entries.len() as u64,
+                Err(_)
+                    if !self.path.exists()
+                        || self
+                            .path
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.len() == 0) =>
+                {
+                    let Some(header) = &self.initial_header else {
+                        return self.load_events().map(|entries| entries.len() as u64);
+                    };
+                    ensure_parent_exists(&self.path)?;
+                    let content = serde_yaml::to_string(header).with_context(|| {
+                        format!(
+                            "Failed to serialize session header in '{}'",
+                            self.session_name
+                        )
+                    })?;
+                    write(&self.path, content).with_context(|| {
+                        format!(
+                            "Failed to initialize session {} at {}",
+                            self.session_name,
+                            self.path.display()
+                        )
+                    })?;
+                    1
+                }
+                Err(err) => return Err(err),
+            },
+        };
+        let yaml = serde_yaml::to_string(entry)
+            .with_context(|| format!("Failed to serialize log entry in '{}'", self.session_name))?;
+        let mut data = String::from("---\n");
+        data.push_str(&yaml);
+        let mut file = OpenOptions::new().append(true).open(&self.path)?;
+        file.write_all(data.as_bytes())?;
+        self.next_seq = Some(assigned_seq + 1);
+        Ok(assigned_seq)
+    }
+
+    fn load_events(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
+        let content = read_to_string(&self.path).with_context(|| {
+            format!(
+                "Failed to load session {} at {}",
+                self.session_name,
+                self.path.display()
+            )
+        })?;
+        collect_raw_log_entries(&content, &self.session_name).map(|entries| {
+            entries
+                .into_iter()
+                .map(|(seq, entry)| (seq as u64, entry))
+                .collect()
+        })
+    }
+
+    fn replay_from(&self, seq: u64) -> Result<Vec<SessionLogEntry>> {
+        Ok(self
+            .load_events()?
+            .into_iter()
+            .filter(|(entry_seq, _)| *entry_seq >= seq)
+            .map(|(_, entry)| entry)
+            .collect())
+    }
+}
+
 fn apply_name_and_path(
     session: &mut Session,
     name: &str,
@@ -523,24 +582,29 @@ pub fn ensure_log_file(session: &mut Session) {
 /// Lazily initializes the log file on the first call.
 /// Returns true if the entry was successfully written.
 pub fn append_event(session: &mut Session, entry: &SessionLogEntry) -> bool {
+    if let Some(runtime) = session.runtime.as_ref() {
+        if let Some(append_sink) = runtime.downcast_ref::<Arc<dyn SessionAppendSink>>() {
+            return match append_sink.append(entry) {
+                Ok(seq) => {
+                    session.log_entry_count = seq as usize + 1;
+                    true
+                }
+                Err(_) => false,
+            };
+        }
+    }
+
     ensure_log_file(session);
     let Some(path_str) = &session.path else {
         return false;
     };
-    let path = Path::new(path_str);
-    let Ok(yaml) = serde_yaml::to_string(entry) else {
-        return false;
-    };
-    let mut data = String::from("---\n");
-    data.push_str(&yaml);
-    let Ok(mut file) = OpenOptions::new().append(true).open(path) else {
-        return false;
-    };
-    if file.write_all(data.as_bytes()).is_ok() {
-        session.log_entry_count += 1;
-        true
-    } else {
-        false
+    let mut log = FileSessionLog::new(Path::new(path_str), &session.id);
+    match log.append_event(entry) {
+        Ok(seq) => {
+            session.log_entry_count = seq as usize + 1;
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -644,6 +708,7 @@ fn append_message_entries(content: &mut String, msg: &Message, session_id: &str)
                 thought: tc.thought.clone(),
                 calls,
                 timestamp: None,
+                fence_token: None,
             };
             content.push_str("---\n");
             content
@@ -677,9 +742,11 @@ fn append_message_entries(content: &mut String, msg: &Message, session_id: &str)
     }
 
     let entry = SessionLogEntry::Message {
+        id: None,
         role: msg.role,
         content: msg.content.clone(),
         timestamp: None,
+        fence_token: None,
     };
     content.push_str("---\n");
     content.push_str(
@@ -865,6 +932,7 @@ fn relog_message(session: &mut Session, msg: &Message) -> usize {
                     thought: tc.thought.clone(),
                     calls,
                     timestamp: msg.log_timestamp,
+                    fence_token: None,
                 },
             );
             let results: Vec<harnx_core::session::ToolOutput> = tc
@@ -894,9 +962,11 @@ fn relog_message(session: &mut Session, msg: &Message) -> usize {
     if !append_event(
         session,
         &SessionLogEntry::Message {
+            id: None,
             role: msg.role,
             content: msg.content.clone(),
             timestamp: msg.log_timestamp,
+            fence_token: None,
         },
     ) {
         session.dirty = true;
@@ -942,9 +1012,11 @@ pub fn add_assistant_text(
         all_appended &= append_event(
             session,
             &SessionLogEntry::Message {
+                id: None,
                 role: assistant_msg.role,
                 content: assistant_msg.content.clone(),
                 timestamp: Some(timestamp),
+                fence_token: None,
             },
         );
         session.messages.push(assistant_msg);
@@ -984,6 +1056,7 @@ pub fn add_tool_calls(
             thought: thought.map(str::to_string),
             calls: calls.clone(),
             timestamp: Some(Utc::now()),
+            fence_token: None,
         },
     );
     emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned {
@@ -1116,166 +1189,66 @@ fn is_tool_continuation(input: &Input, messages: &[Message]) -> bool {
     input.tool_calls.is_some() && messages.last().is_some_and(|m| m.role == MessageRole::Tool)
 }
 
-/// Externalize inline image data URIs in a single message's content — both
-/// plain content arrays and tool-result content — into `cid:` references,
-/// writing files to `dir` and recording `cid -> filename` in `map`. On partial
-/// failure, keeps whatever was already externalized (those files are on disk
-/// and their refs are already in `content`).
-fn externalize_message(
-    dir: &std::path::Path,
-    content: &mut MessageContent,
-    map: &mut std::collections::HashMap<String, String>,
-) {
-    let result = match content {
-        MessageContent::Array(parts) => {
-            crate::config::attachments::externalize_parts(dir, parts, map)
-        }
-        MessageContent::ToolCalls(tool_calls) => {
-            let mut res = Ok(());
-            for tool_result in tool_calls.tool_results.iter_mut() {
-                if let Err(err) = crate::config::attachments::externalize_parts(
-                    dir,
-                    &mut tool_result.content,
-                    map,
-                ) {
-                    res = Err(err);
-                }
-            }
-            res
-        }
-        MessageContent::Text(_) => Ok(()),
-    };
-    if let Err(err) = result {
-        log::warn!("attachment externalization failed: {err}");
-    }
-}
-
-/// Rewrite inline image data URIs in `content` to `cid:` references in place,
-/// writing the bytes to the session's attachments dir. Returns the
-/// `cid -> filename` map of newly externalized blobs (empty when there are
-/// none, or when the session has no saved path yet — in which case the blob
-/// stays inline and is externalized on a later save).
-fn externalize_content(
-    session: &Session,
-    content: &mut MessageContent,
-) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
-    let Some(path) = session.path.as_deref() else {
-        return map;
-    };
-    let dir = crate::config::attachments::attachments_dir_for(std::path::Path::new(path));
-    externalize_message(&dir, content, &mut map);
-    map
-}
-
-/// Externalize inline image data URIs across a slice of tool results into
-/// `cid:` references, recording `cid -> filename` in `map`. No-op when the
-/// session has no attachments dir yet.
-fn externalize_tool_result_content(
-    dir: Option<&std::path::Path>,
-    results: &mut [crate::tool::ToolResult],
-    map: &mut std::collections::HashMap<String, String>,
-) {
-    let Some(dir) = dir else {
-        return;
-    };
-    for slot in results.iter_mut() {
-        if let Err(err) = crate::config::attachments::externalize_parts(dir, &mut slot.content, map)
-        {
-            log::warn!("tool-result attachment externalization failed: {err}");
-        }
-    }
-}
-
-/// Externalize still-inline image content across every stored message
-/// (compressed + active) into the session's attachments dir, merging the new
-/// `cid -> filename` mappings into the session map. Idempotent — used by the
-/// full-rewrite `save()` to migrate first-turn/legacy inline blobs.
-fn externalize_persisted_messages(session: &mut Session, session_path: &std::path::Path) {
-    let dir = crate::config::attachments::attachments_dir_for(session_path);
-    let mut map = std::collections::HashMap::new();
-    for msg in session.compressed_messages.iter_mut() {
-        externalize_message(&dir, &mut msg.content, &mut map);
-    }
-    for msg in session.messages.iter_mut() {
-        externalize_message(&dir, &mut msg.content, &mut map);
-    }
-    session.data_urls.extend(map);
-}
-
-/// Record freshly externalized `cid -> filename` mappings: append a `DataUrls`
-/// log entry and merge them into the session map. No-op when empty. Returns
-/// whether the append (if any) succeeded.
-fn record_externalized(
-    session: &mut Session,
-    cid_urls: std::collections::HashMap<String, String>,
-) -> bool {
-    if cid_urls.is_empty() {
-        return true;
-    }
-    let appended = append_event(
-        session,
-        &SessionLogEntry::DataUrls {
-            urls: cid_urls.clone(),
-        },
-    );
-    session.data_urls.extend(cid_urls);
-    appended
-}
-
-/// Shared round-opening setup used by both `add_assistant_text` and
-/// `add_tool_calls`: first-turn agent-message injection, user-message
-/// push (skipped on continuation rounds), data-URL persistence, and
-/// any queued injected-user-text.  Returns `true` iff every log
-/// append succeeded.
 fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<bool> {
     let mut all_appended = true;
     let is_continuation = is_tool_continuation(input, &session.messages);
+
     if session.messages.is_empty() {
-        let agent_messages = input.agent().build_messages(input)?;
-        let mut cid_urls = std::collections::HashMap::new();
-        for mut msg in agent_messages {
-            // `externalize_content` only writes files + rewrites `content` in
-            // memory (takes `&Session`, cannot append), so `seq` stays correct.
-            let seq = session.next_seq();
-            cid_urls.extend(externalize_content(session, &mut msg.content));
-            all_appended &= append_event(
-                session,
-                &SessionLogEntry::Message {
-                    role: msg.role,
-                    content: msg.content.clone(),
-                    timestamp: Some(Utc::now()),
-                },
-            );
-            session.messages.push(msg.with_log_seq(seq));
-        }
-        // Seq-less metadata record for the cids written above; appended after
-        // the messages so message log_seqs are unaffected.
-        all_appended &= record_externalized(session, cid_urls);
-    } else if !is_continuation {
-        // `seq` is the message's log-document index. `externalize_content` only
-        // writes attachment files + rewrites `content` in memory (it takes
-        // `&Session`, so it cannot append), so nothing must be appended between
-        // here and the Message append below or `seq` would be off by one. The
-        // cid DataUrls entry is a seq-less metadata record appended *after* the
-        // message.
-        let seq = session.next_seq();
-        let mut content = input.message_content();
-        let cid_urls = externalize_content(session, &mut content);
-        let user_msg = Message::new(MessageRole::User, content).with_log_seq(seq);
-        all_appended &= append_event(
-            session,
-            &SessionLogEntry::Message {
-                role: user_msg.role,
-                content: user_msg.content.clone(),
-                timestamp: Some(Utc::now()),
-            },
-        );
-        session.messages.push(user_msg);
-        emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
-        all_appended &= record_externalized(session, cid_urls);
+        all_appended &= append_initial_agent_messages(session, input)?;
+    } else if !is_continuation && !input.skip_user_log_append {
+        // `skip_user_log_append` is set by the NATS HA worker: the user
+        // message is already durably logged by the client and present in the
+        // loaded `session.messages`, so re-appending it would duplicate it and
+        // reorder the assistant barrier past concurrent arrivals.
+        all_appended &= append_user_turn_message(session, input);
     }
+
+    all_appended &= append_input_data_urls(session, input);
+    all_appended &= append_injected_user_text(session, input);
+    Ok(all_appended)
+}
+
+fn append_initial_agent_messages(session: &mut Session, input: &Input) -> Result<bool> {
+    let agent_messages = input.agent().build_messages(input)?;
+    let mut all_appended = true;
+    let mut cid_urls = std::collections::HashMap::new();
+
+    for mut msg in agent_messages {
+        // `externalize_content` only writes files + rewrites `content` in
+        // memory (takes `&Session`, cannot append), so `seq` stays correct.
+        let seq = session.next_seq();
+        cid_urls.extend(externalize_content(session, &mut msg.content));
+        all_appended &= append_session_message(session, msg.role, msg.content.clone());
+        session.messages.push(msg.with_log_seq(seq));
+    }
+
+    // Seq-less metadata record for the cids written above; appended after
+    // the messages so message log_seqs are unaffected.
+    all_appended &= record_externalized(session, cid_urls);
+    Ok(all_appended)
+}
+
+fn append_user_turn_message(session: &mut Session, input: &Input) -> bool {
+    // `seq` is the message's log-document index. `externalize_content` only
+    // writes attachment files + rewrites `content` in memory (it takes
+    // `&Session`, so it cannot append), so nothing must be appended between
+    // here and the Message append below or `seq` would be off by one. The
+    // cid DataUrls entry is a seq-less metadata record appended *after* the
+    // message.
+    let seq = session.next_seq();
+    let mut content = input.message_content();
+    let cid_urls = externalize_content(session, &mut content);
+    let user_msg = Message::new(MessageRole::User, content).with_log_seq(seq);
+    let mut all_appended = append_session_message(session, user_msg.role, user_msg.content.clone());
+    session.messages.push(user_msg);
+    emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
+    all_appended &= record_externalized(session, cid_urls);
+    all_appended
+}
+
+fn append_input_data_urls(session: &mut Session, input: &Input) -> bool {
     let new_data_urls = input.data_urls();
+    let mut all_appended = true;
     if !new_data_urls.is_empty() {
         all_appended &= append_event(
             session,
@@ -1285,25 +1258,42 @@ fn begin_turn(session: &mut Session, input: &Input, _output: &str) -> Result<boo
         );
     }
     session.data_urls.extend(new_data_urls);
-    if let Some(injected) = input.injected_user_text() {
-        let seq = session.next_seq();
-        let injected_msg = Message::new(
-            MessageRole::User,
-            MessageContent::Text(injected.to_string()),
-        )
-        .with_log_seq(seq);
-        all_appended &= append_event(
-            session,
-            &SessionLogEntry::Message {
-                role: injected_msg.role,
-                content: injected_msg.content.clone(),
-                timestamp: Some(Utc::now()),
-            },
-        );
-        session.messages.push(injected_msg);
-        emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
-    }
-    Ok(all_appended)
+    all_appended
+}
+
+fn append_injected_user_text(session: &mut Session, input: &Input) -> bool {
+    let Some(injected) = input.injected_user_text() else {
+        return true;
+    };
+
+    let seq = session.next_seq();
+    let injected_msg = Message::new(
+        MessageRole::User,
+        MessageContent::Text(injected.to_string()),
+    )
+    .with_log_seq(seq);
+    let all_appended =
+        append_session_message(session, injected_msg.role, injected_msg.content.clone());
+    session.messages.push(injected_msg);
+    emit_agent_event(AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }));
+    all_appended
+}
+
+fn append_session_message(
+    session: &mut Session,
+    role: MessageRole,
+    content: MessageContent,
+) -> bool {
+    append_event(
+        session,
+        &SessionLogEntry::Message {
+            id: None,
+            role,
+            content,
+            timestamp: Some(Utc::now()),
+            fence_token: None,
+        },
+    )
 }
 
 pub fn clear_messages(session: &mut Session) {
@@ -2856,7 +2846,9 @@ content: second
         let appended = super::append_event(
             &mut session,
             &SessionLogEntry::Message {
+                id: None,
                 timestamp: None,
+                fence_token: None,
                 role: MessageRole::User,
                 content: MessageContent::Text("third".to_string()),
             },
@@ -3164,7 +3156,7 @@ content: second
             },
         ]);
 
-        let map = super::externalize_content(&session, &mut content);
+        let map = super::session_externalize::externalize_content(&session, &mut content);
         assert_eq!(map.len(), 1, "one cid recorded");
         assert!(
             map.keys().next().unwrap().starts_with("cid:"),

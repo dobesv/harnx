@@ -1,14 +1,20 @@
 /// Sanitize a string for use in tool name generation.
-/// Replaces `/` with `__` and any other non-alphanumeric-or-hyphen char with `_`.
+///
+/// Forward-only, lossy mapping. `/` becomes `__`, `@` becomes `__at__`, and any
+/// other non-alphanumeric-or-hyphen char becomes `_`. Like `/`, `@` mapping is
+/// not round-trippable and must not be used to reconstruct higher-level meaning.
 /// Examples:
 ///   "my-pkg"      → "my-pkg"
 ///   "org/my-pkg"  → "org__my-pkg"
+///   "foo@bar"     → "foo__at__bar"
 ///   "foo bar"     → "foo_bar"
 pub fn sanitize_for_tool_name(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 2);
+    let mut result = String::with_capacity(s.len() + 8);
     for ch in s.chars() {
         if ch == '/' {
             result.push_str("__");
+        } else if ch == '@' {
+            result.push_str("__at__");
         } else if ch.is_alphanumeric() || ch == '-' || ch == '_' {
             result.push(ch);
         } else {
@@ -119,6 +125,11 @@ mod tests {
     #[test]
     fn test_sanitize_clean() {
         assert_eq!(sanitize_for_tool_name("mypkg"), "mypkg");
+    }
+
+    #[test]
+    fn test_sanitize_at_sign() {
+        assert_eq!(sanitize_for_tool_name("foo@bar"), "foo__at__bar");
     }
 
     #[test]

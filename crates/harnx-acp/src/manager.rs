@@ -233,95 +233,103 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
             mcp_server_name: None,
             call_template: Some(session_new_call_template),
             result_template: None,
+            idempotent_hint: None,
+            read_only_hint: None,
         },
-        ToolDeclaration {
-            name: format!("{server_name}_session_prompt"),
-            description: format!(
-                "Send a prompt to the '{server_name}' ACP agent. To continue a prior conversation, you must pass the session_id returned by an earlier prompt call or by session_new; the remote agent keeps context under that session_id. If you omit session_id, this starts a new empty session with no prior context."
-            ),
-            parameters: JsonSchema {
-                type_value: Some("object".to_string()),
-                properties: Some({
-                    let mut props = IndexMap::new();
-                    props.insert(
-                        "message".to_string(),
-                        JsonSchema {
-                            type_value: Some("string".to_string()),
-                            description: Some("The prompt message to send to the agent".to_string()),
-                            ..Default::default()
-                        },
-                    );
-                    props.insert(
-                        "session_id".to_string(),
-                        JsonSchema {
-                            type_value: Some("string".to_string()),
-                            description: Some(
-                                "Session ID returned by a prior prompt call or by session_new. Pass it to preserve context from earlier turns; if omitted, a new empty session is created and no prior context is available.".to_string(),
-                            ),
-                            ..Default::default()
-                        },
-                    );
-                    props
-                }),
-                required: Some(vec!["message".to_string()]),
-                ..Default::default()
+        acp_session_prompt_tool(server_name, session_prompt_call_template),
+        acp_session_id_tool(
+            AcpSessionIdTool {
+                name: &format!("{server_name}_session_load"),
+                description: &format!(
+                    "Load an existing session on the '{server_name}' ACP agent and resume its prior context"
+                ),
+                session_id_desc: "The session ID to load",
+                mcp_tool_name: "session_load",
+                call_template: session_load_call_template,
             },
-            mcp_tool_name: Some("session_prompt".to_string()),
-            mcp_server_name: None,
-            call_template: Some(session_prompt_call_template),
-            result_template: None,
-        },
-        ToolDeclaration {
-            name: format!("{server_name}_session_load"),
-            description: format!("Load an existing session on the '{server_name}' ACP agent and resume its prior context"),
-            parameters: JsonSchema {
-                type_value: Some("object".to_string()),
-                properties: Some({
-                    let mut props = IndexMap::new();
-                    props.insert(
-                        "session_id".to_string(),
-                        JsonSchema {
-                            type_value: Some("string".to_string()),
-                            description: Some("The session ID to load".to_string()),
-                            ..Default::default()
-                        },
-                    );
-                    props
-                }),
-                required: Some(vec!["session_id".to_string()]),
-                ..Default::default()
-            },
-            mcp_tool_name: Some("session_load".to_string()),
-            mcp_server_name: None,
-            call_template: Some(session_load_call_template),
-            result_template: None,
-        },
-        ToolDeclaration {
-            name: format!("{server_name}_session_cancel"),
-            description: format!("Cancel a running prompt on the '{server_name}' ACP agent"),
-            parameters: JsonSchema {
-                type_value: Some("object".to_string()),
-                properties: Some({
-                    let mut props = IndexMap::new();
-                    props.insert(
-                        "session_id".to_string(),
-                        JsonSchema {
-                            type_value: Some("string".to_string()),
-                            description: Some("The session ID to cancel".to_string()),
-                            ..Default::default()
-                        },
-                    );
-                    props
-                }),
-                required: Some(vec!["session_id".to_string()]),
-                ..Default::default()
-            },
-            mcp_tool_name: Some("session_cancel".to_string()),
-            mcp_server_name: None,
-            call_template: Some(session_cancel_call_template),
-            result_template: None,
-        },
+        ),
+        acp_session_id_tool(AcpSessionIdTool {
+            name: &format!("{server_name}_session_cancel"),
+            description: &format!("Cancel a running prompt on the '{server_name}' ACP agent"),
+            session_id_desc: "The session ID to cancel",
+            mcp_tool_name: "session_cancel",
+            call_template: session_cancel_call_template,
+        }),
     ]
+}
+
+/// Build a single object property of type `string` with the given description.
+fn string_prop(description: &str) -> JsonSchema {
+    JsonSchema {
+        type_value: Some("string".to_string()),
+        description: Some(description.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The `session_prompt` ACP tool declaration (message + optional session_id).
+fn acp_session_prompt_tool(server_name: &str, call_template: String) -> ToolDeclaration {
+    let mut props = IndexMap::new();
+    props.insert(
+        "message".to_string(),
+        string_prop("The prompt message to send to the agent"),
+    );
+    props.insert(
+        "session_id".to_string(),
+        string_prop(
+            "Session ID returned by a prior prompt call or by session_new. Pass it to preserve context from earlier turns; if omitted, a new empty session is created and no prior context is available.",
+        ),
+    );
+    ToolDeclaration {
+        name: format!("{server_name}_session_prompt"),
+        description: format!(
+            "Send a prompt to the '{server_name}' ACP agent. To continue a prior conversation, you must pass the session_id returned by an earlier prompt call or by session_new; the remote agent keeps context under that session_id. If you omit session_id, this starts a new empty session with no prior context."
+        ),
+        parameters: JsonSchema {
+            type_value: Some("object".to_string()),
+            properties: Some(props),
+            required: Some(vec!["message".to_string()]),
+            ..Default::default()
+        },
+        mcp_tool_name: Some("session_prompt".to_string()),
+        mcp_server_name: None,
+        call_template: Some(call_template),
+        result_template: None,
+        idempotent_hint: None,
+        read_only_hint: None,
+    }
+}
+
+/// Parameters for [`acp_session_id_tool`].
+struct AcpSessionIdTool<'a> {
+    name: &'a str,
+    description: &'a str,
+    session_id_desc: &'a str,
+    mcp_tool_name: &'a str,
+    call_template: String,
+}
+
+/// Build an ACP tool that takes a single required `session_id` string
+/// parameter (used by `session_load` and `session_cancel`).
+fn acp_session_id_tool(tool: AcpSessionIdTool<'_>) -> ToolDeclaration {
+    let mut props = IndexMap::new();
+    props.insert("session_id".to_string(), string_prop(tool.session_id_desc));
+    ToolDeclaration {
+        name: tool.name.to_string(),
+        description: tool.description.to_string(),
+        parameters: JsonSchema {
+            type_value: Some("object".to_string()),
+            properties: Some(props),
+            required: Some(vec!["session_id".to_string()]),
+            ..Default::default()
+        },
+        mcp_tool_name: Some(tool.mcp_tool_name.to_string()),
+        mcp_server_name: None,
+        call_template: Some(tool.call_template),
+        result_template: None,
+        idempotent_hint: None,
+        read_only_hint: None,
+    }
 }
 
 pub async fn session_prompt_with_abort<Fut>(

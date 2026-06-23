@@ -1,0 +1,874 @@
+use crate::message::{Message, MessageRole};
+use crate::session::{SessionLogEntry, ToolOutput};
+use crate::tool::ToolCall;
+
+/// Apply mutation entries (EditEntries, Rewind) to build the effective entry stream.
+///
+/// This is the canonical resolver for mutation semantics:
+/// - `EditEntries { from, to, replacements: [] }` deletes entries in [from, to]
+/// - `EditEntries { from, to, replacements: [yaml, ...] }` replaces with parsed entries
+/// - `Rewind { after_seq }` truncates effective entries to <= after_seq
+///
+/// Invalid/malformed mutations are skipped with warnings (logged via the `log` crate).
+/// Replacements inherit the mutation's seq number for future addressing.
+pub fn apply_log_mutations(
+    raw_entries: &[(usize, SessionLogEntry)],
+) -> Vec<(usize, SessionLogEntry)> {
+    apply_log_mutations_with_name(raw_entries, "session")
+}
+
+/// Variant that accepts a session name for logging context.
+pub fn apply_log_mutations_with_name(
+    raw_entries: &[(usize, SessionLogEntry)],
+    name: &str,
+) -> Vec<(usize, SessionLogEntry)> {
+    let mut effective_entries = Vec::new();
+
+    for (seq, entry) in raw_entries {
+        match entry {
+            SessionLogEntry::Rewind { after_seq } => {
+                // Rewind can only reference entries that come before it in the log
+                if !effective_entries
+                    .iter()
+                    .any(|(existing_seq, _)| existing_seq == after_seq)
+                {
+                    log::warn!(
+                        "Skipping rewind entry #{seq} in session {name}: after_seq {after_seq} not present in replay state"
+                    );
+                    continue;
+                }
+                effective_entries.retain(|(existing_seq, _)| *existing_seq <= *after_seq);
+            }
+            SessionLogEntry::EditEntries {
+                from,
+                to,
+                replacements,
+            } => {
+                if from > to {
+                    log::warn!(
+                        "Skipping edit_entries entry #{seq} in session {name}: invalid range [{from}, {to}]"
+                    );
+                    continue;
+                }
+                // Note: to >= seq check is SKIPPED intentionally for NATS sequences
+                // which start at 1 (not 0). The validation that from/to reference
+                // earlier entries is done by checking they exist in effective_entries.
+
+                let Some(start_idx) = effective_entries
+                    .iter()
+                    .position(|(existing_seq, _)| existing_seq == from)
+                else {
+                    log::warn!(
+                        "Skipping edit_entries entry #{seq} in session {name}: from seq {from} not present in replay state"
+                    );
+                    continue;
+                };
+                let Some(end_idx) = effective_entries
+                    .iter()
+                    .rposition(|(existing_seq, _)| existing_seq == to)
+                else {
+                    log::warn!(
+                        "Skipping edit_entries entry #{seq} in session {name}: to seq {to} not present in replay state"
+                    );
+                    continue;
+                };
+                if start_idx > end_idx {
+                    log::warn!(
+                        "Skipping edit_entries entry #{seq} in session {name}: range [{from}, {to}] not in replay order"
+                    );
+                    continue;
+                }
+
+                let parsed_replacements: Vec<_> = replacements
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(replacement_idx, replacement)| {
+                        match serde_yaml::from_str::<SessionLogEntry>(replacement) {
+                            Ok(parsed) => {
+                                // Replacements inherit EditEntries seq because originals are
+                                // logically removed from effective stream. Future rewind/edit
+                                // operations must target mutation seq, not replaced seqs.
+                                Some((*seq, parsed))
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "Skipping replacement #{replacement_idx} in edit_entries entry #{seq} for session {name}: {err}"
+                                );
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+
+                effective_entries.splice(start_idx..=end_idx, parsed_replacements);
+            }
+            SessionLogEntry::Unknown => {}
+            _ => effective_entries.push((*seq, entry.clone())),
+        }
+    }
+
+    effective_entries
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnStatus {
+    Idle,
+    InFlightResumable,
+    InFlightCancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconstructedState {
+    pub turn_status: TurnStatus,
+    pub next_turn_messages: Vec<Message>,
+    pub resumable_ctx: Option<ResumableCtx>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumableCtx {
+    pub last_user: Option<Message>,
+    pub last_assistant: Option<AssistantTurn>,
+    pub pending_tool_results: Vec<ToolOutput>,
+    pub fence_token: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AssistantTurn {
+    Message(Message),
+    ToolCalls {
+        text: String,
+        thought: Option<String>,
+        calls: Vec<ToolCall>,
+    },
+}
+
+/// Reconstruct session state from raw log entries.
+///
+/// This function applies mutation entries (EditEntries, Rewind) automatically
+/// before reconstruction, so retract/edit operations are honored.
+///
+/// For direct control over mutation resolution, use `apply_log_mutations` then
+/// `reconstruct_state_effective`.
+pub fn reconstruct_state(entries: &[SessionLogEntry]) -> ReconstructedState {
+    // Apply mutations first: convert raw entries to effective entries
+    // Use 0-based indexing for local entries
+    let raw_with_seq: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (i, e.clone()))
+        .collect();
+    let effective_entries = apply_log_mutations(&raw_with_seq);
+
+    // Convert to the format expected by reconstruct_state_with_seq
+    reconstruct_state_effective(&effective_entries)
+}
+
+/// Reconstruct session state from entries with NATS JetStream sequence numbers.
+///
+/// This function applies mutation entries (EditEntries, Rewind) automatically
+/// before reconstruction, so retract/edit operations are honored.
+///
+/// NATS sequences start at 1, not 0.
+pub fn reconstruct_state_from_nats(entries: &[(u64, SessionLogEntry)]) -> ReconstructedState {
+    // Convert u64 seq to usize and apply mutations
+    let raw_with_seq: Vec<_> = entries
+        .iter()
+        .map(|(seq, e)| (*seq as usize, e.clone()))
+        .collect();
+    let effective_entries = apply_log_mutations(&raw_with_seq);
+    reconstruct_state_effective(&effective_entries)
+}
+
+/// Reconstruct from pre-resolved effective entries (mutations already applied).
+pub fn reconstruct_state_effective(entries: &[(usize, SessionLogEntry)]) -> ReconstructedState {
+    let with_seq: Vec<_> = entries
+        .iter()
+        .map(|(seq, e)| (Some(*seq), e.clone()))
+        .collect();
+    reconstruct_state_with_seq(&with_seq)
+}
+
+/// Variant that accepts entries with JetStream sequence numbers attached.
+///
+/// IMPORTANT: Callers should use `reconstruct_state` or ensure they pass
+/// already-resolved entries. This function does NOT apply mutations.
+pub fn reconstruct_state_with_seq(
+    entries: &[(Option<usize>, SessionLogEntry)],
+) -> ReconstructedState {
+    let tail_indices = entries_after_last_barrier_with_seq(entries);
+    let mut replay = ReplayAccumulator::default();
+
+    for (idx, entry) in tail_indices {
+        replay.apply_entry_with_seq(idx, entry);
+    }
+
+    replay.finish()
+}
+
+#[derive(Debug, Default)]
+struct ReplayAccumulator {
+    next_turn_messages: Vec<Message>,
+    resumable_last_user: Option<Message>,
+    resumable_last_assistant: Option<AssistantTurn>,
+    pending_tool_results: Vec<ToolOutput>,
+    active_fence_token: Option<u64>,
+    cancel_fence_token: Option<u64>,
+}
+
+impl ReplayAccumulator {
+    #[allow(dead_code)]
+    fn apply_entry(&mut self, entry: &SessionLogEntry) {
+        self.apply_entry_with_seq(None, entry);
+    }
+
+    fn apply_entry_with_seq(&mut self, log_seq: Option<usize>, entry: &SessionLogEntry) {
+        match entry {
+            SessionLogEntry::Cancel { fence_token } => self.on_cancel(*fence_token),
+            SessionLogEntry::Message { role, .. } if role.is_user() => {
+                self.on_user_message_with_seq(log_seq, entry)
+            }
+            SessionLogEntry::Message { role, .. } if role.is_assistant() => {
+                self.on_assistant_message(entry)
+            }
+            SessionLogEntry::ToolCalls { .. } => self.on_tool_calls(entry),
+            SessionLogEntry::ToolResults { results, .. } => self.on_tool_results(results),
+            _ => {}
+        }
+    }
+
+    fn finish(self) -> ReconstructedState {
+        let is_resumable = matches!(
+            self.resumable_last_assistant,
+            Some(AssistantTurn::ToolCalls { .. })
+        );
+
+        if let Some(fence_token) = self.cancel_fence_token {
+            return ReconstructedState {
+                turn_status: TurnStatus::InFlightCancelled,
+                next_turn_messages: Vec::new(),
+                resumable_ctx: Some(ResumableCtx {
+                    last_user: None,
+                    last_assistant: None,
+                    pending_tool_results: Vec::new(),
+                    fence_token: Some(fence_token),
+                }),
+            };
+        }
+
+        if !self.next_turn_messages.is_empty() && !is_resumable {
+            return ReconstructedState {
+                turn_status: TurnStatus::Idle,
+                next_turn_messages: self.next_turn_messages,
+                resumable_ctx: None,
+            };
+        }
+
+        let next_turn_messages = self.next_turn_messages;
+        ReconstructedState {
+            turn_status: if is_resumable {
+                TurnStatus::InFlightResumable
+            } else {
+                TurnStatus::Idle
+            },
+            next_turn_messages: if is_resumable {
+                next_turn_messages
+            } else {
+                Vec::new()
+            },
+            resumable_ctx: is_resumable.then_some(ResumableCtx {
+                last_user: self.resumable_last_user,
+                last_assistant: self.resumable_last_assistant,
+                pending_tool_results: self.pending_tool_results,
+                fence_token: self.active_fence_token,
+            }),
+        }
+    }
+
+    fn on_cancel(&mut self, fence_token: u64) {
+        self.cancel_fence_token = Some(fence_token);
+        self.resumable_last_user = None;
+        self.resumable_last_assistant = None;
+        self.pending_tool_results.clear();
+        self.active_fence_token = None;
+    }
+
+    #[allow(dead_code)]
+    fn on_user_message(&mut self, entry: &SessionLogEntry) {
+        self.on_user_message_with_seq(None, entry);
+    }
+
+    fn on_user_message_with_seq(&mut self, log_seq: Option<usize>, entry: &SessionLogEntry) {
+        let Some(mut message) = cloned_message(entry) else {
+            return;
+        };
+        // Attach log_seq if provided
+        if let Some(seq) = log_seq {
+            message.log_seq = Some(seq);
+        }
+
+        if self.cancel_fence_token.is_some() {
+            self.cancel_fence_token = None;
+            self.next_turn_messages.clear();
+        }
+
+        if matches!(
+            self.resumable_last_assistant,
+            Some(AssistantTurn::ToolCalls { .. })
+        ) {
+            self.next_turn_messages.push(message);
+            return;
+        }
+
+        self.next_turn_messages.push(message.clone());
+        self.resumable_last_user = None;
+        self.resumable_last_assistant = None;
+        self.pending_tool_results.clear();
+        self.active_fence_token = None;
+    }
+
+    fn on_assistant_message(&mut self, _entry: &SessionLogEntry) {
+        self.next_turn_messages.clear();
+        self.resumable_last_user = None;
+        self.resumable_last_assistant = None;
+        self.pending_tool_results.clear();
+        self.active_fence_token = None;
+        self.cancel_fence_token = None;
+    }
+
+    fn on_tool_calls(&mut self, entry: &SessionLogEntry) {
+        if self.cancel_fence_token.is_some() {
+            return;
+        }
+
+        let SessionLogEntry::ToolCalls {
+            text,
+            thought,
+            calls,
+            fence_token,
+            ..
+        } = entry
+        else {
+            return;
+        };
+
+        self.resumable_last_user = self.next_turn_messages.last().cloned();
+        self.next_turn_messages.clear();
+        self.resumable_last_assistant = Some(AssistantTurn::ToolCalls {
+            text: text.clone(),
+            thought: thought.clone(),
+            calls: calls.clone(),
+        });
+        self.pending_tool_results.clear();
+        self.active_fence_token = *fence_token;
+    }
+
+    fn on_tool_results(&mut self, results: &[ToolOutput]) {
+        if self.cancel_fence_token.is_none()
+            && matches!(
+                self.resumable_last_assistant,
+                Some(AssistantTurn::ToolCalls { .. })
+            )
+        {
+            self.pending_tool_results = results.to_vec();
+        }
+    }
+}
+
+fn cloned_message(entry: &SessionLogEntry) -> Option<Message> {
+    let SessionLogEntry::Message {
+        role,
+        content,
+        timestamp,
+        ..
+    } = entry
+    else {
+        return None;
+    };
+
+    Some(Message {
+        role: *role,
+        content: content.clone(),
+        log_seq: None,
+        log_timestamp: *timestamp,
+    })
+}
+
+#[allow(dead_code)]
+fn entries_after_last_barrier(entries: &[SessionLogEntry]) -> &[SessionLogEntry] {
+    let last_barrier = entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, entry)| is_final_assistant_message(entry).then_some(index));
+
+    last_barrier.map_or(entries, |index| &entries[index + 1..])
+}
+
+fn entries_after_last_barrier_with_seq(
+    entries: &[(Option<usize>, SessionLogEntry)],
+) -> Vec<(Option<usize>, &SessionLogEntry)> {
+    let last_barrier = entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, (_, entry))| is_final_assistant_message(entry).then_some(index));
+
+    last_barrier.map_or_else(
+        || entries.iter().map(|(seq, e)| (*seq, e)).collect(),
+        |index| {
+            entries[index + 1..]
+                .iter()
+                .map(|(seq, e)| (*seq, e))
+                .collect()
+        },
+    )
+}
+
+fn is_final_assistant_message(entry: &SessionLogEntry) -> bool {
+    // A barrier is any final assistant text Message. Tool calls live in separate
+    // `ToolCalls` entries, so an assistant `Message` always marks the end of a
+    // completed turn. The fence_token is `Some(..)` for worker-originated (NATS HA)
+    // turns and `None` for local-mode turns — BOTH are barriers. The client-side
+    // `id` is irrelevant to barrier detection.
+    matches!(
+        entry,
+        SessionLogEntry::Message {
+            role: MessageRole::Assistant,
+            ..
+        }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::MessageContent;
+    use serde_json::json;
+
+    #[test]
+    fn empty_log_is_idle_with_no_next_turn_messages() {
+        assert_case(
+            vec![],
+            ExpectedState::Idle {
+                next_turn_messages: &[],
+            },
+        );
+    }
+
+    #[test]
+    fn barrier_only_is_idle_with_no_next_turn_messages() {
+        assert_case(
+            vec![final_assistant("done")],
+            ExpectedState::Idle {
+                next_turn_messages: &[],
+            },
+        );
+    }
+
+    #[test]
+    fn post_barrier_single_user_folds_into_next_turn_messages() {
+        assert_case(
+            vec![final_assistant("done"), user_message("u1")],
+            ExpectedState::Idle {
+                next_turn_messages: &["u1"],
+            },
+        );
+    }
+
+    #[test]
+    fn post_barrier_multiple_users_fold_in_order() {
+        assert_case(
+            vec![
+                final_assistant("done"),
+                user_message("u1"),
+                user_message("u2"),
+                user_message("u3"),
+            ],
+            ExpectedState::Idle {
+                next_turn_messages: &["u1", "u2", "u3"],
+            },
+        );
+    }
+
+    #[test]
+    fn tool_calls_after_post_barrier_user_are_resumable() {
+        assert_case(
+            vec![
+                final_assistant("done"),
+                user_message("u1"),
+                tool_calls_assistant(7),
+            ],
+            ExpectedState::Resumable {
+                fence_token: Some(7),
+                last_user: Some("u1"),
+                assistant: ExpectedAssistant::ToolCalls,
+                pending_tool_results_len: 0,
+                next_turn_messages: &[],
+            },
+        );
+    }
+
+    #[test]
+    fn users_after_tool_calls_queue_for_next_turn() {
+        assert_case(
+            vec![
+                final_assistant("done"),
+                user_message("u1"),
+                tool_calls_assistant(7),
+                user_message("u2"),
+            ],
+            ExpectedState::Resumable {
+                fence_token: Some(7),
+                last_user: Some("u1"),
+                assistant: ExpectedAssistant::ToolCalls,
+                pending_tool_results_len: 0,
+                next_turn_messages: &["u2"],
+            },
+        );
+    }
+
+    #[test]
+    fn tool_results_without_matching_tool_calls_are_ignored() {
+        assert_case(
+            vec![final_assistant("done"), tool_results("tool-a")],
+            ExpectedState::Idle {
+                next_turn_messages: &[],
+            },
+        );
+    }
+
+    #[test]
+    fn tool_results_attach_to_resumable_ctx_but_keep_queued_users() {
+        assert_case(
+            vec![
+                final_assistant("done"),
+                user_message("u1"),
+                tool_calls_assistant(7),
+                user_message("u2"),
+                tool_results("tool-a"),
+            ],
+            ExpectedState::Resumable {
+                fence_token: Some(7),
+                last_user: Some("u1"),
+                assistant: ExpectedAssistant::ToolCalls,
+                pending_tool_results_len: 1,
+                next_turn_messages: &["u2"],
+            },
+        );
+    }
+
+    #[test]
+    fn cancel_after_tool_calls_marks_inflight_cancelled() {
+        assert_case(
+            vec![
+                final_assistant("done"),
+                user_message("u1"),
+                tool_calls_assistant(7),
+                cancel(7),
+            ],
+            ExpectedState::Cancelled {
+                fence_token: Some(7),
+            },
+        );
+    }
+
+    #[test]
+    fn user_after_cancel_starts_next_turn_and_clears_tombstone() {
+        assert_case(
+            vec![
+                final_assistant("done"),
+                user_message("u1"),
+                tool_calls_assistant(7),
+                cancel(7),
+                user_message("u2"),
+            ],
+            ExpectedState::Idle {
+                next_turn_messages: &["u2"],
+            },
+        );
+    }
+
+    #[test]
+    fn latest_cancel_tombstone_wins() {
+        assert_case(
+            vec![
+                final_assistant("done"),
+                user_message("u1"),
+                tool_calls_assistant(7),
+                cancel(7),
+                cancel(8),
+            ],
+            ExpectedState::Cancelled {
+                fence_token: Some(8),
+            },
+        );
+    }
+
+    #[test]
+    fn cancel_without_barrier_is_cancelled() {
+        assert_case(
+            vec![cancel(9)],
+            ExpectedState::Cancelled {
+                fence_token: Some(9),
+            },
+        );
+    }
+
+    #[test]
+    fn tool_results_without_tool_calls_after_barrier_stay_idle() {
+        assert_case(
+            vec![final_assistant("done"), tool_results("tool-a")],
+            ExpectedState::Idle {
+                next_turn_messages: &[],
+            },
+        );
+    }
+
+    #[test]
+    fn final_assistant_message_is_barrier_even_after_cancelled_tail() {
+        assert_case(
+            vec![cancel(3), final_assistant("done")],
+            ExpectedState::Idle {
+                next_turn_messages: &[],
+            },
+        );
+    }
+
+    #[test]
+    fn fenced_final_assistant_is_a_barrier() {
+        // Worker-originated (NATS HA) final assistant messages carry a fence_token.
+        // They MUST still be recognized as turn barriers, otherwise the worker
+        // re-folds already-answered user messages and re-runs completed turns.
+        assert_case(
+            vec![user_message("u1"), fenced_final_assistant("done", 5)],
+            ExpectedState::Idle {
+                next_turn_messages: &[],
+            },
+        );
+    }
+
+    #[test]
+    fn edit_entries_replacement_yaml_is_applied() {
+        let replacement = serde_yaml::to_string(&SessionLogEntry::Message {
+            id: Some("edited-id".to_string()),
+            role: MessageRole::User,
+            content: MessageContent::Text("edited".to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .expect("serialize replacement");
+
+        let effective = apply_log_mutations(&[
+            (1, user_message("original")),
+            (
+                2,
+                SessionLogEntry::EditEntries {
+                    from: 1,
+                    to: 1,
+                    replacements: vec![replacement],
+                },
+            ),
+        ]);
+
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].0, 2);
+        assert_eq!(message_text(&entry_as_message(&effective[0].1)), "edited");
+    }
+
+    #[test]
+    fn rewind_truncates_effective_entries_after_prior_edit() {
+        let replacement = serde_yaml::to_string(&SessionLogEntry::Message {
+            id: Some("edited-id".to_string()),
+            role: MessageRole::User,
+            content: MessageContent::Text("edited".to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .expect("serialize replacement");
+
+        let effective = apply_log_mutations(&[
+            (1, user_message("original")),
+            (
+                2,
+                SessionLogEntry::EditEntries {
+                    from: 1,
+                    to: 1,
+                    replacements: vec![replacement],
+                },
+            ),
+            (3, final_assistant("done")),
+            (4, SessionLogEntry::Rewind { after_seq: 2 }),
+        ]);
+
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].0, 2);
+        assert_eq!(message_text(&entry_as_message(&effective[0].1)), "edited");
+    }
+
+    #[test]
+    fn post_fenced_barrier_user_folds_into_next_turn() {
+        assert_case(
+            vec![
+                user_message("u1"),
+                fenced_final_assistant("answer1", 5),
+                user_message("u2"),
+            ],
+            ExpectedState::Idle {
+                next_turn_messages: &["u2"],
+            },
+        );
+    }
+
+    enum ExpectedState<'a> {
+        Idle {
+            next_turn_messages: &'a [&'a str],
+        },
+        Resumable {
+            fence_token: Option<u64>,
+            last_user: Option<&'a str>,
+            assistant: ExpectedAssistant,
+            pending_tool_results_len: usize,
+            next_turn_messages: &'a [&'a str],
+        },
+        Cancelled {
+            fence_token: Option<u64>,
+        },
+    }
+
+    enum ExpectedAssistant {
+        ToolCalls,
+    }
+
+    fn assert_case(entries: Vec<SessionLogEntry>, expected: ExpectedState<'_>) {
+        let state = reconstruct_state(&entries);
+        match expected {
+            ExpectedState::Idle { next_turn_messages } => {
+                assert_eq!(state.turn_status, TurnStatus::Idle);
+                assert_next_turn_messages(&state.next_turn_messages, next_turn_messages);
+                assert!(state.resumable_ctx.is_none());
+            }
+            ExpectedState::Resumable {
+                fence_token,
+                last_user,
+                assistant,
+                pending_tool_results_len,
+                next_turn_messages,
+            } => {
+                assert_eq!(state.turn_status, TurnStatus::InFlightResumable);
+                assert_next_turn_messages(&state.next_turn_messages, next_turn_messages);
+                let ctx = state.resumable_ctx.expect("resumable ctx");
+                assert_eq!(ctx.fence_token, fence_token);
+                assert_eq!(
+                    ctx.last_user.as_ref().map(message_text).as_deref(),
+                    last_user
+                );
+                match assistant {
+                    ExpectedAssistant::ToolCalls => {
+                        assert!(matches!(
+                            ctx.last_assistant,
+                            Some(AssistantTurn::ToolCalls { .. })
+                        ));
+                    }
+                }
+                assert_eq!(ctx.pending_tool_results.len(), pending_tool_results_len);
+            }
+            ExpectedState::Cancelled { fence_token } => {
+                assert_eq!(state.turn_status, TurnStatus::InFlightCancelled);
+                assert!(state.next_turn_messages.is_empty());
+                let ctx = state.resumable_ctx.expect("cancel ctx");
+                assert_eq!(ctx.fence_token, fence_token);
+                assert!(ctx.last_user.is_none());
+                assert!(ctx.last_assistant.is_none());
+                assert!(ctx.pending_tool_results.is_empty());
+            }
+        }
+    }
+
+    fn assert_next_turn_messages(messages: &[Message], expected: &[&str]) {
+        let actual: Vec<_> = messages.iter().map(message_text).collect();
+        assert_eq!(actual, expected);
+    }
+
+    fn message_text(message: &Message) -> String {
+        message.content.to_text()
+    }
+
+    fn final_assistant(text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn entry_as_message(entry: &SessionLogEntry) -> Message {
+        match entry {
+            SessionLogEntry::Message {
+                role,
+                content,
+                timestamp,
+                ..
+            } => Message {
+                role: *role,
+                content: content.clone(),
+                log_seq: None,
+                log_timestamp: *timestamp,
+            },
+            other => panic!("expected message entry, got {other:?}"),
+        }
+    }
+
+    fn fenced_final_assistant(text: &str, fence_token: u64) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::Assistant,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: Some(fence_token),
+        }
+    }
+
+    fn user_message(text: &str) -> SessionLogEntry {
+        SessionLogEntry::Message {
+            id: None,
+            role: MessageRole::User,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: None,
+            fence_token: None,
+        }
+    }
+
+    fn tool_calls_assistant(fence_token: u64) -> SessionLogEntry {
+        SessionLogEntry::ToolCalls {
+            text: "working".to_string(),
+            thought: Some("thinking".to_string()),
+            calls: vec![ToolCall::new(
+                "tool-a".to_string(),
+                json!({"arg": 1}),
+                Some("call-1".to_string()),
+                None,
+            )],
+            timestamp: None,
+            fence_token: Some(fence_token),
+        }
+    }
+
+    fn tool_results(name: &str) -> SessionLogEntry {
+        SessionLogEntry::ToolResults {
+            results: vec![ToolOutput {
+                id: Some("call-1".to_string()),
+                name: name.to_string(),
+                output: json!({"ok": true}),
+                content: vec![],
+                switch_agent: None,
+            }],
+            timestamp: None,
+        }
+    }
+
+    fn cancel(fence_token: u64) -> SessionLogEntry {
+        SessionLogEntry::Cancel { fence_token }
+    }
+}

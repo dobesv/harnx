@@ -101,6 +101,41 @@ pub struct Cli {
 pub enum Commands {
     /// Inspect harnx state
     Info(InfoArgs),
+    /// Session management commands
+    Session(SessionArgs),
+    /// Run a remote worker daemon for a NATS cluster (HA mode)
+    Worker(WorkerArgs),
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct WorkerArgs {
+    /// Cluster key from nats_servers/<name>.yaml
+    #[arg(long)]
+    pub cluster: String,
+    /// Stable worker identity for leases and the durable consumer name.
+    /// Defaults to a generated id if omitted.
+    #[arg(long)]
+    pub worker_id: Option<String>,
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionSubcommands,
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum SessionSubcommands {
+    /// Delete remote NATS session log stream + lease key for a cluster
+    Delete(DeleteSessionArgs),
+}
+
+#[derive(Args, Debug, PartialEq, Eq)]
+pub struct DeleteSessionArgs {
+    pub session_id: String,
+    /// Cluster key from nats_servers/<name>.yaml
+    #[arg(long)]
+    pub cluster: String,
 }
 
 #[derive(Args, Debug, PartialEq, Eq)]
@@ -164,7 +199,7 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, InfoSubcommands};
+    use super::{Cli, Commands, InfoSubcommands, SessionSubcommands};
     use clap::Parser;
 
     #[test]
@@ -185,5 +220,49 @@ mod tests {
         let cli = Cli::try_parse_from(["harnx", "--list-agents"]).unwrap();
         assert!(cli.command.is_none());
         assert!(cli.list_agents);
+    }
+
+    #[test]
+    fn parses_session_delete_subcommand() {
+        let cli =
+            Cli::try_parse_from(["harnx", "session", "delete", "sess-1", "--cluster", "local"])
+                .unwrap();
+        match cli.command {
+            Some(Commands::Session(args)) => match args.command {
+                SessionSubcommands::Delete(delete) => {
+                    assert_eq!(delete.session_id, "sess-1");
+                    assert_eq!(delete.cluster, "local");
+                }
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod agent_ref_tests {
+    use super::Cli;
+    use clap::Parser;
+    use harnx_core::agent_ref::AgentRef;
+
+    #[test]
+    fn cli_agent_flag_preserves_local_agent_refs() {
+        let cli = Cli::try_parse_from(["harnx", "--agent", "pkg/bar"]).unwrap();
+        assert_eq!(
+            AgentRef::parse(cli.agent.as_deref().unwrap()),
+            AgentRef::Local("pkg/bar".into())
+        );
+    }
+
+    #[test]
+    fn cli_agent_flag_preserves_remote_agent_refs() {
+        let cli = Cli::try_parse_from(["harnx", "--agent", "bar@foo"]).unwrap();
+        assert_eq!(
+            AgentRef::parse(cli.agent.as_deref().unwrap()),
+            AgentRef::Remote {
+                agent: "bar".into(),
+                cluster: "foo".into(),
+            }
+        );
     }
 }

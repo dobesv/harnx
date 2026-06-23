@@ -5,6 +5,7 @@
 
 pub mod abort;
 pub mod agent_config;
+pub mod agent_ref;
 pub mod alloc_guard;
 pub mod api_types;
 pub mod attachments;
@@ -28,6 +29,8 @@ pub mod path;
 pub mod provider_config;
 pub mod retry_config;
 pub mod session;
+pub mod session_log;
+pub mod session_reconstruct;
 pub mod sink;
 pub mod system_vars;
 pub mod text;

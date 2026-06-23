@@ -1,12 +1,14 @@
 use crate::types::Tui;
 use crate::types::{PendingMessage, TuiEvent};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::client::CompletionTokenUsage;
 use harnx_runtime::config::{GlobalConfig, Input};
 use harnx_runtime::utils::AbortSignal;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+
+use crate::agent_event_sink::TuiAgentEventSink;
 
 pub(super) struct PromptTaskContext {
     pub(super) config: GlobalConfig,
@@ -149,6 +151,72 @@ impl Tui {
         };
 
         harnx_runtime::run_agent_loop(&loop_ctx, input).await
+    }
+
+    /// Run a prompt task for a remote agent (NATS thin-client mode).
+    ///
+    /// This drives the turn via `ThinClientSession` instead of running
+    /// `run_agent_loop` locally. The worker daemon executes the actual agent loop.
+    pub(super) async fn run_remote_prompt_task(
+        msg: PendingMessage,
+        ctx: PromptTaskContext,
+        agent: String,
+        cluster: String,
+    ) -> Result<()> {
+        use harnx_runtime::{ThinClientConfig, ThinClientSession};
+
+        // Clean up any attachment directory to avoid leaking temp files
+        if let Some(dir) = msg.attachment_dir.clone() {
+            let cleanup_dir = dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::types::cleanup_attachment_dir(&cleanup_dir);
+            })
+            .await;
+        }
+
+        // We do not support attachments in remote mode yet
+        if !msg.attachments.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Attachments are not yet supported in remote (thin-client) mode"
+            ));
+        }
+
+        let text = msg.text.clone();
+
+        // Create a TUI event sink that forwards to the event channel
+        let event_tx = ctx.event_tx.clone();
+        let sink = Arc::new(TuiAgentEventSink::new(event_tx.clone()));
+
+        // Build thin-client config
+        let thin_config = ThinClientConfig {
+            cluster,
+            agent,
+            session_id: None, // New session for this turn
+        };
+
+        // Create the thin-client session
+        // We pass a cloned GlobalConfig, but we must be careful about the
+        // read guard - we need to avoid holding it across the await boundary
+        let session = ThinClientSession::from_global_config(
+            thin_config,
+            &ctx.config,
+            ctx.abort_signal.clone(),
+        )
+        .await
+        .context("failed to create thin-client session")?;
+
+        // We don't have pending cancel channels in TUI yet
+        // (those would come from UI controls in future work)
+        let result = session.run_turn(&text, sink, None).await?;
+
+        // Log result for debugging
+        log::info!(
+            "remote prompt completed: session_id={} cancelled={}",
+            result.session_id,
+            result.was_cancelled
+        );
+
+        Ok(())
     }
 
     async fn call_chat_completions_streaming_tui(
