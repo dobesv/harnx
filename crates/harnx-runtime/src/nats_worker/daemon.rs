@@ -221,7 +221,7 @@ pub async fn run_worker_daemon(
     while let Some(message) = messages.next().await {
         let message = message.context("receive activation")?;
         if let Err(error) = runtime.handle_activation(message).await {
-            warn!("worker activation handling failed: {error:#}");
+            log::warn!("worker activation handling failed: {error:#}");
         }
     }
     Ok(())
@@ -284,7 +284,7 @@ impl WorkerRuntime {
             Some(lease) => lease,
             None => return Ok(()),
         };
-        info!(
+        log::info!(
             "session activate claimed: session_id={} worker_id={} revision={} epoch={}",
             activation.session_id,
             lease.worker_id(),
@@ -301,7 +301,7 @@ impl WorkerRuntime {
         nats_metrics::active_session_started();
         let handle = tokio::spawn(async move {
             let snapshot = nats_metrics::snapshot();
-            info!(
+            log::info!(
                 "active session started: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
                 activation.session_id,
                 lease.worker_id(),
@@ -311,7 +311,7 @@ impl WorkerRuntime {
             let result = worker.execute_session(activation, Arc::clone(&lease)).await;
             nats_metrics::active_session_finished();
             let snapshot = nats_metrics::snapshot();
-            info!(
+            log::info!(
                 "active session finished: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
                 task_session_id,
                 lease.worker_id(),
@@ -319,7 +319,7 @@ impl WorkerRuntime {
                 snapshot.active_sessions_per_worker
             );
             if let Err(error) = result {
-                warn!("worker session execution failed: {error:#}");
+                log::warn!("worker session execution failed: {error:#}");
             }
         });
         self.active.lock().await.insert(session_id, handle);
@@ -343,9 +343,17 @@ impl WorkerRuntime {
         // cursor (high-water mark of messages already fed this activation) is the
         // authoritative "unanswered" boundary and matches the drain decision.
         if let Some(hw) = high_water {
-            let tail = backend
-                .load_events_consistent_blocking()
-                .unwrap_or_default();
+            let tail = match backend.load_events_consistent_blocking() {
+                Ok(entries) => entries,
+                Err(err) => {
+                    log::warn!(
+                        "failed to load session log for continuation drain: session_id={} worker_id={} err={err}",
+                        backend.session_id(),
+                        self.worker_id,
+                    );
+                    Vec::new()
+                }
+            };
             let (new_messages, latest_seq) = fold_new_user_messages_since(&tail, Some(hw));
             if !new_messages.is_empty() {
                 let (mut input, seed) = self
@@ -379,7 +387,7 @@ impl WorkerRuntime {
             }
             harnx_core::session_reconstruct::TurnStatus::InFlightResumable => {
                 // Resume existing turn (orphan repair handled inside run_agent_loop_with_nats_inner).
-                info!(
+                log::info!(
                     "resume state: session_id={} worker_id={} revision={} mode=resumable",
                     activation.session_id,
                     lease.worker_id(),
@@ -619,7 +627,7 @@ impl WorkerRuntime {
         .await;
 
         if !lease.is_held() {
-            warn!(
+            log::warn!(
                 "session execution ended after failover: session_id={} worker_id={} revision={}",
                 activation.session_id,
                 lease.worker_id(),
@@ -649,7 +657,7 @@ impl WorkerRuntime {
         tokio::spawn(async move {
             while lost.changed().await.is_ok() {
                 if !*lost.borrow() {
-                    warn!(
+                    log::warn!(
                         "failover abort: session_id={} worker_id={} revision={} reason=lease_lost",
                         watch_session_id,
                         watch_lease.worker_id(),

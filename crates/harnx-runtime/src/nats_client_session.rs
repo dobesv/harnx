@@ -184,11 +184,7 @@ impl ThinClientSession {
         // Render history to event sink (for resume/attach scenarios)
         let history = event_stream.history();
         // Apply mutations so retracted/edited entries are excluded from history render.
-        let raw_with_seq: Vec<_> = history
-            .iter()
-            .map(|(seq, e)| (*seq as usize, e.clone()))
-            .collect();
-        let effective_history = harnx_core::session_reconstruct::apply_log_mutations(&raw_with_seq);
+        let effective_history = harnx_core::session_reconstruct::apply_log_mutations_nats(history);
         for (_seq, entry) in effective_history {
             render_log_entry_to_sink(&entry, event_sink.clone());
         }
@@ -328,9 +324,10 @@ impl ThinClientSession {
     /// The sequence number of the appended EditEntries entry.
     pub async fn retract_user_message(&self, seq: u64) -> Result<u64> {
         let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
+        let seq = usize::try_from(seq).expect("JetStream seq fits usize");
         let edit_entry = SessionLogEntry::EditEntries {
-            from: seq as usize,
-            to: seq as usize,
+            from: seq,
+            to: seq,
             replacements: vec![], // Empty = deletion
         };
         log.append_event_async(&edit_entry)
@@ -354,7 +351,7 @@ impl ThinClientSession {
     pub async fn edit_user_message(&self, seq: u64, new_text: String) -> Result<u64> {
         let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
         let replacement_entry = SessionLogEntry::Message {
-            id: Some(uuid::Uuid::new_v4().to_string()),
+            id: Some(new_client_message_id()),
             role: MessageRole::User,
             content: MessageContent::Text(new_text),
             timestamp: None,
@@ -362,9 +359,10 @@ impl ThinClientSession {
         };
         let replacement_yaml = serde_yaml::to_string(&replacement_entry)
             .context("failed to serialize replacement entry for user-message edit")?;
+        let seq = usize::try_from(seq).expect("JetStream seq fits usize");
         let edit_entry = SessionLogEntry::EditEntries {
-            from: seq as usize,
-            to: seq as usize,
+            from: seq,
+            to: seq,
             replacements: vec![replacement_yaml],
         };
         log.append_event_async(&edit_entry)
@@ -392,11 +390,7 @@ impl ThinClientSession {
     /// Extract the final assistant response text from durable entries.
     fn extract_final_response(&self, entries: &[(u64, SessionLogEntry)]) -> Option<String> {
         // Apply mutations so retracted messages are excluded.
-        let raw_with_seq: Vec<_> = entries
-            .iter()
-            .map(|(seq, e)| (*seq as usize, e.clone()))
-            .collect();
-        let effective_entries = harnx_core::session_reconstruct::apply_log_mutations(&raw_with_seq);
+        let effective_entries = harnx_core::session_reconstruct::apply_log_mutations_nats(entries);
         // Find the last assistant message in effective entries.
         for (_, entry) in effective_entries.iter().rev() {
             if let SessionLogEntry::Message { role, content, .. } = entry {
