@@ -10,7 +10,7 @@ use harnx_core::{
     message::MessageRole,
     require_nextest,
     session::SessionLogEntry,
-    session_reconstruct::{reconstruct_state, TurnStatus},
+    session_reconstruct::{reconstruct_state, reconstruct_state_from_nats, TurnStatus},
     tool::ToolCall,
 };
 use harnx_runtime::{
@@ -28,9 +28,11 @@ use std::sync::LazyLock;
 static MID_ROUND_APPEND_READY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static MID_ROUND_APPEND_DONE: LazyLock<Notify> = LazyLock::new(Notify::new);
 static MID_ROUND_FINAL_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MID_ROUND_RELOAD_SEEN: AtomicUsize = AtomicUsize::new(0);
 static END_TURN_APPEND_READY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static END_TURN_APPEND_DONE: LazyLock<Notify> = LazyLock::new(Notify::new);
 static END_TURN_CALLS: AtomicUsize = AtomicUsize::new(0);
+static RETRACTED_ORPHAN_ACTIVATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 use parking_lot::RwLock;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -183,6 +185,39 @@ fn append_user_message_entry(text: &str) -> SessionLogEntry {
     }
 }
 
+async fn spawn_worker_daemon_with_call_fn(
+    config: Arc<RwLock<Config>>,
+    worker_id: &str,
+    call_fn: harnx_runtime::agent_loop::AgentCallFn,
+) -> tokio::task::JoinHandle<Result<()>> {
+    let worker_config = WorkerDaemonConfig::new("local", worker_id);
+    let daemon = tokio::spawn({
+        let cfg = config.clone();
+        async move { run_worker_daemon(cfg, worker_config, Some(call_fn)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    daemon
+}
+
+async fn local_test_nats(server_url: &str) -> Result<async_nats::jetstream::Context> {
+    Ok(async_nats::jetstream::new(
+        async_nats::connect(server_url).await?,
+    ))
+}
+
+async fn activate_session(
+    jetstream: &async_nats::jetstream::Context,
+    session_id: &str,
+) -> Result<()> {
+    publish_session_activate(
+        jetstream,
+        "local",
+        &SessionActivate::new(session_id, "ignored-agent"),
+    )
+    .await?;
+    Ok(())
+}
+
 fn mid_round_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
     Arc::new(move |input, _config, _abort| {
         // The mid-turn injection is delivered via `input.injected_user_text`
@@ -201,6 +236,7 @@ fn mid_round_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
                 // (the `on_tool_round` seam fires between rounds and injects it).
                 MID_ROUND_APPEND_READY.notify_one();
                 MID_ROUND_APPEND_DONE.notified().await;
+                MID_ROUND_RELOAD_SEEN.fetch_add(1, Ordering::SeqCst);
                 Ok((
                     "round-one".to_string(),
                     None,
@@ -360,6 +396,8 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
         MID_ROUND_FINAL_CALLS.load(Ordering::SeqCst) >= 1
     })
     .await?;
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let entries = log.load_events_async().await?;
     let assistants = final_assistant_texts(&entries);
@@ -926,7 +964,7 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
 
 /// Read-your-writes seam (Step 2): a backend wired with an `after_seq_observer`
 /// advances the observer to the durable ack sequence on every append, and
-/// `load_events_consistent_blocking` waits until the stream reflects at least
+/// `load_events_consistent_async` waits until the stream reflects at least
 /// that sequence before returning. This is the mechanism that lets the
 /// end-of-turn drain re-read observe the worker's own just-persisted barrier
 /// instead of a stale tail.
@@ -981,7 +1019,7 @@ async fn after_seq_observer_advances_and_consistent_read_honors_it() -> Result<(
     // The consistent read uses the observer's high-water mark; it must return a
     // tail that reflects at least seq2 (both entries visible), never a stale
     // read missing the worker's own latest barrier.
-    let entries = backend.load_events_consistent_blocking()?;
+    let entries = backend.load_events_consistent_async().await?;
     assert!(
         entries.iter().any(|(s, _)| *s == seq2),
         "consistent read must include the latest appended entry (seq {seq2}); got {entries:?}"
@@ -1000,6 +1038,330 @@ async fn after_seq_observer_advances_and_consistent_read_honors_it() -> Result<(
 /// This test proves the worker path honors EditEntries mutations. Without the fix,
 /// `fold_new_user_messages_since` would iterate raw entries and fold the retracted
 /// message, causing unwanted worker execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retracted_mid_tool_round_message_is_not_injected() -> Result<()> {
+    reset_test_state();
+    MID_ROUND_RELOAD_SEEN.store(0, Ordering::SeqCst);
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("Skipping test: nats-server not available");
+        return Ok(());
+    };
+
+    let config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+        name: "local",
+        url: server.url(),
+        token: None,
+    })));
+    let daemon =
+        spawn_worker_daemon_with_call_fn(config, "worker-mid-round-retract", mid_round_call_fn())
+            .await;
+
+    let js = local_test_nats(server.url()).await?;
+    let session_id = "mid-round-retracted-injection";
+    let log = NatsSessionLog::new(js.clone(), session_id);
+    let ready_fut = MID_ROUND_APPEND_READY.notified();
+
+    log.append_event_async(&append_user_message_entry("seed message"))
+        .await?;
+    activate_session(&js, session_id).await?;
+    ready_fut.await;
+
+    let retracted_seq = log
+        .append_event_async(&SessionLogEntry::Message {
+            id: Some("msg-retracted-before-injection".to_string()),
+            role: MessageRole::User,
+            content: harnx_core::message::MessageContent::Text("late message".to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await?;
+    let retracted_seq = usize::try_from(retracted_seq).expect("JetStream seq fits usize");
+    log.append_event_async(&SessionLogEntry::EditEntries {
+        from: retracted_seq,
+        to: retracted_seq,
+        replacements: vec![],
+    })
+    .await?;
+
+    MID_ROUND_APPEND_DONE.notify_one();
+    wait_until(Duration::from_secs(10), || {
+        MID_ROUND_RELOAD_SEEN.load(Ordering::SeqCst) >= 1
+    })
+    .await?;
+
+    let entries = log.load_events_async().await?;
+    let assistants = final_assistant_texts(&entries);
+
+    assert_eq!(
+        MID_ROUND_FINAL_CALLS.load(Ordering::SeqCst),
+        0,
+        "retracted message should not trigger injected follow-up round"
+    );
+    assert!(
+        assistants.is_empty(),
+        "no final assistant turn should be persisted without injected message"
+    );
+    // The raw durable log still physically contains the retracted "late message"
+    // entry plus its EditEntries tombstone (retract is a tombstone, never a
+    // physical delete). The EFFECTIVE stream (mutations applied via
+    // reconstruct_state_from_nats) is what the worker folds, and it must exclude
+    // the retracted message from next_turn_messages.
+    let effective_user_texts: Vec<String> = reconstruct_state_from_nats(&entries)
+        .next_turn_messages
+        .iter()
+        .map(|m| m.content.to_text())
+        .collect();
+    assert!(
+        !effective_user_texts.iter().any(|t| t == "late message"),
+        "effective next-turn stream should exclude retracted mid-round message, got: {effective_user_texts:?}"
+    );
+
+    daemon.abort();
+    let _ = daemon.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let prompts = Arc::new(AsyncMutex::new(Vec::<String>::new()));
+
+    let config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+        name: "local",
+        url: server.url(),
+        token: None,
+    })));
+    let daemon = spawn_worker_daemon_with_call_fn(
+        config,
+        "worker-rewind",
+        fold_capture_call_fn(counter.clone(), prompts.clone()),
+    )
+    .await;
+
+    let js = local_test_nats(server.url()).await?;
+    let session_id = "rewind-worker-test";
+    let log = NatsSessionLog::new(js.clone(), session_id);
+
+    let first_seq = log
+        .append_event_async(&SessionLogEntry::Message {
+            id: Some("msg-first".to_string()),
+            role: MessageRole::User,
+            content: harnx_core::message::MessageContent::Text("first prompt".to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await?;
+    log.append_event_async(&SessionLogEntry::Message {
+        id: Some("msg-second".to_string()),
+        role: MessageRole::User,
+        content: harnx_core::message::MessageContent::Text("second prompt".to_string()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await?;
+    log.append_event_async(&SessionLogEntry::Rewind {
+        after_seq: usize::try_from(first_seq).expect("JetStream seq fits usize"),
+    })
+    .await?;
+
+    activate_session(&js, session_id).await?;
+
+    wait_until(Duration::from_secs(10), || {
+        counter.load(Ordering::SeqCst) >= 1
+    })
+    .await?;
+
+    let captured_prompts = prompts.lock().await.clone();
+    assert_eq!(captured_prompts, vec!["first prompt".to_string()]);
+
+    let entries = log.load_events_async().await?;
+    let assistant_texts = final_assistant_texts(&entries);
+    assert_eq!(
+        assistant_texts.len(),
+        1,
+        "worker should persist one response"
+    );
+    assert!(
+        assistant_texts[0].contains("first prompt"),
+        "worker should answer only unre-wound prompt, got: {:?}",
+        assistant_texts
+    );
+    assert!(
+        assistant_texts
+            .iter()
+            .all(|text| !text.contains("second prompt")),
+        "rewound tail must not leak into worker execution: {:?}",
+        assistant_texts
+    );
+
+    let reconstructed = reconstruct_state_from_nats(&entries);
+    assert_eq!(reconstructed.turn_status, TurnStatus::Idle);
+
+    daemon.abort();
+    let _ = daemon.await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
+    RETRACTED_ORPHAN_ACTIVATION_CALLS.store(0, Ordering::SeqCst);
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+        name: "local",
+        url: server.url(),
+        token: None,
+    })));
+    let tool_calls_seen = Arc::new(AtomicUsize::new(0));
+    let seen_for_call_fn = Arc::clone(&tool_calls_seen);
+    let call_fn: harnx_runtime::agent_loop::AgentCallFn =
+        Arc::new(move |_input, _config, _abort| {
+            let seen = seen_for_call_fn.clone();
+            Box::pin(async move {
+                RETRACTED_ORPHAN_ACTIVATION_CALLS.fetch_add(1, Ordering::SeqCst);
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    "should not run".to_string(),
+                    None,
+                    vec![],
+                    CompletionTokenUsage::default(),
+                ))
+            })
+        });
+    let daemon = spawn_worker_daemon_with_call_fn(config, "worker-retracted-orphan", call_fn).await;
+
+    let js = local_test_nats(server.url()).await?;
+    let session_id = "retracted-orphan-test";
+    let log = NatsSessionLog::new(js.clone(), session_id);
+
+    log.append_event_async(&session_header(session_id)).await?;
+    // NOTE: deliberately NO unanswered user message in the seed. We want the log to
+    // contain ONLY a retracted tool round, so that after mutations are applied the
+    // effective log is idle and the worker has nothing to do. A pending user message
+    // would (correctly) make the worker run a normal turn and invoke call_fn,
+    // confounding the "orphan repair must not run" assertions below.
+    let tool_calls_seq = log
+        .append_event_async(&SessionLogEntry::ToolCalls {
+            text: "working".to_string(),
+            thought: Some("thinking".to_string()),
+            calls: vec![ToolCall::new(
+                "echo".to_string(),
+                json!({"message": "ghost"}),
+                Some("call-retracted-orphan".to_string()),
+                None,
+            )],
+            timestamp: None,
+            // fence_token MUST be None (or <= the worker's lease revision) so the
+            // resume is NOT aborted by abort_resume_if_fenced before it reaches
+            // load_or_repair_session. A stale fence here would make the test pass
+            // vacuously (resume aborted before the orphan scan ever runs).
+            fence_token: None,
+        })
+        .await?;
+    let tool_calls_seq = usize::try_from(tool_calls_seq).expect("JetStream seq fits usize");
+    log.append_event_async(&SessionLogEntry::EditEntries {
+        from: tool_calls_seq,
+        to: tool_calls_seq,
+        replacements: vec![],
+    })
+    .await?;
+
+    // Snapshot HA metrics before activation. With the bug (raw orphan scan) the
+    // worker would detect the retracted ToolCalls as an orphan (resumes += 1) and
+    // synthesize an interrupt-error ToolResults (interrupt_errors_synthesized += 1).
+    // With the fix (effective scan) the retract is honored: neither increments.
+    let metrics_before = harnx_runtime::nats_metrics::snapshot();
+
+    activate_session(&js, session_id).await?;
+
+    // Deterministic barrier: wait until the worker has actually CLAIMED the session
+    // (lease_acquisitions increments) — which proves it reached load_or_repair_session
+    // and ran the orphan scan — and then FINISHED (active_sessions back to 0). Without
+    // this, the assertions could run before the worker did anything (a 0==0 check is
+    // satisfied immediately), letting the test pass vacuously even with the bug present.
+    wait_until(Duration::from_secs(10), || {
+        harnx_runtime::nats_metrics::snapshot().lease_acquisitions
+            > metrics_before.lease_acquisitions
+    })
+    .await?;
+    wait_until(Duration::from_secs(10), || {
+        harnx_runtime::nats_metrics::snapshot().active_sessions_per_worker == 0
+    })
+    .await?;
+
+    let entries = log.load_events_async().await?;
+    let retracted_results = entries
+        .iter()
+        .filter_map(|(_, entry)| match entry {
+            SessionLogEntry::ToolResults { results, .. }
+                if results
+                    .iter()
+                    .any(|result| result.id.as_deref() == Some("call-retracted-orphan")) =>
+            {
+                Some(results)
+            }
+            _ => None,
+        })
+        .count();
+    assert_eq!(
+        retracted_results, 0,
+        "worker must not synthesize or replay ToolResults for retracted orphan tool call"
+    );
+    assert_eq!(
+        tool_calls_seen.load(Ordering::SeqCst),
+        0,
+        "orphan repair must not invoke call_fn for retracted tool call"
+    );
+
+    // The retracted tool round must not be detected as a resume orphan, and no
+    // interrupt-error result may be synthesized for it. These HA-metric deltas are
+    // the direct observable of the bug: with the raw-scan bug they would each be 1.
+    let metrics_after = harnx_runtime::nats_metrics::snapshot();
+    assert_eq!(
+        metrics_after.resumes, metrics_before.resumes,
+        "retracted tool round must not trigger a resume/orphan repair"
+    );
+    assert_eq!(
+        metrics_after.interrupt_errors_synthesized, metrics_before.interrupt_errors_synthesized,
+        "retracted tool round must not synthesize an interrupt-error result"
+    );
+
+    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
+    assert!(
+        !effective.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::ToolCalls { calls, .. }
+                if calls.iter().any(|call| call.id.as_deref() == Some("call-retracted-orphan"))
+        )),
+        "effective log must not contain retracted tool call"
+    );
+    assert!(
+        !effective.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::ToolResults { results, .. }
+                if results
+                    .iter()
+                    .any(|result| result.id.as_deref() == Some("call-retracted-orphan"))
+        )),
+        "effective log must not contain resurrected ToolResults for retracted tool call"
+    );
+
+    daemon.abort();
+    let _ = daemon.await;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
     require_nextest();

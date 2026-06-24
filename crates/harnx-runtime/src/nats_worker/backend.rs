@@ -127,7 +127,7 @@ impl NatsSessionLogBackend {
     /// falls back to a plain load otherwise. Used by the end-of-turn drain
     /// re-read so the worker sees its own just-written turn barrier and does not
     /// re-fold already-answered messages.
-    pub fn load_events_consistent_blocking(
+    pub async fn load_events_consistent_async(
         &self,
     ) -> Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
         let min_seq = self
@@ -139,8 +139,6 @@ impl NatsSessionLogBackend {
             self.jetstream.clone(),
             self.session_id.clone(),
         );
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(log.load_events_at_least_async(min_seq))
-        })
+        log.load_events_at_least_async(min_seq).await
     }
 }

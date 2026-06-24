@@ -64,17 +64,20 @@ pub(crate) fn fold_new_user_messages_since(
     cursor: Option<u64>,
 ) -> (Vec<Message>, Option<u64>) {
     // Apply mutations first: retracted/edited entries must be filtered.
-    let raw_with_seq: Vec<_> = entries
-        .iter()
-        .map(|(seq, e)| (*seq as usize, e.clone()))
-        .collect();
-    let effective_entries = harnx_core::session_reconstruct::apply_log_mutations(&raw_with_seq);
+    let effective_entries = match harnx_core::session_reconstruct::apply_log_mutations_nats(entries)
+    {
+        Ok(entries) => entries,
+        Err(err) => {
+            log::warn!("failed to apply NATS log mutations while folding user messages: {err}");
+            return (Vec::new(), cursor);
+        }
+    };
 
     let mut messages = Vec::new();
     let mut latest_seq = cursor;
     for (seq, entry) in effective_entries {
         // Entry may be mutated; cursor semantics still skip seq <= cursor.
-        if cursor.is_some_and(|seen| seq as u64 <= seen) {
+        if cursor.is_some_and(|seen| seq <= seen) {
             continue;
         }
         if let harnx_core::session::SessionLogEntry::Message {
@@ -87,10 +90,10 @@ pub(crate) fn fold_new_user_messages_since(
             if role.is_user() {
                 messages.push(
                     Message::new(role, content)
-                        .with_log_seq(seq)
+                        .with_log_seq(usize::try_from(seq).expect("JetStream seq fits usize"))
                         .with_log_timestamp(timestamp.unwrap_or_else(chrono::Utc::now)),
                 );
-                latest_seq = Some(seq as u64);
+                latest_seq = Some(seq);
             }
         }
     }
@@ -105,7 +108,7 @@ pub(crate) fn build_mid_turn_injection_callback(
         let backend = backend.clone();
         let cursor = Arc::clone(&cursor);
         Box::pin(async move {
-            let tail = match backend.load_events_blocking() {
+            let tail = match backend.load_events_consistent_async().await {
                 Ok(entries) => entries,
                 Err(err) => {
                     log::warn!("failed to reload session log for mid-turn injection: {err}");
@@ -266,9 +269,11 @@ async fn load_or_repair_session(
         return write_header_and_load_session(backend, config, input, session_id).await;
     }
 
-    // Existing session: check for orphan tool calls and repair with hints
+    // Existing session: check effective session log for orphan tool calls and repair with hints
     let mut entries_vec = entries;
-    let orphan_calls = find_orphan_tool_calls(&entries_vec);
+    let effective_entries =
+        harnx_core::session_reconstruct::apply_log_mutations_nats(&entries_vec)?;
+    let orphan_calls = find_orphan_tool_calls(&effective_entries);
     if !orphan_calls.is_empty() {
         nats_metrics::resume_detected();
         info!(

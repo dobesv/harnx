@@ -1,6 +1,7 @@
 use crate::message::{Message, MessageRole};
 use crate::session::{SessionLogEntry, ToolOutput};
 use crate::tool::ToolCall;
+use anyhow::{bail, Result};
 
 /// Apply mutation entries (EditEntries, Rewind) to build the effective entry stream.
 ///
@@ -11,10 +12,41 @@ use crate::tool::ToolCall;
 ///
 /// Invalid/malformed mutations are skipped with warnings (logged via the `log` crate).
 /// Replacements inherit the mutation's seq number for future addressing.
+///
+/// Complexity: O(N*M) in worst case because each mutation may scan current
+/// effective entries with linear `position`/`rposition` lookups. Acceptable for
+/// typical session sizes.
 pub fn apply_log_mutations(
     raw_entries: &[(usize, SessionLogEntry)],
 ) -> Vec<(usize, SessionLogEntry)> {
     apply_log_mutations_with_name(raw_entries, "session")
+}
+
+/// NATS-seq wrapper for [`apply_log_mutations`].
+///
+/// Preserves exact mutation semantics while accepting JetStream `u64`
+/// sequence numbers and returning same typed sequence numbers.
+pub fn apply_log_mutations_nats(
+    raw_entries: &[(u64, SessionLogEntry)],
+) -> Result<Vec<(u64, SessionLogEntry)>> {
+    let raw_with_seq: Vec<_> = raw_entries
+        .iter()
+        .map(|(seq, entry)| {
+            let Ok(seq) = usize::try_from(*seq) else {
+                bail!("JetStream seq {seq} does not fit into usize");
+            };
+            Ok((seq, entry.clone()))
+        })
+        .collect::<Result<_>>()?;
+    Ok(apply_log_mutations(&raw_with_seq)
+        .into_iter()
+        .map(|(seq, entry)| {
+            // SAFETY: effective seqs are a subset of input seqs. Resolver only
+            // deletes/replaces existing entries, and replacements inherit the
+            // EditEntries seq, so no new seq can exceed input JetStream seq range.
+            (u64::try_from(seq).expect("effective seq fits u64"), entry)
+        })
+        .collect())
 }
 
 /// Variant that accepts a session name for logging context.
@@ -170,12 +202,22 @@ pub fn reconstruct_state(entries: &[SessionLogEntry]) -> ReconstructedState {
 ///
 /// NATS sequences start at 1, not 0.
 pub fn reconstruct_state_from_nats(entries: &[(u64, SessionLogEntry)]) -> ReconstructedState {
-    // Convert u64 seq to usize and apply mutations
-    let raw_with_seq: Vec<_> = entries
-        .iter()
-        .map(|(seq, e)| (*seq as usize, e.clone()))
+    let effective_entries_nats = match apply_log_mutations_nats(entries) {
+        Ok(entries) => entries,
+        Err(err) => {
+            log::warn!("failed to apply NATS log mutations during reconstruction: {err}");
+            return reconstruct_state_effective(&[]);
+        }
+    };
+    let effective_entries: Vec<_> = effective_entries_nats
+        .into_iter()
+        .map(|(seq, entry)| {
+            (
+                usize::try_from(seq).expect("JetStream seq fits usize"),
+                entry,
+            )
+        })
         .collect();
-    let effective_entries = apply_log_mutations(&raw_with_seq);
     reconstruct_state_effective(&effective_entries)
 }
 
@@ -647,58 +689,143 @@ mod tests {
         );
     }
 
-    #[test]
-    fn edit_entries_replacement_yaml_is_applied() {
-        let replacement = serde_yaml::to_string(&SessionLogEntry::Message {
+    fn edited_user_replacement_yaml() -> String {
+        serde_yaml::to_string(&SessionLogEntry::Message {
             id: Some("edited-id".to_string()),
             role: MessageRole::User,
             content: MessageContent::Text("edited".to_string()),
             timestamp: None,
             fence_token: None,
         })
-        .expect("serialize replacement");
+        .expect("serialize replacement")
+    }
 
-        let effective = apply_log_mutations(&[
-            (1, user_message("original")),
-            (
-                2,
-                SessionLogEntry::EditEntries {
-                    from: 1,
-                    to: 1,
-                    replacements: vec![replacement],
-                },
-            ),
-        ]);
+    fn apply_edit_replacement_case(
+        from: usize,
+        to: usize,
+        replacements: Vec<String>,
+        prefix_entries: Vec<(usize, SessionLogEntry)>,
+        edit_seq: usize,
+        suffix_entries: Vec<(usize, SessionLogEntry)>,
+    ) -> Vec<(usize, SessionLogEntry)> {
+        let mut entries = prefix_entries;
+        entries.push((
+            edit_seq,
+            SessionLogEntry::EditEntries {
+                from,
+                to,
+                replacements,
+            },
+        ));
+        entries.extend(suffix_entries);
+        apply_log_mutations(&entries)
+    }
+
+    #[test]
+    fn edit_entries_replacement_yaml_is_applied() {
+        let effective = apply_edit_replacement_case(
+            1,
+            1,
+            vec![edited_user_replacement_yaml()],
+            vec![(1, user_message("original"))],
+            2,
+            vec![],
+        );
 
         assert_eq!(effective.len(), 1);
         assert_eq!(effective[0].0, 2);
         assert_eq!(message_text(&entry_as_message(&effective[0].1)), "edited");
     }
 
-    #[test]
-    fn rewind_truncates_effective_entries_after_prior_edit() {
-        let replacement = serde_yaml::to_string(&SessionLogEntry::Message {
-            id: Some("edited-id".to_string()),
-            role: MessageRole::User,
-            content: MessageContent::Text("edited".to_string()),
-            timestamp: None,
-            fence_token: None,
-        })
-        .expect("serialize replacement");
-
+    /// Apply `[first, second, edit]` and assert the malformed `edit` was skipped,
+    /// leaving the original two user messages untouched.
+    fn assert_edit_is_skipped(edit: SessionLogEntry) {
         let effective = apply_log_mutations(&[
-            (1, user_message("original")),
+            (1, user_message("first")),
+            (2, user_message("second")),
+            (3, edit),
+        ]);
+
+        assert_eq!(effective.len(), 2);
+        assert_eq!(effective[0].0, 1);
+        assert_eq!(effective[1].0, 2);
+        assert_eq!(message_text(&entry_as_message(&effective[0].1)), "first");
+        assert_eq!(message_text(&entry_as_message(&effective[1].1)), "second");
+    }
+
+    #[test]
+    fn edit_entries_invalid_range_is_skipped() {
+        assert_edit_is_skipped(SessionLogEntry::EditEntries {
+            from: 2,
+            to: 1,
+            replacements: vec![],
+        });
+    }
+
+    #[test]
+    fn edit_entries_missing_target_seq_is_skipped() {
+        assert_edit_is_skipped(SessionLogEntry::EditEntries {
+            from: 1,
+            to: 99,
+            replacements: vec![
+                serde_yaml::to_string(&user_message("edited")).expect("serialize replacement")
+            ],
+        });
+    }
+
+    #[test]
+    fn edit_entries_all_malformed_replacements_delete_target_range() {
+        let effective = apply_log_mutations(&[
+            (1, user_message("first")),
+            (2, user_message("second")),
             (
-                2,
+                3,
                 SessionLogEntry::EditEntries {
                     from: 1,
-                    to: 1,
-                    replacements: vec![replacement],
+                    to: 2,
+                    replacements: vec![": not valid yaml for session entry".to_string()],
                 },
             ),
-            (3, final_assistant("done")),
-            (4, SessionLogEntry::Rewind { after_seq: 2 }),
+            (4, user_message("tail")),
         ]);
+
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].0, 4);
+        assert_eq!(message_text(&entry_as_message(&effective[0].1)), "tail");
+    }
+
+    #[test]
+    fn edit_entries_malformed_replacement_is_dropped_while_valid_one_is_applied() {
+        let effective = apply_edit_replacement_case(
+            1,
+            2,
+            vec![
+                edited_user_replacement_yaml(),
+                ": not valid yaml for session entry".to_string(),
+            ],
+            vec![(1, user_message("original")), (2, final_assistant("done"))],
+            3,
+            vec![],
+        );
+
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].0, 3);
+        assert_eq!(message_text(&entry_as_message(&effective[0].1)), "edited");
+    }
+
+    #[test]
+    fn rewind_truncates_effective_entries_after_prior_edit() {
+        let effective = apply_edit_replacement_case(
+            1,
+            1,
+            vec![edited_user_replacement_yaml()],
+            vec![(1, user_message("original"))],
+            2,
+            vec![
+                (3, final_assistant("done")),
+                (4, SessionLogEntry::Rewind { after_seq: 2 }),
+            ],
+        );
 
         assert_eq!(effective.len(), 1);
         assert_eq!(effective[0].0, 2);
