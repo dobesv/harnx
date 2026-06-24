@@ -321,6 +321,10 @@ fn claude_handle_stream_event(
         "content_block_start" => claude_handle_content_block_start(state, handler, data)?,
         "content_block_delta" => claude_handle_content_block_delta(state, handler, data)?,
         "content_block_stop" => claude_handle_content_block_stop(state, handler)?,
+        "error" => {
+            let _ = data;
+            return crate::catch_error(data, 500, None);
+        }
         _ => {}
     }
     Ok(())
@@ -1277,6 +1281,33 @@ system_prompt_prefix:
             tool_calls.is_empty(),
             "no tool_use blocks were sent; tool_calls must stay empty"
         );
+    }
+
+    #[test]
+    fn claude_streaming_error_event_fails() {
+        use harnx_core::abort::create_abort_signal;
+        use tokio::sync::mpsc::unbounded_channel;
+        use harnx_core::error::LlmError;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = ClaudeStreamState::default();
+
+        let event = json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "Internal server error"
+            }
+        });
+
+        let result = claude_handle_stream_event(&mut state, &mut handler, &event);
+        assert!(result.is_err(), "Stream error event should return an error");
+        let err = result.unwrap_err();
+        let llm_err = err.downcast_ref::<LlmError>().expect("Should be an LlmError");
+        assert_eq!(llm_err.status, 500);
+        assert!(llm_err.is_retryable());
+        assert!(llm_err.message.contains("Internal server error"));
     }
 
     #[test]

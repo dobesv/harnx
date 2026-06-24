@@ -1,4 +1,5 @@
 use crate::openai::*;
+use std::time::Duration;
 use crate::openai_compatible::*;
 use crate::*;
 
@@ -103,7 +104,7 @@ async fn chat_completions(
     let retry_after = parse_retry_after(res.headers());
     let data: Value = res.json().await?;
     if !status.is_success() {
-        catch_error(&data, status.as_u16(), retry_after)?;
+        cohere_catch_error(&data, status.as_u16(), retry_after)?;
     }
 
     debug!("non-stream-data: {data}");
@@ -157,6 +158,16 @@ fn cohere_handle_tool_call_end(
     Ok(())
 }
 
+fn cohere_catch_error(data: &Value, status: u16, retry_after: Option<Duration>) -> Result<()> {
+    let mut mapped_status = status;
+    if let Some(typ) = data["error"]["type"].as_str() {
+        if typ == "invalid_request_error" {
+            mapped_status = 400;
+        }
+    }
+    crate::catch_error(data, mapped_status, retry_after)
+}
+
 fn cohere_handle_stream_event(
     state: &mut CohereStreamState,
     handler: &mut SseHandler,
@@ -166,6 +177,9 @@ fn cohere_handle_stream_event(
         return Ok(());
     };
     match typ {
+        "message-error" | "stream-error" => {
+            return cohere_catch_error(data, 500, None);
+        }
         "content-delta" => {
             if let Some(text) = data["delta"]["message"]["content"]["text"].as_str() {
                 handler.text(text)?;
@@ -218,7 +232,7 @@ async fn embeddings(builder: RequestBuilder, _model: &Model) -> Result<Embedding
     let status = res.status();
     let data: Value = res.json().await?;
     if !status.is_success() {
-        catch_error(&data, status.as_u16(), None)?;
+        cohere_catch_error(&data, status.as_u16(), None)?;
     }
     let res_body: EmbeddingsResBody =
         serde_json::from_value(data).context("Invalid embeddings data")?;
@@ -342,5 +356,32 @@ mod tests {
             vec![Some("call_A"), Some("call_B")],
             "each tool-call block must be emitted exactly once"
         );
+    }
+
+    #[test]
+    fn cohere_streaming_error_event_fails() {
+        use harnx_core::abort::create_abort_signal;
+        use tokio::sync::mpsc::unbounded_channel;
+        use harnx_core::error::LlmError;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = CohereStreamState::default();
+
+        let event = json!({
+            "type": "message-error",
+            "error": {
+                "message": "The request is invalid.",
+                "type": "invalid_request_error"
+            }
+        });
+
+        let result = cohere_handle_stream_event(&mut state, &mut handler, &event);
+        assert!(result.is_err(), "Stream error event should return an error");
+        let err = result.unwrap_err();
+        let llm_err = err.downcast_ref::<LlmError>().expect("Should be an LlmError");
+        assert_eq!(llm_err.status, 400);
+        assert!(!llm_err.is_retryable());
+        assert!(llm_err.message.contains("The request is invalid"));
     }
 }

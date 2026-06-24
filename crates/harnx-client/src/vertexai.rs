@@ -220,6 +220,9 @@ fn gemini_handle_part(handler: &mut SseHandler, part: &Value, index: usize) -> R
 /// /OpenAI, Gemini has no accumulator state — each chunk carries complete
 /// parts — so no state struct is needed.
 fn gemini_handle_stream_chunk(handler: &mut SseHandler, data: &Value) -> Result<()> {
+    if let Some(_err) = data["error"].as_object() {
+        return crate::catch_error(data, 500, None);
+    }
     if let Some(parts) = data["candidates"][0]["content"]["parts"].as_array() {
         for (i, part) in parts.iter().enumerate() {
             gemini_handle_part(handler, part, i)?;
@@ -1250,5 +1253,31 @@ mod attachment_emission_tests {
         
         assert_eq!(inline_data["data"], "QUJDREVGR0g=");
         assert_eq!(inline_data["mimeType"], "image/jpeg");
+    }
+
+    #[test]
+    fn gemini_streaming_error_event_fails() {
+        use harnx_core::abort::create_abort_signal;
+        use tokio::sync::mpsc::unbounded_channel;
+        use harnx_core::error::LlmError;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+
+        let event = json!({
+            "error": {
+                "code": 400,
+                "message": "User location is not supported for the API use.",
+                "status": "FAILED_PRECONDITION"
+            }
+        });
+
+        let result = gemini_handle_stream_chunk(&mut handler, &event);
+        assert!(result.is_err(), "Stream error event should return an error");
+        let err = result.unwrap_err();
+        let llm_err = err.downcast_ref::<LlmError>().expect("Should be an LlmError");
+        assert_eq!(llm_err.status, 500);
+        assert!(llm_err.is_retryable());
+        assert!(llm_err.message.contains("User location is not supported"));
     }
 }

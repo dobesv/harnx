@@ -262,6 +262,9 @@ pub(crate) fn openai_handle_stream_event(
     handler: &mut SseHandler,
     data: &Value,
 ) -> Result<()> {
+    if let Some(_err) = data["error"].as_object() {
+        return crate::catch_error(data, 500, None);
+    }
     openai_handle_text_delta(state, handler, data)?;
     openai_handle_tool_call_delta(state, handler, data)?;
     openai_handle_final_usage(handler, data);
@@ -882,5 +885,33 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn openai_streaming_error_event_fails() {
+        use harnx_core::abort::create_abort_signal;
+        use tokio::sync::mpsc::unbounded_channel;
+        use harnx_core::error::LlmError;
+
+        let (tx, _rx) = unbounded_channel();
+        let mut handler = SseHandler::new(tx, create_abort_signal());
+        let mut state = OpenAiStreamState::default();
+
+        let event = json!({
+            "error": {
+                "message": "Rate limit reached",
+                "type": "requests",
+                "param": null,
+                "code": "rate_limit_exceeded"
+            }
+        });
+
+        let result = openai_handle_stream_event(&mut state, &mut handler, &event);
+        assert!(result.is_err(), "Stream error event should return an error");
+        let err = result.unwrap_err();
+        let llm_err = err.downcast_ref::<LlmError>().expect("Should be an LlmError");
+        assert_eq!(llm_err.status, 500); // We map internal stream errors to 500
+        assert!(llm_err.is_retryable());
+        assert!(llm_err.message.contains("Rate limit reached"));
     }
 }
