@@ -184,7 +184,16 @@ impl ThinClientSession {
         // Render history to event sink (for resume/attach scenarios)
         let history = event_stream.history();
         // Apply mutations so retracted/edited entries are excluded from history render.
-        let effective_history = harnx_core::session_reconstruct::apply_log_mutations_nats(history);
+        let effective_history =
+            match harnx_core::session_reconstruct::apply_log_mutations_nats(history) {
+                Ok(history) => history,
+                Err(err) => {
+                    log::warn!(
+                    "failed to apply NATS log mutations while rendering thin-client history: {err}"
+                );
+                    Vec::new()
+                }
+            };
         for (_seq, entry) in effective_history {
             render_log_entry_to_sink(&entry, event_sink.clone());
         }
@@ -324,7 +333,7 @@ impl ThinClientSession {
     /// The sequence number of the appended EditEntries entry.
     pub async fn retract_user_message(&self, seq: u64) -> Result<u64> {
         let log = NatsSessionLog::new(self.jetstream.clone(), self.session_id.clone());
-        let seq = usize::try_from(seq).expect("JetStream seq fits usize");
+        let seq = usize::try_from(seq).context("JetStream seq does not fit into usize")?;
         let edit_entry = SessionLogEntry::EditEntries {
             from: seq,
             to: seq,
@@ -359,7 +368,7 @@ impl ThinClientSession {
         };
         let replacement_yaml = serde_yaml::to_string(&replacement_entry)
             .context("failed to serialize replacement entry for user-message edit")?;
-        let seq = usize::try_from(seq).expect("JetStream seq fits usize");
+        let seq = usize::try_from(seq).context("JetStream seq does not fit into usize")?;
         let edit_entry = SessionLogEntry::EditEntries {
             from: seq,
             to: seq,
@@ -390,7 +399,16 @@ impl ThinClientSession {
     /// Extract the final assistant response text from durable entries.
     fn extract_final_response(&self, entries: &[(u64, SessionLogEntry)]) -> Option<String> {
         // Apply mutations so retracted messages are excluded.
-        let effective_entries = harnx_core::session_reconstruct::apply_log_mutations_nats(entries);
+        let effective_entries =
+            match harnx_core::session_reconstruct::apply_log_mutations_nats(entries) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    log::warn!(
+                        "failed to apply NATS log mutations while extracting final response: {err}"
+                    );
+                    return None;
+                }
+            };
         // Find the last assistant message in effective entries.
         for (_, entry) in effective_entries.iter().rev() {
             if let SessionLogEntry::Message { role, content, .. } = entry {

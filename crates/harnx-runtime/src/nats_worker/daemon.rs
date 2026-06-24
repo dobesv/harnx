@@ -170,6 +170,16 @@ pub async fn publish_session_activate(
     Ok(ack.sequence)
 }
 
+/// Shared, borrowed context for the `derive_*_turn_input` helpers. Groups the
+/// three references they all thread through so each helper stays within the
+/// function-argument budget.
+#[derive(Clone, Copy)]
+struct TurnInputCtx<'a> {
+    activation: &'a SessionActivate,
+    per_session: &'a GlobalConfig,
+    backend: &'a NatsSessionLogBackend,
+}
+
 /// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
 /// KV lease, and execute the session (exactly one worker per session).
 pub async fn run_worker_daemon(
@@ -326,6 +336,41 @@ impl WorkerRuntime {
         Ok(())
     }
 
+    async fn derive_continuation_turn_input(
+        &self,
+        ctx: TurnInputCtx<'_>,
+        high_water: Option<u64>,
+    ) -> Option<(Input, Option<u64>)> {
+        // Continuation turns (high_water set) derive input CURSOR-based, not
+        // barrier-based. A user message that arrives DURING a turn is logged at
+        // a seq BELOW that turn's assistant barrier, so the barrier-based
+        // reconstruct would treat it as already-answered and never fold it. The
+        // cursor (high-water mark of messages already fed this activation) is the
+        // authoritative "unanswered" boundary and matches the drain decision.
+        let hw = high_water?;
+        let tail = match ctx.backend.load_events_consistent_blocking() {
+            Ok(entries) => entries,
+            Err(err) => {
+                log::warn!(
+                    "failed to load session log for continuation drain: session_id={} worker_id={} err={err}",
+                    ctx.backend.session_id(),
+                    self.worker_id,
+                );
+                Vec::new()
+            }
+        };
+        let (new_messages, latest_seq) = fold_new_user_messages_since(&tail, Some(hw));
+        if new_messages.is_empty() {
+            return None;
+        }
+        let (mut input, seed) = self
+            .derive_idle_turn_input(ctx.activation, ctx.per_session, new_messages)
+            .await;
+        input.with_session = true;
+        input.skip_user_log_append = true;
+        Some((input, seed.or(latest_seq)))
+    }
+
     /// Derive the turn input for an activation from the reconstructed session
     /// state, honoring cancel tombstones, resumable turns, and pending messages.
     async fn derive_turn_input(
@@ -336,35 +381,13 @@ impl WorkerRuntime {
         backend: &NatsSessionLogBackend,
         high_water: Option<u64>,
     ) -> (Input, Option<u64>) {
-        // Continuation turns (high_water set) derive input CURSOR-based, not
-        // barrier-based. A user message that arrives DURING a turn is logged at
-        // a seq BELOW that turn's assistant barrier, so the barrier-based
-        // reconstruct would treat it as already-answered and never fold it. The
-        // cursor (high-water mark of messages already fed this activation) is the
-        // authoritative "unanswered" boundary and matches the drain decision.
-        if let Some(hw) = high_water {
-            let tail = match backend.load_events_consistent_blocking() {
-                Ok(entries) => entries,
-                Err(err) => {
-                    log::warn!(
-                        "failed to load session log for continuation drain: session_id={} worker_id={} err={err}",
-                        backend.session_id(),
-                        self.worker_id,
-                    );
-                    Vec::new()
-                }
-            };
-            let (new_messages, latest_seq) = fold_new_user_messages_since(&tail, Some(hw));
-            if !new_messages.is_empty() {
-                let (mut input, seed) = self
-                    .derive_idle_turn_input(activation, per_session, new_messages)
-                    .await;
-                input.with_session = true;
-                input.skip_user_log_append = true;
-                return (input, seed.or(latest_seq));
-            }
-            // No new user messages past the cursor: fall through to reconstruct,
-            // which still handles a genuinely-resumable in-flight tool round.
+        let ctx = TurnInputCtx {
+            activation,
+            per_session,
+            backend,
+        };
+        if let Some(continuation) = self.derive_continuation_turn_input(ctx, high_water).await {
+            return continuation;
         }
 
         let reconstructed = self.reconstruct_session_state(backend).await;

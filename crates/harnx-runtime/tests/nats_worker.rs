@@ -28,9 +28,11 @@ use std::sync::LazyLock;
 static MID_ROUND_APPEND_READY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static MID_ROUND_APPEND_DONE: LazyLock<Notify> = LazyLock::new(Notify::new);
 static MID_ROUND_FINAL_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MID_ROUND_RELOAD_SEEN: AtomicUsize = AtomicUsize::new(0);
 static END_TURN_APPEND_READY: LazyLock<Notify> = LazyLock::new(Notify::new);
 static END_TURN_APPEND_DONE: LazyLock<Notify> = LazyLock::new(Notify::new);
 static END_TURN_CALLS: AtomicUsize = AtomicUsize::new(0);
+static RETRACTED_ORPHAN_ACTIVATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 use parking_lot::RwLock;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -183,6 +185,39 @@ fn append_user_message_entry(text: &str) -> SessionLogEntry {
     }
 }
 
+async fn spawn_worker_daemon_with_call_fn(
+    config: Arc<RwLock<Config>>,
+    worker_id: &str,
+    call_fn: harnx_runtime::agent_loop::AgentCallFn,
+) -> tokio::task::JoinHandle<Result<()>> {
+    let worker_config = WorkerDaemonConfig::new("local", worker_id);
+    let daemon = tokio::spawn({
+        let cfg = config.clone();
+        async move { run_worker_daemon(cfg, worker_config, Some(call_fn)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    daemon
+}
+
+async fn local_test_nats(server_url: &str) -> Result<async_nats::jetstream::Context> {
+    Ok(async_nats::jetstream::new(
+        async_nats::connect(server_url).await?,
+    ))
+}
+
+async fn activate_session(
+    jetstream: &async_nats::jetstream::Context,
+    session_id: &str,
+) -> Result<()> {
+    publish_session_activate(
+        jetstream,
+        "local",
+        &SessionActivate::new(session_id, "ignored-agent"),
+    )
+    .await?;
+    Ok(())
+}
+
 fn mid_round_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
     Arc::new(move |input, _config, _abort| {
         // The mid-turn injection is delivered via `input.injected_user_text`
@@ -201,6 +236,7 @@ fn mid_round_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
                 // (the `on_tool_round` seam fires between rounds and injects it).
                 MID_ROUND_APPEND_READY.notify_one();
                 MID_ROUND_APPEND_DONE.notified().await;
+                MID_ROUND_RELOAD_SEEN.fetch_add(1, Ordering::SeqCst);
                 Ok((
                     "round-one".to_string(),
                     None,
@@ -1005,6 +1041,7 @@ async fn after_seq_observer_advances_and_consistent_read_honors_it() -> Result<(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retracted_mid_tool_round_message_is_not_injected() -> Result<()> {
     reset_test_state();
+    MID_ROUND_RELOAD_SEEN.store(0, Ordering::SeqCst);
     require_nextest();
     let Some(server) = spawn_nats_server().await? else {
         eprintln!("Skipping test: nats-server not available");
@@ -1016,28 +1053,18 @@ async fn retracted_mid_tool_round_message_is_not_injected() -> Result<()> {
         url: server.url(),
         token: None,
     })));
-    let worker_config = WorkerDaemonConfig::new("local", "worker-mid-round-retract");
-    let daemon = tokio::spawn({
-        let cfg = config.clone();
-        async move { run_worker_daemon(cfg, worker_config, Some(mid_round_call_fn())).await }
-    });
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let daemon =
+        spawn_worker_daemon_with_call_fn(config, "worker-mid-round-retract", mid_round_call_fn())
+            .await;
 
-    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let js = local_test_nats(server.url()).await?;
     let session_id = "mid-round-retracted-injection";
     let log = NatsSessionLog::new(js.clone(), session_id);
-
     let ready_fut = MID_ROUND_APPEND_READY.notified();
 
     log.append_event_async(&append_user_message_entry("seed message"))
         .await?;
-    publish_session_activate(
-        &js,
-        "local",
-        &SessionActivate::new(session_id, "ignored-agent"),
-    )
-    .await?;
-
+    activate_session(&js, session_id).await?;
     ready_fut.await;
 
     let retracted_seq = log
@@ -1049,15 +1076,19 @@ async fn retracted_mid_tool_round_message_is_not_injected() -> Result<()> {
             fence_token: None,
         })
         .await?;
+    let retracted_seq = usize::try_from(retracted_seq).expect("JetStream seq fits usize");
     log.append_event_async(&SessionLogEntry::EditEntries {
-        from: retracted_seq as usize,
-        to: retracted_seq as usize,
+        from: retracted_seq,
+        to: retracted_seq,
         replacements: vec![],
     })
     .await?;
 
     MID_ROUND_APPEND_DONE.notify_one();
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    wait_until(Duration::from_secs(10), || {
+        MID_ROUND_RELOAD_SEEN.load(Ordering::SeqCst) >= 1
+    })
+    .await?;
 
     let entries = log.load_events_async().await?;
     let assistants = final_assistant_texts(&entries);
@@ -1107,23 +1138,14 @@ async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> 
         url: server.url(),
         token: None,
     })));
-    let worker_config = WorkerDaemonConfig::new("local", "worker-rewind");
-    let daemon = tokio::spawn({
-        let cfg = config.clone();
-        let calls = counter.clone();
-        let captured_prompts = prompts.clone();
-        async move {
-            run_worker_daemon(
-                cfg,
-                worker_config,
-                Some(fold_capture_call_fn(calls, captured_prompts)),
-            )
-            .await
-        }
-    });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let daemon = spawn_worker_daemon_with_call_fn(
+        config,
+        "worker-rewind",
+        fold_capture_call_fn(counter.clone(), prompts.clone()),
+    )
+    .await;
 
-    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let js = local_test_nats(server.url()).await?;
     let session_id = "rewind-worker-test";
     let log = NatsSessionLog::new(js.clone(), session_id);
 
@@ -1145,16 +1167,11 @@ async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> 
     })
     .await?;
     log.append_event_async(&SessionLogEntry::Rewind {
-        after_seq: first_seq as usize,
+        after_seq: usize::try_from(first_seq).expect("JetStream seq fits usize"),
     })
     .await?;
 
-    publish_session_activate(
-        &js,
-        "local",
-        &SessionActivate::new(session_id, "ignored-agent"),
-    )
-    .await?;
+    activate_session(&js, session_id).await?;
 
     wait_until(Duration::from_secs(10), || {
         counter.load(Ordering::SeqCst) >= 1
@@ -1184,12 +1201,7 @@ async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> 
         assistant_texts
     );
 
-    let reconstructed = reconstruct_state(
-        &entries
-            .iter()
-            .map(|(_, entry)| entry.clone())
-            .collect::<Vec<_>>(),
-    );
+    let reconstructed = reconstruct_state_from_nats(&entries);
     assert_eq!(reconstructed.turn_status, TurnStatus::Idle);
 
     daemon.abort();
@@ -1199,6 +1211,7 @@ async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
+    RETRACTED_ORPHAN_ACTIVATION_CALLS.store(0, Ordering::SeqCst);
     require_nextest();
     let Some(server) = spawn_nats_server().await? else {
         eprintln!("skipping: nats-server not available");
@@ -1210,29 +1223,25 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
         url: server.url(),
         token: None,
     })));
-    let worker_config = WorkerDaemonConfig::new("local", "worker-retracted-orphan");
     let tool_calls_seen = Arc::new(AtomicUsize::new(0));
-    let daemon = tokio::spawn({
-        let cfg = config.clone();
-        let seen = tool_calls_seen.clone();
-        let call_fn: harnx_runtime::agent_loop::AgentCallFn =
-            Arc::new(move |_input, _config, _abort| {
-                let seen = seen.clone();
-                Box::pin(async move {
-                    seen.fetch_add(1, Ordering::SeqCst);
-                    Ok((
-                        "should not run".to_string(),
-                        None,
-                        vec![],
-                        CompletionTokenUsage::default(),
-                    ))
-                })
-            });
-        async move { run_worker_daemon(cfg, worker_config, Some(call_fn)).await }
-    });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let seen_for_call_fn = Arc::clone(&tool_calls_seen);
+    let call_fn: harnx_runtime::agent_loop::AgentCallFn =
+        Arc::new(move |_input, _config, _abort| {
+            let seen = seen_for_call_fn.clone();
+            Box::pin(async move {
+                RETRACTED_ORPHAN_ACTIVATION_CALLS.fetch_add(1, Ordering::SeqCst);
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    "should not run".to_string(),
+                    None,
+                    vec![],
+                    CompletionTokenUsage::default(),
+                ))
+            })
+        });
+    let daemon = spawn_worker_daemon_with_call_fn(config, "worker-retracted-orphan", call_fn).await;
 
-    let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
+    let js = local_test_nats(server.url()).await?;
     let session_id = "retracted-orphan-test";
     let log = NatsSessionLog::new(js.clone(), session_id);
 
@@ -1260,9 +1269,10 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
             fence_token: None,
         })
         .await?;
+    let tool_calls_seq = usize::try_from(tool_calls_seq).expect("JetStream seq fits usize");
     log.append_event_async(&SessionLogEntry::EditEntries {
-        from: tool_calls_seq as usize,
-        to: tool_calls_seq as usize,
+        from: tool_calls_seq,
+        to: tool_calls_seq,
         replacements: vec![],
     })
     .await?;
@@ -1273,14 +1283,22 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
     // With the fix (effective scan) the retract is honored: neither increments.
     let metrics_before = harnx_runtime::nats_metrics::snapshot();
 
-    publish_session_activate(
-        &js,
-        "local",
-        &SessionActivate::new(session_id, "ignored-agent"),
-    )
-    .await?;
+    activate_session(&js, session_id).await?;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Deterministic barrier: wait until the worker has actually CLAIMED the session
+    // (lease_acquisitions increments) — which proves it reached load_or_repair_session
+    // and ran the orphan scan — and then FINISHED (active_sessions back to 0). Without
+    // this, the assertions could run before the worker did anything (a 0==0 check is
+    // satisfied immediately), letting the test pass vacuously even with the bug present.
+    wait_until(Duration::from_secs(10), || {
+        harnx_runtime::nats_metrics::snapshot().lease_acquisitions
+            > metrics_before.lease_acquisitions
+    })
+    .await?;
+    wait_until(Duration::from_secs(10), || {
+        harnx_runtime::nats_metrics::snapshot().active_sessions_per_worker == 0
+    })
+    .await?;
 
     let entries = log.load_events_async().await?;
     let retracted_results = entries
@@ -1319,7 +1337,7 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
         "retracted tool round must not synthesize an interrupt-error result"
     );
 
-    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries);
+    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
     assert!(
         !effective.iter().any(|(_, entry)| matches!(
             entry,
