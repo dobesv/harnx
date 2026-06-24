@@ -211,9 +211,10 @@ impl ScrollState {
             .get_height_log_from_cache_for_width(viewport_width, elements.len())
             .clone();
 
-        // Loop until we successfully rendert the current scroll position
-        // Render attempts might fail if the cache is out of sync
-        loop {
+        // Loop until we successfully rendered the current scroll position
+        // Render attempts might fail if the cache is out of sync.
+        // We limit the number of attempts to avoid infinite loops if heights are unstable.
+        for _ in 0..10 {
             let total_height: usize = height_log.iter().sum();
 
             // No need to scroll at all, when everything fits on the screen
@@ -236,7 +237,7 @@ impl ScrollState {
                 &render_element,
             );
 
-            // All good? Update the cache and end the endless loop
+            // All good? Update the cache and end the loop
             if result.is_ok() {
                 // Update the cache
                 self.render_height_cache.insert(viewport_width, height_log);
@@ -248,7 +249,6 @@ impl ScrollState {
                     Self::render_scrollbar(frame, area, scroll_offset, max_scroll_offset);
                 }
 
-                // End loop
                 break;
             }
         }
@@ -337,11 +337,14 @@ where
     let (partial_draw_top, full_draw_middle, partial_draw_bottom) =
         get_areas_to_render_from_scroll_position(draw_area, scroll_positon, height_log);
 
-    if let Some((index, area)) = partial_draw_top {
-        let element = &elements[index];
+    if let (Some((_, area)), Some(element), Some(cached_height)) = (
+        partial_draw_top,
+        partial_draw_top.and_then(|(i, _)| elements.get(i)),
+        partial_draw_top.and_then(|(i, _)| height_log.get_mut(i)),
+    ) {
         let (widget_height, widget) = render_element(element);
 
-        if widget_height == height_log[index] {
+        if widget_height == *cached_height {
             let buffer_area = Rect::new(
                 0,
                 0,
@@ -353,16 +356,19 @@ where
             widget.render(buffer.area, &mut buffer);
             copy_partial_top_widget_to_frame(frame, area, buffer, widget_height);
         } else {
-            height_log[index] = widget_height;
+            *cached_height = widget_height;
             update_needed = true;
         }
     }
 
-    if let Some((index, area, lines_above)) = partial_draw_bottom {
-        let element = &elements[index];
+    if let (Some((_, area, lines_above)), Some(element), Some(cached_height)) = (
+        partial_draw_bottom,
+        partial_draw_bottom.and_then(|(i, _, _)| elements.get(i)),
+        partial_draw_bottom.and_then(|(i, _, _)| height_log.get_mut(i)),
+    ) {
         let (widget_height, widget) = render_element(element);
 
-        if widget_height == height_log[index] {
+        if widget_height == *cached_height {
             let buffer_area = Rect::new(
                 0,
                 0,
@@ -374,7 +380,7 @@ where
             widget.render(buffer.area, &mut buffer);
             copy_partial_bottom_widget_to_frame(frame, area, buffer, lines_above);
         } else {
-            height_log[index] = widget_height;
+            *cached_height = widget_height;
             update_needed = true;
         }
     }
@@ -384,21 +390,24 @@ where
         let mut widget_blocks = vec![];
         let mut constrains = vec![];
         for index in range {
-            let element = &elements[index];
-            let (height, widget) = render_element(element);
+            if let (Some(element), Some(cached_height)) =
+                (elements.get(index), height_log.get_mut(index))
+            {
+                let (height, widget) = render_element(element);
 
-            if height != height_log[index] {
-                height_log[index] = height;
-                update_needed = true;
-            }
+                if height != *cached_height {
+                    *cached_height = height;
+                    update_needed = true;
+                }
 
-            if !update_needed {
-                widget_blocks.push(widget);
-                constrains.push(Constraint::Length(height.try_into().unwrap()));
+                if !update_needed {
+                    widget_blocks.push(widget);
+                    constrains.push(Constraint::Length(height.try_into().unwrap_or(u16::MAX)));
+                }
             }
         }
 
-        if !update_needed {
+        if !update_needed && !constrains.is_empty() {
             let areas: Vec<Rect> = Layout::vertical(constrains).split(area).to_vec();
             for (a, widget) in zip(areas, widget_blocks) {
                 widget.render(a, frame.buffer_mut());
