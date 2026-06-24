@@ -141,12 +141,4 @@ impl NatsSessionLogBackend {
         );
         log.load_events_at_least_async(min_seq).await
     }
-
-    pub fn load_events_consistent_blocking(
-        &self,
-    ) -> Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.load_events_consistent_async())
-        })
-    }
 }

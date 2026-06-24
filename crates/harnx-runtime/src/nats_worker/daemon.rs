@@ -348,7 +348,7 @@ impl WorkerRuntime {
         // cursor (high-water mark of messages already fed this activation) is the
         // authoritative "unanswered" boundary and matches the drain decision.
         let hw = high_water?;
-        let tail = match ctx.backend.load_events_consistent_blocking() {
+        let tail = match ctx.backend.load_events_consistent_async().await {
             Ok(entries) => entries,
             Err(err) => {
                 log::warn!(
@@ -615,7 +615,7 @@ impl WorkerRuntime {
                 // Use the read-your-writes consistent load so this re-read reflects
                 // the worker's own just-persisted turn barrier (otherwise it would
                 // re-fold already-answered messages).
-                let tail = backend.load_events_consistent_blocking()?;
+                let tail = backend.load_events_consistent_async().await?;
 
                 // Check for resumable in-flight tool rounds (multi-turn tool execution).
                 // Use reconstruct_state_from_nats to preserve NATS seqs for EditEntries resolution.
@@ -744,7 +744,7 @@ impl WorkerRuntime {
         &self,
         backend: &NatsSessionLogBackend,
     ) -> harnx_core::session_reconstruct::ReconstructedState {
-        match backend.load_events_consistent_blocking() {
+        match backend.load_events_consistent_async().await {
             Ok(entries) => harnx_core::session_reconstruct::reconstruct_state_from_nats(&entries),
             Err(err) => {
                 log::warn!(

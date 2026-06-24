@@ -964,7 +964,7 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
 
 /// Read-your-writes seam (Step 2): a backend wired with an `after_seq_observer`
 /// advances the observer to the durable ack sequence on every append, and
-/// `load_events_consistent_blocking` waits until the stream reflects at least
+/// `load_events_consistent_async` waits until the stream reflects at least
 /// that sequence before returning. This is the mechanism that lets the
 /// end-of-turn drain re-read observe the worker's own just-persisted barrier
 /// instead of a stale tail.
@@ -1019,7 +1019,7 @@ async fn after_seq_observer_advances_and_consistent_read_honors_it() -> Result<(
     // The consistent read uses the observer's high-water mark; it must return a
     // tail that reflects at least seq2 (both entries visible), never a stale
     // read missing the worker's own latest barrier.
-    let entries = backend.load_events_consistent_blocking()?;
+    let entries = backend.load_events_consistent_async().await?;
     assert!(
         entries.iter().any(|(s, _)| *s == seq2),
         "consistent read must include the latest appended entry (seq {seq2}); got {entries:?}"
