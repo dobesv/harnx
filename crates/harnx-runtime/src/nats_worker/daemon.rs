@@ -170,6 +170,16 @@ pub async fn publish_session_activate(
     Ok(ack.sequence)
 }
 
+/// Shared, borrowed context for the `derive_*_turn_input` helpers. Groups the
+/// three references they all thread through so each helper stays within the
+/// function-argument budget.
+#[derive(Clone, Copy)]
+struct TurnInputCtx<'a> {
+    activation: &'a SessionActivate,
+    per_session: &'a GlobalConfig,
+    backend: &'a NatsSessionLogBackend,
+}
+
 /// Run a worker daemon: pull `SessionActivate` notifications, claim each via a
 /// KV lease, and execute the session (exactly one worker per session).
 pub async fn run_worker_daemon(
@@ -221,7 +231,7 @@ pub async fn run_worker_daemon(
     while let Some(message) = messages.next().await {
         let message = message.context("receive activation")?;
         if let Err(error) = runtime.handle_activation(message).await {
-            warn!("worker activation handling failed: {error:#}");
+            log::warn!("worker activation handling failed: {error:#}");
         }
     }
     Ok(())
@@ -284,7 +294,7 @@ impl WorkerRuntime {
             Some(lease) => lease,
             None => return Ok(()),
         };
-        info!(
+        log::info!(
             "session activate claimed: session_id={} worker_id={} revision={} epoch={}",
             activation.session_id,
             lease.worker_id(),
@@ -301,7 +311,7 @@ impl WorkerRuntime {
         nats_metrics::active_session_started();
         let handle = tokio::spawn(async move {
             let snapshot = nats_metrics::snapshot();
-            info!(
+            log::info!(
                 "active session started: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
                 activation.session_id,
                 lease.worker_id(),
@@ -311,7 +321,7 @@ impl WorkerRuntime {
             let result = worker.execute_session(activation, Arc::clone(&lease)).await;
             nats_metrics::active_session_finished();
             let snapshot = nats_metrics::snapshot();
-            info!(
+            log::info!(
                 "active session finished: session_id={} worker_id={} revision={} active_sessions_per_worker={}",
                 task_session_id,
                 lease.worker_id(),
@@ -319,11 +329,46 @@ impl WorkerRuntime {
                 snapshot.active_sessions_per_worker
             );
             if let Err(error) = result {
-                warn!("worker session execution failed: {error:#}");
+                log::warn!("worker session execution failed: {error:#}");
             }
         });
         self.active.lock().await.insert(session_id, handle);
         Ok(())
+    }
+
+    async fn derive_continuation_turn_input(
+        &self,
+        ctx: TurnInputCtx<'_>,
+        high_water: Option<u64>,
+    ) -> Option<(Input, Option<u64>)> {
+        // Continuation turns (high_water set) derive input CURSOR-based, not
+        // barrier-based. A user message that arrives DURING a turn is logged at
+        // a seq BELOW that turn's assistant barrier, so the barrier-based
+        // reconstruct would treat it as already-answered and never fold it. The
+        // cursor (high-water mark of messages already fed this activation) is the
+        // authoritative "unanswered" boundary and matches the drain decision.
+        let hw = high_water?;
+        let tail = match ctx.backend.load_events_consistent_async().await {
+            Ok(entries) => entries,
+            Err(err) => {
+                log::warn!(
+                    "failed to load session log for continuation drain: session_id={} worker_id={} err={err}",
+                    ctx.backend.session_id(),
+                    self.worker_id,
+                );
+                Vec::new()
+            }
+        };
+        let (new_messages, latest_seq) = fold_new_user_messages_since(&tail, Some(hw));
+        if new_messages.is_empty() {
+            return None;
+        }
+        let (mut input, seed) = self
+            .derive_idle_turn_input(ctx.activation, ctx.per_session, new_messages)
+            .await;
+        input.with_session = true;
+        input.skip_user_log_append = true;
+        Some((input, seed.or(latest_seq)))
     }
 
     /// Derive the turn input for an activation from the reconstructed session
@@ -336,27 +381,13 @@ impl WorkerRuntime {
         backend: &NatsSessionLogBackend,
         high_water: Option<u64>,
     ) -> (Input, Option<u64>) {
-        // Continuation turns (high_water set) derive input CURSOR-based, not
-        // barrier-based. A user message that arrives DURING a turn is logged at
-        // a seq BELOW that turn's assistant barrier, so the barrier-based
-        // reconstruct would treat it as already-answered and never fold it. The
-        // cursor (high-water mark of messages already fed this activation) is the
-        // authoritative "unanswered" boundary and matches the drain decision.
-        if let Some(hw) = high_water {
-            let tail = backend
-                .load_events_consistent_blocking()
-                .unwrap_or_default();
-            let (new_messages, latest_seq) = fold_new_user_messages_since(&tail, Some(hw));
-            if !new_messages.is_empty() {
-                let (mut input, seed) = self
-                    .derive_idle_turn_input(activation, per_session, new_messages)
-                    .await;
-                input.with_session = true;
-                input.skip_user_log_append = true;
-                return (input, seed.or(latest_seq));
-            }
-            // No new user messages past the cursor: fall through to reconstruct,
-            // which still handles a genuinely-resumable in-flight tool round.
+        let ctx = TurnInputCtx {
+            activation,
+            per_session,
+            backend,
+        };
+        if let Some(continuation) = self.derive_continuation_turn_input(ctx, high_water).await {
+            return continuation;
         }
 
         let reconstructed = self.reconstruct_session_state(backend).await;
@@ -379,7 +410,7 @@ impl WorkerRuntime {
             }
             harnx_core::session_reconstruct::TurnStatus::InFlightResumable => {
                 // Resume existing turn (orphan repair handled inside run_agent_loop_with_nats_inner).
-                info!(
+                log::info!(
                     "resume state: session_id={} worker_id={} revision={} mode=resumable",
                     activation.session_id,
                     lease.worker_id(),
@@ -584,7 +615,7 @@ impl WorkerRuntime {
                 // Use the read-your-writes consistent load so this re-read reflects
                 // the worker's own just-persisted turn barrier (otherwise it would
                 // re-fold already-answered messages).
-                let tail = backend.load_events_consistent_blocking()?;
+                let tail = backend.load_events_consistent_async().await?;
 
                 // Check for resumable in-flight tool rounds (multi-turn tool execution).
                 // Use reconstruct_state_from_nats to preserve NATS seqs for EditEntries resolution.
@@ -619,7 +650,7 @@ impl WorkerRuntime {
         .await;
 
         if !lease.is_held() {
-            warn!(
+            log::warn!(
                 "session execution ended after failover: session_id={} worker_id={} revision={}",
                 activation.session_id,
                 lease.worker_id(),
@@ -649,7 +680,7 @@ impl WorkerRuntime {
         tokio::spawn(async move {
             while lost.changed().await.is_ok() {
                 if !*lost.borrow() {
-                    warn!(
+                    log::warn!(
                         "failover abort: session_id={} worker_id={} revision={} reason=lease_lost",
                         watch_session_id,
                         watch_lease.worker_id(),
@@ -713,7 +744,7 @@ impl WorkerRuntime {
         &self,
         backend: &NatsSessionLogBackend,
     ) -> harnx_core::session_reconstruct::ReconstructedState {
-        match backend.load_events_consistent_blocking() {
+        match backend.load_events_consistent_async().await {
             Ok(entries) => harnx_core::session_reconstruct::reconstruct_state_from_nats(&entries),
             Err(err) => {
                 log::warn!(
