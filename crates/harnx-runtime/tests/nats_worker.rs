@@ -65,6 +65,130 @@ fn local_nats_config(spec: NatsServerSpec<'_>) -> Config {
     config
 }
 
+fn local_nats_runtime_config(server_url: &str) -> Arc<RwLock<Config>> {
+    Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
+        name: "local",
+        url: server_url,
+        token: None,
+    })))
+}
+
+async fn require_nats_server() -> Result<Option<common::NatsServerHandle>> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(None);
+    };
+    Ok(Some(server))
+}
+
+async fn append_retracted_user_message(
+    log: &NatsSessionLog,
+    message_id: &str,
+    content: &str,
+) -> Result<u64> {
+    let seq = log
+        .append_event_async(&append_user_message_entry(message_id, content))
+        .await?;
+    log.append_event_async(&SessionLogEntry::EditEntries {
+        from: seq as usize,
+        to: seq as usize,
+        replacements: vec![],
+    })
+    .await?;
+    Ok(seq)
+}
+
+async fn assert_single_prompt(prompts: &Arc<AsyncMutex<Vec<String>>>, expected: &str) {
+    let captured = prompts.lock().await.clone();
+    assert_eq!(
+        captured.len(),
+        1,
+        "worker should have made exactly one call"
+    );
+    assert_eq!(
+        captured[0], expected,
+        "worker input should match expected message"
+    );
+}
+
+fn assert_single_assistant_contains(entries: &[(u64, SessionLogEntry)], needle: &str) {
+    let assistant_texts = final_assistant_texts(entries);
+    assert_eq!(
+        assistant_texts.len(),
+        1,
+        "exactly one assistant message should be persisted"
+    );
+    assert!(
+        assistant_texts[0].contains(needle),
+        "assistant should contain {needle:?}, got: {:?}",
+        assistant_texts
+    );
+}
+
+fn count_tool_results_with_id(entries: &[(u64, SessionLogEntry)], call_id: &str) -> usize {
+    entries
+        .iter()
+        .filter(|(_, entry)| match entry {
+            SessionLogEntry::ToolResults { results, .. } => results
+                .iter()
+                .any(|result| result.id.as_deref() == Some(call_id)),
+            _ => false,
+        })
+        .count()
+}
+
+async fn wait_for_worker_daemon_idle(metrics_before_lease_acquisitions: u64) -> Result<()> {
+    wait_until(Duration::from_secs(10), || {
+        harnx_runtime::nats_metrics::snapshot().lease_acquisitions
+            > metrics_before_lease_acquisitions
+    })
+    .await?;
+    wait_until(Duration::from_secs(10), || {
+        harnx_runtime::nats_metrics::snapshot().active_sessions_per_worker == 0
+    })
+    .await
+}
+
+fn assert_no_resume_or_interrupt_metric_delta(
+    metrics_before: harnx_runtime::nats_metrics::NatsMetricsSnapshot,
+    metrics_after: harnx_runtime::nats_metrics::NatsMetricsSnapshot,
+) {
+    assert_eq!(
+        metrics_after.resumes, metrics_before.resumes,
+        "retracted tool round must not trigger a resume/orphan repair"
+    );
+    assert_eq!(
+        metrics_after.interrupt_errors_synthesized, metrics_before.interrupt_errors_synthesized,
+        "retracted tool round must not synthesize an interrupt-error result"
+    );
+}
+
+fn assert_retracted_orphan_absent(entries: &[(u64, SessionLogEntry)], call_id: &str) -> Result<()> {
+    assert_eq!(
+        count_tool_results_with_id(entries, call_id),
+        0,
+        "worker must not synthesize or replay ToolResults for retracted orphan tool call"
+    );
+    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(entries)?;
+    assert!(
+        !effective.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::ToolCalls { calls, .. }
+                if calls.iter().any(|call| call.id.as_deref() == Some(call_id))
+        )),
+        "effective log must not contain retracted tool call"
+    );
+    assert!(
+        !effective.iter().any(|(_, entry)| matches!(
+            entry,
+            SessionLogEntry::ToolResults { results, .. }
+                if results.iter().any(|result| result.id.as_deref() == Some(call_id))
+        )),
+        "effective log must not contain resurrected ToolResults for retracted tool call"
+    );
+    Ok(())
+}
 fn session_header(session_id: &str) -> SessionLogEntry {
     SessionLogEntry::Header {
         model_id: "test-model".to_string(),
@@ -175,9 +299,9 @@ fn make_stub_llm_call_fn() -> harnx_runtime::agent_loop::AgentCallFn {
     })
 }
 
-fn append_user_message_entry(text: &str) -> SessionLogEntry {
+fn append_user_message_entry(message_id: &str, text: &str) -> SessionLogEntry {
     SessionLogEntry::Message {
-        id: None,
+        id: Some(message_id.to_string()),
         role: MessageRole::User,
         content: harnx_core::message::MessageContent::Text(text.to_string()),
         timestamp: None,
@@ -354,11 +478,7 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
         return Ok(());
     };
 
-    let config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
-        name: "local",
-        url: server.url(),
-        token: None,
-    })));
+    let config = local_nats_runtime_config(server.url());
     let worker_config = WorkerDaemonConfig::new("local", "worker-mid-round");
     let daemon = tokio::spawn({
         let cfg = config.clone();
@@ -375,7 +495,7 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
     // to avoid lost wakeup race between notify_one() and notified().await
     let ready_fut = MID_ROUND_APPEND_READY.notified();
 
-    log.append_event_async(&append_user_message_entry("seed message"))
+    log.append_event_async(&append_user_message_entry("user-1", "seed message"))
         .await?;
     publish_session_activate(
         &js,
@@ -387,7 +507,7 @@ async fn mid_tool_round_user_message_is_injected_once_into_same_turn() -> Result
     // Now await the ready signal - the permit was stored by notify_one()
     ready_fut.await;
 
-    log.append_event_async(&append_user_message_entry("late message"))
+    log.append_event_async(&append_user_message_entry("user-2", "late message"))
         .await?;
     // Use notify_one() to signal completion - matches the notify_one() in call_fn
     MID_ROUND_APPEND_DONE.notify_one();
@@ -445,7 +565,7 @@ async fn end_of_turn_reread_runs_continuation_turn_with_same_activation() -> Res
     // to avoid lost wakeup race between notify_one() and notified().await
     let ready_fut = END_TURN_APPEND_READY.notified();
 
-    log.append_event_async(&append_user_message_entry("first"))
+    log.append_event_async(&append_user_message_entry("user-1", "first"))
         .await?;
     publish_session_activate(
         &js,
@@ -460,7 +580,7 @@ async fn end_of_turn_reread_runs_continuation_turn_with_same_activation() -> Res
     // Give a moment for the NATS message to propagate
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    log.append_event_async(&append_user_message_entry("second"))
+    log.append_event_async(&append_user_message_entry("user-2", "second"))
         .await?;
     // Signal to turn 1 that it can complete now
     END_TURN_APPEND_DONE.notify_one();
@@ -556,9 +676,9 @@ async fn idle_concurrent_messages_fold_in_seq_order_into_single_turn() -> Result
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
     let session_id = "fold-order";
     let log = NatsSessionLog::new(js.clone(), session_id);
-    log.append_event_async(&append_user_message_entry("alpha"))
+    log.append_event_async(&append_user_message_entry("user-1", "alpha"))
         .await?;
-    log.append_event_async(&append_user_message_entry("beta"))
+    log.append_event_async(&append_user_message_entry("user-2", "beta"))
         .await?;
     publish_session_activate(
         &js,
@@ -734,9 +854,7 @@ async fn dispatch_runs_exactly_one_worker_per_activation_and_reactivation_is_noo
     };
     use std::time::Duration;
 
-    require_nextest();
-    let Some(server) = spawn_nats_server().await? else {
-        eprintln!("skipping: nats-server not available");
+    let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
 
@@ -820,9 +938,7 @@ async fn fenced_sink_rejects_append_when_lease_lost() -> Result<()> {
     use harnx_runtime::nats_worker::{FencedSessionLogSink, NatsSessionLogBackend};
     use std::time::Duration;
 
-    require_nextest();
-    let Some(server) = spawn_nats_server().await? else {
-        eprintln!("skipping: nats-server not available");
+    let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
@@ -887,9 +1003,7 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
     use harnx_runtime::nats_worker::run_agent_loop_with_nats_inner;
     use std::time::Duration;
 
-    require_nextest();
-    let Some(server) = spawn_nats_server().await? else {
-        eprintln!("skipping: nats-server not available");
+    let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
@@ -973,9 +1087,7 @@ async fn after_seq_observer_advances_and_consistent_read_honors_it() -> Result<(
     use harnx_runtime::nats_worker::NatsSessionLogBackend;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-    require_nextest();
-    let Some(server) = spawn_nats_server().await? else {
-        eprintln!("skipping: nats-server not available");
+    let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
     let js = async_nats::jetstream::new(async_nats::connect(server.url()).await?);
@@ -1062,7 +1174,7 @@ async fn retracted_mid_tool_round_message_is_not_injected() -> Result<()> {
     let log = NatsSessionLog::new(js.clone(), session_id);
     let ready_fut = MID_ROUND_APPEND_READY.notified();
 
-    log.append_event_async(&append_user_message_entry("seed message"))
+    log.append_event_async(&append_user_message_entry("user-1", "seed message"))
         .await?;
     activate_session(&js, session_id).await?;
     ready_fut.await;
@@ -1124,20 +1236,14 @@ async fn retracted_mid_tool_round_message_is_not_injected() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> {
-    require_nextest();
-    let Some(server) = spawn_nats_server().await? else {
-        eprintln!("skipping: nats-server not available");
+    let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
 
     let counter = Arc::new(AtomicUsize::new(0));
     let prompts = Arc::new(AsyncMutex::new(Vec::<String>::new()));
 
-    let config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
-        name: "local",
-        url: server.url(),
-        token: None,
-    })));
+    let config = local_nats_runtime_config(server.url());
     let daemon = spawn_worker_daemon_with_call_fn(
         config,
         "worker-rewind",
@@ -1178,21 +1284,11 @@ async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> 
     })
     .await?;
 
-    let captured_prompts = prompts.lock().await.clone();
-    assert_eq!(captured_prompts, vec!["first prompt".to_string()]);
+    assert_single_prompt(&prompts, "first prompt").await;
 
     let entries = log.load_events_async().await?;
     let assistant_texts = final_assistant_texts(&entries);
-    assert_eq!(
-        assistant_texts.len(),
-        1,
-        "worker should persist one response"
-    );
-    assert!(
-        assistant_texts[0].contains("first prompt"),
-        "worker should answer only unre-wound prompt, got: {:?}",
-        assistant_texts
-    );
+    assert_single_assistant_contains(&entries, "first prompt");
     assert!(
         assistant_texts
             .iter()
@@ -1212,9 +1308,7 @@ async fn rewind_truncates_worker_visible_tail_before_activation() -> Result<()> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
     RETRACTED_ORPHAN_ACTIVATION_CALLS.store(0, Ordering::SeqCst);
-    require_nextest();
-    let Some(server) = spawn_nats_server().await? else {
-        eprintln!("skipping: nats-server not available");
+    let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
 
@@ -1290,72 +1384,19 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
     // and ran the orphan scan — and then FINISHED (active_sessions back to 0). Without
     // this, the assertions could run before the worker did anything (a 0==0 check is
     // satisfied immediately), letting the test pass vacuously even with the bug present.
-    wait_until(Duration::from_secs(10), || {
-        harnx_runtime::nats_metrics::snapshot().lease_acquisitions
-            > metrics_before.lease_acquisitions
-    })
-    .await?;
-    wait_until(Duration::from_secs(10), || {
-        harnx_runtime::nats_metrics::snapshot().active_sessions_per_worker == 0
-    })
-    .await?;
+    wait_for_worker_daemon_idle(metrics_before.lease_acquisitions).await?;
 
     let entries = log.load_events_async().await?;
-    let retracted_results = entries
-        .iter()
-        .filter_map(|(_, entry)| match entry {
-            SessionLogEntry::ToolResults { results, .. }
-                if results
-                    .iter()
-                    .any(|result| result.id.as_deref() == Some("call-retracted-orphan")) =>
-            {
-                Some(results)
-            }
-            _ => None,
-        })
-        .count();
-    assert_eq!(
-        retracted_results, 0,
-        "worker must not synthesize or replay ToolResults for retracted orphan tool call"
-    );
     assert_eq!(
         tool_calls_seen.load(Ordering::SeqCst),
         0,
         "orphan repair must not invoke call_fn for retracted tool call"
     );
-
-    // The retracted tool round must not be detected as a resume orphan, and no
-    // interrupt-error result may be synthesized for it. These HA-metric deltas are
-    // the direct observable of the bug: with the raw-scan bug they would each be 1.
-    let metrics_after = harnx_runtime::nats_metrics::snapshot();
-    assert_eq!(
-        metrics_after.resumes, metrics_before.resumes,
-        "retracted tool round must not trigger a resume/orphan repair"
+    assert_no_resume_or_interrupt_metric_delta(
+        metrics_before,
+        harnx_runtime::nats_metrics::snapshot(),
     );
-    assert_eq!(
-        metrics_after.interrupt_errors_synthesized, metrics_before.interrupt_errors_synthesized,
-        "retracted tool round must not synthesize an interrupt-error result"
-    );
-
-    let effective = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries)?;
-    assert!(
-        !effective.iter().any(|(_, entry)| matches!(
-            entry,
-            SessionLogEntry::ToolCalls { calls, .. }
-                if calls.iter().any(|call| call.id.as_deref() == Some("call-retracted-orphan"))
-        )),
-        "effective log must not contain retracted tool call"
-    );
-    assert!(
-        !effective.iter().any(|(_, entry)| matches!(
-            entry,
-            SessionLogEntry::ToolResults { results, .. }
-                if results
-                    .iter()
-                    .any(|result| result.id.as_deref() == Some("call-retracted-orphan"))
-        )),
-        "effective log must not contain resurrected ToolResults for retracted tool call"
-    );
+    assert_retracted_orphan_absent(&entries, "call-retracted-orphan")?;
 
     daemon.abort();
     let _ = daemon.await;
@@ -1364,20 +1405,14 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
-    require_nextest();
-    let Some(server) = spawn_nats_server().await? else {
-        eprintln!("skipping: nats-server not available");
+    let Some(server) = require_nats_server().await? else {
         return Ok(());
     };
 
     let counter = Arc::new(AtomicUsize::new(0));
     let prompts = Arc::new(AsyncMutex::new(Vec::<String>::new()));
 
-    let config = Arc::new(RwLock::new(local_nats_config(NatsServerSpec {
-        name: "local",
-        url: server.url(),
-        token: None,
-    })));
+    let config = local_nats_runtime_config(server.url());
     let worker_config = WorkerDaemonConfig::new("local", "worker-retract");
     let daemon = tokio::spawn({
         let cfg = config.clone();
@@ -1399,31 +1434,11 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
     let log = NatsSessionLog::new(js.clone(), session_id);
 
     // Append a user message and an EditEntries that retracts it.
-    let user_seq = log
-        .append_event_async(&SessionLogEntry::Message {
-            id: Some("msg-to-retract".to_string()),
-            role: MessageRole::User,
-            content: harnx_core::message::MessageContent::Text("please ignore this".to_string()),
-            timestamp: None,
-            fence_token: None,
-        })
-        .await?;
-    log.append_event_async(&SessionLogEntry::EditEntries {
-        from: user_seq as usize,
-        to: user_seq as usize,
-        replacements: vec![], // deletion
-    })
-    .await?;
+    append_retracted_user_message(&log, "msg-to-retract", "please ignore this").await?;
 
     // Append a valid user message that SHOULD be processed.
-    log.append_event_async(&SessionLogEntry::Message {
-        id: Some("valid-msg".to_string()),
-        role: MessageRole::User,
-        content: harnx_core::message::MessageContent::Text("hello world".to_string()),
-        timestamp: None,
-        fence_token: None,
-    })
-    .await?;
+    log.append_event_async(&append_user_message_entry("valid-msg", "hello world"))
+        .await?;
 
     // Activate the session.
     publish_session_activate(
@@ -1441,31 +1456,11 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
 
     // Verify: only ONE call was made, and the prompt is "hello world", NOT "please ignore this"
     // If the bug is present, the prompt would contain the retracted message.
-    let captured_prompts = prompts.lock().await.clone();
-    assert_eq!(
-        captured_prompts.len(),
-        1,
-        "worker should have made exactly one call"
-    );
-    assert_eq!(
-        captured_prompts[0],
-        "hello world".to_string(),
-        "worker input should be the valid message, not the retracted one"
-    );
+    assert_single_prompt(&prompts, "hello world").await;
 
     // Verify the durable log: no assistant turn for the retracted message.
     let entries = log.load_events_async().await?;
-    let assistant_texts = final_assistant_texts(&entries);
-    assert_eq!(
-        assistant_texts.len(),
-        1,
-        "exactly one assistant message should be persisted"
-    );
-    assert!(
-        assistant_texts[0].contains("hello world"),
-        "assistant should respond to the valid message, got: {:?}",
-        assistant_texts
-    );
+    assert_single_assistant_contains(&entries, "hello world");
 
     daemon.abort();
     let _ = daemon.await;
