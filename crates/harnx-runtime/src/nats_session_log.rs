@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{
     self,
-    context::Publish,
+    message::PublishMessage,
     stream::{Config as StreamConfig, RetentionPolicy},
 };
 use bytes::Bytes;
@@ -41,7 +41,7 @@ impl NatsSessionLog {
             .jetstream
             .send_publish(
                 self.subject.clone(),
-                Publish::build()
+                PublishMessage::build()
                     .payload(Bytes::from(payload))
                     .message_id(message_id),
             )
