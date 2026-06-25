@@ -136,7 +136,7 @@ rmcp = { version = "1.7", features = ["client", "server", "transport-child-proce
 process-wrap = { version = "9", features = ["tokio1"] }
 libc = "0.2"
 agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk", rev = "5ce2e5d40fac5bf2596dfba1b8e4d562defff177" }
-async-nats = { version = "0.42", default-features = false, features = ["server_2_10", "server_2_11", "ring"] }
+async-nats = { version = "0.49", default-features = false, features = ["server_2_10", "server_2_11", "ring", "jetstream", "kv"] }
 glob = "0.3"
 globset = "0.4"
 shellexpand = "3.1.0"
