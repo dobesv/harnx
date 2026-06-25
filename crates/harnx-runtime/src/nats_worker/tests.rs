@@ -7,7 +7,9 @@ use harnx_core::config_data::ConfigData;
 use harnx_core::session::ToolOutput;
 use harnx_core::tool::{ToolCall, ToolDeclaration};
 use serde_json::json;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Spawn a local JetStream-enabled nats-server on a free port with an isolated
 /// temp store dir, returning the connect URL, the child process, and the temp
@@ -45,6 +47,85 @@ async fn spawn_test_nats() -> Option<(String, std::process::Child, tempfile::Tem
     let _ = child.kill();
     let _ = child.wait();
     None
+}
+
+static CWD_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+struct CurrentDirGuard {
+    original_dir: PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl CurrentDirGuard {
+    fn change_to(path: &Path) -> std::io::Result<Self> {
+        let lock = CWD_MUTEX.lock().unwrap();
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(path)?;
+        Ok(Self {
+            original_dir,
+            _lock: lock,
+        })
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.original_dir)
+            .expect("must restore original working directory after test");
+    }
+}
+
+fn run_git(temp_repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(temp_repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git command must spawn");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: stdout={} stderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn create_test_git_repo() -> tempfile::TempDir {
+    let temp_dir = tempfile::tempdir().expect("temp dir must be created");
+    let repo = temp_dir.path();
+    let tracked_file = repo.join("README.md");
+
+    run_git(repo, &["init", "-b", "main"]);
+    std::fs::write(&tracked_file, "hermetic test repo\n").expect("tracked file must be written");
+    run_git(repo, &["add", "README.md"]);
+    run_git(
+        repo,
+        &[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "initial commit",
+            "--no-gpg-sign",
+            "--no-verify",
+        ],
+    );
+    run_git(repo, &["checkout", "-b", "test-branch"]);
+    run_git(
+        repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/test/repo.git",
+        ],
+    );
+
+    temp_dir
 }
 
 #[test]
@@ -177,6 +258,9 @@ async fn remote_header_matches_local_header_source_of_truth() {
     let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
         return;
     };
+    let temp_repo = create_test_git_repo();
+    let temp_repo_path = temp_repo.path().to_path_buf();
+    let original_cwd = std::env::current_dir().expect("current dir must exist before test");
     let client = async_nats::connect(&url).await.unwrap();
     let jetstream = async_nats::jetstream::new(client);
     let session_id = "remote-header-test";
@@ -208,14 +292,25 @@ async fn remote_header_matches_local_header_source_of_truth() {
         agent.into_config(),
     );
 
-    let session = write_header_and_load_session(&backend, &config, &input, session_id)
-        .await
-        .unwrap();
-    let expected_header = {
-        let mut expected_session = config::session::new(&config.read(), session_id).unwrap();
-        expected_session.set_agent(&input.agent).unwrap();
-        expected_session.build_header_entry()
+    let (session, expected_header) = {
+        let _cwd_guard = CurrentDirGuard::change_to(&temp_repo_path)
+            .expect("must switch into hermetic git repo for header generation");
+        let session = write_header_and_load_session(&backend, &config, &input, session_id)
+            .await
+            .unwrap();
+        let expected_header = {
+            let mut expected_session = config::session::new(&config.read(), session_id).unwrap();
+            expected_session.set_agent(&input.agent).unwrap();
+            expected_session.build_header_entry()
+        };
+        (session, expected_header)
     };
+
+    assert_eq!(
+        std::env::current_dir().unwrap(),
+        original_cwd,
+        "test must restore original working directory"
+    );
 
     let entries = backend.load_events_blocking().unwrap();
     let actual_header = entries
@@ -229,13 +324,27 @@ async fn remote_header_matches_local_header_source_of_truth() {
     assert!(
         actual_header_yaml.contains("agent_instructions: Agent instructions without variables.")
     );
-    assert!(actual_header_yaml.contains("git_branch: nats"));
-    assert!(actual_header_yaml.contains("git_remote: https://github.com/dobesv/harnx.git"));
-    assert!(actual_header_yaml
-        .contains("working_dir: /mnt/projects/ai-tools/harnx/crates/harnx-runtime"));
+    assert!(actual_header_yaml.contains("git_branch: test-branch"));
+    assert!(
+        actual_header_yaml.contains("git_remote: https://example.com/test/repo.git"),
+        "actual header must use hermetic git remote: {actual_header_yaml}"
+    );
+    let expected_working_dir = format!("working_dir: {}", temp_repo_path.display());
+    assert!(
+        actual_header_yaml.contains(&expected_working_dir),
+        "actual header must use hermetic working dir: {actual_header_yaml}"
+    );
+    assert!(expected_header_yaml.contains("git_branch: test-branch"));
+    assert!(expected_header_yaml.contains("git_remote: https://example.com/test/repo.git"));
+    assert!(expected_header_yaml.contains(&expected_working_dir));
+    assert_eq!(
+        actual_header_yaml, expected_header_yaml,
+        "remote header must match locally built header"
+    );
     let loaded_header_yaml = serde_yaml::to_string(&session.build_header_entry()).unwrap();
     assert!(loaded_header_yaml.contains("agent_name: pkg/main"));
     assert!(expected_header_yaml.contains("agent_name: pkg/main"));
+    assert!(loaded_header_yaml.contains("git_branch: test-branch"));
 
     let _ = child.kill();
     let _ = child.wait();
