@@ -108,7 +108,7 @@ pub(crate) fn build_mid_turn_injection_callback(
         let backend = backend.clone();
         let cursor = Arc::clone(&cursor);
         Box::pin(async move {
-            let tail = match backend.load_events_consistent_async().await {
+            let tail = match backend.load_events_latest_async().await {
                 Ok(entries) => entries,
                 Err(err) => {
                     log::warn!("failed to reload session log for mid-turn injection: {err}");

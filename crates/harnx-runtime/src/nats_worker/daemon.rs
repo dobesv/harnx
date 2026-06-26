@@ -348,7 +348,7 @@ impl WorkerRuntime {
         // cursor (high-water mark of messages already fed this activation) is the
         // authoritative "unanswered" boundary and matches the drain decision.
         let hw = high_water?;
-        let tail = match ctx.backend.load_events_consistent_async().await {
+        let tail = match ctx.backend.load_events_latest_async().await {
             Ok(entries) => entries,
             Err(err) => {
                 log::warn!(
@@ -516,8 +516,8 @@ impl WorkerRuntime {
         let event_sink = Arc::new(event_sink);
 
         // Build the backend for control-plane operations and state reconstruction.
-        // Share the `after_seq` high-water mark so the drain re-read can enforce
-        // read-your-writes consistency on the worker's own turn-output appends.
+        // Share the `after_seq` high-water mark for event-sink fan-out advisories;
+        // worker tail reads themselves use leader-authoritative `load_events_latest_async`.
         let backend = NatsSessionLogBackend::new(self.jetstream.clone(), &activation.session_id)
             .with_after_seq_observer(Arc::clone(&after_seq_observer));
 
@@ -612,10 +612,11 @@ impl WorkerRuntime {
                 // DRAIN DECISION: cursor-based, not barrier-based.
                 // Re-run another turn ONLY if there's a user message with seq > activation_high_water.
                 // This prevents re-running when we've already consumed everything.
-                // Use the read-your-writes consistent load so this re-read reflects
-                // the worker's own just-persisted turn barrier (otherwise it would
-                // re-fold already-answered messages).
-                let tail = backend.load_events_consistent_async().await?;
+                // Use the fresh leader-authoritative load so this re-read reflects
+                // both the worker's own just-persisted turn barrier and any client
+                // edit/retract committed just before the read (otherwise it would
+                // re-fold already-answered or retracted messages).
+                let tail = backend.load_events_latest_async().await?;
 
                 // Check for resumable in-flight tool rounds (multi-turn tool execution).
                 // Use reconstruct_state_from_nats to preserve NATS seqs for EditEntries resolution.
@@ -744,7 +745,7 @@ impl WorkerRuntime {
         &self,
         backend: &NatsSessionLogBackend,
     ) -> harnx_core::session_reconstruct::ReconstructedState {
-        match backend.load_events_consistent_async().await {
+        match backend.load_events_latest_async().await {
             Ok(entries) => harnx_core::session_reconstruct::reconstruct_state_from_nats(&entries),
             Err(err) => {
                 log::warn!(
