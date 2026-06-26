@@ -78,6 +78,30 @@ This works from the CLI, TUI, and ACP server.
 - **New Sessions**: A new session log and lease are created in NATS.
 - **Resuming Sessions**: Clients attach to an existing `session_id`. Multiple clients can attach to the same session simultaneously (Multiplayer Mode).
 
+## Agent Catalog (Static Discovery)
+
+To make remote agents discoverable in shell completion and interactive pickers, you can declare them in your cluster configuration.
+
+Add an `agents:` list to `nats_servers/<cluster>.yaml`:
+
+```yaml
+url: "nats://nats.example.com:4222"
+agents:
+  - name: atlas
+    description: "Main orchestrator"  # Reserved for future use / stored only
+    role: assistant                # Optional: 'assistant' (default) or 'subagent'
+  - name: critic
+    role: subagent
+```
+
+### Discovery Behavior
+
+- **Naming**: Agents appear as `name@cluster`. For example, `name: atlas` in `prod.yaml` surfaces as `atlas@prod`.
+- **Filtering**:
+    - **Shell Completion**: All agents appear in `--list-agents` and tab-completion regardless of role.
+    - **Assistant Picker**: Only agents with `role: assistant` (the default) appear in interactive assistant selection menus. `subagent` entries are excluded from the picker.
+- **Static Config**: This is purely local configuration. Harnx does not perform network calls to discover or list these agents.
+
 ## Control Plane
 
 Clients communicate with the active worker over specific NATS subjects:

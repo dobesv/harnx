@@ -2,11 +2,21 @@
 use super::*;
 use anyhow::{bail, Context, Result};
 use async_nats::{jetstream, ConnectOptions};
+use harnx_core::agent_config::AgentRole;
 use serde::{Deserialize, Serialize};
 use std::{
     io::BufReader,
     path::{Path, PathBuf},
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteAgentEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub role: AgentRole,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NatsServerConfig {
@@ -23,6 +33,8 @@ pub struct NatsServerConfig {
     pub tls_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<RemoteAgentEntry>,
 }
 
 impl NatsServerConfig {
@@ -306,6 +318,7 @@ mod tests {
             tls_cert: Some("${NATS_CERT}".into()),
             tls_key: Some("${NATS_KEY}".into()),
             tls_ca: Some("${NATS_CA}".into()),
+            agents: vec![],
         };
         Config::expand_nats_server_envs(&mut server);
 
@@ -314,6 +327,69 @@ mod tests {
         assert_eq!(server.tls_cert.as_deref(), Some("/tmp/client-cert.pem"));
         assert_eq!(server.tls_key.as_deref(), Some("/tmp/client-key.pem"));
         assert_eq!(server.tls_ca.as_deref(), Some("/tmp/ca.pem"));
+    }
+
+    #[test]
+    fn nats_server_config_parses_agents_list_with_description_and_role() {
+        let config: NatsServerConfig = serde_yaml::from_str(
+            r#"
+url: nats://localhost:4222
+agents:
+  - name: forge-atlas
+    description: Handles heavy planning
+    role: subagent
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.url, "nats://localhost:4222");
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(config.agents[0].name, "forge-atlas");
+        assert_eq!(
+            config.agents[0].description.as_deref(),
+            Some("Handles heavy planning")
+        );
+        assert_eq!(config.agents[0].role, AgentRole::Subagent);
+    }
+
+    #[test]
+    fn nats_server_config_parses_agents_defaults_for_missing_fields() {
+        let config: NatsServerConfig = serde_yaml::from_str(
+            r#"
+url: nats://localhost:4222
+agents:
+  - name: no-description
+    role: subagent
+  - name: no-role
+    description: Defaults role to assistant
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.agents.len(), 2);
+        assert_eq!(config.agents[0].name, "no-description");
+        assert_eq!(config.agents[0].description, None);
+        assert_eq!(config.agents[0].role, AgentRole::Subagent);
+        assert_eq!(config.agents[1].name, "no-role");
+        assert_eq!(
+            config.agents[1].description.as_deref(),
+            Some("Defaults role to assistant")
+        );
+        assert_eq!(config.agents[1].role, AgentRole::Assistant);
+    }
+
+    #[test]
+    fn nats_server_config_parses_without_agents_key_for_back_compat() {
+        let config: NatsServerConfig = serde_yaml::from_str(
+            r#"
+url: nats://localhost:4222
+tls: false
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.url, "nats://localhost:4222");
+        assert!(config.agents.is_empty());
     }
 
     #[test]
@@ -326,6 +402,7 @@ mod tests {
             tls_cert: Some("/tmp/client-cert.pem".into()),
             tls_key: None,
             tls_ca: None,
+            agents: vec![],
         };
 
         let error = build_nats_connect_options(&server).unwrap_err().to_string();
@@ -344,6 +421,7 @@ mod tests {
             tls_cert: Some("/definitely/missing-cert.pem".into()),
             tls_key: Some("/definitely/missing-key.pem".into()),
             tls_ca: None,
+            agents: vec![],
         };
 
         let error = build_nats_connect_options(&server).unwrap_err().to_string();
@@ -364,6 +442,7 @@ mod tests {
             tls_cert: Some("/tmp/client-cert.pem".into()),
             tls_key: Some("/tmp/client-key.pem".into()),
             tls_ca: Some("/tmp/ca.pem".into()),
+            agents: vec![],
         };
 
         let error = build_nats_connect_options(&server).unwrap_err().to_string();

@@ -59,6 +59,7 @@ fn local_nats_config(spec: NatsServerSpec<'_>) -> Config {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            agents: vec![],
         }],
         ..Default::default()
     };

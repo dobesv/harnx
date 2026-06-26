@@ -473,6 +473,7 @@ fn ensure_no_unset_variables(unset_variables: &[&AgentVariable]) -> Result<()> {
 pub fn list_agents() -> Vec<String> {
     let mut output = list_local_agent_names();
     output.extend(list_package_agent_names());
+    output.extend(list_remote_agent_names(None));
     output.sort();
     output.dedup();
     output
@@ -510,6 +511,25 @@ fn list_package_agent_names() -> Vec<String> {
             if let Some(stem) = markdown_stem(&agent_entry.path()) {
                 names.push(format!("{pkg_name}/{stem}"));
             }
+        }
+    }
+    names
+}
+
+fn list_remote_agent_names(role_filter: Option<AgentRole>) -> Vec<String> {
+    let nats_servers_dir = Config::config_dir().join(paths::NATS_SERVERS_DIR_NAME);
+    let Ok(servers) = Config::load_nats_servers_from_dir(&nats_servers_dir) else {
+        return vec![];
+    };
+
+    let mut names = vec![];
+    for server in servers {
+        let cluster_name = server.name;
+        for agent in server.agents {
+            if role_filter.as_ref().is_some_and(|role| agent.role != *role) {
+                continue;
+            }
+            names.push(format!("{}@{}", agent.name, cluster_name));
         }
     }
     names
@@ -584,6 +604,7 @@ pub async fn list_assistant_agents() -> Vec<String> {
     let mut output =
         collect_assistant_agents_in_dir(&Config::agents_config_dir(), |stem| stem.to_string())
             .await;
+    output.extend(list_remote_agent_names(Some(AgentRole::Assistant)));
 
     let packages_dir = harnx_core::config_paths::packages_dir();
     if let Ok(mut pkg_dir) = tokio::fs::read_dir(&packages_dir).await {
