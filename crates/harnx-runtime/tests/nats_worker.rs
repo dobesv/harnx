@@ -35,6 +35,7 @@ static END_TURN_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RETRACTED_ORPHAN_ACTIVATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 use parking_lot::RwLock;
 use serde_json::json;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1403,6 +1404,101 @@ async fn retracted_orphan_tool_call_is_not_repaired_by_worker() -> Result<()> {
     Ok(())
 }
 
+/// Verifies `load_events_latest_async` reads leader-authoritative tail end-to-end.
+///
+/// On single-node NATS this cannot differ from old `stream.info()` path because
+/// there is no replication lag, so this is a forward behavioral guarantee rather
+/// than a fail-on-revert differential. Real #917 bug requires multi-node
+/// STREAM.INFO-vs-leader divergence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_events_latest_async_reads_leader_authoritative_tail() -> Result<()> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+
+    let js = local_test_nats(server.url()).await?;
+    let session_id = "latest-tail-test";
+    let log = NatsSessionLog::new(js, session_id);
+
+    let user_seq = log
+        .append_event_async(&append_user_message_entry(
+            "msg-to-retract",
+            "please ignore this",
+        ))
+        .await?;
+    let retract_seq = log
+        .append_event_async(&SessionLogEntry::EditEntries {
+            from: user_seq as usize,
+            to: user_seq as usize,
+            replacements: vec![],
+        })
+        .await?;
+
+    let entries = log.load_events_latest_async().await?;
+    let max_seq = entries.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
+    assert!(
+        max_seq >= retract_seq,
+        "latest read must include retract seq {retract_seq}, got max seq {max_seq}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(_, entry)| matches!(entry, SessionLogEntry::EditEntries { .. })),
+        "latest read must include EditEntries retract entry"
+    );
+
+    let effective_messages = reconstruct_state_from_nats(&entries).next_turn_messages;
+    assert!(
+        !effective_messages
+            .iter()
+            .any(|message| message.content.to_text().contains("please ignore this")),
+        "retracted user text must not survive reconstruct_state_from_nats fold"
+    );
+
+    Ok(())
+}
+
+/// Structural regression guard for #917.
+///
+/// Runtime difference only appears under multi-node replication lag, which CI's
+/// single-node NATS cannot reproduce. If production structure changes
+/// legitimately, update this guard.
+#[test]
+fn injection_decision_points_use_leader_authoritative_read() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let agent_loop = std::fs::read_to_string(manifest_dir.join("src/nats_worker/agent_loop.rs"))
+        .expect("agent_loop.rs must be readable");
+    let daemon = std::fs::read_to_string(manifest_dir.join("src/nats_worker/daemon.rs"))
+        .expect("daemon.rs must be readable");
+
+    assert!(
+        agent_loop.contains("build_mid_turn_injection_callback"),
+        "agent_loop.rs must still define build_mid_turn_injection_callback"
+    );
+    assert!(
+        agent_loop.contains("load_events_latest_async"),
+        "mid-turn injection callback must use load_events_latest_async"
+    );
+    assert!(
+        !agent_loop.contains("load_events_consistent_async"),
+        "agent_loop.rs must not route mid-turn injection through load_events_consistent_async"
+    );
+
+    assert_eq!(
+        daemon
+            .lines()
+            .filter(|line| line.contains("load_events_latest_async()"))
+            .count(),
+        3,
+        "daemon.rs must use load_events_latest_async at exact 3 decision points"
+    );
+    assert_eq!(
+        daemon.matches("load_events_consistent_async").count(),
+        0,
+        "daemon.rs must not use load_events_consistent_async at #917 decision points"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
     let Some(server) = require_nats_server().await? else {
@@ -1464,5 +1560,22 @@ async fn retracted_user_message_is_not_executed_by_worker() -> Result<()> {
 
     daemon.abort();
     let _ = daemon.await;
+    Ok(())
+}
+
+/// Exercises the NoMessageFound / empty-stream branch of load_events_latest_async (#917).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn load_events_latest_async_empty_stream_returns_empty() -> Result<()> {
+    let Some(server) = require_nats_server().await? else {
+        return Ok(());
+    };
+
+    let js = local_test_nats(server.url()).await?;
+    let session_id = "latest-tail-empty-stream-test";
+    let log = NatsSessionLog::new(js, session_id);
+
+    let entries = log.load_events_latest_async().await?;
+    assert!(entries.is_empty(), "empty stream should return empty Vec");
+
     Ok(())
 }

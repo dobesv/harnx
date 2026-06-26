@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use async_nats::jetstream::{
     self,
     message::PublishMessage,
-    stream::{Config as StreamConfig, RetentionPolicy},
+    stream::{Config as StreamConfig, LastRawMessageErrorKind, RetentionPolicy},
 };
 use bytes::Bytes;
 use harnx_core::{session::SessionLogEntry, session_log::SessionLog};
@@ -113,6 +113,38 @@ impl NatsSessionLog {
             .map(|entries| entries.into_iter().map(|(_, entry)| entry).collect())
     }
 
+    pub async fn load_events_latest_async(&self) -> Result<Vec<(u64, SessionLogEntry)>> {
+        let mut stream = self.ensure_stream().await?;
+        let latest = match stream.get_last_raw_message_by_subject(&self.subject).await {
+            Ok(raw) => raw,
+            Err(err) if matches!(err.kind(), LastRawMessageErrorKind::NoMessageFound) => {
+                return Ok(Vec::new());
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to get latest JetStream session log entry for session '{}' subject '{}'",
+                        self.session_id, self.subject
+                    )
+                });
+            }
+        };
+        let first_sequence = stream
+            .info()
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to inspect JetStream log stream '{}' for session '{}'",
+                    self.stream_name, self.session_id
+                )
+            })?
+            .state
+            .first_sequence;
+        let start = first_sequence.max(1);
+
+        self.read_range(&stream, start, latest.sequence).await
+    }
+
     async fn ensure_stream(&self) -> Result<jetstream::stream::Stream> {
         self.jetstream
             .get_or_create_stream(StreamConfig {
@@ -156,9 +188,26 @@ impl NatsSessionLog {
             return Ok(Vec::new());
         }
 
-        let begin = start_sequence.max(first_sequence).max(1);
+        self.read_range(
+            &stream,
+            start_sequence.max(first_sequence).max(1),
+            last_sequence,
+        )
+        .await
+    }
+
+    async fn read_range(
+        &self,
+        stream: &jetstream::stream::Stream,
+        start_sequence: u64,
+        last_sequence: u64,
+    ) -> Result<Vec<(u64, SessionLogEntry)>> {
+        if last_sequence < start_sequence {
+            return Ok(Vec::new());
+        }
+
         let mut entries = Vec::new();
-        for seq in begin..=last_sequence {
+        for seq in start_sequence..=last_sequence {
             let raw = match timeout(READ_TIMEOUT, stream.get_raw_message(seq)).await {
                 Ok(Ok(raw)) => raw,
                 // Sequence may have been removed (retention/limits) leaving a gap;

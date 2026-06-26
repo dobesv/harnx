@@ -141,4 +141,14 @@ impl NatsSessionLogBackend {
         );
         log.load_events_at_least_async(min_seq).await
     }
+
+    pub async fn load_events_latest_async(
+        &self,
+    ) -> Result<Vec<(u64, harnx_core::session::SessionLogEntry)>> {
+        let log = crate::nats_session_log::NatsSessionLog::new(
+            self.jetstream.clone(),
+            self.session_id.clone(),
+        );
+        log.load_events_latest_async().await
+    }
 }
