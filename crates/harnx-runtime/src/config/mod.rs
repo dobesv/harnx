@@ -1498,6 +1498,8 @@ where
 #[cfg(test)]
 mod compaction_tests;
 #[cfg(test)]
+mod remote_agent_tests;
+#[cfg(test)]
 mod session_edit_tests;
 #[cfg(test)]
 mod test_support;
