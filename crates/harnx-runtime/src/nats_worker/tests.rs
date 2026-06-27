@@ -1,15 +1,19 @@
 //! Unit tests for nats_worker module.
 
-use crate::config::{self};
+use crate::config::{self, Config};
 use crate::nats_worker::agent_loop::{tool_can_rerun, write_header_and_load_session};
+use crate::nats_worker::run_worker_daemon;
+use anyhow::Context;
 use harnx_core::agent_config::AgentConfig;
 use harnx_core::config_data::ConfigData;
+use harnx_core::event::{AgentEvent, AgentEventSink};
 use harnx_core::session::ToolOutput;
 use harnx_core::tool::{ToolCall, ToolDeclaration};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 /// Spawn a local JetStream-enabled nats-server on a free port with an isolated
 /// temp store dir, returning the connect URL, the child process, and the temp
@@ -50,6 +54,7 @@ async fn spawn_test_nats() -> Option<(String, std::process::Child, tempfile::Tem
 }
 
 static CWD_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 struct CurrentDirGuard {
     original_dir: PathBuf,
@@ -75,6 +80,214 @@ impl Drop for CurrentDirGuard {
     }
 }
 
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    match ENV_MUTEX.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+struct TestEnvGuard {
+    prev: Option<std::ffi::OsString>,
+}
+
+impl TestEnvGuard {
+    fn new(key: &str, value: &Path) -> Self {
+        let prev = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        let _ = key;
+        Self { prev }
+    }
+}
+
+impl Drop for TestEnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(value) => unsafe { std::env::set_var("HARNX_CONFIG_DIR", value) },
+            None => unsafe { std::env::remove_var("HARNX_CONFIG_DIR") },
+        }
+    }
+}
+
+fn load_config_via_internal_pipeline(config_path: &Path) -> Config {
+    let prev = std::env::var_os("HARNX_CONFIG_DIR");
+    let config_dir = config_path
+        .parent()
+        .expect("config path must have parent directory");
+    let _config_guard = TestEnvGuard::new("HARNX_CONFIG_DIR", config_dir);
+    let mut config = Config::load_from_file(config_path).unwrap();
+    // Initialize acp_manager from the auto-registered ACP servers; without this
+    // the delegation tool family is never materialized and only the handoff
+    // path contributes to tool_declarations_for_use_tools. Mirrors the config
+    // tests' `remote_use_tools_selectors_match_full_sanitized_family`.
+    config.reinit_managers_for_agent(None);
+    drop(_config_guard);
+    match prev {
+        Some(value) => unsafe { std::env::set_var("HARNX_CONFIG_DIR", value) },
+        None => unsafe { std::env::remove_var("HARNX_CONFIG_DIR") },
+    }
+    config
+}
+
+struct SeededRemoteParentConfig {
+    temp: tempfile::TempDir,
+    parent_config: Config,
+}
+
+impl SeededRemoteParentConfig {
+    fn config_dir(&self) -> &Path {
+        self.temp.path()
+    }
+}
+
+fn expected_metis_remote_tool_names() -> Vec<String> {
+    vec![
+        "metis__at__local_session_cancel".to_string(),
+        "metis__at__local_session_handoff".to_string(),
+        "metis__at__local_session_load".to_string(),
+        "metis__at__local_session_new".to_string(),
+        "metis__at__local_session_prompt".to_string(),
+    ]
+}
+
+fn seed_remote_config(url: &str) -> SeededRemoteParentConfig {
+    use std::fs;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("nats_servers")).unwrap();
+    fs::write(
+        temp.path().join("nats_servers/local.yaml"),
+        format!(
+            "url: {url}
+agents:
+  - name: metis
+    description: Remote planner over NATS
+"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("config.yaml"),
+        "model: test:test-model
+use_tools:
+  - metis@local
+",
+    )
+    .unwrap();
+
+    SeededRemoteParentConfig {
+        parent_config: load_config_via_internal_pipeline(&temp.path().join("config.yaml")),
+        temp,
+    }
+}
+
+fn assert_remote_tool_family(parent_config: &mut Config) {
+    let expected_tools = expected_metis_remote_tool_names();
+
+    let mut whitelisted_names: Vec<String> = parent_config
+        .tool_declarations_for_use_tools(Some("metis@local"), None)
+        .0
+        .into_iter()
+        .map(|tool| tool.name)
+        .filter(|name| name.starts_with("metis__at__local_session_"))
+        .collect();
+    whitelisted_names.sort();
+    assert_eq!(whitelisted_names, expected_tools);
+}
+
+fn assert_remote_tool_descriptions(parent_config: &mut Config) {
+    let wildcard_tools = parent_config
+        .tool_declarations_for_use_tools(Some("*"), None)
+        .0;
+    let mut wildcard_names: Vec<String> = wildcard_tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .filter(|name| name.starts_with("metis__at__local_session_"))
+        .collect();
+    wildcard_names.sort();
+    assert_eq!(wildcard_names, expected_metis_remote_tool_names());
+
+    let prompt_tool = wildcard_tools
+        .iter()
+        .find(|tool| tool.name == "metis__at__local_session_prompt")
+        .expect("prompt tool must exist");
+    let prompt_description = &prompt_tool.description;
+    assert!(
+        prompt_description.contains("Remote planner over NATS"),
+        "prompt tool description must include seeded catalog description: {prompt_description}"
+    );
+    assert!(
+        prompt_description.ends_with("Remote planner over NATS"),
+        "prompt tool description must end with seeded catalog description: {prompt_description}"
+    );
+}
+
+fn spawn_metis_worker(url: &str) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let worker_agent = AgentConfig::from_markdown("metis", "stub worker prompt").unwrap();
+    let worker_config = Config {
+        data: harnx_core::config_data::ConfigData {
+            model_id: "test:test-model".to_string(),
+            ..Default::default()
+        },
+        agent: Some(crate::config::Agent::new(worker_agent)),
+        nats_servers: vec![config::NatsServerConfig {
+            name: "local".to_string(),
+            url: url.to_string(),
+            token: None,
+            tls: Some(false),
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
+            agents: Vec::new(),
+        }],
+        ..Default::default()
+    };
+    let worker_config = Arc::new(parking_lot::RwLock::new(worker_config));
+    tokio::spawn({
+        let worker_config = Arc::clone(&worker_config);
+        async move {
+            run_worker_daemon(
+                worker_config,
+                crate::nats_worker::WorkerDaemonConfig::new("local", "worker-metis"),
+                Some(fixed_prompt_call_fn("stub remote reply over nats")),
+            )
+            .await
+        }
+    })
+}
+
+async fn run_remote_round_trip(parent_config: Config) -> anyhow::Result<()> {
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let mut parent_config = parent_config;
+    let parent_session = crate::config::session::new(&parent_config, "parent-nats-roundtrip")?;
+    parent_config.session = Some(parent_session);
+    let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
+    let abort_signal = harnx_core::abort::create_abort_signal();
+    let thin_cfg = crate::ThinClientConfig {
+        cluster: "local".to_string(),
+        agent: "metis".to_string(),
+        session_id: Some(crate::nats_worker::new_remote_session_id()),
+    };
+    let thin =
+        crate::ThinClientSession::from_global_config(thin_cfg, &parent_global_config, abort_signal)
+            .await?;
+
+    let turn_result = tokio::time::timeout(
+        Duration::from_secs(10),
+        thin.run_turn("delegate over nats", Arc::new(NoopEventSink), None),
+    )
+    .await
+    .context("thin client run_turn timed out after 10s in remote NATS round-trip test")??;
+    let reply = turn_result
+        .response
+        .context("thin client turn must return final assistant response")?;
+    anyhow::ensure!(
+        reply.contains("stub remote reply over nats"),
+        "expected reply to contain stub remote reply, got: {reply}"
+    );
+    Ok(())
+}
 fn run_git(temp_repo: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -401,4 +614,46 @@ async fn control_log_append_requires_live_lease() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+struct NoopEventSink;
+
+impl AgentEventSink for NoopEventSink {
+    fn emit(&self, _event: AgentEvent, _source: Option<harnx_core::event::AgentSource>) {}
+}
+
+fn fixed_prompt_call_fn(reply: &'static str) -> crate::agent_loop::AgentCallFn {
+    Arc::new(move |_input, _config, _abort| {
+        Box::pin(async move {
+            Ok((
+                reply.to_string(),
+                None,
+                vec![],
+                crate::client::CompletionTokenUsage::default(),
+            ))
+        })
+    })
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_agent_tool_family_and_nats_call_and_return_round_trip() {
+    let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
+        return;
+    };
+
+    let _env_guard = env_lock();
+    let mut seeded = seed_remote_config(&url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
+    assert_remote_tool_family(&mut seeded.parent_config);
+    assert_remote_tool_descriptions(&mut seeded.parent_config);
+
+    let daemon = spawn_metis_worker(&url);
+    let test_result = run_remote_round_trip(seeded.parent_config).await;
+
+    daemon.abort();
+    let _ = daemon.await;
+    let _ = child.kill();
+    let _ = child.wait();
+    test_result.unwrap()
 }

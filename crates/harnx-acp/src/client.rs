@@ -368,6 +368,10 @@ impl AcpClient {
         &self.name
     }
 
+    pub fn description(&self) -> Option<&str> {
+        self.config.description.as_deref()
+    }
+
     pub async fn connect(&self) -> Result<()> {
         *self.connection_failed.write().await = false;
 

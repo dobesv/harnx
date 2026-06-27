@@ -223,6 +223,8 @@ impl ThinClientSession {
         const COMPLETION_CHECK_INTERVAL: std::time::Duration =
             std::time::Duration::from_millis(500);
         let mut last_completion_check = std::time::Instant::now() - COMPLETION_CHECK_INTERVAL;
+        let mut completion_interval = tokio::time::interval(COMPLETION_CHECK_INTERVAL);
+        completion_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Set up control command sender
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlCommand>(16);
@@ -264,6 +266,19 @@ impl ThinClientSession {
                     let _ = control_tx.send(ControlCommand::Cancel).await;
                 }
 
+                // Poll durable completion independently so non-streaming workers
+                // that persist a final assistant message without an advisory still
+                // complete the turn promptly.
+                _ = completion_interval.tick() => {
+                    if let Ok(entries) = self.load_durable_entries().await {
+                        if self.is_turn_complete(&entries, user_msg_seq) {
+                            final_response = Self::extract_final_response(&entries, user_msg_seq);
+                            turn_complete = true;
+                            break;
+                        }
+                    }
+                }
+
                 // Receive advisory events
                 maybe_envelope = event_stream.next() => {
                     match maybe_envelope {
@@ -281,9 +296,9 @@ impl ThinClientSession {
                             if last_completion_check.elapsed() >= COMPLETION_CHECK_INTERVAL {
                                 last_completion_check = std::time::Instant::now();
                                 if let Ok(entries) = self.load_durable_entries().await {
-                                    if self.is_turn_complete(&entries) {
+                                    if self.is_turn_complete(&entries, user_msg_seq) {
                                         // Extract final response before we finish
-                                        final_response = self.extract_final_response(&entries);
+                                        final_response = Self::extract_final_response(&entries, user_msg_seq);
                                         turn_complete = true;
                                         break;
                                     }
@@ -307,7 +322,7 @@ impl ThinClientSession {
         // Re-load durable log to get final state if we haven't already
         if !turn_complete {
             let entries = self.load_durable_entries().await?;
-            final_response = self.extract_final_response(&entries);
+            final_response = Self::extract_final_response(&entries, user_msg_seq);
         }
 
         Ok(ThinClientTurnResult {
@@ -388,19 +403,33 @@ impl ThinClientSession {
     }
 
     /// Check if the turn is complete based on durable entries.
-    fn is_turn_complete(&self, entries: &[(u64, SessionLogEntry)]) -> bool {
-        let state = reconstruct_state_from_nats(entries);
-        matches!(
-            state.turn_status,
-            TurnStatus::Idle | TurnStatus::InFlightCancelled
-        )
+    fn is_turn_complete(&self, entries: &[(u64, SessionLogEntry)], user_msg_seq: u64) -> bool {
+        let has_assistant_after_user = entries.iter().any(|(seq, entry)| {
+            *seq > user_msg_seq
+                && matches!(entry, SessionLogEntry::Message { role, .. } if role.is_assistant())
+        });
+
+        has_assistant_after_user
+            || matches!(
+                reconstruct_state_from_nats(entries).turn_status,
+                TurnStatus::InFlightCancelled
+            )
     }
 
-    /// Extract the final assistant response text from durable entries.
-    fn extract_final_response(&self, entries: &[(u64, SessionLogEntry)]) -> Option<String> {
+    /// Extract final assistant response text for current turn from durable entries.
+    fn extract_final_response(
+        entries: &[(u64, SessionLogEntry)],
+        user_msg_seq: u64,
+    ) -> Option<String> {
+        let turn_entries: Vec<_> = entries
+            .iter()
+            .filter(|(seq, _)| *seq > user_msg_seq)
+            .cloned()
+            .collect();
+
         // Apply mutations so retracted messages are excluded.
         let effective_entries =
-            match harnx_core::session_reconstruct::apply_log_mutations_nats(entries) {
+            match harnx_core::session_reconstruct::apply_log_mutations_nats(&turn_entries) {
                 Ok(entries) => entries,
                 Err(err) => {
                     log::warn!(
@@ -409,7 +438,7 @@ impl ThinClientSession {
                     return None;
                 }
             };
-        // Find the last assistant message in effective entries.
+        // Find the last assistant message in effective entries for this turn only.
         for (_, entry) in effective_entries.iter().rev() {
             if let SessionLogEntry::Message { role, content, .. } = entry {
                 if role.is_assistant() {
@@ -561,6 +590,24 @@ mod tests {
         }
     }
 
+    fn test_entries(entries: &[(u64, MessageRole, &str)]) -> Vec<(u64, SessionLogEntry)> {
+        entries
+            .iter()
+            .map(|(seq, role, text)| {
+                (
+                    *seq,
+                    SessionLogEntry::Message {
+                        id: None,
+                        role: *role,
+                        content: MessageContent::Text((*text).to_string()),
+                        timestamp: None,
+                        fence_token: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn test_render_message_entry() {
         let count = Arc::new(AtomicUsize::new(0));
@@ -612,5 +659,31 @@ mod tests {
         };
         render_log_entry_to_sink(&entry, sink.clone());
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_extract_final_response_ignores_stale_prior_turn_reply() {
+        let entries = test_entries(&[
+            (1, MessageRole::User, "old prompt"),
+            (2, MessageRole::Assistant, "old"),
+            (3, MessageRole::User, "new prompt"),
+            (4, MessageRole::Assistant, "new"),
+        ]);
+
+        assert_eq!(
+            ThinClientSession::extract_final_response(&entries, 3),
+            Some("new".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_final_response_returns_none_without_new_assistant_reply() {
+        let entries = test_entries(&[
+            (1, MessageRole::User, "old prompt"),
+            (2, MessageRole::Assistant, "old"),
+            (3, MessageRole::User, "new prompt"),
+        ]);
+
+        assert_eq!(ThinClientSession::extract_final_response(&entries, 3), None);
     }
 }

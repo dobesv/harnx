@@ -122,7 +122,7 @@ impl Config {
     ///
     /// When switching agents this replaces the old managers entirely, killing
     /// any running MCP server subprocesses, giving a clean slate.
-    pub(super) fn reinit_managers_for_agent(&mut self, agent_package: Option<&str>) {
+    pub(crate) fn reinit_managers_for_agent(&mut self, agent_package: Option<&str>) {
         // ── MCP ──────────────────────────────────────────────────────────────
         self.mcp_manager = if self.mcp_servers.is_empty() {
             None

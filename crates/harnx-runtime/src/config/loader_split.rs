@@ -1,5 +1,13 @@
 //! Config loading/initialization extracted from config/mod.rs for code health.
 use super::*;
+use harnx_core::agent_config::AgentConfig;
+
+fn normalize_description(description: Option<String>) -> Option<String> {
+    description.and_then(|description| {
+        let description = description.trim().to_string();
+        (!description.is_empty()).then_some(description)
+    })
+}
 
 impl Config {
     pub async fn init(
@@ -185,6 +193,8 @@ impl Config {
             .iter()
             .map(|server| server.name.clone())
             .collect();
+        let remote_descriptions = Self::remote_agent_description_map();
+        let local_descriptions = Self::local_agent_description_map(list_agents());
         let command = harnx_acp_server_command();
         for agent_name in list_agents() {
             if !existing_names.contains(&agent_name) {
@@ -192,13 +202,18 @@ impl Config {
                 // Top-level agents have package = None.
                 let pkg = harnx_core::package_namespace::pkg_from_qualified(&agent_name)
                     .map(str::to_string);
+                let description = remote_descriptions
+                    .get(&agent_name)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| local_descriptions.get(&agent_name).cloned().flatten());
                 acp_servers.push(AcpServerConfig {
                     name: agent_name.clone(),
                     command: command.clone(),
                     args: vec![agent_name.clone()],
                     env: Default::default(),
                     enabled: true,
-                    description: None,
+                    description,
                     idle_timeout_secs: 300,
                     operation_timeout_secs: 3600,
                     package: pkg,
@@ -206,6 +221,44 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn remote_agent_description_map() -> HashMap<String, Option<String>> {
+        let nats_servers_dir = Self::config_dir().join(paths::NATS_SERVERS_DIR_NAME);
+        let Ok(servers) = Self::load_nats_servers_from_dir(&nats_servers_dir) else {
+            return HashMap::new();
+        };
+
+        servers
+            .into_iter()
+            .flat_map(|server| {
+                let cluster_name = server.name;
+                server.agents.into_iter().map(move |agent| {
+                    (
+                        format!("{}@{}", agent.name, cluster_name),
+                        normalize_description(agent.description),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn local_agent_description_map<I>(agent_names: I) -> HashMap<String, Option<String>>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        agent_names
+            .into_iter()
+            .filter(|agent_name| !agent_name.contains('@'))
+            .map(|agent_name| {
+                let description = std::fs::read_to_string(Self::agent_file(&agent_name))
+                    .ok()
+                    .and_then(|content| AgentConfig::from_markdown(&agent_name, &content).ok())
+                    .map(|config| normalize_description(Some(config.description().to_string())))
+                    .unwrap_or(None);
+                (agent_name, description)
+            })
+            .collect()
     }
 
     pub(super) fn sorted_yaml_files(dir: &Path) -> Result<Vec<PathBuf>> {

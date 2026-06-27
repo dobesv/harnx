@@ -162,15 +162,66 @@ fn matches_tool_glob(pattern: &str, name: &str) -> bool {
         .is_some_and(|g| g.compile_matcher().is_match(name))
 }
 
-/// Extract a valid package name from a directory path entry.
-/// Returns None for non-directories and hidden directories (starting with '.').
+fn selector_literal_prefix(selector: &str) -> &str {
+    selector
+        .find(['*', '?', '{', '[', ']', '}'])
+        .map_or(selector, |idx| &selector[..idx])
+}
+
+fn selector_could_match_server(selector: &str, server_name: &str) -> bool {
+    if selector == "*" {
+        return true;
+    }
+
+    let server_prefix = if server_name.is_empty() {
+        String::new()
+    } else {
+        format!("{server_name}_")
+    };
+    let sanitized_selector = harnx_core::package_namespace::sanitize_for_tool_name(selector);
+    let sanitized_server_prefix = if sanitized_selector.is_empty() {
+        String::new()
+    } else {
+        format!("{sanitized_selector}_")
+    };
+
+    if !selector.contains(['*', '?', '{', '[', ']', '}']) {
+        return selector.starts_with(&server_prefix)
+            || sanitized_selector.starts_with(&server_prefix)
+            || (!server_prefix.is_empty() && server_prefix.starts_with(&sanitized_server_prefix));
+    }
+
+    let literal_prefix = selector_literal_prefix(selector);
+    let sanitized_literal_prefix = selector_literal_prefix(&sanitized_selector);
+    server_prefix.starts_with(literal_prefix)
+        || literal_prefix.starts_with(&server_prefix)
+        || server_prefix.starts_with(sanitized_literal_prefix)
+        || sanitized_literal_prefix.starts_with(&server_prefix)
+}
+
+/// Build handoff tool description for `agent_name`, appending catalog
+/// description verbatim when one is provided; falls back to generic
+/// handoff text when `catalog_description` is `None`.
+fn handoff_description(agent_name: &str, catalog_description: Option<&str>) -> String {
+    let fallback = format!(
+        "Exit the current agent session and hand off to the '{agent_name}' agent, which starts fresh. Prior conversation history is not carried over — it is intentionally cleared on handoff. Only the `prompt` argument provides context to the target agent, so include everything it needs there."
+    );
+    // Keep handoff semantics first, then append catalog description verbatim.
+    // Format: "<existing handoff sentence> — <catalog description>".
+    match catalog_description {
+        Some(description) => format!("{fallback} — {description}"),
+        None => fallback,
+    }
+}
+
 fn handoff_tool_declarations_for_agents(
     active_pkg: Option<&str>,
 ) -> (Vec<ToolDeclaration>, HashMap<String, String>) {
+    let remote_descriptions = Config::remote_agent_description_map();
+    let agent_names = crate::config::agent::list_agents();
+    let local_descriptions = Config::local_agent_description_map(agent_names.iter().cloned());
     let mut handoff_targets = HashMap::new();
-    let declarations = crate::config::agent::list_agents()
-        .into_iter()
-        .map(|agent_name| {
+    let declarations = agent_names.into_iter().map(|agent_name| {
             let display_name =
                 harnx_core::package_namespace::handoff_display_name(&agent_name, active_pkg);
             handoff_targets.insert(display_name.clone(), agent_name.clone());
@@ -194,11 +245,18 @@ fn handoff_tool_declarations_for_agents(
                     ..Default::default()
                 },
             );
+            let catalog_description = remote_descriptions
+                .get(&agent_name)
+                .and_then(|description| description.as_deref())
+                .or_else(|| {
+                    local_descriptions
+                        .get(&agent_name)
+                        .and_then(|description| description.as_deref())
+                });
+
             ToolDeclaration {
                 name: format!("{display_name}_session_handoff"),
-                description: format!(
-                    "Exit the current agent session and hand off to the '{agent_name}' agent, which starts fresh. Prior conversation history is not carried over — it is intentionally cleared on handoff. Only the `prompt` argument provides context to the target agent, so include everything it needs there."
-                ),
+                description: handoff_description(&agent_name, catalog_description),
                 parameters: crate::tool::JsonSchema {
                     type_value: Some("object".to_string()),
                     properties: Some(properties),
@@ -877,7 +935,12 @@ impl Config {
             declarations.iter().map(|v| v.name.to_string()).collect();
         let mut tool_names: HashSet<String> = HashSet::new();
         for item in use_tools.iter().map(|s| s.trim()) {
-            if let Some(values) = self.toolsets.get(item) {
+            let sanitized_item = harnx_core::package_namespace::sanitize_for_tool_name(item);
+            if let Some(values) = self.toolsets.get(item).or_else(|| {
+                (sanitized_item != item)
+                    .then(|| self.toolsets.get(&sanitized_item))
+                    .flatten()
+            }) {
                 tool_names.extend(
                     values
                         .iter()
@@ -888,7 +951,11 @@ impl Config {
                 tool_names.extend(
                     declaration_names
                         .iter()
-                        .filter(|name| matches_tool_glob(item, name))
+                        .filter(|name| {
+                            matches_tool_glob(item, name)
+                                || (sanitized_item != item
+                                    && matches_tool_glob(&sanitized_item, name))
+                        })
                         .cloned(),
                 );
             }
@@ -1262,26 +1329,11 @@ impl Config {
                     }
                 }
             }
-            if let Some(manager) = &self.acp_manager {
-                declarations.extend(manager.get_all_tools_blocking());
-            }
-            // Only generate handoff tool declarations when the agent's use_tools
-            // actually requests a *_session_handoff tool. Generating them
-            // unconditionally would inject extra tool declarations into agents
-            // that don't need them, changing LLM request payloads (#303).
-            //
-            // Use the toolset-expanded `selectors` (not the raw `use_tools`)
-            // so a handoff selector or `*` reached via a toolset is honored,
-            // matching how MCP tools are selected above.
-            if selectors.iter().any(|v| {
-                let v = v.trim();
-                v.ends_with("_session_handoff") || v == "*"
-            }) {
-                let (handoff_declarations, targets) =
-                    handoff_tool_declarations_for_agents(active_pkg);
-                declarations.extend(handoff_declarations);
-                handoff_targets.extend(targets);
-            }
+            declarations.extend(self.acp_tool_declarations_for_selectors(&selectors));
+            let (filtered_handoff_declarations, filtered_handoff_targets) =
+                self.filtered_handoff_declarations(&selectors, active_pkg);
+            declarations.extend(filtered_handoff_declarations);
+            handoff_targets.extend(filtered_handoff_targets);
             if selectors.iter().any(|v| {
                 let v = v.trim();
                 v == crate::session_history::TOOL_NAME || v == "*"
@@ -1293,6 +1345,68 @@ impl Config {
         let mut seen = HashSet::new();
         declarations.retain(|declaration| seen.insert(declaration.name.clone()));
         (declarations, handoff_targets)
+    }
+
+    fn acp_tool_declarations_for_selectors(&self, selectors: &[String]) -> Vec<ToolDeclaration> {
+        let Some(manager) = &self.acp_manager else {
+            return Vec::new();
+        };
+        if selectors.iter().any(|selector| selector == "*") {
+            return manager.get_all_tools_blocking();
+        }
+
+        let mut acp_selectors = selectors.to_vec();
+        acp_selectors.extend(
+            selectors
+                .iter()
+                .map(|selector| harnx_core::package_namespace::sanitize_for_tool_name(selector))
+                .filter(|selector| !selector.is_empty()),
+        );
+        acp_selectors.sort();
+        acp_selectors.dedup();
+        manager.get_tools_for_selectors_blocking(&acp_selectors)
+    }
+
+    fn filtered_handoff_declarations(
+        &self,
+        selectors: &[String],
+        active_pkg: Option<&str>,
+    ) -> (Vec<ToolDeclaration>, HashMap<String, String>) {
+        // Only generate handoff tool declarations when the agent's use_tools
+        // actually requests a *_session_handoff tool. Generating them
+        // unconditionally would inject extra tool declarations into agents
+        // that don't need them, changing LLM request payloads (#303).
+        //
+        // Use the toolset-expanded `selectors` (not the raw `use_tools`)
+        // so a handoff selector or `*` reached via a toolset is honored,
+        // matching how MCP tools are selected above.
+        if !selectors.iter().any(|v| {
+            let v = v.trim();
+            v.ends_with("_session_handoff") || v == "*" || selector_could_match_server(v, "")
+        }) {
+            return (Vec::new(), HashMap::new());
+        }
+
+        let (handoff_declarations, targets) = handoff_tool_declarations_for_agents(active_pkg);
+        let mut filtered_handoff_declarations = Vec::new();
+        let mut handoff_targets = HashMap::new();
+        for declaration in handoff_declarations {
+            let handoff_display_name = declaration
+                .name
+                .strip_suffix("_session_handoff")
+                .unwrap_or(&declaration.name);
+            if selectors.iter().any(|selector| {
+                let selector = selector.trim();
+                selector_could_match_server(selector, handoff_display_name)
+                    || matches_tool_glob(selector, &declaration.name)
+            }) {
+                if let Some(target) = targets.get(handoff_display_name) {
+                    handoff_targets.insert(handoff_display_name.to_string(), target.clone());
+                }
+                filtered_handoff_declarations.push(declaration);
+            }
+        }
+        (filtered_handoff_declarations, handoff_targets)
     }
 }
 
@@ -1383,6 +1497,8 @@ where
 
 #[cfg(test)]
 mod compaction_tests;
+#[cfg(test)]
+mod remote_agent_tests;
 #[cfg(test)]
 mod session_edit_tests;
 #[cfg(test)]

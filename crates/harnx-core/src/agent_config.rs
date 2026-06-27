@@ -209,6 +209,10 @@ impl AgentConfig {
         }
     }
 
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
     /// Markdown body for the built-in `%create-title%` agent, or `None`
     /// if `name` is not a recognised built-in.
     pub fn builtin_markdown(name: &str) -> Option<&'static str> {

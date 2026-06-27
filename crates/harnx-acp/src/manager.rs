@@ -5,6 +5,7 @@ use harnx_spinner::{spawn_spinner, Spinner};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use globset::GlobBuilder;
 use indexmap::IndexMap;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
@@ -34,6 +35,43 @@ impl fmt::Debug for AcpManager {
     }
 }
 
+fn matches_tool_glob(pattern: &str, name: &str) -> bool {
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .ok()
+        .is_some_and(|g| g.compile_matcher().is_match(name))
+}
+
+fn selector_literal_prefix(selector: &str) -> &str {
+    selector
+        .find(['*', '?', '{', '[', ']', '}'])
+        .map_or(selector, |idx| &selector[..idx])
+}
+
+fn selector_could_match_server(selector: &str, server_name: &str) -> bool {
+    if selector == "*" {
+        return true;
+    }
+
+    let server_prefix = format!("{server_name}_");
+    let sanitized_selector = harnx_core::package_namespace::sanitize_for_tool_name(selector);
+    let sanitized_server_prefix = format!("{sanitized_selector}_");
+
+    if !selector.contains(['*', '?', '{', '[', ']', '}']) {
+        return selector.starts_with(&server_prefix)
+            || sanitized_selector.starts_with(&server_prefix)
+            || server_prefix.starts_with(&sanitized_server_prefix);
+    }
+
+    let literal_prefix = selector_literal_prefix(selector);
+    let sanitized_literal_prefix = selector_literal_prefix(&sanitized_selector);
+    server_prefix.starts_with(literal_prefix)
+        || literal_prefix.starts_with(&server_prefix)
+        || server_prefix.starts_with(sanitized_literal_prefix)
+        || sanitized_literal_prefix.starts_with(&server_prefix)
+}
+
 impl AcpManager {
     pub fn new() -> Self {
         Self {
@@ -57,8 +95,8 @@ impl AcpManager {
     pub async fn get_all_tools(&self) -> Vec<ToolDeclaration> {
         let clients = self.clients.read();
         let mut tools: Vec<_> = clients
-            .keys()
-            .flat_map(|name| generate_acp_tools(name))
+            .iter()
+            .flat_map(|(name, client)| generate_acp_tools(name, client.description()))
             .collect();
         tools.sort_by(|left, right| left.name.cmp(&right.name));
         tools
@@ -106,9 +144,45 @@ impl AcpManager {
     pub fn get_all_tools_blocking(&self) -> Vec<ToolDeclaration> {
         let clients = self.clients.read();
         let mut tools: Vec<_> = clients
-            .keys()
-            .flat_map(|name| generate_acp_tools(name))
+            .iter()
+            .flat_map(|(name, client)| generate_acp_tools(name, client.description()))
             .collect();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        tools
+    }
+
+    pub fn get_tools_for_selectors_blocking(&self, selectors: &[String]) -> Vec<ToolDeclaration> {
+        if selectors.iter().any(|selector| selector.trim() == "*") {
+            return self.get_all_tools_blocking();
+        }
+
+        let trimmed_selectors: Vec<&str> =
+            selectors.iter().map(|selector| selector.trim()).collect();
+        let clients = self.clients.read();
+        let mut tools = Vec::new();
+
+        for (name, client) in clients.iter().filter(|(name, _)| {
+            trimmed_selectors
+                .iter()
+                .any(|selector| selector_could_match_server(selector, name))
+        }) {
+            let family = generate_acp_tools(name, client.description());
+            let whole_family_selected = trimmed_selectors.iter().any(|selector| {
+                selector_could_match_server(selector, name)
+                    && !family.iter().any(|tool| selector == &tool.name)
+            });
+
+            if whole_family_selected {
+                tools.extend(family);
+            } else {
+                tools.extend(family.into_iter().filter(|tool| {
+                    trimmed_selectors
+                        .iter()
+                        .any(|selector| matches_tool_glob(selector, &tool.name))
+                }));
+            }
+        }
+
         tools.sort_by(|left, right| left.name.cmp(&right.name));
         tools
     }
@@ -208,7 +282,13 @@ impl Default for AcpManager {
     }
 }
 
-fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
+fn generate_acp_tools(server_name: &str, description: Option<&str>) -> Vec<ToolDeclaration> {
+    // Keep method-specific ACP hint first, then append catalog description verbatim.
+    // Format: "<existing ACP action hint> — <catalog description>".
+    let describe = |fallback: String| match description {
+        Some(description) => format!("{fallback} — {description}"),
+        None => fallback,
+    };
     let session_new_call_template = format!("@ {} new session", server_name);
     let session_prompt_call_template = "@ ".to_string() + server_name + "{% if args.session_id %} [{{ args.session_id | truncate(8, end='') }}]{% endif %}\n{{ args.message }}";
     let session_load_call_template = format!(
@@ -223,7 +303,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
     vec![
         ToolDeclaration {
             name: format!("{server_name}_session_new"),
-            description: format!("Create a new session on the '{server_name}' ACP agent"),
+            description: describe(format!("Create a new session on the '{server_name}' ACP agent")),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::new()),
@@ -236,13 +316,13 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
             idempotent_hint: None,
             read_only_hint: None,
         },
-        acp_session_prompt_tool(server_name, session_prompt_call_template),
+        acp_session_prompt_tool(server_name, description, session_prompt_call_template),
         acp_session_id_tool(
             AcpSessionIdTool {
                 name: &format!("{server_name}_session_load"),
-                description: &format!(
+                description: &describe(format!(
                     "Load an existing session on the '{server_name}' ACP agent and resume its prior context"
-                ),
+                )),
                 session_id_desc: "The session ID to load",
                 mcp_tool_name: "session_load",
                 call_template: session_load_call_template,
@@ -250,7 +330,7 @@ fn generate_acp_tools(server_name: &str) -> Vec<ToolDeclaration> {
         ),
         acp_session_id_tool(AcpSessionIdTool {
             name: &format!("{server_name}_session_cancel"),
-            description: &format!("Cancel a running prompt on the '{server_name}' ACP agent"),
+            description: &describe(format!("Cancel a running prompt on the '{server_name}' ACP agent")),
             session_id_desc: "The session ID to cancel",
             mcp_tool_name: "session_cancel",
             call_template: session_cancel_call_template,
@@ -268,7 +348,11 @@ fn string_prop(description: &str) -> JsonSchema {
 }
 
 /// The `session_prompt` ACP tool declaration (message + optional session_id).
-fn acp_session_prompt_tool(server_name: &str, call_template: String) -> ToolDeclaration {
+fn acp_session_prompt_tool(
+    server_name: &str,
+    description: Option<&str>,
+    call_template: String,
+) -> ToolDeclaration {
     let mut props = IndexMap::new();
     props.insert(
         "message".to_string(),
@@ -280,11 +364,17 @@ fn acp_session_prompt_tool(server_name: &str, call_template: String) -> ToolDecl
             "Session ID returned by a prior prompt call or by session_new. Pass it to preserve context from earlier turns; if omitted, a new empty session is created and no prior context is available.",
         ),
     );
-    ToolDeclaration {
-        name: format!("{server_name}_session_prompt"),
-        description: format!(
+    let description = match description {
+        Some(description) => format!(
+            "Send a prompt to the '{server_name}' ACP agent. To continue a prior conversation, you must pass the session_id returned by an earlier prompt call or by session_new; the remote agent keeps context under that session_id. If you omit session_id, this starts a new empty session with no prior context. — {description}"
+        ),
+        None => format!(
             "Send a prompt to the '{server_name}' ACP agent. To continue a prior conversation, you must pass the session_id returned by an earlier prompt call or by session_new; the remote agent keeps context under that session_id. If you omit session_id, this starts a new empty session with no prior context."
         ),
+    };
+    ToolDeclaration {
+        name: format!("{server_name}_session_prompt"),
+        description,
         parameters: JsonSchema {
             type_value: Some("object".to_string()),
             properties: Some(props),
@@ -699,20 +789,25 @@ enabled: false
 
     #[test]
     fn test_generate_acp_tools() {
-        let tools = generate_acp_tools("myagent");
+        let tools = generate_acp_tools("myagent", None);
+        let names: std::collections::HashSet<&str> =
+            tools.iter().map(|tool| tool.name.as_str()).collect();
 
         assert_eq!(tools.len(), 4);
-
-        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-        assert!(names.contains(&"myagent_session_new"));
-        assert!(names.contains(&"myagent_session_prompt"));
-        assert!(names.contains(&"myagent_session_load"));
-        assert!(names.contains(&"myagent_session_cancel"));
+        assert_eq!(
+            names,
+            std::collections::HashSet::from([
+                "myagent_session_new",
+                "myagent_session_prompt",
+                "myagent_session_load",
+                "myagent_session_cancel",
+            ])
+        );
     }
 
     #[test]
     fn test_session_prompt_tool_has_message_param() {
-        let tools = generate_acp_tools("agent1");
+        let tools = generate_acp_tools("agent1", None);
         let prompt_tool = tools
             .iter()
             .find(|tool| tool.name == "agent1_session_prompt")
@@ -736,7 +831,7 @@ enabled: false
 
     #[test]
     fn test_session_cancel_tool_requires_session_id() {
-        let tools = generate_acp_tools("agent1");
+        let tools = generate_acp_tools("agent1", None);
         let cancel_tool = tools
             .iter()
             .find(|tool| tool.name == "agent1_session_cancel")
@@ -750,6 +845,62 @@ enabled: false
         assert!(required.contains(&"session_id".to_string()));
     }
 
+    #[test]
+    fn test_generate_acp_tools_appends_catalog_description_when_present() {
+        let tools = generate_acp_tools("planner", Some("Handles heavy planning"));
+
+        let descriptions: Vec<&str> = tools.iter().map(|tool| tool.description.as_str()).collect();
+        assert_eq!(tools.len(), 4);
+        assert!(descriptions
+            .iter()
+            .all(|description| description.contains("Handles heavy planning")));
+        assert!(descriptions.iter().any(|description| {
+            *description
+                == "Create a new session on the 'planner' ACP agent — Handles heavy planning"
+        }));
+        assert!(descriptions.iter().any(|description| {
+            description.contains("Send a prompt to the 'planner' ACP agent")
+                && description.contains("Handles heavy planning")
+        }));
+        assert!(descriptions.iter().any(|description| {
+            *description
+                == "Load an existing session on the 'planner' ACP agent and resume its prior context — Handles heavy planning"
+        }));
+        assert!(descriptions.iter().any(|description| {
+            *description
+                == "Cancel a running prompt on the 'planner' ACP agent — Handles heavy planning"
+        }));
+    }
+
+    #[test]
+    fn test_generate_acp_tools_keeps_fallback_descriptions_when_catalog_description_missing() {
+        let tools = generate_acp_tools("planner", None);
+        let descriptions: HashMap<&str, &str> = tools
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool.description.as_str()))
+            .collect();
+
+        assert_eq!(
+            descriptions.get("planner_session_new"),
+            Some(&"Create a new session on the 'planner' ACP agent")
+        );
+        assert_eq!(
+            descriptions.get("planner_session_prompt"),
+            Some(
+                &"Send a prompt to the 'planner' ACP agent. To continue a prior conversation, you must pass the session_id returned by an earlier prompt call or by session_new; the remote agent keeps context under that session_id. If you omit session_id, this starts a new empty session with no prior context."
+            )
+        );
+        assert_eq!(
+            descriptions.get("planner_session_load"),
+            Some(
+                &"Load an existing session on the 'planner' ACP agent and resume its prior context"
+            )
+        );
+        assert_eq!(
+            descriptions.get("planner_session_cancel"),
+            Some(&"Cancel a running prompt on the 'planner' ACP agent")
+        );
+    }
     #[test]
     fn test_find_client_for_tool_matches() {
         let manager = AcpManager::new();
@@ -765,7 +916,7 @@ enabled: false
 
     #[test]
     fn test_generate_acp_tools_namespaced_server_name_is_slash_free() {
-        let tools = generate_acp_tools("other__helper");
+        let tools = generate_acp_tools("other__helper", None);
         let tool_names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
 
         assert_eq!(
@@ -778,6 +929,26 @@ enabled: false
             ]
         );
         assert!(tool_names.iter().all(|name| !name.contains('/')));
+    }
+
+    #[test]
+    fn test_selector_could_match_server_sanitizes_remote_ref_selector_forward() {
+        assert!(selector_could_match_server(
+            "metis@local",
+            "metis__at__local"
+        ));
+        assert!(selector_could_match_server(
+            "metis__at__local",
+            "metis__at__local"
+        ));
+        assert!(selector_could_match_server(
+            "metis__at__local_*",
+            "metis__at__local"
+        ));
+        assert!(!selector_could_match_server(
+            "atlas@local",
+            "metis__at__local"
+        ));
     }
 
     #[test]
@@ -801,8 +972,20 @@ enabled: false
     }
 
     #[test]
+    fn test_find_client_for_tool_routes_forward_sanitized_remote_prompt() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("metis__at__local")]);
+
+        let (client, method) = manager
+            .find_client_for_tool("metis__at__local_session_prompt")
+            .expect("matched client for forward-sanitized remote tool");
+        assert_eq!(client.name(), "metis__at__local");
+        assert_eq!(method, "session_prompt");
+    }
+
+    #[test]
     fn test_generate_acp_tools_global_server_name_round_trips() {
-        let tools = generate_acp_tools("__global");
+        let tools = generate_acp_tools("__global", None);
         let tool_names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
 
         assert_eq!(
@@ -828,7 +1011,7 @@ enabled: false
 
     #[test]
     fn test_find_client_for_tool_round_trips_server_name_with_underscore() {
-        let tools = generate_acp_tools("my_agent");
+        let tools = generate_acp_tools("my_agent", None);
         let tool_names: Vec<_> = tools.iter().map(|tool| tool.name.as_str()).collect();
         assert_eq!(
             tool_names,
@@ -887,6 +1070,55 @@ enabled: false
         let tools = manager.get_all_tools_blocking();
 
         assert_eq!(tools.len(), 8);
+    }
+
+    #[test]
+    fn test_get_tools_for_selectors_blocking_bare_remote_ref_keeps_full_family() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("metis__at__local")]);
+
+        let tool_names: Vec<String> = manager
+            .get_tools_for_selectors_blocking(&["metis@local".to_string()])
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(
+            tool_names,
+            vec![
+                "metis__at__local_session_cancel".to_string(),
+                "metis__at__local_session_load".to_string(),
+                "metis__at__local_session_new".to_string(),
+                "metis__at__local_session_prompt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_get_tools_for_selectors_blocking_specific_tool_ref_stays_narrow() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("metis__at__local")]);
+
+        let tool_names: Vec<String> = manager
+            .get_tools_for_selectors_blocking(&["metis__at__local_session_prompt".to_string()])
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(
+            tool_names,
+            vec!["metis__at__local_session_prompt".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_get_tools_for_selectors_blocking_unrelated_selector_returns_none() {
+        let manager = AcpManager::new();
+        manager.initialize(vec![test_config("metis__at__local")]);
+
+        let tools = manager.get_tools_for_selectors_blocking(&["atlas@local".to_string()]);
+
+        assert!(tools.is_empty());
     }
 
     #[test]

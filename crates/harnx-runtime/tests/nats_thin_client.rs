@@ -3,6 +3,7 @@ mod common;
 use anyhow::Result;
 use common::spawn_nats_server;
 use harnx_core::{
+    event::{AgentEvent, AgentEventSink},
     message::{MessageContent, MessageRole},
     require_nextest,
     session::SessionLogEntry,
@@ -12,11 +13,86 @@ use harnx_runtime::{
     nats_session_log::NatsSessionLog, nats_worker::ControlCommand, send_control_command,
     ThinClientConfig, ThinClientSession,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 fn new_remote_session_id() -> String {
     format!("test-{}", Uuid::new_v4())
+}
+
+async fn seed_prior_completed_turn(log: &NatsSessionLog) -> Result<u64> {
+    let prior_user_seq = log
+        .append_event_async(&SessionLogEntry::Message {
+            id: Some("prior-user".to_string()),
+            role: MessageRole::User,
+            content: MessageContent::Text("old prompt".to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await?;
+    let prior_assistant_seq = log
+        .append_event_async(&SessionLogEntry::Message {
+            id: Some("prior-assistant".to_string()),
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("old reply".to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await?;
+    assert!(prior_assistant_seq > prior_user_seq);
+    Ok(prior_assistant_seq)
+}
+
+fn resumed_session_config(session_id: String) -> ThinClientConfig {
+    ThinClientConfig {
+        cluster: "test".to_string(),
+        agent: "test-agent".to_string(),
+        session_id: Some(session_id),
+    }
+}
+
+async fn append_new_reply_after_current_turn_user(
+    log: NatsSessionLog,
+    prior_assistant_seq: u64,
+) -> Result<u64> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entries = log.load_events_async().await?;
+            let saw_current_turn_user = entries.iter().any(|(seq, entry)| {
+                *seq > prior_assistant_seq
+                    && matches!(
+                        entry,
+                        SessionLogEntry::Message {
+                            role: MessageRole::User,
+                            content: MessageContent::Text(text),
+                            ..
+                        } if text == "new prompt"
+                    )
+            });
+            if saw_current_turn_user {
+                break Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("timed out waiting for current-turn user entry before appending new reply")
+    })??;
+    log.append_event_async(&SessionLogEntry::Message {
+        id: Some("new-assistant".to_string()),
+        role: MessageRole::Assistant,
+        content: MessageContent::Text("new reply".to_string()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await
+}
+
+struct NoopEventSink;
+
+impl AgentEventSink for NoopEventSink {
+    fn emit(&self, _event: AgentEvent, _source: Option<harnx_core::event::AgentSource>) {}
 }
 
 /// Test that control commands are sent correctly
@@ -387,6 +463,49 @@ async fn edit_queued_user_message_replaces_text_in_reconstructed_state() -> Resu
         .collect();
     assert_eq!(next_turn_texts, vec!["edited text".to_string()]);
     assert!(!next_turn_texts.iter().any(|text| text == "Hello world"));
+
+    Ok(())
+}
+
+/// Test resumed session ignores stale prior assistant reply and returns new turn reply
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_reply() -> Result<()> {
+    require_nextest();
+    let Some(server) = spawn_nats_server().await? else {
+        eprintln!("skipping: nats-server not available");
+        return Ok(());
+    };
+
+    let client = async_nats::connect(server.url()).await?;
+    let jetstream = async_nats::jetstream::new(client.clone());
+    let session_id = new_remote_session_id();
+    let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let prior_assistant_seq = seed_prior_completed_turn(&log).await?;
+
+    let abort_signal = harnx_runtime::utils::create_abort_signal();
+    let session = ThinClientSession::new(
+        resumed_session_config(session_id.clone()),
+        client.clone(),
+        jetstream.clone(),
+        abort_signal,
+    )
+    .await?;
+
+    let log_for_reply = log.clone();
+    let reply_task = tokio::spawn(async move {
+        append_new_reply_after_current_turn_user(log_for_reply, prior_assistant_seq).await
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.run_turn("new prompt", Arc::new(NoopEventSink), None),
+    )
+    .await??;
+
+    let new_assistant_seq = reply_task.await??;
+    assert!(new_assistant_seq > result.user_msg_seq);
+    assert_ne!(result.response.as_deref(), Some("old reply"));
+    assert_eq!(result.response.as_deref(), Some("new reply"));
 
     Ok(())
 }

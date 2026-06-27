@@ -1,7 +1,9 @@
 //! Tests for the config module (extracted from mod.rs for code health).
 #![cfg(test)]
 
-use super::test_support::EnvGuard;
+#[cfg(unix)]
+use super::test_support::env_lock;
+use super::test_support::{EnvGuard, PackageServer};
 use super::*;
 use harnx_core::message::MessageRole;
 use std::sync::{Mutex, OnceLock};
@@ -375,16 +377,6 @@ fn make_test_mcp_server(name: &str) -> McpServerConfig {
         tool_templates: HashMap::new(),
         hooks: None,
         package: None,
-    }
-}
-
-#[cfg(unix)]
-/// Serialize env-mutating tests to prevent HOME from racing.
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    match LOCK.get_or_init(|| std::sync::Mutex::new(())).lock() {
-        Ok(g) => g,
-        Err(e) => e.into_inner(),
     }
 }
 
@@ -792,6 +784,20 @@ fn handoff_tool_declarations_are_package_aware_and_valid() {
 }
 
 #[test]
+fn selector_could_match_server_sanitizes_remote_ref_selector_forward() {
+    for selector in ["metis@local", "metis__at__local", "metis__at__local_*"] {
+        assert!(
+            selector_could_match_server(selector, "metis__at__local"),
+            "selector should match forward-sanitized remote server: {selector}"
+        );
+    }
+    assert!(!selector_could_match_server(
+        "atlas@local",
+        "metis__at__local"
+    ));
+}
+
+#[test]
 fn session_history_tool_declaration_is_gated_by_use_tools() {
     let config = Config::default();
     let history_name = crate::session_history::TOOL_NAME;
@@ -848,61 +854,6 @@ fn dynamic_provider_model_init_sets_client_name_from_provider() {
 // ── Regression tests for #826: package agent delegation/MCP tools must be
 //    scoped to the active agent's package ───────────────────────────────────
 
-/// A package-loaded server identity: the bare yaml stem plus the package it
-/// belongs to. Mirrors what `load_package_servers` records on disk.
-struct PackageServer<'a> {
-    stem: &'a str,
-    package: &'a str,
-}
-
-impl<'a> PackageServer<'a> {
-    fn new(stem: &'a str, package: &'a str) -> Self {
-        Self { stem, package }
-    }
-
-    /// Build an ACP server config for this package server.
-    fn into_acp(self) -> AcpServerConfig {
-        AcpServerConfig {
-            name: self.stem.to_string(),
-            command: "echo".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            enabled: true,
-            description: None,
-            idle_timeout_secs: 300,
-            operation_timeout_secs: 3600,
-            package: Some(self.package.to_string()),
-        }
-    }
-
-    /// Build an MCP server config for this package server.
-    ///
-    /// Built inline (rather than via the `#[cfg(unix)]` `make_test_mcp_server`
-    /// helper) so these regression tests compile on all platforms.
-    fn into_mcp(self) -> McpServerConfig {
-        McpServerConfig {
-            name: self.stem.to_string(),
-            command: "echo".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            roots: vec![],
-            enabled: true,
-            description: None,
-            rename_tools: HashMap::new(),
-            tool_templates: HashMap::new(),
-            hooks: None,
-            package: Some(self.package.to_string()),
-        }
-    }
-}
-
-/// #826 regression: when the active agent belongs to package `pantheon`, its
-/// own package ACP server (e.g. `pantheon/atlas`) must surface its delegation
-/// tool under the BARE name `atlas_session_prompt` — the name the agent's
-/// `use_tools` allow-list references. If the managers are left in the global
-/// (`None`) scope, the tool is emitted as `pantheon__atlas_session_prompt`,
-/// which does not match the allow-list and is filtered out, so the agent has
-/// NO delegation tools (the observed bug).
 #[test]
 fn package_agent_acp_delegation_tool_uses_bare_name_when_scoped() {
     let mut config = Config {
