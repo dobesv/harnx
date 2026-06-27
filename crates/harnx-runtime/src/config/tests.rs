@@ -1,7 +1,9 @@
 //! Tests for the config module (extracted from mod.rs for code health).
 #![cfg(test)]
 
-use super::test_support::{env_lock, EnvGuard, PackageServer};
+#[cfg(unix)]
+use super::test_support::env_lock;
+use super::test_support::{EnvGuard, PackageServer};
 use super::*;
 use harnx_core::message::MessageRole;
 use std::sync::{Mutex, OnceLock};
