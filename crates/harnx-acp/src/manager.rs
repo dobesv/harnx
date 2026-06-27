@@ -790,14 +790,19 @@ enabled: false
     #[test]
     fn test_generate_acp_tools() {
         let tools = generate_acp_tools("myagent", None);
+        let names: std::collections::HashSet<&str> =
+            tools.iter().map(|tool| tool.name.as_str()).collect();
 
         assert_eq!(tools.len(), 4);
-
-        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-        assert!(names.contains(&"myagent_session_new"));
-        assert!(names.contains(&"myagent_session_prompt"));
-        assert!(names.contains(&"myagent_session_load"));
-        assert!(names.contains(&"myagent_session_cancel"));
+        assert_eq!(
+            names,
+            std::collections::HashSet::from([
+                "myagent_session_new",
+                "myagent_session_prompt",
+                "myagent_session_load",
+                "myagent_session_cancel",
+            ])
+        );
     }
 
     #[test]

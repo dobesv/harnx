@@ -795,18 +795,12 @@ fn handoff_tool_declarations_are_package_aware_and_valid() {
 
 #[test]
 fn selector_could_match_server_sanitizes_remote_ref_selector_forward() {
-    assert!(selector_could_match_server(
-        "metis@local",
-        "metis__at__local"
-    ));
-    assert!(selector_could_match_server(
-        "metis__at__local",
-        "metis__at__local"
-    ));
-    assert!(selector_could_match_server(
-        "metis__at__local_*",
-        "metis__at__local"
-    ));
+    for selector in ["metis@local", "metis__at__local", "metis__at__local_*"] {
+        assert!(
+            selector_could_match_server(selector, "metis__at__local"),
+            "selector should match forward-sanitized remote server: {selector}"
+        );
+    }
     assert!(!selector_could_match_server(
         "atlas@local",
         "metis__at__local"
@@ -1078,13 +1072,63 @@ fn auto_register_agents_preserves_raw_remote_spawn_args() {
     assert_eq!(remote_server.args, vec!["metis@local"]);
 }
 
-#[test]
-fn remote_use_tools_selectors_match_full_sanitized_family() {
+fn metis_remote_acp_names(config: &Config) -> Vec<String> {
+    let manager = config
+        .acp_manager
+        .as_ref()
+        .expect("acp_manager should be initialized for auto-registered remote ACP server");
+    let mut manager_names: Vec<String> = manager
+        .get_all_tools_blocking()
+        .into_iter()
+        .filter(|d| d.name.starts_with("metis__at__local_session_"))
+        .map(|d| d.name)
+        .collect();
+    manager_names.sort();
+    manager_names
+}
+
+fn metis_remote_tool_names(config: &Config, selector: &str) -> Vec<String> {
+    let mut names: Vec<String> = config
+        .tool_declarations_for_use_tools(Some(selector), None)
+        .0
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|name| name.starts_with("metis__at__local_session_"))
+        .collect();
+    names.sort();
+    names
+}
+
+fn metis_remote_full_family() -> Vec<String> {
+    vec![
+        "metis__at__local_session_cancel".to_string(),
+        "metis__at__local_session_handoff".to_string(),
+        "metis__at__local_session_load".to_string(),
+        "metis__at__local_session_new".to_string(),
+        "metis__at__local_session_prompt".to_string(),
+    ]
+}
+
+fn metis_remote_acp_family() -> Vec<String> {
+    vec![
+        "metis__at__local_session_cancel".to_string(),
+        "metis__at__local_session_load".to_string(),
+        "metis__at__local_session_new".to_string(),
+        "metis__at__local_session_prompt".to_string(),
+    ]
+}
+
+struct MetisRemoteConfigFixture {
+    temp: tempfile::TempDir,
+    config_dir: EnvGuard,
+    config: Config,
+}
+
+fn load_metis_remote_config() -> MetisRemoteConfigFixture {
     use std::fs;
 
-    let _env_guard = env_lock();
     let temp = tempfile::TempDir::new().unwrap();
-    let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    let config_dir = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
     fs::create_dir_all(temp.path().join("nats_servers")).unwrap();
     fs::write(
         temp.path().join("nats_servers/local.yaml"),
@@ -1099,86 +1143,74 @@ fn remote_use_tools_selectors_match_full_sanitized_family() {
 
     let mut config = Config::load_from_file(&temp.path().join("config.yaml")).unwrap();
     config.reinit_managers_for_agent(None);
-    let manager = config
-        .acp_manager
-        .as_ref()
-        .expect("acp_manager should be initialized for auto-registered remote ACP server");
-    let mut manager_names: Vec<String> = manager
-        .get_all_tools_blocking()
-        .into_iter()
-        .map(|tool| tool.name)
-        .filter(|name| name.starts_with("metis__at__local_session_"))
-        .collect();
-    manager_names.sort();
-    let expected_acp_tools = vec![
-        "metis__at__local_session_cancel".to_string(),
-        "metis__at__local_session_load".to_string(),
-        "metis__at__local_session_new".to_string(),
-        "metis__at__local_session_prompt".to_string(),
-    ];
+    MetisRemoteConfigFixture {
+        temp,
+        config_dir,
+        config,
+    }
+}
+
+#[test]
+fn remote_selector_bare_ref_exposes_full_family() {
+    let _env_guard = env_lock();
+    let fixture = load_metis_remote_config();
+    let _keep_temp_alive = &fixture.temp;
+    let _keep_config_dir_alive = &fixture.config_dir;
+    let config = &fixture.config;
+
     assert_eq!(
-        manager_names, expected_acp_tools,
+        metis_remote_acp_names(config),
+        metis_remote_acp_family(),
         "auto-registered remote ACP server must contribute full delegation family"
     );
-
-    let mut wildcard_names: Vec<String> = config
-        .tool_declarations_for_use_tools(Some("*"), None)
-        .0
-        .into_iter()
-        .map(|d| d.name)
-        .filter(|name| name.starts_with("metis__at__local_session_"))
-        .collect();
-    wildcard_names.sort();
     assert_eq!(
-        wildcard_names,
-        vec![
-            "metis__at__local_session_cancel".to_string(),
-            "metis__at__local_session_handoff".to_string(),
-            "metis__at__local_session_load".to_string(),
-            "metis__at__local_session_new".to_string(),
-            "metis__at__local_session_prompt".to_string(),
-        ]
+        metis_remote_tool_names(config, "metis@local"),
+        metis_remote_full_family(),
+        "bare remote selector should keep full sanitized family"
     );
+}
 
-    let selectors = ["metis@local", "metis__at__local", "*"];
-    for selector in selectors {
-        assert!(
-            selector_could_match_server(selector, "metis__at__local"),
-            "selector should match forward-sanitized remote server: {selector}"
-        );
-    }
+#[test]
+fn remote_selector_sanitized_ref_exposes_full_family() {
+    let _env_guard = env_lock();
+    let fixture = load_metis_remote_config();
+    let _keep_temp_alive = &fixture.temp;
+    let _keep_config_dir_alive = &fixture.config_dir;
+    let config = &fixture.config;
 
-    for selector in ["metis@local", "metis__at__local"] {
-        let mut selected_names: Vec<String> = config
-            .tool_declarations_for_use_tools(Some(selector), None)
-            .0
-            .into_iter()
-            .map(|d| d.name)
-            .filter(|name| name.starts_with("metis__at__local_session_"))
-            .collect();
-        selected_names.sort();
-        assert_eq!(
-            selected_names,
-            vec![
-                "metis__at__local_session_cancel".to_string(),
-                "metis__at__local_session_handoff".to_string(),
-                "metis__at__local_session_load".to_string(),
-                "metis__at__local_session_new".to_string(),
-                "metis__at__local_session_prompt".to_string(),
-            ],
-            "bare remote selector should keep full sanitized family: {selector}"
-        );
-    }
+    assert_eq!(
+        metis_remote_tool_names(config, "metis__at__local"),
+        metis_remote_full_family(),
+        "sanitized remote selector should keep full sanitized family"
+    );
+}
 
-    let specific_tool_names: Vec<String> = config
-        .tool_declarations_for_use_tools(Some("metis__at__local_session_prompt"), None)
-        .0
-        .into_iter()
-        .map(|d| d.name)
-        .collect();
+#[test]
+fn remote_selector_wildcard_exposes_full_family() {
+    let _env_guard = env_lock();
+    let fixture = load_metis_remote_config();
+    let _keep_temp_alive = &fixture.temp;
+    let _keep_config_dir_alive = &fixture.config_dir;
+    let config = &fixture.config;
+
+    assert_eq!(
+        metis_remote_tool_names(config, "*"),
+        metis_remote_full_family()
+    );
+}
+
+#[test]
+fn remote_selector_specific_tool_stays_narrow() {
+    let _env_guard = env_lock();
+    let fixture = load_metis_remote_config();
+    let _keep_temp_alive = &fixture.temp;
+    let _keep_config_dir_alive = &fixture.config_dir;
+    let config = &fixture.config;
+
+    let specific_tool_names = metis_remote_tool_names(config, "metis__at__local_session_prompt");
     let remote_acp_names: Vec<String> = specific_tool_names
         .iter()
-        .filter(|name| name.starts_with("metis__at__local_session_") && !name.ends_with("_handoff"))
+        .filter(|name| !name.ends_with("_handoff"))
         .cloned()
         .collect();
     assert_eq!(

@@ -20,6 +20,75 @@ fn new_remote_session_id() -> String {
     format!("test-{}", Uuid::new_v4())
 }
 
+async fn seed_prior_completed_turn(log: &NatsSessionLog) -> Result<u64> {
+    let prior_user_seq = log
+        .append_event_async(&SessionLogEntry::Message {
+            id: Some("prior-user".to_string()),
+            role: MessageRole::User,
+            content: MessageContent::Text("old prompt".to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await?;
+    let prior_assistant_seq = log
+        .append_event_async(&SessionLogEntry::Message {
+            id: Some("prior-assistant".to_string()),
+            role: MessageRole::Assistant,
+            content: MessageContent::Text("old reply".to_string()),
+            timestamp: None,
+            fence_token: None,
+        })
+        .await?;
+    assert!(prior_assistant_seq > prior_user_seq);
+    Ok(prior_assistant_seq)
+}
+
+fn resumed_session_config(session_id: String) -> ThinClientConfig {
+    ThinClientConfig {
+        cluster: "test".to_string(),
+        agent: "test-agent".to_string(),
+        session_id: Some(session_id),
+    }
+}
+
+async fn append_new_reply_after_current_turn_user(
+    log: NatsSessionLog,
+    prior_assistant_seq: u64,
+) -> Result<u64> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entries = log.load_events_async().await?;
+            let saw_current_turn_user = entries.iter().any(|(seq, entry)| {
+                *seq > prior_assistant_seq
+                    && matches!(
+                        entry,
+                        SessionLogEntry::Message {
+                            role: MessageRole::User,
+                            content: MessageContent::Text(text),
+                            ..
+                        } if text == "new prompt"
+                    )
+            });
+            if saw_current_turn_user {
+                break Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("timed out waiting for current-turn user entry before appending new reply")
+    })??;
+    log.append_event_async(&SessionLogEntry::Message {
+        id: Some("new-assistant".to_string()),
+        role: MessageRole::Assistant,
+        content: MessageContent::Text("new reply".to_string()),
+        timestamp: None,
+        fence_token: None,
+    })
+    .await
+}
+
 struct NoopEventSink;
 
 impl AgentEventSink for NoopEventSink {
@@ -411,73 +480,20 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
     let jetstream = async_nats::jetstream::new(client.clone());
     let session_id = new_remote_session_id();
     let log = NatsSessionLog::new(jetstream.clone(), session_id.clone());
+    let prior_assistant_seq = seed_prior_completed_turn(&log).await?;
 
-    let prior_user_seq = log
-        .append_event_async(&SessionLogEntry::Message {
-            id: Some("prior-user".to_string()),
-            role: MessageRole::User,
-            content: MessageContent::Text("old prompt".to_string()),
-            timestamp: None,
-            fence_token: None,
-        })
-        .await?;
-    let prior_assistant_seq = log
-        .append_event_async(&SessionLogEntry::Message {
-            id: Some("prior-assistant".to_string()),
-            role: MessageRole::Assistant,
-            content: MessageContent::Text("old reply".to_string()),
-            timestamp: None,
-            fence_token: None,
-        })
-        .await?;
-    assert!(prior_assistant_seq > prior_user_seq);
-
-    let config = ThinClientConfig {
-        cluster: "test".to_string(),
-        agent: "test-agent".to_string(),
-        session_id: Some(session_id.clone()),
-    };
     let abort_signal = harnx_runtime::utils::create_abort_signal();
-    let session =
-        ThinClientSession::new(config, client.clone(), jetstream.clone(), abort_signal).await?;
+    let session = ThinClientSession::new(
+        resumed_session_config(session_id.clone()),
+        client.clone(),
+        jetstream.clone(),
+        abort_signal,
+    )
+    .await?;
 
     let log_for_reply = log.clone();
     let reply_task = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let entries = log_for_reply.load_events_async().await?;
-                let saw_current_turn_user = entries.iter().any(|(seq, entry)| {
-                    *seq > prior_assistant_seq
-                        && matches!(
-                            entry,
-                            SessionLogEntry::Message {
-                                role: MessageRole::User,
-                                content: MessageContent::Text(text),
-                                ..
-                            } if text == "new prompt"
-                        )
-                });
-                if saw_current_turn_user {
-                    break Ok::<(), anyhow::Error>(());
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out waiting for current-turn user entry before appending new reply"
-            )
-        })??;
-        log_for_reply
-            .append_event_async(&SessionLogEntry::Message {
-                id: Some("new-assistant".to_string()),
-                role: MessageRole::Assistant,
-                content: MessageContent::Text("new reply".to_string()),
-                timestamp: None,
-                fence_token: None,
-            })
-            .await
+        append_new_reply_after_current_turn_user(log_for_reply, prior_assistant_seq).await
     });
 
     let result = tokio::time::timeout(
