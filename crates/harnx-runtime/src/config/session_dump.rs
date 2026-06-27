@@ -158,11 +158,10 @@ fn build_session_snapshot(session: &Session) -> serde_json::Map<String, serde_js
 #[cfg(all(test, unix))]
 mod tests {
     use super::render_session_dump;
-    use crate::config::{paths, test_support::EnvGuard};
+    use crate::config::{paths, test_support::env_lock, test_support::EnvGuard};
     use harnx_core::config_paths::{agent_data_dir, state_dir};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     #[derive(Clone, Copy)]
@@ -250,14 +249,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        match LOCK.get_or_init(|| Mutex::new(())).lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        }
     }
 
     fn write_test_config() {
