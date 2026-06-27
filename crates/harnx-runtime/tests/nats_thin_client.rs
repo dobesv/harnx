@@ -443,7 +443,32 @@ async fn resumed_session_run_turn_ignores_stale_prior_reply_and_returns_new_repl
 
     let log_for_reply = log.clone();
     let reply_task = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let entries = log_for_reply.load_events_async().await?;
+                let saw_current_turn_user = entries.iter().any(|(seq, entry)| {
+                    *seq > prior_assistant_seq
+                        && matches!(
+                            entry,
+                            SessionLogEntry::Message {
+                                role: MessageRole::User,
+                                content: MessageContent::Text(text),
+                                ..
+                            } if text == "new prompt"
+                        )
+                });
+                if saw_current_turn_user {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out waiting for current-turn user entry before appending new reply"
+            )
+        })??;
         log_for_reply
             .append_event_async(&SessionLogEntry::Message {
                 id: Some("new-assistant".to_string()),

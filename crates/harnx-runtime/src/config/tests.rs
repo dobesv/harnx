@@ -378,8 +378,10 @@ fn make_test_mcp_server(name: &str) -> McpServerConfig {
     }
 }
 
-#[cfg(unix)]
-/// Serialize env-mutating tests to prevent HOME from racing.
+/// Serialize env-mutating tests to prevent HOME/HARNX_CONFIG_DIR from racing.
+/// Cross-platform: used by both the unix-only HOME tests and the
+/// platform-agnostic remote-agent/use_tools tests, so it must compile on all
+/// targets (Windows CI builds these tests too).
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     match LOCK.get_or_init(|| std::sync::Mutex::new(())).lock() {

@@ -13,6 +13,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 /// Spawn a local JetStream-enabled nats-server on a free port with an isolated
 /// temp store dir, returning the connect URL, the child process, and the temp
@@ -616,9 +617,12 @@ use_tools:
         )
         .await?;
 
-        let turn_result = thin
-            .run_turn("delegate over nats", Arc::new(NoopEventSink), None)
-            .await?;
+        let turn_result = tokio::time::timeout(
+            Duration::from_secs(10),
+            thin.run_turn("delegate over nats", Arc::new(NoopEventSink), None),
+        )
+        .await
+        .context("thin client run_turn timed out after 10s in remote NATS round-trip test")??;
         let reply = turn_result
             .response
             .context("thin client turn must return final assistant response")?;
