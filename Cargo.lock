@@ -3563,6 +3563,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures-util",
+ "globset",
  "harnx-core",
  "harnx-spinner",
  "indexmap 2.14.0",

@@ -792,6 +792,26 @@ fn handoff_tool_declarations_are_package_aware_and_valid() {
 }
 
 #[test]
+fn selector_could_match_server_sanitizes_remote_ref_selector_forward() {
+    assert!(selector_could_match_server(
+        "metis@local",
+        "metis__at__local"
+    ));
+    assert!(selector_could_match_server(
+        "metis__at__local",
+        "metis__at__local"
+    ));
+    assert!(selector_could_match_server(
+        "metis__at__local_*",
+        "metis__at__local"
+    ));
+    assert!(!selector_could_match_server(
+        "atlas@local",
+        "metis__at__local"
+    ));
+}
+
+#[test]
 fn session_history_tool_declaration_is_gated_by_use_tools() {
     let config = Config::default();
     let history_name = crate::session_history::TOOL_NAME;
@@ -903,6 +923,424 @@ impl<'a> PackageServer<'a> {
 /// (`None`) scope, the tool is emitted as `pantheon__atlas_session_prompt`,
 /// which does not match the allow-list and is filtered out, so the agent has
 /// NO delegation tools (the observed bug).
+#[test]
+fn acp_tool_declarations_respect_use_tools_selector_whitelist() {
+    let mut config = Config {
+        acp_servers: vec![PackageServer::new("metis", "local").into_acp()],
+        ..Config::default()
+    };
+
+    // Global scope keeps package-prefixed ACP tool names, matching the current
+    // auto-registered package agent shape in issue #913.
+    config.reinit_managers_for_agent(None);
+
+    let declarations = config
+        .tool_declarations_for_use_tools(Some("some_unrelated_tool"), None)
+        .0;
+    let leaked: Vec<String> = declarations
+        .iter()
+        .map(|d| d.name.clone())
+        .filter(|name| name.starts_with("local__metis_session_"))
+        .collect();
+
+    assert!(
+        leaked.is_empty(),
+        "unselected ACP agent tools must not leak into use_tools-filtered declarations; got {leaked:?}"
+    );
+}
+
+#[test]
+fn acp_tool_declarations_keep_selected_agent_and_wildcard_tools() {
+    let mut config = Config {
+        acp_servers: vec![PackageServer::new("metis", "local").into_acp()],
+        ..Config::default()
+    };
+
+    config.reinit_managers_for_agent(None);
+
+    let selected_names: Vec<String> = config
+        .tool_declarations_for_use_tools(Some("local__metis_session_*"), None)
+        .0
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|name| name.starts_with("local__metis_session_"))
+        .collect();
+    assert_eq!(
+        selected_names,
+        vec![
+            "local__metis_session_cancel".to_string(),
+            "local__metis_session_load".to_string(),
+            "local__metis_session_new".to_string(),
+            "local__metis_session_prompt".to_string(),
+        ]
+    );
+
+    let wildcard_names: Vec<String> = config
+        .tool_declarations_for_use_tools(Some("*"), None)
+        .0
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|name| name.starts_with("local__metis_session_"))
+        .collect();
+    assert_eq!(
+        wildcard_names,
+        vec![
+            "local__metis_session_cancel".to_string(),
+            "local__metis_session_load".to_string(),
+            "local__metis_session_new".to_string(),
+            "local__metis_session_prompt".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn auto_register_agents_populates_catalog_descriptions() {
+    use std::fs;
+
+    let _env_guard = env_lock();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    fs::create_dir_all(temp.path().join("agents")).unwrap();
+    fs::create_dir_all(temp.path().join("nats_servers")).unwrap();
+    fs::write(
+        temp.path().join("agents/local-helper.md"),
+        "---\ndescription: Local helper description\n---\nPrompt\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("agents/no-description.md"),
+        "---\ndescription: \"\"\n---\nPrompt\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("nats_servers/local.yaml"),
+        concat!(
+            "url: nats://localhost:4222\n",
+            "agents:\n",
+            "  - name: metis\n",
+            "    description: Handles heavy planning\n",
+            "  - name: atlas\n",
+            "    description: \"\"\n"
+        ),
+    )
+    .unwrap();
+
+    let config = Config::load_from_file(&temp.path().join("config.yaml")).unwrap();
+
+    let server_description = |name: &str| {
+        config
+            .acp_servers
+            .iter()
+            .find(|server| server.name == name)
+            .and_then(|server| server.description.clone())
+    };
+
+    assert_eq!(
+        server_description("metis@local").as_deref(),
+        Some("Handles heavy planning")
+    );
+    assert_eq!(
+        server_description("local-helper").as_deref(),
+        Some("Local helper description")
+    );
+    assert_eq!(server_description("atlas@local"), None);
+    assert_eq!(server_description("no-description"), None);
+}
+
+#[test]
+fn auto_register_agents_preserves_raw_remote_spawn_args() {
+    use std::fs;
+
+    let _env_guard = env_lock();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    fs::create_dir_all(temp.path().join("nats_servers")).unwrap();
+    fs::write(
+        temp.path().join("nats_servers/local.yaml"),
+        concat!(
+            "url: nats://localhost:4222\n",
+            "agents:\n",
+            "  - name: metis\n",
+            "    description: Handles heavy planning\n"
+        ),
+    )
+    .unwrap();
+
+    let config = Config::load_from_file(&temp.path().join("config.yaml")).unwrap();
+    let remote_server = config
+        .acp_servers
+        .iter()
+        .find(|server| server.name == "metis@local")
+        .expect("auto-registered remote ACP server");
+
+    assert_eq!(remote_server.args, vec!["metis@local"]);
+}
+
+#[test]
+fn remote_use_tools_selectors_match_full_sanitized_family() {
+    use std::fs;
+
+    let _env_guard = env_lock();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    fs::create_dir_all(temp.path().join("nats_servers")).unwrap();
+    fs::write(
+        temp.path().join("nats_servers/local.yaml"),
+        concat!(
+            "url: nats://localhost:4222\n",
+            "agents:\n",
+            "  - name: metis\n",
+            "    description: Handles heavy planning\n"
+        ),
+    )
+    .unwrap();
+
+    let mut config = Config::load_from_file(&temp.path().join("config.yaml")).unwrap();
+    config.reinit_managers_for_agent(None);
+    let manager = config
+        .acp_manager
+        .as_ref()
+        .expect("acp_manager should be initialized for auto-registered remote ACP server");
+    let mut manager_names: Vec<String> = manager
+        .get_all_tools_blocking()
+        .into_iter()
+        .map(|tool| tool.name)
+        .filter(|name| name.starts_with("metis__at__local_session_"))
+        .collect();
+    manager_names.sort();
+    let expected_acp_tools = vec![
+        "metis__at__local_session_cancel".to_string(),
+        "metis__at__local_session_load".to_string(),
+        "metis__at__local_session_new".to_string(),
+        "metis__at__local_session_prompt".to_string(),
+    ];
+    assert_eq!(
+        manager_names, expected_acp_tools,
+        "auto-registered remote ACP server must contribute full delegation family"
+    );
+
+    let mut wildcard_names: Vec<String> = config
+        .tool_declarations_for_use_tools(Some("*"), None)
+        .0
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|name| name.starts_with("metis__at__local_session_"))
+        .collect();
+    wildcard_names.sort();
+    assert_eq!(
+        wildcard_names,
+        vec![
+            "metis__at__local_session_cancel".to_string(),
+            "metis__at__local_session_handoff".to_string(),
+            "metis__at__local_session_load".to_string(),
+            "metis__at__local_session_new".to_string(),
+            "metis__at__local_session_prompt".to_string(),
+        ]
+    );
+
+    let selectors = ["metis@local", "metis__at__local", "*"];
+    for selector in selectors {
+        assert!(
+            selector_could_match_server(selector, "metis__at__local"),
+            "selector should match forward-sanitized remote server: {selector}"
+        );
+    }
+
+    for selector in ["metis@local", "metis__at__local"] {
+        let mut selected_names: Vec<String> = config
+            .tool_declarations_for_use_tools(Some(selector), None)
+            .0
+            .into_iter()
+            .map(|d| d.name)
+            .filter(|name| name.starts_with("metis__at__local_session_"))
+            .collect();
+        selected_names.sort();
+        assert_eq!(
+            selected_names,
+            vec![
+                "metis__at__local_session_cancel".to_string(),
+                "metis__at__local_session_handoff".to_string(),
+                "metis__at__local_session_load".to_string(),
+                "metis__at__local_session_new".to_string(),
+                "metis__at__local_session_prompt".to_string(),
+            ],
+            "bare remote selector should keep full sanitized family: {selector}"
+        );
+    }
+
+    let specific_tool_names: Vec<String> = config
+        .tool_declarations_for_use_tools(Some("metis__at__local_session_prompt"), None)
+        .0
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    let remote_acp_names: Vec<String> = specific_tool_names
+        .iter()
+        .filter(|name| name.starts_with("metis__at__local_session_") && !name.ends_with("_handoff"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        remote_acp_names,
+        vec!["metis__at__local_session_prompt".to_string()],
+        "specific ACP tool selector must not broaden to ACP remote family"
+    );
+}
+
+#[test]
+fn remote_handoff_selector_logic_resolves_raw_agent_without_reverse_sanitize() {
+    use std::fs;
+
+    let _env_guard = env_lock();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    fs::create_dir_all(temp.path().join("nats_servers")).unwrap();
+    fs::write(
+        temp.path().join("nats_servers/local.yaml"),
+        "url: nats://localhost:4222\nagents:\n  - name: metis\n",
+    )
+    .unwrap();
+
+    let (declarations, handoff_targets) = handoff_tool_declarations_for_agents(None);
+    assert!(declarations
+        .iter()
+        .any(|tool| tool.name == "metis__at__local_session_handoff"));
+    assert_eq!(
+        handoff_targets.get("metis__at__local").map(String::as_str),
+        Some("metis@local")
+    );
+
+    let bare_target = "metis__at__local_session_handoff"
+        .strip_suffix("_session_handoff")
+        .unwrap();
+    assert_eq!(bare_target, "metis__at__local");
+    assert_eq!(
+        handoff_targets.get(bare_target).map(String::as_str),
+        Some("metis@local")
+    );
+}
+
+#[test]
+fn handoff_tool_declarations_filter_per_agent_and_keep_targets_in_sync() {
+    use std::fs;
+
+    let _env_guard = env_lock();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    fs::create_dir_all(temp.path().join("agents")).unwrap();
+    fs::create_dir_all(temp.path().join("nats_servers")).unwrap();
+    fs::write(
+        temp.path().join("nats_servers/local.yaml"),
+        "url: nats://localhost:4222\nagents:\n  - name: metis\n  - name: atlas\n",
+    )
+    .unwrap();
+
+    let mut config = Config::default();
+    config.reinit_managers_for_agent(None);
+
+    let (selected_declarations, selected_targets) =
+        config.tool_declarations_for_use_tools(Some("metis__at__local_session_handoff"), None);
+    let selected_handoff_names: Vec<String> = selected_declarations
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|name| name.ends_with("_session_handoff"))
+        .collect();
+    assert_eq!(
+        selected_handoff_names,
+        vec!["metis__at__local_session_handoff".to_string()]
+    );
+    assert_eq!(selected_targets.len(), 1);
+    assert_eq!(
+        selected_targets.get("metis__at__local").map(String::as_str),
+        Some("metis@local")
+    );
+    assert!(
+        !selected_targets.contains_key("atlas__at__local"),
+        "handoff target map must only retain selected agents: {selected_targets:?}"
+    );
+
+    let (wildcard_declarations, wildcard_targets) =
+        config.tool_declarations_for_use_tools(Some("*"), None);
+    let wildcard_handoff_names: Vec<String> = wildcard_declarations
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|name| name.ends_with("_session_handoff"))
+        .collect();
+    assert!(
+        wildcard_handoff_names.contains(&"metis__at__local_session_handoff".to_string()),
+        "wildcard should keep metis handoff: {wildcard_handoff_names:?}"
+    );
+    assert!(
+        wildcard_handoff_names.contains(&"atlas__at__local_session_handoff".to_string()),
+        "wildcard should keep atlas handoff: {wildcard_handoff_names:?}"
+    );
+    assert_eq!(
+        wildcard_targets.get("metis__at__local").map(String::as_str),
+        Some("metis@local")
+    );
+    assert_eq!(
+        wildcard_targets.get("atlas__at__local").map(String::as_str),
+        Some("atlas@local")
+    );
+}
+
+#[test]
+fn handoff_tool_declarations_append_catalog_description_for_local_and_remote_agents() {
+    use std::fs;
+
+    let _env_guard = env_lock();
+    let temp = tempfile::TempDir::new().unwrap();
+    let _config_dir = EnvGuard::new("HARNX_CONFIG_DIR", temp.path());
+    fs::create_dir_all(temp.path().join("agents")).unwrap();
+    fs::create_dir_all(temp.path().join("nats_servers")).unwrap();
+    fs::write(
+        temp.path().join("agents/local-helper.md"),
+        "---\ndescription: Local helper description\n---\nPrompt\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("agents/no-description.md"),
+        "---\ndescription: \"\"\n---\nPrompt\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("nats_servers/local.yaml"),
+        concat!(
+            "url: nats://localhost:4222\n",
+            "agents:\n",
+            "  - name: metis\n",
+            "    description: Handles heavy planning\n",
+            "  - name: atlas\n",
+            "    description: \"\"\n"
+        ),
+    )
+    .unwrap();
+
+    let (declarations, _) = handoff_tool_declarations_for_agents(None);
+    let descriptions: std::collections::HashMap<&str, &str> = declarations
+        .iter()
+        .map(|tool| (tool.name.as_str(), tool.description.as_str()))
+        .collect();
+
+    assert!(
+        descriptions["local-helper_session_handoff"].contains("Local helper description"),
+        "local handoff tool should include local description: {:?}",
+        descriptions["local-helper_session_handoff"]
+    );
+    assert!(
+        descriptions["metis__at__local_session_handoff"].contains("Handles heavy planning"),
+        "remote handoff tool should include remote description: {:?}",
+        descriptions["metis__at__local_session_handoff"]
+    );
+    assert_eq!(
+        descriptions["no-description_session_handoff"],
+        "Exit the current agent session and hand off to the 'no-description' agent, which starts fresh. Prior conversation history is not carried over — it is intentionally cleared on handoff. Only the `prompt` argument provides context to the target agent, so include everything it needs there."
+    );
+    assert_eq!(
+        descriptions["atlas__at__local_session_handoff"],
+        "Exit the current agent session and hand off to the 'atlas@local' agent, which starts fresh. Prior conversation history is not carried over — it is intentionally cleared on handoff. Only the `prompt` argument provides context to the target agent, so include everything it needs there."
+    );
+}
+
 #[test]
 fn package_agent_acp_delegation_tool_uses_bare_name_when_scoped() {
     let mut config = Config {
