@@ -30,6 +30,7 @@ async fn nats_session_log_round_trips_and_reconstructs() -> Result<()> {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            agents: vec![],
         }],
         ..Default::default()
     };
@@ -82,6 +83,7 @@ async fn nats_session_log_orphan_repair_matches_file_replay() -> Result<()> {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            agents: vec![],
         }],
         ..Default::default()
     };

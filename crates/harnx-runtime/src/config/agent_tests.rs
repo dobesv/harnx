@@ -148,6 +148,13 @@ fn assert_path_variable_rejected(name: &str, path: &str) {
     assert!(message.contains("not allowed"));
 }
 
+fn write_remote_cluster_fixture(config_dir: &Path, cluster: &str, body: &str) -> Result<()> {
+    let nats_servers_dir = config_dir.join("nats_servers");
+    fs::create_dir_all(&nats_servers_dir)?;
+    fs::write(nats_servers_dir.join(format!("{cluster}.yaml")), body)?;
+    Ok(())
+}
+
 #[test]
 fn test_agent_from_markdown_full() {
     let content = "---\nmodel: openai:gpt-4o\ntemperature: 0.7\ntop_p: 0.9\nuse_tools: fs,web_search\ndescription: A test agent\nversion: '1.0'\n---\nYou are a helpful test agent.";
@@ -577,6 +584,86 @@ fn test_list_assistant_agents_sorted() {
         let runtime = tokio::runtime::Runtime::new()?;
         let result = runtime.block_on(list_assistant_agents());
         assert_eq!(result, vec!["apple", "mango", "zebra"]);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_list_agents_merges_remote_and_local_agents() {
+    with_test_config_dir(|config_dir| {
+        let agents_dir = config_dir.join("agents");
+        fs::write(agents_dir.join("zz-local-forge.md"), "You are local forge.")?;
+        write_remote_cluster_fixture(
+            config_dir,
+            "cluster-nats-static-enum",
+            r#"url: nats://localhost:4222
+agents:
+  - name: atlas-forge-remote
+    role: assistant
+  - name: helper-forge-remote
+    role: subagent
+"#,
+        )?;
+
+        let result = list_agents();
+        assert!(result.contains(&"atlas-forge-remote@cluster-nats-static-enum".to_string()));
+        assert!(result.contains(&"helper-forge-remote@cluster-nats-static-enum".to_string()));
+        assert!(result.contains(&"zz-local-forge".to_string()));
+
+        let mut expected = result.clone();
+        expected.sort();
+        expected.dedup();
+        assert_eq!(result, expected);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_list_assistant_agents_includes_remote_assistants_only() {
+    with_test_config_dir(|config_dir| {
+        write_remote_cluster_fixture(
+            config_dir,
+            "cluster-nats-static-filter",
+            r#"url: nats://localhost:4222
+agents:
+  - name: atlas-filter-remote
+    role: assistant
+  - name: helper-filter-remote
+    role: subagent
+  - name: default-role-remote
+"#,
+        )?;
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        let result = runtime.block_on(list_assistant_agents());
+        assert!(result.contains(&"atlas-filter-remote@cluster-nats-static-filter".to_string()));
+        assert!(result.contains(&"default-role-remote@cluster-nats-static-filter".to_string()));
+        assert!(!result.contains(&"helper-filter-remote@cluster-nats-static-filter".to_string()));
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_agent_lists_ignore_remote_clusters_when_none_seeded() {
+    with_test_config_dir(|config_dir| {
+        let agents_dir = config_dir.join("agents");
+        fs::write(
+            agents_dir.join("solo-local-forge.md"),
+            "You are solo local forge.",
+        )?;
+
+        let all_agents = list_agents();
+        assert_eq!(all_agents, vec!["solo-local-forge"]);
+        assert!(all_agents.iter().all(|name| !name.contains('@')));
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        let assistant_agents = runtime.block_on(list_assistant_agents());
+        assert_eq!(assistant_agents, vec!["solo-local-forge"]);
+        assert!(assistant_agents.iter().all(|name| !name.contains('@')));
+        assert!(!config_dir.join("nats_servers").exists());
         Ok(())
     })
     .unwrap();

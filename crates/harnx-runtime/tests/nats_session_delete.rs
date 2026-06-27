@@ -32,6 +32,7 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            agents: vec![],
         }],
         ..Default::default()
     };
