@@ -11,6 +11,9 @@ use harnx_runtime::{
     config::Config,
     nats_admin::delete_remote_session,
     nats_lease::NatsLeaseConfig,
+    nats_session_index::{
+        delete_record, ensure_index_bucket, get_record, put_record, SessionIndexRecord,
+    },
     nats_session_log::{stream_name_for_session, NatsSessionLog},
 };
 use indexmap::IndexMap;
@@ -56,12 +59,24 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
             worker_id: "w1".to_string(),
             generation: 1,
             config: NatsLeaseConfig::default(),
+            session_index: None,
         },
     )
     .await?
     .expect("lease acquired");
     let lease_key = NatsLeaseConfig::default().key_for_session(session_id);
     lease.stop_renewal_for_test().await;
+
+    let index_store = ensure_index_bucket(&jetstream).await?;
+    let index_record = SessionIndexRecord {
+        session_id: session_id.to_string(),
+        agent_name: "oracle".to_string(),
+        working_dir: Some("/tmp".to_string()),
+        git_branch: Some("main".to_string()),
+        git_remote: Some("origin".to_string()),
+        last_activity: 1_700_000_000,
+    };
+    put_record(&index_store, &index_record).await?;
 
     let deleted = delete_remote_session(&config, "local", session_id).await?;
     assert!(deleted.stream_deleted);
@@ -89,9 +104,16 @@ async fn session_delete_removes_stream_and_lease_and_is_idempotent() -> Result<(
             )
     );
 
+    assert!(
+        get_record(&index_store, session_id).await?.is_none(),
+        "session index record should be removed"
+    );
+
     let deleted_again = delete_remote_session(&config, "local", session_id).await?;
     assert!(!deleted_again.stream_deleted);
     assert!(!deleted_again.lease_deleted);
+
+    delete_record(&index_store, session_id).await.ok();
 
     Ok(())
 }

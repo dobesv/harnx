@@ -1,8 +1,10 @@
 use crate::nats_metrics;
+use crate::nats_session_index::{self, update_record_with_revision, SessionIndexRecord};
 use anyhow::{anyhow, bail, Context, Result};
 use async_nats::header::{NATS_EXPECTED_LAST_SUBJECT_SEQUENCE, NATS_MESSAGE_TTL};
 use async_nats::jetstream::{self, context::PublishErrorKind, kv, stream};
 use serde::{Deserialize, Serialize};
+use std::cmp;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -18,6 +20,8 @@ pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 pub const DEFAULT_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 pub const DEFAULT_BUCKET_REPLICAS: usize = 1;
 pub const DEFAULT_TOMBSTONE_TTL: Duration = Duration::from_secs(3600);
+const INDEX_REFRESH_RETRY_LIMIT: usize = 3;
+const INDEX_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeaseRecord {
@@ -60,6 +64,7 @@ pub struct NatsLeaseAcquireParams<'a> {
     pub worker_id: String,
     pub generation: u64,
     pub config: NatsLeaseConfig,
+    pub session_index: Option<kv::Store>,
 }
 
 #[derive(Debug)]
@@ -70,6 +75,7 @@ struct RenewTaskParams {
     state: Arc<LeaseState>,
     renew_interval: Duration,
     session_id: String,
+    session_index: Option<kv::Store>,
 }
 
 #[derive(Debug)]
@@ -99,6 +105,7 @@ impl NatsSessionLease {
             worker_id,
             generation,
             config,
+            session_index,
         } = params;
         config.validate()?;
         let bucket = ensure_lease_bucket(&jetstream, &config).await?;
@@ -142,6 +149,7 @@ impl NatsSessionLease {
             state: Arc::clone(&state),
             renew_interval: config.renew_interval,
             session_id: session_id.to_string(),
+            session_index,
         });
 
         Ok(Some(Self {
@@ -187,10 +195,16 @@ impl NatsSessionLease {
         }
 
         let revision = self.fence_token();
-        self.bucket
+        match self
+            .bucket
             .delete_expect_revision(&self.key, Some(revision))
             .await
-            .with_context(|| format!("Failed to release NATS lease key '{}'", self.key))
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == kv::UpdateErrorKind::WrongLastRevision => Ok(()),
+            Err(error) => Err(anyhow::Error::from(error))
+                .with_context(|| format!("Failed to release NATS lease key '{}'", self.key)),
+        }
     }
 
     pub async fn stop_renewal_for_test(&self) {
@@ -318,6 +332,7 @@ fn spawn_renew_task(params: RenewTaskParams) -> JoinHandle<()> {
         state,
         renew_interval,
         session_id,
+        session_index,
     } = params;
     tokio::spawn(async move {
         let mut ticker = time::interval(renew_interval);
@@ -329,6 +344,33 @@ fn spawn_renew_task(params: RenewTaskParams) -> JoinHandle<()> {
             }
             match renew_once(&jetstream, &bucket, &key, &state).await {
                 Ok(new_revision) => {
+                    if let Some(store) = session_index.as_ref() {
+                        match time::timeout(
+                            INDEX_REFRESH_TIMEOUT,
+                            refresh_session_index_last_activity(store, &session_id),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                warn!(
+                                    "failed to refresh remote session index on lease renew: session_id={} worker_id={} generation={} err={error:#}",
+                                    session_id,
+                                    state.worker_id,
+                                    state.generation
+                                );
+                            }
+                            Err(_) => {
+                                warn!(
+                                    "timed out refreshing remote session index on lease renew: session_id={} worker_id={} generation={} timeout_ms={}",
+                                    session_id,
+                                    state.worker_id,
+                                    state.generation,
+                                    INDEX_REFRESH_TIMEOUT.as_millis()
+                                );
+                            }
+                        }
+                    }
                     info!(
                         "nats lease renewed: session_id={} worker_id={} generation={} revision={new_revision}",
                         session_id,
@@ -390,6 +432,102 @@ async fn renew_once(
     }
 }
 
+async fn refresh_session_index_last_activity(store: &kv::Store, session_id: &str) -> Result<()> {
+    for attempt in 0..INDEX_REFRESH_RETRY_LIMIT {
+        let Some((record, revision)) =
+            nats_session_index::get_record_with_revision(store, session_id).await?
+        else {
+            return Ok(());
+        };
+
+        let updated_record = with_refreshed_last_activity(record)?;
+        match update_record_with_revision(store, &updated_record, revision).await {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if is_wrong_last_revision(&error) && attempt + 1 < INDEX_REFRESH_RETRY_LIMIT =>
+            {
+                continue;
+            }
+            Err(error) if is_wrong_last_revision(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn with_refreshed_last_activity(mut record: SessionIndexRecord) -> Result<SessionIndexRecord> {
+    record.last_activity = cmp::max(
+        record.last_activity.saturating_add(1),
+        unix_timestamp_now()?,
+    );
+    Ok(record)
+}
+
+fn unix_timestamp_now() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_secs())
+}
+
+fn is_wrong_last_revision(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<kv::UpdateError>())
+        .is_some_and(|error| error.kind() == kv::UpdateErrorKind::WrongLastRevision)
+}
+
 fn is_create_conflict(error: &kv::CreateError) -> bool {
     matches!(error.kind(), kv::CreateErrorKind::AlreadyExists)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_refreshed_last_activity_saturates_on_overflow() {
+        let record = SessionIndexRecord {
+            session_id: "overflow-session".to_string(),
+            agent_name: "hephaestus".to_string(),
+            working_dir: None,
+            git_branch: None,
+            git_remote: None,
+            last_activity: u64::MAX,
+        };
+
+        let refreshed = with_refreshed_last_activity(record).expect("refresh should not panic");
+
+        assert_eq!(refreshed.last_activity, u64::MAX);
+    }
+
+    #[test]
+    fn is_wrong_last_revision_detects_wrapped_update_error() {
+        let wrapped_error = Err::<(), _>(anyhow::Error::from(kv::UpdateError::new(
+            kv::UpdateErrorKind::WrongLastRevision,
+        )))
+        .with_context(|| {
+            "Failed to CAS-update session index record for key 'sessions/test/meta' at revision 7"
+        })
+        .expect_err("wrong-last-revision should remain an error");
+
+        assert!(is_wrong_last_revision(&wrapped_error));
+        assert!(!is_wrong_last_revision(&anyhow::anyhow!("unrelated error")));
+    }
+
+    #[tokio::test]
+    async fn best_effort_index_refresh_times_out_without_blocking_long() {
+        let never_returns = async {
+            let store = futures_util::future::pending::<kv::Store>().await;
+            refresh_session_index_last_activity(&store, "session-timeout").await
+        };
+
+        let result = time::timeout(INDEX_REFRESH_TIMEOUT, never_returns).await;
+
+        assert!(
+            result.is_err(),
+            "refresh_session_index_last_activity path should time out when store acquisition never completes"
+        );
+    }
 }

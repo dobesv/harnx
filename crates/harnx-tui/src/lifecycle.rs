@@ -239,7 +239,32 @@ impl Tui {
         if config.read().session.is_none() {
             // sessions_dir() is already scoped to the active agent, so no
             // extra agent_name filter is needed here.
-            let sessions = config.read().list_sessions_with_meta();
+            let (is_remote, cluster) = {
+                let cfg = config.read();
+                if let Some((_, ref cluster)) = cfg.remote_agent {
+                    (true, cluster.clone())
+                } else {
+                    (false, String::new())
+                }
+            };
+
+            let (sessions, fetch_error) = if is_remote {
+                let cfg = config.read().clone();
+                match cfg.list_remote_sessions_with_meta(&cluster).await {
+                    Ok(s) => (s, None),
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to list remote sessions for cluster '{}': {:#}",
+                            cluster,
+                            e
+                        );
+                        (vec![], Some(format!("remote sessions unavailable: {e:#}")))
+                    }
+                }
+            } else {
+                (config.read().list_sessions_with_meta(), None)
+            };
+
             let ctx = build_picker_context();
             let sorted = sort_sessions_for_picker(sessions, &ctx);
             // Always show picker when agent active but no session — even empty list
@@ -251,6 +276,7 @@ impl Tui {
                 selected: 0,
                 origin_agent,
                 origin_session,
+                error: fetch_error,
             });
         }
         None

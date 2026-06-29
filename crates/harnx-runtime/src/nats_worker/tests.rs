@@ -1,9 +1,13 @@
 //! Unit tests for nats_worker module.
 
 use crate::config::{self, Config};
+use crate::nats_session_index::{
+    ensure_index_bucket, get_record, session_index_key, SessionIndexRecord,
+};
 use crate::nats_worker::agent_loop::{tool_can_rerun, write_header_and_load_session};
 use crate::nats_worker::run_worker_daemon;
 use anyhow::Context;
+use futures_util::StreamExt;
 use harnx_core::agent_config::AgentConfig;
 use harnx_core::config_data::ConfigData;
 use harnx_core::event::{AgentEvent, AgentEventSink};
@@ -12,8 +16,9 @@ use harnx_core::tool::{ToolCall, ToolDeclaration};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Spawn a local JetStream-enabled nats-server on a free port with an isolated
 /// temp store dir, returning the connect URL, the child process, and the temp
@@ -53,8 +58,8 @@ async fn spawn_test_nats() -> Option<(String, std::process::Child, tempfile::Tem
     None
 }
 
-static CWD_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static CWD_MUTEX: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
+static ENV_MUTEX: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
 struct CurrentDirGuard {
     original_dir: PathBuf,
@@ -80,11 +85,8 @@ impl Drop for CurrentDirGuard {
     }
 }
 
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    match ENV_MUTEX.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    ENV_MUTEX.lock().await
 }
 
 struct TestEnvGuard {
@@ -257,6 +259,17 @@ fn spawn_metis_worker(url: &str) -> tokio::task::JoinHandle<anyhow::Result<()>> 
 }
 
 async fn run_remote_round_trip(parent_config: Config) -> anyhow::Result<()> {
+    run_remote_round_trip_with_session_id(
+        parent_config,
+        crate::nats_worker::new_remote_session_id(),
+    )
+    .await
+}
+
+async fn run_remote_round_trip_with_session_id(
+    parent_config: Config,
+    session_id: String,
+) -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let mut parent_config = parent_config;
@@ -267,7 +280,7 @@ async fn run_remote_round_trip(parent_config: Config) -> anyhow::Result<()> {
     let thin_cfg = crate::ThinClientConfig {
         cluster: "local".to_string(),
         agent: "metis".to_string(),
-        session_id: Some(crate::nats_worker::new_remote_session_id()),
+        session_id: Some(session_id),
     };
     let thin =
         crate::ThinClientSession::from_global_config(thin_cfg, &parent_global_config, abort_signal)
@@ -468,6 +481,7 @@ fn test_non_idempotent_output_is_synthesized() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_header_matches_local_header_source_of_truth() {
+    let _env_guard = env_lock().await;
     let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
         return;
     };
@@ -508,7 +522,7 @@ async fn remote_header_matches_local_header_source_of_truth() {
     let (session, expected_header) = {
         let _cwd_guard = CurrentDirGuard::change_to(&temp_repo_path)
             .expect("must switch into hermetic git repo for header generation");
-        let session = write_header_and_load_session(&backend, &config, &input, session_id)
+        let session = write_header_and_load_session(&backend, &config, &input, None, session_id)
             .await
             .unwrap();
         let expected_header = {
@@ -586,6 +600,7 @@ async fn control_log_append_requires_live_lease() {
             tombstone_ttl: std::time::Duration::from_secs(10),
             ..Default::default()
         },
+        session_index: None,
     })
     .await
     .unwrap()
@@ -635,14 +650,13 @@ fn fixed_prompt_call_fn(reply: &'static str) -> crate::agent_loop::AgentCallFn {
     })
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_agent_tool_family_and_nats_call_and_return_round_trip() {
     let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
         return;
     };
 
-    let _env_guard = env_lock();
+    let _env_guard = env_lock().await;
     let mut seeded = seed_remote_config(&url);
     let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
     assert_remote_tool_family(&mut seeded.parent_config);
@@ -656,4 +670,135 @@ async fn remote_agent_tool_family_and_nats_call_and_return_round_trip() {
     let _ = child.kill();
     let _ = child.wait();
     test_result.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_session_activation_writes_session_index_record() {
+    let server_url = match std::env::var("HARNX_NATS_TEST_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!(
+                "skipping remote_session_activation_writes_session_index_record: HARNX_NATS_TEST_URL unset"
+            );
+            return;
+        }
+    };
+
+    let _env_guard = env_lock().await;
+    let mut seeded = seed_remote_config(&server_url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
+    assert_remote_tool_family(&mut seeded.parent_config);
+    assert_remote_tool_descriptions(&mut seeded.parent_config);
+
+    // Capture the session_id that will be created so we can assert on it specifically
+    let expected_session_id = crate::nats_worker::new_remote_session_id();
+
+    let client = async_nats::connect(&server_url)
+        .await
+        .expect("connect to test nats");
+    let jetstream = async_nats::jetstream::new(client);
+    let store = ensure_index_bucket(&jetstream)
+        .await
+        .expect("ensure session index bucket");
+
+    let daemon = spawn_metis_worker(&server_url);
+    // Use the expected_session_id in the thin client config
+    let round_trip =
+        run_remote_round_trip_with_session_id(seeded.parent_config, expected_session_id.clone())
+            .await;
+
+    // Assert on the specific session_id we created, not just "first key in bucket"
+    let record = get_record(&store, &expected_session_id)
+        .await
+        .expect("load session index record")
+        .expect("remote session index record exists");
+    assert_eq!(record.session_id, expected_session_id);
+    assert_eq!(record.agent_name, "metis");
+    assert!(record.last_activity > 0);
+
+    daemon.abort();
+    let _ = daemon.await;
+    round_trip.expect("remote round trip must succeed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_session_renew_updates_last_activity_without_clobbering_header_fields() {
+    let server_url = match std::env::var("HARNX_NATS_TEST_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!(
+                "skipping remote_session_renew_updates_last_activity_without_clobbering_header_fields: HARNX_NATS_TEST_URL unset"
+            );
+            return;
+        }
+    };
+
+    let _env_guard = env_lock().await;
+    let mut seeded = seed_remote_config(&server_url);
+    let _config_dir = TestEnvGuard::new("HARNX_CONFIG_DIR", seeded.config_dir());
+    assert_remote_tool_family(&mut seeded.parent_config);
+    assert_remote_tool_descriptions(&mut seeded.parent_config);
+
+    // Capture the session_id that will be created so we can assert on it specifically
+    let expected_session_id = crate::nats_worker::new_remote_session_id();
+
+    let client = async_nats::connect(&server_url)
+        .await
+        .expect("connect to test nats");
+    let jetstream = async_nats::jetstream::new(client);
+    let store = ensure_index_bucket(&jetstream)
+        .await
+        .expect("ensure session index bucket");
+
+    let daemon = spawn_metis_worker(&server_url);
+    // Use the expected_session_id in the thin client config
+    let round_trip =
+        run_remote_round_trip_with_session_id(seeded.parent_config, expected_session_id.clone())
+            .await;
+
+    // Assert on the specific session_id we created, not just "first key in bucket"
+    let first_record = get_record(&store, &expected_session_id)
+        .await
+        .expect("load initial session index record")
+        .expect("initial session index record exists");
+    let first_last_activity = first_record.last_activity;
+
+    let record_key = session_index_key(&expected_session_id);
+    let mut watcher = store
+        .watch(record_key.clone())
+        .await
+        .expect("watch session index record");
+
+    let mut refreshed_record: Option<SessionIndexRecord> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(entry) = tokio::time::timeout(remaining, watcher.next())
+            .await
+            .expect("timed out waiting for renewed session index record")
+        else {
+            break;
+        };
+        let entry = entry.expect("watch entry result");
+        if !matches!(entry.operation, async_nats::jetstream::kv::Operation::Put) {
+            continue;
+        }
+        let record: SessionIndexRecord =
+            serde_json::from_slice(&entry.value).expect("deserialize watched session index record");
+        if record.session_id == expected_session_id && record.last_activity > first_last_activity {
+            refreshed_record = Some(record);
+            break;
+        }
+    }
+
+    let refreshed_record = refreshed_record.expect("renew should refresh last_activity");
+    assert!(refreshed_record.last_activity > first_last_activity);
+    assert_eq!(refreshed_record.agent_name, first_record.agent_name);
+    assert_eq!(refreshed_record.working_dir, first_record.working_dir);
+    assert_eq!(refreshed_record.git_branch, first_record.git_branch);
+    assert_eq!(refreshed_record.git_remote, first_record.git_remote);
+
+    daemon.abort();
+    let _ = daemon.await;
+    round_trip.expect("remote round trip must succeed");
 }

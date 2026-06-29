@@ -5,12 +5,14 @@ use crate::agent_loop::OnToolRoundFn;
 use crate::config::{GlobalConfig, Input};
 use crate::nats_lease::NatsSessionLease;
 use crate::nats_metrics;
+use crate::nats_session_index::{put_record, SessionIndexRecord};
 use crate::utils::AbortSignal;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use harnx_core::message::Message;
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct RunAgentLoopArgs<'a> {
@@ -188,6 +190,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         config: &config,
         input: &initial_input,
         lease: lease.as_deref(),
+        session_index: None,
         session_id,
         abort_signal: &abort_signal,
     })
@@ -245,6 +248,7 @@ struct LoadOrRepairSessionParams<'a> {
     config: &'a GlobalConfig,
     input: &'a Input,
     lease: Option<&'a NatsSessionLease>,
+    session_index: Option<&'a async_nats::jetstream::kv::Store>,
     session_id: &'a str,
     abort_signal: &'a AbortSignal,
 }
@@ -260,13 +264,15 @@ async fn load_or_repair_session(
         config,
         input,
         lease,
+        session_index,
         session_id,
         abort_signal,
     } = params;
     let entries = backend.load_events_blocking()?;
     if entries.is_empty() {
         // New session: write header and load
-        return write_header_and_load_session(backend, config, input, session_id).await;
+        return write_header_and_load_session(backend, config, input, session_index, session_id)
+            .await;
     }
 
     // Existing session: check effective session log for orphan tool calls and repair with hints
@@ -598,15 +604,66 @@ fn build_remote_session_header(
     Ok(header_session.build_header_entry())
 }
 
+fn build_session_index_record_from_header(
+    header: &harnx_core::session::SessionLogEntry,
+) -> Result<SessionIndexRecord> {
+    let harnx_core::session::SessionLogEntry::Header {
+        session_id,
+        agent_name,
+        working_dir,
+        git_branch,
+        git_remote,
+        ..
+    } = header
+    else {
+        anyhow::bail!("remote session index requires header entry")
+    };
+
+    Ok(SessionIndexRecord {
+        session_id: session_id
+            .clone()
+            .context("remote session header missing session_id")?,
+        agent_name: agent_name
+            .clone()
+            .context("remote session header missing agent_name")?,
+        working_dir: working_dir.clone(),
+        git_branch: git_branch.clone(),
+        git_remote: git_remote.clone(),
+        last_activity: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock before unix epoch")?
+            .as_secs(),
+    })
+}
+
+async fn upsert_session_index_record(
+    store: &async_nats::jetstream::kv::Store,
+    header: &harnx_core::session::SessionLogEntry,
+) -> Result<u64> {
+    let record = build_session_index_record_from_header(header)?;
+    put_record(store, &record)
+        .await
+        .with_context(|| format!("put session index record for {}", record.session_id))
+}
+
 /// Write a new session header and load the session.
 pub(crate) async fn write_header_and_load_session(
     backend: &NatsSessionLogBackend,
     config: &GlobalConfig,
     input: &Input,
+    session_index: Option<&async_nats::jetstream::kv::Store>,
     session_id: &str,
 ) -> Result<harnx_core::session::Session> {
     let header = build_remote_session_header(config, input, session_id)?;
     backend.append_event_blocking(&header)?;
+    if let Some(store) = session_index {
+        if let Err(err) = upsert_session_index_record(store, &header).await {
+            log::warn!(
+                "failed to upsert remote session index after header write: session_id={} err={err:#}",
+                session_id
+            );
+        }
+    }
     let entries = backend.load_events_blocking()?;
     crate::nats_session_log::load_session_from_entries(&entries, session_id)
 }
