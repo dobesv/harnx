@@ -957,6 +957,7 @@ async fn fenced_sink_rejects_append_when_lease_lost() -> Result<()> {
                 renew_interval: Duration::from_secs(10),
                 ..Default::default()
             },
+            session_index: None,
         })
         .await?
         .expect("acquire"),
@@ -1043,6 +1044,7 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
                 renew_interval: Duration::from_secs(10),
                 ..Default::default()
             },
+            session_index: None,
         })
         .await?
         .expect("acquire"),

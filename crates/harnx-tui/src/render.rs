@@ -832,7 +832,10 @@ impl Tui {
                 );
             }
             ModalState::SessionPicker {
-                sessions, selected, ..
+                sessions,
+                selected,
+                error,
+                ..
             } => {
                 let title = "Select Session";
                 let footer = "↑↓ navigate  Enter select  Esc cancel";
@@ -851,11 +854,16 @@ impl Tui {
                     };
                     format!("{}  {}  {}", s.id, branch, cwd_tail)
                 }));
+                // Prepend error message if present (visible in picker)
+                if let Some(err) = error {
+                    items.insert(0, format!("⚠ {}", err));
+                }
                 self.render_list_modal(
                     frame,
                     screen_size,
                     &items,
-                    *selected,
+                    // Adjust selected index if error message is prepended
+                    session_picker_highlight_index(*selected, error.is_some()),
                     ListModalOpts {
                         title,
                         footer,
@@ -1523,5 +1531,28 @@ impl Tui {
         let shortcuts_para =
             Paragraph::new(shortcuts_text).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(shortcuts_para, footer_chunks[1]);
+    }
+}
+
+pub(crate) fn session_picker_highlight_index(selected: usize, has_error: bool) -> usize {
+    if has_error {
+        selected + 1
+    } else {
+        selected
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_picker_highlight_index() {
+        // - error: Some, selected: 0 → highlighted display row is "✦ New session" (display index 1), NOT the ⚠ error row (index 0).
+        assert_eq!(session_picker_highlight_index(0, true), 1);
+        // - error: Some, selected: 1 → highlighted display row is the first session (display index 2).
+        assert_eq!(session_picker_highlight_index(1, true), 2);
+        // - error: None, selected: 0 → highlighted row is "New session" (display index 0).
+        assert_eq!(session_picker_highlight_index(0, false), 0);
     }
 }

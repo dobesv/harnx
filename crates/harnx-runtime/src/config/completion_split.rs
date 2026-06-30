@@ -169,6 +169,53 @@ impl Config {
         };
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
+
+    /// Generate tab-completion candidates for session IDs.
+    ///
+    /// This is the async variant that should be used from async contexts (TUI).
+    /// When a remote agent is in context, fetches session IDs from the remote
+    /// NATS KV index with a short timeout for snappy completion. Otherwise,
+    /// returns local session IDs.
+    ///
+    /// # Arguments
+    /// * `cluster` - The cluster name if a remote agent is active, or `None` for local
+    ///
+    /// # Returns
+    /// Session ID strings suitable for completion. Returns empty vec on timeout/error
+    /// (graceful degradation).
+    pub async fn list_sessions_for_completion(&self, cluster: Option<&str>) -> Vec<String> {
+        match cluster {
+            Some(cluster) => {
+                // Short timeout to keep completion snappy; on timeout/error,
+                // fall back to empty vec (graceful degradation).
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    self.list_remote_sessions_with_meta(cluster),
+                )
+                .await
+                {
+                    Ok(Ok(sessions)) => sessions.into_iter().map(|s| s.id).collect(),
+                    Ok(Err(e)) => {
+                        log::debug!("Remote session completion failed: {:#}", e);
+                        vec![]
+                    }
+                    Err(_) => {
+                        log::debug!("Remote session completion timed out");
+                        vec![]
+                    }
+                }
+            }
+            None => {
+                let config = self.clone();
+                tokio::task::spawn_blocking(move || config.list_sessions())
+                    .await
+                    .unwrap_or_else(|error| {
+                        log::debug!("Local session completion task failed: {error}");
+                        vec![]
+                    })
+            }
+        }
+    }
 }
 
 fn complete_bool(value: bool) -> Vec<String> {
@@ -180,5 +227,85 @@ fn complete_option_bool(value: Option<bool>) -> Vec<String> {
         Some(true) => vec!["false".to_string(), "null".to_string()],
         Some(false) => vec!["true".to_string(), "null".to_string()],
         None => vec!["true".to_string(), "false".to_string()],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Test that list_sessions_for_completion returns local sessions when cluster is None.
+    ///
+    /// Creates a temp sessions dir with known session files, verifies that
+    /// `list_sessions_for_completion(None)` returns those session IDs.
+    #[tokio::test]
+    async fn test_list_sessions_for_completion_local_branch() {
+        // Create a temp directory to act as sessions_dir
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let sessions_dir = temp.path();
+
+        // Create session files: session-alpha.yaml, session-beta.yaml
+        let session_alpha = sessions_dir.join("session-alpha.yaml");
+        let session_beta = sessions_dir.join("session-beta.yaml");
+        std::fs::File::create(&session_alpha)
+            .expect("create session-alpha")
+            .write_all(b"id: session-alpha\n")
+            .expect("write session-alpha");
+        std::fs::File::create(&session_beta)
+            .expect("create session-beta")
+            .write_all(b"id: session-beta\n")
+            .expect("write session-beta");
+
+        // Build a minimal Config with sessions_dir_override pointing to temp
+        let config = Config {
+            sessions_dir_override: Some(sessions_dir.to_path_buf()),
+            ..Config::default()
+        };
+
+        // WHEN cluster = None, local branch fires
+        let result = config.list_sessions_for_completion(None).await;
+
+        // THEN result contains our session IDs (sorted alphabetically)
+        assert_eq!(
+            result,
+            vec!["session-alpha", "session-beta"],
+            "cluster=None should return local session IDs from list_sessions()"
+        );
+    }
+
+    /// Test that remote session completion gracefully degrades on unreachable cluster.
+    ///
+    /// Passes a bogus cluster name that has no NATS server; the method should:
+    /// 1. Return an empty Vec (no panic/error)
+    /// 2. Complete within the timeout (~500ms), not hang indefinitely.
+    #[tokio::test]
+    async fn test_remote_completion_graceful_degradation() {
+        let config = Config::default();
+
+        // Start timing before the call
+        let start = std::time::Instant::now();
+
+        // Call with a bogus-unreachable cluster name (no live NATS at this address)
+        let result = config
+            .list_sessions_for_completion(Some("bogus-unreachable-cluster-xyz-9f8e7d"))
+            .await;
+
+        let elapsed = start.elapsed();
+
+        // THEN: graceful degradation — empty vec, no panic
+        assert!(
+            result.is_empty(),
+            "remote completion on unreachable cluster should return empty vec, got: {:?}",
+            result
+        );
+
+        // AND: completes within the timeout budget (500ms + margin)
+        // The implementation uses 500ms timeout; we allow some overhead.
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "remote completion should not hang; took {:?}",
+            elapsed
+        );
     }
 }

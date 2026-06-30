@@ -214,6 +214,10 @@ pub(super) enum ModalState {
         origin_agent: Option<String>,
         /// Session id *before* the picker flow started (pre-activation).
         origin_session: Option<String>,
+        /// Error message when remote session fetch failed. Displayed visibly
+        /// in the picker so users know the cluster was unreachable, rather
+        /// than seeing an empty list and assuming no sessions exist.
+        error: Option<String>,
     },
 }
 

@@ -37,6 +37,7 @@ use harnx_hooks::{
     PersistentHookManager,
 };
 use harnx_render::{render_error, MarkdownRender};
+use harnx_runtime::config::SessionMeta;
 use harnx_runtime::utils::*;
 
 use anyhow::{bail, Result};
@@ -46,6 +47,61 @@ use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use harnx_core::sink::emit_agent_event;
 use harnx_runtime::session_cleanup::{humanize_bytes, run_cleanup, CleanupStats};
+
+/// Routing decision for `--list-sessions` handler.
+/// Extracted as a pure function for testability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListSessionsTarget {
+    /// List sessions from the local session directory.
+    Local,
+    /// List sessions from a remote NATS cluster.
+    Remote { cluster: String },
+}
+
+/// Pure routing decision for `--list-sessions`.
+/// Given the remote agent context, returns whether to list local or remote sessions.
+///
+/// This function encapsulates the branch selection logic so it can be unit-tested
+/// without requiring a live NATS cluster or mocking async I/O.
+pub fn resolve_list_sessions_target(remote_agent: Option<&(String, String)>) -> ListSessionsTarget {
+    match remote_agent {
+        Some((_, cluster)) => ListSessionsTarget::Remote {
+            cluster: cluster.clone(),
+        },
+        None => ListSessionsTarget::Local,
+    }
+}
+
+/// Format session metadata as one ID per line.
+/// This helper is extracted for testability without touching stdout.
+pub fn format_sessions_for_output(sessions: &[SessionMeta]) -> String {
+    let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    ids.join("\n")
+}
+
+/// Outcome of a remote list-sessions operation.
+/// This pure helper enables unit-testing the error-propagation path without
+/// mocking the async NATS client or relying on assertion side-effects.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ListSessionsOutcome {
+    /// Sessions fetched successfully; output to be printed to stdout.
+    Print(String),
+    /// Remote fetch failed; error message for stderr and non-zero exit.
+    Error(String),
+}
+
+/// Map a remote list-sessions result to an outcome for the CLI.
+/// Ok(sessions) → Print(formatted output)
+/// Err(e) → Error(error message)
+///
+/// This helper exists to make error-propagation genuinely testable.
+/// The handler calls this and then performs the actual println/eprintln/return-Err.
+pub fn remote_list_outcome(result: Result<Vec<SessionMeta>, anyhow::Error>) -> ListSessionsOutcome {
+    match result {
+        Ok(sessions) => ListSessionsOutcome::Print(format_sessions_for_output(&sessions)),
+        Err(e) => ListSessionsOutcome::Error(format!("{e:#}")),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -257,8 +313,29 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         }
     }
     if cli.list_sessions {
-        let sessions = config.read().list_sessions().join("\n");
-        println!("{sessions}");
+        // Use the pure routing decision function for branch selection.
+        // This logic is now unit-testable via resolve_list_sessions_target.
+        let target = resolve_list_sessions_target(config.read().remote_agent.as_ref());
+        match target {
+            ListSessionsTarget::Remote { cluster } => {
+                // Clone config to avoid holding lock across await
+                let cfg = config.read().clone();
+                let result = cfg.list_remote_sessions_with_meta(&cluster).await;
+                match remote_list_outcome(result) {
+                    ListSessionsOutcome::Print(output) => {
+                        println!("{output}");
+                    }
+                    ListSessionsOutcome::Error(msg) => {
+                        eprintln!("error: could not list sessions for cluster '{cluster}': {msg}");
+                        return Err(anyhow::anyhow!("{msg}"));
+                    }
+                }
+            }
+            ListSessionsTarget::Local => {
+                let sessions = config.read().list_sessions().join("\n");
+                println!("{sessions}");
+            }
+        }
         return Ok(());
     }
     if let Some(model_id) = &cli.model {
@@ -1121,6 +1198,176 @@ mod resume_tests {
             session_resume_command(&config).unwrap(),
             "harnx -a 'my agent' -s 'my session'"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_list_sessions_routing {
+    use super::*;
+
+    /// Routing decision: no remote agent → Local
+    /// This test will fail if routing logic regresses to unconditionally use remote.
+    #[test]
+    fn test_routing_local_when_no_remote_agent() {
+        let target = resolve_list_sessions_target(None);
+        assert_eq!(target, ListSessionsTarget::Local);
+    }
+
+    /// Routing decision: remote agent set → Remote with correct cluster
+    /// This test will fail if routing logic regresses to unconditionally use local
+    /// or if cluster extraction is broken.
+    #[test]
+    fn test_routing_remote_when_remote_agent_set() {
+        let remote_agent = Some(("my-agent".to_string(), "my-cluster".to_string()));
+        let target = resolve_list_sessions_target(remote_agent.as_ref());
+        assert_eq!(
+            target,
+            ListSessionsTarget::Remote {
+                cluster: "my-cluster".to_string()
+            }
+        );
+    }
+
+    /// Routing decision: cluster extraction preserves full cluster name
+    #[test]
+    fn test_routing_remote_extracts_cluster_correctly() {
+        let test_cases = [
+            ("agent", "nats://localhost:4222"),
+            ("worker", "production-cluster"),
+            ("remote-agent", "cluster.with.dots.example.com"),
+        ];
+
+        for (agent, cluster) in test_cases {
+            let remote_agent = Some((agent.to_string(), cluster.to_string()));
+            let target = resolve_list_sessions_target(remote_agent.as_ref());
+            match target {
+                ListSessionsTarget::Remote { cluster: extracted } => {
+                    assert_eq!(extracted, cluster, "cluster mismatch for agent '{agent}'");
+                }
+                ListSessionsTarget::Local => {
+                    panic!("Expected Remote target for agent '{agent}', got Local");
+                }
+            }
+        }
+    }
+
+    /// Output formatting: one session ID per line
+    /// This test will fail if the formatting changes (e.g., comma-separated).
+    #[test]
+    fn test_output_format_one_id_per_line() {
+        let sessions = [
+            SessionMeta {
+                id: "session-1".to_string(),
+                session_id: Some("session-1".to_string()),
+                working_dir: None,
+                git_branch: None,
+                git_remote: None,
+                terminal_session_id: None,
+                agent_name: None,
+                modified: None,
+            },
+            SessionMeta {
+                id: "session-2".to_string(),
+                session_id: Some("session-2".to_string()),
+                working_dir: None,
+                git_branch: None,
+                git_remote: None,
+                terminal_session_id: None,
+                agent_name: None,
+                modified: None,
+            },
+        ];
+        let output = format_sessions_for_output(&sessions);
+        assert_eq!(output, "session-1\nsession-2");
+    }
+
+    /// Output formatting: empty sessions → empty string
+    #[test]
+    fn test_output_format_empty_sessions() {
+        let sessions: Vec<SessionMeta> = vec![];
+        let output = format_sessions_for_output(&sessions);
+        assert_eq!(output, "");
+    }
+
+    /// Output formatting: single session → single line (no trailing newline)
+    #[test]
+    fn test_output_format_single_session() {
+        let sessions = [SessionMeta {
+            id: "only-session".to_string(),
+            session_id: Some("only-session".to_string()),
+            working_dir: None,
+            git_branch: None,
+            git_remote: None,
+            terminal_session_id: None,
+            agent_name: None,
+            modified: None,
+        }];
+        let output = format_sessions_for_output(&sessions);
+        assert_eq!(output, "only-session");
+    }
+
+    /// Remote list outcome: empty sessions → Print("") (not an error)
+    /// Regression guard: empty result is valid output, not an error condition.
+    #[test]
+    fn test_remote_list_outcome_empty_ok() {
+        let result: Result<Vec<SessionMeta>, anyhow::Error> = Ok(vec![]);
+        let outcome = remote_list_outcome(result);
+        assert_eq!(outcome, ListSessionsOutcome::Print(String::new()));
+    }
+
+    /// Remote list outcome: Ok with sessions → Print with one id per line
+    #[test]
+    fn test_remote_list_outcome_ok_with_sessions() {
+        let sessions = vec![
+            SessionMeta {
+                id: "sess-a".to_string(),
+                session_id: Some("sess-a".to_string()),
+                working_dir: None,
+                git_branch: None,
+                git_remote: None,
+                terminal_session_id: None,
+                agent_name: None,
+                modified: None,
+            },
+            SessionMeta {
+                id: "sess-b".to_string(),
+                session_id: Some("sess-b".to_string()),
+                working_dir: None,
+                git_branch: None,
+                git_remote: None,
+                terminal_session_id: None,
+                agent_name: None,
+                modified: None,
+            },
+        ];
+        let result: Result<Vec<SessionMeta>, anyhow::Error> = Ok(sessions);
+        let outcome = remote_list_outcome(result);
+        assert_eq!(
+            outcome,
+            ListSessionsOutcome::Print("sess-a\nsess-b".to_string())
+        );
+    }
+
+    /// Remote list outcome: Err → Error (error is surfaced, NOT swallowed).
+    /// Regression guard: if this test fails, it means errors are being silently
+    /// converted to empty-success (the bug we're preventing).
+    #[test]
+    fn test_remote_list_outcome_error() {
+        let error = anyhow::anyhow!("connection refused");
+        let result: Result<Vec<SessionMeta>, anyhow::Error> = Err(error);
+        let outcome = remote_list_outcome(result);
+        // Critical: must be Error variant, NOT Print("")
+        match outcome {
+            ListSessionsOutcome::Error(msg) => {
+                assert!(
+                    msg.contains("connection refused"),
+                    "error message preserved"
+                );
+            }
+            ListSessionsOutcome::Print(_) => {
+                panic!("regression: error was swallowed into Print variant!");
+            }
+        }
     }
 }
 

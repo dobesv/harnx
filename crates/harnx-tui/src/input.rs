@@ -1720,7 +1720,7 @@ impl Tui {
                     return;
                 }
                 Some(PickerCommand::Session) => {
-                    self.open_session_picker();
+                    self.open_session_picker().await;
                     return;
                 }
                 None => return,
@@ -1869,6 +1869,22 @@ impl Tui {
             } else {
                 Vec::new()
             };
+
+            // When completing .session in remote-agent context, use the async
+            // helper that queries the NATS KV index with a short timeout.
+            // Otherwise, fall back to local sessions.
+            if cmd == ".session" && args.len() == 1 {
+                let cluster = self
+                    .config
+                    .read()
+                    .remote_agent
+                    .as_ref()
+                    .map(|(_, c)| c.clone());
+                let cfg = self.config.read().clone();
+                let sessions = cfg.list_sessions_for_completion(cluster.as_deref()).await;
+                return sessions.into_iter().map(|s| (s, None)).collect();
+            }
+
             return self
                 .config
                 .read()
@@ -1886,8 +1902,33 @@ impl Tui {
         });
     }
 
-    fn open_session_picker(&mut self) {
-        let sessions = self.config.read().list_sessions_with_meta();
+    pub(crate) async fn open_session_picker(&mut self) {
+        let (is_remote, cluster) = {
+            let cfg = self.config.read();
+            if let Some((_, ref cluster)) = cfg.remote_agent {
+                (true, cluster.clone())
+            } else {
+                (false, String::new())
+            }
+        };
+
+        let (sessions, fetch_error) = if is_remote {
+            let cfg = self.config.read().clone();
+            match cfg.list_remote_sessions_with_meta(&cluster).await {
+                Ok(s) => (s, None),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to list remote sessions for cluster '{}': {:#}",
+                        cluster,
+                        e
+                    );
+                    (vec![], Some(format!("remote sessions unavailable: {e:#}")))
+                }
+            }
+        } else {
+            (self.config.read().list_sessions_with_meta(), None)
+        };
+
         let ctx = build_picker_context();
         let sessions = sort_sessions_for_picker(sessions, &ctx);
         let origin_agent = self
@@ -1907,6 +1948,7 @@ impl Tui {
             selected: 0,
             origin_agent,
             origin_session,
+            error: fetch_error,
         });
     }
 
@@ -1917,12 +1959,15 @@ impl Tui {
     ) {
         match outcome {
             harnx_runtime::commands::CommandOutcome::Continue => {
-                let cfg = self.config.read();
-                let curr_agent = cfg.agent.as_ref().map(|a| a.name().to_string());
-                let session_missing = cfg.session.is_none();
-                drop(cfg);
+                let (curr_agent, session_missing) = {
+                    let cfg = self.config.read();
+                    (
+                        cfg.agent.as_ref().map(|a| a.name().to_string()),
+                        cfg.session.is_none(),
+                    )
+                };
                 if prev_agent != curr_agent && session_missing {
-                    self.open_session_picker();
+                    self.open_session_picker().await;
                 }
             }
             harnx_runtime::commands::CommandOutcome::Exit => {
@@ -1932,7 +1977,7 @@ impl Tui {
                 self.open_agent_picker().await;
             }
             harnx_runtime::commands::CommandOutcome::OpenSessionPicker => {
-                self.open_session_picker();
+                self.open_session_picker().await;
             }
         }
     }
@@ -2343,6 +2388,7 @@ impl Tui {
                                 selected: 0,
                                 origin_agent: prev_agent,
                                 origin_session: prev_session,
+                                error: None,
                             });
                         }
                     }
@@ -2351,6 +2397,7 @@ impl Tui {
                         selected,
                         origin_agent,
                         origin_session,
+                        error: _error,
                     }) => {
                         // Index 0 = "New session"; index N (1‥) = sessions[N-1].
                         if selected == 0 {
@@ -2361,6 +2408,7 @@ impl Tui {
                                     selected,
                                     origin_agent,
                                     origin_session,
+                                    error: None,
                                 });
                                 return Err(e);
                             }
@@ -2384,6 +2432,7 @@ impl Tui {
                                 selected,
                                 origin_agent,
                                 origin_session,
+                                error: None,
                             });
                         } else {
                             // Existing session at sessions[selected - 1].
@@ -2395,6 +2444,7 @@ impl Tui {
                                     selected,
                                     origin_agent,
                                     origin_session,
+                                    error: None,
                                 });
                                 return Err(e);
                             }
@@ -2439,6 +2489,7 @@ impl Tui {
                 if let Some(crate::types::ModalState::SessionPicker {
                     origin_session,
                     origin_agent,
+                    error: _,
                     ..
                 }) = self.app.modal.as_ref()
                 {
@@ -2480,6 +2531,7 @@ impl Tui {
                     if let Some(crate::types::ModalState::SessionPicker {
                         origin_agent,
                         origin_session,
+                        error: _,
                         ..
                     }) = self.app.modal.take()
                     {

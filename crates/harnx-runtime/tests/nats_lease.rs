@@ -41,6 +41,7 @@ async fn lease_contention_allows_exactly_one_holder() -> Result<()> {
         worker_id: "worker-a".to_string(),
         generation: 1,
         config: cfg.clone(),
+        session_index: None,
     })
     .await?;
     let two = NatsSessionLease::acquire(harnx_runtime::nats_lease::NatsLeaseAcquireParams {
@@ -49,6 +50,7 @@ async fn lease_contention_allows_exactly_one_holder() -> Result<()> {
         worker_id: "worker-b".to_string(),
         generation: 1,
         config: cfg.clone(),
+        session_index: None,
     })
     .await?;
 
@@ -82,6 +84,7 @@ async fn lease_release_succeeds_after_renewals() -> Result<()> {
         worker_id: "worker-a".to_string(),
         generation: 1,
         config: cfg,
+        session_index: None,
     })
     .await?
     .context("acquire")?;
@@ -108,6 +111,7 @@ async fn lease_release_succeeds_after_renewals() -> Result<()> {
         worker_id: "worker-b".to_string(),
         generation: 2,
         config: fast_lease_config(),
+        session_index: None,
     })
     .await?;
     assert!(
@@ -133,6 +137,7 @@ async fn lease_failover_after_holder_stops_renewing() -> Result<()> {
         worker_id: "worker-a".to_string(),
         generation: 1,
         config: cfg.clone(),
+        session_index: None,
     })
     .await?
     .context("first acquire")?;
@@ -149,6 +154,7 @@ async fn lease_failover_after_holder_stops_renewing() -> Result<()> {
                 worker_id: "worker-b".to_string(),
                 generation: 1,
                 config: cfg.clone(),
+                session_index: None,
             })
             .await?
         {
@@ -178,6 +184,7 @@ async fn lease_renewal_survives_long_operation() -> Result<()> {
         worker_id: "worker-a".to_string(),
         generation: 1,
         config: cfg,
+        session_index: None,
     })
     .await?
     .context("acquire")?;
@@ -209,6 +216,7 @@ async fn lease_loss_is_signalled_on_watch() -> Result<()> {
         worker_id: "worker-a".to_string(),
         generation: 1,
         config: cfg,
+        session_index: None,
     })
     .await?
     .context("acquire")?;

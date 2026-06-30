@@ -21,6 +21,7 @@ pub mod nats_client_session;
 pub mod nats_event_sink;
 pub mod nats_lease;
 pub mod nats_metrics;
+pub mod nats_session_index;
 pub mod nats_session_log;
 pub mod nats_worker;
 pub mod session_cleanup;

@@ -9,6 +9,7 @@ use super::control::{control_subject, ControlCommand};
 use crate::config::{GlobalConfig, Input};
 use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
 use crate::nats_metrics;
+use crate::nats_session_index;
 use anyhow::{Context, Result};
 use async_nats::header::{HeaderValue, NATS_MESSAGE_ID};
 use async_nats::jetstream::{
@@ -212,12 +213,24 @@ pub async fn run_worker_daemon(
         .await
         .with_context(|| format!("create worker consumer '{consumer_name}'"))?;
 
+    let session_index = match nats_session_index::ensure_index_bucket(&jetstream).await {
+        Ok(store) => Some(store),
+        Err(error) => {
+            log::warn!(
+                "session index disabled: failed to ensure harnx_sessions index bucket: {:#}",
+                error
+            );
+            None
+        }
+    };
+
     let runtime = Arc::new(WorkerRuntime {
         config,
         cluster: daemon.cluster.clone(),
         worker_id: daemon.worker_id.clone(),
         lease: daemon.lease,
         jetstream: jetstream.clone(),
+        session_index,
         client,
         call_fn,
         generation: AtomicU64::new(1),
@@ -253,6 +266,7 @@ struct WorkerRuntime {
     worker_id: String,
     lease: NatsLeaseConfig,
     jetstream: jetstream::Context,
+    session_index: Option<async_nats::jetstream::kv::Store>,
     /// Shared NATS client for control-plane subscriptions (cloned per session
     /// rather than reconnecting on each activation).
     client: async_nats::Client,
@@ -288,6 +302,7 @@ impl WorkerRuntime {
             worker_id: self.worker_id.clone(),
             generation,
             config: self.lease.clone(),
+            session_index: self.session_index.clone(),
         })
         .await?
         {
@@ -379,6 +394,7 @@ impl WorkerRuntime {
         lease: &NatsSessionLease,
         per_session: &GlobalConfig,
         backend: &NatsSessionLogBackend,
+        _session_index: Option<&async_nats::jetstream::kv::Store>,
         high_water: Option<u64>,
     ) -> (Input, Option<u64>) {
         let ctx = TurnInputCtx {
@@ -551,6 +567,7 @@ impl WorkerRuntime {
                         &lease,
                         &per_session,
                         &backend,
+                        self.session_index.as_ref(),
                         activation_high_water,
                     )
                     .await;
