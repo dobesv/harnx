@@ -8262,9 +8262,26 @@ async fn render_agent_event_user_message_produces_user_transcript_entry() {
     .await
     .unwrap();
 
+    // Replayed/attached user turns must have no live timestamp and no seq, so
+    // they are excluded from the LogSeqAssigned backfill heuristic (which only
+    // patches items with `timestamp: Some`). Binding a live seq to a replayed
+    // row would break edit/delete/rewind targeting.
     assert!(matches!(
         tui.app.transcript.last(),
-        Some(TranscriptItem::UserText { text, .. }) if text == "hello from attach"
+        Some(TranscriptItem::UserText { text, seq: None, timestamp: None })
+            if text == "hello from attach"
+    ));
+
+    // A subsequent LogSeqAssigned must NOT backfill into the replayed row.
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 42 }),
+        None,
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(
+        tui.app.transcript.last(),
+        Some(TranscriptItem::UserText { seq: None, .. })
     ));
 }
 

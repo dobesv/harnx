@@ -63,18 +63,35 @@ pub enum AgentEvent {
 **TUI** — `crates/harnx-tui/src/input.rs`, `render_agent_event()`:
 ```rust
 AgentEvent::User(UserEvent::Message { content }) => {
-    vec![TranscriptItem::UserText(content.clone())]
+    // `TranscriptItem::UserText` is a struct variant. Use `timestamp: None`
+    // (and `seq: None`) so replayed history rows are excluded from the
+    // `LogSeqAssigned` backfill heuristic, which only patches "live" items
+    // (`timestamp: Some`). A fabricated live timestamp would let the next
+    // live seq bind to a replayed row and break edit/delete/rewind targeting.
+    vec![TranscriptItem::UserText {
+        text: content,
+        seq: None,
+        timestamp: None,
+    }]
 }
 ```
 
 **ACP server** — `crates/harnx-acp-server/src/lib.rs`, `AcpChunkSink::emit()`:
 ```rust
-AgentEvent::User(UserEvent::Message { content }) => {
-    if !content.is_empty() {
-        forward(AcpForward::Text(content));
-    }
+AgentEvent::User(UserEvent::Message { content }) if !content.is_empty() => {
+    // Use a dedicated `AcpForward::UserText(content, source)` variant — NOT
+    // `AcpForward::Text` (which maps to `AgentMessageChunk` and would pollute
+    // the parent's accumulated `response_text`, i.e. the next agent's input).
+    let _ = self.tx.send(AcpForward::UserText(content, source));
 }
 ```
+
+`AcpForward::UserText` is forwarded via `spawn_notify_user_text`, which emits
+`SessionUpdate::UserMessageChunk` (not `AgentMessageChunk`). The parent client
+(`crates/harnx-acp/src/client.rs`) maps `UserMessageChunk` to
+`AgentEvent::User(UserEvent::Message { .. })` for rendering and deliberately
+does NOT accumulate it into `response_text` (only `AgentMessageChunk` sets
+`is_agent_message`).
 
 **CLI** — `crates/harnx/src/cli_event_sink.rs`:
 - Added `UserEvent` to imports.

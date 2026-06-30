@@ -385,11 +385,11 @@ mod tests {
         );
 
         match rx.try_recv().expect("should forward user text") {
-            AcpForward::Text(text, source) => {
+            AcpForward::UserText(text, source) => {
                 assert_eq!(text, "hello user");
                 assert!(source.is_none());
             }
-            _ => panic!("expected Text forward"),
+            _ => panic!("expected UserText forward"),
         }
 
         sink.emit(

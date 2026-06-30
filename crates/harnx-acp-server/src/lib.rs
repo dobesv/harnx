@@ -33,6 +33,11 @@ use harnx_runtime::utils::{AbortSignal, AbortSignalInner};
 enum AcpForward {
     /// Text chunk for `SessionUpdate::AgentMessageChunk`.
     Text(String, Option<AgentSource>),
+    /// User-turn text for `SessionUpdate::UserMessageChunk`. Kept separate
+    /// from `Text` so replayed/attached user turns are NOT mixed into the
+    /// parent's accumulated `response_text` (which forms the next agent's
+    /// input). The parent client renders these as user transcript entries.
+    UserText(String, Option<AgentSource>),
     /// Sub-agent tool invocation for `SessionUpdate::ToolCall`.
     ToolCall {
         id: String,
@@ -92,7 +97,7 @@ impl harnx_core::event::AgentEventSink for AcpChunkSink {
                 let _ = self.tx.send(AcpForward::Text(output, source));
             }
             AgentEvent::User(UserEvent::Message { content }) if !content.is_empty() => {
-                let _ = self.tx.send(AcpForward::Text(content, source));
+                let _ = self.tx.send(AcpForward::UserText(content, source));
             }
             AgentEvent::Tool(ToolEvent::Started {
                 id,
@@ -381,6 +386,36 @@ impl HarnxAgent {
             }
         }
 
+        fn spawn_notify_user_text(
+            conn: &Option<acp::ConnectionTo<acp::Client>>,
+            session_key: &str,
+            text: String,
+            source: Option<AgentSource>,
+        ) {
+            if text.is_empty() {
+                return;
+            }
+            if let Some(conn) = conn.clone() {
+                let sid = session_key.to_string();
+                tokio::task::spawn_local(async move {
+                    let mut chunk = ContentChunk::new(text.into());
+                    if let Some(source) = source.as_ref() {
+                        if let Some(meta) = meta_from_source(source) {
+                            chunk = chunk.meta(meta);
+                        }
+                    }
+                    // Use `UserMessageChunk` (not `AgentMessageChunk`) so the
+                    // parent renders this as a user turn and does NOT append it
+                    // to `response_text` (the next agent's input).
+                    let notification = SessionNotification::new(
+                        SessionId::new(sid),
+                        SessionUpdate::UserMessageChunk(chunk),
+                    );
+                    let _ = conn.send_notification(notification);
+                });
+            }
+        }
+
         fn spawn_notify_tool_call(
             conn: &Option<acp::ConnectionTo<acp::Client>>,
             session_key: &str,
@@ -492,6 +527,9 @@ impl HarnxAgent {
             match update {
                 AcpForward::Text(text, source) => {
                     spawn_notify_text(conn, session_key, text, source)
+                }
+                AcpForward::UserText(text, source) => {
+                    spawn_notify_user_text(conn, session_key, text, source)
                 }
                 AcpForward::ToolCall {
                     id,

@@ -1016,10 +1016,16 @@ impl Tui {
                 }
             }
             AgentEvent::User(UserEvent::Message { content }) => {
+                // Replayed/attached history item — NOT a live turn. Use
+                // `timestamp: None` (matching the agent banner) so this row is
+                // excluded from the `LogSeqAssigned` backfill heuristic above,
+                // which only patches "live" items (`timestamp: Some`). A fresh
+                // timestamp would let the next live seq bind to this replayed
+                // row, breaking edit/delete/rewind targeting.
                 vec![TranscriptItem::UserText {
                     text: content,
                     seq: None,
-                    timestamp: Some(chrono::Utc::now()),
+                    timestamp: None,
                 }]
             }
             AgentEvent::Tool(ToolEvent::Completed {
