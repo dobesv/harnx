@@ -20,7 +20,7 @@ use agent_client_protocol::schema::*;
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use std::{collections::HashMap, sync::Arc};
 
-use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, ToolEvent};
+use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, ToolEvent, UserEvent};
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::utils::{AbortSignal, AbortSignalInner};
 
@@ -90,6 +90,9 @@ impl harnx_core::event::AgentEventSink for AcpChunkSink {
             }
             AgentEvent::Model(ModelEvent::Final { output, .. }) if !output.is_empty() => {
                 let _ = self.tx.send(AcpForward::Text(output, source));
+            }
+            AgentEvent::User(UserEvent::Message { content }) if !content.is_empty() => {
+                let _ = self.tx.send(AcpForward::Text(content, source));
             }
             AgentEvent::Tool(ToolEvent::Started {
                 id,

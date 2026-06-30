@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use harnx_core::event::{
     AgentEvent, AgentEventSink, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent,
-    ToolEvent, TurnEvent,
+    ToolEvent, TurnEvent, UserEvent,
 };
 
 use harnx_render::{MarkdownRender, RenderOptions};
@@ -34,6 +34,7 @@ fn is_model_output_event(event: &AgentEvent) -> bool {
             | AgentEvent::Model(ModelEvent::ThoughtChunk { .. })
             | AgentEvent::Model(ModelEvent::Final { .. })
             | AgentEvent::Model(ModelEvent::Error(_))
+            | AgentEvent::User(UserEvent::Message { .. })
     )
 }
 
@@ -363,6 +364,17 @@ impl AgentEventSink for CliAgentEventSink {
                 }
                 eprintln!("{}", warning_text(&format!("LLM error: {err}")));
             }
+            AgentEvent::User(UserEvent::Message { content }) => {
+                if let Err(err) = state.cleanup() {
+                    eprintln!(
+                        "{}",
+                        warning_text(&format!("cli-sink cleanup failed: {err}"))
+                    );
+                }
+                if !content.is_empty() {
+                    eprintln!("{}", dimmed_text(&content));
+                }
+            }
             AgentEvent::Model(ModelEvent::Usage {
                 input,
                 output,
@@ -500,6 +512,12 @@ mod tests {
         );
         sink.emit(AgentEvent::Model(ModelEvent::Error("boom".into())), None);
         sink.emit(
+            AgentEvent::User(UserEvent::Message {
+                content: "hello user".into(),
+            }),
+            None,
+        );
+        sink.emit(
             AgentEvent::Tool(ToolEvent::Blocked {
                 id: String::new(),
                 name: "test_tool".into(),
@@ -508,6 +526,42 @@ mod tests {
             }),
             None,
         );
+    }
+
+    #[test]
+    fn user_message_is_model_output_event() {
+        assert!(is_model_output_event(&AgentEvent::User(
+            UserEvent::Message {
+                content: "hello user".into(),
+            }
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_message_cleans_up_spinner_without_panic() {
+        let sink = CliAgentEventSink::new(
+            false,
+            RenderOptions::default(),
+            harnx_core::abort::create_abort_signal(),
+        );
+        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
+        {
+            let state = sink.state.lock().unwrap();
+            assert!(state.spinner.is_some(), "spinner should be started");
+        }
+        sink.emit(
+            AgentEvent::User(UserEvent::Message {
+                content: "hello user".into(),
+            }),
+            None,
+        );
+        {
+            let state = sink.state.lock().unwrap();
+            assert!(
+                state.spinner.is_none(),
+                "spinner should be cleared before printing user text"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

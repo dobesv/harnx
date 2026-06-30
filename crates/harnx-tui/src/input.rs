@@ -907,7 +907,9 @@ impl Tui {
     }
 
     async fn render_agent_event(&mut self, event: AgentEvent, source: Option<AgentSource>) {
-        use harnx_core::event::{ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent};
+        use harnx_core::event::{
+            ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent, UserEvent,
+        };
 
         let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
         let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
@@ -1012,6 +1014,13 @@ impl Tui {
                 } else {
                     vec![TranscriptItem::SystemText(clean)]
                 }
+            }
+            AgentEvent::User(UserEvent::Message { content }) => {
+                vec![TranscriptItem::UserText {
+                    text: content,
+                    seq: None,
+                    timestamp: Some(chrono::Utc::now()),
+                }]
             }
             AgentEvent::Tool(ToolEvent::Completed {
                 output, markdown, ..

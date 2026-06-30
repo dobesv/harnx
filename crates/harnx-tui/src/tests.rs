@@ -5,7 +5,7 @@ use crate::types::{ToolCallBody, TranscriptItem, TuiEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, PlanEntry, SessionEvent,
-    ToolEvent, ToolKind, ToolStatus,
+    ToolEvent, ToolKind, ToolStatus, UserEvent,
 };
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::client::{Client, ClientConfig, TestStateGuard};
@@ -8243,6 +8243,29 @@ async fn test_agent_command_leaves_tui_without_session_gap() {
         modal_open,
         "Expected a picker to be open when session is missing!"
     );
+}
+
+#[tokio::test]
+async fn render_agent_event_user_message_produces_user_transcript_entry() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::User(UserEvent::Message {
+            content: "hello from attach".to_string(),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        tui.app.transcript.last(),
+        Some(TranscriptItem::UserText { text, .. }) if text == "hello from attach"
+    ));
 }
 
 #[tokio::test]

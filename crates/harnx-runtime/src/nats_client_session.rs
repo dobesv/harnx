@@ -36,7 +36,7 @@
 use anyhow::{Context, Result};
 use async_nats::jetstream;
 use harnx_core::abort::wait_abort_signal;
-use harnx_core::event::{AgentEvent, AgentEventSink};
+use harnx_core::event::{AgentEvent, AgentEventSink, UserEvent};
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::session::SessionLogEntry;
 use harnx_core::session_reconstruct::{reconstruct_state_from_nats, TurnStatus};
@@ -191,12 +191,10 @@ impl ThinClientSession {
                     log::warn!(
                     "failed to apply NATS log mutations while rendering thin-client history: {err}"
                 );
-                    Vec::new()
+                    history.to_vec()
                 }
             };
-        for (_seq, entry) in effective_history {
-            render_log_entry_to_sink(&entry, event_sink.clone());
-        }
+        replay_history_to_sink(&effective_history, user_msg_seq, event_sink.clone());
 
         // Step 3: Publish activation to wake a worker.
         let activation = SessionActivate::new(&self.session_id, &self.config.agent);
@@ -468,6 +466,23 @@ pub struct ThinClientTurnResult {
 /// Render a session log entry to an event sink.
 ///
 /// Used for rendering history when attaching to an existing session.
+fn should_skip_replay_entry(seq: u64, user_msg_seq: u64) -> bool {
+    seq == user_msg_seq
+}
+
+fn replay_history_to_sink(
+    effective_history: &[(u64, SessionLogEntry)],
+    user_msg_seq: u64,
+    sink: Arc<dyn AgentEventSink>,
+) {
+    for (seq, entry) in effective_history {
+        if should_skip_replay_entry(*seq, user_msg_seq) {
+            continue;
+        }
+        render_log_entry_to_sink(entry, sink.clone());
+    }
+}
+
 fn render_log_entry_to_sink(entry: &SessionLogEntry, sink: Arc<dyn AgentEventSink>) {
     match entry {
         SessionLogEntry::Message { role, content, .. } => {
@@ -501,6 +516,13 @@ fn render_message_entry(
             AgentEvent::Model(ModelEvent::Final {
                 output: content.to_text(),
                 usage: Default::default(),
+            }),
+            None,
+        );
+    } else if role.is_user() {
+        sink.emit(
+            AgentEvent::User(UserEvent::Message {
+                content: content.to_text(),
             }),
             None,
         );
@@ -579,14 +601,18 @@ pub async fn send_control_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harnx_core::event::AgentSource;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     struct TestSink {
         count: Arc<AtomicUsize>,
+        events: Mutex<Vec<AgentEvent>>,
     }
     impl AgentEventSink for TestSink {
-        fn emit(&self, _event: AgentEvent, _source: Option<harnx_core::event::AgentSource>) {
+        fn emit(&self, event: AgentEvent, _source: Option<AgentSource>) {
             self.count.fetch_add(1, Ordering::SeqCst);
+            self.events.lock().unwrap().push(event);
         }
     }
 
@@ -613,6 +639,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let sink = Arc::new(TestSink {
             count: Arc::clone(&count),
+            events: Mutex::new(Vec::new()),
         });
 
         // Test assistant message
@@ -626,7 +653,7 @@ mod tests {
         render_log_entry_to_sink(&entry, sink.clone());
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
-        // Test user message (should not render)
+        // Test user message
         let entry = SessionLogEntry::Message {
             id: None,
             role: MessageRole::User,
@@ -635,7 +662,41 @@ mod tests {
             fence_token: None,
         };
         render_log_entry_to_sink(&entry, sink.clone());
-        assert_eq!(count.load(Ordering::SeqCst), 1); // Still 1
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_replay_history_skips_last_user_message_only() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::new(TestSink {
+            count: Arc::clone(&count),
+            events: Mutex::new(Vec::new()),
+        });
+
+        let effective_history = test_entries(&[
+            (1, MessageRole::User, "first user"),
+            (2, MessageRole::Assistant, "assistant"),
+            (3, MessageRole::User, "current user"),
+        ]);
+
+        replay_history_to_sink(&effective_history, 3, sink.clone());
+
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let rendered_messages: Vec<String> = sink
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::User(UserEvent::Message { content }) => Some(content.clone()),
+                AgentEvent::Model(harnx_core::event::ModelEvent::Final { output, .. }) => {
+                    Some(output.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rendered_messages, vec!["first user", "assistant"]);
+        assert!(!rendered_messages.iter().any(|msg| msg == "current user"));
     }
 
     #[test]
@@ -645,6 +706,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let sink = Arc::new(TestSink {
             count: Arc::clone(&count),
+            events: Mutex::new(Vec::new()),
         });
 
         let entry = SessionLogEntry::ToolResults {
