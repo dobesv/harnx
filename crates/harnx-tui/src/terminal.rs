@@ -51,6 +51,16 @@ impl PanicTerminalHookGuard {
 
 impl Drop for PanicTerminalHookGuard {
     fn drop(&mut self) {
+        // `panic::set_hook` itself panics ("cannot modify the panic hook from a
+        // panicking thread") when called while a panic is unwinding. If this
+        // guard is dropped as part of that unwinding, restoring the previous
+        // hook would turn a normal panic into a fatal double-panic ("panic in a
+        // destructor during cleanup") that aborts the process. Skip restoration
+        // in that case — the installed hook has already restored the terminal,
+        // and the panic can continue to unwind normally.
+        if std::thread::panicking() {
+            return;
+        }
         if let Some(previous_hook) = self.previous_hook.take() {
             panic::set_hook(Box::new(move |panic_info: &panic::PanicHookInfo<'_>| {
                 previous_hook(panic_info);
@@ -97,5 +107,24 @@ impl Tui {
         cleanup_terminal_state();
         terminal.show_cursor()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dropping the guard while a panic is unwinding must not call
+    /// `panic::set_hook` (which aborts with "cannot modify the panic hook from a
+    /// panicking thread"). The original panic should propagate to `catch_unwind`
+    /// and the process must survive — reaching the assertion at all proves we did
+    /// not abort during cleanup.
+    #[test]
+    fn guard_drop_during_panic_does_not_double_panic() {
+        let result = std::panic::catch_unwind(|| {
+            let _guard = PanicTerminalHookGuard::install();
+            panic!("boom");
+        });
+        assert!(result.is_err(), "the original panic should propagate");
     }
 }
