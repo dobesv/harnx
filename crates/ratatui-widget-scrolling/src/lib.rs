@@ -90,13 +90,16 @@ impl ScrollState {
         width: u16,
         num_elements: usize,
     ) -> &Vec<usize> {
-        let list = self.render_height_cache.entry(width).or_insert_with(|| {
-            let tmp_height_list = vec![1; num_elements];
-            tmp_height_list
-        });
-        for _ in 0..num_elements - list.len() {
-            list.push(1);
-        }
+        let list = self.render_height_cache.entry(width).or_default();
+        // Resize the cached height log to the current element count: pad new
+        // entries with a default height of 1, and drop stale trailing entries
+        // when the element count shrinks (e.g. when compaction replaces many
+        // transcript items with a single summary, or blanks the transcript).
+        // Computing the growth count as `num_elements - list.len()` underflowed
+        // once the list became shorter than the cache — a panic in debug, and in
+        // release a wraparound that pushed ~usize::MAX entries (runaway
+        // allocation / out-of-memory).
+        list.resize(num_elements, 1);
         list
     }
 
@@ -1171,6 +1174,27 @@ mod tests {
         assert_eq!(
             pos, 3,
             "empty cache with many elements should center the item"
+        );
+    }
+
+    /// Regression: the width-keyed height cache must tolerate the element count
+    /// shrinking between renders. Compaction can replace many transcript items
+    /// with a single summary (or blank the transcript entirely), so a render at
+    /// the pre-compaction count is followed by one with far fewer elements. The
+    /// cache still holds the larger length, so the helper must shrink it rather
+    /// than computing `num_elements - list.len()`, which underflowed — panicking
+    /// in debug and, in release, wrapping into an unbounded push loop that
+    /// exhausted memory.
+    #[test]
+    fn height_cache_tolerates_element_count_shrinking() {
+        let mut state = ScrollState::new();
+        // Prime the width-80 cache with 10 elements (pre-compaction).
+        let _ = state.scroll_position_to_show_item(0, 80, 10, 10);
+        // Compaction drops us to 2 elements; must not panic or underflow.
+        let pos = state.scroll_position_to_show_item(0, 80, 10, 2);
+        assert_eq!(
+            pos, 0,
+            "content fits after shrinking, so position clamps to 0"
         );
     }
 }
