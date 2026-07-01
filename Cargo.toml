@@ -46,7 +46,12 @@ keywords = ["chatgpt", "llm", "cli", "ai", "tui"]
 
 [profile.release]
 lto = true
-strip = true
+# Keep symbols and line tables (don't strip) so crash backtraces in released
+# binaries — notably the heap-guard abort trace and panic backtraces — resolve
+# to real function names and file:line instead of `<unknown>`. Line-tables-only
+# keeps the added size modest, and opt-level = "z" still minimises the code.
+strip = false
+debug = "line-tables-only"
 opt-level = "z"
 
 [workspace.dependencies]
