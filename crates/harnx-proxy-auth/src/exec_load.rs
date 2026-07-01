@@ -228,6 +228,7 @@ mod tests {
         let vars = JaqVars::new_from_values(
             &sentinels(),
             String::new(),
+            None,
             vec![("myexec".to_owned(), json!("hello from exec"))],
         )
         .unwrap();

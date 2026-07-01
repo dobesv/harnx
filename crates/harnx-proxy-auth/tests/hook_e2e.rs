@@ -175,6 +175,51 @@ async fn hook_env_sentinel_is_injected_into_bash_tool_input() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn hook_env_proxy_port_is_injected_into_bash_tool_input() {
+    let Some(proxy_bin) = proxy_binary_path() else {
+        eprintln!(
+            "SKIP hook_env_proxy_port_is_injected_into_bash_tool_input: harnx-proxy-auth not found"
+        );
+        return;
+    };
+
+    let env_arg = r#"{"GCE_METADATA_HOST": "127.0.0.1:\($proxy_port)"}"#;
+    let outcome = dispatch_one_hook_with_env(
+        &proxy_bin,
+        Some(env_arg),
+        HookEvent::PreToolUse {
+            tool_name: "bash_exec".to_string(),
+            tool_input: json!({
+                "command": "env",
+            }),
+            tool_use_id: "toolu_hook_e2e_proxy_port".to_string(),
+        },
+    )
+    .await;
+
+    assert!(matches!(outcome.control, HookResultControl::Continue));
+
+    let mutated = outcome
+        .result
+        .mutated_tool_input
+        .expect("persistent hook must mutate tool_input for bash_exec");
+    let env = mutated
+        .get("env")
+        .and_then(Value::as_object)
+        .expect("mutated tool_input must contain an 'env' object");
+    let host = env
+        .get("GCE_METADATA_HOST")
+        .and_then(Value::as_str)
+        .expect("GCE_METADATA_HOST must be injected");
+
+    let port = host
+        .strip_prefix("127.0.0.1:")
+        .expect("metadata host should use localhost proxy");
+    let port_num = port.parse::<u16>().expect("proxy port should parse");
+    assert!(port_num > 0, "proxy port should be non-zero");
+}
+
 async fn dispatch_one_hook(proxy_bin: &Path, event: HookEvent) -> HookOutcome {
     dispatch_one_hook_with_env(proxy_bin, None, event).await
 }

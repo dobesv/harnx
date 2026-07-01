@@ -21,12 +21,11 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 
 use crate::ca::CaSetup;
-use crate::filter::{self, CompiledFilter};
+use crate::transform::TransformPipeline;
 
 #[derive(Clone)]
 struct AuthHandler {
-    filter: Arc<CompiledFilter>,
-    jaq_vars: Arc<crate::filter::JaqVars>,
+    transforms: Arc<TransformPipeline>,
     log_file: Option<PathBuf>,
 }
 
@@ -37,71 +36,74 @@ impl HttpHandler for AuthHandler {
         mut req: Request<Body>,
     ) -> RequestOrResponse {
         let req_json = request_json(&req);
+        let result = self.transforms.apply(req_json.clone()).await;
 
-        match filter::apply_filter_with_vars(&self.filter, req_json.clone(), &self.jaq_vars) {
-            Ok(result) => {
-                // If the filter sets `.block` to a truthy value, return a 403 response
-                // instead of forwarding the request.
-                // - `true`          → generic "Blocked by proxy" message
-                // - a string        → that string is used as the response body
-                let block_reason = match result.get("block") {
-                    Some(Value::Bool(true)) => Some("Blocked by proxy".to_string()),
-                    Some(Value::String(reason)) if !reason.is_empty() => Some(reason.clone()),
-                    _ => None,
-                };
-                if let Some(reason) = block_reason {
-                    tracing::info!(reason = %reason, "request blocked by filter");
-                    let response = Response::builder()
-                        .status(StatusCode::FORBIDDEN)
-                        .header("content-type", "text/plain")
-                        .body(Body::from(Bytes::from(reason)))
-                        .unwrap_or_else(|_| Response::new(Body::empty()));
-                    return response.into();
-                }
-
-                let changed_headers =
-                    if let Some(headers) = result.get("headers").and_then(Value::as_object) {
-                        replace_headers(req.headers_mut(), headers)
-                    } else {
-                        vec![]
-                    };
-
-                // Log every request when --log-file is specified.
-                if let Some(log_path) = &self.log_file {
-                    let auth_after = req
-                        .headers()
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let entry = serde_json::json!({
-                        "host": result.get("host").and_then(Value::as_str).unwrap_or(""),
-                        "method": result.get("method").and_then(Value::as_str).unwrap_or(""),
-                        "path": result.get("path").and_then(Value::as_str).unwrap_or(""),
-                        "auth": truncate_auth(auth_after),
-                        "changed": changed_headers,
-                    });
-                    append_log(log_path, &entry).await;
+        if let Some(respond) = result.get("respond").and_then(Value::as_object) {
+            let status = respond
+                .get("status")
+                .and_then(Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok())
+                .and_then(|status| StatusCode::from_u16(status).ok())
+                .unwrap_or(StatusCode::OK);
+            let body = respond
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let mut response = Response::builder().status(status);
+            if let Some(headers) = respond.get("headers").and_then(Value::as_object) {
+                for (name, value) in headers {
+                    if let Some(value) = value.as_str() {
+                        response = response.header(name, value);
+                    }
                 }
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "request hook filter failed; passing through unchanged");
-                // Still log the request even if the filter failed.
-                if let Some(log_path) = &self.log_file {
-                    let auth = req_json
-                        .get("headers")
-                        .and_then(|h| h.get("authorization"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let entry = serde_json::json!({
-                        "host": req_json.get("host").and_then(Value::as_str).unwrap_or(""),
-                        "method": req_json.get("method").and_then(Value::as_str).unwrap_or(""),
-                        "path": req_json.get("path").and_then(Value::as_str).unwrap_or(""),
-                        "auth": truncate_auth(auth),
-                        "changed": ["filter-error"],
-                    });
-                    append_log(log_path, &entry).await;
-                }
-            }
+            let response = response
+                .body(Body::from(Bytes::from(body)))
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+            return response.into();
+        }
+
+        // If filter sets `.block` to truthy value, return 403 response
+        // instead of forwarding request.
+        // - `true`          → generic "Blocked by proxy" message
+        // - string          → string used as response body
+        let block_reason = match result.get("block") {
+            Some(Value::Bool(true)) => Some("Blocked by proxy".to_string()),
+            Some(Value::String(reason)) if !reason.is_empty() => Some(reason.clone()),
+            _ => None,
+        };
+        if let Some(reason) = block_reason {
+            tracing::info!(reason = %reason, "request blocked by filter");
+            let response = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("content-type", "text/plain")
+                .body(Body::from(Bytes::from(reason)))
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+            return response.into();
+        }
+
+        let changed_headers =
+            if let Some(headers) = result.get("headers").and_then(Value::as_object) {
+                replace_headers(req.headers_mut(), headers)
+            } else {
+                vec![]
+            };
+
+        if let Some(log_path) = &self.log_file {
+            let auth_after = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let entry = serde_json::json!({
+                "host": result.get("host").and_then(Value::as_str).unwrap_or(""),
+                "method": result.get("method").and_then(Value::as_str).unwrap_or(""),
+                "path": result.get("path").and_then(Value::as_str).unwrap_or(""),
+                "auth": truncate_auth(auth_after),
+                "changed": changed_headers,
+            });
+            append_log(log_path, &entry).await;
         }
 
         req.into()
@@ -221,16 +223,11 @@ fn replace_headers(headers: &mut http::HeaderMap, new_headers: &Map<String, Valu
     changed
 }
 
-pub async fn start_proxy(
-    filter: CompiledFilter,
-    ca: CaSetup,
-    jaq_vars: Arc<crate::filter::JaqVars>,
-) -> Result<u16> {
+pub async fn start_proxy(transforms: Arc<TransformPipeline>, ca: CaSetup) -> Result<u16> {
     start_proxy_inner(
-        filter,
+        transforms,
         ProxyConfig {
             ca,
-            jaq_vars,
             log_file: None,
             danger_accept_invalid_certs: false,
         },
@@ -239,16 +236,14 @@ pub async fn start_proxy(
 }
 
 pub async fn start_proxy_with_log(
-    filter: CompiledFilter,
+    transforms: Arc<TransformPipeline>,
     ca: CaSetup,
-    jaq_vars: Arc<crate::filter::JaqVars>,
     log_file: Option<PathBuf>,
 ) -> Result<u16> {
     start_proxy_inner(
-        filter,
+        transforms,
         ProxyConfig {
             ca,
-            jaq_vars,
             log_file,
             danger_accept_invalid_certs: false,
         },
@@ -260,15 +255,13 @@ pub async fn start_proxy_with_log(
 /// connections. Only for use in integration tests with self-signed server certs.
 #[doc(hidden)]
 pub async fn start_proxy_danger_accept_invalid_certs(
-    filter: CompiledFilter,
+    transforms: Arc<TransformPipeline>,
     ca: CaSetup,
-    jaq_vars: Arc<crate::filter::JaqVars>,
 ) -> Result<u16> {
     start_proxy_inner(
-        filter,
+        transforms,
         ProxyConfig {
             ca,
-            jaq_vars,
             log_file: None,
             danger_accept_invalid_certs: true,
         },
@@ -278,7 +271,6 @@ pub async fn start_proxy_danger_accept_invalid_certs(
 
 struct ProxyConfig {
     ca: CaSetup,
-    jaq_vars: Arc<crate::filter::JaqVars>,
     log_file: Option<PathBuf>,
     danger_accept_invalid_certs: bool,
 }
@@ -341,10 +333,9 @@ fn build_danger_https_connector() -> Result<hyper_rustls::HttpsConnector<HttpCon
         .wrap_connector(http))
 }
 
-async fn start_proxy_inner(filter: CompiledFilter, config: ProxyConfig) -> Result<u16> {
+async fn start_proxy_inner(transforms: Arc<TransformPipeline>, config: ProxyConfig) -> Result<u16> {
     let ProxyConfig {
         ca,
-        jaq_vars,
         log_file,
         danger_accept_invalid_certs,
     } = config;
@@ -355,8 +346,7 @@ async fn start_proxy_inner(filter: CompiledFilter, config: ProxyConfig) -> Resul
     let port = listener.local_addr()?.port();
 
     let handler = AuthHandler {
-        filter: Arc::new(filter),
-        jaq_vars,
+        transforms,
         log_file,
     };
 
@@ -392,7 +382,11 @@ async fn start_proxy_inner(filter: CompiledFilter, config: ProxyConfig) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::{self, JaqVars};
+    use crate::sentinel::Sentinels;
+    use crate::transform::{Stage, TransformPipeline};
     use hudsucker::hyper::Request;
+    use std::sync::Arc;
 
     fn make_request(uri: &str, host_header: Option<&str>) -> Request<Body> {
         let mut builder = Request::builder().uri(uri);
@@ -400,6 +394,10 @@ mod tests {
             builder = builder.header("host", h);
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    fn test_jaq_vars() -> JaqVars {
+        JaqVars::new(&Sentinels::generate(), "/tmp".to_string(), None, vec![]).unwrap()
     }
 
     /// For tunnelled HTTPS (CONNECT), the inner request URI is path-only.
@@ -425,5 +423,43 @@ mod tests {
         let req = make_request("http://api.github.com/user", None);
         let json = request_json(&req);
         assert_eq!(json["host"], "api.github.com");
+    }
+
+    #[tokio::test]
+    async fn respond_filter_returns_synthetic_response() {
+        let vars = Arc::new(test_jaq_vars());
+        let filter = Arc::new(filter::compile_with_vars(
+            r#".respond = {status: 201, headers: {"content-type": "application/json"}, body: "{}"}"#,
+            &vars,
+        )
+        .unwrap());
+        let mut handler = AuthHandler {
+            transforms: Arc::new(TransformPipeline::new(vec![Stage::Jaq { filter, vars }])),
+            log_file: None,
+        };
+
+        let outcome = handler
+            .handle_request(
+                // SAFETY: test-only helper. `handle_request` ignores HttpContext,
+                // so placeholder value is never read.
+                unsafe { &*std::ptr::NonNull::<HttpContext>::dangling().as_ptr() },
+                make_request("http://example.com/test", None),
+            )
+            .await;
+
+        let response = match outcome {
+            RequestOrResponse::Response(response) => response,
+            RequestOrResponse::Request(_) => panic!("expected synthetic response"),
+        };
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body, Bytes::from_static(b"{}"));
     }
 }

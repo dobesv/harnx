@@ -28,7 +28,8 @@ const SENTINEL_VAR_NAMES: [&str; 5] = [
     "fake_hex_key",
     "fake_email",
 ];
-const TEMP_FILE_ROOT_VAR_NAME: &str = "temp_file_root";
+pub const TEMP_FILE_ROOT_VAR_NAME: &str = "temp_file_root";
+pub const PROXY_PORT_VAR_NAME: &str = "proxy_port";
 
 #[derive(Debug, Clone)]
 pub struct JaqVars {
@@ -40,22 +41,27 @@ impl JaqVars {
     pub fn new_from_values(
         sentinels: &crate::sentinel::Sentinels,
         temp_file_root: String,
+        proxy_port: Option<u16>,
         loaded: Vec<(String, serde_json::Value)>,
     ) -> Result<Self> {
         let loaded = loaded
             .into_iter()
             .map(|(name, value)| Ok((name, crate::load::serde_json_to_jaq_value(&value)?)))
             .collect::<Result<Vec<_>>>()?;
-        Self::new(sentinels, temp_file_root, loaded)
+        Self::new(sentinels, temp_file_root, proxy_port, loaded)
     }
 
     pub fn new(
         sentinels: &crate::sentinel::Sentinels,
         temp_file_root: String,
+        proxy_port: Option<u16>,
         loaded: Vec<(String, json::Val)>,
     ) -> Result<Self> {
-        let mut names = Vec::with_capacity(SENTINEL_VAR_NAMES.len() + 1 + loaded.len());
-        let mut values = Vec::with_capacity(SENTINEL_VAR_NAMES.len() + 1 + loaded.len());
+        let proxy_var_count = usize::from(proxy_port.is_some());
+        let mut names =
+            Vec::with_capacity(SENTINEL_VAR_NAMES.len() + 1 + proxy_var_count + loaded.len());
+        let mut values =
+            Vec::with_capacity(SENTINEL_VAR_NAMES.len() + 1 + proxy_var_count + loaded.len());
 
         for (name, value) in [
             (
@@ -85,6 +91,10 @@ impl JaqVars {
         ] {
             names.push(name);
             values.push(value);
+        }
+        if let Some(proxy_port) = proxy_port {
+            names.push(PROXY_PORT_VAR_NAME.to_owned());
+            values.push(serde_json::Value::String(proxy_port.to_string()));
         }
 
         for (name, value) in loaded {
@@ -121,7 +131,7 @@ impl JaqVars {
 }
 
 pub fn jaq_vars_from_sentinels(sentinels: &crate::sentinel::Sentinels) -> Result<JaqVars> {
-    JaqVars::new(sentinels, String::new(), Vec::new())
+    JaqVars::new(sentinels, String::new(), None, Vec::new())
 }
 
 pub fn compile(expr: &str) -> Result<CompiledFilter> {
@@ -340,7 +350,7 @@ mod tests {
     }
 
     fn vars_with_loaded(loaded: Vec<(String, jaq_all::json::Val)>) -> JaqVars {
-        JaqVars::new(&test_sentinels(), String::new(), loaded).expect("vars build")
+        JaqVars::new(&test_sentinels(), String::new(), None, loaded).expect("vars build")
     }
 
     fn sentinel_vars() -> JaqVars {
@@ -511,7 +521,7 @@ mod tests {
     #[test]
     fn eval_env_scripts_injects_sentinel_variables() {
         let sentinels = test_sentinels();
-        let vars = JaqVars::new(&sentinels, String::new(), Vec::new()).expect("vars build");
+        let vars = JaqVars::new(&sentinels, String::new(), None, Vec::new()).expect("vars build");
         let output = eval_env_scripts(&[r#"{"K": $fake_uuid_key}"#.to_owned()], &vars)
             .expect("env scripts eval");
 
@@ -710,6 +720,7 @@ mod tests {
         let vars = JaqVars::new(
             &test_sentinels(),
             "/tmp/harnx-fs-test".to_owned(),
+            None,
             Vec::new(),
         )
         .expect("vars build");
@@ -720,6 +731,27 @@ mod tests {
         let env_output =
             eval_env_scripts(&[r#"{"ROOT": $temp_file_root}"#.to_owned()], &vars).unwrap();
         assert_eq!(env_output.get("ROOT"), Some(&json!("/tmp/harnx-fs-test")));
+    }
+
+    #[test]
+    fn proxy_port_available_in_env_scripts_as_string() {
+        let vars = JaqVars::new(
+            &test_sentinels(),
+            "/tmp/harnx-fs-test".to_owned(),
+            Some(4312),
+            Vec::new(),
+        )
+        .expect("vars build");
+
+        let env_output = eval_env_scripts(
+            &[r#"{"GCE_METADATA_HOST": "127.0.0.1:\($proxy_port)"}"#.to_owned()],
+            &vars,
+        )
+        .unwrap();
+        assert_eq!(
+            env_output.get("GCE_METADATA_HOST"),
+            Some(&json!("127.0.0.1:4312"))
+        );
     }
 
     #[test]
