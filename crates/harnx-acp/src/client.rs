@@ -13,6 +13,7 @@ use agent_client_protocol::schema::{
 use anyhow::{anyhow, bail, Context, Result};
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, PlanEntry, ToolEvent, ToolKind, ToolStatus,
+    UserEvent,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -260,8 +261,19 @@ impl AcpNotificationClient {
                 }
             }
             SessionUpdate::SessionInfoUpdate(_) => unreachable!(),
-            SessionUpdate::UserMessageChunk(_)
-            | SessionUpdate::AvailableCommandsUpdate(_)
+            SessionUpdate::UserMessageChunk(chunk) => {
+                // User turns (e.g. from remote attach/resume history replay)
+                // are rendered as user transcript entries and deliberately
+                // NOT accumulated into `response_text` (`is_agent_message` is
+                // only set for `AgentMessageChunk`).
+                let text = chunk_text(&chunk.content);
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(AgentEvent::User(UserEvent::Message { content: text }))
+                }
+            }
+            SessionUpdate::AvailableCommandsUpdate(_)
             | SessionUpdate::CurrentModeUpdate(_)
             | SessionUpdate::ConfigOptionUpdate(_) => None,
             other => {
@@ -1711,6 +1723,47 @@ mod tests {
             .get("outer-session")
             .expect("session state recorded");
         assert_eq!(state.response_text, expected);
+    }
+
+    /// User-message chunks (e.g. from remote attach/resume history replay) must
+    /// be forwarded as `AgentEvent::User` for rendering, but must NOT be
+    /// accumulated into `response_text` (which forms the next agent's input).
+    #[tokio::test]
+    async fn user_message_chunk_forwards_user_event_without_polluting_response_text() {
+        let sessions = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let chunk_forwarder = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
+        chunk_forwarder.write().await.insert(1, chunk_tx);
+        let (activity_tx, _) = tokio::sync::broadcast::channel(8);
+        let client = AcpNotificationClient::new(
+            "working".to_string(),
+            sessions.clone(),
+            chunk_forwarder,
+            activity_tx,
+        );
+
+        let notification = SessionNotification::new(
+            SessionId::new("outer-session"),
+            SessionUpdate::UserMessageChunk(ContentChunk::new("hello from attach".into())),
+        );
+        client.session_notification(notification).await.unwrap();
+
+        let forwarded = chunk_rx.recv().await.expect("forwarded user chunk");
+        match forwarded {
+            NestedAcpEvent::Agent(AgentEvent::User(UserEvent::Message { content }), _) => {
+                assert_eq!(content, "hello from attach");
+            }
+            other => panic!("unexpected nested ACP event: {other:?}"),
+        }
+
+        // Critically: a user turn must NOT be appended to response_text.
+        let sessions = sessions.read().await;
+        if let Some(state) = sessions.get("outer-session") {
+            assert!(
+                state.response_text.is_empty(),
+                "user message chunk must not accumulate into response_text"
+            );
+        }
     }
 
     /// Regression test for issue #862, thought-chunk path: whitespace-only

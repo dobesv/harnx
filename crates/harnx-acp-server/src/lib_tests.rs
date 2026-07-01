@@ -4,7 +4,7 @@ mod tests {
     use agent_client_protocol::schema::{
         CancelNotification, ContentBlock, NewSessionRequest, PromptRequest, PromptResponse,
     };
-    use harnx_core::event::{AgentEvent, AgentEventSink, ToolEvent, ToolStatus};
+    use harnx_core::event::{AgentEvent, AgentEventSink, ToolEvent, ToolStatus, UserEvent};
     use harnx_runtime::{
         client::{ClientConfig, ModelType, TestStateGuard},
         config::Config,
@@ -370,6 +370,39 @@ mod tests {
             }
             _ => panic!("expected ToolUpdate"),
         }
+    }
+
+    #[test]
+    fn acp_chunk_sink_forwards_non_empty_user_messages_only() {
+        let (tx, mut rx) = unbounded_channel::<AcpForward>();
+        let sink = AcpChunkSink { tx };
+
+        sink.emit(
+            AgentEvent::User(UserEvent::Message {
+                content: "hello user".to_string(),
+            }),
+            None,
+        );
+
+        match rx.try_recv().expect("should forward user text") {
+            AcpForward::UserText(text, source) => {
+                assert_eq!(text, "hello user");
+                assert!(source.is_none());
+            }
+            _ => panic!("expected UserText forward"),
+        }
+
+        sink.emit(
+            AgentEvent::User(UserEvent::Message {
+                content: String::new(),
+            }),
+            None,
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "empty user message should not forward anything"
+        );
     }
 
     #[test]

@@ -907,7 +907,9 @@ impl Tui {
     }
 
     async fn render_agent_event(&mut self, event: AgentEvent, source: Option<AgentSource>) {
-        use harnx_core::event::{ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent};
+        use harnx_core::event::{
+            ModelEvent, NoticeEvent, SessionEvent, ToolEvent, TurnEvent, UserEvent,
+        };
 
         let is_thought = matches!(&event, AgentEvent::Model(ModelEvent::ThoughtChunk { .. }));
         let is_usage = matches!(&event, AgentEvent::Model(ModelEvent::Usage { .. }));
@@ -1012,6 +1014,19 @@ impl Tui {
                 } else {
                     vec![TranscriptItem::SystemText(clean)]
                 }
+            }
+            AgentEvent::User(UserEvent::Message { content }) => {
+                // Replayed/attached history item — NOT a live turn. Use
+                // `timestamp: None` (matching the agent banner) so this row is
+                // excluded from the `LogSeqAssigned` backfill heuristic above,
+                // which only patches "live" items (`timestamp: Some`). A fresh
+                // timestamp would let the next live seq bind to this replayed
+                // row, breaking edit/delete/rewind targeting.
+                vec![TranscriptItem::UserText {
+                    text: content,
+                    seq: None,
+                    timestamp: None,
+                }]
             }
             AgentEvent::Tool(ToolEvent::Completed {
                 output, markdown, ..

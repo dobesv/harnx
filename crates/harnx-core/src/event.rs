@@ -22,6 +22,7 @@ pub enum AgentEvent {
     Turn(TurnEvent),
     Session(SessionEvent),
     Notice(NoticeEvent),
+    User(UserEvent),
     Status(StatusLine),
     Plan { entries: Vec<PlanEntry> },
 }
@@ -147,6 +148,11 @@ pub enum NoticeEvent {
     Info(String),
     Warning(String),
     Error(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UserEvent {
+    Message { content: String },
 }
 
 // --- supporting types --------------------------------------------------------
@@ -334,5 +340,20 @@ mod tests {
         };
         sink.emit(AgentEvent::Turn(TurnEvent::Started), Some(source));
         sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
+    }
+
+    #[test]
+    fn user_event_round_trips_through_serde() {
+        let event = AgentEvent::User(UserEvent::Message {
+            content: "hello from user".into(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: AgentEvent = serde_json::from_str(&json).unwrap();
+        match decoded {
+            AgentEvent::User(UserEvent::Message { content }) => {
+                assert_eq!(content, "hello from user");
+            }
+            other => panic!("wrong variant after round-trip: {other:?}"),
+        }
     }
 }

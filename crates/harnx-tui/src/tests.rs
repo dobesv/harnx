@@ -5,7 +5,7 @@ use crate::types::{ToolCallBody, TranscriptItem, TuiEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, PlanEntry, SessionEvent,
-    ToolEvent, ToolKind, ToolStatus,
+    ToolEvent, ToolKind, ToolStatus, UserEvent,
 };
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::client::{Client, ClientConfig, TestStateGuard};
@@ -8243,6 +8243,46 @@ async fn test_agent_command_leaves_tui_without_session_gap() {
         modal_open,
         "Expected a picker to be open when session is missing!"
     );
+}
+
+#[tokio::test]
+async fn render_agent_event_user_message_produces_user_transcript_entry() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::User(UserEvent::Message {
+            content: "hello from attach".to_string(),
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Replayed/attached user turns must have no live timestamp and no seq, so
+    // they are excluded from the LogSeqAssigned backfill heuristic (which only
+    // patches items with `timestamp: Some`). Binding a live seq to a replayed
+    // row would break edit/delete/rewind targeting.
+    assert!(matches!(
+        tui.app.transcript.last(),
+        Some(TranscriptItem::UserText { text, seq: None, timestamp: None })
+            if text == "hello from attach"
+    ));
+
+    // A subsequent LogSeqAssigned must NOT backfill into the replayed row.
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 42 }),
+        None,
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(
+        tui.app.transcript.last(),
+        Some(TranscriptItem::UserText { seq: None, .. })
+    ));
 }
 
 #[tokio::test]
