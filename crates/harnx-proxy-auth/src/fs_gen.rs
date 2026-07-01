@@ -138,7 +138,7 @@ mod tests {
     }
 
     fn vars(temp_file_root: &str) -> JaqVars {
-        JaqVars::new(&sentinels(), temp_file_root.to_owned(), Vec::new()).unwrap()
+        JaqVars::new(&sentinels(), temp_file_root.to_owned(), None, Vec::new()).unwrap()
     }
 
     #[test]
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn temp_file_root_empty_without_fs() {
-        let vars = JaqVars::new(&sentinels(), String::new(), Vec::new()).unwrap();
+        let vars = JaqVars::new(&sentinels(), String::new(), None, Vec::new()).unwrap();
         let output =
             crate::filter::eval_env_scripts(&[r#"{"ROOT": $temp_file_root}"#.to_owned()], &vars)
                 .unwrap();

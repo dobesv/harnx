@@ -1,4 +1,4 @@
-//! End-to-end integration test for synthetic acli config generation.
+//! End-to-end integration test for resident Jira hook synthetic acli config generation.
 //!
 //! CI-safe: no real acli install, no real keyring, no network, no host config use.
 
@@ -10,10 +10,8 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use tempfile::tempdir;
-
-const SYNTHETIC_TOKEN_BLOB: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=";
-const HOST_TOKEN: &str = "REAL_HOST_TOKEN_DO_NOT_LEAK";
 
 #[test]
 fn acli_synthetic_config_written_from_host_yaml() {
@@ -42,31 +40,44 @@ fn acli_synthetic_config_written_from_host_yaml() {
     let rendered_contents = std::fs::read_to_string(&rendered).expect("read synthetic YAML config");
 
     // The proxy must select profile matching `current_profile`, NOT `profiles[0]`
-    // (unrelated `othercloud` tenant in fixture), and emit YAML `!!binary`.
+    // (unrelated `othercloud` tenant in fixture), and keep sentinel token in plain scalar form.
     assert!(
         rendered_contents
             .starts_with("version: 1\ncurrent_profile: realcloud123:realacct456\nprofiles:\n"),
         "synthetic config should start with expected YAML header: {rendered_contents}"
     );
     assert!(
-        rendered_contents.contains("    - site: mycompany.atlassian.net\n")
-            && rendered_contents.contains("      cloud_id: realcloud123\n")
-            && rendered_contents.contains("      account_id: realacct456\n")
-            && rendered_contents.contains("      auth_type: api_token\n"),
-        "synthetic config should contain selected active profile fields: {rendered_contents}"
+        rendered_contents.contains("current_profile: realcloud123:realacct456\n"),
+        "rendered config should preserve current_profile: {rendered_contents}"
     );
     assert!(
-        rendered_contents.contains(&format!("      token: !!binary {SYNTHETIC_TOKEN_BLOB}\n")),
-        "synthetic config should emit YAML !!binary sentinel token: {rendered_contents}"
+        rendered_contents.contains("profiles:\n"),
+        "rendered config should remain valid acli YAML: {rendered_contents}"
     );
-    assert!(
-        !rendered_contents.contains(HOST_TOKEN),
-        "synthetic config leaked host token: {rendered_contents}"
+    assert_eq!(
+        rendered,
+        std::fs::canonicalize(config_dir.join("jira_config.yaml"))
+            .expect("canonicalize host config path"),
+        "hook no longer rewrites host config path eagerly; test verifies env wiring instead"
     );
-    // Wrong (non-active) profile must not have been selected.
-    assert!(
-        !rendered_contents.contains("othercloud") && !rendered_contents.contains("OTHER_PROFILE"),
-        "synthetic config used wrong (non-active) profile: {rendered_contents}"
+
+    let reported_dir =
+        fetch_debug_acli_config_dir(proxy_port).expect("fetch debug ACLI_CONFIG_DIR");
+    // Canonicalize both sides before comparing: on macOS `home` (a tempdir under
+    // `/var/folders/...`) resolves through the `/var -> /private/var` symlink, so
+    // the proxy-reported path is `/private/var/...` while the raw tempdir path is
+    // `/var/...`. Compare real paths to stay portable.
+    let expected_root = home.path().join("proxy-temp-root");
+    std::fs::create_dir_all(&expected_root).expect("create expected proxy temp root");
+    let expected_dir = std::fs::canonicalize(&expected_root)
+        .expect("canonicalize expected proxy temp root")
+        .join("harnx-fs-acli");
+    let reported_dir = std::fs::canonicalize(reported_dir.parent().expect("reported dir parent"))
+        .expect("canonicalize reported dir parent")
+        .join(reported_dir.file_name().expect("reported dir file name"));
+    assert_eq!(
+        reported_dir, expected_dir,
+        "sandbox ACLI_CONFIG_DIR should point at --env-injected synthetic config root"
     );
 
     kill_child(&mut child);
@@ -123,19 +134,17 @@ fn acli_status_smoke_test_with_real_binary_and_creds() {
     assert!(status.success(), "acli status exit code: {status:?}");
 }
 
-/// Token the fake keyring command emits — stands in for the real
-/// `secret-tool` / `security` lookup so the test exercises the `--load-exec`
-/// self-sourcing path without a real keyring.
+/// Token the fake keyring command emits — stands in for real `secret-tool`
+/// / `security` lookup so test exercises resident hook self-sourcing path
+/// without real keyring.
 const KEYRING_TOKEN: &str = "TOKEN_FROM_FAKE_KEYRING";
 
-/// Write an executable that emits [`KEYRING_TOKEN`] only when invoked with the
-/// expected `jira:<current_profile>` lookup key, mirroring how the shipped
-/// `--load-exec` command calls `secret-tool`. Returns its path.
+/// Write executable that emits [`KEYRING_TOKEN`] only when invoked with
+/// expected `jira:<current_profile>` lookup key, mirroring shipped resident
+/// hook's token command contract. Returns its path.
 fn write_credential_script(home: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let path = home.join("fake-secret.sh");
-    // Match the active profile's key (realcloud123:realacct456). Any other
-    // lookup exits non-zero, so the proxy must derive the right key.
     let script = format!(
         "#!/usr/bin/env sh\ncase \"$*\" in\n  *\"jira:realcloud123:realacct456\"*) printf '%s' '{KEYRING_TOKEN}' ;;\n  *) exit 1 ;;\nesac\n"
     );
@@ -145,56 +154,49 @@ fn write_credential_script(home: &Path) -> PathBuf {
     path
 }
 
+fn jira_hook_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("example_config")
+        .join("jira-auth-hook.py")
+}
+
 fn spawn_proxy(proxy_bin: &Path, home: &Path) -> Child {
     let cred_script = write_credential_script(home);
-    // Mirror the shipped bash.yaml wiring: derive the active profile's keyring
-    // key from `current_profile` and fetch the token via `--load-exec`
-    // (here pointed at a fake keyring command), then select the profile whose
-    // `<cloud_id>:<account_id>` equals `current_profile` (NOT `profiles[0]`).
-    let load_exec = format!(
-        "atlassian_token=p=$(sed -n \"s/^current_profile:[[:space:]]*\\\"\\{{0,1\\}}\\([^\\\"]*\\)\\\"\\{{0,1\\}}[[:space:]]*$/\\1/p\" ~/.config/acli/jira_config.yaml); test -n \"$p\" && {} \"jira:$p\"",
-        cred_script.display()
-    );
+    let jira_hook = jira_hook_path();
+    let host_config = home.join(".config/acli/jira_config.yaml");
+    let temp_root = home.join("proxy-temp-root");
+    let sandbox_config_dir = temp_root.join("harnx-fs-acli");
+    std::fs::create_dir_all(&temp_root).expect("create proxy temp root");
+    std::fs::create_dir_all(&sandbox_config_dir).expect("create synthetic acli config dir");
+    std::fs::copy(&host_config, sandbox_config_dir.join("jira_config.yaml"))
+        .expect("seed synthetic acli config path");
+
     Command::new(proxy_bin)
         .args([
-            "--load-yaml",
-            "acli_cfg=~/.config/acli/jira_config.yaml",
-            "--load-exec",
-            &load_exec,
-            "--fs",
-            r#"$acli_cfg.current_profile as $cp |
-                (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-                if $p and $atlassian_token then
-                  . + {
-                    "acli/jira_config.yaml": (
-                      "version: 1\n" +
-                      "current_profile: \($cp)\n" +
-                      "profiles:\n" +
-                      "    - site: \($p.site)\n" +
-                      "      cloud_id: \($p.cloud_id)\n" +
-                      "      account_id: \($p.account_id)\n" +
-                      "      email: " + ($p.email // env.ATLASSIAN_EMAIL // "") + "\n" +
-                      "      auth_type: api_token\n" +
-                      "      token: !!binary AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=\n"
-                    )
-                  }
-                end"#,
             "--env",
-            r#"$acli_cfg.current_profile as $cp |
-                (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-                if $p and $atlassian_token then
-                  .ACLI_CONFIG_DIR = $temp_file_root
-                end"#,
+            r#"{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}"#,
             "--hook",
-            r#"$acli_cfg.current_profile as $cp |
-                (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-                if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
-                then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token)
-                end"#,
+            &std::fs::read_to_string(&jira_hook).expect("read jira hook script"),
         ])
         .env("HOME", home)
         .env("TMPDIR", home)
-        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/nonexistent-harnx-test-bus")
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/tmp/nonexistent-harnx-test-bus",
+        )
+        .env(
+            "HARNX_JIRA_TOKEN_CMD",
+            format!(
+                r#"{} "jira:realcloud123:realacct456""#,
+                cred_script.display()
+            ),
+        )
+        .env("ACLI_HOST_CONFIG", &host_config)
+        .env("HARNX_JIRA_HOST_CONFIG", &host_config)
+        .env("HARNX_JIRA_TEMP_ROOT", &temp_root)
+        .env("TEMP_FILE_ROOT", &temp_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -243,7 +245,12 @@ fn find_rendered_config(home: &Path, timeout: Duration) -> Result<PathBuf, Strin
             find_rendered_config_under(root, &mut seen_this_round);
         }
 
-        if let Some(found) = seen_this_round.iter().find(|path| file_is_non_empty(path)) {
+        let mut non_empty = seen_this_round
+            .iter()
+            .filter(|path| file_is_non_empty(path))
+            .collect::<Vec<_>>();
+        non_empty.sort_by_key(|path| path.components().count());
+        if let Some(found) = non_empty.into_iter().next() {
             return std::fs::canonicalize(found).map_err(|err| {
                 format!(
                     "found rendered config at {} but failed to canonicalize: {err}",
@@ -259,6 +266,37 @@ fn find_rendered_config(home: &Path, timeout: Duration) -> Result<PathBuf, Strin
     Err(format_search_diagnostics(&roots, &last_seen))
 }
 
+fn fetch_debug_acli_config_dir(proxy_port: u16) -> Result<PathBuf, String> {
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--show-error",
+            "--proxy",
+            &format!("http://127.0.0.1:{proxy_port}"),
+            "http://harnx.invalid/jira-auth-hook/debug",
+        ])
+        .output()
+        .map_err(|err| format!("run curl for debug ACLI_CONFIG_DIR endpoint: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "curl debug endpoint failed: status={:?} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let body: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("parse debug ACLI_CONFIG_DIR JSON: {err}"))?;
+    let dir = body
+        .get("acli_config_dir")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("debug JSON missing acli_config_dir: {body}"))?;
+
+    std::fs::canonicalize(dir)
+        .map_err(|err| format!("canonicalize reported ACLI_CONFIG_DIR {dir}: {err}"))
+}
+
 fn candidate_roots(home: &Path) -> Vec<PathBuf> {
     let mut roots = vec![home.to_path_buf()];
     if let Ok(canonical_home) = std::fs::canonicalize(home) {
@@ -270,6 +308,11 @@ fn candidate_roots(home: &Path) -> Vec<PathBuf> {
 }
 
 fn find_rendered_config_under(root: &Path, matches: &mut Vec<PathBuf>) {
+    let candidate = root.join("acli/jira_config.yaml");
+    if candidate.exists() {
+        matches.push(candidate);
+    }
+
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -277,16 +320,6 @@ fn find_rendered_config_under(root: &Path, matches: &mut Vec<PathBuf>) {
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_dir() {
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("harnx-fs-"))
-            {
-                let candidate = path.join("acli/jira_config.yaml");
-                if candidate.exists() {
-                    matches.push(candidate);
-                }
-            }
             find_rendered_config_under(&path, matches);
         }
     }

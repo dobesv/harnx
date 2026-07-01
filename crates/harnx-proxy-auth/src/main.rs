@@ -4,7 +4,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 
-use harnx_proxy_auth::{ca, cli, exec_load, filter, fs_gen, hook, load, proxy, sentinel};
+use harnx_proxy_auth::{
+    ca, cli, exec_load, filter, fs_gen, hook, load, proxy, sentinel,
+    transform::{build_stages, TransformPipeline},
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -15,7 +18,6 @@ async fn main() -> Result<()> {
         .init();
 
     let args = <cli::Args as Parser>::parse();
-    let filter_expr = args.combined_filter();
     let sentinels = Arc::new(sentinel::Sentinels::generate());
     let load_specs = load::parse_load_specs(&args.load_yaml, &args.load_json, &args.load_raw)?;
     let loaded_vars: Vec<(String, jaq_all::json::Val)> = load_specs
@@ -52,16 +54,24 @@ async fn main() -> Result<()> {
     let jaq_vars = Arc::new(filter::JaqVars::new_from_values(
         &sentinels,
         temp_file_root.clone(),
-        loaded_vars,
+        None,
+        loaded_vars.clone(),
     )?);
-    let filter = filter::compile_with_vars(&filter_expr, &jaq_vars)?;
+    let stages = build_stages(&args.hook, &jaq_vars, args.hook_timeout_secs)?;
+    let pipeline = Arc::new(TransformPipeline::new(stages));
     fs_gen::eval_and_write_files(&args.fs, &jaq_vars, &temp_file_root)?;
-    let extra_env = filter::eval_env_scripts(&args.env, &jaq_vars)?;
 
     let (ca_setup, _ca_temp_dir) = ca::setup()?;
     let ca_cert_path = ca_setup.cert_pem_path.clone();
     let ca_cert_pem = std::fs::read_to_string(&ca_cert_path)?;
-    let port = proxy::start_proxy_with_log(filter, ca_setup, jaq_vars, args.log_file).await?;
+    let port = proxy::start_proxy_with_log(pipeline, ca_setup, args.log_file).await?;
+    let env_vars = filter::JaqVars::new_from_values(
+        &sentinels,
+        temp_file_root.clone(),
+        Some(port),
+        loaded_vars.clone(),
+    )?;
+    let extra_env = filter::eval_env_scripts(&args.env, &env_vars)?;
 
     // Write readiness lines then explicitly drop the lock before entering the
     // async JSONL loop. Holding a std::io::StdoutLock across an .await would

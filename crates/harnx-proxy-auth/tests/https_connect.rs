@@ -23,14 +23,27 @@ use tokio::time::{sleep, timeout, Duration};
 use tokio_rustls::rustls::{self, pki_types};
 use tokio_rustls::TlsAcceptor;
 
-use harnx_proxy_auth::{ca, filter, proxy};
+use harnx_proxy_auth::{
+    ca, filter, proxy,
+    transform::{Stage, TransformPipeline},
+};
 fn jaq_vars(
     sentinels: &Arc<harnx_proxy_auth::sentinel::Sentinels>,
 ) -> Arc<harnx_proxy_auth::filter::JaqVars> {
     Arc::new(
-        harnx_proxy_auth::filter::JaqVars::new(sentinels, String::new(), Vec::new())
+        harnx_proxy_auth::filter::JaqVars::new(sentinels, String::new(), None, Vec::new())
             .expect("jaq vars"),
     )
+}
+
+fn jaq_pipeline(
+    expr: &str,
+    vars: Arc<harnx_proxy_auth::filter::JaqVars>,
+) -> Arc<TransformPipeline> {
+    Arc::new(TransformPipeline::new(vec![Stage::Jaq {
+        filter: Arc::new(filter::compile_with_vars(expr, &vars).expect("compile filter")),
+        vars,
+    }]))
 }
 
 /// Starts an HTTPS test server using the provided cert+key (DER-encoded).
@@ -122,18 +135,14 @@ async fn header_injection_works_through_https_connect_tunnel() {
         // Compile the jq filter that injects a test header for localhost.
         let filter_expr =
             r#"if .host == "localhost" then .headers["x-test-header"] = "hello-world" end"#;
-        let compiled = filter::compile(filter_expr).expect("compile filter");
         let sentinels = Arc::new(harnx_proxy_auth::sentinel::Sentinels::generate());
+        let pipeline = jaq_pipeline(filter_expr, jaq_vars(&sentinels));
 
         // Start the proxy with danger_accept_invalid_certs so it can connect
         // upstream to our self-signed test server.
-        let proxy_port = proxy::start_proxy_danger_accept_invalid_certs(
-            compiled,
-            ca_setup,
-            jaq_vars(&sentinels),
-        )
-        .await
-        .expect("start proxy");
+        let proxy_port = proxy::start_proxy_danger_accept_invalid_certs(pipeline, ca_setup)
+            .await
+            .expect("start proxy");
 
         sleep(Duration::from_millis(100)).await;
 
@@ -216,12 +225,11 @@ async fn hook_filter_can_use_sentinel_variables() {
         // Compile the jq filter that checks the sentinel jaq variable directly.
         let filter_expr =
             r#"if .headers.authorization == "Bearer ghs_\($fake_base64_key)" then .headers.authorization = "Bearer real_token_from_env" else . end"#;
-        let compiled = filter::compile(filter_expr).expect("compile filter");
+        let pipeline = jaq_pipeline(filter_expr, jaq_vars(&sentinels));
 
         // Start the proxy with danger_accept_invalid_certs so it can connect
         // upstream to our self-signed test server.
-        let proxy_port =
-            proxy::start_proxy_danger_accept_invalid_certs(compiled, ca_setup, jaq_vars(&sentinels))
+        let proxy_port = proxy::start_proxy_danger_accept_invalid_certs(pipeline, ca_setup)
             .await
             .expect("start proxy");
 

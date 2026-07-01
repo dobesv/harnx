@@ -77,7 +77,7 @@ toolsets:
 # `if COND then EXPR end` — omitting `else` passes the input through unchanged when
 # the condition is false (equivalent to `else .` in jaq but cleaner).
 #
-# Example: GitHub auth injection (git over HTTPS + GitHub API + uploads)
+# Example: GitHub PAT auth injection (git over HTTPS + GitHub API + uploads)
 #
 # hooks:
 #   entries:
@@ -102,8 +102,14 @@ toolsets:
 # token never enters the sandbox — harnx-proxy-auth reads it from the host env
 # and injects it into outbound HTTP auth headers.
 #
-# Example: Atlassian (Jira/Confluence) auth injection
-# Sources credentials from the host OS keyring using --load-exec.
+# Example: GitHub App auth injection (resident hook mints + caches installation token)
+# Requires host env: GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, and either
+# GITHUB_APP_INSTALLATION_ID or GITHUB_OWNER/GITHUB_REPO (or GITHUB_ORG).
+# Optional scoping env vars:
+#   GITHUB_APP_REPOSITORIES='["repo-one","repo-two"]'
+#   GITHUB_APP_PERMISSIONS='{"contents":"read","pull_requests":"write"}'
+# Optional test/advanced override: GITHUB_APP_INSTALLATION_TOKEN short-circuits
+# live GitHub exchange and stays proxy-side only.
 #
 # hooks:
 #   entries:
@@ -112,22 +118,51 @@ toolsets:
 #     matcher: "bash_exec|bash_spawn"
 #     command: >-
 #       harnx-proxy-auth
-#       --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
-#       --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
-#       --fs '$acli_cfg.current_profile as $cp |
-#           (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-#           if $p and $atlassian_token then
-#             . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
-#               profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
-#                 token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
-#           end'
-#       --env '$acli_cfg.current_profile as $cp |
-#           (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-#           if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
-#       --hook '$acli_cfg.current_profile as $cp |
-#           (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-#           if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
-#           then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
+#       --hook ./example_config/github-app-auth-hook.py
+#       # Inline shebang script content also works.
+#
+# Example: Atlassian (Jira/Confluence) auth injection
+# One resident hook handles whole acli workaround once: read host jira_config.yaml,
+# select profile matching current_profile, fetch real token from host keyring, write
+# private synthetic acli config with sentinel token, set ACLI_CONFIG_DIR, and swap in
+# real Authorization header only for api.atlassian.com / active site host.
+#
+# hooks:
+#   entries:
+#   - event: PreToolUse
+#     type: claude-command-persistent
+#     matcher: "bash_exec|bash_spawn"
+#     command: >-
+#       harnx-proxy-auth
+#       --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+#       --hook ./example_config/jira-auth-hook.py
+#
+# Example: GCP auth injection for Node ADC / BigQuery-style clients
+# Resident hook injects metadata endpoints into sandbox env, so Google client libs
+# discover ADC without credential files. Sandbox gets only proxy metadata hints;
+# proxy-side hook mints real token on demand and rewrites outbound Authorization
+# on *.googleapis.com requests (for example BigQuery HTTPS) with real scoped token.
+# Result: Node ADC works file-free, real Google credential stays outside sandbox,
+# and sandbox cannot reuse token beyond proxied calls.
+#
+# Optional host env:
+#   HARNX_GCP_TOKEN_CMD                      token source command
+#     default: gcloud auth print-access-token
+#   HARNX_GCP_SA                             service account for impersonation
+#   HARNX_GCP_TOKEN_CMD='gcloud auth print-access-token --impersonate-service-account=$HARNX_GCP_SA'
+#     use impersonation/scoping without exposing reusable Google credential in sandbox
+#
+# hooks:
+#   entries:
+#   - event: PreToolUse
+#     type: claude-command-persistent
+#     matcher: "bash_exec|bash_spawn"
+#     command: >-
+#       harnx-proxy-auth
+#       --env '{"GCE_METADATA_HOST":"127.0.0.1:\($proxy_port)","METADATA_SERVER_DETECTION":"assume-present"}'
+#       # Optional: add GOOGLE_CLOUD_PROJECT in same --env object.
+#       # --env '{"GCE_METADATA_HOST":"127.0.0.1:\($proxy_port)","METADATA_SERVER_DETECTION":"assume-present","GOOGLE_CLOUD_PROJECT":"<id>"}'
+#       --hook ./example_config/gcp-auth-hook.py
 #
 # Both can be combined into a single harnx-proxy-auth invocation with multiple
 # --env and --hook flags. See docs/sandbox-run.md for full claude-sb / gemini-sb

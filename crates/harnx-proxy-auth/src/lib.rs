@@ -1,5 +1,6 @@
 pub mod ca;
 pub mod cli;
+pub mod exec_hook;
 pub mod exec_load;
 pub mod filter;
 pub mod fs_gen;
@@ -7,6 +8,7 @@ pub mod hook;
 pub mod load;
 pub mod proxy;
 pub mod sentinel;
+pub mod transform;
 
 /// Decode a standard base64 string to bytes.
 /// Used by integration tests to decode the CA cert from the `CA_CERT_PEM_B64` readiness line.

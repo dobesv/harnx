@@ -267,6 +267,93 @@ mod tests {
     }
 
     #[test]
+    fn gcp_metadata_env_from_extra_env_is_injected() {
+        let input = Some(json!({"command": "node app.js"}));
+        let extra_env = Map::from_iter([
+            (
+                String::from("GCE_METADATA_HOST"),
+                json!(format!("127.0.0.1:{PROXY_PORT}")),
+            ),
+            (
+                String::from("METADATA_SERVER_DETECTION"),
+                json!("assume-present"),
+            ),
+            (String::from("GOOGLE_CLOUD_PROJECT"), json!("demo-project")),
+        ]);
+
+        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &extra_env);
+
+        assert_eq!(
+            actual["env"]["GCE_METADATA_HOST"],
+            json!(format!("127.0.0.1:{PROXY_PORT}"))
+        );
+        assert_eq!(
+            actual["env"]["METADATA_SERVER_DETECTION"],
+            json!("assume-present")
+        );
+        assert_eq!(actual["env"]["GOOGLE_CLOUD_PROJECT"], json!("demo-project"));
+        assert_eq!(
+            actual["env"]["HTTPS_PROXY"],
+            json!(format!("http://127.0.0.1:{PROXY_PORT}"))
+        );
+        assert!(actual["env"]
+            .get("GOOGLE_APPLICATION_CREDENTIALS")
+            .is_none());
+    }
+
+    #[test]
+    fn gcp_metadata_env_is_absent_without_extra_env() {
+        let input = Some(json!({"command": "node app.js"}));
+
+        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &Map::new());
+
+        assert!(actual["env"].get("GCE_METADATA_HOST").is_none());
+        assert!(actual["env"].get("METADATA_SERVER_DETECTION").is_none());
+        assert!(actual["env"].get("GOOGLE_CLOUD_PROJECT").is_none());
+        assert!(actual["env"]
+            .get("GOOGLE_APPLICATION_CREDENTIALS")
+            .is_none());
+    }
+
+    #[test]
+    fn tool_input_env_takes_precedence_over_gcp_metadata_env() {
+        let input = Some(json!({
+            "command": "node app.js",
+            "env": {
+                "GCE_METADATA_HOST": "operator-host:9000",
+                "METADATA_SERVER_DETECTION": "ping-only",
+                "GOOGLE_CLOUD_PROJECT": "operator-project"
+            }
+        }));
+        let extra_env = Map::from_iter([
+            (
+                String::from("GCE_METADATA_HOST"),
+                json!(format!("127.0.0.1:{PROXY_PORT}")),
+            ),
+            (
+                String::from("METADATA_SERVER_DETECTION"),
+                json!("assume-present"),
+            ),
+            (String::from("GOOGLE_CLOUD_PROJECT"), json!("flag-project")),
+        ]);
+
+        let actual = augment_tool_input(input, PROXY_PORT, CA_CERT_PATH, &extra_env);
+
+        assert_eq!(
+            actual["env"]["GCE_METADATA_HOST"],
+            json!("operator-host:9000")
+        );
+        assert_eq!(
+            actual["env"]["METADATA_SERVER_DETECTION"],
+            json!("ping-only")
+        );
+        assert_eq!(
+            actual["env"]["GOOGLE_CLOUD_PROJECT"],
+            json!("operator-project")
+        );
+    }
+
+    #[test]
     fn jsonl_round_trip_augments_bash_request() {
         let line = r#"{"id":"req-1","tool_name":"bash_exec","tool_input":{"command":"curl https://example.com","env":{"FOO":"bar"}}}"#;
 
