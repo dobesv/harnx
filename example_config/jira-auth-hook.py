@@ -2,6 +2,7 @@
 import base64
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ SENTINEL_TOKEN_BLOB = (
     "MGZiM2EzYTRhMWY="
 )
 TOKEN_CMD_ENV = "HARNX_JIRA_TOKEN_CMD"
-DEFAULT_TOKEN_CMD = 'secret-tool lookup service acli username "jira:{current_profile}"'
+DEFAULT_TOKEN_CMD = 'secret-tool lookup service acli username {profile_arg}'
 HOST_CONFIG_ENV_NAMES = ["ACLI_HOST_CONFIG", "HARNX_JIRA_HOST_CONFIG"]
 DEFAULT_HOST_CONFIG = "~/.config/acli/jira_config.yaml"
 TEMP_ROOT_ENV_NAMES = ["HARNX_JIRA_TEMP_ROOT", "TEMP_FILE_ROOT", "TMPDIR", "TMP", "TEMP"]
@@ -103,7 +104,7 @@ def resolve_temp_root():
 
 
 def lookup_token(current_profile):
-    token_cmd = os.environ.get(TOKEN_CMD_ENV, DEFAULT_TOKEN_CMD.format(current_profile=current_profile))
+    token_cmd = os.environ.get(TOKEN_CMD_ENV, DEFAULT_TOKEN_CMD.format(profile_arg=shlex.quote(f"jira:{current_profile}")))
     try:
         completed = subprocess.run(
             token_cmd,

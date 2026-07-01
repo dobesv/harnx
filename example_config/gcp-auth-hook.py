@@ -7,6 +7,8 @@ import time
 
 TOKEN_CMD_ENV = "HARNX_GCP_TOKEN_CMD"
 DEFAULT_TOKEN_CMD = "gcloud auth print-access-token"
+TOKEN_CMD_TIMEOUT_ENV = "HARNX_GCP_TOKEN_CMD_TIMEOUT_SECONDS"
+DEFAULT_TOKEN_CMD_TIMEOUT_SECONDS = 10
 DEFAULT_TOKEN_TTL_SECONDS = 55 * 60
 REFRESH_SKEW_SECONDS = 60
 
@@ -29,6 +31,33 @@ def is_google_api_host(host):
     return any(host == suffix or host.endswith("." + suffix) for suffix in GOOGLE_API_HOST_SUFFIXES)
 
 
+def reset_cached_token():
+    global _cached_token, _cached_expiry
+    _cached_token = None
+    _cached_expiry = 0.0
+
+
+def token_cmd_timeout_seconds():
+    raw_value = os.environ.get(TOKEN_CMD_TIMEOUT_ENV)
+    if raw_value is None:
+        return DEFAULT_TOKEN_CMD_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw_value)
+    except ValueError:
+        log(
+            f"invalid {TOKEN_CMD_TIMEOUT_ENV} value {raw_value!r}; "
+            f"using default timeout={DEFAULT_TOKEN_CMD_TIMEOUT_SECONDS}s"
+        )
+        return DEFAULT_TOKEN_CMD_TIMEOUT_SECONDS
+    if timeout <= 0:
+        log(
+            f"non-positive {TOKEN_CMD_TIMEOUT_ENV} value {raw_value!r}; "
+            f"using default timeout={DEFAULT_TOKEN_CMD_TIMEOUT_SECONDS}s"
+        )
+        return DEFAULT_TOKEN_CMD_TIMEOUT_SECONDS
+    return timeout
+
+
 def mint_token():
     global _cached_token, _cached_expiry
 
@@ -37,6 +66,7 @@ def mint_token():
         return _cached_token
 
     token_cmd = os.environ.get(TOKEN_CMD_ENV, DEFAULT_TOKEN_CMD)
+    timeout_seconds = token_cmd_timeout_seconds()
     try:
         completed = subprocess.run(
             token_cmd,
@@ -45,18 +75,21 @@ def mint_token():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=timeout_seconds,
         )
+    except subprocess.TimeoutExpired as exc:
+        log(f"token command timed out after {exc.timeout}s: {exc.__class__.__name__}")
+        reset_cached_token()
+        return None
     except Exception as exc:
-        log(f"token command failed: {token_cmd!r}: {exc}")
-        _cached_token = None
-        _cached_expiry = 0.0
+        log(f"token command failed: {exc.__class__.__name__}: {exc}")
+        reset_cached_token()
         return None
 
     token = completed.stdout.strip()
     if not token:
-        log(f"token command produced empty stdout: {token_cmd!r}")
-        _cached_token = None
-        _cached_expiry = 0.0
+        log("token command produced empty stdout")
+        reset_cached_token()
         return None
 
     _cached_token = token
@@ -145,13 +178,20 @@ def main():
         if not raw_line:
             continue
         request_id = None
+        request_host = ""
+        request_path = ""
         try:
             request = json.loads(raw_line)
             if isinstance(request, dict):
                 request_id = request.get("id")
+                request_host = request.get("host") or ""
+                request_path = request.get("path") or ""
             response = handle_request(request)
         except Exception as exc:
-            log(f"request handling failed: {exc}; line={raw_line!r}")
+            log(
+                f"request handling failed: {exc.__class__.__name__}: {exc}; "
+                f"id={request_id!r} host={request_host!r} path={request_path!r}"
+            )
             if request_id is None:
                 continue
             response = {"id": request_id}

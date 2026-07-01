@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -57,7 +58,17 @@ def emit(response):
 
 
 def get_api_base():
-    return os.environ.get(API_BASE_ENV, DEFAULT_API_BASE).rstrip("/")
+    value = os.environ.get(API_BASE_ENV, DEFAULT_API_BASE).rstrip("/")
+    parsed = urllib.parse.urlparse(value)
+    if not parsed.scheme or not parsed.netloc:
+        raise RuntimeError(
+            f"{API_BASE_ENV} is not a valid URL: {value!r} (missing scheme or host)"
+        )
+    if parsed.scheme not in ("http", "https"):
+        raise RuntimeError(
+            f"{API_BASE_ENV} has unsupported scheme: {parsed.scheme!r} (expected http or https)"
+        )
+    return value
 
 
 def normalize_host(host):
@@ -303,7 +314,9 @@ def main():
                 request_id = request.get("id")
             response = handle_request(request)
         except Exception as exc:
-            log(f"request handling failed: {exc}; line={raw_line!r}")
+            # Fail closed: do not log raw request line (may contain sensitive data)
+            # Log only non-sensitive diagnostics
+            log(f"request handling failed: {type(exc).__name__}")
             if request_id is None:
                 continue
             response = {"id": request_id}

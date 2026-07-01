@@ -116,19 +116,31 @@ mod imp {
             let (tx, rx) = oneshot::channel();
             runtime.pending.lock().await.insert(id.clone(), tx);
 
-            let send_result = async {
+            let send_result = tokio::time::timeout(self.timeout, async {
                 let mut stdin = runtime.stdin.lock().await;
                 stdin.write_all(line.as_bytes()).await?;
                 stdin.flush().await?;
                 Ok::<(), std::io::Error>(())
-            }
+            })
             .await;
 
-            if let Err(err) = send_result {
-                runtime.pending.lock().await.remove(&id);
-                warn!("Exec hook write failed for `{id}`: {err}");
-                self.mark_dead().await;
-                return original;
+            match send_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    runtime.pending.lock().await.remove(&id);
+                    warn!("Exec hook write failed for `{id}`: {err}");
+                    self.mark_dead().await;
+                    return original;
+                }
+                Err(_) => {
+                    runtime.pending.lock().await.remove(&id);
+                    warn!(
+                        "Exec hook write timed out for `{id}` after {:?}",
+                        self.timeout
+                    );
+                    self.mark_dead().await;
+                    return original;
+                }
             }
 
             match tokio::time::timeout(self.timeout, rx).await {
