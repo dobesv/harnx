@@ -264,6 +264,8 @@ async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
         call_fn: Some(call_fn),
         lease: None,
         after_seq_observer: None,
+        header_insert_observer: None,
+        session_index: None,
         on_tool_round: None,
     })
     .await
@@ -1062,6 +1064,8 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
             call_fn: Some(counting_stub_call_fn(Arc::new(AtomicUsize::new(0)))),
             lease: None,
             after_seq_observer: None,
+            header_insert_observer: None,
+            session_index: None,
             on_tool_round: None,
         }
         .with_lease(lease),

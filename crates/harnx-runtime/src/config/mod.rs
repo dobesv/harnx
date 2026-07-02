@@ -12,6 +12,7 @@ mod patches_split;
 mod paths_split;
 mod persistence_split;
 mod rag_split;
+pub mod remote_session_ops;
 mod servers_split;
 pub mod session;
 mod session_dump;
@@ -19,6 +20,7 @@ mod session_externalize;
 mod session_log_split;
 pub mod session_meta;
 mod session_ops_compaction;
+mod session_ops_core;
 mod session_ops_split;
 mod settings_split;
 

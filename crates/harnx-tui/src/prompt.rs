@@ -188,10 +188,17 @@ impl Tui {
         let sink = Arc::new(TuiAgentEventSink::new(event_tx.clone()));
 
         // Build thin-client config
+        // Extract session id before any await to avoid holding the read lock.
+        let session_id = ctx
+            .config
+            .read()
+            .session
+            .as_ref()
+            .map(|s| s.id().to_string());
         let thin_config = ThinClientConfig {
             cluster,
             agent,
-            session_id: None, // New session for this turn
+            session_id,
         };
 
         // Create the thin-client session

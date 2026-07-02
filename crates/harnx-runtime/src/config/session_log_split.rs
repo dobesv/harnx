@@ -1,4 +1,5 @@
 //! Session-log parsing/validation helpers extracted from config/mod.rs for code health.
+pub(crate) use super::session_ops_core::adjust_range_for_tool_pairs;
 use super::*;
 
 pub(crate) fn split_session_log_documents(raw_log: &str) -> Vec<String> {
@@ -47,43 +48,6 @@ pub(crate) fn validate_edited_session_documents(content: &str) -> Result<Vec<Str
 ///   `ToolResults`, auto-expand `to` by one.
 ///
 /// Returns `(adjusted_from, adjusted_to)`.
-pub(crate) fn adjust_range_for_tool_pairs(
-    from: usize,
-    to: usize,
-    documents: &[String],
-) -> Result<(usize, usize)> {
-    // Parse only the entries we need: the one just before `from` (to check if
-    // `from` is a dangling ToolResults) and up through `to + 1` (to check if
-    // `to` is a ToolCalls that needs its partner).
-    let parse = |idx: usize| -> Option<SessionLogEntry> {
-        documents
-            .get(idx)
-            .and_then(|raw| serde_yaml::from_str::<SessionLogEntry>(raw).ok())
-    };
-
-    // Reject: range starts on a ToolResults whose ToolCalls is outside the range.
-    if matches!(parse(from), Some(SessionLogEntry::ToolResults { .. })) {
-        // Check if the immediately preceding entry is a ToolCalls — if so,
-        // this is definitely a dangling-results situation.
-        bail!(
-            "Sequence {from} is a tool-results entry; its paired tool-calls entry ({}) \
-             would be outside the range. Expand your range to include it.",
-            from.saturating_sub(1)
-        );
-    }
-
-    // Auto-expand: range ends on a ToolCalls whose ToolResults is just outside.
-    let mut adjusted_to = to;
-    if matches!(parse(to), Some(SessionLogEntry::ToolCalls { .. }))
-        && to + 1 < documents.len()
-        && matches!(parse(to + 1), Some(SessionLogEntry::ToolResults { .. }))
-    {
-        adjusted_to = to + 1;
-    }
-
-    Ok((from, adjusted_to))
-}
-
 pub(crate) fn validate_tool_pair_integrity(start_seq: usize, documents: &[String]) -> Result<()> {
     let entries = documents
         .iter()

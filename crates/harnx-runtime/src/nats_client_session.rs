@@ -36,10 +36,13 @@
 use anyhow::{Context, Result};
 use async_nats::jetstream;
 use harnx_core::abort::wait_abort_signal;
-use harnx_core::event::{AgentEvent, AgentEventSink, UserEvent};
+use harnx_core::event::{AgentEvent, AgentEventSink, SessionEvent, UserEvent};
 use harnx_core::message::{MessageContent, MessageRole};
 use harnx_core::session::SessionLogEntry;
-use harnx_core::session_reconstruct::{reconstruct_state_from_nats, TurnStatus};
+use harnx_core::session_reconstruct::{
+    active_context_window, reconstruct_state_from_nats, ActiveContextWindow, TurnStatus,
+};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::nats_event_sink::SessionEventStream;
@@ -51,7 +54,7 @@ use crate::nats_worker::{
 use crate::utils::AbortSignal;
 
 /// Generate a client-side message ID (UUID v4).
-fn new_client_message_id() -> String {
+pub(crate) fn new_client_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -131,6 +134,10 @@ impl ThinClientSession {
         &self.session_id
     }
 
+    pub(crate) fn jetstream(&self) -> &jetstream::Context {
+        &self.jetstream
+    }
+
     /// Run a turn: append user message, activate worker, stream events until completion.
     ///
     /// This is the main entry point for all frontends (CLI, TUI, ACP).
@@ -194,7 +201,13 @@ impl ThinClientSession {
                     history.to_vec()
                 }
             };
-        replay_history_to_sink(&effective_history, user_msg_seq, event_sink.clone());
+        let history_window = active_context_window(&effective_history);
+        replay_history_to_sink(
+            &effective_history,
+            &history_window,
+            user_msg_seq,
+            event_sink.clone(),
+        );
 
         // Step 3: Publish activation to wake a worker.
         let activation = SessionActivate::new(&self.session_id, &self.config.agent);
@@ -213,6 +226,12 @@ impl ThinClientSession {
         let mut event_stream = event_stream;
         let mut final_response: Option<String> = None;
         let mut turn_complete = false;
+        // Cached effective log for emitting LogSeqAssigned on live advisory
+        // events. Refreshed on throttled durable reloads so we avoid O(N^2)
+        // full-log load per streaming token.
+        let mut cached_effective: Option<Vec<(u64, SessionLogEntry)>> = None;
+        let mut pending_advisories = VecDeque::new();
+        let mut emitted_logical_seqs = HashSet::new();
         // Throttle the durable-log completion check: advisory events arrive at
         // streaming-token frequency, and reloading the full log on each would be
         // O(N^2) in session size. Check at most once per interval instead — the
@@ -223,7 +242,6 @@ impl ThinClientSession {
         let mut last_completion_check = std::time::Instant::now() - COMPLETION_CHECK_INTERVAL;
         let mut completion_interval = tokio::time::interval(COMPLETION_CHECK_INTERVAL);
         completion_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
         // Set up control command sender
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlCommand>(16);
         let session_id_control = self.session_id.clone();
@@ -269,6 +287,21 @@ impl ThinClientSession {
                 // complete the turn promptly.
                 _ = completion_interval.tick() => {
                     if let Ok(entries) = self.load_durable_entries().await {
+                        // Refresh cached effective log for live LogSeqAssigned.
+                        if let Ok(effective) = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries) {
+                            cached_effective = Some(effective);
+                            emit_all_logical_seqs_for_window(
+                                cached_effective.as_deref(),
+                                &event_sink,
+                                &mut emitted_logical_seqs,
+                            );
+                            flush_pending_advisories(
+                                &mut pending_advisories,
+                                cached_effective.as_deref(),
+                                &event_sink,
+                                &mut emitted_logical_seqs,
+                            );
+                        }
                         if self.is_turn_complete(&entries, user_msg_seq) {
                             final_response = Self::extract_final_response(&entries, user_msg_seq);
                             turn_complete = true;
@@ -283,17 +316,36 @@ impl ThinClientSession {
                         Some(envelope) => {
                             // Check if this advisory should be rendered (dedup rule)
                             if event_stream.should_render(&envelope) {
-                                // Emit to sink for rendering
-                                event_sink.emit(envelope.event.clone(), None);
+                                pending_advisories.push_back(envelope.clone());
+                                flush_pending_advisories(
+                                    &mut pending_advisories,
+                                    cached_effective.as_deref(),
+                                    &event_sink,
+                                    &mut emitted_logical_seqs,
+                                );
                             }
 
-                            // Poll the durable log for turn completion, but at
-                            // most once per COMPLETION_CHECK_INTERVAL so a burst
-                            // of streaming advisories doesn't trigger a full
-                            // log reload each (avoids O(N^2) growth).
+                            // Poll durable log for turn completion, but at most
+                            // once per COMPLETION_CHECK_INTERVAL so bursty
+                            // streaming advisories do not trigger full log reload
+                            // each time (avoids O(N^2) growth).
                             if last_completion_check.elapsed() >= COMPLETION_CHECK_INTERVAL {
                                 last_completion_check = std::time::Instant::now();
                                 if let Ok(entries) = self.load_durable_entries().await {
+                                    if let Ok(effective) = harnx_core::session_reconstruct::apply_log_mutations_nats(&entries) {
+                                        cached_effective = Some(effective);
+                                        emit_all_logical_seqs_for_window(
+                                cached_effective.as_deref(),
+                                &event_sink,
+                                &mut emitted_logical_seqs,
+                            );
+                                        flush_pending_advisories(
+                                            &mut pending_advisories,
+                                            cached_effective.as_deref(),
+                                            &event_sink,
+                                            &mut emitted_logical_seqs,
+                                        );
+                                    }
                                     if self.is_turn_complete(&entries, user_msg_seq) {
                                         // Extract final response before we finish
                                         final_response = Self::extract_final_response(&entries, user_msg_seq);
@@ -472,6 +524,7 @@ fn should_skip_replay_entry(seq: u64, user_msg_seq: u64) -> bool {
 
 fn replay_history_to_sink(
     effective_history: &[(u64, SessionLogEntry)],
+    history_window: &ActiveContextWindow<'_, (u64, SessionLogEntry)>,
     user_msg_seq: u64,
     sink: Arc<dyn AgentEventSink>,
 ) {
@@ -479,30 +532,177 @@ fn replay_history_to_sink(
         if should_skip_replay_entry(*seq, user_msg_seq) {
             continue;
         }
-        render_log_entry_to_sink(entry, sink.clone());
+        render_log_entry_to_sink(entry, *seq, history_window, sink.clone());
     }
 }
 
-fn render_log_entry_to_sink(entry: &SessionLogEntry, sink: Arc<dyn AgentEventSink>) {
-    match entry {
+fn render_log_entry_to_sink(
+    entry: &SessionLogEntry,
+    physical_seq: u64,
+    history_window: &ActiveContextWindow<'_, (u64, SessionLogEntry)>,
+    sink: Arc<dyn AgentEventSink>,
+) {
+    let rendered = match entry {
         SessionLogEntry::Message { role, content, .. } => {
-            render_message_entry(role, content, &sink)
+            render_message_entry(role, content, &sink);
+            true
         }
         SessionLogEntry::ToolCalls { text, calls, .. } => {
-            render_tool_calls_entry(text, calls, &sink)
+            render_tool_calls_entry(text, calls, &sink);
+            true
         }
-        SessionLogEntry::ToolResults { results, .. } => render_tool_results_entry(results, &sink),
-        SessionLogEntry::Cancel { .. } => render_cancel_entry(&sink),
+        SessionLogEntry::ToolResults { results, .. } => {
+            render_tool_results_entry(results, &sink);
+            false
+        }
+        SessionLogEntry::Cancel { .. } => {
+            render_cancel_entry(&sink);
+            false
+        }
         SessionLogEntry::Header { .. }
         | SessionLogEntry::DataUrls { .. }
         | SessionLogEntry::Compress { .. }
         | SessionLogEntry::Clear
         | SessionLogEntry::EditEntries { .. }
         | SessionLogEntry::Rewind { .. }
-        | SessionLogEntry::Unknown => {}
+        | SessionLogEntry::Unknown => false,
+    };
+    // Only emit logical seqs during replay when the window has a Header/Compress
+    // boundary. A headerless-origin remote session has no boundary at replay
+    // time (the worker inserts the Header via migration only AFTER activation),
+    // so any replay-time number would be wrong and — because the TUI never
+    // overrides a `Some(seq)` — would permanently mis-label the row. In that
+    // case seq assignment is deferred to the post-migration reload pass
+    // (`emit_all_logical_seqs_for_window`). An already-headered session (resume)
+    // has a boundary and numbers replayed rows immediately here.
+    if rendered && history_window.boundary_index().is_some() {
+        for logical_index in logical_indices_for_entry(physical_seq, entry, history_window) {
+            sink.emit(
+                AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: logical_index }),
+                None,
+            );
+        }
     }
     // Note: ToolResults fence_token is not currently exposed in the entry type
     // (it belongs to ToolCalls which should be followed by ToolResults)
+}
+
+fn emit_live_logical_seq_for_physical(
+    physical_seq: u64,
+    history_window: &ActiveContextWindow<'_, (u64, SessionLogEntry)>,
+    sink: &Arc<dyn AgentEventSink>,
+    emitted_logical_seqs: &mut HashSet<usize>,
+) -> Option<usize> {
+    let logical_index = history_window
+        .logical_indices_for_physical(physical_seq)
+        .last()?;
+    emit_deduped_logical_seq(logical_index, sink, emitted_logical_seqs);
+    Some(logical_index)
+}
+
+fn flush_pending_advisories(
+    pending_advisories: &mut VecDeque<crate::nats_event_sink::AdvisoryEnvelope>,
+    effective_entries: Option<&[(u64, SessionLogEntry)]>,
+    sink: &Arc<dyn AgentEventSink>,
+    emitted_logical_seqs: &mut HashSet<usize>,
+) {
+    let Some(effective_entries) = effective_entries else {
+        return;
+    };
+    let window = active_context_window(effective_entries);
+    while let Some(envelope) = pending_advisories.front() {
+        let Some(_) = emit_live_logical_seq_for_physical(
+            envelope.after_seq,
+            &window,
+            sink,
+            emitted_logical_seqs,
+        ) else {
+            break;
+        };
+        let envelope = pending_advisories
+            .pop_front()
+            .expect("front checked before pop");
+        if !matches!(
+            envelope.event,
+            AgentEvent::Session(SessionEvent::LogSeqAssigned { .. })
+        ) {
+            sink.emit(envelope.event, None);
+        }
+    }
+}
+
+/// Assign logical `LogSeqAssigned` seqs for every renderable row in the
+/// post-migration active window, deduped.
+///
+/// Remote sessions start headerless; the worker inserts the Header via an
+/// `EditEntries` migration only AFTER activation (S2). Replay renders the
+/// historical rows BEFORE that migration, when the window has no boundary and
+/// logical numbers are not yet authoritative — so replay defers seq emission
+/// (see `render_log_entry_to_sink`). This pass runs on each post-activation
+/// durable reload: once the effective log carries a Header/Compress boundary,
+/// it emits the FINAL logical index for each renderable row (replayed history
+/// rows AND the just-submitted live user), exactly once via the shared dedup
+/// set. The TUI backfills each `seq: None` row with its number and never
+/// overrides it, so emitting the correct number once is essential.
+///
+/// Live worker rows (streamed assistant/tool events) are numbered via advisory
+/// translation; the shared dedup set keeps this pass and that path consistent.
+fn emit_all_logical_seqs_for_window(
+    effective_entries: Option<&[(u64, SessionLogEntry)]>,
+    sink: &Arc<dyn AgentEventSink>,
+    emitted_logical_seqs: &mut HashSet<usize>,
+) {
+    let Some(effective_entries) = effective_entries else {
+        return;
+    };
+    let window = active_context_window(effective_entries);
+    // Wait for the header-insert migration to land: no boundary means the
+    // numbering isn't authoritative yet.
+    if window.boundary_index().is_none() {
+        return;
+    }
+    // The logical index of a row is its position WITHIN the active window
+    // (Header/Compress boundary = 0). Iterate the window slice directly so the
+    // logical index stays aligned even when a boundary trims a pre-window prefix.
+    for (logical_index, (_js_seq, entry)) in window.entries().iter().enumerate() {
+        let renders = matches!(
+            entry,
+            SessionLogEntry::Message { .. } | SessionLogEntry::ToolCalls { .. }
+        );
+        if renders {
+            emit_deduped_logical_seq(logical_index, sink, emitted_logical_seqs);
+        }
+    }
+}
+
+fn emit_deduped_logical_seq(
+    logical_index: usize,
+    sink: &Arc<dyn AgentEventSink>,
+    emitted_logical_seqs: &mut HashSet<usize>,
+) {
+    if emitted_logical_seqs.insert(logical_index) {
+        sink.emit(
+            AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: logical_index }),
+            None,
+        );
+    }
+}
+
+pub(crate) fn logical_indices_for_entry(
+    physical_seq: u64,
+    entry: &SessionLogEntry,
+    history_window: &ActiveContextWindow<'_, (u64, SessionLogEntry)>,
+) -> Vec<usize> {
+    let logical_indices: Vec<usize> = history_window
+        .logical_indices_for_physical(physical_seq)
+        .collect();
+    if logical_indices.len() <= 1 {
+        return logical_indices;
+    }
+    match entry {
+        SessionLogEntry::Message { role, .. } if role.is_user() => logical_indices,
+        _ => logical_indices.into_iter().rev().take(1).collect(),
+    }
 }
 
 fn render_message_entry(
@@ -650,7 +850,9 @@ mod tests {
             timestamp: None,
             fence_token: None,
         };
-        render_log_entry_to_sink(&entry, sink.clone());
+        let empty: Vec<(u64, SessionLogEntry)> = vec![];
+        let window = active_context_window(&empty);
+        render_log_entry_to_sink(&entry, 0, &window, sink.clone());
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
         // Test user message
@@ -661,7 +863,9 @@ mod tests {
             timestamp: None,
             fence_token: None,
         };
-        render_log_entry_to_sink(&entry, sink.clone());
+        let empty: Vec<(u64, SessionLogEntry)> = vec![];
+        let window = active_context_window(&empty);
+        render_log_entry_to_sink(&entry, 0, &window, sink.clone());
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
@@ -679,8 +883,13 @@ mod tests {
             (3, MessageRole::User, "current user"),
         ]);
 
-        replay_history_to_sink(&effective_history, 3, sink.clone());
+        let window = active_context_window(&effective_history);
+        replay_history_to_sink(&effective_history, &window, 3, sink.clone());
 
+        // This fixture is HEADERLESS (no boundary): replay RENDERS the two
+        // non-current rows but DEFERS seq emission (the worker will migrate a
+        // Header in; numbering is only authoritative post-migration). So we see
+        // 2 render events and ZERO LogSeqAssigned events.
         assert_eq!(count.load(Ordering::SeqCst), 2);
         let rendered_messages: Vec<String> = sink
             .events
@@ -697,8 +906,226 @@ mod tests {
             .collect();
         assert_eq!(rendered_messages, vec!["first user", "assistant"]);
         assert!(!rendered_messages.iter().any(|msg| msg == "current user"));
+        let replayed_seqs: Vec<usize> = sink
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }) => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            replayed_seqs.is_empty(),
+            "headerless replay defers seq emission until the migration boundary exists, got {replayed_seqs:?}"
+        );
     }
 
+    #[test]
+    fn test_replay_with_header_boundary_emits_row_seqs() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::new(TestSink {
+            count: Arc::clone(&count),
+            events: Mutex::new(Vec::new()),
+        });
+
+        // Resume case: the log already carries a Header (boundary present), so
+        // replay numbers rows immediately. Header is logical 0 (renders no row);
+        // the first user is logical 1, the assistant logical 2. The current
+        // user (seq 4) is skipped from replay.
+        let mut effective_history = vec![(
+            1u64,
+            SessionLogEntry::Header {
+                model_id: "m".to_string(),
+                temperature: None,
+                top_p: None,
+                use_tools: None,
+                save_session: None,
+                compress_threshold: None,
+                agent_name: Some("a".to_string()),
+                session_id: Some("s".to_string()),
+                working_dir: None,
+                git_branch: None,
+                git_remote: None,
+                terminal_session_id: None,
+                agent_variables: Default::default(),
+                agent_instructions: String::new(),
+                model_fallbacks: vec![],
+                compaction_agent: None,
+            },
+        )];
+        effective_history.extend(test_entries(&[
+            (2, MessageRole::User, "first user"),
+            (3, MessageRole::Assistant, "assistant"),
+            (4, MessageRole::User, "current user"),
+        ]));
+
+        let window = active_context_window(&effective_history);
+        replay_history_to_sink(&effective_history, &window, 4, sink.clone());
+
+        let replayed_seqs: Vec<usize> = sink
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }) => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replayed_seqs, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_emit_all_logical_seqs_numbers_every_renderable_window_row() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::new(TestSink {
+            count: Arc::clone(&count),
+            events: Mutex::new(Vec::new()),
+        });
+        let sink_trait: Arc<dyn AgentEventSink> = sink.clone();
+        let user_msg_id = "live-user".to_string();
+        let effective_history = vec![
+            (
+                3,
+                SessionLogEntry::Header {
+                    model_id: "test-model".to_string(),
+                    temperature: None,
+                    top_p: None,
+                    use_tools: None,
+                    save_session: None,
+                    compress_threshold: None,
+                    agent_name: Some("test-agent".to_string()),
+                    session_id: Some("session".to_string()),
+                    working_dir: None,
+                    git_branch: None,
+                    git_remote: None,
+                    terminal_session_id: None,
+                    agent_variables: Default::default(),
+                    agent_instructions: String::new(),
+                    model_fallbacks: vec![],
+                    compaction_agent: None,
+                },
+            ),
+            (
+                3,
+                SessionLogEntry::Message {
+                    id: Some("legacy-user".to_string()),
+                    role: MessageRole::User,
+                    content: MessageContent::Text("legacy".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                3,
+                SessionLogEntry::Message {
+                    id: Some(user_msg_id.clone()),
+                    role: MessageRole::User,
+                    content: MessageContent::Text("live user".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                4,
+                SessionLogEntry::Message {
+                    id: Some("assistant".to_string()),
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text("reply".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+        ];
+        let mut emitted_logical_seqs = HashSet::new();
+
+        emit_all_logical_seqs_for_window(
+            Some(&effective_history),
+            &sink_trait,
+            &mut emitted_logical_seqs,
+        );
+
+        // Window = [Header(0), legacy-user(1), live-user(2), assistant(3)].
+        // The Header renders no row; every message row is numbered by its
+        // logical position, deduped and in order.
+        let assigned_seqs: Vec<usize> = sink
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }) => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assigned_seqs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_logical_indices_for_entry_user_fans_out_shared_seq() {
+        let effective_history = vec![
+            (
+                50,
+                SessionLogEntry::Header {
+                    model_id: "test-model".to_string(),
+                    temperature: None,
+                    top_p: None,
+                    use_tools: None,
+                    save_session: None,
+                    compress_threshold: None,
+                    agent_name: Some("test-agent".to_string()),
+                    session_id: Some("session".to_string()),
+                    working_dir: None,
+                    git_branch: None,
+                    git_remote: None,
+                    terminal_session_id: None,
+                    agent_variables: Default::default(),
+                    agent_instructions: String::new(),
+                    model_fallbacks: vec![],
+                    compaction_agent: None,
+                },
+            ),
+            (
+                51,
+                SessionLogEntry::Message {
+                    id: Some("u1".to_string()),
+                    role: MessageRole::User,
+                    content: MessageContent::Text("u1".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                51,
+                SessionLogEntry::Message {
+                    id: Some("u2".to_string()),
+                    role: MessageRole::User,
+                    content: MessageContent::Text("u2".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+            (
+                51,
+                SessionLogEntry::Message {
+                    id: Some("a1".to_string()),
+                    role: MessageRole::Assistant,
+                    content: MessageContent::Text("a1".to_string()),
+                    timestamp: None,
+                    fence_token: None,
+                },
+            ),
+        ];
+        let window = active_context_window(&effective_history);
+
+        let user_indices = logical_indices_for_entry(51, &effective_history[1].1, &window);
+        let assistant_indices = logical_indices_for_entry(51, &effective_history[3].1, &window);
+
+        assert_eq!(user_indices, vec![1, 2, 3]);
+        assert_eq!(assistant_indices, vec![3]);
+    }
     #[test]
     fn test_render_tool_results_entry() {
         use harnx_core::session::ToolOutput;
@@ -719,7 +1146,9 @@ mod tests {
             }],
             timestamp: None,
         };
-        render_log_entry_to_sink(&entry, sink.clone());
+        let empty: Vec<(u64, SessionLogEntry)> = vec![];
+        let window = active_context_window(&empty);
+        render_log_entry_to_sink(&entry, 0, &window, sink.clone());
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 

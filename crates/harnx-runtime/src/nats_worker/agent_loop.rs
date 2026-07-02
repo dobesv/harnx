@@ -9,6 +9,7 @@ use crate::nats_session_index::{put_record, SessionIndexRecord};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result};
 use harnx_core::message::Message;
+use harnx_core::session::SessionLogEntry;
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -24,6 +25,19 @@ pub struct RunAgentLoopArgs<'a> {
     pub call_fn: Option<crate::agent_loop::AgentCallFn>,
     pub lease: Option<Arc<NatsSessionLease>>,
     pub after_seq_observer: Option<Arc<AtomicU64>>,
+    /// Optional observer of the JetStream seq of the header-insert migration
+    /// EditEntries (S2), when the worker migrates a headerless remote session on
+    /// this activation. The migration re-maps the leading-user block onto this
+    /// seq, so the daemon must advance its activation high-water cursor to cover
+    /// it — otherwise the end-of-turn drain re-folds the now-remapped (and
+    /// already-answered) leading user messages and re-runs the turn (S3).
+    pub header_insert_observer: Option<Arc<AtomicU64>>,
+    /// Optional NATS KV store for the session index. When set, the worker
+    /// upserts a `SessionIndexRecord` after the effective log has a `Header`
+    /// on this activation, so remote sessions taking the existing-session path
+    /// (headerless-migrated per S2, or normal resumes) are indexed and their
+    /// `last_activity` is refreshed — not just brand-new empty-log sessions.
+    pub session_index: Option<&'a async_nats::jetstream::kv::Store>,
     pub on_tool_round: Option<OnToolRoundFn>,
 }
 
@@ -35,6 +49,11 @@ impl<'a> RunAgentLoopArgs<'a> {
 
     pub fn with_after_seq_observer(mut self, observer: Arc<AtomicU64>) -> Self {
         self.after_seq_observer = Some(observer);
+        self
+    }
+
+    pub fn with_header_insert_observer(mut self, observer: Arc<AtomicU64>) -> Self {
+        self.header_insert_observer = Some(observer);
         self
     }
 }
@@ -166,6 +185,8 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         call_fn,
         lease,
         after_seq_observer,
+        header_insert_observer,
+        session_index,
         on_tool_round,
     } = args;
     // Get JetStream context from config (extract URL before await)
@@ -190,9 +211,10 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         config: &config,
         input: &initial_input,
         lease: lease.as_deref(),
-        session_index: None,
+        session_index,
         session_id,
         abort_signal: &abort_signal,
+        header_insert_observer: header_insert_observer.as_ref(),
     })
     .await?;
 
@@ -251,6 +273,10 @@ struct LoadOrRepairSessionParams<'a> {
     session_index: Option<&'a async_nats::jetstream::kv::Store>,
     session_id: &'a str,
     abort_signal: &'a AbortSignal,
+    /// When a header-insert migration is performed on this activation, its
+    /// JetStream seq is published here so the daemon can advance its high-water
+    /// cursor past the re-mapped leading-user block (S3).
+    header_insert_observer: Option<&'a Arc<AtomicU64>>,
 }
 
 /// Load the session from the backend, creating a new one when the log is empty
@@ -267,6 +293,7 @@ async fn load_or_repair_session(
         session_index,
         session_id,
         abort_signal,
+        header_insert_observer,
     } = params;
     let entries = backend.load_events_blocking()?;
     if entries.is_empty() {
@@ -277,8 +304,65 @@ async fn load_or_repair_session(
 
     // Existing session: check effective session log for orphan tool calls and repair with hints
     let mut entries_vec = entries;
-    let effective_entries =
+    let mut effective_entries =
         harnx_core::session_reconstruct::apply_log_mutations_nats(&entries_vec)?;
+    if should_insert_remote_header(&effective_entries) {
+        if let Some((first_user_seq, last_user_seq, replacements)) =
+            build_remote_header_insert_replacements(
+                &entries_vec,
+                &effective_entries,
+                config,
+                input,
+                session_id,
+            )?
+        {
+            let edit_entry = SessionLogEntry::EditEntries {
+                from: first_user_seq,
+                to: last_user_seq,
+                replacements,
+            };
+            let message_id = remote_header_insert_message_id(session_id, first_user_seq);
+            let insert_seq = crate::nats_session_log::NatsSessionLog::new(
+                backend.jetstream(),
+                session_id.to_string(),
+            )
+            .append_event_with_message_id_async(&edit_entry, message_id)
+            .await?;
+            debug!("inserted header via EditEntries js{insert_seq}");
+            // Publish the migration seq so the daemon advances its activation
+            // high-water cursor past the re-mapped leading-user block. The
+            // migration re-maps those users onto `insert_seq`; the turn that
+            // runs this activation answers them, so without this the drain would
+            // re-fold them (seq > pre-migration cursor) and re-run the turn (S3).
+            if let Some(observer) = header_insert_observer {
+                observer.fetch_max(insert_seq, std::sync::atomic::Ordering::Relaxed);
+            }
+            entries_vec = backend.load_events_blocking()?;
+            effective_entries =
+                harnx_core::session_reconstruct::apply_log_mutations_nats(&entries_vec)?;
+        }
+    }
+    // Keep the session index current on every activation that takes the
+    // existing-session path. Brand-new (empty-log) sessions register their
+    // index in `write_header_and_load_session`; but headerless sessions
+    // migrated here (S2) and normal resumes take THIS path, so upsert from the
+    // effective `Header` — otherwise the session never appears in
+    // `list_remote_sessions_with_meta` (breaks resume/picker) and its
+    // `last_activity` is never refreshed. Best-effort: warn on failure, never
+    // fail activation. Idempotent (`put_record` upserts).
+    if let Some(store) = session_index {
+        if let Some((_, header)) = effective_entries
+            .iter()
+            .find(|(_, entry)| matches!(entry, SessionLogEntry::Header { .. }))
+        {
+            if let Err(err) = upsert_session_index_record(store, header).await {
+                log::warn!(
+                    "failed to upsert remote session index during activation: \
+                     session_id={session_id} err={err:#}"
+                );
+            }
+        }
+    }
     let orphan_calls = find_orphan_tool_calls(&effective_entries);
     if !orphan_calls.is_empty() {
         nats_metrics::resume_detected();
@@ -307,6 +391,59 @@ async fn load_or_repair_session(
         entries_vec = backend.load_events_blocking()?;
     }
     crate::nats_session_log::load_session_from_entries(&entries_vec, session_id)
+}
+
+fn should_insert_remote_header(effective_entries: &[(u64, SessionLogEntry)]) -> bool {
+    !effective_entries.iter().any(|(_, entry)| {
+        matches!(
+            entry,
+            SessionLogEntry::Header { .. } | SessionLogEntry::Compress { .. }
+        )
+    })
+}
+
+fn build_remote_header_insert_replacements(
+    raw_entries: &[(u64, SessionLogEntry)],
+    effective_entries: &[(u64, SessionLogEntry)],
+    config: &GlobalConfig,
+    input: &Input,
+    session_id: &str,
+) -> Result<Option<(usize, usize, Vec<String>)>> {
+    if effective_entries.is_empty() || !should_insert_remote_header(effective_entries) {
+        return Ok(None);
+    }
+
+    let mut first_user_seq = None;
+    let mut last_user_seq = None;
+    let mut replacements = Vec::new();
+    replacements.push(serde_yaml::to_string(&build_remote_session_header(
+        config, input, session_id,
+    )?)?);
+
+    for (seq, entry) in raw_entries {
+        match entry {
+            SessionLogEntry::Message { role, .. } if role.is_user() => {
+                let seq = usize::try_from(*seq)
+                    .context("session log sequence does not fit into usize")?;
+                if first_user_seq.is_none() {
+                    first_user_seq = Some(seq);
+                }
+                last_user_seq = Some(seq);
+                replacements.push(serde_yaml::to_string(entry)?);
+            }
+            _ if first_user_seq.is_some() => break,
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(match (first_user_seq, last_user_seq) {
+        (Some(from), Some(to)) => Some((from, to, replacements)),
+        _ => None,
+    })
+}
+
+fn remote_header_insert_message_id(session_id: &str, first_user_seq: usize) -> String {
+    format!("{session_id}:header-insert:{first_user_seq}")
 }
 
 /// Attach the reconstructed session to the shared config with the NATS append

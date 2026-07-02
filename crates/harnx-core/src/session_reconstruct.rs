@@ -142,6 +142,123 @@ pub fn apply_log_mutations_with_name(
     effective_entries
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogicalEntryRef<P> {
+    pub logical_index: usize,
+    pub physical_seq: P,
+}
+
+pub trait PhysicalSessionEntry {
+    type PhysicalSeq: Copy;
+
+    fn physical_seq(&self) -> Self::PhysicalSeq;
+    fn entry(&self) -> &SessionLogEntry;
+}
+
+impl PhysicalSessionEntry for (usize, SessionLogEntry) {
+    type PhysicalSeq = usize;
+
+    fn physical_seq(&self) -> Self::PhysicalSeq {
+        self.0
+    }
+
+    fn entry(&self) -> &SessionLogEntry {
+        &self.1
+    }
+}
+
+impl PhysicalSessionEntry for (u64, SessionLogEntry) {
+    type PhysicalSeq = u64;
+
+    fn physical_seq(&self) -> Self::PhysicalSeq {
+        self.0
+    }
+
+    fn entry(&self) -> &SessionLogEntry {
+        &self.1
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveContextWindow<'a, T: PhysicalSessionEntry> {
+    entries: &'a [T],
+    boundary_index: Option<usize>,
+}
+
+impl<'a, T: PhysicalSessionEntry> ActiveContextWindow<'a, T> {
+    pub fn entries(&self) -> &'a [T] {
+        self.entries
+    }
+
+    pub fn boundary_index(&self) -> Option<usize> {
+        self.boundary_index
+    }
+
+    pub fn logical_entries(&self) -> impl Iterator<Item = LogicalEntryRef<T::PhysicalSeq>> + '_ {
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(logical_index, entry)| LogicalEntryRef {
+                logical_index,
+                physical_seq: entry.physical_seq(),
+            })
+    }
+
+    pub fn physical_seq_for_logical(&self, logical_index: usize) -> Option<T::PhysicalSeq> {
+        self.entries
+            .get(logical_index)
+            .map(PhysicalSessionEntry::physical_seq)
+    }
+
+    pub fn logical_indices_for_physical(
+        &self,
+        physical_seq: T::PhysicalSeq,
+    ) -> impl Iterator<Item = usize> + '_
+    where
+        T::PhysicalSeq: PartialEq,
+    {
+        self.logical_entries()
+            .filter(move |entry| entry.physical_seq == physical_seq)
+            .map(|entry| entry.logical_index)
+    }
+
+    pub fn is_protected_logical_index(&self, logical_index: usize) -> bool {
+        self.entries
+            .get(logical_index)
+            .map(PhysicalSessionEntry::entry)
+            .is_some_and(is_context_boundary)
+    }
+}
+
+pub fn active_context_window<T: PhysicalSessionEntry>(entries: &[T]) -> ActiveContextWindow<'_, T> {
+    let boundary_index = entries
+        .iter()
+        .rposition(|entry| is_context_boundary(entry.entry()));
+    match boundary_index {
+        Some(index) if matches!(entries[index].entry(), SessionLogEntry::Header { .. }) => {
+            ActiveContextWindow {
+                entries: &entries[index..],
+                boundary_index: Some(index),
+            }
+        }
+        Some(index) => ActiveContextWindow {
+            entries: &entries[index + 1..],
+            boundary_index: Some(index),
+        },
+        None => ActiveContextWindow {
+            entries,
+            boundary_index: None,
+        },
+    }
+}
+
+fn is_context_boundary(entry: &SessionLogEntry) -> bool {
+    matches!(
+        entry,
+        SessionLogEntry::Header { .. } | SessionLogEntry::Compress { .. }
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnStatus {
     Idle,
@@ -992,6 +1109,191 @@ mod tests {
                 switch_agent: None,
             }],
             timestamp: None,
+        }
+    }
+
+    #[test]
+    fn active_context_window_includes_header_boundary_as_logical_zero() {
+        let entries = vec![
+            (10_u64, header_entry()),
+            (11, user_message("u1")),
+            (12, final_assistant("a1")),
+        ];
+
+        let window = active_context_window(&entries);
+        let logical_entries: Vec<_> = window.logical_entries().collect();
+
+        assert_eq!(window.boundary_index(), Some(0));
+        assert_eq!(window.entries().len(), 3);
+        assert_eq!(
+            logical_entries,
+            vec![
+                LogicalEntryRef {
+                    logical_index: 0,
+                    physical_seq: 10
+                },
+                LogicalEntryRef {
+                    logical_index: 1,
+                    physical_seq: 11
+                },
+                LogicalEntryRef {
+                    logical_index: 2,
+                    physical_seq: 12
+                },
+            ]
+        );
+        assert_eq!(window.physical_seq_for_logical(0), Some(10));
+        assert_eq!(window.physical_seq_for_logical(1), Some(11));
+        assert!(window.is_protected_logical_index(0));
+        assert!(!window.is_protected_logical_index(1));
+        assert_eq!(
+            window.logical_indices_for_physical(10).collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn active_context_window_uses_whole_log_when_headerless() {
+        let entries = vec![(0_usize, user_message("u1")), (1, final_assistant("a1"))];
+
+        let window = active_context_window(&entries);
+        let logical_entries: Vec<_> = window.logical_entries().collect();
+
+        assert_eq!(window.boundary_index(), None);
+        assert_eq!(window.entries().len(), 2);
+        assert_eq!(
+            logical_entries,
+            vec![
+                LogicalEntryRef {
+                    logical_index: 0,
+                    physical_seq: 0
+                },
+                LogicalEntryRef {
+                    logical_index: 1,
+                    physical_seq: 1
+                },
+            ]
+        );
+        assert_eq!(window.physical_seq_for_logical(0), Some(0));
+        assert_eq!(window.physical_seq_for_logical(1), Some(1));
+        assert!(!window.is_protected_logical_index(0));
+    }
+
+    #[test]
+    fn active_context_window_starts_after_most_recent_compress() {
+        let entries = vec![
+            (20_u64, header_entry()),
+            (21, user_message("u1")),
+            (22, final_assistant("a1")),
+            (
+                30,
+                SessionLogEntry::Compress {
+                    prompt: "summary".to_string(),
+                },
+            ),
+            (31, user_message("u2")),
+            (32, final_assistant("a2")),
+        ];
+
+        let window = active_context_window(&entries);
+        let logical_entries: Vec<_> = window.logical_entries().collect();
+
+        assert_eq!(window.boundary_index(), Some(3));
+        assert_eq!(window.entries().len(), 2);
+        assert_eq!(
+            logical_entries,
+            vec![
+                LogicalEntryRef {
+                    logical_index: 0,
+                    physical_seq: 31
+                },
+                LogicalEntryRef {
+                    logical_index: 1,
+                    physical_seq: 32
+                },
+            ]
+        );
+        assert_eq!(window.physical_seq_for_logical(0), Some(31));
+        assert_eq!(
+            window.logical_indices_for_physical(30).collect::<Vec<_>>(),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn active_context_window_preserves_many_logical_entries_for_one_physical_seq() {
+        let entries = vec![
+            (40_u64, header_entry()),
+            (50, user_message("u1")),
+            (
+                51,
+                SessionLogEntry::EditEntries {
+                    from: 50,
+                    to: 50,
+                    replacements: vec![
+                        serde_yaml::to_string(&user_message("u1 clone"))
+                            .expect("serialize replacement"),
+                        serde_yaml::to_string(&user_message("u2 clone"))
+                            .expect("serialize replacement"),
+                        serde_yaml::to_string(&final_assistant("a1 clone"))
+                            .expect("serialize replacement"),
+                    ],
+                },
+            ),
+        ];
+        let effective = apply_log_mutations_nats(&entries).expect("mutations apply");
+        let window = active_context_window(&effective);
+        let logical_entries: Vec<_> = window.logical_entries().collect();
+
+        assert_eq!(window.boundary_index(), Some(0));
+        assert_eq!(
+            logical_entries,
+            vec![
+                LogicalEntryRef {
+                    logical_index: 0,
+                    physical_seq: 40
+                },
+                LogicalEntryRef {
+                    logical_index: 1,
+                    physical_seq: 51
+                },
+                LogicalEntryRef {
+                    logical_index: 2,
+                    physical_seq: 51
+                },
+                LogicalEntryRef {
+                    logical_index: 3,
+                    physical_seq: 51
+                },
+            ]
+        );
+        assert_eq!(window.physical_seq_for_logical(1), Some(51));
+        assert_eq!(window.physical_seq_for_logical(2), Some(51));
+        assert_eq!(window.physical_seq_for_logical(3), Some(51));
+        assert_eq!(
+            window.logical_indices_for_physical(51).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    fn header_entry() -> SessionLogEntry {
+        SessionLogEntry::Header {
+            model_id: "model".to_string(),
+            temperature: None,
+            top_p: None,
+            use_tools: None,
+            save_session: None,
+            compress_threshold: None,
+            agent_name: None,
+            session_id: None,
+            working_dir: None,
+            git_branch: None,
+            git_remote: None,
+            terminal_session_id: None,
+            agent_variables: Default::default(),
+            agent_instructions: String::new(),
+            model_fallbacks: vec![],
+            compaction_agent: None,
         }
     }
 

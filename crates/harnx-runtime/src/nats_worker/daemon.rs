@@ -590,6 +590,14 @@ impl WorkerRuntime {
                 let on_tool_round =
                     build_mid_turn_injection_callback(backend.clone(), Arc::clone(&turn_cursor));
 
+                // Per-turn observer for the S2 header-insert migration seq. Only
+                // the first activation of a headerless session migrates; the
+                // migration re-maps the leading-user block onto this seq, which
+                // the turn answers. We must advance the activation high-water
+                // past it so the end-of-turn drain does not re-fold the remapped
+                // (already-answered) users and spuriously re-run the turn (S3).
+                let header_insert_seq = Arc::new(AtomicU64::new(0));
+
                 run_agent_loop_with_nats_inner(
                     RunAgentLoopArgs {
                         cluster_key: &self.cluster,
@@ -600,10 +608,13 @@ impl WorkerRuntime {
                         call_fn: self.call_fn.clone(),
                         lease: None,
                         after_seq_observer: None,
+                        header_insert_observer: None,
+                        session_index: self.session_index.as_ref(),
                         on_tool_round: Some(on_tool_round),
                     }
                     .with_lease(Arc::clone(&lease))
-                    .with_after_seq_observer(Arc::clone(&after_seq_observer)),
+                    .with_after_seq_observer(Arc::clone(&after_seq_observer))
+                    .with_header_insert_observer(Arc::clone(&header_insert_seq)),
                 )
                 .await?;
 
@@ -613,6 +624,16 @@ impl WorkerRuntime {
                 let turn_cursor_val = turn_cursor.load(Ordering::SeqCst);
                 if turn_cursor_val > 0 {
                     activation_high_water = Some(activation_high_water.map_or(turn_cursor_val, |h| h.max(turn_cursor_val)));
+                }
+
+                // Advance past the header-insert migration seq (if any). The
+                // migration remaps this turn's leading-user block onto this seq,
+                // so treat it as consumed by this turn's answer.
+                let header_insert_val = header_insert_seq.load(Ordering::SeqCst);
+                if header_insert_val > 0 {
+                    activation_high_water = Some(
+                        activation_high_water.map_or(header_insert_val, |h| h.max(header_insert_val)),
+                    );
                 }
 
                 log::info!(

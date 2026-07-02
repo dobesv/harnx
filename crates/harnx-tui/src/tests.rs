@@ -8694,3 +8694,90 @@ async fn test_info_session_single_arg_no_active_agent() {
         text
     );
 }
+
+#[tokio::test]
+async fn test_start_prompt_sets_active_remote_session() {
+    let config = test_config();
+    {
+        let mut guard = config.write();
+        guard.remote_agent = Some(("remote_agent_name".to_string(), "cluster_name".to_string()));
+        // Note: session is None by default in test_config, but we expect it to fallback gracefully or get stringified.
+    }
+
+    let mut harness = TuiTestHarness::with_config(config).await;
+    let tui = harness.tui();
+
+    // Verify it starts as None
+    assert_eq!(tui.active_remote_session, None);
+
+    let msg = crate::types::PendingMessage {
+        text: "hello".to_string(),
+        attachments: vec![],
+        attachment_dir: None,
+        paste_count: 0,
+    };
+
+    // start_prompt handles the spawn
+    tui.start_prompt(msg).await.unwrap();
+
+    // The remote info should be set!
+    let session_opt = tui.active_remote_session.as_ref();
+    assert!(
+        session_opt.is_some(),
+        "active_remote_session should be Some when config.remote_agent is set"
+    );
+    let (session_id, cluster) = session_opt.unwrap();
+    assert_eq!(cluster, "cluster_name");
+    assert_eq!(session_id, ""); // Because we didn't set a session in config, it defaults to ""
+
+    // We can simulate an Error or Final event to clear it
+    use harnx_core::event::{AgentEvent, ModelEvent};
+    let _ = tui
+        .handle_tui_event(crate::types::TuiEvent::Agent(
+            AgentEvent::Model(ModelEvent::Final {
+                output: "done".to_string(),
+                usage: Default::default(),
+            }),
+            None,
+        ))
+        .await;
+
+    assert_eq!(
+        tui.active_remote_session, None,
+        "Final event should clear the active_remote_session"
+    );
+}
+
+#[test]
+fn messages_to_transcript_items_renders_tool_message_with_seq() {
+    use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+    use harnx_core::tool::{ToolCall, ToolResult};
+
+    let call = ToolCall::new(
+        "fs_read".to_string(),
+        serde_json::json!({"path": "README.md"}),
+        Some("tool-1".to_string()),
+        None,
+    );
+    let tool_message = Message {
+        role: MessageRole::Tool,
+        content: MessageContent::ToolCalls(MessageContentToolCalls::new(
+            vec![ToolResult::new(call, serde_json::json!({"ok": true}))],
+            "calling tool".to_string(),
+            Some("tool thought".to_string()),
+        )),
+        log_seq: Some(5),
+        log_timestamp: None,
+    };
+
+    let items = crate::lifecycle::messages_to_transcript_items(
+        &[tool_message],
+        &std::collections::HashMap::new(),
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| matches!(item, TranscriptItem::ToolCall { seq: Some(5), .. })),
+        "tool message should render into targetable tool transcript rows"
+    );
+}
