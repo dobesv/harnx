@@ -34,6 +34,7 @@ pub mod utils;
 pub use nats_client_session::{
     send_control_command, ThinClientConfig, ThinClientSession, ThinClientTurnResult,
 };
+pub use nats_worker::ControlCommand;
 
 pub use agent_loop::{
     run_agent_loop, AgentCallFn, AgentLoopContext, OnTextResponseFn, OnToolRoundFn,

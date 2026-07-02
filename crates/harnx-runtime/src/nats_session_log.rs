@@ -34,16 +34,48 @@ impl NatsSessionLog {
     }
 
     pub async fn append_event_async(&self, entry: &SessionLogEntry) -> Result<u64> {
+        self.append_event_with_message_id_async(entry, new_message_id())
+            .await
+    }
+
+    pub async fn append_event_with_message_id_async(
+        &self,
+        entry: &SessionLogEntry,
+        message_id: impl Into<String>,
+    ) -> Result<u64> {
+        self.append_event_with_publish_message_async(
+            entry,
+            PublishMessage::build().message_id(message_id.into()),
+        )
+        .await
+    }
+
+    pub async fn append_event_with_expected_last_sequence_async(
+        &self,
+        entry: &SessionLogEntry,
+        expected_last_sequence: u64,
+    ) -> Result<u64> {
+        self.append_event_with_publish_message_async(
+            entry,
+            PublishMessage::build()
+                .message_id(new_message_id())
+                .expected_last_sequence(expected_last_sequence),
+        )
+        .await
+    }
+
+    async fn append_event_with_publish_message_async(
+        &self,
+        entry: &SessionLogEntry,
+        publish_message: PublishMessage,
+    ) -> Result<u64> {
         self.ensure_stream().await?;
         let payload = serialize_entry(entry)?;
-        let message_id = new_message_id();
         let ack = self
             .jetstream
             .send_publish(
                 self.subject.clone(),
-                PublishMessage::build()
-                    .payload(Bytes::from(payload))
-                    .message_id(message_id),
+                publish_message.payload(Bytes::from(payload)),
             )
             .await
             .with_context(|| {

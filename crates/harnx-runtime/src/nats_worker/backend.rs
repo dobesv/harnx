@@ -75,6 +75,10 @@ impl NatsSessionLogBackend {
         }
     }
 
+    pub fn jetstream(&self) -> jetstream::Context {
+        self.jetstream.clone()
+    }
+
     /// Attach an observer that tracks the latest durable append sequence
     /// (advanced via `fetch_max` on every successful append). Used to keep the
     /// P4.1 live-event sink's `after_seq` current during multi-step turns.

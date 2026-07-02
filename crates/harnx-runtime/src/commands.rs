@@ -2,7 +2,9 @@ use std::io::Write;
 
 use syntect::highlighting::{Color, Theme};
 
-use crate::config::{macro_execute, AgentVariables, Config, GlobalConfig, Input, LastMessage};
+use crate::config::{
+    macro_execute, remote_session_ops, AgentVariables, Config, GlobalConfig, Input, LastMessage,
+};
 use crate::utils::{dimmed_text, set_text, AbortSignal};
 use harnx_hooks::{
     dispatch_hooks_with_managers, AsyncHookManager, HookEvent, HookResultControl,
@@ -387,7 +389,17 @@ pub async fn run_command_with_output(
                     }
                     Some(args) if args.starts_with("message ") => {
                         let (from, to) = parse_message_range(&args[8..])?;
-                        config.write().edit_message_range(from, to)?;
+                        if config.read().is_remote_agent() {
+                            remote_session_ops::edit_remote_message_range(
+                                config,
+                                from,
+                                to,
+                                &abort_signal,
+                            )
+                            .await?;
+                        } else {
+                            config.write().edit_message_range(from, to)?;
+                        }
                     }
                     _ => writeln!(output, r#"Usage: .edit <config|agent|session|rag-docs|message <n>|message <n>-<m>>"#)?,
                 }
@@ -756,7 +768,17 @@ Commands:
             ".delete" => match args {
                 Some(args) if args.starts_with("message ") => {
                     let (from, to) = parse_message_range(&args[8..])?;
-                    config.write().delete_message_range(from, to)?;
+                    if config.read().is_remote_agent() {
+                        remote_session_ops::delete_remote_message_range(
+                            config,
+                            from,
+                            to,
+                            &abort_signal,
+                        )
+                        .await?;
+                    } else {
+                        config.write().delete_message_range(from, to)?;
+                    }
                     writeln!(output, "Deleted entries {from}-{to}.")?;
                 }
                 Some(args) => {
@@ -773,7 +795,11 @@ Commands:
                     .trim()
                     .parse::<usize>()
                     .context("Invalid sequence number")?;
-                config.write().rewind_session(n)?;
+                if config.read().is_remote_agent() {
+                    remote_session_ops::rewind_remote_session(config, n, &abort_signal).await?;
+                } else {
+                    config.write().rewind_session(n)?;
+                }
                 writeln!(output, "↩ Rewound session to entry {n}.")?;
             }
             ".copy" => {

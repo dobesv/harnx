@@ -44,6 +44,9 @@ pub struct Tui {
     /// prompt task. `start_prompt` awaits/aborts this before spawning a
     /// new task — guaranteeing one prompt task at a time.
     pub(super) current_prompt_handle: Option<JoinHandle<()>>,
+    /// The (session_id, cluster) of the remote agent currently running, if any.
+    /// Set in `start_prompt` and cleared when the turn completes.
+    pub(super) active_remote_session: Option<(String, String)>,
     #[allow(private_interfaces)]
     pub(crate) app: App,
     pub(crate) event_tx: mpsc::UnboundedSender<TuiEvent>,

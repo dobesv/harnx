@@ -16,12 +16,14 @@ use crossterm::terminal::{enable_raw_mode, supports_keyboard_enhancement, EnterA
 use crossterm::ExecutableCommand;
 use harnx_core::message::Message;
 use harnx_hooks::{drain_async_results, AsyncHookManager, PersistentHookManager};
+use harnx_runtime::config::remote_session_ops::load_remote_transcript_for_render;
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::config::{
     build_picker_context, list_assistant_agents, sort_sessions_for_picker,
 };
 use harnx_runtime::tool::ToolDeclaration;
 use harnx_runtime::utils::create_abort_signal;
+use harnx_runtime::{ThinClientConfig, ThinClientSession};
 use log::warn;
 use ratatui::Terminal;
 #[cfg(test)]
@@ -217,6 +219,7 @@ impl Tui {
             shared_pending_message: Arc::new(Mutex::new(None)),
             current_prompt_abort: None,
             current_prompt_handle: None,
+            active_remote_session: None,
             needs_full_redraw: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             app,
             event_tx,
@@ -768,10 +771,11 @@ fn build_compaction_marker(
 
 pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<TranscriptItem> {
     let cfg = config.read();
-    let session = match cfg.session.as_ref() {
-        Some(s) if !s.is_empty() => s,
+    let session_id = match cfg.session.as_ref() {
+        Some(s) if !s.is_empty() => s.id().to_string(),
         _ => return vec![],
     };
+    let remote_agent = cfg.remote_agent.clone();
     // Spell handoff tool declaration names relative to the active agent's
     // package so the transcript matches what the agent actually saw (#709).
     let active_pkg = cfg.active_package();
@@ -781,6 +785,66 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
         .into_iter()
         .map(|d| (d.name.clone(), d))
         .collect();
+
+    if let Some((agent, cluster)) = remote_agent {
+        drop(cfg);
+        let abort_signal = harnx_runtime::utils::create_abort_signal();
+        let remote_load = || async {
+            let thin = ThinClientSession::from_global_config(
+                ThinClientConfig {
+                    cluster,
+                    agent,
+                    session_id: Some(session_id),
+                },
+                config,
+                abort_signal,
+            )
+            .await?;
+            load_remote_transcript_for_render(&thin).await
+        };
+        let state = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => match tokio::task::block_in_place(|| handle.block_on(remote_load())) {
+                Ok(state) => state,
+                Err(err) => {
+                    warn!("failed to load remote session transcript for resume: {err:#}");
+                    return vec![];
+                }
+            },
+            Err(_) => {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        warn!(
+                            "failed to build Tokio runtime for remote transcript resume: {err:#}"
+                        );
+                        return vec![];
+                    }
+                };
+                match runtime.block_on(remote_load()) {
+                    Ok(state) => state,
+                    Err(err) => {
+                        warn!("failed to load remote session transcript for resume: {err:#}");
+                        return vec![];
+                    }
+                }
+            }
+        };
+
+        let mut items = Vec::new();
+        if !state.compressed_messages.is_empty() {
+            items.push(build_compaction_marker(
+                &state.compressed_messages,
+                &decl_map,
+            ));
+        }
+        items.extend(messages_to_transcript_items(&state.messages, &decl_map));
+        return items;
+    }
+
+    let session = cfg.session.as_ref().expect("checked above");
     let mut items = Vec::new();
     if !session.compressed_messages.is_empty() {
         items.push(build_compaction_marker(

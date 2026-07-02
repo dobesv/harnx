@@ -152,16 +152,12 @@ impl Config {
         let raw_log = std::fs::read_to_string(&session_path)
             .with_context(|| format!("Failed to read '{}'", session_path.display()))?;
         let documents = split_session_log_documents(&raw_log);
-        if from == 0 {
-            bail!("Cannot edit or delete the session header (sequence 0)");
-        }
-        if to >= documents.len() {
-            bail!("Sequence numbers out of range");
-        }
-        let (from, to) = adjust_range_for_tool_pairs(from, to, &documents)?;
-        if from > to || to >= documents.len() {
-            bail!("Sequence numbers out of range");
-        }
+        let entries = documents
+            .iter()
+            .map(|document| serde_yaml::from_str::<SessionLogEntry>(document))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let (from, to) =
+            self::session_ops_core::compute_delete_range(from, to, &entries, &documents)?;
 
         // Replacement list order becomes new order for edited range. Reordering
         // plain message entries in editor is supported as long as edited YAML still
@@ -236,16 +232,12 @@ impl Config {
         let raw_log = std::fs::read_to_string(&session_path)
             .with_context(|| format!("Failed to read '{}'", session_path.display()))?;
         let documents = split_session_log_documents(&raw_log);
-        if from == 0 {
-            bail!("Cannot edit or delete the session header (sequence 0)");
-        }
-        if to >= documents.len() {
-            bail!("Sequence numbers out of range");
-        }
-        let (from, to) = adjust_range_for_tool_pairs(from, to, &documents)?;
-        if from > to || to >= documents.len() {
-            bail!("Sequence numbers out of range");
-        }
+        let entries = documents
+            .iter()
+            .map(|document| serde_yaml::from_str::<SessionLogEntry>(document))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let (from, to) =
+            self::session_ops_core::compute_delete_range(from, to, &entries, &documents)?;
 
         let edit_entry = SessionLogEntry::EditEntries {
             from,
@@ -277,30 +269,18 @@ impl Config {
             );
         }
 
-        // Reject a cut point that splits a ToolCalls/ToolResults pair.
         let raw_log = std::fs::read_to_string(&session_path)
             .with_context(|| format!("Failed to read '{}'", session_path.display()))?;
         let documents = split_session_log_documents(&raw_log);
-        let parse = |idx: usize| -> Option<SessionLogEntry> {
-            documents
-                .get(idx)
-                .and_then(|raw| serde_yaml::from_str::<SessionLogEntry>(raw).ok())
-        };
-        if matches!(parse(after_seq), Some(SessionLogEntry::ToolCalls { .. }))
-            && matches!(
-                parse(after_seq + 1),
-                Some(SessionLogEntry::ToolResults { .. })
-            )
-        {
-            bail!(
-                "Sequence {after_seq} is a tool-calls entry paired with tool-results at {}; \
-                 rewinding here would orphan the tool calls. \
-                 Use {} to keep the pair or {} to exclude it.",
-                after_seq + 1,
-                after_seq + 1,
-                after_seq.saturating_sub(1),
-            );
-        }
+        let entries = documents
+            .iter()
+            .map(|document| serde_yaml::from_str::<SessionLogEntry>(document))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let after_seq = self::session_ops_core::compute_rewind_point(
+            after_seq,
+            session.log_entry_count,
+            &entries,
+        )?;
 
         let rewind_entry = SessionLogEntry::Rewind { after_seq };
         let session = self.session.as_mut().context("No session")?;

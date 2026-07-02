@@ -320,6 +320,35 @@ impl Tui {
                 if let Some(prompt_abort) = &self.current_prompt_abort {
                     prompt_abort.set_ctrlc();
                 }
+
+                if let Some((ref session_id, ref cluster)) = self.active_remote_session {
+                    let config = self.config.clone();
+                    let session_id = session_id.clone();
+                    let cluster = cluster.clone();
+                    tokio::spawn(async move {
+                        let server = { config.read().nats_server(&cluster).cloned() };
+                        if let Ok(server) = server {
+                            match harnx_runtime::config::Config::connect_nats_server(&server).await
+                            {
+                                Ok(client) => {
+                                    if let Err(e) = harnx_runtime::send_control_command(
+                                        &client,
+                                        &session_id,
+                                        harnx_runtime::ControlCommand::Cancel,
+                                    )
+                                    .await
+                                    {
+                                        log::warn!("Failed to send remote cancel command: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to connect to NATS for remote cancel: {e}");
+                                }
+                            }
+                        }
+                    });
+                }
+
                 self.app.transcript.push(TranscriptItem::SystemText(
                     "(Ctrl+C — operation aborted. Ctrl+D to exit.)".to_string(),
                 ));
@@ -337,6 +366,7 @@ impl Tui {
                 // the flag for parity with the prior UX.
                 if self.current_prompt_handle.is_none() {
                     self.app.llm_busy = false;
+                    self.active_remote_session = None;
                 }
             }
             (KeyCode::Up, KeyModifiers::NONE) => {
@@ -1045,6 +1075,7 @@ impl Tui {
             AgentEvent::Model(ModelEvent::Final { output, usage }) => {
                 self.flush_pending_thought();
                 self.app.llm_busy = false;
+                self.active_remote_session = None;
                 // The task that emitted Final has signalled it is exiting.
                 // Drop our reference to its abort signal — the next Ctrl+C
                 // should not target a task that's already gone. We keep
@@ -1131,6 +1162,7 @@ impl Tui {
             AgentEvent::Model(ModelEvent::Error(err)) => {
                 self.flush_pending_thought();
                 self.app.llm_busy = false;
+                self.active_remote_session = None;
                 // Mirrors the Final cleanup: drop the per-task abort
                 // signal (task has exited) and clear the shared pending
                 // channel so its content can't leak into the next task.
@@ -1381,9 +1413,23 @@ impl Tui {
 
         self.app.llm_busy = true;
         self.app.streaming_open = false;
+
         self.app.streamed_text_this_turn = false;
 
+        let remote_info = {
+            let guard = self.config.read();
+            let agent_and_cluster = guard.remote_agent.clone();
+            let session_id = guard
+                .session
+                .as_ref()
+                .map(|s| s.id().to_string())
+                .unwrap_or_default();
+            agent_and_cluster.map(|(_, cluster)| (session_id, cluster))
+        };
+        self.active_remote_session = remote_info;
+
         let event_tx = self.event_tx.clone();
+
         let ctx = crate::prompt::PromptTaskContext {
             config: self.config.clone(),
             abort_signal: new_abort,

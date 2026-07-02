@@ -56,6 +56,20 @@ jobs:
     - name: Build workspace
       run: cargo build --workspace --all-targets
 
+    - name: Install nats-server (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        set -euo pipefail
+        VERSION="v2.11.6"
+        ASSET="nats-server-${VERSION}-linux-amd64.tar.gz"
+        DOWNLOAD_URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${ASSET}"
+        BINDIR="${HOME}/.local/bin"
+        mkdir -p "${BINDIR}"
+        curl -sL "${DOWNLOAD_URL}" | tar -xzf - -C "${BINDIR}" --strip-components=1 "nats-server-${VERSION}-linux-amd64/nats-server"
+        chmod +x "${BINDIR}/nats-server"
+        echo "${BINDIR}" >> "${GITHUB_PATH}"
+      shell: bash
+
     - name: Test
       run: cargo nextest run --all
 
