@@ -350,7 +350,7 @@ dependencies = [
  "memchr",
  "pin-project",
  "portable-atomic",
- "rand 0.10.1",
+ "rand 0.10.2",
  "regex",
  "ring",
  "rustls-native-certs",
@@ -3521,7 +3521,7 @@ dependencies = [
  "path-absolutize",
  "pretty_assertions",
  "process-wrap",
- "rand 0.10.1",
+ "rand 0.10.2",
  "ratatui",
  "ratatui-textarea",
  "ratatui_widget_scrolling",
@@ -3640,7 +3640,7 @@ dependencies = [
  "log",
  "parking_lot",
  "path-absolutize",
- "rand 0.10.1",
+ "rand 0.10.2",
  "reqwest",
  "reqwest-eventsource",
  "serde",
@@ -4172,7 +4172,7 @@ dependencies = [
  "parking_lot",
  "pretty_assertions",
  "pulldown-cmark",
- "rand 0.10.1",
+ "rand 0.10.2",
  "ratatui",
  "ratatui-textarea",
  "ratatui_widget_scrolling",
@@ -4450,7 +4450,7 @@ dependencies = [
  "hyper-tungstenite",
  "hyper-util",
  "moka",
- "rand 0.10.1",
+ "rand 0.10.2",
  "rcgen",
  "thiserror 2.0.18",
  "time",
@@ -6611,9 +6611,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -7019,7 +7019,7 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "process-wrap",
- "rand 0.10.1",
+ "rand 0.10.2",
  "rmcp-macros",
  "schemars 1.2.1",
  "serde",
@@ -8031,7 +8031,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.52.0",
