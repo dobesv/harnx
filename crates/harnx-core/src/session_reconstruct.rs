@@ -806,6 +806,10 @@ mod tests {
         );
     }
 
+    fn to_yaml(entry: &SessionLogEntry) -> String {
+        serde_yaml::to_string(entry).expect("serialize replacement")
+    }
+
     fn edited_user_replacement_yaml() -> String {
         serde_yaml::to_string(&SessionLogEntry::Message {
             id: Some("edited-id".to_string()),
@@ -875,19 +879,74 @@ mod tests {
         assert_edit_is_skipped(SessionLogEntry::EditEntries {
             from: 2,
             to: 1,
-            replacements: vec![],
+            replacements: vec![edited_user_replacement_yaml()],
         });
     }
 
     #[test]
-    fn edit_entries_missing_target_seq_is_skipped() {
+    fn edit_entries_missing_from_seq_is_skipped() {
+        assert_edit_is_skipped(SessionLogEntry::EditEntries {
+            from: 99,
+            to: 2,
+            replacements: vec![edited_user_replacement_yaml()],
+        });
+    }
+
+    #[test]
+    fn edit_entries_missing_to_seq_is_skipped() {
         assert_edit_is_skipped(SessionLogEntry::EditEntries {
             from: 1,
             to: 99,
-            replacements: vec![
-                serde_yaml::to_string(&user_message("edited")).expect("serialize replacement")
-            ],
+            replacements: vec![edited_user_replacement_yaml()],
         });
+    }
+
+    #[test]
+    fn edit_entries_not_in_replay_order_is_skipped() {
+        let effective = apply_log_mutations(&[
+            (1, user_message("first")),
+            (2, user_message("second")),
+            (
+                3,
+                SessionLogEntry::EditEntries {
+                    from: 1,
+                    to: 1,
+                    replacements: vec![to_yaml(&user_message("first replacement one"))],
+                },
+            ),
+            (
+                4,
+                SessionLogEntry::EditEntries {
+                    from: 2,
+                    to: 3,
+                    replacements: vec![edited_user_replacement_yaml()],
+                },
+            ),
+        ]);
+
+        assert_eq!(effective.len(), 2);
+        assert_eq!(effective[0].0, 3);
+        assert_eq!(effective[1].0, 2);
+        assert_eq!(
+            message_text(&entry_as_message(&effective[0].1)),
+            "first replacement one"
+        );
+        assert_eq!(message_text(&entry_as_message(&effective[1].1)), "second");
+    }
+
+    #[test]
+    fn rewind_missing_after_seq_is_skipped() {
+        let effective = apply_log_mutations(&[
+            (1, user_message("first")),
+            (2, final_assistant("done")),
+            (3, SessionLogEntry::Rewind { after_seq: 99 }),
+        ]);
+
+        assert_eq!(effective.len(), 2);
+        assert_eq!(effective[0].0, 1);
+        assert_eq!(effective[1].0, 2);
+        assert_eq!(message_text(&entry_as_message(&effective[0].1)), "first");
+        assert_eq!(message_text(&entry_as_message(&effective[1].1)), "done");
     }
 
     #[test]
@@ -1231,12 +1290,9 @@ mod tests {
                     from: 50,
                     to: 50,
                     replacements: vec![
-                        serde_yaml::to_string(&user_message("u1 clone"))
-                            .expect("serialize replacement"),
-                        serde_yaml::to_string(&user_message("u2 clone"))
-                            .expect("serialize replacement"),
-                        serde_yaml::to_string(&final_assistant("a1 clone"))
-                            .expect("serialize replacement"),
+                        to_yaml(&user_message("u1 clone")),
+                        to_yaml(&user_message("u2 clone")),
+                        to_yaml(&final_assistant("a1 clone")),
                     ],
                 },
             ),
