@@ -24,6 +24,7 @@ pub mod nats_metrics;
 pub mod nats_session_index;
 pub mod nats_session_log;
 pub mod nats_worker;
+pub mod remote_session_cleanup;
 pub mod session_cleanup;
 pub mod session_history;
 pub mod test_utils;

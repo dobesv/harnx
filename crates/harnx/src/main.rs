@@ -46,6 +46,7 @@ use parking_lot::RwLock;
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use harnx_core::sink::emit_agent_event;
+use harnx_runtime::remote_session_cleanup::{run_remote_cleanup, RemoteCleanupStats};
 use harnx_runtime::session_cleanup::{humanize_bytes, run_cleanup, CleanupStats};
 
 /// Routing decision for `--list-sessions` handler.
@@ -385,6 +386,38 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
                     interval.tick().await;
                     let stats = run_cleanup(&config_clone, days).await;
                     emit_cleanup_summary(stats);
+                }
+            });
+        }
+    }
+
+    // Spawn remote session cleanup background task if enabled.
+    // MUST run before the serve branch so cleanup runs in ALL modes (TUI, CLI, Serve).
+    // The task is best-effort and never panics; deletions are fault-tolerant.
+    let remote_cleanup_days = config.read().cleanup_remote_sessions_days;
+    if let Some(days) = remote_cleanup_days {
+        if days > 0 {
+            let config_clone = Arc::clone(&config);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(3600));
+                loop {
+                    interval.tick().await;
+                    // Collect cluster names up front to release config lock before any await.
+                    let cluster_names: Vec<String> = {
+                        config_clone
+                            .read()
+                            .nats_servers
+                            .iter()
+                            .map(|s| s.name.clone())
+                            .collect()
+                    };
+                    for cluster_name in cluster_names {
+                        // Clone config to avoid holding lock across await.
+                        // Config is cheap to clone (Arc-wrapped internally).
+                        let config_snapshot = config_clone.read().clone();
+                        let stats = run_remote_cleanup(&config_snapshot, days, &cluster_name).await;
+                        emit_remote_cleanup_summary(cluster_name, stats);
+                    }
                 }
             });
         }
@@ -1395,4 +1428,20 @@ fn emit_cleanup_summary(stats: CleanupStats) {
     // In TUI/CLI this creates a minor duplication (transcript + log), but the
     // log is typically suppressed at INFO level in interactive use anyway.
     log::info!("{msg}");
+}
+
+/// Emit remote cleanup summary if any work was done.
+/// Logs per-cluster summary for server visibility.
+fn emit_remote_cleanup_summary(cluster: String, stats: RemoteCleanupStats) {
+    if stats == RemoteCleanupStats::default() {
+        return;
+    }
+    log::info!(
+        "Remote session cleanup ({}): scanned={}, deleted={}, skipped_active={}, errors={}",
+        cluster,
+        stats.scanned,
+        stats.deleted,
+        stats.skipped_active,
+        stats.errors
+    );
 }
