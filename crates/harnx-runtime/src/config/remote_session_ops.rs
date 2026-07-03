@@ -1,5 +1,5 @@
 use super::*;
-use crate::nats_client_session::{ThinClientConfig, ThinClientSession};
+use crate::nats_client_session::{new_client_message_id, ThinClientConfig, ThinClientSession};
 use crate::nats_session_log::NatsSessionLog;
 use crate::utils::{edit_file, temp_file, AbortSignal};
 use anyhow::{anyhow, bail, Context, Result};
@@ -124,7 +124,7 @@ fn build_edit_replacements(
 
 fn serialize_edited_user_entry(new_text: &str) -> Result<String> {
     let edited_entry = SessionLogEntry::Message {
-        id: Some(uuid::Uuid::new_v4().to_string()),
+        id: Some(new_client_message_id()),
         role: harnx_core::message::MessageRole::User,
         content: harnx_core::message::MessageContent::Text(new_text.to_string()),
         timestamp: None,

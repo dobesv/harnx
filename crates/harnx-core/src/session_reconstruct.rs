@@ -319,22 +319,25 @@ pub fn reconstruct_state(entries: &[SessionLogEntry]) -> ReconstructedState {
 ///
 /// NATS sequences start at 1, not 0.
 pub fn reconstruct_state_from_nats(entries: &[(u64, SessionLogEntry)]) -> ReconstructedState {
-    let effective_entries_nats = match apply_log_mutations_nats(entries) {
-        Ok(entries) => entries,
+    // Convert u64 sequences to usize once upfront, avoiding the double round-trip
+    // through apply_log_mutations_nats (which would convert u64→usize→u64, then we'd
+    // convert back to usize for reconstruct_state_effective).
+    let raw_with_usize: Vec<_> = match entries
+        .iter()
+        .map(|(seq, entry)| {
+            usize::try_from(*seq)
+                .map(|s| (s, entry.clone()))
+                .map_err(|_| format!("JetStream seq {seq} does not fit into usize"))
+        })
+        .collect::<Result<_, _>>()
+    {
+        Ok(v) => v,
         Err(err) => {
-            log::warn!("failed to apply NATS log mutations during reconstruction: {err}");
+            log::warn!("failed to convert NATS sequences during reconstruction: {err}");
             return reconstruct_state_effective(&[]);
         }
     };
-    let effective_entries: Vec<_> = effective_entries_nats
-        .into_iter()
-        .map(|(seq, entry)| {
-            (
-                usize::try_from(seq).expect("JetStream seq fits usize"),
-                entry,
-            )
-        })
-        .collect();
+    let effective_entries = apply_log_mutations(&raw_with_usize);
     reconstruct_state_effective(&effective_entries)
 }
 

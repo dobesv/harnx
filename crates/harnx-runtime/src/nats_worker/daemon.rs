@@ -444,7 +444,8 @@ impl WorkerRuntime {
                 };
                 // Cursor: the log_seq of the last user message that kicked off this resumable turn.
                 // Any messages appended AFTER this (seq > cursor) will be folded mid-turn.
-                let seed_cursor = last_user_msg.and_then(|msg| msg.log_seq.map(|seq| seq as u64));
+                let seed_cursor = last_user_msg
+                    .and_then(|msg| msg.log_seq.and_then(|seq| u64::try_from(seq).ok()));
                 (input, seed_cursor)
             }
             harnx_core::session_reconstruct::TurnStatus::Idle => {
@@ -490,7 +491,7 @@ impl WorkerRuntime {
     ) -> (Input, Option<u64>) {
         let seed_cursor = next_turn_messages
             .last()
-            .and_then(|message| message.log_seq.map(|seq| seq as u64));
+            .and_then(|message| message.log_seq.and_then(|seq| u64::try_from(seq).ok()));
         let folded = next_turn_messages
             .into_iter()
             .map(|message| message.content.to_text())
