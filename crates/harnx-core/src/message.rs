@@ -12,6 +12,11 @@ use crate::tool::ToolResult;
 pub struct Message {
     pub role: MessageRole,
     pub content: MessageContent,
+    /// Stable persisted message id from session log replay. `None` for
+    /// pre-P1.5 session entries or messages not yet persisted.
+    /// Never serialised — source of truth stays on `SessionLogEntry`.
+    #[serde(skip)]
+    pub id: Option<String>,
     /// 0-based index of the YAML document in the session log that produced
     /// this message. Set during log replay; `None` for messages created
     /// during a live session (before they are persisted and reloaded).
@@ -29,6 +34,7 @@ impl Default for Message {
         Self {
             role: MessageRole::User,
             content: MessageContent::Text(String::new()),
+            id: None,
             log_seq: None,
             log_timestamp: None,
         }
@@ -40,9 +46,15 @@ impl Message {
         Self {
             role,
             content,
+            id: None,
             log_seq: None,
             log_timestamp: None,
         }
+    }
+
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     pub fn with_log_seq(mut self, seq: usize) -> Self {

@@ -48,6 +48,7 @@ pub struct Input {
     /// already present in the loaded `session.messages`, so the LLM still sees
     /// them; only the redundant durable append is suppressed.
     pub skip_user_log_append: bool,
+    pub preferred_assistant_message_id: Option<String>,
 }
 
 impl Input {
@@ -73,6 +74,7 @@ impl Input {
             inject_system_prompt: false,
             injected_user_text: None,
             skip_user_log_append: false,
+            preferred_assistant_message_id: None,
         }
     }
 
@@ -169,6 +171,14 @@ impl Input {
 
     pub fn with_session(&self) -> bool {
         self.with_session
+    }
+
+    pub fn set_preferred_assistant_message_id(&mut self, message_id: String) {
+        self.preferred_assistant_message_id = Some(message_id);
+    }
+
+    pub fn preferred_assistant_message_id(&self) -> Option<&str> {
+        self.preferred_assistant_message_id.as_deref()
     }
 
     pub fn with_agent(&self) -> bool {

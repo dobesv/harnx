@@ -2564,7 +2564,6 @@ fn session_mutation_edit_delete_rewind_persists_across_sessions() -> Result<()> 
         let entry = serde::Deserialize::deserialize(document)?;
         match entry {
             SessionLogEntry::Message {
-                id: None,
                 role: MessageRole::User,
                 ..
             } => {
@@ -2574,7 +2573,6 @@ fn session_mutation_edit_delete_rewind_persists_across_sessions() -> Result<()> 
                 }
             }
             SessionLogEntry::Message {
-                id: None,
                 role: MessageRole::Assistant,
                 ..
             } => {

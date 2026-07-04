@@ -2,13 +2,18 @@
 //! (plan P47, β+ progressive peel). Extracted from `harnx::serve`.
 //! Depends on `harnx-runtime` for Config + Client orchestration.
 
+mod ag_ui;
+
+use crate::ag_ui::{fork_prompt_config, resolve_agent, AgUiError, AppResponse as AgUiAppResponse};
+
+use harnx_core::message::{Message, MessageRole};
 use harnx_rag::*;
 use harnx_runtime::{client::*, config::*, tool::*, utils::*};
 use log::{debug, error, info};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
-use chrono::{Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use futures_util::StreamExt;
 use http::{Method, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -21,12 +26,14 @@ use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     net::IpAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::SystemTime,
 };
 use tokio::{
     net::TcpListener,
@@ -75,6 +82,22 @@ struct Server {
     models: Vec<Value>,
     agents: Vec<AgentConfig>,
     rags: Vec<String>,
+}
+
+type RouteMatch<'a> = (&'a str, Option<&'a str>, AgentsRoute);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentsRoute {
+    Agent,
+    Sessions,
+    Session,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentsRepresentation {
+    Html,
+    Json,
+    AgUiSse,
 }
 
 impl Server {
@@ -171,6 +194,8 @@ impl Server {
             self.list_models()
         } else if path == "/v1/agents" {
             self.list_agents()
+        } else if path.starts_with("/v1/agents/") {
+            self.handle_agent_tree(req).await
         } else if path == "/v1/rags" {
             self.list_rags()
         } else if path == "/v1/rags/search" {
@@ -190,7 +215,7 @@ impl Server {
             }
             Err(err) => {
                 if status == StatusCode::OK {
-                    status = StatusCode::BAD_REQUEST;
+                    status = status_from_error(&err).unwrap_or(StatusCode::BAD_REQUEST);
                 }
                 error!("{method} {uri} {} {err}", status.as_u16());
                 ret_err(err)
@@ -229,6 +254,125 @@ impl Server {
             .header("Content-Type", "application/json; charset=utf-8")
             .body(Full::new(Bytes::from(data.to_string())).boxed())?;
         Ok(res)
+    }
+
+    async fn handle_agent_tree(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let route = match parse_agents_route(&path) {
+            Some(route) => route,
+            None => return Err(anyhow!("Not Found")),
+        };
+        let (agent_name, session_name, agent_route) = route;
+
+        resolve_agent(&self.config, agent_name).map_err(ag_ui_error_to_anyhow)?;
+
+        match agent_route {
+            AgentsRoute::Agent => {
+                match negotiate_agents_route(&method, req.headers(), agent_route)? {
+                    AgentsRepresentation::Html => self.agent_html_page(agent_name),
+                    AgentsRepresentation::Json => self.agent_json(agent_name),
+                    AgentsRepresentation::AgUiSse => Err(anyhow!("Not Acceptable")),
+                }
+            }
+            AgentsRoute::Sessions => {
+                match negotiate_agents_route(&method, req.headers(), agent_route)? {
+                    AgentsRepresentation::Json => self.sessions_json(agent_name),
+                    AgentsRepresentation::Html | AgentsRepresentation::AgUiSse => {
+                        Err(anyhow!("Not Acceptable"))
+                    }
+                }
+            }
+            AgentsRoute::Session => {
+                let session_name = session_name.expect("session route always has session name");
+                match negotiate_agents_route(&method, req.headers(), agent_route)? {
+                    AgentsRepresentation::Html => self.session_html_page(agent_name, session_name),
+                    AgentsRepresentation::Json => {
+                        self.session_history_json(agent_name, session_name)
+                    }
+                    AgentsRepresentation::AgUiSse => {
+                        self.ag_ui_run_route(req, agent_name, session_name).await
+                    }
+                }
+            }
+        }
+    }
+
+    fn agent_html_page(&self, agent: &str) -> Result<AppResponse> {
+        let html = format!("<h1>agent: {agent}</h1>");
+        let res = Response::builder()
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Full::new(Bytes::from(html)).boxed())?;
+        Ok(res)
+    }
+
+    fn session_html_page(&self, _agent: &str, session: &str) -> Result<AppResponse> {
+        let html = format!("<h1>session: {session}</h1>");
+        let res = Response::builder()
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Full::new(Bytes::from(html)).boxed())?;
+        Ok(res)
+    }
+
+    fn agent_json(&self, agent: &str) -> Result<AppResponse> {
+        let sessions = agent_sessions_json(&self.config, agent)?;
+        let description = self
+            .agents
+            .iter()
+            .find(|candidate| candidate.name() == agent)
+            .map(AgentConfig::description)
+            .filter(|description| !description.is_empty());
+        let data = json!({
+            "name": agent,
+            "description": description,
+            "sessions": sessions,
+        });
+        json_response(data)
+    }
+
+    fn sessions_json(&self, agent: &str) -> Result<AppResponse> {
+        json_response(Value::Array(agent_sessions_json(&self.config, agent)?))
+    }
+
+    fn session_history_json(&self, agent: &str, session: &str) -> Result<AppResponse> {
+        let config = agent_scoped_config(&self.config, agent)?;
+        let session_path = config.session_file(session);
+        if !session_path.exists() {
+            bail!("Not Found");
+        }
+
+        let loaded_session = harnx_runtime::config::session::load(&config, session, &session_path)
+            .map_err(|err| anyhow!("Failed to load session history for '{session}': {err}"))?;
+        if loaded_session.agent_name.as_deref() != Some(agent) {
+            bail!("Not Found");
+        }
+
+        let mut seq_counts = BTreeMap::new();
+        let messages = loaded_session
+            .messages
+            .iter()
+            .map(|message| {
+                let id = history_message_id(message, &mut seq_counts);
+                json!({
+                    "id": id,
+                    "role": history_role_name(message.role),
+                    "content": history_message_content(message),
+                })
+            })
+            .collect();
+        json_response(Value::Array(messages))
+    }
+
+    async fn ag_ui_run_route(
+        &self,
+        req: hyper::Request<Incoming>,
+        agent: &str,
+        session: &str,
+    ) -> Result<AppResponse> {
+        let req_body = req.collect().await?.to_bytes();
+        self.ag_ui_run(agent, session, &req_body)
+            .await
+            .map_err(ag_ui_error_to_anyhow)
     }
 
     fn list_rags(&self) -> Result<AppResponse> {
@@ -484,6 +628,15 @@ impl Server {
                 )?;
             Ok(res)
         }
+    }
+
+    pub(crate) async fn ag_ui_run(
+        &self,
+        agent: &str,
+        session: &str,
+        req_body: &[u8],
+    ) -> Result<AgUiAppResponse, AgUiError> {
+        ag_ui::ag_ui_run_with_call_fn(&self.config, agent, session, req_body, None).await
     }
 
     async fn embeddings(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
@@ -860,6 +1013,182 @@ fn ret_err<T: std::fmt::Display>(err: T) -> AppResponse {
         .unwrap()
 }
 
+fn parse_agents_route(path: &str) -> Option<RouteMatch<'_>> {
+    let suffix = path.strip_prefix("/v1/agents/")?;
+    let segments: Vec<_> = suffix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    match segments.as_slice() {
+        [agent] => Some((*agent, None, AgentsRoute::Agent)),
+        [agent, "sessions"] => Some((*agent, None, AgentsRoute::Sessions)),
+        [agent, "sessions", session] => Some((*agent, Some(*session), AgentsRoute::Session)),
+        _ => None,
+    }
+}
+
+fn negotiate_agents_route(
+    method: &Method,
+    headers: &http::HeaderMap,
+    route: AgentsRoute,
+) -> Result<AgentsRepresentation> {
+    match (method, route) {
+        (&Method::GET, AgentsRoute::Agent | AgentsRoute::Session) => {
+            if accepts_html(headers) {
+                Ok(AgentsRepresentation::Html)
+            } else {
+                Ok(AgentsRepresentation::Json)
+            }
+        }
+        (&Method::GET, AgentsRoute::Sessions) => Ok(AgentsRepresentation::Json),
+        (&Method::POST, AgentsRoute::Session) => {
+            if accepts_event_stream(headers) || content_type_is_json(headers) {
+                Ok(AgentsRepresentation::AgUiSse)
+            } else {
+                Err(anyhow!("Not Acceptable"))
+            }
+        }
+        _ => Err(anyhow!("Method Not Allowed")),
+    }
+}
+
+fn accepts_html(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/html"))
+}
+
+fn accepts_event_stream(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+}
+
+fn agent_scoped_config(config: &Config, agent: &str) -> Result<Config> {
+    let scoped = fork_prompt_config(config);
+    scoped
+        .write()
+        .use_agent_by_name(agent)
+        .map_err(|err| anyhow!("Failed to scope config to agent '{agent}': {err}"))?;
+    let config = scoped.read().clone();
+    Ok(config)
+}
+
+fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>> {
+    Ok(agent_scoped_config(config, agent)?
+        .list_sessions_with_meta()
+        .into_iter()
+        // Per-agent endpoints must not leak sessions without agent attribution or for other agents.
+        // Missing/empty agent_name stays excluded from per-agent lists until a later backfill pass.
+        .filter(|session| session.agent_name.as_deref() == Some(agent))
+        .map(|session| {
+            let session_id = session.session_id.unwrap_or(session.id);
+            let mut value = serde_json::Map::from_iter([(
+                String::from("session_id"),
+                Value::String(session_id),
+            )]);
+            if let Some(modified) = session.modified {
+                value.insert(
+                    String::from("updated_at"),
+                    Value::String(format_system_time(modified)),
+                );
+            }
+            Value::Object(value)
+        })
+        .collect())
+}
+
+fn format_system_time(value: SystemTime) -> String {
+    DateTime::<Utc>::from(value).to_rfc3339()
+}
+
+fn history_role_name(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "system",
+        MessageRole::Assistant => "assistant",
+        MessageRole::User => "user",
+        MessageRole::Tool => "tool",
+    }
+}
+
+fn history_message_content(message: &Message) -> String {
+    match &message.content {
+        harnx_core::message::MessageContent::ToolCalls(tool_calls) => {
+            if let Some(thought) = tool_calls
+                .thought
+                .as_deref()
+                .filter(|thought| !thought.is_empty())
+            {
+                if tool_calls.text.is_empty() {
+                    thought.to_string()
+                } else {
+                    format!("<think>\n{thought}\n</think>\n{}", tool_calls.text)
+                }
+            } else {
+                tool_calls.text.clone()
+            }
+        }
+        _ => message.content.to_text(),
+    }
+}
+
+fn history_message_id(message: &Message, seq_counts: &mut BTreeMap<usize, usize>) -> String {
+    if let Some(id) = &message.id {
+        return id.clone();
+    }
+
+    match message.log_seq {
+        Some(seq) => {
+            let subindex = seq_counts.entry(seq).or_insert(0);
+            let id = format!("seq:{seq}:{subindex}");
+            *subindex += 1;
+            id
+        }
+        None => {
+            let subindex = seq_counts.entry(usize::MAX).or_insert(0);
+            let id = format!("seq:none:{subindex}");
+            *subindex += 1;
+            id
+        }
+    }
+}
+
+fn content_type_is_json(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"))
+}
+
+fn json_response(data: Value) -> Result<AppResponse> {
+    let res = Response::builder()
+        .header("Content-Type", "application/json; charset=utf-8")
+        .body(Full::new(Bytes::from(data.to_string())).boxed())?;
+    Ok(res)
+}
+
+fn ag_ui_error_to_anyhow(err: AgUiError) -> anyhow::Error {
+    anyhow!(format!("{}::__status={}", err, err.status_code().as_u16()))
+}
+
+fn status_from_error(err: &anyhow::Error) -> Option<StatusCode> {
+    let message = err.to_string();
+    if message == "Not Found" {
+        return Some(StatusCode::NOT_FOUND);
+    }
+    if message == "Method Not Allowed" {
+        return Some(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    if message == "Not Acceptable" {
+        return Some(StatusCode::NOT_ACCEPTABLE);
+    }
+    let marker = "__status=";
+    let status = message.split(marker).nth(1)?;
+    let code = status.parse::<u16>().ok()?;
+    StatusCode::from_u16(code).ok()
+}
 fn parse_messages(message: Vec<Value>) -> Result<Vec<Message>> {
     let mut output = vec![];
     let mut tool_results = None;
@@ -987,4 +1316,466 @@ fn parse_tools(tools: Option<Vec<Value>>) -> Result<Option<Vec<ToolDeclaration>>
         }
     }
     Ok(Some(functions))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderValue;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{LazyLock, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TEST_CONFIG_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct TestConfigSandbox {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        root: PathBuf,
+        data_dir: PathBuf,
+        state_dir: PathBuf,
+        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl TestConfigSandbox {
+        fn new() -> Self {
+            let lock = TEST_CONFIG_ENV_LOCK.lock().expect("config env lock");
+            let root = unique_test_config_dir();
+            let data_dir = root.join("data");
+            let state_dir = root.join("state");
+            fs::create_dir_all(root.join("clients")).expect("create clients dir");
+            fs::create_dir_all(root.join("agents")).expect("create agents dir");
+            fs::create_dir_all(&data_dir).expect("create data dir");
+            fs::create_dir_all(&state_dir).expect("create state dir");
+            fs::write(
+                root.join("config.yaml"),
+                "model: openai:gpt-4o\nclients: []\n",
+            )
+            .expect("write config");
+            fs::write(
+                root.join("clients/openai.yaml"),
+                concat!(
+                    "type: openai\n",
+                    "api_key: sk-test\n",
+                    "models:\n",
+                    "  - name: gpt-4o\n",
+                    "    type: chat\n",
+                    "    max_input_tokens: 4096\n"
+                ),
+            )
+            .expect("write openai client");
+
+            let vars = vec![
+                ("HARNX_CONFIG_DIR", std::env::var_os("HARNX_CONFIG_DIR")),
+                ("HARNX_DATA_DIR", std::env::var_os("HARNX_DATA_DIR")),
+                ("HARNX_STATE_DIR", std::env::var_os("HARNX_STATE_DIR")),
+            ];
+            unsafe {
+                std::env::set_var("HARNX_CONFIG_DIR", &root);
+                std::env::set_var("HARNX_DATA_DIR", &data_dir);
+                std::env::set_var("HARNX_STATE_DIR", &state_dir);
+                std::env::remove_var("HARNX_CONFIG_FILE");
+            }
+
+            Self {
+                _lock: lock,
+                root,
+                data_dir,
+                state_dir,
+                vars,
+            }
+        }
+
+        fn config(&self) -> Config {
+            let prev = std::env::current_dir().expect("cwd");
+            std::env::set_current_dir(&self.root).expect("switch cwd");
+            let result = futures::executor::block_on(Config::init(WorkingMode::Cmd, false, vec![]));
+            std::env::set_current_dir(prev).expect("restore cwd");
+            result.expect("load config")
+        }
+
+        fn write_agent(&self, name: &str, prompt: &str) {
+            let body = format!("---\nmodel: openai:gpt-4o\n---\n{prompt}\n");
+            fs::write(self.root.join("agents").join(format!("{name}.md")), body)
+                .expect("write agent");
+        }
+    }
+
+    impl Drop for TestConfigSandbox {
+        fn drop(&mut self) {
+            for (key, previous) in &self.vars {
+                match previous {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+            let _ = fs::remove_dir_all(&self.data_dir);
+            let _ = fs::remove_dir_all(&self.state_dir);
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn unique_test_config_dir() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "harnx-serve-lib-test-{}-{timestamp}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn parse_agents_route_extracts_agent_and_session_segments() {
+        assert_eq!(
+            parse_agents_route("/v1/agents/hephaestus"),
+            Some(("hephaestus", None, AgentsRoute::Agent))
+        );
+        assert_eq!(
+            parse_agents_route("/v1/agents/hephaestus/sessions"),
+            Some(("hephaestus", None, AgentsRoute::Sessions))
+        );
+        assert_eq!(
+            parse_agents_route("/v1/agents/hephaestus/sessions/thread-1"),
+            Some(("hephaestus", Some("thread-1"), AgentsRoute::Session))
+        );
+        assert_eq!(parse_agents_route("/v1/agents"), None);
+        assert_eq!(parse_agents_route("/v1/agents/hephaestus/extra"), None);
+    }
+
+    #[test]
+    fn negotiate_agents_route_prefers_html_for_browser_gets() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/html,application/xhtml+xml"),
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::GET, &headers, AgentsRoute::Agent).unwrap(),
+            AgentsRepresentation::Html
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::GET, &headers, AgentsRoute::Session).unwrap(),
+            AgentsRepresentation::Html
+        );
+    }
+
+    #[test]
+    fn negotiate_agents_route_defaults_gets_to_json() {
+        let headers = http::HeaderMap::new();
+        assert_eq!(
+            negotiate_agents_route(&Method::GET, &headers, AgentsRoute::Agent).unwrap(),
+            AgentsRepresentation::Json
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::GET, &headers, AgentsRoute::Sessions).unwrap(),
+            AgentsRepresentation::Json
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::GET, &headers, AgentsRoute::Session).unwrap(),
+            AgentsRepresentation::Json
+        );
+    }
+
+    #[test]
+    fn negotiate_agents_route_accepts_ag_ui_post_shape() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::POST, &headers, AgentsRoute::Session).unwrap(),
+            AgentsRepresentation::AgUiSse
+        );
+    }
+
+    #[test]
+    fn negotiate_agents_route_rejects_wrong_method_and_headers() {
+        let headers = http::HeaderMap::new();
+        assert_eq!(
+            negotiate_agents_route(&Method::POST, &headers, AgentsRoute::Session)
+                .unwrap_err()
+                .to_string(),
+            "Not Acceptable"
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::DELETE, &headers, AgentsRoute::Agent)
+                .unwrap_err()
+                .to_string(),
+            "Method Not Allowed"
+        );
+    }
+
+    #[test]
+    fn agent_route_error_mapping_covers_404_405_and_406_shapes() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+
+        let missing_agent = resolve_agent(&config, "missing").map_err(ag_ui_error_to_anyhow);
+        let missing_err = missing_agent.expect_err("unknown agent should 404");
+        assert!(missing_err.to_string().contains("__status=404"));
+        assert_eq!(status_from_error(&missing_err), Some(StatusCode::NOT_FOUND));
+
+        let wrong_method_err =
+            negotiate_agents_route(&Method::DELETE, &http::HeaderMap::new(), AgentsRoute::Agent)
+                .expect_err("wrong method should 405");
+        assert_eq!(wrong_method_err.to_string(), "Method Not Allowed");
+        assert_eq!(
+            status_from_error(&wrong_method_err),
+            Some(StatusCode::METHOD_NOT_ALLOWED)
+        );
+
+        let mut bad_post_headers = http::HeaderMap::new();
+        bad_post_headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+        bad_post_headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain"),
+        );
+        let not_acceptable_err =
+            negotiate_agents_route(&Method::POST, &bad_post_headers, AgentsRoute::Session)
+                .expect_err("bad post accept should 406");
+        assert_eq!(not_acceptable_err.to_string(), "Not Acceptable");
+        assert_eq!(
+            status_from_error(&not_acceptable_err),
+            Some(StatusCode::NOT_ACCEPTABLE)
+        );
+    }
+
+    #[test]
+    fn negotiate_agents_route_accept_header_drives_html_json_and_sse_cases() {
+        let mut html_headers = http::HeaderMap::new();
+        html_headers.insert(http::header::ACCEPT, HeaderValue::from_static("text/html"));
+        assert_eq!(
+            negotiate_agents_route(&Method::GET, &html_headers, AgentsRoute::Agent).unwrap(),
+            AgentsRepresentation::Html
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::GET, &html_headers, AgentsRoute::Session).unwrap(),
+            AgentsRepresentation::Html
+        );
+
+        let mut json_headers = http::HeaderMap::new();
+        json_headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::GET, &json_headers, AgentsRoute::Agent).unwrap(),
+            AgentsRepresentation::Json
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::GET, &json_headers, AgentsRoute::Session).unwrap(),
+            AgentsRepresentation::Json
+        );
+
+        let mut sse_headers = http::HeaderMap::new();
+        sse_headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::POST, &sse_headers, AgentsRoute::Session).unwrap(),
+            AgentsRepresentation::AgUiSse
+        );
+    }
+
+    #[test]
+    fn status_from_error_maps_agent_route_errors() {
+        assert_eq!(
+            status_from_error(&anyhow!("Not Found")),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(
+            status_from_error(&anyhow!("Method Not Allowed")),
+            Some(StatusCode::METHOD_NOT_ALLOWED)
+        );
+        assert_eq!(
+            status_from_error(&anyhow!("Not Acceptable")),
+            Some(StatusCode::NOT_ACCEPTABLE)
+        );
+        let err = ag_ui_error_to_anyhow(AgUiError::BadRequest("bad body".to_string()));
+        assert_eq!(status_from_error(&err), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn agent_sessions_json_excludes_other_agents_and_missing_agent_names() {
+        let sessions = vec![
+            SessionMeta {
+                id: "local-1".into(),
+                session_id: Some("alpha".into()),
+                working_dir: None,
+                git_branch: None,
+                git_remote: None,
+                terminal_session_id: None,
+                agent_name: Some("plain".into()),
+                modified: None,
+            },
+            SessionMeta {
+                id: "local-2".into(),
+                session_id: Some("beta".into()),
+                working_dir: None,
+                git_branch: None,
+                git_remote: None,
+                terminal_session_id: None,
+                agent_name: Some("other".into()),
+                modified: None,
+            },
+            SessionMeta {
+                id: "local-3".into(),
+                session_id: None,
+                working_dir: None,
+                git_branch: None,
+                git_remote: None,
+                terminal_session_id: None,
+                agent_name: None,
+                modified: None,
+            },
+        ];
+
+        let filtered: Vec<Value> = sessions
+            .into_iter()
+            .filter(|session| session.agent_name.as_deref() == Some("plain"))
+            .map(|session| {
+                json!({
+                    "session_id": session.session_id.unwrap_or(session.id),
+                })
+            })
+            .collect();
+
+        assert_eq!(filtered, vec![json!({"session_id": "alpha"})]);
+    }
+
+    #[test]
+    fn agent_scoped_resolution_lists_and_loads_agent_sessions() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        sandbox.write_agent("other", "You are other.");
+        let config = sandbox.config();
+
+        let scoped = agent_scoped_config(&config, "plain").expect("scope config");
+        let agent_session_path = scoped.session_file("akjG7w");
+        std::fs::create_dir_all(
+            agent_session_path
+                .parent()
+                .expect("agent session parent directory"),
+        )
+        .expect("create agent sessions dir");
+        let flat_session_path = config.session_file("flat-only");
+        std::fs::create_dir_all(
+            flat_session_path
+                .parent()
+                .expect("flat session parent directory"),
+        )
+        .expect("create flat sessions dir");
+
+        let prompt_config = fork_prompt_config(&config);
+        {
+            let mut prompt = prompt_config.write();
+            prompt.use_agent_by_name("plain").expect("set agent");
+            prompt.use_session(Some("akjG7w")).expect("open session");
+            let session = prompt.session.as_mut().expect("session loaded");
+            session.messages.push(Message::new(
+                MessageRole::User,
+                harnx_core::message::MessageContent::Text("hi from scoped dir".into()),
+            ));
+            harnx_runtime::config::session::save(session, "agent-real", &agent_session_path, false)
+                .expect("save scoped session");
+        }
+
+        std::fs::write(
+            &flat_session_path,
+            concat!(
+                "type: header
+",
+                "session_id: flat-only
+",
+                "working_dir: /tmp/project
+",
+                "agent_name: plain
+",
+                "---
+",
+                "type: message
+",
+                "role: user
+",
+                "content: hi from flat dir
+",
+            ),
+        )
+        .expect("write flat session");
+
+        let listed = agent_sessions_json(&config, "plain").expect("list scoped sessions");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].get("session_id"), Some(&json!("akjG7w")));
+        assert!(listed[0].get("updated_at").is_some());
+
+        let loaded =
+            harnx_runtime::config::session::load(&scoped, "agent-real", &agent_session_path)
+                .expect("load scoped session");
+        assert_eq!(loaded.agent_name.as_deref(), Some("plain"));
+        assert!(!loaded.messages.is_empty());
+        assert_eq!(
+            history_message_content(loaded.messages.last().expect("latest message")),
+            "hi from scoped dir"
+        );
+        assert!(!scoped.session_file("flat-only").exists());
+    }
+
+    #[test]
+    fn history_message_helpers_map_roles_and_ids() {
+        let messages = [
+            Message::new(
+                MessageRole::User,
+                harnx_core::message::MessageContent::Text("hi".into()),
+            )
+            .with_log_seq(7),
+            Message::new(
+                MessageRole::Assistant,
+                harnx_core::message::MessageContent::Text("hello".into()),
+            )
+            .with_log_seq(7),
+            Message::new(
+                MessageRole::Tool,
+                harnx_core::message::MessageContent::Array(vec![
+                    harnx_core::message::MessageContentPart::Text {
+                        text: "tool text".into(),
+                    },
+                ]),
+            )
+            .with_log_seq(8),
+        ];
+        let mut seq_counts = BTreeMap::new();
+        let shaped: Vec<Value> = messages
+            .iter()
+            .map(|message| {
+                json!({
+                    "id": history_message_id(message, &mut seq_counts),
+                    "role": history_role_name(message.role),
+                    "content": history_message_content(message),
+                })
+            })
+            .collect();
+
+        assert_eq!(
+            shaped,
+            vec![
+                json!({"id": "seq:7:0", "role": "user", "content": "hi"}),
+                json!({"id": "seq:7:1", "role": "assistant", "content": "hello"}),
+                json!({"id": "seq:8:0", "role": "tool", "content": "tool text"}),
+            ]
+        );
+    }
 }

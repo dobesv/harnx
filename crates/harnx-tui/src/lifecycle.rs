@@ -909,6 +909,7 @@ mod tests {
         let messages = vec![Message {
             role: MessageRole::Tool,
             content: MessageContent::ToolCalls(tc),
+            id: None,
             log_seq: None,
             log_timestamp: None,
         }];
@@ -966,6 +967,7 @@ mod tests {
         let messages = vec![Message {
             role: MessageRole::Tool,
             content: MessageContent::ToolCalls(tc),
+            id: None,
             log_seq: None,
             log_timestamp: None,
         }];

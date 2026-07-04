@@ -538,6 +538,7 @@ impl ReplayAccumulator {
 
 fn cloned_message(entry: &SessionLogEntry) -> Option<Message> {
     let SessionLogEntry::Message {
+        id,
         role,
         content,
         timestamp,
@@ -550,6 +551,7 @@ fn cloned_message(entry: &SessionLogEntry) -> Option<Message> {
     Some(Message {
         role: *role,
         content: content.clone(),
+        id: id.clone(),
         log_seq: None,
         log_timestamp: *timestamp,
     })
@@ -1112,6 +1114,7 @@ mod tests {
     fn entry_as_message(entry: &SessionLogEntry) -> Message {
         match entry {
             SessionLogEntry::Message {
+                id,
                 role,
                 content,
                 timestamp,
@@ -1119,6 +1122,7 @@ mod tests {
             } => Message {
                 role: *role,
                 content: content.clone(),
+                id: id.clone(),
                 log_seq: None,
                 log_timestamp: *timestamp,
             },

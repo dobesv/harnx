@@ -75,6 +75,7 @@ fn make_compacted_message(
     harnx_core::message::Message {
         role,
         content,
+        id: None,
         log_seq: Some(log_seq),
         log_timestamp: None,
     }
@@ -8766,6 +8767,7 @@ fn messages_to_transcript_items_renders_tool_message_with_seq() {
             "calling tool".to_string(),
             Some("tool thought".to_string()),
         )),
+        id: None,
         log_seq: Some(5),
         log_timestamp: None,
     };
