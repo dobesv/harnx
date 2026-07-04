@@ -4,6 +4,7 @@ use super::session_externalize::{
     record_externalized,
 };
 use super::*;
+use crate::nats_client_session::new_client_message_id;
 
 pub use harnx_core::session::{Session, SessionLogEntry};
 
@@ -214,6 +215,7 @@ pub(crate) fn replay_log_entries_for_external(
                 session.compaction_agent = compaction_agent;
             }
             SessionLogEntry::Message {
+                id,
                 role,
                 content,
                 timestamp,
@@ -230,6 +232,9 @@ pub(crate) fn replay_log_entries_for_external(
                     );
                 }
                 let mut message = Message::new(role, content).with_log_seq(seq);
+                if let Some(id) = id {
+                    message = message.with_id(id);
+                }
                 if let Some(timestamp) = timestamp {
                     message = message.with_log_timestamp(timestamp);
                 }
@@ -317,7 +322,7 @@ pub(crate) fn replay_log_entries_for_external(
 /// `super::load` performs, so it works against minimal `Config::default`
 /// used in unit tests.
 #[cfg(test)]
-fn load_from_log_for_test(content: &str) -> Session {
+pub(crate) fn load_from_log_for_test(content: &str) -> Session {
     let raw_entries = collect_raw_log_entries(content, "test").expect("valid log entries");
     let mut session =
         replay_log_entries_for_external(&raw_entries, "test").expect("replay should succeed");
@@ -351,7 +356,9 @@ fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Me
             ..lost.clone()
         })
         .collect();
-    let mut message = assemble_tool_message(text, thought, calls, results).with_log_seq(seq);
+    let mut message = assemble_tool_message(text, thought, calls, results)
+        .with_id(persisted_message_id())
+        .with_log_seq(seq);
     if let Some(timestamp) = timestamp {
         message = message.with_log_timestamp(timestamp);
     }
@@ -698,6 +705,10 @@ pub fn exit(session: &mut Session, session_dir: &Path, is_tui: bool) -> Result<(
 /// `tool_results` entry (the tool outputs), matching the format that
 /// `replay_log_entries` expects. All other messages are written as a
 /// single `message` entry.
+fn persisted_message_id() -> String {
+    new_client_message_id()
+}
+
 fn append_message_entries(content: &mut String, msg: &Message, session_id: &str) -> Result<()> {
     if msg.role == MessageRole::Tool {
         if let MessageContent::ToolCalls(tc) = &msg.content {
@@ -742,7 +753,7 @@ fn append_message_entries(content: &mut String, msg: &Message, session_id: &str)
     }
 
     let entry = SessionLogEntry::Message {
-        id: None,
+        id: msg.id.clone().or_else(|| Some(persisted_message_id())),
         role: msg.role,
         content: msg.content.clone(),
         timestamp: None,
@@ -921,6 +932,7 @@ pub fn compress_keeping_recent(session: &mut Session, mut prompt: String, keep_f
 /// event so the on-disk layout is self-describing (no stored index).
 fn relog_message(session: &mut Session, msg: &Message) -> usize {
     let seq = session.next_seq();
+    let message_id = msg.id.clone();
     if msg.role == MessageRole::Tool {
         if let MessageContent::ToolCalls(tc) = &msg.content {
             let calls: Vec<crate::tool::ToolCall> =
@@ -962,7 +974,7 @@ fn relog_message(session: &mut Session, msg: &Message) -> usize {
     if !append_event(
         session,
         &SessionLogEntry::Message {
-            id: None,
+            id: message_id,
             role: msg.role,
             content: msg.content.clone(),
             timestamp: msg.log_timestamp,
@@ -1006,13 +1018,18 @@ pub fn add_assistant_text(
         };
         let seq = session.next_seq();
         let timestamp = Utc::now();
+        let message_id = input
+            .preferred_assistant_message_id()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(persisted_message_id);
         let assistant_msg = Message::new(MessageRole::Assistant, content)
+            .with_id(message_id.clone())
             .with_log_seq(seq)
             .with_log_timestamp(timestamp);
         all_appended &= append_event(
             session,
             &SessionLogEntry::Message {
-                id: None,
+                id: Some(message_id),
                 role: assistant_msg.role,
                 content: assistant_msg.content.clone(),
                 timestamp: Some(timestamp),
@@ -1049,6 +1066,7 @@ pub fn add_tool_calls(
     let calls = crate::tool::ToolCall::dedup(calls.to_vec());
     let mut all_appended = begin_turn(session, input, output)?;
     let tool_calls_seq = session.next_seq();
+    let tool_message_id = persisted_message_id();
     all_appended &= append_event(
         session,
         &SessionLogEntry::ToolCalls {
@@ -1083,9 +1101,11 @@ pub fn add_tool_calls(
         output.to_string(),
         thought.map(str::to_string),
     ));
-    session
-        .messages
-        .push(Message::new(MessageRole::Tool, content).with_log_seq(tool_calls_seq));
+    session.messages.push(
+        Message::new(MessageRole::Tool, content)
+            .with_id(tool_message_id)
+            .with_log_seq(tool_calls_seq),
+    );
     session.dirty = !all_appended;
     session.update_tokens();
     Ok(())
@@ -1287,13 +1307,17 @@ fn append_session_message(
     append_event(
         session,
         &SessionLogEntry::Message {
-            id: None,
+            id: Some(persisted_message_id()),
             role,
             content,
             timestamp: Some(Utc::now()),
             fence_token: None,
         },
     )
+}
+
+pub fn append_message(session: &mut Session, role: MessageRole, content: MessageContent) -> bool {
+    append_session_message(session, role, content)
 }
 
 pub fn clear_messages(session: &mut Session) {
@@ -2168,6 +2192,52 @@ prompt: summary
             .last()
             .expect("assistant message reloaded");
         assert!(last.log_timestamp.is_some());
+    }
+
+    #[test]
+    fn load_from_log_accepts_old_message_entries_without_ids() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("old-session.yaml");
+        let content = r#"---
+type: header
+model: openai:gpt-4o
+---
+type: message
+role: user
+content: legacy prompt
+---
+type: message
+role: assistant
+content: legacy reply
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let loaded = load_from_log_for_test(&content);
+
+        assert_eq!(
+            loaded.messages.len(),
+            2,
+            "both legacy messages must reconstruct"
+        );
+        assert!(
+            loaded.messages.iter().all(|message| message.id.is_none()),
+            "pre-P1.5 messages without id fields must reconstruct with id == None"
+        );
+        assert_eq!(
+            loaded.messages[0].log_seq,
+            Some(1),
+            "legacy user message should still get seq fallback coordinate"
+        );
+        assert_eq!(
+            loaded.messages[1].log_seq,
+            Some(2),
+            "legacy assistant message should still get seq fallback coordinate"
+        );
+        assert_eq!(loaded.messages[0].content.to_text(), "legacy prompt");
+        assert_eq!(loaded.messages[1].content.to_text(), "legacy reply");
     }
 
     #[test]

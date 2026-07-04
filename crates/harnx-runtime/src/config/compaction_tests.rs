@@ -246,6 +246,130 @@ async fn test_compact_session_package_bare_compaction_agent_resolves_within_pack
     );
 }
 
+#[tokio::test]
+async fn test_compaction_preserves_ids_for_preserved_suffix_messages() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let session_name = "suffix-id-preservation";
+    let session_path = temp.path().join(format!("{session_name}.yaml"));
+
+    let mut config = Config {
+        model: crate::client::Model::new("gemini", "gemini-3.1-flash-lite"),
+        data: ConfigData {
+            stream: false,
+            compress_threshold: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut session = self::session::new(&config, session_name).unwrap();
+    session.set_sessions_dir(temp.path().to_path_buf());
+    self::session::ensure_log_file(&mut session);
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&session_path)
+        .unwrap();
+    for (role, text) in [
+        (MessageRole::User, "user turn 1"),
+        (MessageRole::Assistant, "assistant reply 1"),
+        (MessageRole::User, "user turn 2"),
+        (MessageRole::Assistant, "assistant reply 2"),
+        (MessageRole::User, "user turn 3"),
+        (MessageRole::Assistant, "assistant reply 3"),
+        (MessageRole::User, "user turn 4"),
+        (MessageRole::Assistant, "assistant reply 4"),
+    ] {
+        let id = uuid::Uuid::now_v7().to_string();
+        let entry = harnx_core::session::SessionLogEntry::Message {
+            id: Some(id.clone()),
+            role,
+            content: MessageContent::Text(text.to_string()),
+            timestamp: Some(chrono::Utc::now()),
+            fence_token: None,
+        };
+        writeln!(file, "---").unwrap();
+        write!(file, "{}", serde_yaml::to_string(&entry).unwrap()).unwrap();
+        let seq = session.next_seq();
+        session.messages.push(
+            Message::new(role, MessageContent::Text(text.to_string()))
+                .with_id(id.clone())
+                .with_log_seq(seq),
+        );
+    }
+
+    let preserved_suffix_before: Vec<(MessageRole, String, String)> = session
+        .messages
+        .iter()
+        .skip(6)
+        .map(|message| {
+            (
+                message.role,
+                message.content.to_text(),
+                message.id.clone().expect("persisted message id"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        preserved_suffix_before.len(),
+        2,
+        "test setup must preserve exactly final turn as suffix"
+    );
+
+    config.session = Some(session);
+    let global_config = Arc::new(RwLock::new(config));
+    let (mock, _guard) = install_summarizer_mock().await;
+
+    Config::compact_session(&global_config).await.unwrap();
+
+    let history = mock.conversation_history();
+    assert_eq!(
+        history.conversation_history.len(),
+        1,
+        "expected one LLM call"
+    );
+
+    let reloaded =
+        super::session::load_from_log_for_test(&std::fs::read_to_string(&session_path).unwrap());
+
+    let preserved_suffix_after: Vec<(MessageRole, String, Option<String>)> = reloaded
+        .messages
+        .iter()
+        .rev()
+        .take(preserved_suffix_before.len())
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|message| (message.role, message.content.to_text(), message.id.clone()))
+        .collect();
+
+    assert_eq!(
+        preserved_suffix_after.len(),
+        preserved_suffix_before.len(),
+        "reloaded session must keep preserved suffix length"
+    );
+
+    for ((before_role, before_text, before_id), (after_role, after_text, after_id)) in
+        preserved_suffix_before
+            .iter()
+            .zip(preserved_suffix_after.iter())
+    {
+        assert_eq!(
+            after_role, before_role,
+            "preserved suffix role changed across compaction"
+        );
+        assert_eq!(
+            after_text, before_text,
+            "preserved suffix text changed across compaction"
+        );
+        assert_eq!(
+            after_id.as_deref(),
+            Some(before_id.as_str()),
+            "preserved suffix message id changed across compaction"
+        );
+    }
+}
+
 /// compact_session must honor a non-default `compaction_keep_recent_turns`
 /// from the compaction agent's frontmatter: a smaller value keeps fewer recent
 /// turns verbatim and therefore compacts MORE of the conversation. With
