@@ -12,22 +12,22 @@ Harnx ships as a family of independently installable binaries. Each release
 publishes a separate archive per binary per target, so you can install only
 what you need:
 
-| Binary | What it does | Docs |
-|---|---|---|
-| `harnx` | Full CLI — TUI + Cmd + HTTP (`--serve`); ACP via `harnx-acp-server <agent>` | [Command-Line Guide](docs/command-line-guide.md) |
-| `harnx-serve` | HTTP-only server, no TUI deps | [README](crates/harnx-serve/README.md) |
-| `harnx-acp-server` | ACP-only headless agent over stdio, no TUI deps | [README](crates/harnx-acp-server/README.md) |
-| `harnx-pkg` | Package manager for harnx agent configurations | [Package System](docs/packages.md) |
-| `harnx-mcp-bash` | MCP server exposing bash/subprocess execution with safety guards | [Bash MCP Server](docs/bash-mcp-server.md) |
-| `harnx-mcp-fs` | MCP server exposing filesystem operations with safety guards | [README](crates/harnx-mcp-fs/README.md) |
-| `harnx-mcp-plans` | MCP server exposing file-based plan/task/note management | [README](crates/harnx-mcp-plans/README.md) |
-| `harnx-mcp-time` | MCP server exposing time and timezone utilities | [README](crates/harnx-mcp-time/README.md) |
-| `harnx-mcp-hooks-proxy` | MCP proxy that runs harnx hooks around every tool call | [README](crates/harnx-mcp-hooks-proxy/README.md) |
-| `harnx-sandbox-run` | Run commands inside the birdcage sandbox with hook support | [Sandbox Run](docs/sandbox-run.md) |
-| `harnx-sandbox-exec` | Low-level birdcage sandbox wrapper with explicit path allow-lists | [README](crates/harnx-sandbox-common/README.md) |
-| `harnx-aws-creds` | Bearer-protected helper that serves AWS credentials to tools | [AWS Creds](docs/aws-creds.md) |
-| `harnx-k8s-creds` | Persistent hook that injects scoped Kubernetes credentials into sandboxed tools | [README](crates/harnx-k8s-creds/README.md) |
-| `harnx-proxy-auth` | TLS-intercepting auth proxy that injects credentials and runs hooks | [README](crates/harnx-proxy-auth/README.md) |
+| Binary                  | What it does                                                                    | Docs                                             |
+|-------------------------|---------------------------------------------------------------------------------|--------------------------------------------------|
+| `harnx`                 | Terminal interface, TUI or non-interactive                                      | [Command-Line Guide](docs/command-line-guide.md) |
+| `harnx-serve`           | HTTP-only server, no TUI deps                                                   | [README](crates/harnx-serve/README.md)           |
+| `harnx-acp-server`      | ACP-only headless agent over stdio, no TUI deps                                 | [README](crates/harnx-acp-server/README.md)      |
+| `harnx-pkg`             | Package manager for harnx agent configurations                                  | [Package System](docs/packages.md)               |
+| `harnx-mcp-bash`        | MCP server exposing bash/subprocess execution with safety guards                | [Bash MCP Server](docs/bash-mcp-server.md)       |
+| `harnx-mcp-fs`          | MCP server exposing filesystem operations with safety guards                    | [README](crates/harnx-mcp-fs/README.md)          |
+| `harnx-mcp-plans`       | MCP server exposing file-based plan/task/note management                        | [README](crates/harnx-mcp-plans/README.md)       |
+| `harnx-mcp-time`        | MCP server exposing time and timezone utilities                                 | [README](crates/harnx-mcp-time/README.md)        |
+| `harnx-mcp-hooks-proxy` | MCP proxy that runs harnx hooks around every tool call                          | [README](crates/harnx-mcp-hooks-proxy/README.md) |
+| `harnx-sandbox-run`     | Run commands inside the birdcage sandbox with hook support                      | [Sandbox Run](docs/sandbox-run.md)               |
+| `harnx-sandbox-exec`    | Low-level birdcage sandbox wrapper with explicit path allow-lists               | [README](crates/harnx-sandbox-common/README.md)  |
+| `harnx-aws-creds`       | Bearer-protected helper that serves AWS credentials to tools                    | [AWS Creds](docs/aws-creds.md)                   |
+| `harnx-k8s-creds`       | Persistent hook that injects scoped Kubernetes credentials into sandboxed tools | [README](crates/harnx-k8s-creds/README.md)       |
+| `harnx-proxy-auth`      | TLS-intercepting auth proxy that injects credentials and runs hooks             | [README](crates/harnx-proxy-auth/README.md)      |
 
 One helper binary ships bundled alongside its parent rather than as its own
 archive: `harnx-mcp-bash-sandbox-run` is included in the `harnx-mcp-bash`
