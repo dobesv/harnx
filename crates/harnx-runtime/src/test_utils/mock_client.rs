@@ -265,6 +265,14 @@ impl MockTurnBuilder {
         self
     }
 
+    /// Add an error event to the response stream.
+    pub fn add_error(mut self, error: anyhow::Error) -> Self {
+        self.turn
+            .events
+            .push(MockResponseEvent::Error(Arc::new(error)));
+        self
+    }
+
     /// Add blocking gate to pause streaming until test releases it.
     pub fn add_gate(mut self, reached: Arc<Notify>, release: Arc<Notify>) -> Self {
         self.turn

@@ -80,68 +80,72 @@ impl harnx_core::event::AgentEventSink for AcpChunkSink {
         // notification`). The parent's UI reconstructs source from the
         // chunk's `meta` (set by `spawn_notify_text` /
         // `spawn_notify_tool_call`) and renders the heading itself.
-        match event {
-            AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
-                let text: String = blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        harnx_core::event::ContentBlock::Text(t) => Some(t.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                if !text.is_empty() {
-                    let _ = self.tx.send(AcpForward::Text(text, source));
-                }
-            }
-            AgentEvent::Model(ModelEvent::Final { output, .. }) if !output.is_empty() => {
-                let _ = self.tx.send(AcpForward::Text(output, source));
-            }
-            AgentEvent::User(UserEvent::Message { content }) if !content.is_empty() => {
-                let _ = self.tx.send(AcpForward::UserText(content, source));
-            }
-            AgentEvent::Tool(ToolEvent::Started {
-                id,
-                name,
-                input,
-                markdown,
-                ..
-            }) => {
-                let _ = self.tx.send(AcpForward::ToolCall {
-                    id,
-                    name,
-                    input,
-                    markdown,
-                    source,
-                });
-            }
-            AgentEvent::Tool(ToolEvent::Update {
-                id,
-                markdown,
-                status,
-                ..
-            }) => {
-                let _ = self.tx.send(AcpForward::ToolUpdate {
-                    id,
-                    markdown,
-                    status,
-                    source,
-                });
-            }
-            AgentEvent::Tool(ToolEvent::Completed {
-                id,
-                output,
-                markdown,
-                ..
-            }) => {
-                let _ = self.tx.send(AcpForward::ToolCompleted {
-                    id,
-                    output,
-                    markdown,
-                    source,
-                });
-            }
-            _ => {}
+        if let Some(forward) = event_to_forward(event, source) {
+            let _ = self.tx.send(forward);
         }
+    }
+}
+
+/// Map an `AgentEvent` to the `AcpForward` it should produce, or `None`
+/// when the event carries no forwardable payload (e.g. empty text). Kept
+/// as a free function so `AcpChunkSink::emit` stays a trivial dispatch.
+fn event_to_forward(event: AgentEvent, source: Option<AgentSource>) -> Option<AcpForward> {
+    match event {
+        AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
+            let text: String = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    harnx_core::event::ContentBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            (!text.is_empty()).then(|| AcpForward::Text(text, source))
+        }
+        AgentEvent::Model(ModelEvent::Final { output, .. }) if !output.is_empty() => {
+            Some(AcpForward::Text(output, source))
+        }
+        AgentEvent::Model(ModelEvent::Error(err)) if !err.is_empty() => {
+            Some(AcpForward::Text(format!("error: {err}"), source))
+        }
+        AgentEvent::User(UserEvent::Message { content }) if !content.is_empty() => {
+            Some(AcpForward::UserText(content, source))
+        }
+        AgentEvent::Tool(ToolEvent::Started {
+            id,
+            name,
+            input,
+            markdown,
+            ..
+        }) => Some(AcpForward::ToolCall {
+            id,
+            name,
+            input,
+            markdown,
+            source,
+        }),
+        AgentEvent::Tool(ToolEvent::Update {
+            id,
+            markdown,
+            status,
+            ..
+        }) => Some(AcpForward::ToolUpdate {
+            id,
+            markdown,
+            status,
+            source,
+        }),
+        AgentEvent::Tool(ToolEvent::Completed {
+            id,
+            output,
+            markdown,
+            ..
+        }) => Some(AcpForward::ToolCompleted {
+            id,
+            output,
+            markdown,
+            source,
+        }),
+        _ => None,
     }
 }
 
