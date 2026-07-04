@@ -406,6 +406,27 @@ mod tests {
     }
 
     #[test]
+    fn acp_chunk_sink_forwards_model_errors_as_visible_text() {
+        let (tx, mut rx) = unbounded_channel::<AcpForward>();
+        let sink = AcpChunkSink { tx };
+
+        sink.emit(
+            AgentEvent::Model(harnx_core::event::ModelEvent::Error(
+                "Internal server error".to_string(),
+            )),
+            None,
+        );
+
+        match rx.try_recv().expect("should forward error text") {
+            AcpForward::Text(text, source) => {
+                assert_eq!(text, "error: Internal server error");
+                assert!(source.is_none());
+            }
+            _ => panic!("expected Text forward"),
+        }
+    }
+
+    #[test]
     fn meta_from_source_includes_model_when_present() {
         use harnx_core::event::AgentSource;
 

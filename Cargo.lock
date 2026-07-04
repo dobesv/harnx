@@ -3697,6 +3697,7 @@ dependencies = [
  "harnx-client",
  "harnx-core",
  "harnx-render",
+ "harnx-runtime",
  "parking_lot",
  "serde_json",
  "tokio",

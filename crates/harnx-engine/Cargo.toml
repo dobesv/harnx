@@ -19,4 +19,5 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 
 [dev-dependencies]
+harnx-runtime = { path = "../harnx-runtime" }
 tokio = { workspace = true, features = ["test-util"] }

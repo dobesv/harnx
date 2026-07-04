@@ -1,7 +1,10 @@
 use crate::types::Tui;
 use crate::types::{PendingMessage, TuiEvent};
 use anyhow::{Context, Result};
+use harnx_core::event::{AgentEvent, ModelEvent};
+use harnx_core::sink::emit_agent_event;
 use harnx_hooks::{AsyncHookManager, PersistentHookManager};
+use harnx_render::pretty_error_string;
 use harnx_runtime::client::CompletionTokenUsage;
 use harnx_runtime::config::{GlobalConfig, Input};
 use harnx_runtime::utils::AbortSignal;
@@ -279,9 +282,12 @@ impl Tui {
         match send_ret {
             Ok(_) => Ok((text, thought, tool_calls, usage)),
             Err(err) => {
-                if text.is_empty() {
+                if text.trim().is_empty() {
                     Err(err)
                 } else {
+                    emit_agent_event(AgentEvent::Model(ModelEvent::Error(pretty_error_string(
+                        &err,
+                    ))));
                     Ok((text, thought, vec![], usage))
                 }
             }
