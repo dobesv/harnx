@@ -44,7 +44,7 @@ The AG-UI surface allows modern web interfaces (e.g., [assistant-ui](https://ass
 ### Key Behaviors
 
 - **Content Negotiation:** The same URL serves HTML (for browsers), JSON (for data), or SSE (for execution) based on the `Accept` header and HTTP method.
-- **Permalink Model:** The `:session` ID in the URL corresponds to the AG-UI `threadId`. Sessions are lazily created upon the first run to a new session ID.
+- **Permalink Model:** The `:session` ID in the URL is the stable session key from which the AG-UI `threadId` is derived. If the session ID is already a UUID, the `threadId` is identical; otherwise, it is a stable UUIDv5 hash of the slug. Sessions are lazily created upon the first run to a new session ID.
 - **SSE Framing:** Each event is delivered as `data: {json}\n\n`. The event type is specified in the JSON `type` field.
 - **Server-Authoritative History:** While clients send the full message array on each run, the server reconciles history and persists only new user turns. Resuming a session continues context without duplicating messages.
 - **Single-Message Run Contract:** Phase 1 accepts exactly **one** new user message per run. 
@@ -80,16 +80,17 @@ The following events are supported in the initial implementation:
      -H "Accept: text/event-stream" \
      -H "Content-Type: application/json" \
      -d '{
-       "threadId": "my-session",
+       "threadId": "<derived-thread-id>",
        "messages": [
          { "role": "user", "content": "hello" }
        ]
      }'
    ```
+   *Note: When the session ID (e.g., `my-session`) is not a UUID, the wire `threadId` is a derived UUID, not the literal slug.*
 
 3. **Expected SSE Output:**
    ```text
-   data: {"type":"RUN_STARTED","threadId":"my-session","runId":"..."}
+   data: {"type":"RUN_STARTED","threadId":"<derived-thread-id>","runId":"..."}
 
    data: {"type":"TEXT_MESSAGE_START","messageId":"<uuid>","role":"assistant"}
 
@@ -97,7 +98,7 @@ The following events are supported in the initial implementation:
 
    data: {"type":"TEXT_MESSAGE_END","messageId":"<uuid>"}
 
-   data: {"type":"RUN_FINISHED","threadId":"my-session","runId":"..."}
+   data: {"type":"RUN_FINISHED","threadId":"<derived-thread-id>","runId":"..."}
    ```
 
    The assistant `messageId` in the SSE stream is a durable UUID. This `messageId` 

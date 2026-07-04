@@ -132,8 +132,9 @@ pub fn derive_thread_id(session_id: &str) -> ThreadId {
     if let Ok(uuid) = Uuid::parse_str(session_id) {
         ThreadId::from(uuid)
     } else {
-        // Stable UUIDv5 for non-UUID sessions
-        Uuid::new_v5(&Uuid::NAMESPACE_URL, session_id.as_bytes()).into()
+        // Stable UUIDv5 for non-UUID sessions.
+        // THREAD_ID_NAMESPACE is a fixed constant in ag_ui.rs for stable derivation.
+        Uuid::new_v5(&THREAD_ID_NAMESPACE, session_id.as_bytes()).into()
     }
 }
 
