@@ -64,6 +64,12 @@ impl Config {
         if let Some(v) = read_env_bool(&get_env_name("save_session")) {
             self.save_session = v;
         }
+        if let Some(v) = read_env_value::<u64>(&get_env_name("cleanup_inactive_sessions_days")) {
+            self.cleanup_inactive_sessions_days = v;
+        }
+        if let Some(v) = read_env_value::<u64>(&get_env_name("cleanup_remote_sessions_days")) {
+            self.cleanup_remote_sessions_days = v;
+        }
         if let Some(Some(v)) = read_env_value::<usize>(&get_env_name("compress_threshold")) {
             self.compress_threshold = v;
         }
@@ -154,4 +160,47 @@ pub fn load_env_file() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RAII guard that removes an env var on drop.
+    #[test]
+    fn load_envs_reads_cleanup_remote_sessions_days() {
+        let _lock = crate::config::test_support::env_lock();
+        let prev = std::env::var_os("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS");
+        // SAFETY: test-only; global test lock held.
+        unsafe { std::env::set_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", "7") };
+
+        let mut config = Config::default();
+        config.load_envs();
+
+        assert_eq!(config.cleanup_remote_sessions_days, Some(7));
+
+        // Restore prior state
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", v) },
+            None => unsafe { std::env::remove_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS") },
+        }
+    }
+
+    #[test]
+    fn load_envs_unset_cleanup_remote_sessions_days_is_none() {
+        let _lock = crate::config::test_support::env_lock();
+        let prev = std::env::var_os("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS");
+        // SAFETY: test-only; global test lock held.
+        unsafe { std::env::remove_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS") };
+
+        let mut config = Config::default();
+        config.load_envs();
+
+        assert_eq!(config.cleanup_remote_sessions_days, None);
+
+        // Restore prior state
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", v) }
+        }
+    }
 }
