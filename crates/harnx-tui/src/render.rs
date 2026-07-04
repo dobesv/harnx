@@ -143,8 +143,10 @@ impl Tui {
                 );
                 RenderedEntry::from_lines(lines, width)
             }
-            TranscriptItem::CompactionMarker { text, .. } => {
-                let lines = Self::render_text_entry(
+            TranscriptItem::CompactionMarker {
+                text, summary_text, ..
+            } => {
+                let mut lines = Self::render_text_entry(
                     "",
                     text,
                     Style::default()
@@ -152,6 +154,16 @@ impl Tui {
                         .add_modifier(Modifier::DIM),
                     false,
                 );
+                if !summary_text.is_empty() {
+                    lines.extend(Self::render_text_entry(
+                        "",
+                        summary_text,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                        false,
+                    ));
+                }
                 RenderedEntry::from_lines(lines, width)
             }
             TranscriptItem::SystemText(text) => {
@@ -1141,6 +1153,7 @@ impl Tui {
             }
             TranscriptItem::CompactionMarker {
                 text,
+                summary_text,
                 from_seq,
                 to_seq,
                 detail_text,
@@ -1150,6 +1163,9 @@ impl Tui {
                     label_style,
                 )));
                 push_field!("text", text);
+                if !summary_text.is_empty() {
+                    push_field!("summary", summary_text);
+                }
                 let seq_range = match (from_seq, to_seq) {
                     (Some(from), Some(to)) => format!("{from}–{to}"),
                     _ => "n/a".to_string(),

@@ -82,8 +82,11 @@ fn transcript_footprint(items: &[TranscriptItem]) -> (usize, usize) {
             | TranscriptItem::AssistantText { text, .. }
             | TranscriptItem::ToolResultMarkdown { text, .. } => text.len(),
             TranscriptItem::CompactionMarker {
-                text, detail_text, ..
-            } => text.len() + detail_text.len(),
+                text,
+                summary_text,
+                detail_text,
+                ..
+            } => text.len() + summary_text.len() + detail_text.len(),
             TranscriptItem::ToolCall { tool_name, .. } => tool_name.len(),
             TranscriptItem::Plan(_) | TranscriptItem::SourceHeading(_) => 0,
         })
@@ -748,25 +751,64 @@ fn append_message_compaction_detail_sections(
 
 fn build_compaction_marker(
     messages: &[Message],
+    summary_text: String,
     decl_map: &HashMap<String, ToolDeclaration>,
 ) -> TranscriptItem {
     let from_seq = messages.iter().filter_map(|msg| msg.log_seq).min();
     let to_seq = messages.iter().filter_map(|msg| msg.log_seq).max();
+    let archived_count = messages.len();
     let mut detail_sections = Vec::new();
+    if !summary_text.is_empty() {
+        detail_sections.push(format!("── summary ──\n{summary_text}"));
+    }
+    detail_sections.push(format!("archived messages: {archived_count}"));
     for message in messages {
         append_message_compaction_detail_sections(&mut detail_sections, message, decl_map);
     }
-    let detail_text = detail_sections.join(
-        "
-
-",
-    );
+    let detail_text = detail_sections.join("\n\n");
     TranscriptItem::CompactionMarker {
         text: "─── session compacted ───".to_string(),
+        summary_text,
         from_seq,
         to_seq,
         detail_text,
     }
+}
+
+/// Build the transcript for a (possibly compacted) session view.
+///
+/// When `compressed_messages` is non-empty the archived history is rendered
+/// inline first so it stays visible, followed by a single compaction marker
+/// carrying the summary (the leading `System` message of the active window),
+/// then the active/preserved messages. Shared by the local and remote resume
+/// paths to keep their layout in lockstep (#904).
+pub(crate) fn build_transcript_with_compaction(
+    compressed_messages: &[Message],
+    active_messages: &[Message],
+    decl_map: &HashMap<String, ToolDeclaration>,
+) -> Vec<TranscriptItem> {
+    use harnx_core::message::MessageRole;
+
+    let mut items = Vec::new();
+    if !compressed_messages.is_empty() {
+        items.extend(messages_to_transcript_items(compressed_messages, decl_map));
+        // Invariant: `compress_keeping_recent` prepends the compaction summary as
+        // the leading `System` message of the active window, so the summary (when
+        // present) is `active_messages[0]`. If that contract changes, the summary
+        // would silently render empty rather than showing wrong content.
+        let summary_text = active_messages
+            .first()
+            .filter(|msg| msg.role == MessageRole::System)
+            .map(|msg| msg.content.to_text())
+            .unwrap_or_default();
+        items.push(build_compaction_marker(
+            compressed_messages,
+            summary_text,
+            decl_map,
+        ));
+    }
+    items.extend(messages_to_transcript_items(active_messages, decl_map));
+    items
 }
 
 pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<TranscriptItem> {
@@ -833,27 +875,15 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
             }
         };
 
-        let mut items = Vec::new();
-        if !state.compressed_messages.is_empty() {
-            items.push(build_compaction_marker(
-                &state.compressed_messages,
-                &decl_map,
-            ));
-        }
-        items.extend(messages_to_transcript_items(&state.messages, &decl_map));
-        return items;
+        return build_transcript_with_compaction(
+            &state.compressed_messages,
+            &state.messages,
+            &decl_map,
+        );
     }
 
     let session = cfg.session.as_ref().expect("checked above");
-    let mut items = Vec::new();
-    if !session.compressed_messages.is_empty() {
-        items.push(build_compaction_marker(
-            &session.compressed_messages,
-            &decl_map,
-        ));
-    }
-    items.extend(messages_to_transcript_items(&session.messages, &decl_map));
-    items
+    build_transcript_with_compaction(&session.compressed_messages, &session.messages, &decl_map)
 }
 
 /// Compact one-line preview of a tool call's arguments for the confirmation
