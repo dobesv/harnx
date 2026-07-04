@@ -267,6 +267,7 @@ pub enum TranscriptItem {
     StatusLine(String),
     CompactionMarker {
         text: String,
+        summary_text: String,
         from_seq: Option<usize>,
         to_seq: Option<usize>,
         detail_text: String,
