@@ -17,6 +17,9 @@ pub struct RemoteCleanupStats {
 }
 
 pub async fn run_remote_cleanup(config: &Config, days: u64, cluster: &str) -> RemoteCleanupStats {
+    if days == 0 {
+        return RemoteCleanupStats::default();
+    }
     run_remote_cleanup_with_gc_id(config, days, cluster, GC_SESSION_ID).await
 }
 
@@ -65,6 +68,14 @@ async fn run_remote_cleanup_with_gc_id(
     stats
 }
 
+struct CandidateContext<'a> {
+    config: &'a Config,
+    cluster: &'a str,
+    index_store: &'a Store,
+    lease_store: Option<&'a Store>,
+    threshold: u64,
+}
+
 async fn run_remote_cleanup_inner(
     config: &Config,
     days: u64,
@@ -84,18 +95,16 @@ async fn run_remote_cleanup_inner(
         scanned: candidates.len(),
         ..RemoteCleanupStats::default()
     };
+    let context = CandidateContext {
+        config,
+        cluster,
+        index_store: &index_store,
+        lease_store: lease_store.as_ref(),
+        threshold,
+    };
 
     for session_id in candidates {
-        handle_candidate(
-            config,
-            cluster,
-            &index_store,
-            lease_store.as_ref(),
-            threshold,
-            &session_id,
-            &mut stats,
-        )
-        .await;
+        handle_candidate(&context, &session_id, &mut stats).await;
     }
 
     Ok(stats)
@@ -145,49 +154,47 @@ async fn load_optional_lease_store(
 }
 
 async fn handle_candidate(
-    config: &Config,
-    cluster: &str,
-    index_store: &Store,
-    lease_store: Option<&Store>,
-    threshold: u64,
+    context: &CandidateContext<'_>,
     session_id: &str,
     stats: &mut RemoteCleanupStats,
 ) {
-    match candidate_is_active(index_store, lease_store, threshold, session_id).await {
+    match candidate_is_active(context, session_id).await {
         Ok(true) => {
             stats.skipped_active += 1;
         }
-        Ok(false) => match nats_admin::delete_remote_session(config, cluster, session_id).await {
-            Ok(_) => stats.deleted += 1,
-            Err(error) => {
-                stats.errors += 1;
-                warn!(
+        Ok(false) => {
+            match nats_admin::delete_remote_session(context.config, context.cluster, session_id)
+                .await
+            {
+                Ok(_) => stats.deleted += 1,
+                Err(error) => {
+                    stats.errors += 1;
+                    warn!(
                     "remote session cleanup delete failed: cluster={} session_id={} err={error:#}",
-                    cluster, session_id
+                    context.cluster, session_id
                 );
+                }
             }
-        },
+        }
         Err(error) => {
             stats.errors += 1;
             warn!(
                 "remote session cleanup candidate check failed: cluster={} session_id={} err={error:#}",
-                cluster, session_id
+                context.cluster, session_id
             );
         }
     }
 }
 
 async fn candidate_is_active(
-    index_store: &Store,
-    lease_store: Option<&Store>,
-    threshold: u64,
+    context: &CandidateContext<'_>,
     session_id: &str,
 ) -> anyhow::Result<bool> {
-    if lease_present(lease_store, session_id).await? {
+    if lease_present(context.lease_store, session_id).await? {
         return Ok(true);
     }
 
-    session_reactivated(index_store, session_id, threshold).await
+    session_reactivated(context.index_store, session_id, context.threshold).await
 }
 
 async fn lease_present(lease_store: Option<&Store>, session_id: &str) -> anyhow::Result<bool> {
@@ -243,8 +250,8 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_session_ids, cleanup_threshold, lease_present, run_remote_cleanup_with_gc_id,
-        SECONDS_PER_DAY,
+        candidate_session_ids, cleanup_threshold, lease_present, run_remote_cleanup,
+        run_remote_cleanup_with_gc_id, RemoteCleanupStats, SECONDS_PER_DAY,
     };
     use crate::config::{Config, NatsServerConfig};
     use crate::nats_lease::{NatsLeaseAcquireParams, NatsLeaseConfig, NatsSessionLease};
@@ -291,6 +298,16 @@ mod tests {
         assert!(!lease_present(None, "session-123")
             .await
             .expect("missing lease store"));
+    }
+
+    #[tokio::test]
+    async fn run_remote_cleanup_returns_default_when_days_zero() {
+        let config = Config::default();
+
+        assert_eq!(
+            run_remote_cleanup(&config, 0, "no-cluster").await,
+            RemoteCleanupStats::default()
+        );
     }
 
     #[tokio::test]

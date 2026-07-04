@@ -167,24 +167,12 @@ mod tests {
     use super::*;
 
     /// RAII guard that removes an env var on drop.
-    struct RemoveEnvGuard {
-        key: &'static str,
-    }
-    impl Drop for RemoveEnvGuard {
-        fn drop(&mut self) {
-            unsafe { std::env::remove_var(self.key) };
-        }
-    }
-
     #[test]
     fn load_envs_reads_cleanup_remote_sessions_days() {
         let _lock = crate::config::test_support::env_lock();
         let prev = std::env::var_os("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS");
         // SAFETY: test-only; global test lock held.
         unsafe { std::env::set_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", "7") };
-        let _guard = RemoveEnvGuard {
-            key: "HARNX_CLEANUP_REMOTE_SESSIONS_DAYS",
-        };
 
         let mut config = Config::default();
         config.load_envs();

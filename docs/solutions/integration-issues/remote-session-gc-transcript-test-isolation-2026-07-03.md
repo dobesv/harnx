@@ -76,16 +76,29 @@ Deletion order (existing primitive): stream → lease → index. "Not found" tol
 ### GC Loop Pattern
 
 ```rust
+// Public entry returns owned stats (errors are counted, not propagated);
+// the fallible scan lives in an inner helper returning anyhow::Result.
 pub async fn run_remote_cleanup(
     config: &Config,
     days: u64,
     cluster: &str,
 ) -> RemoteCleanupStats {
+    if days == 0 {
+        return RemoteCleanupStats::default();  // disabled / guard direct callers
+    }
+    // ... acquire leader lease, then run_remote_cleanup_inner(...).await ...
+}
+
+async fn run_remote_cleanup_inner(
+    config: &Config,
+    days: u64,
+    cluster: &str,
+) -> anyhow::Result<RemoteCleanupStats> {
     // Leader-election: only one worker scans per cycle
     let lease_id = "session_index_gc";  // unique per NATS cluster
     let lease = NatsSessionLease::acquire(config, cluster, lease_id).await?;
     if lease.is_none() { return Ok(RemoteCleanupStats::default()); }
-    
+
     // Scan index bucket for idle sessions
     let threshold = now() - Duration::from_days(days);
     for record in list_records(&sessions_bucket).await? {
@@ -141,10 +154,11 @@ delete_bucket(&leases_bucket).await?;
 let result = run_remote_cleanup(...).await;  // race-prone
 
 // CORRECT: unit test of decision branch
-#[test]
-fn lease_present_returns_false_when_store_missing() {
+#[tokio::test]
+async fn lease_present_returns_false_when_store_missing() -> anyhow::Result<()> {
     let result = lease_present(None, "any_session").await?;
-    assert_eq!(result, false);  // pure logic, no NATS
+    assert!(!result);  // pure logic, no NATS
+    Ok(())
 }
 ```
 
