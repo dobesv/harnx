@@ -235,6 +235,7 @@ pub async fn eval_tool_calls(
                     "is_error": true,
                     "error": error_display,
                 });
+                (ctx.emit_tool_result_fn)(&call, &error_result);
                 output.push(ToolResult::new(call, error_result));
             }
             Err(ToolError::Fatal(err)) => {
@@ -652,9 +653,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recoverable_error_does_not_emit_result() {
+    async fn recoverable_error_emits_result() {
         let result_emit_count = Arc::new(AtomicUsize::new(0));
         let result_emit_count_clone = Arc::clone(&result_emit_count);
+        let emitted_result = Arc::new(std::sync::Mutex::new(None));
+        let emitted_result_clone = Arc::clone(&emitted_result);
         let ctx = test_context_with_emitters(
             vec![Arc::new(MockToolProvider::err(
                 "tool_a",
@@ -663,8 +666,9 @@ mod tests {
             ))],
             |_| continue_hook_outcome(),
             |_, _| {},
-            move |_, _| {
+            move |_, result| {
                 result_emit_count_clone.fetch_add(1, Ordering::SeqCst);
+                *emitted_result_clone.lock().unwrap() = Some(result.clone());
             },
             |_, _| {},
         );
@@ -675,7 +679,15 @@ mod tests {
             .expect("recoverable error should return output");
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result_emit_count.load(Ordering::SeqCst), 0);
+        assert_eq!(result_emit_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            emitted_result.lock().unwrap().clone(),
+            Some(json!({"is_error": true, "error": "retry"}))
+        );
+        assert_eq!(
+            result[0].output,
+            json!({"is_error": true, "error": "retry"})
+        );
     }
 
     #[tokio::test]

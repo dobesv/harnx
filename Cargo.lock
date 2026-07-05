@@ -3509,7 +3509,6 @@ dependencies = [
  "harnx-rag",
  "harnx-render",
  "harnx-runtime",
- "harnx-serve",
  "harnx-spinner",
  "harnx-tui",
  "hmac",
@@ -3601,6 +3600,7 @@ dependencies = [
  "harnx-hooks",
  "harnx-render",
  "harnx-runtime",
+ "harnx-session",
  "log",
  "parking_lot",
  "serde_json",
@@ -4126,6 +4126,7 @@ dependencies = [
  "harnx-rag",
  "harnx-render",
  "harnx-runtime",
+ "harnx-session",
  "http 1.4.2",
  "http-body-util",
  "hyper",
@@ -4140,6 +4141,18 @@ dependencies = [
  "tokio-graceful",
  "tokio-stream",
  "uuid",
+]
+
+[[package]]
+name = "harnx-session"
+version = "0.33.1"
+dependencies = [
+ "anyhow",
+ "harnx-core",
+ "harnx-hooks",
+ "harnx-runtime",
+ "parking_lot",
+ "tokio",
 ]
 
 [[package]]

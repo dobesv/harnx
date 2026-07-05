@@ -1,7 +1,6 @@
 mod agent_event_sink;
 mod cli;
 mod cli_event_sink;
-mod serve;
 
 #[macro_use]
 extern crate log;
@@ -115,15 +114,13 @@ async fn main() -> Result<()> {
     }
 
     let text = cli.text()?;
-    let working_mode = if cli.serve.is_some() {
-        WorkingMode::Serve
-    } else if text.is_none() && cli.file.is_empty() {
+    let working_mode = if text.is_none() && cli.file.is_empty() {
         WorkingMode::Tui
     } else {
         WorkingMode::Cmd
     };
     let info_flag = legacy_info_flag(&cli);
-    setup_logger(working_mode.is_serve())?;
+    setup_logger(false)?;
     harnx_core::alloc_guard::init_from_env();
     let config = Arc::new(RwLock::new(
         Config::init(working_mode, info_flag, cli.mcp_root.clone()).await?,
@@ -372,7 +369,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     }
 
     // Spawn session cleanup background task if enabled.
-    // MUST run before the serve branch so cleanup runs in ALL modes (TUI, CLI, Serve).
+    // MUST run before command/TUI branching so cleanup runs in all harnx modes.
     // The task is best-effort and never panics; deletions are fault-tolerant.
     let cleanup_days = config.read().cleanup_inactive_sessions_days;
     if let Some(days) = cleanup_days {
@@ -392,7 +389,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
     }
 
     // Spawn remote session cleanup background task if enabled.
-    // MUST run before the serve branch so cleanup runs in ALL modes (TUI, CLI, Serve).
+    // MUST run before command/TUI branching so cleanup runs in all harnx modes.
     // The task is best-effort and never panics; deletions are fault-tolerant.
     let remote_cleanup_days = config.read().cleanup_remote_sessions_days;
     if let Some(days) = remote_cleanup_days {
@@ -423,9 +420,6 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         }
     }
 
-    if let Some(addr) = cli.serve {
-        return serve::run(config, addr).await;
-    }
     let is_tui = config.read().working_mode.is_tui();
     if cli.rebuild_rag {
         Config::rebuild_rag(&config, abort_signal.clone()).await?;
@@ -459,7 +453,7 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
                 if cfg.session.is_none() {
                     use harnx_runtime::config::{build_picker_context, find_matching_session};
                     let sessions = cfg.list_sessions_with_meta();
-                    let ctx = build_picker_context();
+                    let ctx = build_picker_context(None);
                     let agent_name = cfg
                         .agent
                         .as_ref()
@@ -796,6 +790,7 @@ async fn start_directive_inner(
             tool_calls,
             &abort_signal,
             persistent_manager,
+            None,
         )
         .await?
     };
@@ -1405,13 +1400,11 @@ mod tests_list_sessions_routing {
 }
 
 /// Emit cleanup summary if sessions were removed.
-/// In TUI/CLI mode, `emit_agent_event` buffers the event until a sink is installed,
-/// then replays it to the transcript.
+/// `emit_agent_event` buffers the event until a TUI/CLI sink is installed,
+/// then replays it to transcript.
 ///
-/// In serve mode there is no interactive transcript sink. The event will be buffered
-/// but never delivered to a user-visible destination. For serve mode visibility,
-/// we log the summary directly using `log::info!`. This dual-path ensures the message
-/// appears in user-facing transcripts (TUI/CLI) AND in server logs (serve mode).
+/// We also log summary directly so background cleanup remains visible even when
+/// no interactive transcript sink is attached yet.
 fn emit_cleanup_summary(stats: CleanupStats) {
     if stats.sessions_removed == 0 {
         return;
@@ -1421,12 +1414,11 @@ fn emit_cleanup_summary(stats: CleanupStats) {
         stats.sessions_removed,
         humanize_bytes(stats.bytes_freed)
     );
-    // Always emit via agent event sink for TUI/CLI visibility.
-    // The function returns true if the event was delivered or buffered.
+    // Always emit via agent event sink for transcript visibility.
+    // Function returns true if event was delivered or buffered.
     emit_agent_event(AgentEvent::Notice(NoticeEvent::Info(msg.clone())));
-    // Also log for serve mode visibility, since serve has no transcript sink.
-    // In TUI/CLI this creates a minor duplication (transcript + log), but the
-    // log is typically suppressed at INFO level in interactive use anyway.
+    // Also log so early/background cleanup work is visible before sink attach.
+    // In interactive use this can duplicate transcript text in logs.
     log::info!("{msg}");
 }
 

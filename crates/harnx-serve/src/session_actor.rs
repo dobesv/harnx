@@ -2,7 +2,10 @@
 
 use crate::ag_ui::AgUiSink;
 use ag_ui_core::{
-    event::{BaseEvent, Event, RunErrorEvent, RunFinishedEvent, RunStartedEvent, TextMessageEndEvent, TextMessageStartEvent},
+    event::{
+        BaseEvent, Event, RunErrorEvent, RunFinishedEvent, RunStartedEvent, TextMessageEndEvent,
+        TextMessageStartEvent,
+    },
     types::{
         ids::{MessageId, RunId, ThreadId},
         message::{Message as AgUiMessage, Role},
@@ -15,12 +18,10 @@ use harnx_core::{
     sink::with_agent_event_sink,
     tool::ToolResult,
 };
-use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::{
-    run_agent_loop, AgentCallFn, AgentLoopContext, OnToolRoundFn,
     config::{self, Config, GlobalConfig, WorkingMode},
+    run_agent_loop, AgentCallFn, AgentLoopContext, OnToolRoundFn,
 };
-use parking_lot::RwLock;
 use std::{
     collections::VecDeque,
     hash::{Hash, Hasher},
@@ -62,12 +63,18 @@ pub struct SessionHandle {
     pub tx: mpsc::Sender<SessionCommand>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionPromptOptions {
+    pub working_dir: Option<std::path::PathBuf>,
+}
+
 pub enum SessionCommand {
     Subscribe {
         reply: oneshot::Sender<SubscribeResult>,
     },
     Prompt {
         text: String,
+        options: SessionPromptOptions,
         reply: oneshot::Sender<PromptResult>,
     },
     Cancel {
@@ -90,12 +97,8 @@ pub struct SubscribeResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptResult {
-    Accepted {
-        run_id: String,
-    },
-    Enqueued {
-        run_id: String,
-    },
+    Accepted { run_id: String },
+    Enqueued { run_id: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,7 +175,11 @@ impl SessionRegistry {
         }
     }
 
-    pub fn new_for_tests(base_config: Config, reap_ttl: Duration, call_fn: Option<AgentCallFn>) -> Self {
+    pub fn new_for_tests(
+        base_config: Config,
+        reap_ttl: Duration,
+        call_fn: Option<AgentCallFn>,
+    ) -> Self {
         Self::with_options(
             reap_ttl,
             SessionActorConfig {
@@ -181,7 +188,6 @@ impl SessionRegistry {
             },
         )
     }
-
 
     pub fn has_session(&self, key: &SessionKey) -> bool {
         self.map.contains_key(key)
@@ -317,9 +323,13 @@ impl SessionActor {
                     events: self.broadcast_tx.subscribe(),
                 });
             }
-            SessionCommand::Prompt { text, reply } => match &self.active_run {
+            SessionCommand::Prompt {
+                text,
+                options,
+                reply,
+            } => match &self.active_run {
                 None => {
-                    let run_id = self.start_run(text, reap_sleep).await;
+                    let run_id = self.start_run(text, options, reap_sleep).await;
                     let _ = reply.send(PromptResult::Accepted {
                         run_id: run_id.to_string(),
                     });
@@ -372,10 +382,12 @@ impl SessionActor {
         self.refresh_history_snapshot();
         match done.result {
             Ok(()) => {
-                let _ = self.broadcast_tx.send(Event::TextMessageEnd(TextMessageEndEvent {
-                    base: base_event(),
-                    message_id: done.message_id.clone(),
-                }));
+                let _ = self
+                    .broadcast_tx
+                    .send(Event::TextMessageEnd(TextMessageEndEvent {
+                        base: base_event(),
+                        message_id: done.message_id.clone(),
+                    }));
                 let _ = self.broadcast_tx.send(Event::RunFinished(RunFinishedEvent {
                     base: base_event(),
                     thread_id: done.thread_id,
@@ -393,7 +405,8 @@ impl SessionActor {
         }
 
         if let Some(next_prompt) = self.pending.pop_front() {
-            self.start_run(next_prompt, reap_sleep).await;
+            self.start_run(next_prompt, SessionPromptOptions::default(), reap_sleep)
+                .await;
             return;
         }
 
@@ -406,10 +419,12 @@ impl SessionActor {
     async fn start_run(
         &mut self,
         text: String,
+        options: SessionPromptOptions,
         reap_sleep: &mut std::pin::Pin<&mut Sleep>,
     ) -> RunId {
         self.cancel_reap(reap_sleep);
-        let prompt_config = prompt_config_for_agent_session_from_global(&self.actor_config.base_config, &self.key);
+        let prompt_config =
+            prompt_config_for_agent_session_from_global(&self.actor_config.base_config, &self.key);
         let run_id = RunId::random();
         let thread_id = derive_thread_id(&self.key.session);
         let message_id = MessageId::random();
@@ -422,17 +437,20 @@ impl SessionActor {
             thread_id: thread_id.clone(),
             run_id: run_id.clone(),
         }));
-        let _ = self.broadcast_tx.send(Event::TextMessageStart(TextMessageStartEvent {
-            base: base_event(),
-            message_id: message_id.clone(),
-            role: Role::Assistant,
-        }));
+        let _ = self
+            .broadcast_tx
+            .send(Event::TextMessageStart(TextMessageStartEvent {
+                base: base_event(),
+                message_id: message_id.clone(),
+                role: Role::Assistant,
+            }));
 
         let loop_ctx = build_loop_ctx(
             prompt_config.clone(),
             self.actor_config.call_fn.clone(),
             abort_signal.clone(),
             inject_rx,
+            options.working_dir.clone(),
         );
         let event_tx = self.broadcast_tx.clone();
         let input = build_input(&prompt_config, &text).expect("build actor input");
@@ -440,10 +458,22 @@ impl SessionActor {
         let run_id_for_task = run_id.clone();
         let thread_id_for_task = thread_id.clone();
         let message_id_for_task = message_id.clone();
+        let base_config_for_snapshot = self.actor_config.base_config.clone();
+        let session_key_for_snapshot = self.key.clone();
         let task = tokio::spawn(async move {
-            let sink = Arc::new(BroadcastEventSender::new(event_tx, message_id_for_task.clone()));
-            let loop_result = with_agent_event_sink(sink, async { Box::pin(run_agent_loop(&loop_ctx, input)).await })
-                .await;
+            let history_snapshot = Arc::new(move || {
+                load_history_snapshot(&base_config_for_snapshot, &session_key_for_snapshot)
+                    .unwrap_or_default()
+            });
+            let sink = Arc::new(BroadcastEventSender::new(
+                event_tx,
+                message_id_for_task.clone(),
+                history_snapshot,
+            ));
+            let loop_result = with_agent_event_sink(sink, async {
+                Box::pin(run_agent_loop(&loop_ctx, input)).await
+            })
+            .await;
             let _ = done_tx
                 .send(RunFinished {
                     run_id: run_id_for_task,
@@ -505,29 +535,34 @@ impl SessionActor {
     }
 
     fn refresh_history_snapshot(&mut self) {
-        self.history_snapshot = load_history_snapshot(&self.actor_config.base_config, &self.key).unwrap_or_default();
+        self.history_snapshot =
+            load_history_snapshot(&self.actor_config.base_config, &self.key).unwrap_or_default();
     }
 }
 
 struct BroadcastEventSender {
-    tx: broadcast::Sender<Event>,
-    message_id: MessageId,
+    sink: AgUiSink,
 }
 
 impl BroadcastEventSender {
-    fn new(tx: broadcast::Sender<Event>, message_id: MessageId) -> Self {
-        Self { tx, message_id }
+    fn new(
+        tx: broadcast::Sender<Event>,
+        message_id: MessageId,
+        history_snapshot: Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>,
+    ) -> Self {
+        Self {
+            sink: AgUiSink::new_broadcast_with_snapshot(tx, message_id, history_snapshot),
+        }
     }
 }
 
 impl harnx_core::event::AgentEventSink for BroadcastEventSender {
-    fn emit(&self, event: harnx_core::event::AgentEvent, source: Option<harnx_core::event::AgentSource>) {
-        let (relay_tx, mut relay_rx) = mpsc::unbounded_channel();
-        let sink = AgUiSink::new(relay_tx, self.message_id.clone());
-        sink.emit(event, source);
-        while let Ok(event) = relay_rx.try_recv() {
-            let _ = self.tx.send(event);
-        }
+    fn emit(
+        &self,
+        event: harnx_core::event::AgentEvent,
+        source: Option<harnx_core::event::AgentSource>,
+    ) {
+        self.sink.emit(event, source);
     }
 }
 
@@ -536,6 +571,7 @@ fn build_loop_ctx(
     call_fn: Option<AgentCallFn>,
     abort_signal: AbortSignal,
     inject_rx: mpsc::Receiver<String>,
+    working_dir: Option<std::path::PathBuf>,
 ) -> AgentLoopContext {
     let shared_injected_text = Arc::new(Mutex::new(inject_rx));
     let on_tool_round: OnToolRoundFn = Arc::new(move |merged_input, _results: &[ToolResult]| {
@@ -547,69 +583,48 @@ fn build_loop_ctx(
             }
         })
     });
-    AgentLoopContext {
-        config: prompt_config,
-        abort_signal,
-        async_manager: Arc::new(Mutex::new(AsyncHookManager::default())),
-        persistent_manager: Arc::new(Mutex::new(PersistentHookManager::default())),
+    harnx_session::build_context(
+        prompt_config,
         call_fn,
-        on_tool_round: Some(on_tool_round),
-        on_text_response: None,
-        initial_with_embeddings: true,
-        initial_resume_count: 0,
-        max_resume: None,
-        pending_async_context: None,
-    }
+        abort_signal,
+        Some(on_tool_round),
+        working_dir,
+    )
 }
 
-fn prompt_config_for_agent_session_from_global(base_config: &Config, key: &SessionKey) -> GlobalConfig {
-    let prompt_config = Arc::new(RwLock::new(base_config.clone()));
+fn prompt_config_for_agent_session_from_global(
+    base_config: &Config,
+    key: &SessionKey,
+) -> GlobalConfig {
+    let prompt_config = harnx_session::fork_prompt_config(base_config);
     {
         let mut cfg = prompt_config.write();
         cfg.use_agent_by_name(&key.agent).expect("set actor agent");
-        cfg.use_session(Some(&key.session)).expect("set actor session");
+        cfg.use_session(Some(&key.session))
+            .expect("set actor session");
     }
     prompt_config
 }
 
-fn build_input(prompt_config: &GlobalConfig, text: &str) -> anyhow::Result<harnx_core::input::Input> {
+fn build_input(
+    prompt_config: &GlobalConfig,
+    text: &str,
+) -> anyhow::Result<harnx_core::input::Input> {
     Ok(config::input::from_str(prompt_config, text, None))
 }
 
-fn load_history_snapshot(base_config: &Config, key: &SessionKey) -> anyhow::Result<Vec<AgUiMessage>> {
+fn load_history_snapshot(
+    base_config: &Config,
+    key: &SessionKey,
+) -> anyhow::Result<Vec<AgUiMessage>> {
     let prompt_config = prompt_config_for_agent_session_from_global(base_config, key);
     let messages = prompt_config
         .read()
         .session
         .as_ref()
-        .map(|session| {
-            session
-                .messages
-                .iter()
-                .filter_map(history_to_ag_ui_message)
-                .collect::<Vec<_>>()
-        })
+        .map(|session| crate::ag_ui::history_messages_for_snapshot(&session.messages))
         .unwrap_or_default();
     Ok(messages)
-}
-
-fn history_to_ag_ui_message(message: &harnx_core::message::Message) -> Option<AgUiMessage> {
-    if message.role.is_user() {
-        return Some(AgUiMessage::User {
-            id: MessageId::random(),
-            content: message.content.to_text(),
-            name: None,
-        });
-    }
-    if message.role.is_assistant() {
-        return Some(AgUiMessage::Assistant {
-            id: MessageId::random(),
-            content: Some(message.content.to_text()),
-            name: None,
-            tool_calls: None,
-        });
-    }
-    None
 }
 
 fn derive_thread_id(session: &str) -> ThreadId {
@@ -624,7 +639,8 @@ fn base_event() -> BaseEvent {
     }
 }
 
-pub(crate) static TEST_CONFIG_DIR_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+pub(crate) static TEST_CONFIG_DIR_LOCK: LazyLock<StdMutex<()>> =
+    LazyLock::new(|| StdMutex::new(()));
 
 pub(crate) fn load_base_config_for_tests() -> Config {
     let prev = std::env::current_dir().expect("cwd");
@@ -658,7 +674,9 @@ mod tests {
 
     impl TestConfigSandbox {
         fn new() -> Self {
-            let lock = TEST_CONFIG_DIR_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let lock = TEST_CONFIG_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = unique_test_config_dir();
             let data_dir = root.join("data");
             let state_dir = root.join("state");
@@ -695,8 +713,13 @@ mod tests {
         }
 
         fn write_agent(&self, name: &str, prompt: &str) {
-            let body = format!("---\nmodel: openai:gpt-4o\n---\n{prompt}\n");
-            fs::write(self.root.join("agents").join(format!("{name}.md")), body).expect("write agent");
+            self.write_agent_with_front_matter(name, "model: openai:gpt-4o", prompt);
+        }
+
+        fn write_agent_with_front_matter(&self, name: &str, front_matter: &str, prompt: &str) {
+            let body = format!("---\n{front_matter}\n---\n{prompt}\n");
+            fs::write(self.root.join("agents").join(format!("{name}.md")), body)
+                .expect("write agent");
         }
     }
 
@@ -725,7 +748,10 @@ mod tests {
         ))
     }
 
-    fn set_env_var(key: &'static str, path: &std::path::Path) -> (&'static str, Option<std::ffi::OsString>) {
+    fn set_env_var(
+        key: &'static str,
+        path: &std::path::Path,
+    ) -> (&'static str, Option<std::ffi::OsString>) {
         let previous = std::env::var_os(key);
         std::env::set_var(key, path);
         (key, previous)
@@ -759,11 +785,20 @@ mod tests {
     }
 
     async fn prompt(handle: &SessionHandle, text: &str) -> PromptResult {
+        prompt_with_options(handle, text, SessionPromptOptions::default()).await
+    }
+
+    async fn prompt_with_options(
+        handle: &SessionHandle,
+        text: &str,
+        options: SessionPromptOptions,
+    ) -> PromptResult {
         let (reply_tx, reply_rx) = oneshot::channel();
         handle
             .tx
             .send(SessionCommand::Prompt {
                 text: text.to_string(),
+                options,
                 reply: reply_tx,
             })
             .await
@@ -782,7 +817,11 @@ mod tests {
     }
 
     fn registry_with_call_fn(call_fn: AgentCallFn) -> SessionRegistry {
-        SessionRegistry::new_for_tests(load_base_config_for_tests(), Duration::from_millis(50), Some(call_fn))
+        SessionRegistry::new_for_tests(
+            load_base_config_for_tests(),
+            Duration::from_millis(50),
+            Some(call_fn),
+        )
     }
 
     fn load_session_messages(agent: &str, session_id: &str) -> Vec<Message> {
@@ -845,7 +884,6 @@ mod tests {
         assert!(saw_finished);
     }
 
-
     #[tokio::test]
     async fn session_actor_prompt_run_text_events_reach_subscriber() {
         let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
@@ -856,7 +894,9 @@ mod tests {
             Box::pin(async move {
                 harnx_core::sink::emit_agent_event(harnx_core::event::AgentEvent::Model(
                     harnx_core::event::ModelEvent::MessageChunk {
-                        blocks: vec![harnx_core::event::ContentBlock::Text("hello subscriber".to_string())],
+                        blocks: vec![harnx_core::event::ContentBlock::Text(
+                            "hello subscriber".to_string(),
+                        )],
                     },
                 ));
                 Ok((
@@ -899,7 +939,10 @@ mod tests {
             }
         }
 
-        assert!(saw_text, "expected text content event on subscriber broadcast receiver");
+        assert!(
+            saw_text,
+            "expected text content event on subscriber broadcast receiver"
+        );
         assert!(saw_finished, "expected run finished event for prompted run");
     }
 
@@ -1085,14 +1128,141 @@ mod tests {
         sleep(Duration::from_millis(80)).await;
 
         let seen_injected = seen_injected.lock().await.clone();
-        assert_eq!(seen_injected, vec![None, Some("second".to_string()), Some("third".to_string())]);
+        assert_eq!(
+            seen_injected,
+            vec![None, Some("second".to_string()), Some("third".to_string())]
+        );
 
         let user_texts: Vec<String> = load_session_messages("plain", "inject-fifo")
             .iter()
             .filter(|msg| msg.role.is_user())
             .map(|msg| msg.content.to_text())
             .collect();
-        assert_eq!(user_texts, vec!["initial user request".to_string(), "second".to_string(), "third".to_string()]);
+        assert_eq!(
+            user_texts,
+            vec![
+                "initial user request".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_actor_model_tool_call_executes_and_persists_results() {
+        let _guard = harnx_runtime::client::TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
+            "plain",
+            "model: openai:gpt-4o\nuse_tools: harnx_agent_session_history_read",
+            "You are plain.",
+        );
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let seen_tool_results = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let call_fn: AgentCallFn = {
+            let call_count = Arc::clone(&call_count);
+            let seen_tool_results = Arc::clone(&seen_tool_results);
+            Arc::new(move |input, _config, _abort| {
+                let call_count = Arc::clone(&call_count);
+                let seen_tool_results = Arc::clone(&seen_tool_results);
+                let tool_results = input
+                    .tool_calls()
+                    .as_ref()
+                    .map(|calls| calls.tool_results.clone())
+                    .unwrap_or_default();
+                Box::pin(async move {
+                    let round = call_count.fetch_add(1, Ordering::SeqCst);
+                    match round {
+                        0 => Ok((
+                            "searching history".to_string(),
+                            None,
+                            vec![ToolCall::new(
+                                "harnx_agent_session_history_read".to_string(),
+                                json!({"entry_type": "message", "limit": 5}),
+                                Some("history-1".to_string()),
+                                None,
+                            )],
+                            harnx_runtime::client::CompletionTokenUsage::default(),
+                        )),
+                        1 => {
+                            let outputs = tool_results
+                                .iter()
+                                .map(|result| result.output.to_string())
+                                .collect::<Vec<_>>();
+                            *seen_tool_results.lock().await = outputs.clone();
+                            assert_eq!(tool_results.len(), 1, "expected merged tool result");
+                            assert_eq!(
+                                tool_results[0].call.name,
+                                "harnx_agent_session_history_read"
+                            );
+                            assert!(
+                                outputs[0].contains("session has not been saved yet"),
+                                "tool result should surface real built-in tool execution error: {}",
+                                outputs[0]
+                            );
+                            Ok((
+                                "history checked".to_string(),
+                                None,
+                                vec![],
+                                harnx_runtime::client::CompletionTokenUsage::default(),
+                            ))
+                        }
+                        other => panic!("unexpected llm round {other}"),
+                    }
+                })
+            })
+        };
+
+        let registry = registry_with_call_fn(call_fn);
+        let handle = registry.get_or_spawn(key("plain", "tool-history"));
+        let mut sub = subscribe(&handle).await.events;
+
+        let result = prompt(&handle, "hello actor").await;
+        let run_id = match result {
+            PromptResult::Accepted { run_id } => run_id,
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+
+        loop {
+            match sub.recv().await.expect("recv event") {
+                Event::RunFinished(finished) if finished.run_id.to_string() == run_id => break,
+                Event::RunFinished(_) => {}
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "tool result must trigger follow-up LLM round"
+        );
+        let seen_tool_results = seen_tool_results.lock().await.clone();
+        assert_eq!(
+            seen_tool_results.len(),
+            1,
+            "expected one executed tool result"
+        );
+
+        let messages = load_session_messages("plain", "tool-history");
+        let assistant_messages: Vec<String> = messages
+            .iter()
+            .filter(|msg| msg.role.is_assistant())
+            .map(|msg| msg.content.to_text())
+            .collect();
+        assert!(assistant_messages
+            .iter()
+            .any(|text| text == "history checked"));
+
+        let session_path = {
+            let mut config = load_base_config_for_tests();
+            config.use_agent_by_name("plain").expect("set agent");
+            config.session_file("tool-history")
+        };
+        let persisted = fs::read_to_string(session_path).expect("read persisted session");
+        assert!(persisted.contains("type: tool_calls"));
+        assert!(persisted.contains("type: tool_results"));
+        assert!(persisted.contains("harnx_agent_session_history_read"));
     }
 
     #[tokio::test]
@@ -1193,7 +1363,10 @@ mod tests {
         let _ = prompt(&handle, "first prompt").await;
         sleep(Duration::from_millis(5)).await;
         let enqueued = prompt(&handle, "boundary prompt").await;
-        assert!(matches!(enqueued, PromptResult::Enqueued { .. } | PromptResult::Accepted { .. }));
+        assert!(matches!(
+            enqueued,
+            PromptResult::Enqueued { .. } | PromptResult::Accepted { .. }
+        ));
         second_turn_started.notified().await;
         sleep(Duration::from_millis(80)).await;
 
@@ -1245,7 +1418,10 @@ mod tests {
 
         let running = get_info(&handle).await;
         match running.state {
-            SessionState::Running { run_id: active_run_id, .. } => assert_eq!(active_run_id, run_id),
+            SessionState::Running {
+                run_id: active_run_id,
+                ..
+            } => assert_eq!(active_run_id, run_id),
             other => panic!("expected running state, got {other:?}"),
         }
 

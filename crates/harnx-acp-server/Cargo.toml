@@ -25,6 +25,7 @@ harnx-core = { path = "../harnx-core" }
 harnx-hooks = { path = "../harnx-hooks" }
 harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
+harnx-session = { path = "../harnx-session" }
 log = { workspace = true }
 parking_lot = { workspace = true }
 serde_json = { workspace = true }

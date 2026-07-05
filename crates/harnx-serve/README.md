@@ -1,6 +1,6 @@
 # harnx-serve
 
-`harnx-serve` is a standalone HTTP server binary for the `harnx` agent harness. It provides a headless deployment option that serves the same HTTP API as `harnx --serve` but with a smaller dependency footprint, omitting the TUI and terminal-related components.
+`harnx-serve` is standalone HTTP server binary for `harnx` agent harness. It is now the only supported way to run server mode, with a smaller dependency footprint that omits TUI and terminal-related components.
 
 ## Overview
 
@@ -25,7 +25,7 @@ cargo install --path crates/harnx-serve
 
 ## AG-UI (Agent User Interaction Protocol)
 
-`harnx-serve` implements the AG-UI protocol, providing a content-negotiated, permalinkable REST surface under `/v1/agents`. This API is additive; the standard OpenAI-compatible endpoints (`/v1/chat/completions`, etc.) remain unaffected.
+`harnx-serve` implements the AG-UI protocol, providing a content-negotiated, permalinkable REST surface under `/v1/agents`. AG-UI is the sole interactive surface.
 
 The AG-UI surface allows modern web interfaces to interact with `harnx` agents using a real-time event stream and a JSON-RPC control plane.
 
@@ -57,7 +57,7 @@ Provides a live stream of AG-UI events. Multiple concurrent subscribers are supp
   - If the last message is a `user` message → starts/continues a run.
   - Otherwise (or empty body) → joins/resumes the session without starting a new run.
 - **Keep-Alive:** Sends `: keep-alive` SSE comments approximately every 15 seconds.
-- **Events:** Streams `RUN_STARTED`, `TEXT_MESSAGE_START`, `TEXT_MESSAGE_CONTENT`, `TEXT_MESSAGE_END`, `RUN_FINISHED`, and `RUN_ERROR`.
+- **Events:** Streams `RUN_STARTED`, `STEP_STARTED`, `TEXT_MESSAGE_START`, `THINKING_*`, `TEXT_MESSAGE_CONTENT`, `TOOL_CALL_*`, `CUSTOM`, `STEP_FINISHED`, `RUN_FINISHED`, and `RUN_ERROR`.
 
 #### 2. JSON-RPC 2.0 Control Plane
 **Endpoint:** `POST /v1/agents/:agent/sessions/:session/rpc`  
@@ -107,6 +107,28 @@ This implementation deliberately diverges from generic AG-UI/assistant-ui standa
 
 Cross-process live synchronization via NATS and distributed persistence (Issue #848) are deferred to Phase B.
 
+
+### AgentEvent → AG-UI mapping
+
+| harnx `AgentEvent` | AG-UI event(s) | Notes |
+| :--- | :--- | :--- |
+| `Model::MessageChunk` / `Model::Final` | `TEXT_MESSAGE_CONTENT` | `TEXT_MESSAGE_START` / `TEXT_MESSAGE_END` still come from session actor lifecycle. |
+| `Model::ThoughtChunk` | `THINKING_START`, `THINKING_TEXT_MESSAGE_START`, `THINKING_TEXT_MESSAGE_CONTENT`, `THINKING_TEXT_MESSAGE_END`, `THINKING_END` | Sink keeps per-run thinking state so multi-chunk reasoning stays one segment. |
+| `Tool::*` | `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END`, `TOOL_CALL_RESULT` | Progress/update still dropped as too noisy. |
+| `Turn::Started` / `Turn::Ended` | `STEP_STARTED` / `STEP_FINISHED` | Step names use `turn-N`. |
+| `Turn::RetryAttempt` / `ModelFallback` / `HandoffRequested` | `CUSTOM` | Names: `turn_retry_attempt`, `turn_model_fallback`, `turn_handoff_requested`. |
+| `Session::Compacting*` | `CUSTOM` (+ `MESSAGES_SNAPSHOT` on completed) | Names: `session_compacting_started`, `session_compacting_completed`, `session_compacting_failed`. Completion re-snapshots transcript because compaction mutates history. |
+| `Session::Saved` / `AgentInitializing` / `ModelChanged` / `RagIndexing` / `Generic` | `CUSTOM` | Stable names prefixed with `session_...`. |
+| `Session::LogSeqAssigned` | dropped | Persistence bookkeeping for local transcript patching; not useful on AG-UI wire. |
+| `Plan { entries }` | `CUSTOM` | Name: `plan`. Carries serialized plan entries for plan/todo panels. |
+| `Status(StatusLine)` | dropped | Spinner/status chatter is high-frequency and not durable transcript structure, so server keeps it off wire. |
+| `Model::Usage` | `CUSTOM` | Name: `usage`. Carries input/output/cached/session label for token-cost displays. |
+| `Notice::Error` / `Model::Error` | `RUN_ERROR` | Terminal user-visible error path. |
+
+Intentionally dropped today:
+- `Tool::Progress` / `Tool::Update` — high-volume progress noise; clients still get durable start/result framing.
+- `Status(StatusLine)` — spinner/status chatter is frequent and not durable transcript structure.
+- `Notice::Info` / `Notice::Warning` — not currently emitted in server flows worth surfacing; omitted to avoid custom-event spam.
 ## Operational Notes
 
 - **Persistence and `--dry-run`:** Session persistence is skipped in `--dry-run` mode.

@@ -28,6 +28,7 @@ harnx-hooks = { path = "../harnx-hooks" }
 harnx-rag = { path = "../harnx-rag" }
 harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
+harnx-session = { path = "../harnx-session" }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }

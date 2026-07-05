@@ -32,7 +32,7 @@ fn test_render_status_line() {
         "my-agent ▸ test:agent-model"
     );
 
-    let session = super::session::new(&config, "my-session").unwrap();
+    let session = super::session::new(&config, "my-session", None).unwrap();
     let session_id = session.id().to_string();
     config.session = Some(session);
 
@@ -51,7 +51,7 @@ fn test_render_status_line() {
     let mut agent3 = Agent::new(AgentConfig::from_markdown("agent3", "prompt").unwrap());
     agent3.set_model(crate::client::Model::new("", ""));
     config3.agent = Some(agent3);
-    let session3 = super::session::new(&config3, "session3").unwrap();
+    let session3 = super::session::new(&config3, "session3", None).unwrap();
     let session_id3 = session3.id().to_string();
     config3.session = Some(session3);
 
@@ -66,7 +66,7 @@ fn test_render_status_line() {
 
     // Session only (create a session without an agent)
     let mut config2 = Config::default();
-    let session_no_agent = super::session::new(&config2, "my-session2").unwrap();
+    let session_no_agent = super::session::new(&config2, "my-session2", None).unwrap();
     let session_id2 = session_no_agent.id().to_string();
     config2.session = Some(session_no_agent);
     assert_eq!(
@@ -159,7 +159,7 @@ fn test_init_mcp_manager_with_roots() {
 #[test]
 fn test_new_session_has_session_id() {
     let config = Config::default();
-    let session = self::session::new(&config, "metadata-check").unwrap();
+    let session = self::session::new(&config, "metadata-check", None).unwrap();
 
     assert!(session.session_id.is_some());
 }
@@ -227,7 +227,7 @@ fn test_anonymous_session_id_collision_retries() {
 #[test]
 fn empty_session_clears_named_session_with_messages() {
     let mut config = Config::default();
-    let mut session = self::session::new(&config, "handoff-target").unwrap();
+    let mut session = self::session::new(&config, "handoff-target", None).unwrap();
     session.push_message_for_test(MessageRole::System, "You are agent A.".to_string());
     session.push_message_for_test(MessageRole::User, "Hello from old session".to_string());
     session.push_message_for_test(MessageRole::Assistant, "Response from agent A".to_string());
@@ -261,7 +261,7 @@ fn after_chat_completion_saves_intermediate_tool_rounds() {
         },
         ..Default::default()
     };
-    let mut session = self::session::new(&config, "test-intermediate").unwrap();
+    let mut session = self::session::new(&config, "test-intermediate", None).unwrap();
     session.set_sessions_dir(tmp.path().to_path_buf());
     config.session = Some(session);
 

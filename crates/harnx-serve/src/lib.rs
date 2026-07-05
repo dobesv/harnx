@@ -7,52 +7,30 @@ pub mod ag_ui_rpc;
 pub mod session_actor;
 pub mod test_support;
 
-use crate::ag_ui::{fork_prompt_config, resolve_agent, AgUiError, AppResponse as AgUiAppResponse};
+use crate::ag_ui::{resolve_agent, AgUiError, AppResponse as AgUiAppResponse};
 use crate::ag_ui_rpc::{handle_ag_ui_rpc, PersistenceKind};
 use crate::session_actor::SessionRegistry;
 
-use harnx_core::message::{Message, MessageRole};
+use harnx_core::message::MessageRole;
 use harnx_rag::*;
-use harnx_runtime::{client::*, config::*, tool::*, utils::*};
+use harnx_runtime::{client::*, config::*, utils::*};
 use log::{debug, error, info};
 
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
-use chrono::{DateTime, Timelike, Utc};
-use futures_util::StreamExt;
+use chrono::{DateTime, Utc};
 use http::{Method, Response, StatusCode};
-use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
-use hyper::{
-    body::{Frame, Incoming},
-    service::service_fn,
-};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{
-    collections::BTreeMap,
-    convert::Infallible,
-    net::IpAddr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::SystemTime,
-};
-use tokio::{
-    net::TcpListener,
-    sync::{
-        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-        oneshot,
-    },
-};
+use std::{collections::BTreeMap, convert::Infallible, net::IpAddr, sync::Arc, time::SystemTime};
+use tokio::{net::TcpListener, sync::oneshot};
 use tokio_graceful::Shutdown;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 const DEFAULT_MODEL_NAME: &str = "default";
-const PLAYGROUND_HTML: &[u8] = include_bytes!("../assets/playground.html");
-const ARENA_HTML: &[u8] = include_bytes!("../assets/arena.html");
 
 type AppResponse = Response<BoxBody<Bytes, Infallible>>;
 
@@ -78,11 +56,8 @@ pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
     let server = Arc::new(Server::new(&config));
     let listener = TcpListener::bind(&addr).await?;
     let stop_server = server.run(listener).await?;
-    println!("Chat Completions API: http://{addr}/v1/chat/completions");
     println!("Embeddings API:       http://{addr}/v1/embeddings");
     println!("Rerank API:           http://{addr}/v1/rerank");
-    println!("LLM Playground:       http://{addr}/playground");
-    println!("LLM Arena:            http://{addr}/arena?num=2");
     shutdown_signal().await;
     let _ = stop_server.send(());
     Ok(())
@@ -117,8 +92,7 @@ enum AgentsRepresentation {
 impl Server {
     #[doc(hidden)]
     pub fn new(config: &GlobalConfig) -> Self {
-        let mut config = config.read().clone();
-        config.tools = Tools::default();
+        let config = config.read().clone();
         let mut models = list_all_models(&config.clients);
         let mut default_model = config.model.clone();
         default_model.data_mut().name = DEFAULT_MODEL_NAME.into();
@@ -163,12 +137,6 @@ impl Server {
         let resp = self.session_history_json(agent, session)?;
         let body = resp.into_body().collect().await?.to_bytes();
         Ok(serde_json::from_slice(&body)?)
-    }
-
-    #[doc(hidden)]
-    pub async fn chat_completions_status(&self) -> StatusCode {
-        // Just return OK to prove route exists - we don't run live LLM calls
-        StatusCode::BAD_REQUEST // Proves route exists and fails on missing body, not 404/405
     }
 
     async fn run(self: Arc<Self>, listener: TcpListener) -> Result<oneshot::Sender<()>> {
@@ -220,9 +188,7 @@ impl Server {
         }
 
         let mut status = StatusCode::OK;
-        let res = if path == "/v1/chat/completions" {
-            self.chat_completions(req).await
-        } else if path == "/v1/embeddings" {
+        let res = if path == "/v1/embeddings" {
             self.embeddings(req).await
         } else if path == "/v1/rerank" {
             self.rerank(req).await
@@ -230,7 +196,7 @@ impl Server {
             self.list_models()
         } else if path == "/v1/agents" {
             self.list_agents()
-        } else if path.starts_with("/v1/agents/") && path.ends_with("/rpc") {
+        } else if is_agent_rpc_path(path) {
             let persistence = if self.config.nats_servers.is_empty() {
                 PersistenceKind::Filesystem
             } else {
@@ -243,10 +209,6 @@ impl Server {
             self.list_rags()
         } else if path == "/v1/rags/search" {
             self.search_rag(req).await
-        } else if path == "/playground" || path == "/playground.html" {
-            self.playground_page()
-        } else if path == "/arena" || path == "/arena.html" {
-            self.arena_page()
         } else {
             status = StatusCode::NOT_FOUND;
             Err(anyhow!("Not Found"))
@@ -266,20 +228,6 @@ impl Server {
         };
         *res.status_mut() = status;
         set_cors_header(&mut res);
-        Ok(res)
-    }
-
-    fn playground_page(&self) -> Result<AppResponse> {
-        let res = Response::builder()
-            .header("Content-Type", "text/html; charset=utf-8")
-            .body(Full::new(Bytes::from(PLAYGROUND_HTML)).boxed())?;
-        Ok(res)
-    }
-
-    fn arena_page(&self) -> Result<AppResponse> {
-        let res = Response::builder()
-            .header("Content-Type", "text/html; charset=utf-8")
-            .body(Full::new(Bytes::from(ARENA_HTML)).boxed())?;
         Ok(res)
     }
 
@@ -451,235 +399,21 @@ impl Server {
         Ok(res)
     }
 
-    async fn chat_completions(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
-        let req_body = req.collect().await?.to_bytes();
-        let req_body: Value = serde_json::from_slice(&req_body)
-            .map_err(|err| anyhow!("Invalid request json, {err}"))?;
-
-        debug!("chat completions request: {req_body}");
-        let req_body = serde_json::from_value(req_body)
-            .map_err(|err| anyhow!("Invalid request body, {err}"))?;
-
-        let ChatCompletionsReqBody {
-            model,
-            messages,
-            temperature,
-            top_p,
-            max_tokens,
-            stream,
-            tools,
-        } = req_body;
-
-        let mut messages =
-            parse_messages(messages).map_err(|err| anyhow!("Invalid request body, {err}"))?;
-
-        let functions = parse_tools(tools).map_err(|err| anyhow!("Invalid request body, {err}"))?;
-
-        let config = self.config.clone();
-
-        let default_model = config.model.clone();
-
-        let config = Arc::new(RwLock::new(config));
-
-        let (model_name, change) = if model == DEFAULT_MODEL_NAME {
-            (default_model.id(), true)
-        } else if default_model.id() == model {
-            (model, false)
-        } else {
-            (model, true)
-        };
-
-        if change {
-            config.write().set_model(&model_name)?;
-        }
-
-        let mut client = {
-            let guard = config.read();
-            let model = guard.model.clone();
-            init_client(&guard.clients, &model)?
-        };
-        if max_tokens.is_some() {
-            client.model_mut().set_max_tokens(max_tokens, true);
-        }
-        let abort_signal = create_abort_signal();
-        let (dry_run_flag, ua_owned) = {
-            let cfg = config.read();
-            (cfg.dry_run, cfg.user_agent.clone())
-        };
-        let call_ctx = harnx_runtime::client::ClientCallContext {
-            user_agent: ua_owned.as_deref(),
-            dry_run: dry_run_flag,
-        };
-        let http_client = client.build_client(&call_ctx)?;
-
-        let completion_id = generate_completion_id();
-        let created = Utc::now().timestamp();
-
-        patch_messages(&mut messages, client.model());
-
-        let data: ChatCompletionsData = ChatCompletionsData {
-            messages,
-            temperature,
-            top_p,
-            functions,
-            stream,
-            attachments_dir: None, // harnx-serve doesn't have session attachment dirs
-        };
-
-        if stream {
-            let (tx, mut rx) = unbounded_channel();
-            tokio::spawn(async move {
-                let is_first = Arc::new(AtomicBool::new(true));
-                let (sse_tx, sse_rx) = unbounded_channel();
-                let mut handler = SseHandler::new(sse_tx, abort_signal);
-                async fn map_event(
-                    mut sse_rx: UnboundedReceiver<SseEvent>,
-                    tx: &UnboundedSender<ResEvent>,
-                    is_first: Arc<AtomicBool>,
-                ) {
-                    while let Some(reply_event) = sse_rx.recv().await {
-                        if is_first.load(Ordering::SeqCst) {
-                            let _ = tx.send(ResEvent::First(None));
-                            is_first.store(false, Ordering::SeqCst)
-                        }
-                        match reply_event {
-                            SseEvent::Text(text) => {
-                                let _ = tx.send(ResEvent::Text(text));
-                            }
-                            SseEvent::Done => {
-                                let _ = tx.send(ResEvent::Done);
-                                sse_rx.close();
-                            }
-                        }
-                    }
-                }
-                async fn chat_completions(
-                    client: &dyn Client,
-                    http_client: &reqwest::Client,
-                    handler: &mut SseHandler,
-                    mut data: ChatCompletionsData,
-                    tx: &UnboundedSender<ResEvent>,
-                    is_first: Arc<AtomicBool>,
-                ) {
-                    if client.model().no_stream() {
-                        data.stream = false;
-                        let ret = client.chat_completions_inner(http_client, data).await;
-                        match ret {
-                            Ok(output) => {
-                                let ChatCompletionsOutput {
-                                    text, tool_calls, ..
-                                } = output;
-                                let _ = tx.send(ResEvent::First(None));
-                                is_first.store(false, Ordering::SeqCst);
-                                let _ = tx.send(ResEvent::Text(text));
-                                if !tool_calls.is_empty() {
-                                    let _ = tx.send(ResEvent::ToolCalls(tool_calls));
-                                }
-                            }
-                            Err(err) => {
-                                let _ = tx.send(ResEvent::First(Some(format!("{err:?}"))));
-                                is_first.store(false, Ordering::SeqCst)
-                            }
-                        };
-                    } else {
-                        let ret = client
-                            .chat_completions_streaming_inner(http_client, handler, data)
-                            .await;
-                        let first = match ret {
-                            Ok(()) => None,
-                            Err(err) => Some(format!("{err:?}")),
-                        };
-                        if is_first.load(Ordering::SeqCst) {
-                            let _ = tx.send(ResEvent::First(first));
-                            is_first.store(false, Ordering::SeqCst)
-                        }
-                        let tool_calls = handler.tool_calls().to_vec();
-                        if !tool_calls.is_empty() {
-                            let _ = tx.send(ResEvent::ToolCalls(tool_calls));
-                        }
-                    }
-                    handler.done();
-                }
-                tokio::join!(
-                    map_event(sse_rx, &tx, is_first.clone()),
-                    chat_completions(
-                        client.as_ref(),
-                        &http_client,
-                        &mut handler,
-                        data,
-                        &tx,
-                        is_first
-                    ),
-                );
-            });
-
-            let first_event = rx.recv().await;
-
-            if let Some(ResEvent::First(Some(err))) = first_event {
-                bail!("{err}");
-            }
-
-            let shared: Arc<(String, String, i64, AtomicBool)> =
-                Arc::new((completion_id, model_name, created, AtomicBool::new(false)));
-            let stream = UnboundedReceiverStream::new(rx);
-            let stream = stream.filter_map(move |res_event| {
-                let shared = shared.clone();
-                async move {
-                    let (completion_id, model, created, has_tool_calls) = shared.as_ref();
-                    match res_event {
-                        ResEvent::Text(text) => {
-                            Some(Ok(create_text_frame(completion_id, model, *created, &text)))
-                        }
-                        ResEvent::ToolCalls(tool_calls) => {
-                            has_tool_calls.store(true, Ordering::SeqCst);
-                            Some(Ok(create_tool_calls_frame(
-                                completion_id,
-                                model,
-                                *created,
-                                &tool_calls,
-                            )))
-                        }
-                        ResEvent::Done => Some(Ok(create_done_frame(
-                            completion_id,
-                            model,
-                            *created,
-                            has_tool_calls.load(Ordering::SeqCst),
-                        ))),
-                        _ => None,
-                    }
-                }
-            });
-            let res = Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", "text/event-stream")
-                .header("Cache-Control", "no-cache")
-                .header("Connection", "keep-alive")
-                .body(BodyExt::boxed(StreamBody::new(stream)))?;
-            Ok(res)
-        } else {
-            let output = client.chat_completions_inner(&http_client, data).await?;
-            let res = Response::builder()
-                .header("Content-Type", "application/json")
-                .body(
-                    Full::new(ret_non_stream(
-                        &completion_id,
-                        &model_name,
-                        created,
-                        &output,
-                    ))
-                    .boxed(),
-                )?;
-            Ok(res)
-        }
-    }
-
     pub(crate) async fn ag_ui_run(
         &self,
         agent: &str,
         session: &str,
         req_body: &[u8],
     ) -> Result<AgUiAppResponse, AgUiError> {
-        ag_ui::ag_ui_run_with_call_fn(&self.config, &self.session_registry, agent, session, req_body, None).await
+        ag_ui::ag_ui_run_with_call_fn(
+            &self.config,
+            &self.session_registry,
+            agent,
+            session,
+            req_body,
+            None,
+        )
+        .await
     }
 
     async fn embeddings(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
@@ -826,18 +560,6 @@ struct SearchRagReqBody {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatCompletionsReqBody {
-    model: String,
-    messages: Vec<Value>,
-    temperature: Option<f64>,
-    top_p: Option<f64>,
-    max_tokens: Option<isize>,
-    #[serde(default)]
-    stream: bool,
-    tools: Option<Vec<Value>>,
-}
-
-#[derive(Debug, Deserialize)]
 struct EmbeddingsReqBody {
     input: EmbeddingsReqBodyInput,
     model: String,
@@ -858,23 +580,10 @@ struct RerankReqBody {
     top_n: Option<usize>,
 }
 
-#[derive(Debug)]
-enum ResEvent {
-    First(Option<String>),
-    Text(String),
-    ToolCalls(Vec<ToolCall>),
-    Done,
-}
-
 async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to install CTRL+C signal handler")
-}
-
-fn generate_completion_id() -> String {
-    let random_id = chrono::Utc::now().nanosecond();
-    format!("chatcmpl-{random_id}")
 }
 
 fn set_cors_header(res: &mut AppResponse) {
@@ -890,157 +599,6 @@ fn set_cors_header(res: &mut AppResponse) {
         hyper::header::ACCESS_CONTROL_ALLOW_HEADERS,
         hyper::header::HeaderValue::from_static("Content-Type,Authorization"),
     );
-}
-
-fn create_text_frame(id: &str, model: &str, created: i64, content: &str) -> Frame<Bytes> {
-    let delta = if content.is_empty() {
-        json!({ "role": "assistant", "content": content })
-    } else {
-        json!({ "content": content })
-    };
-    let choice = json!({
-        "index": 0,
-        "delta": delta,
-        "finish_reason": null,
-    });
-    let value = build_chat_completion_chunk_json(id, model, created, &choice);
-    Frame::data(Bytes::from(format!("data: {value}\n\n")))
-}
-
-fn create_tool_calls_frame(
-    id: &str,
-    model: &str,
-    created: i64,
-    tool_calls: &[ToolCall],
-) -> Frame<Bytes> {
-    let chunks = tool_calls
-        .iter()
-        .enumerate()
-        .flat_map(|(i, call)| {
-            let choice1 = json!({
-              "index": 0,
-              "delta": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [
-                  {
-                    "index": i,
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                      "name": call.name,
-                      "arguments": ""
-                    }
-                  }
-                ]
-              },
-              "finish_reason": null
-            });
-            let choice2 = json!({
-              "index": 0,
-              "delta": {
-                "tool_calls": [
-                  {
-                    "index": i,
-                    "function": {
-                      "arguments": call.arguments.to_string(),
-                    }
-                  }
-                ]
-              },
-              "finish_reason": null
-            });
-            vec![
-                build_chat_completion_chunk_json(id, model, created, &choice1),
-                build_chat_completion_chunk_json(id, model, created, &choice2),
-            ]
-        })
-        .map(|v| format!("data: {v}\n\n"))
-        .collect::<Vec<String>>()
-        .join("");
-    Frame::data(Bytes::from(chunks))
-}
-
-fn create_done_frame(id: &str, model: &str, created: i64, has_tool_calls: bool) -> Frame<Bytes> {
-    let finish_reason = if has_tool_calls { "tool_calls" } else { "stop" };
-    let choice = json!({
-        "index": 0,
-        "delta": {},
-        "finish_reason": finish_reason,
-    });
-    let value = build_chat_completion_chunk_json(id, model, created, &choice);
-    Frame::data(Bytes::from(format!("data: {value}\n\ndata: [DONE]\n\n")))
-}
-
-fn build_chat_completion_chunk_json(id: &str, model: &str, created: i64, choice: &Value) -> Value {
-    json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [choice],
-    })
-}
-
-fn ret_non_stream(id: &str, model: &str, created: i64, output: &ChatCompletionsOutput) -> Bytes {
-    let id = output.id.as_deref().unwrap_or(id);
-    let input_tokens = output.input_tokens.unwrap_or_default();
-    let output_tokens = output.output_tokens.unwrap_or_default();
-    let total_tokens = input_tokens + output_tokens;
-    let choice = if output.tool_calls.is_empty() {
-        json!({
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": output.text,
-            },
-            "logprobs": null,
-            "finish_reason": "stop",
-        })
-    } else {
-        let content = if output.text.is_empty() {
-            Value::Null
-        } else {
-            output.text.clone().into()
-        };
-        let tool_calls: Vec<_> = output
-            .tool_calls
-            .iter()
-            .map(|call| {
-                json!({
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        "arguments": call.arguments.to_string(),
-                    }
-                })
-            })
-            .collect();
-        json!({
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls,
-            },
-            "logprobs": null,
-            "finish_reason": "tool_calls",
-        })
-    };
-    let res_body = json!({
-        "id": id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [choice],
-        "usage": {
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": total_tokens,
-        },
-    });
-    Bytes::from(res_body.to_string())
 }
 
 fn ret_err<T: std::fmt::Display>(err: T) -> AppResponse {
@@ -1068,6 +626,21 @@ fn parse_agents_route(path: &str) -> Option<RouteMatch<'_>> {
         [agent, "sessions", session] => Some((*agent, Some(*session), AgentsRoute::Session)),
         _ => None,
     }
+}
+
+/// Matches exactly the JSON-RPC control-plane path shape `/v1/agents/{agent}/rpc`
+/// (a single agent segment followed by `rpc`). A naive `ends_with("/rpc")` check
+/// would also match a session literally named `rpc`
+/// (`/v1/agents/{agent}/sessions/rpc`) and misroute it to the RPC handler.
+fn is_agent_rpc_path(path: &str) -> bool {
+    let Some(suffix) = path.strip_prefix("/v1/agents/") else {
+        return false;
+    };
+    let segments: Vec<_> = suffix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    matches!(segments.as_slice(), [_agent, "rpc"])
 }
 
 fn negotiate_agents_route(
@@ -1110,7 +683,7 @@ fn accepts_event_stream(headers: &http::HeaderMap) -> bool {
 }
 
 fn agent_scoped_config(config: &Config, agent: &str) -> Result<Config> {
-    let scoped = fork_prompt_config(config);
+    let scoped = harnx_session::fork_prompt_config(config);
     scoped
         .write()
         .use_agent_by_name(agent)
@@ -1231,134 +804,6 @@ fn status_from_error(err: &anyhow::Error) -> Option<StatusCode> {
     let status = message.split(marker).nth(1)?;
     let code = status.parse::<u16>().ok()?;
     StatusCode::from_u16(code).ok()
-}
-fn parse_messages(message: Vec<Value>) -> Result<Vec<Message>> {
-    let mut output = vec![];
-    let mut tool_results = None;
-    for (i, message) in message.into_iter().enumerate() {
-        let err = || anyhow!("Failed to parse '.messages[{i}]'");
-        let role = message["role"].as_str().ok_or_else(err)?;
-        let content = match message.get("content") {
-            Some(value) => {
-                if let Some(value) = value.as_str() {
-                    MessageContent::Text(value.to_string())
-                } else if value.is_array() {
-                    let value = serde_json::from_value(value.clone()).map_err(|_| err())?;
-                    MessageContent::Array(value)
-                } else if value.is_null() {
-                    MessageContent::Text(String::new())
-                } else {
-                    return Err(err());
-                }
-            }
-            None => MessageContent::Text(String::new()),
-        };
-        match role {
-            "system" | "user" => {
-                let role = match role {
-                    "system" => MessageRole::System,
-                    "user" => MessageRole::User,
-                    _ => unreachable!(),
-                };
-                output.push(Message::new(role, content))
-            }
-            "assistant" => {
-                let role = MessageRole::Assistant;
-                match message["tool_calls"].as_array() {
-                    Some(tool_calls) => {
-                        if tool_results.is_some() {
-                            return Err(err());
-                        }
-                        let mut list = vec![];
-                        for tool_call in tool_calls {
-                            if let (id, Some(name), Some(arguments)) = (
-                                tool_call["id"].as_str().map(|v| v.to_string()),
-                                tool_call["function"]["name"].as_str(),
-                                tool_call["function"]["arguments"].as_str(),
-                            ) {
-                                let arguments =
-                                    serde_json::from_str(arguments).map_err(|_| err())?;
-                                let thought_signature = tool_call["function"]["thought_signature"]
-                                    .as_str()
-                                    .map(|v| v.to_string());
-                                list.push((id, name.to_string(), arguments, thought_signature));
-                            } else {
-                                return Err(err());
-                            }
-                        }
-                        tool_results = Some((content.to_text(), list, vec![]));
-                    }
-                    None => output.push(Message::new(role, content)),
-                }
-            }
-            "tool" => match tool_results.take() {
-                Some((text, tool_calls, mut tool_values)) => {
-                    let tool_call_id = message["tool_call_id"].as_str().map(|v| v.to_string());
-                    let content = content.to_text();
-                    let value: Value = serde_json::from_str(&content)
-                        .ok()
-                        .unwrap_or_else(|| content.into());
-
-                    tool_values.push((value, tool_call_id));
-
-                    if tool_calls.len() == tool_values.len() {
-                        let mut list = vec![];
-                        for ((id, name, arguments, thought_signature), (value, tool_call_id)) in
-                            tool_calls.into_iter().zip(tool_values)
-                        {
-                            if id != tool_call_id {
-                                return Err(err());
-                            }
-                            list.push(ToolResult::new(
-                                ToolCall::new(name, arguments, id, thought_signature),
-                                value,
-                            ))
-                        }
-                        output.push(Message::new(
-                            MessageRole::Assistant,
-                            MessageContent::ToolCalls(MessageContentToolCalls::new(
-                                list, text, None,
-                            )),
-                        ));
-                        tool_results = None;
-                    } else {
-                        tool_results = Some((text, tool_calls, tool_values));
-                    }
-                }
-                None => return Err(err()),
-            },
-            _ => {
-                return Err(err());
-            }
-        }
-    }
-
-    if tool_results.is_some() {
-        bail!("Invalid messages");
-    }
-
-    Ok(output)
-}
-
-fn parse_tools(tools: Option<Vec<Value>>) -> Result<Option<Vec<ToolDeclaration>>> {
-    let tools = match tools {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-    let mut functions = vec![];
-    for (i, tool) in tools.into_iter().enumerate() {
-        if let (Some("function"), Some(function)) = (
-            tool["type"].as_str(),
-            tool["function"]
-                .as_object()
-                .and_then(|v| serde_json::from_value(json!(v)).ok()),
-        ) {
-            functions.push(function);
-        } else {
-            bail!("Failed to parse '.tools[{i}]'")
-        }
-    }
-    Ok(Some(functions))
 }
 
 #[cfg(test)]
@@ -1487,6 +932,21 @@ mod tests {
         );
         assert_eq!(parse_agents_route("/v1/agents"), None);
         assert_eq!(parse_agents_route("/v1/agents/hephaestus/extra"), None);
+    }
+
+    #[test]
+    fn is_agent_rpc_path_matches_only_agent_rpc_shape() {
+        // The real RPC endpoint.
+        assert!(is_agent_rpc_path("/v1/agents/hephaestus/rpc"));
+        // A session literally named "rpc" must NOT be treated as the RPC endpoint.
+        assert!(!is_agent_rpc_path("/v1/agents/hephaestus/sessions/rpc"));
+        // Other agent-tree shapes are not RPC.
+        assert!(!is_agent_rpc_path("/v1/agents/hephaestus"));
+        assert!(!is_agent_rpc_path("/v1/agents/hephaestus/sessions"));
+        assert!(!is_agent_rpc_path(
+            "/v1/agents/hephaestus/sessions/thread-1"
+        ));
+        assert!(!is_agent_rpc_path("/v1/models"));
     }
 
     #[test]
@@ -1723,7 +1183,7 @@ mod tests {
         )
         .expect("create flat sessions dir");
 
-        let prompt_config = fork_prompt_config(&config);
+        let prompt_config = harnx_session::fork_prompt_config(&config);
         {
             let mut prompt = prompt_config.write();
             prompt.use_agent_by_name("plain").expect("set agent");

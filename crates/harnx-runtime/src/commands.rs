@@ -948,6 +948,7 @@ async fn ask_inner(
         initial_resume_count: resume_count,
         max_resume: Some(max_resume),
         pending_async_context: Some(pending_arc.clone()),
+        working_dir: None,
     };
 
     let result = crate::agent_loop::run_agent_loop(&ctx, input).await;
@@ -1211,7 +1212,7 @@ mod tests {
             working_mode: WorkingMode::Cmd,
             ..Default::default()
         };
-        config.session = Some(config::session::new(&config, "test").expect("test session"));
+        config.session = Some(config::session::new(&config, "test", None).expect("test session"));
         Arc::new(RwLock::new(config))
     }
 
@@ -1235,7 +1236,7 @@ mod tests {
             working_mode: WorkingMode::Cmd,
             ..Default::default()
         };
-        config.session = Some(config::session::new(&config, "test").expect("test session"));
+        config.session = Some(config::session::new(&config, "test", None).expect("test session"));
         let config = Arc::new(RwLock::new(config));
         let mut output = Vec::new();
         let abort_signal = crate::utils::create_abort_signal();
@@ -1300,7 +1301,7 @@ mod tests {
             working_mode: WorkingMode::Cmd,
             ..Default::default()
         };
-        config.session = Some(config::session::new(&config, "test").expect("test session"));
+        config.session = Some(config::session::new(&config, "test", None).expect("test session"));
         Arc::new(RwLock::new(config))
     }
 

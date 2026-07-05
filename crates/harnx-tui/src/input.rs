@@ -1990,7 +1990,7 @@ impl Tui {
             (self.config.read().list_sessions_with_meta(), None)
         };
 
-        let ctx = build_picker_context();
+        let ctx = build_picker_context(None);
         let sessions = sort_sessions_for_picker(sessions, &ctx);
         let origin_agent = self
             .config
@@ -2438,7 +2438,7 @@ impl Tui {
                             }
 
                             let sessions = self.config.read().list_sessions_with_meta();
-                            let ctx = build_picker_context();
+                            let ctx = build_picker_context(None);
                             let sessions = sort_sessions_for_picker(sessions, &ctx);
                             // Always show SessionPicker so the user can pick "New session"
                             // (index 0) or an existing session. Carry the pre-activation

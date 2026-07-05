@@ -403,7 +403,8 @@ async fn run_remote_round_trip_with_session_id_and_sink(
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let mut parent_config = parent_config;
-    let parent_session = crate::config::session::new(&parent_config, "parent-nats-roundtrip")?;
+    let parent_session =
+        crate::config::session::new(&parent_config, "parent-nats-roundtrip", None)?;
     parent_config.session = Some(parent_session);
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
@@ -652,11 +653,13 @@ async fn remote_header_matches_local_header_source_of_truth() {
     let (session, expected_header) = {
         let _cwd_guard = CurrentDirGuard::change_to(&temp_repo_path)
             .expect("must switch into hermetic git repo for header generation");
-        let session = write_header_and_load_session(&backend, &config, &input, None, session_id)
-            .await
-            .unwrap();
+        let session =
+            write_header_and_load_session(&backend, &config, &input, None, session_id, None)
+                .await
+                .unwrap();
         let expected_header = {
-            let mut expected_session = config::session::new(&config.read(), session_id).unwrap();
+            let mut expected_session =
+                config::session::new(&config.read(), session_id, None).unwrap();
             expected_session.set_agent(&input.agent).unwrap();
             expected_session.build_header_entry()
         };
@@ -821,7 +824,8 @@ async fn run_remote_turn_returning_reply(
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let mut parent_config = parent_config;
-    let parent_session = crate::config::session::new(&parent_config, "parent-nats-roundtrip")?;
+    let parent_session =
+        crate::config::session::new(&parent_config, "parent-nats-roundtrip", None)?;
     parent_config.session = Some(parent_session);
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();
@@ -1357,8 +1361,9 @@ async fn remote_cancel_published_after_in_flight_marks_session_cancelled() {
     let daemon = spawn_metis_worker_with_call_fn(&url, call_fn);
 
     let mut parent_config = seeded.parent_config;
-    let parent_session = crate::config::session::new(&parent_config, "parent-nats-remote-cancel")
-        .expect("create parent session");
+    let parent_session =
+        crate::config::session::new(&parent_config, "parent-nats-remote-cancel", None)
+            .expect("create parent session");
     parent_config.session = Some(parent_session);
     let parent_global_config = Arc::new(parking_lot::RwLock::new(parent_config));
     let abort_signal = harnx_core::abort::create_abort_signal();

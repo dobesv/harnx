@@ -71,7 +71,11 @@ impl TestConfigSandbox {
     }
 
     pub fn write_agent(&self, name: &str, prompt: &str) {
-        let body = format!("---\nmodel: openai:gpt-4o\n---\n{prompt}\n");
+        self.write_agent_with_front_matter(name, "model: openai:gpt-4o", prompt);
+    }
+
+    pub fn write_agent_with_front_matter(&self, name: &str, front_matter: &str, prompt: &str) {
+        let body = format!("---\n{front_matter}\n---\n{prompt}\n");
         fs::write(self.root.join("agents").join(format!("{name}.md")), body).expect("write agent");
     }
 

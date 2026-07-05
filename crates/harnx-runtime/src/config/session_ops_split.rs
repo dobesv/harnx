@@ -30,12 +30,12 @@ impl Config {
         match session_name {
             None => {
                 let short_id = self.new_session_id()?;
-                session = Some(self::session::new(self, &short_id)?);
+                session = Some(self::session::new(self, &short_id, None)?);
             }
             Some(name) => {
                 let session_path = self.session_file(name);
                 if !session_path.exists() {
-                    session = Some(self::session::new(self, name)?);
+                    session = Some(self::session::new(self, name, None)?);
                 } else {
                     session = Some(self::session::load(self, name, &session_path)?);
                 }

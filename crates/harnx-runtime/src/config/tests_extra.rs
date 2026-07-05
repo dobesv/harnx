@@ -178,7 +178,7 @@ async fn session_history_provider_call_tool_returns_message_entries() {
         },
         ..Default::default()
     };
-    let mut session = self::session::new(&config, "call-tool-test").unwrap();
+    let mut session = self::session::new(&config, "call-tool-test", None).unwrap();
     session.set_sessions_dir(tmp.path().to_path_buf());
 
     // Append a message entry so the log file is initialized and contains data.

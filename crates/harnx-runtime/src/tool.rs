@@ -42,6 +42,7 @@ pub async fn execute_tool_round(
     tool_calls: Vec<ToolCall>,
     abort_signal: &AbortSignal,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<Vec<ToolResult>> {
     let dry_run = config.read().dry_run;
 
@@ -64,6 +65,7 @@ pub async fn execute_tool_round(
         agent_use_tools.as_deref(),
         current_agent_package,
         persistent_manager,
+        working_dir,
     );
     let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal).await {
         Ok(results) => results,
@@ -115,10 +117,13 @@ fn build_dispatch_hook_fn(
     per_tool_hooks: HashMap<String, (String, Vec<HookConfig>)>,
     session_name: Option<&str>,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
+    working_dir: Option<&std::path::Path>,
 ) -> Arc<DispatchHookFn> {
     let hooks_entries = hooks.entries.clone();
     let session_id = session_name.unwrap_or("cmd").to_string();
-    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd = working_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let persistent_manager = persistent_manager.clone();
     Arc::new(move |event: HookEvent| {
         let hooks_entries = hooks_entries.clone();
@@ -207,6 +212,7 @@ pub fn build_tool_eval_context(
     agent_use_tools: Option<&str>,
     current_agent_package: Option<String>,
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
+    working_dir: Option<&std::path::Path>,
 ) -> ToolEvalContext {
     let guard = config.read();
     let (tool_declarations, handoff_targets) =
@@ -280,6 +286,7 @@ pub fn build_tool_eval_context(
         per_tool_hooks,
         session_name.as_deref(),
         persistent_manager,
+        working_dir,
     );
     let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn) = build_emit_fns(&decl_map);
 
@@ -505,7 +512,7 @@ mod tests {
             harnx_hooks::PersistentHookManager::new(),
         ));
         let result = eval_tool_calls(
-            &build_tool_eval_context(&config, None, None, &persistent_manager),
+            &build_tool_eval_context(&config, None, None, &persistent_manager, None),
             calls,
             &abort_signal,
         )
@@ -536,14 +543,14 @@ mod tests {
         let pkg = harnx_core::package_namespace::pkg_from_qualified("pantheon/daedalus")
             .map(str::to_string);
         assert_eq!(pkg.as_deref(), Some("pantheon"));
-        let ctx = build_tool_eval_context(&config, None, pkg, &persistent_manager);
+        let ctx = build_tool_eval_context(&config, None, pkg, &persistent_manager, None);
         assert_eq!(ctx.current_agent_package.as_deref(), Some("pantheon"));
 
         // A bare (top-level) agent name yields no package context.
         let bare =
             harnx_core::package_namespace::pkg_from_qualified("daedalus").map(str::to_string);
         assert_eq!(bare, None);
-        let ctx = build_tool_eval_context(&config, None, bare, &persistent_manager);
+        let ctx = build_tool_eval_context(&config, None, bare, &persistent_manager, None);
         assert_eq!(ctx.current_agent_package, None);
     }
 
@@ -559,7 +566,7 @@ mod tests {
 
         // Default (no override): the inquire-based prompt is used. In a
         // non-terminal test process it denies, so this returns false.
-        let ctx = build_tool_eval_context(&config, None, None, &persistent_manager);
+        let ctx = build_tool_eval_context(&config, None, None, &persistent_manager, None);
         assert!(!(ctx.confirm_tool_use_fn)(
             "t",
             &serde_json::json!({}),
@@ -570,7 +577,7 @@ mod tests {
         config
             .write()
             .set_tui_confirm_tool_use(Some(Arc::new(|_, _, _| true)));
-        let ctx = build_tool_eval_context(&config, None, None, &persistent_manager);
+        let ctx = build_tool_eval_context(&config, None, None, &persistent_manager, None);
         assert!((ctx.confirm_tool_use_fn)("t", &serde_json::json!({}), None));
     }
 
@@ -869,7 +876,7 @@ mod tests {
         let pm = Arc::new(tokio::sync::Mutex::new(
             harnx_hooks::PersistentHookManager::new(),
         ));
-        let dispatch_fn = build_dispatch_hook_fn(&hooks_config, per_tool_hooks, None, &pm);
+        let dispatch_fn = build_dispatch_hook_fn(&hooks_config, per_tool_hooks, None, &pm, None);
         (dispatch_fn)(event).await
     }
 
@@ -1023,5 +1030,68 @@ mod tests {
                 other => panic!("expected Completed event, got {other:?}"),
             }
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_dispatch_hook_fn_uses_explicit_working_dir_per_run() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let hooks = harnx_hooks::HooksConfig {
+            entries: vec![make_hook_config("SessionStart", None, "pwd > hook-cwd.txt")],
+            max_resume: None,
+        };
+        let persistent_manager =
+            std::sync::Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
+        let root_a = TempDir::new().unwrap();
+        let root_b = TempDir::new().unwrap();
+
+        let dispatch_a = build_dispatch_hook_fn(
+            &hooks,
+            HashMap::new(),
+            Some("session-a"),
+            &persistent_manager,
+            Some(root_a.path()),
+        );
+        let dispatch_b = build_dispatch_hook_fn(
+            &hooks,
+            HashMap::new(),
+            Some("session-b"),
+            &persistent_manager,
+            Some(root_b.path()),
+        );
+
+        let (outcome_a, outcome_b) = tokio::join!(
+            dispatch_a(session_start_event()),
+            dispatch_b(session_start_event())
+        );
+        assert!(matches!(
+            outcome_a.control,
+            harnx_core::hooks::HookResultControl::Continue
+        ));
+        assert!(matches!(
+            outcome_b.control,
+            harnx_core::hooks::HookResultControl::Continue
+        ));
+
+        let cwd_a = fs::read_to_string(root_a.path().join("hook-cwd.txt")).unwrap();
+        let cwd_b = fs::read_to_string(root_b.path().join("hook-cwd.txt")).unwrap();
+        // Each hook's `pwd` is captured by the shell, so its exact string form
+        // is platform/shell dependent (macOS resolves /var -> /private/var;
+        // git-bash on Windows emits Unix-style /c/... paths that Rust's
+        // fs::canonicalize can't resolve). Assert per-run isolation by the
+        // TempDir's unique basename rather than full-path equality: each hook
+        // ran in its own root, and the two dirs differ.
+        let name_a = root_a.path().file_name().unwrap().to_str().unwrap();
+        let name_b = root_b.path().file_name().unwrap().to_str().unwrap();
+        assert!(
+            cwd_a.trim().ends_with(name_a),
+            "hook A cwd {cwd_a:?} should end with its root {name_a:?}"
+        );
+        assert!(
+            cwd_b.trim().ends_with(name_b),
+            "hook B cwd {cwd_b:?} should end with its root {name_b:?}"
+        );
+        assert_ne!(cwd_a, cwd_b);
     }
 }

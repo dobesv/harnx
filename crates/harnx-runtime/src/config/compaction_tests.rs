@@ -38,7 +38,7 @@ fn config_with_agent(name: &str, md: &str) -> Config {
 
 /// Attach a fresh session carrying `turns` and wrap the config for sharing.
 fn with_session(mut config: Config, turns: Vec<(MessageRole, String)>) -> GlobalConfig {
-    let mut session = self::session::new(&config, "test-session").unwrap();
+    let mut session = self::session::new(&config, "test-session", None).unwrap();
     for (role, text) in turns {
         session.push_message_for_test(role, text);
     }
@@ -261,7 +261,7 @@ async fn test_compaction_preserves_ids_for_preserved_suffix_messages() {
         },
         ..Default::default()
     };
-    let mut session = self::session::new(&config, session_name).unwrap();
+    let mut session = self::session::new(&config, session_name, None).unwrap();
     session.set_sessions_dir(temp.path().to_path_buf());
     self::session::ensure_log_file(&mut session);
 

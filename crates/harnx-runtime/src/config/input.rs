@@ -435,7 +435,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut sess = session::new(&config, "trace-repro").unwrap();
+        let mut sess = session::new(&config, "trace-repro", None).unwrap();
         sess.set_sessions_dir(tmp.path().to_path_buf());
         config.session = Some(sess);
         let global_config: GlobalConfig = Arc::new(RwLock::new(config));
@@ -514,7 +514,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut sess = session::new(&config, "test-session").unwrap();
+        let mut sess = session::new(&config, "test-session", None).unwrap();
         sess.set_sessions_dir(tmp.path().to_path_buf());
         sess.path = Some(session_path.to_string_lossy().into_owned());
         config.session = Some(sess);
@@ -580,7 +580,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut sess = session::new(&config, "test-session").unwrap();
+        let mut sess = session::new(&config, "test-session", None).unwrap();
         sess.set_sessions_dir(tmp.path().to_path_buf());
         sess.path = Some(session_path.to_string_lossy().into_owned());
         config.session = Some(sess);

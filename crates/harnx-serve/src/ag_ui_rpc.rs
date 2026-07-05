@@ -1,6 +1,9 @@
 use crate::ag_ui::AppResponse;
 use crate::agent_scoped_config;
-use crate::session_actor::{PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionKey, SessionRegistry, SessionState};
+use crate::session_actor::{
+    PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionKey, SessionPromptOptions,
+    SessionRegistry, SessionState,
+};
 use bytes::Bytes;
 use http::{Method, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -39,6 +42,8 @@ struct JsonRpcRequest {
 #[derive(Debug, Deserialize)]
 struct PromptParams {
     text: String,
+    #[serde(default)]
+    working_dir: Option<std::path::PathBuf>,
 }
 
 pub async fn handle_ag_ui_rpc(
@@ -72,7 +77,12 @@ pub async fn handle_ag_ui_rpc_bytes(
     if method != Method::POST {
         return json_rpc_response(
             StatusCode::METHOD_NOT_ALLOWED,
-            json_rpc_error(Value::Null, -32600, "invalid request", Some(json!({ "reason": "method must be POST" }))),
+            json_rpc_error(
+                Value::Null,
+                -32600,
+                "invalid request",
+                Some(json!({ "reason": "method must be POST" })),
+            ),
         );
     }
 
@@ -81,7 +91,12 @@ pub async fn handle_ag_ui_rpc_bytes(
         Err(err) => {
             return json_rpc_response(
                 StatusCode::BAD_REQUEST,
-                json_rpc_error(Value::Null, -32700, "parse error", Some(json!({ "detail": err.to_string() }))),
+                json_rpc_error(
+                    Value::Null,
+                    -32700,
+                    "parse error",
+                    Some(json!({ "detail": err.to_string() })),
+                ),
             );
         }
     };
@@ -168,14 +183,24 @@ async fn handle_prompt(
             Err(_) => {
                 return json_rpc_response(
                     StatusCode::BAD_REQUEST,
-                    json_rpc_error(id, -32602, "invalid params", Some(json!({ "expected": { "text": "string" } }))),
+                    json_rpc_error(
+                        id,
+                        -32602,
+                        "invalid params",
+                        Some(json!({ "expected": { "text": "string", "working_dir": "string?" } })),
+                    ),
                 );
             }
         },
         None => {
             return json_rpc_response(
                 StatusCode::BAD_REQUEST,
-                json_rpc_error(id, -32602, "invalid params", Some(json!({ "expected": { "text": "string" } }))),
+                json_rpc_error(
+                    id,
+                    -32602,
+                    "invalid params",
+                    Some(json!({ "expected": { "text": "string" } })),
+                ),
             );
         }
     };
@@ -183,7 +208,12 @@ async fn handle_prompt(
     if params.text.trim().is_empty() {
         return json_rpc_response(
             StatusCode::BAD_REQUEST,
-            json_rpc_error(id, -32602, "invalid params", Some(json!({ "expected": { "text": "non-empty string" } }))),
+            json_rpc_error(
+                id,
+                -32602,
+                "invalid params",
+                Some(json!({ "expected": { "text": "non-empty string" } })),
+            ),
         );
     }
 
@@ -200,7 +230,15 @@ async fn handle_prompt(
     }
 
     let handle = registry.get_or_spawn(key);
-    let result = match prompt(&handle, &params.text).await {
+    let result = match prompt(
+        &handle,
+        &params.text,
+        SessionPromptOptions {
+            working_dir: params.working_dir.clone(),
+        },
+    )
+    .await
+    {
         Ok(result) => result,
         Err(message) => {
             return json_rpc_response(
@@ -250,7 +288,12 @@ async fn handle_cancel(
     if matches!(info.state, SessionState::Idle) {
         return json_rpc_response(
             StatusCode::BAD_REQUEST,
-            json_rpc_error(id, JSON_RPC_IDLE_CANCEL_CODE, "session is not running", None),
+            json_rpc_error(
+                id,
+                JSON_RPC_IDLE_CANCEL_CODE,
+                "session is not running",
+                None,
+            ),
         );
     }
 
@@ -306,12 +349,17 @@ fn session_state_json(state: &SessionState) -> Value {
     }
 }
 
-async fn prompt(handle: &SessionHandle, text: &str) -> Result<PromptResult, String> {
+async fn prompt(
+    handle: &SessionHandle,
+    text: &str,
+    options: SessionPromptOptions,
+) -> Result<PromptResult, String> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     handle
         .tx
         .send(SessionCommand::Prompt {
             text: text.to_string(),
+            options,
             reply: reply_tx,
         })
         .await
@@ -364,17 +412,24 @@ fn json_rpc_response(status: StatusCode, data: Value) -> anyhow::Result<AppRespo
         .body(Full::new(Bytes::from(data.to_string())).boxed())?)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session_actor::{SessionKey, SessionRegistry};
+    use bytes::Bytes;
     use harnx_runtime::{client::TestStateGuard, AgentCallFn};
     use http_body_util::BodyExt;
-    use bytes::Bytes;
     use serde_json::json;
-    use std::{fs, path::PathBuf, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
-    use tokio::{sync::Notify, time::{sleep, Duration}};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tokio::{
+        sync::Notify,
+        time::{sleep, Duration},
+    };
 
     struct TestConfigSandbox {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -384,28 +439,43 @@ mod tests {
 
     impl TestConfigSandbox {
         fn new() -> Self {
-            let lock = crate::session_actor::TEST_CONFIG_DIR_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let lock = crate::session_actor::TEST_CONFIG_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = unique_test_config_dir();
             fs::create_dir_all(root.join("clients")).expect("create clients dir");
             fs::create_dir_all(root.join("agents")).expect("create agents dir");
             fs::create_dir_all(root.join("data")).expect("create data dir");
             fs::create_dir_all(root.join("state")).expect("create state dir");
-            fs::write(root.join("config.yaml"), "model: openai:gpt-4o
+            fs::write(
+                root.join("config.yaml"),
+                "model: openai:gpt-4o
 save_session: true
-").expect("write config");
-            fs::write(root.join("clients/openai.yaml"), "type: openai-compatible
+",
+            )
+            .expect("write config");
+            fs::write(
+                root.join("clients/openai.yaml"),
+                "type: openai-compatible
 api_base: https://example.invalid/v1
 api_key: test-key
 models:
   - name: gpt-4o
-").expect("write client cfg");
+",
+            )
+            .expect("write client cfg");
             let vars = set_test_env_vars(&root);
-            Self { _lock: lock, root, vars }
+            Self {
+                _lock: lock,
+                root,
+                vars,
+            }
         }
 
         fn write_agent(&self, name: &str, prompt: &str) {
             let body = format!("---\nmodel: openai:gpt-4o\n---\n{prompt}\n");
-            fs::write(self.root.join("agents").join(format!("{name}.md")), body).expect("write agent prompt");
+            fs::write(self.root.join("agents").join(format!("{name}.md")), body)
+                .expect("write agent prompt");
         }
     }
 
@@ -422,11 +492,16 @@ models:
     }
 
     fn unique_test_config_dir() -> PathBuf {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
         std::env::temp_dir().join(format!("harnx-serve-rpc-tests-{nanos}"))
     }
 
-    fn set_test_env_vars(root: &std::path::Path) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+    fn set_test_env_vars(
+        root: &std::path::Path,
+    ) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
         let vars = [
             ("HARNX_CONFIG_DIR", root.as_os_str().to_os_string()),
             ("HARNX_DATA_DIR", root.join("data").into_os_string()),
@@ -441,11 +516,20 @@ models:
     }
 
     fn registry_with_call_fn(call_fn: AgentCallFn) -> SessionRegistry {
-        SessionRegistry::new_for_tests(crate::session_actor::load_base_config_for_tests(), Duration::from_millis(25), Some(call_fn))
+        SessionRegistry::new_for_tests(
+            crate::session_actor::load_base_config_for_tests(),
+            Duration::from_millis(25),
+            Some(call_fn),
+        )
     }
 
     async fn response_json(response: AppResponse) -> Value {
-        let body = response.into_body().collect().await.expect("collect body").to_bytes();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
         serde_json::from_slice(&body).expect("json body")
     }
 
@@ -457,15 +541,32 @@ models:
 
         let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {
             Box::pin(async move {
-                Ok(("hello".to_string(), None, vec![], harnx_runtime::client::CompletionTokenUsage::default()))
+                Ok((
+                    "hello".to_string(),
+                    None,
+                    vec![],
+                    harnx_runtime::client::CompletionTokenUsage::default(),
+                ))
             })
         });
         let registry = registry_with_call_fn(call_fn);
-        let handle = registry.get_or_spawn(SessionKey { agent: "plain".into(), session: "rpc-get".into() });
-        let _ = prompt(&handle, "seed history").await;
+        let handle = registry.get_or_spawn(SessionKey {
+            agent: "plain".into(),
+            session: "rpc-get".into(),
+        });
+        let _ = prompt(&handle, "seed history", SessionPromptOptions::default()).await;
         sleep(Duration::from_millis(80)).await;
 
-        let response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/rpc-get/rpc".to_string(), Bytes::from(json!({"jsonrpc":"2.0","id":1,"method":"session/get"}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
+        let response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "/v1/agents/plain/sessions/rpc-get/rpc".to_string(),
+            Bytes::from(json!({"jsonrpc":"2.0","id":1,"method":"session/get"}).to_string()),
+            &crate::session_actor::load_base_config_for_tests(),
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("rpc response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["jsonrpc"], "2.0");
@@ -473,7 +574,11 @@ models:
         assert_eq!(body["result"]["capabilities"]["multiClient"], true);
         assert_eq!(body["result"]["capabilities"]["persistence"], "filesystem");
         assert_eq!(body["result"]["state"]["status"], "idle");
-        assert!(body["result"]["history_snapshot"].as_array().expect("history array").iter().any(|msg| msg["content"] == "seed history"));
+        assert!(body["result"]["history_snapshot"]
+            .as_array()
+            .expect("history array")
+            .iter()
+            .any(|msg| msg["content"] == "seed history"));
     }
 
     #[tokio::test]
@@ -483,7 +588,16 @@ models:
         sandbox.write_agent("plain", "You are plain.");
         let registry = SessionRegistry::new(crate::session_actor::load_base_config_for_tests());
 
-        let response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/never-ran/rpc".to_string(), Bytes::from(json!({"jsonrpc":"2.0","id":"x","method":"session/get"}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
+        let response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "/v1/agents/plain/sessions/never-ran/rpc".to_string(),
+            Bytes::from(json!({"jsonrpc":"2.0","id":"x","method":"session/get"}).to_string()),
+            &crate::session_actor::load_base_config_for_tests(),
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("rpc response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = response_json(response).await;
         assert_eq!(body["error"]["code"], JSON_RPC_UNKNOWN_SESSION_CODE);
@@ -496,7 +610,10 @@ models:
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let registry = SessionRegistry::new(crate::session_actor::load_base_config_for_tests());
-        let key = SessionKey { agent: "plain".into(), session: "never-prompted".into() };
+        let key = SessionKey {
+            agent: "plain".into(),
+            session: "never-prompted".into(),
+        };
 
         let response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/never-prompted/rpc".to_string(), Bytes::from(json!({"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{"text":"hello"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -512,9 +629,21 @@ models:
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let registry = SessionRegistry::new(crate::session_actor::load_base_config_for_tests());
-        let key = SessionKey { agent: "plain".into(), session: "never-cancelled".into() };
+        let key = SessionKey {
+            agent: "plain".into(),
+            session: "never-cancelled".into(),
+        };
 
-        let response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/never-cancelled/rpc".to_string(), Bytes::from(json!({"jsonrpc":"2.0","id":12,"method":"session/cancel"}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
+        let response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "/v1/agents/plain/sessions/never-cancelled/rpc".to_string(),
+            Bytes::from(json!({"jsonrpc":"2.0","id":12,"method":"session/cancel"}).to_string()),
+            &crate::session_actor::load_base_config_for_tests(),
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("rpc response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = response_json(response).await;
         assert_eq!(body["error"]["code"], JSON_RPC_UNKNOWN_SESSION_CODE);
@@ -530,14 +659,22 @@ models:
 
         let call_fn: AgentCallFn = Arc::new(move |_input, _config, _abort| {
             Box::pin(async move {
-                Ok(("prompt reply".to_string(), None, vec![], harnx_runtime::client::CompletionTokenUsage::default()))
+                Ok((
+                    "prompt reply".to_string(),
+                    None,
+                    vec![],
+                    harnx_runtime::client::CompletionTokenUsage::default(),
+                ))
             })
         });
         let registry = registry_with_call_fn(call_fn);
-        
+
         // Seed session the simple way (not via SSE stream drain)
-        let handle = registry.get_or_spawn(SessionKey { agent: "plain".into(), session: "rpc-prompt".into() });
-        let _ = prompt(&handle, "seed history").await;
+        let handle = registry.get_or_spawn(SessionKey {
+            agent: "plain".into(),
+            session: "rpc-prompt".into(),
+        });
+        let _ = prompt(&handle, "seed history", SessionPromptOptions::default()).await;
         sleep(Duration::from_millis(80)).await;
 
         let response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/rpc-prompt/rpc".to_string(), Bytes::from(json!({"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"text":"run me"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
@@ -551,7 +688,9 @@ models:
         config.use_agent_by_name("plain").expect("set agent");
         config.use_session(Some("rpc-prompt")).expect("set session");
         let messages = config.session.expect("session exists").messages;
-        assert!(messages.iter().any(|msg| msg.role.is_user() && msg.content.to_text() == "run me"));
+        assert!(messages
+            .iter()
+            .any(|msg| msg.role.is_user() && msg.content.to_text() == "run me"));
     }
 
     #[tokio::test]
@@ -571,16 +710,33 @@ models:
                 Box::pin(async move {
                     gate_ready.notify_one();
                     gate_release.notified().await;
-                    Ok(("done".to_string(), None, vec![], harnx_runtime::client::CompletionTokenUsage::default()))
+                    Ok((
+                        "done".to_string(),
+                        None,
+                        vec![],
+                        harnx_runtime::client::CompletionTokenUsage::default(),
+                    ))
                 })
             })
         };
         let registry = registry_with_call_fn(call_fn);
-        let handle = registry.get_or_spawn(SessionKey { agent: "plain".into(), session: "rpc-cancel".into() });
-        let _ = prompt(&handle, "cancel me").await;
+        let handle = registry.get_or_spawn(SessionKey {
+            agent: "plain".into(),
+            session: "rpc-cancel".into(),
+        });
+        let _ = prompt(&handle, "cancel me", SessionPromptOptions::default()).await;
         gate_ready.notified().await;
 
-        let response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/rpc-cancel/rpc".to_string(), Bytes::from(json!({"jsonrpc":"2.0","id":9,"method":"session/cancel"}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
+        let response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "/v1/agents/plain/sessions/rpc-cancel/rpc".to_string(),
+            Bytes::from(json!({"jsonrpc":"2.0","id":9,"method":"session/cancel"}).to_string()),
+            &crate::session_actor::load_base_config_for_tests(),
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("rpc response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["result"]["cancelled"], true);
@@ -594,7 +750,16 @@ models:
         sandbox.write_agent("plain", "You are plain.");
         let registry = SessionRegistry::new(crate::session_actor::load_base_config_for_tests());
 
-        let response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/whatever/rpc".to_string(), Bytes::from(json!({"jsonrpc":"2.0","id":3,"method":"session/nope"}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
+        let response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "/v1/agents/plain/sessions/whatever/rpc".to_string(),
+            Bytes::from(json!({"jsonrpc":"2.0","id":3,"method":"session/nope"}).to_string()),
+            &crate::session_actor::load_base_config_for_tests(),
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("rpc response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["error"]["code"], -32601);
@@ -607,12 +772,30 @@ models:
         sandbox.write_agent("plain", "You are plain.");
         let registry = SessionRegistry::new(crate::session_actor::load_base_config_for_tests());
 
-        let parse_response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/oops/rpc".to_string(), Bytes::from("{not json".to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("parse response");
+        let parse_response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "/v1/agents/plain/sessions/oops/rpc".to_string(),
+            Bytes::from("{not json".to_string()),
+            &crate::session_actor::load_base_config_for_tests(),
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("parse response");
         assert_eq!(parse_response.status(), StatusCode::BAD_REQUEST);
         let parse_body = response_json(parse_response).await;
         assert_eq!(parse_body["error"]["code"], -32700);
 
-        let invalid_response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/oops/rpc".to_string(), Bytes::from(json!({"jsonrpc":"2.0","id":4}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("invalid response");
+        let invalid_response = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "/v1/agents/plain/sessions/oops/rpc".to_string(),
+            Bytes::from(json!({"jsonrpc":"2.0","id":4}).to_string()),
+            &crate::session_actor::load_base_config_for_tests(),
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("invalid response");
         assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
         let invalid_body = response_json(invalid_response).await;
         assert_eq!(invalid_body["error"]["code"], -32600);
