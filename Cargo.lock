@@ -4118,6 +4118,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "dashmap",
  "futures",
  "futures-util",
  "harnx-core",

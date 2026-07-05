@@ -20,6 +20,8 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+dashmap = "6"
+futures = "0.3"
 futures-util = { workspace = true }
 harnx-core = { path = "../harnx-core" }
 harnx-hooks = { path = "../harnx-hooks" }

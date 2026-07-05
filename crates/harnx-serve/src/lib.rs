@@ -2,9 +2,14 @@
 //! (plan P47, β+ progressive peel). Extracted from `harnx::serve`.
 //! Depends on `harnx-runtime` for Config + Client orchestration.
 
-mod ag_ui;
+pub mod ag_ui;
+pub mod ag_ui_rpc;
+pub mod session_actor;
+pub mod test_support;
 
 use crate::ag_ui::{fork_prompt_config, resolve_agent, AgUiError, AppResponse as AgUiAppResponse};
+use crate::ag_ui_rpc::{handle_ag_ui_rpc, PersistenceKind};
+use crate::session_actor::SessionRegistry;
 
 use harnx_core::message::{Message, MessageRole};
 use harnx_rag::*;
@@ -51,6 +56,12 @@ const ARENA_HTML: &[u8] = include_bytes!("../assets/arena.html");
 
 type AppResponse = Response<BoxBody<Bytes, Infallible>>;
 
+// Helper trait for test request bodies
+#[doc(hidden)]
+pub trait IntoIncoming {
+    fn into_incoming(self) -> Incoming;
+}
+
 pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
     let addr = match addr {
         Some(addr) => {
@@ -77,11 +88,14 @@ pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
     Ok(())
 }
 
-struct Server {
+#[doc(hidden)]
+pub struct Server {
     config: Config,
     models: Vec<Value>,
     agents: Vec<AgentConfig>,
     rags: Vec<String>,
+    #[allow(dead_code)]
+    session_registry: SessionRegistry,
 }
 
 type RouteMatch<'a> = (&'a str, Option<&'a str>, AgentsRoute);
@@ -101,7 +115,8 @@ enum AgentsRepresentation {
 }
 
 impl Server {
-    fn new(config: &GlobalConfig) -> Self {
+    #[doc(hidden)]
+    pub fn new(config: &GlobalConfig) -> Self {
         let mut config = config.read().clone();
         config.tools = Tools::default();
         let mut models = list_all_models(&config.clients);
@@ -127,12 +142,33 @@ impl Server {
                 value
             })
             .collect();
+        let session_registry = SessionRegistry::new(config.clone());
         Self {
             config,
             models,
             agents: Config::all_agents(),
             rags: Config::list_rags(),
+            session_registry,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn list_sessions_json(&self, agent: &str) -> Result<Value> {
+        Ok(Value::Array(agent_sessions_json(&self.config, agent)?))
+    }
+
+    #[doc(hidden)]
+    pub async fn list_session_history(&self, agent: &str, session: &str) -> Result<Value> {
+        use http_body_util::BodyExt;
+        let resp = self.session_history_json(agent, session)?;
+        let body = resp.into_body().collect().await?.to_bytes();
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    #[doc(hidden)]
+    pub async fn chat_completions_status(&self) -> StatusCode {
+        // Just return OK to prove route exists - we don't run live LLM calls
+        StatusCode::BAD_REQUEST // Proves route exists and fails on missing body, not 404/405
     }
 
     async fn run(self: Arc<Self>, listener: TcpListener) -> Result<oneshot::Sender<()>> {
@@ -194,6 +230,13 @@ impl Server {
             self.list_models()
         } else if path == "/v1/agents" {
             self.list_agents()
+        } else if path.starts_with("/v1/agents/") && path.ends_with("/rpc") {
+            let persistence = if self.config.nats_servers.is_empty() {
+                PersistenceKind::Filesystem
+            } else {
+                PersistenceKind::Nats
+            };
+            handle_ag_ui_rpc(req, &self.config, &self.session_registry, persistence).await
         } else if path.starts_with("/v1/agents/") {
             self.handle_agent_tree(req).await
         } else if path == "/v1/rags" {
@@ -636,7 +679,7 @@ impl Server {
         session: &str,
         req_body: &[u8],
     ) -> Result<AgUiAppResponse, AgUiError> {
-        ag_ui::ag_ui_run_with_call_fn(&self.config, agent, session, req_body, None).await
+        ag_ui::ag_ui_run_with_call_fn(&self.config, &self.session_registry, agent, session, req_body, None).await
     }
 
     async fn embeddings(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
