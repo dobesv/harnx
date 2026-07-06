@@ -61,7 +61,7 @@ fn test_config_with_mock_client_and_agent(
 
         // Set up session if session_name is provided.
         if let Some(name) = session_name {
-            guard.session = Some(harnx_runtime::config::session::new(&guard, name).unwrap());
+            guard.session = Some(harnx_runtime::config::session::new(&guard, name, None).unwrap());
         }
     }
     config
@@ -83,7 +83,7 @@ fn make_compacted_message(
 
 fn seed_compressed_session(config: &GlobalConfig) {
     let mut guard = config.write();
-    let mut session = harnx_runtime::config::session::new(&guard, "compacted").unwrap();
+    let mut session = harnx_runtime::config::session::new(&guard, "compacted", None).unwrap();
     session.compressed_messages = vec![
         make_compacted_message(
             harnx_core::message::MessageRole::System,
@@ -114,7 +114,8 @@ fn seed_compressed_session(config: &GlobalConfig) {
 /// so the compaction marker carries a non-empty `summary_text`.
 fn seed_compressed_session_with_summary(config: &GlobalConfig) {
     let mut guard = config.write();
-    let mut session = harnx_runtime::config::session::new(&guard, "compacted-summary").unwrap();
+    let mut session =
+        harnx_runtime::config::session::new(&guard, "compacted-summary", None).unwrap();
     session.compressed_messages = vec![
         make_compacted_message(
             harnx_core::message::MessageRole::User,
@@ -2488,7 +2489,7 @@ async fn test_tool_result_switch_agent_parsing() {
         harnx_hooks::PersistentHookManager::new(),
     ));
     let mut results = eval_tool_calls(
-        &harnx_runtime::tool::build_tool_eval_context(&config, None, None, &pm),
+        &harnx_runtime::tool::build_tool_eval_context(&config, None, None, &pm, None),
         vec![call],
         &abort_signal,
     )
@@ -8244,7 +8245,7 @@ async fn test_agent_command_leaves_tui_without_session_gap() {
         agent.set_name("agent-a");
         guard.agent = Some(agent);
 
-        let session = harnx_runtime::config::session::new(&guard, "session-a").unwrap();
+        let session = harnx_runtime::config::session::new(&guard, "session-a", None).unwrap();
         guard.session = Some(session);
     }
 

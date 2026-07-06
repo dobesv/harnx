@@ -23,7 +23,7 @@ use harnx_hooks::{
     inject_pending_async_context, AsyncHookManager, HookEvent, HookResultControl,
     PersistentHookManager,
 };
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use crate::client::retry::call_with_retry_and_fallback;
 use crate::client::CompletionTokenUsage;
@@ -107,6 +107,9 @@ pub struct AgentLoopContext {
     pub initial_resume_count: u32,
     pub max_resume: Option<u32>,
     pub pending_async_context: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+    /// Optional per-session working directory. When unset, runtime falls back
+    /// to process cwd for CLI/ACP compatibility.
+    pub working_dir: Option<PathBuf>,
 }
 
 /// Run the canonical agent loop.
@@ -170,7 +173,9 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
                     .as_ref()
                     .map(|s| s.id().to_string())
                     .unwrap_or_else(|| "default".to_string()),
-                std::env::current_dir().unwrap_or_default(),
+                ctx.working_dir
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
             )
         };
 
@@ -266,6 +271,7 @@ pub async fn run_agent_loop(ctx: &AgentLoopContext, initial_input: Input) -> Res
                 tool_calls,
                 abort_signal,
                 &ctx.persistent_manager,
+                ctx.working_dir.as_deref(),
             )
             .await?
         };
@@ -496,7 +502,7 @@ mod tests {
 
         // Build a Config with an attached session pointed at a temp dir.
         let mut config = Config::default();
-        let mut session = crate::config::session::new(&config, "replay_test").unwrap();
+        let mut session = crate::config::session::new(&config, "replay_test", None).unwrap();
         session.set_sessions_dir(tmp.path().to_path_buf());
         config.session = Some(session);
         let global_config = Arc::new(RwLock::new(config));
@@ -556,6 +562,7 @@ mod tests {
             call_fn: Some(call_fn),
             on_tool_round: Some(on_tool_round),
             on_text_response: None,
+            working_dir: None,
             initial_with_embeddings: false,
             initial_resume_count: 0,
             max_resume: Some(0),

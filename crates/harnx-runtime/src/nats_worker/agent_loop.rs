@@ -39,6 +39,7 @@ pub struct RunAgentLoopArgs<'a> {
     /// `last_activity` is refreshed — not just brand-new empty-log sessions.
     pub session_index: Option<&'a async_nats::jetstream::kv::Store>,
     pub on_tool_round: Option<OnToolRoundFn>,
+    pub working_dir: Option<std::path::PathBuf>,
 }
 
 impl<'a> RunAgentLoopArgs<'a> {
@@ -188,6 +189,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         header_insert_observer,
         session_index,
         on_tool_round,
+        working_dir,
     } = args;
     // Get JetStream context from config (extract URL before await)
     // Connect through the config-driven helper so per-cluster auth/TLS
@@ -213,6 +215,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         lease: lease.as_deref(),
         session_index,
         session_id,
+        working_dir: working_dir.as_deref(),
         abort_signal: &abort_signal,
         header_insert_observer: header_insert_observer.as_ref(),
     })
@@ -233,6 +236,7 @@ pub async fn run_agent_loop_with_nats_inner(args: RunAgentLoopArgs<'_>) -> Resul
         initial_resume_count: 0,
         max_resume: None,
         pending_async_context: None,
+        working_dir,
     };
 
     // Run the unified agent loop
@@ -272,6 +276,7 @@ struct LoadOrRepairSessionParams<'a> {
     lease: Option<&'a NatsSessionLease>,
     session_index: Option<&'a async_nats::jetstream::kv::Store>,
     session_id: &'a str,
+    working_dir: Option<&'a std::path::Path>,
     abort_signal: &'a AbortSignal,
     /// When a header-insert migration is performed on this activation, its
     /// JetStream seq is published here so the daemon can advance its high-water
@@ -292,14 +297,22 @@ async fn load_or_repair_session(
         lease,
         session_index,
         session_id,
+        working_dir,
         abort_signal,
         header_insert_observer,
     } = params;
     let entries = backend.load_events_blocking()?;
     if entries.is_empty() {
         // New session: write header and load
-        return write_header_and_load_session(backend, config, input, session_index, session_id)
-            .await;
+        return write_header_and_load_session(
+            backend,
+            config,
+            input,
+            session_index,
+            session_id,
+            working_dir,
+        )
+        .await;
     }
 
     // Existing session: check effective session log for orphan tool calls and repair with hints
@@ -314,6 +327,7 @@ async fn load_or_repair_session(
                 config,
                 input,
                 session_id,
+                working_dir,
             )?
         {
             let edit_entry = SessionLogEntry::EditEntries {
@@ -408,6 +422,7 @@ fn build_remote_header_insert_replacements(
     config: &GlobalConfig,
     input: &Input,
     session_id: &str,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<Option<(usize, usize, Vec<String>)>> {
     if effective_entries.is_empty() || !should_insert_remote_header(effective_entries) {
         return Ok(None);
@@ -417,7 +432,10 @@ fn build_remote_header_insert_replacements(
     let mut last_user_seq = None;
     let mut replacements = Vec::new();
     replacements.push(serde_yaml::to_string(&build_remote_session_header(
-        config, input, session_id,
+        config,
+        input,
+        session_id,
+        working_dir,
     )?)?);
 
     for (seq, entry) in raw_entries {
@@ -612,6 +630,7 @@ fn build_orphan_tool_eval_context(
         repair.agent_use_tools.as_deref(),
         repair.current_agent_package.clone(),
         &repair.persistent_manager,
+        None,
     )
 }
 
@@ -735,8 +754,9 @@ fn build_remote_session_header(
     config: &GlobalConfig,
     input: &Input,
     session_id: &str,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<harnx_core::session::SessionLogEntry> {
-    let mut header_session = crate::config::session::new(&config.read(), session_id)?;
+    let mut header_session = crate::config::session::new(&config.read(), session_id, working_dir)?;
     header_session.set_agent(&input.agent)?;
     Ok(header_session.build_header_entry())
 }
@@ -790,8 +810,9 @@ pub(crate) async fn write_header_and_load_session(
     input: &Input,
     session_index: Option<&async_nats::jetstream::kv::Store>,
     session_id: &str,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<harnx_core::session::Session> {
-    let header = build_remote_session_header(config, input, session_id)?;
+    let header = build_remote_session_header(config, input, session_id, working_dir)?;
     backend.append_event_blocking(&header)?;
     if let Some(store) = session_index {
         if let Err(err) = upsert_session_index_record(store, &header).await {

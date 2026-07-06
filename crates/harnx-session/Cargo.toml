@@ -1,0 +1,16 @@
+[package]
+name = "harnx-session"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared session management machinery for harnx-serve and harnx-acp-server"
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+harnx-core = { path = "../harnx-core" }
+harnx-hooks = { path = "../harnx-hooks" }
+harnx-runtime = { path = "../harnx-runtime" }
+parking_lot = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }

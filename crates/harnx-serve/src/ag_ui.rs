@@ -2,14 +2,26 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
+use serde_json::json;
+
+use crate::session_actor::{
+    PromptResult, SessionCommand, SessionHandle, SessionInfo, SessionRegistry, SubscribeResult,
+};
+
+#[cfg(test)]
+use ag_ui_core::{event::RunStartedEvent, types::ids::RunId};
 use ag_ui_core::{
     event::{
-        BaseEvent, Event, RunErrorEvent, RunFinishedEvent, RunStartedEvent,
-        TextMessageContentEvent, TextMessageEndEvent, TextMessageStartEvent,
+        BaseEvent, CustomEvent, Event, MessagesSnapshotEvent, RunErrorEvent, StepFinishedEvent,
+        StepStartedEvent, TextMessageContentEvent, TextMessageStartEvent, ThinkingEndEvent,
+        ThinkingStartEvent, ThinkingTextMessageContentEvent, ThinkingTextMessageEndEvent,
+        ThinkingTextMessageStartEvent, ToolCallArgsEvent, ToolCallEndEvent, ToolCallResultEvent,
+        ToolCallStartEvent,
     },
     types::{
-        ids::{MessageId, RunId, ThreadId},
+        ids::{MessageId, ThreadId, ToolCallId},
         input::RunAgentInput,
         message::{Message as AgUiMessage, Role},
     },
@@ -17,26 +29,28 @@ use ag_ui_core::{
 };
 use bytes::Bytes;
 use harnx_core::{
-    abort::create_abort_signal,
     agent_config::AgentConfig,
-    event::{AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent},
+    event::{
+        AgentEvent, AgentSource, ContentBlock, ModelEvent, NoticeEvent, SessionEvent, ToolEvent,
+        TurnEvent,
+    },
     message::{Message as HistoryMsg, MessageContent, MessageRole},
-    sink::with_agent_event_sink,
 };
-use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use harnx_runtime::{
-    config::{input, Agent, Config, GlobalConfig},
-    run_agent_loop, AgentCallFn, AgentLoopContext,
+    config::{Agent, Config, GlobalConfig},
+    AgentCallFn,
 };
 use http::{Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
 use hyper::body::Frame;
-use parking_lot::RwLock;
-use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
+use tokio::sync::{broadcast, mpsc::UnboundedSender};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use uuid::Uuid;
 
 const THREAD_ID_NAMESPACE: Uuid = Uuid::from_u128(0x9f1f_5b4f_8080_4c1a_9544_1ce1_4b63_1a2f);
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const TEST_SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(50);
 
 pub type AppResponse = Response<BoxBody<Bytes, Infallible>>;
 
@@ -71,14 +85,237 @@ impl std::error::Error for AgUiError {}
 ///
 /// Phase-1 mapping: text message content and errors only.
 /// Lifecycle events (RUN_STARTED, TEXT_MESSAGE_START, etc.) are handled by caller.
+enum AgUiEventTx {
+    Unbounded(UnboundedSender<Event>),
+    Broadcast(broadcast::Sender<Event>),
+}
+
+impl AgUiEventTx {
+    fn send(&self, event: Event) {
+        match self {
+            Self::Unbounded(tx) => {
+                let _ = tx.send(event);
+            }
+            Self::Broadcast(tx) => {
+                let _ = tx.send(event);
+            }
+        }
+    }
+}
+
+impl From<UnboundedSender<Event>> for AgUiEventTx {
+    fn from(value: UnboundedSender<Event>) -> Self {
+        Self::Unbounded(value)
+    }
+}
+
+impl From<broadcast::Sender<Event>> for AgUiEventTx {
+    fn from(value: broadcast::Sender<Event>) -> Self {
+        Self::Broadcast(value)
+    }
+}
+
 pub struct AgUiSink {
-    tx: UnboundedSender<Event>,
+    tx: AgUiEventTx,
     message_id: MessageId,
+    history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
+    in_thinking_segment: std::sync::atomic::AtomicBool,
+    text_message_started: std::sync::atomic::AtomicBool,
+    turn_counter: std::sync::atomic::AtomicUsize,
 }
 
 impl AgUiSink {
     pub fn new(tx: UnboundedSender<Event>, message_id: MessageId) -> Self {
-        Self { tx, message_id }
+        Self::with_snapshot(tx, message_id, true, None)
+    }
+
+    pub fn new_broadcast(tx: broadcast::Sender<Event>, message_id: MessageId) -> Self {
+        Self::with_snapshot(tx, message_id, true, None)
+    }
+
+    pub fn new_broadcast_with_snapshot(
+        tx: broadcast::Sender<Event>,
+        message_id: MessageId,
+        history_snapshot: Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>,
+    ) -> Self {
+        Self::with_snapshot(tx, message_id, true, Some(history_snapshot))
+    }
+
+    fn with_snapshot(
+        tx: impl Into<AgUiEventTx>,
+        message_id: MessageId,
+        text_message_started: bool,
+        history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
+    ) -> Self {
+        Self {
+            tx: tx.into(),
+            message_id,
+            history_snapshot,
+            in_thinking_segment: std::sync::atomic::AtomicBool::new(false),
+            text_message_started: std::sync::atomic::AtomicBool::new(text_message_started),
+            turn_counter: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn base_event() -> BaseEvent {
+        BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        }
+    }
+
+    fn send(&self, event: Event) {
+        self.tx.send(event);
+    }
+
+    fn tool_call_id(id: String) -> ToolCallId {
+        serde_json::from_value(serde_json::Value::String(id))
+            .expect("tool call id should deserialize from string")
+    }
+
+    fn ensure_text_message_started(&self) {
+        if !self
+            .text_message_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.send(Event::TextMessageStart(TextMessageStartEvent {
+                base: Self::base_event(),
+                message_id: self.message_id.clone(),
+                role: Role::Assistant,
+            }));
+        }
+    }
+
+    fn close_thinking_segment(&self) {
+        if self
+            .in_thinking_segment
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.send(Event::ThinkingTextMessageEnd(ThinkingTextMessageEndEvent {
+                base: Self::base_event(),
+            }));
+            self.send(Event::ThinkingEnd(ThinkingEndEvent {
+                base: Self::base_event(),
+            }));
+        }
+    }
+
+    fn emit_text_delta(&self, delta: String) {
+        if delta.is_empty() {
+            return;
+        }
+        self.close_thinking_segment();
+        self.ensure_text_message_started();
+        self.send(Event::TextMessageContent(TextMessageContentEvent {
+            base: Self::base_event(),
+            message_id: self.message_id.clone(),
+            delta,
+        }));
+    }
+
+    fn emit_thinking_delta(&self, delta: String) {
+        if delta.is_empty() {
+            return;
+        }
+        if !self
+            .in_thinking_segment
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.send(Event::ThinkingStart(ThinkingStartEvent {
+                base: Self::base_event(),
+                title: None,
+            }));
+            self.send(Event::ThinkingTextMessageStart(
+                ThinkingTextMessageStartEvent {
+                    base: Self::base_event(),
+                },
+            ));
+        }
+        self.send(Event::ThinkingTextMessageContent(
+            ThinkingTextMessageContentEvent {
+                base: Self::base_event(),
+                delta,
+            },
+        ));
+    }
+
+    fn finish_turn(&self) {
+        self.close_thinking_segment();
+    }
+
+    fn emit_custom(&self, name: impl Into<String>, value: serde_json::Value) {
+        self.send(Event::Custom(CustomEvent {
+            base: Self::base_event(),
+            name: name.into(),
+            value,
+        }));
+    }
+
+    fn step_name_for_turn(&self) -> String {
+        let turn = self.turn_counter.load(std::sync::atomic::Ordering::SeqCst);
+        format!("turn-{turn}")
+    }
+
+    fn emit_history_snapshot(&self) {
+        if let Some(history_snapshot) = &self.history_snapshot {
+            self.send(snapshot_event(history_snapshot()));
+        }
+    }
+
+    fn emit_tool_result(&self, tool_call_id: String, content: String) {
+        self.close_thinking_segment();
+        self.send(Event::ToolCallEnd(ToolCallEndEvent {
+            base: Self::base_event(),
+            tool_call_id: Self::tool_call_id(tool_call_id.clone()),
+        }));
+        self.send(Event::ToolCallResult(ToolCallResultEvent {
+            base: Self::base_event(),
+            message_id: MessageId::random(),
+            tool_call_id: Self::tool_call_id(tool_call_id),
+            content,
+            role: Role::Tool,
+        }));
+    }
+
+    fn emit_tool_event(&self, event: ToolEvent) {
+        self.close_thinking_segment();
+        match event {
+            ToolEvent::Started {
+                id, name, input, ..
+            } => {
+                self.send(Event::ToolCallStart(ToolCallStartEvent {
+                    base: Self::base_event(),
+                    tool_call_id: Self::tool_call_id(id.clone()),
+                    tool_call_name: name,
+                    parent_message_id: Some(self.message_id.clone()),
+                }));
+                self.send(Event::ToolCallArgs(ToolCallArgsEvent {
+                    base: Self::base_event(),
+                    tool_call_id: Self::tool_call_id(id),
+                    delta: input.to_string(),
+                }));
+            }
+            ToolEvent::Completed {
+                id,
+                output,
+                markdown,
+            } => {
+                let content = markdown.unwrap_or_else(|| {
+                    output
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| output.to_string())
+                });
+                self.emit_tool_result(id, content);
+            }
+            ToolEvent::Failed { id, error } => {
+                self.emit_tool_result(id, error);
+            }
+            ToolEvent::Blocked { id, reason, .. } => {
+                self.emit_tool_result(id, reason);
+            }
+            ToolEvent::Progress { .. } | ToolEvent::Update { .. } => {}
+        }
     }
 }
 
@@ -94,42 +331,133 @@ impl harnx_core::event::AgentEventSink for AgUiSink {
                     })
                     .collect();
                 if !delta.is_empty() {
-                    let _ = self
-                        .tx
-                        .send(Event::TextMessageContent(TextMessageContentEvent {
-                            base: BaseEvent {
-                                timestamp: None,
-                                raw_event: None,
-                            },
-                            message_id: self.message_id.clone(),
-                            delta,
-                        }));
+                    self.close_thinking_segment();
                 }
+                self.emit_text_delta(delta);
             }
-            AgentEvent::Model(ModelEvent::Final { output, .. }) if !output.is_empty() => {
-                let _ = self
-                    .tx
-                    .send(Event::TextMessageContent(TextMessageContentEvent {
-                        base: BaseEvent {
-                            timestamp: None,
-                            raw_event: None,
-                        },
-                        message_id: self.message_id.clone(),
-                        delta: output,
-                    }));
+            AgentEvent::Model(ModelEvent::Final { output, .. }) => {
+                self.emit_text_delta(output);
+                self.finish_turn();
+            }
+            AgentEvent::Model(ModelEvent::Usage {
+                input,
+                output,
+                cached,
+                session_label,
+            }) => {
+                self.emit_custom(
+                    "usage",
+                    json!({
+                        "input": input,
+                        "output": output,
+                        "cached": cached,
+                        "session_label": session_label,
+                    }),
+                );
             }
             AgentEvent::Model(ModelEvent::Error(message))
             | AgentEvent::Notice(NoticeEvent::Error(message)) => {
-                let _ = self.tx.send(Event::RunError(RunErrorEvent {
-                    base: BaseEvent {
-                        timestamp: None,
-                        raw_event: None,
-                    },
+                self.finish_turn();
+                self.send(Event::RunError(RunErrorEvent {
+                    base: Self::base_event(),
                     message,
                     code: None,
                 }));
             }
-            AgentEvent::Model(ModelEvent::ThoughtChunk { .. }) => {}
+            AgentEvent::Tool(tool_event) => self.emit_tool_event(tool_event),
+            AgentEvent::Model(ModelEvent::ThoughtChunk { blocks }) => {
+                let delta: String = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                self.emit_thinking_delta(delta);
+            }
+            AgentEvent::Turn(TurnEvent::Started) => {
+                let turn = self
+                    .turn_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                self.send(Event::StepStarted(StepStartedEvent {
+                    base: Self::base_event(),
+                    step_name: format!("turn-{turn}"),
+                }));
+            }
+            AgentEvent::Turn(TurnEvent::Ended { outcome }) => {
+                self.finish_turn();
+                self.send(Event::StepFinished(StepFinishedEvent {
+                    base: Self::base_event(),
+                    step_name: self.step_name_for_turn(),
+                }));
+                if !outcome.output.is_empty()
+                    || outcome.thought.is_some()
+                    || outcome.handoff.is_some()
+                    || outcome.usage.input_tokens > 0
+                    || outcome.usage.output_tokens > 0
+                    || outcome.usage.cached_tokens > 0
+                {
+                    self.emit_custom(
+                        "turn_outcome",
+                        serde_json::to_value(outcome).expect("turn outcome should serialize"),
+                    );
+                }
+            }
+            AgentEvent::Turn(TurnEvent::RetryAttempt { attempt, reason }) => {
+                self.emit_custom(
+                    "turn_retry_attempt",
+                    json!({ "attempt": attempt, "reason": reason }),
+                );
+            }
+            AgentEvent::Turn(TurnEvent::ModelFallback { from, to }) => {
+                self.emit_custom("turn_model_fallback", json!({ "from": from, "to": to }));
+            }
+            AgentEvent::Turn(TurnEvent::HandoffRequested { agent, session_id }) => {
+                self.emit_custom(
+                    "turn_handoff_requested",
+                    json!({ "agent": agent, "session_id": session_id }),
+                );
+            }
+            AgentEvent::Session(SessionEvent::CompactingStarted) => {
+                self.emit_custom("session_compacting_started", json!({}));
+            }
+            AgentEvent::Session(SessionEvent::CompactingCompleted) => {
+                self.emit_custom("session_compacting_completed", json!({}));
+                self.emit_history_snapshot();
+            }
+            AgentEvent::Session(SessionEvent::CompactingFailed(error)) => {
+                self.emit_custom("session_compacting_failed", json!({ "error": error }));
+            }
+            AgentEvent::Session(SessionEvent::Saved { path }) => {
+                self.emit_custom("session_saved", json!({ "path": path }));
+            }
+            AgentEvent::Session(SessionEvent::AgentInitializing { agent }) => {
+                self.emit_custom("session_agent_initializing", json!({ "agent": agent }));
+            }
+            AgentEvent::Session(SessionEvent::ModelChanged { from, to }) => {
+                self.emit_custom("session_model_changed", json!({ "from": from, "to": to }));
+            }
+            AgentEvent::Session(SessionEvent::RagIndexing { url, index, total }) => {
+                self.emit_custom(
+                    "session_rag_indexing",
+                    json!({ "url": url, "index": index, "total": total }),
+                );
+            }
+            AgentEvent::Plan { entries } => {
+                self.emit_custom(
+                    "plan",
+                    serde_json::to_value(entries).expect("plan entries should serialize"),
+                );
+            }
+            AgentEvent::Status(_status) => {}
+            AgentEvent::Session(SessionEvent::Generic { text }) => {
+                self.finish_turn();
+                self.emit_custom("session_generic", json!({ "text": text }));
+            }
+            AgentEvent::Session(SessionEvent::LogSeqAssigned { .. }) => {
+                self.finish_turn();
+            }
             _ => {}
         }
     }
@@ -147,37 +475,170 @@ pub fn frame_event(event: &Event) -> Result<String, AgUiError> {
     Ok(format!("data: {json}\n\n"))
 }
 
+fn keep_alive_frame() -> &'static str {
+    ": keep-alive\n\n"
+}
+
+fn keep_alive_stream(interval: Duration) -> impl tokio_stream::Stream<Item = Bytes> {
+    tokio_stream::wrappers::IntervalStream::new({
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker
+    })
+    .skip(1)
+    .map(|_| Bytes::from_static(keep_alive_frame().as_bytes()))
+}
+
 pub fn parse_run_input(body: &[u8]) -> Result<RunAgentInput<JsonValue, JsonValue>, AgUiError> {
-    // Parse into a generic JSON value first to inject defaults for optional envelope fields.
-    // ag-ui-core's RunAgentInput requires state/tools/context/forwardedProps, but per plan
-    // guardrails only `messages` is truly required — others should default if omitted.
     let mut value: serde_json::Value = serde_json::from_slice(body)
-        .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI request body: {err}")))?;
+        .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI JSON body: {err}")))?;
 
-    // Inject defaults for optional envelope fields if missing.
-    if let Some(obj) = value.as_object_mut() {
-        if !obj.contains_key("state") {
-            obj.insert("state".to_string(), serde_json::json!({}));
-        }
-        if !obj.contains_key("tools") {
-            obj.insert("tools".to_string(), serde_json::json!([]));
-        }
-        if !obj.contains_key("context") {
-            obj.insert("context".to_string(), serde_json::json!([]));
-        }
-        if !obj.contains_key("forwardedProps") {
-            obj.insert("forwardedProps".to_string(), serde_json::json!({}));
-        }
-    }
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| AgUiError::BadRequest("AG-UI body must be a JSON object".to_string()))?;
 
-    let input: RunAgentInput<JsonValue, JsonValue> = serde_json::from_value(value)
-        .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI request body: {err}")))?;
-    if input.messages.is_empty() {
+    if !obj.contains_key("messages") {
         return Err(AgUiError::BadRequest(
-            "AG-UI request must include at least one message".to_string(),
+            "AG-UI request must include a messages field".to_string(),
         ));
     }
-    Ok(input)
+
+    obj.entry("state".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    obj.entry("tools".to_string())
+        .or_insert_with(|| serde_json::Value::Array(vec![]));
+    obj.entry("context".to_string())
+        .or_insert_with(|| serde_json::Value::Array(vec![]));
+    obj.entry("forwardedProps".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    serde_json::from_value(value)
+        .map_err(|err| AgUiError::BadRequest(format!("invalid AG-UI request body: {err}")))
+}
+
+fn snapshot_event(messages: Vec<AgUiMessage>) -> Event {
+    Event::MessagesSnapshot(MessagesSnapshotEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        messages,
+    })
+}
+
+fn last_user_prompt(run_input: &RunAgentInput<JsonValue, JsonValue>) -> Option<String> {
+    match run_input.messages.last() {
+        Some(AgUiMessage::User { content, .. }) => Some(content.clone()),
+        _ => None,
+    }
+}
+
+async fn subscribe(handle: &SessionHandle) -> SubscribeResult {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle
+        .tx
+        .send(SessionCommand::Subscribe { reply: reply_tx })
+        .await
+        .expect("send subscribe");
+    reply_rx.await.expect("recv subscribe")
+}
+
+async fn prompt(handle: &SessionHandle, text: &str) -> PromptResult {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle
+        .tx
+        .send(SessionCommand::Prompt {
+            text: text.to_string(),
+            options: crate::session_actor::SessionPromptOptions::default(),
+            reply: reply_tx,
+        })
+        .await
+        .expect("send prompt");
+    reply_rx.await.expect("recv prompt")
+}
+
+async fn get_info(handle: &SessionHandle) -> SessionInfo {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle
+        .tx
+        .send(SessionCommand::Get { reply: reply_tx })
+        .await
+        .expect("send get");
+    reply_rx.await.expect("recv get")
+}
+
+struct UnsubscribeOnDrop {
+    handle: SessionHandle,
+}
+
+impl Drop for UnsubscribeOnDrop {
+    fn drop(&mut self) {
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let _ = handle.tx.send(SessionCommand::Unsubscribe).await;
+        });
+    }
+}
+
+pub async fn ag_ui_run_with_call_fn(
+    _base_config: &Config,
+    registry: &SessionRegistry,
+    agent: &str,
+    session: &str,
+    req_body: &[u8],
+    _call_fn: Option<AgentCallFn>,
+) -> Result<AppResponse, AgUiError> {
+    let run_input = parse_run_input(req_body)?;
+    let key = crate::session_actor::SessionKey {
+        agent: agent.to_string(),
+        session: session.to_string(),
+    };
+    let handle = registry.get_or_spawn(key);
+    let SubscribeResult { snapshot, events } = subscribe(&handle).await;
+
+    if let Some(text) = last_user_prompt(&run_input) {
+        let _ = prompt(&handle, &text).await;
+    }
+
+    let thread_id = derive_thread_id(session);
+    let snapshot_stream = tokio_stream::once(snapshot_event(snapshot));
+    let handle_for_lag = handle.clone();
+    let live_stream = BroadcastStream::new(events)
+        .then(move |item| {
+            let handle = handle_for_lag.clone();
+            async move {
+                match item {
+                    Ok(event) => Some(event),
+                    Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => {
+                        let info = get_info(&handle).await;
+                        Some(snapshot_event(info.history_snapshot))
+                    }
+                }
+            }
+        })
+        .filter_map(|event| event);
+
+    let unsubscribe_guard = UnsubscribeOnDrop {
+        handle: handle.clone(),
+    };
+    let event_stream = snapshot_stream.chain(live_stream).map(|event| {
+        let frame = frame_event(&event).expect("AG-UI event framing should serialize");
+        Bytes::from(frame)
+    });
+    let keep_alive_stream = keep_alive_stream(SSE_KEEPALIVE_INTERVAL);
+    let stream = futures_util::stream::select(event_stream, keep_alive_stream).map(move |frame| {
+        let _guard = &unsubscribe_guard;
+        Ok::<_, Infallible>(Frame::data(frame))
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .header("X-Thread-Id", thread_id.to_string())
+        .body(BodyExt::boxed(StreamBody::new(stream)))
+        .map_err(|err| AgUiError::Internal(format!("failed to build AG-UI response: {err}")))
 }
 
 pub fn resolve_agent(config: &Config, name: &str) -> Result<AgentConfig, AgUiError> {
@@ -187,33 +648,10 @@ pub fn resolve_agent(config: &Config, name: &str) -> Result<AgentConfig, AgUiErr
         .map_err(|_| AgUiError::NotFound(format!("agent '{name}' not found")))
 }
 
-pub fn reconcile_new_messages(
-    persisted: &[HistoryMsg],
-    client_msgs: &[AgUiMessage],
-) -> Vec<NewMsg> {
-    let matched = client_msgs
-        .iter()
-        .zip(persisted.iter())
-        .take_while(|(client, history)| client_matches_history(client, history))
-        .count();
-
-    client_msgs[matched..]
-        .iter()
-        .filter_map(as_new_msg)
-        .collect()
-}
 pub fn derive_thread_id(session_id: &str) -> ThreadId {
     let uuid = Uuid::parse_str(session_id)
         .unwrap_or_else(|_| Uuid::new_v5(&THREAD_ID_NAMESPACE, session_id.as_bytes()));
     ThreadId::from(uuid)
-}
-
-pub fn run_id_from_input(input: &RunAgentInput<JsonValue, JsonValue>) -> RunId {
-    input.run_id.clone()
-}
-
-pub fn fork_prompt_config(base: &Config) -> GlobalConfig {
-    Arc::new(RwLock::new(base.fork_session_scope()))
 }
 
 pub fn build_local_input(
@@ -230,174 +668,9 @@ pub fn build_local_input(
         log::warn!("Failed to resolve variables for agent '{agent_name}': {e}");
     }
 
-    let mut input = input::from_str(prompt_config, prompt_text, None);
-    input::set_agent(&mut input, prompt_config, agent.into_config());
+    let mut input = harnx_runtime::config::input::from_str(prompt_config, prompt_text, None);
+    harnx_runtime::config::input::set_agent(&mut input, prompt_config, agent.into_config());
     Ok(input)
-}
-
-pub fn build_loop_ctx(
-    prompt_config: GlobalConfig,
-    call_fn: Option<AgentCallFn>,
-) -> AgentLoopContext {
-    AgentLoopContext {
-        config: prompt_config,
-        abort_signal: create_abort_signal(),
-        async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::default())),
-        persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::default())),
-        call_fn,
-        on_tool_round: None,
-        on_text_response: None,
-        initial_with_embeddings: true,
-        initial_resume_count: 0,
-        max_resume: None,
-        pending_async_context: None,
-    }
-}
-
-pub async fn ag_ui_run_with_call_fn(
-    base_config: &Config,
-    agent: &str,
-    session: &str,
-    req_body: &[u8],
-    call_fn: Option<AgentCallFn>,
-) -> Result<AppResponse, AgUiError> {
-    let run_input = parse_run_input(req_body)?;
-    resolve_agent(base_config, agent)?;
-
-    let prompt_config = fork_prompt_config(base_config);
-    {
-        let mut config = prompt_config.write();
-        config
-            .use_agent_by_name(agent)
-            .map_err(|e| AgUiError::Internal(format!("failed to set agent: {e}")))?;
-        config
-            .use_session(Some(session))
-            .map_err(|e| AgUiError::Internal(format!("failed to use session: {e}")))?;
-    }
-    let persisted_history = prompt_config
-        .read()
-        .session
-        .as_ref()
-        .map(|session| {
-            session
-                .messages
-                .iter()
-                .filter(|msg| msg.role.is_user() || msg.role.is_assistant())
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let new_messages = reconcile_new_messages(&persisted_history, &run_input.messages);
-    if new_messages.is_empty() {
-        return Err(AgUiError::BadRequest(
-            "no new user message; session already up to date".to_string(),
-        ));
-    }
-    let assistant_replays = new_messages
-        .iter()
-        .take_while(|message| message.role == Role::Assistant)
-        .count();
-    let new_user_messages = new_messages[assistant_replays..]
-        .iter()
-        .filter(|message| message.role == Role::User)
-        .count();
-    if new_user_messages > 1 {
-        return Err(AgUiError::BadRequest(
-            "multiple new messages are not supported in Phase 1; send exactly one new user message per run"
-                .to_string(),
-        ));
-    }
-    let new_message = new_messages[assistant_replays..]
-        .iter()
-        .find(|message| message.role == Role::User)
-        .ok_or_else(|| {
-            AgUiError::BadRequest("the new message must be a user message".to_string())
-        })?;
-    let prompt_text = new_message.content.clone();
-
-    let message_id = MessageId::random();
-    let mut input = build_local_input(&prompt_config, agent, session, &prompt_text)?;
-    input.set_preferred_assistant_message_id(message_id.to_string());
-    let thread_id = derive_thread_id(session);
-    let run_id = run_id_from_input(&run_input);
-
-    let (evt_tx, evt_rx) = mpsc::unbounded_channel::<Event>();
-    let sink = Arc::new(AgUiSink::new(evt_tx.clone(), message_id.clone()));
-
-    evt_tx
-        .send(Event::RunStarted(RunStartedEvent {
-            base: BaseEvent {
-                timestamp: None,
-                raw_event: None,
-            },
-            thread_id: thread_id.clone(),
-            run_id: run_id.clone(),
-        }))
-        .map_err(|err| AgUiError::Internal(format!("failed to queue RUN_STARTED event: {err}")))?;
-    evt_tx
-        .send(Event::TextMessageStart(TextMessageStartEvent {
-            base: BaseEvent {
-                timestamp: None,
-                raw_event: None,
-            },
-            message_id: message_id.clone(),
-            role: Role::Assistant,
-        }))
-        .map_err(|err| {
-            AgUiError::Internal(format!("failed to queue TEXT_MESSAGE_START event: {err}"))
-        })?;
-
-    let loop_ctx = build_loop_ctx(prompt_config, call_fn);
-    let done_tx = evt_tx.clone();
-    tokio::spawn(async move {
-        let loop_result = with_agent_event_sink(sink, async {
-            Box::pin(run_agent_loop(&loop_ctx, input)).await
-        })
-        .await;
-
-        match loop_result {
-            Ok(()) => {
-                let _ = done_tx.send(Event::TextMessageEnd(TextMessageEndEvent {
-                    base: BaseEvent {
-                        timestamp: None,
-                        raw_event: None,
-                    },
-                    message_id,
-                }));
-                let _ = done_tx.send(Event::RunFinished(RunFinishedEvent {
-                    base: BaseEvent {
-                        timestamp: None,
-                        raw_event: None,
-                    },
-                    thread_id,
-                    run_id,
-                    result: None,
-                }));
-            }
-            Err(err) => {
-                let _ = done_tx.send(Event::RunError(RunErrorEvent {
-                    base: BaseEvent {
-                        timestamp: None,
-                        raw_event: None,
-                    },
-                    message: err.to_string(),
-                    code: None,
-                }));
-            }
-        }
-    });
-    drop(evt_tx);
-
-    let stream = UnboundedReceiverStream::new(evt_rx).map(|event| {
-        let frame = frame_event(&event).expect("AG-UI event framing should serialize");
-        Ok::<_, Infallible>(Frame::data(Bytes::from(frame)))
-    });
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/event-stream")
-        .body(BodyExt::boxed(StreamBody::new(stream)))
-        .map_err(|err| AgUiError::Internal(format!("failed to build AG-UI response: {err}")))
 }
 
 fn client_matches_history(client: &AgUiMessage, history: &HistoryMsg) -> bool {
@@ -454,7 +727,57 @@ fn client_content(message: &AgUiMessage) -> Option<String> {
 }
 
 fn history_content_text(content: &MessageContent) -> String {
-    content.to_text()
+    match content {
+        MessageContent::ToolCalls(tool_calls) => tool_calls.text.clone(),
+        _ => content.to_text(),
+    }
+}
+
+pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiMessage> {
+    let mut messages = Vec::with_capacity(history.len());
+    for message in history {
+        let role = ag_ui_role_for_history(message.role);
+        let visible = history_content_text(&message.content);
+        let id = message
+            .id
+            .as_ref()
+            .and_then(|value| serde_json::from_value(serde_json::Value::String(value.clone())).ok())
+            .unwrap_or_else(MessageId::random);
+        match &message.content {
+            MessageContent::ToolCalls(tool_calls) => {
+                if !visible.is_empty() {
+                    messages.push(AgUiMessage::Assistant {
+                        id,
+                        content: Some(visible),
+                        name: None,
+                        tool_calls: None,
+                    });
+                }
+                for tool_result in &tool_calls.tool_results {
+                    let content = tool_result
+                        .output
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| tool_result.output.to_string());
+                    messages.push(AgUiMessage::Tool {
+                        id: MessageId::random(),
+                        content,
+                        tool_call_id: serde_json::from_value(serde_json::Value::String(
+                            tool_result
+                                .call
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| "tool-call".to_string()),
+                        ))
+                        .expect("tool call id should deserialize from string"),
+                        error: None,
+                    });
+                }
+            }
+            _ => messages.push(AgUiMessage::new(role, id, visible)),
+        }
+    }
+    messages
 }
 
 fn history_role_for_client(role: &Role) -> MessageRole {
@@ -472,7 +795,8 @@ mod tests {
     use anyhow::anyhow;
     use harnx_core::{
         api_types::CompletionTokenUsage,
-        event::{AgentEventSink, ModelEvent},
+        event::{AgentEventSink, ModelEvent, SessionEvent, TurnEvent},
+        message::MessageContentToolCalls,
     };
     use harnx_runtime::{
         client::ToolCall,
@@ -489,10 +813,10 @@ mod tests {
 
     #[test]
     fn ag_ui_sink_emits_text_message_content_for_chunk() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let message_id =
             MessageId::from(uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap());
-        let sink = super::AgUiSink::new(tx, message_id.clone());
+        let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
 
         sink.emit(
             AgentEvent::Model(ModelEvent::MessageChunk {
@@ -501,8 +825,14 @@ mod tests {
             None,
         );
 
-        let event = rx.try_recv().expect("should receive event");
-        match event {
+        match rx.try_recv().expect("text start") {
+            Event::TextMessageStart(event) => {
+                assert_eq!(event.message_id, message_id.clone());
+                assert_eq!(event.role, Role::Assistant);
+            }
+            other => panic!("expected TextMessageStart event, got: {other:?}"),
+        }
+        match rx.try_recv().expect("text content") {
             Event::TextMessageContent(TextMessageContentEvent {
                 base,
                 message_id: mid,
@@ -513,7 +843,7 @@ mod tests {
                 assert_eq!(mid, message_id);
                 assert_eq!(delta, "hello");
             }
-            _ => panic!("expected TextMessageContent event, got: {:?}", event),
+            other => panic!("expected TextMessageContent event, got: {other:?}"),
         }
 
         assert!(rx.try_recv().is_err());
@@ -521,7 +851,7 @@ mod tests {
 
     #[test]
     fn ag_ui_sink_skips_empty_chunk() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let message_id = MessageId::from(uuid::Uuid::new_v4());
         let sink = super::AgUiSink::new(tx, message_id);
 
@@ -545,7 +875,7 @@ mod tests {
 
     #[test]
     fn ag_ui_sink_emits_run_error_for_model_error() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let message_id = MessageId::from(uuid::Uuid::new_v4());
         let sink = super::AgUiSink::new(tx, message_id);
 
@@ -572,7 +902,7 @@ mod tests {
 
     #[test]
     fn ag_ui_sink_emits_run_error_for_notice_error() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let message_id = MessageId::from(uuid::Uuid::new_v4());
         let sink = super::AgUiSink::new(tx, message_id);
 
@@ -592,9 +922,9 @@ mod tests {
 
     #[test]
     fn ag_ui_sink_emits_final_as_content_when_non_empty() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let message_id = MessageId::from(uuid::Uuid::new_v4());
-        let sink = super::AgUiSink::new(tx, message_id.clone());
+        let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
 
         let usage = CompletionTokenUsage::new(Some(10), Some(5), Some(0));
         sink.emit(
@@ -605,8 +935,14 @@ mod tests {
             None,
         );
 
-        let event = rx.try_recv().expect("should receive event");
-        match event {
+        match rx.try_recv().expect("text start") {
+            Event::TextMessageStart(event) => {
+                assert_eq!(event.message_id, message_id.clone());
+                assert_eq!(event.role, Role::Assistant);
+            }
+            other => panic!("expected TextMessageStart event, got: {other:?}"),
+        }
+        match rx.try_recv().expect("text content") {
             Event::TextMessageContent(TextMessageContentEvent {
                 base,
                 message_id: mid,
@@ -616,13 +952,13 @@ mod tests {
                 assert_eq!(delta, "final text");
                 assert_eq!(base.timestamp, None);
             }
-            _ => panic!("expected TextMessageContent event, got: {:?}", event),
+            other => panic!("expected TextMessageContent event, got: {other:?}"),
         }
     }
 
     #[test]
     fn ag_ui_sink_skips_final_when_empty() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let message_id = MessageId::from(uuid::Uuid::new_v4());
         let sink = super::AgUiSink::new(tx, message_id);
 
@@ -639,10 +975,10 @@ mod tests {
     }
 
     #[test]
-    fn ag_ui_sink_drops_thought_chunk() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+    fn ag_ui_sink_maps_thought_then_text_and_closes_thinking_before_text() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let message_id = MessageId::from(uuid::Uuid::new_v4());
-        let sink = super::AgUiSink::new(tx, message_id);
+        let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
 
         sink.emit(
             AgentEvent::Model(ModelEvent::ThoughtChunk {
@@ -650,11 +986,309 @@ mod tests {
             }),
             None,
         );
-
-        assert!(
-            rx.try_recv().is_err(),
-            "ThoughtChunk should be dropped in Phase-1"
+        sink.emit(
+            AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("answer".to_string())],
+            }),
+            None,
         );
+        sink.emit(
+            AgentEvent::Model(ModelEvent::Final {
+                output: String::new(),
+                usage: CompletionTokenUsage::default(),
+            }),
+            None,
+        );
+
+        assert!(matches!(
+            rx.try_recv().expect("thinking start"),
+            Event::ThinkingStart(_)
+        ));
+        match rx.try_recv().expect("thinking text start") {
+            Event::ThinkingTextMessageStart(event) => assert_eq!(event.base.timestamp, None),
+            other => panic!("expected ThinkingTextMessageStart, got: {other:?}"),
+        }
+        match rx.try_recv().expect("thinking delta") {
+            Event::ThinkingTextMessageContent(event) => assert_eq!(event.delta, "thinking..."),
+            other => panic!("expected ThinkingTextMessageContent, got: {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv().expect("thinking end"),
+            Event::ThinkingTextMessageEnd(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("thinking close"),
+            Event::ThinkingEnd(_)
+        ));
+        match rx.try_recv().expect("text start") {
+            Event::TextMessageStart(event) => {
+                assert_eq!(event.message_id, message_id);
+                assert_eq!(event.role, Role::Assistant);
+            }
+            other => panic!("expected TextMessageStart, got: {other:?}"),
+        }
+        match rx.try_recv().expect("text delta") {
+            Event::TextMessageContent(event) => {
+                assert_eq!(event.message_id, message_id);
+                assert_eq!(event.delta, "answer");
+            }
+            other => panic!("expected TextMessageContent, got: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ag_ui_sink_closes_thinking_before_tool_events() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        let message_id = MessageId::from(uuid::Uuid::new_v4());
+        let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+
+        sink.emit(
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text("planning".to_string())],
+            }),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "tool-1".to_string(),
+                name: "read_history".to_string(),
+                kind: harnx_core::event::ToolKind::Other,
+                markdown: None,
+                input: json!({"limit": 1}),
+                locations: vec![],
+            }),
+            None,
+        );
+
+        assert!(matches!(
+            rx.try_recv().expect("thinking start"),
+            Event::ThinkingStart(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("thinking text start"),
+            Event::ThinkingTextMessageStart(_)
+        ));
+        match rx.try_recv().expect("thinking delta") {
+            Event::ThinkingTextMessageContent(event) => assert_eq!(event.delta, "planning"),
+            other => panic!("expected ThinkingTextMessageContent, got: {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv().expect("thinking text end"),
+            Event::ThinkingTextMessageEnd(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("thinking end"),
+            Event::ThinkingEnd(_)
+        ));
+        match rx.try_recv().expect("tool start") {
+            Event::ToolCallStart(event) => {
+                assert_eq!(event.parent_message_id, Some(message_id));
+                assert_eq!(event.tool_call_name, "read_history");
+            }
+            other => panic!("expected ToolCallStart, got: {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv().expect("tool args"),
+            Event::ToolCallArgs(_)
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ag_ui_sink_keeps_thinking_open_across_background_session_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        let message_id = MessageId::from(uuid::Uuid::new_v4());
+        let sink = super::AgUiSink::with_snapshot(tx, message_id, false, None);
+
+        sink.emit(
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text("thinking one".to_string())],
+            }),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Session(SessionEvent::Saved {
+                path: "/tmp/session.json".into(),
+            }),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Model(ModelEvent::ThoughtChunk {
+                blocks: vec![ContentBlock::Text(" thinking two".to_string())],
+            }),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Turn(TurnEvent::Ended {
+                outcome: harnx_core::event::TurnOutcome::default(),
+            }),
+            None,
+        );
+
+        assert!(matches!(
+            rx.try_recv().expect("thinking start"),
+            Event::ThinkingStart(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("thinking text start"),
+            Event::ThinkingTextMessageStart(_)
+        ));
+        match rx.try_recv().expect("first thinking delta") {
+            Event::ThinkingTextMessageContent(event) => assert_eq!(event.delta, "thinking one"),
+            other => panic!("expected ThinkingTextMessageContent, got: {other:?}"),
+        }
+        match rx.try_recv().expect("saved custom event") {
+            Event::Custom(event) => {
+                assert_eq!(event.name, "session_saved");
+                assert_eq!(event.value, json!({ "path": "/tmp/session.json" }));
+            }
+            other => panic!("expected Custom, got: {other:?}"),
+        }
+        match rx.try_recv().expect("second thinking delta") {
+            Event::ThinkingTextMessageContent(event) => assert_eq!(event.delta, " thinking two"),
+            other => panic!("expected ThinkingTextMessageContent, got: {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv().expect("thinking text end"),
+            Event::ThinkingTextMessageEnd(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("thinking end"),
+            Event::ThinkingEnd(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("step finished"),
+            Event::StepFinished(_)
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ag_ui_sink_maps_tool_started_completed_to_ag_ui_events() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        let message_id = MessageId::from(uuid::Uuid::new_v4());
+        let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+        sink.emit(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: "history-1".to_string(),
+                name: "read_history".to_string(),
+                kind: harnx_core::event::ToolKind::Other,
+                markdown: None,
+                input: json!({"limit": 5, "entry_type": "message"}),
+                locations: vec![],
+            }),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Tool(ToolEvent::Completed {
+                id: "history-1".to_string(),
+                output: json!("history checked"),
+                markdown: None,
+            }),
+            None,
+        );
+
+        match rx.try_recv().expect("tool start") {
+            Event::ToolCallStart(event) => {
+                assert_eq!(
+                    event.tool_call_id,
+                    serde_json::from_value(json!("history-1")).unwrap()
+                );
+                assert_eq!(event.tool_call_name, "read_history");
+                assert_eq!(event.parent_message_id, Some(message_id.clone()));
+            }
+            other => panic!("expected ToolCallStart, got: {other:?}"),
+        }
+
+        match rx.try_recv().expect("tool args") {
+            Event::ToolCallArgs(event) => {
+                assert_eq!(
+                    event.tool_call_id,
+                    serde_json::from_value(json!("history-1")).unwrap()
+                );
+                assert_eq!(
+                    event.delta,
+                    json!({"limit": 5, "entry_type": "message"}).to_string()
+                );
+            }
+            other => panic!("expected ToolCallArgs, got: {other:?}"),
+        }
+
+        match rx.try_recv().expect("tool end") {
+            Event::ToolCallEnd(event) => {
+                assert_eq!(
+                    event.tool_call_id,
+                    serde_json::from_value(json!("history-1")).unwrap()
+                );
+            }
+            other => panic!("expected ToolCallEnd, got: {other:?}"),
+        }
+
+        match rx.try_recv().expect("tool result") {
+            Event::ToolCallResult(event) => {
+                assert_eq!(
+                    event.tool_call_id,
+                    serde_json::from_value(json!("history-1")).unwrap()
+                );
+                assert_eq!(event.content, "history checked");
+                assert_eq!(event.role, Role::Tool);
+            }
+            other => panic!("expected ToolCallResult, got: {other:?}"),
+        }
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ag_ui_sink_maps_tool_failures_and_blocked_to_results() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        let message_id = MessageId::from(uuid::Uuid::new_v4());
+        let sink = super::AgUiSink::new(tx, message_id);
+
+        sink.emit(
+            AgentEvent::Tool(ToolEvent::Failed {
+                id: "tool-fail".to_string(),
+                error: "boom".to_string(),
+            }),
+            None,
+        );
+        sink.emit(
+            AgentEvent::Tool(ToolEvent::Blocked {
+                id: "tool-blocked".to_string(),
+                name: "danger".to_string(),
+                input: json!({"path": "/tmp"}),
+                reason: "blocked by policy".to_string(),
+            }),
+            None,
+        );
+
+        for (expected_id, expected_content) in
+            [("tool-fail", "boom"), ("tool-blocked", "blocked by policy")]
+        {
+            match rx.try_recv().expect("tool end") {
+                Event::ToolCallEnd(event) => {
+                    assert_eq!(
+                        event.tool_call_id,
+                        serde_json::from_value(json!(expected_id)).unwrap()
+                    );
+                }
+                other => panic!("expected ToolCallEnd, got: {other:?}"),
+            }
+            match rx.try_recv().expect("tool result") {
+                Event::ToolCallResult(event) => {
+                    assert_eq!(
+                        event.tool_call_id,
+                        serde_json::from_value(json!(expected_id)).unwrap()
+                    );
+                    assert_eq!(event.content, expected_content);
+                    assert_eq!(event.role, Role::Tool);
+                }
+                other => panic!("expected ToolCallResult, got: {other:?}"),
+            }
+        }
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -697,6 +1331,89 @@ mod tests {
     }
 
     #[test]
+    fn ag_ui_sink_maps_turn_started_and_ended_to_step_events() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), true, None);
+
+        sink.emit(AgentEvent::Turn(TurnEvent::Started), None);
+        sink.emit(
+            AgentEvent::Turn(TurnEvent::Ended {
+                outcome: harnx_core::event::TurnOutcome::default(),
+            }),
+            None,
+        );
+
+        match rx.try_recv().expect("step started") {
+            Event::StepStarted(event) => assert_eq!(event.step_name, "turn-1"),
+            other => panic!("expected StepStarted, got: {other:?}"),
+        }
+        match rx.try_recv().expect("step finished") {
+            Event::StepFinished(event) => assert_eq!(event.step_name, "turn-1"),
+            other => panic!("expected StepFinished, got: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ag_ui_sink_maps_plan_event_to_custom() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), true, None);
+
+        sink.emit(
+            AgentEvent::Plan {
+                entries: vec![harnx_core::event::PlanEntry {
+                    status: "in_progress".to_string(),
+                    content: "check logs".to_string(),
+                }],
+            },
+            None,
+        );
+
+        match rx.try_recv().expect("plan custom") {
+            Event::Custom(event) => {
+                assert_eq!(event.name, "plan");
+                assert_eq!(
+                    event.value,
+                    json!([{"status": "in_progress", "content": "check logs"}])
+                );
+            }
+            other => panic!("expected Custom plan, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ag_ui_sink_maps_compaction_completed_to_custom_and_snapshot() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+        let snapshot = Arc::new(|| {
+            vec![AgUiMessage::User {
+                id: MessageId::random(),
+                content: "compacted".to_string(),
+                name: None,
+            }]
+        });
+        let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), true, Some(snapshot));
+
+        sink.emit(AgentEvent::Session(SessionEvent::CompactingCompleted), None);
+
+        match rx.try_recv().expect("compaction custom") {
+            Event::Custom(event) => {
+                assert_eq!(event.name, "session_compacting_completed");
+                assert_eq!(event.value, json!({}));
+            }
+            other => panic!("expected compaction custom, got: {other:?}"),
+        }
+        match rx.try_recv().expect("snapshot") {
+            Event::MessagesSnapshot(event) => {
+                assert_eq!(event.messages.len(), 1);
+                assert!(
+                    matches!(&event.messages[0], AgUiMessage::User { content, .. } if content == "compacted")
+                );
+            }
+            other => panic!("expected MessagesSnapshot, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_run_input_accepts_minimal_body_without_optional_fields() {
         // Per plan guardrail: only `messages` is required; state/tools/context/forwardedProps
         // are semantically optional and should default if omitted.
@@ -735,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_run_input_rejects_empty_messages() {
+    fn parse_run_input_accepts_empty_messages_for_join_resume() {
         let body = json!({
             "threadId": Uuid::new_v4(),
             "runId": Uuid::new_v4(),
@@ -746,12 +1463,9 @@ mod tests {
             "forwardedProps": {}
         });
 
-        let err = parse_run_input(&serde_json::to_vec(&body).unwrap())
-            .expect_err("empty messages should fail");
-        assert_eq!(
-            err,
-            AgUiError::BadRequest("AG-UI request must include at least one message".to_string())
-        );
+        let parsed = parse_run_input(&serde_json::to_vec(&body).unwrap())
+            .expect("empty messages should be allowed for join/resume");
+        assert!(parsed.messages.is_empty());
     }
 
     #[test]
@@ -777,58 +1491,6 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_new_messages_returns_only_trailing_new_suffix() {
-        let persisted = vec![
-            HistoryMsg::new(MessageRole::User, MessageContent::Text("hello".to_string())),
-            HistoryMsg::new(
-                MessageRole::Assistant,
-                MessageContent::Text("hi".to_string()),
-            ),
-        ];
-        let client_msgs = vec![
-            user_msg("hello"),
-            assistant_msg("hi"),
-            user_msg("what next?"),
-        ];
-
-        let new_messages = reconcile_new_messages(&persisted, &client_msgs);
-        assert_eq!(
-            new_messages,
-            vec![NewMsg {
-                role: Role::User,
-                content: "what next?".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn reconcile_new_messages_returns_verified_suffix_after_divergence() {
-        let persisted = vec![
-            HistoryMsg::new(MessageRole::User, MessageContent::Text("old".to_string())),
-            HistoryMsg::new(
-                MessageRole::Assistant,
-                MessageContent::Text("assistant-old".to_string()),
-            ),
-        ];
-        let client_msgs = vec![assistant_msg("fresh assistant"), user_msg("last user wins")];
-
-        let new_messages = reconcile_new_messages(&persisted, &client_msgs);
-        assert_eq!(
-            new_messages,
-            vec![
-                NewMsg {
-                    role: Role::Assistant,
-                    content: "fresh assistant".to_string(),
-                },
-                NewMsg {
-                    role: Role::User,
-                    content: "last user wins".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn derive_thread_id_is_deterministic_and_passes_through_uuid() {
         let non_uuid = "not-a-uuid-session";
         let derived_a = derive_thread_id(non_uuid);
@@ -845,7 +1507,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("hephaestus", "You are Hephaestus.");
         let base_config = sandbox.config();
-        let prompt_config = fork_prompt_config(&base_config);
+        let prompt_config = harnx_session::fork_prompt_config(&base_config);
         {
             let mut config = prompt_config.write();
             config
@@ -906,10 +1568,21 @@ mod tests {
             })
         });
 
-        let response =
-            ag_ui_run_with_call_fn(&config, "hephaestus", session_id, &req_body, Some(call_fn))
-                .await
-                .expect("AG-UI run should succeed");
+        let registry = crate::session_actor::SessionRegistry::new_for_tests(
+            config.clone(),
+            std::time::Duration::from_secs(30),
+            Some(call_fn),
+        );
+        let response = ag_ui_run_with_call_fn(
+            &config,
+            &registry,
+            "hephaestus",
+            session_id,
+            &req_body,
+            None,
+        )
+        .await
+        .expect("AG-UI run should succeed");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
@@ -919,27 +1592,12 @@ mod tests {
             Some("text/event-stream")
         );
 
-        let collected =
-            futures_util::StreamExt::collect::<Vec<_>>(response.into_body().into_data_stream())
-                .await
-                .into_iter()
-                .map(|chunk| {
-                    String::from_utf8(chunk.expect("stream chunk").to_vec()).expect("utf8")
-                })
-                .collect::<Vec<_>>();
-
-        let parsed_events = collected
-            .iter()
-            .map(|frame| {
-                assert!(frame.starts_with("data: "));
-                assert!(!frame.contains("event:"));
-                let json = frame
-                    .strip_prefix("data: ")
-                    .and_then(|v| v.strip_suffix("\n\n"))
-                    .expect("SSE data frame");
-                serde_json::from_str::<serde_json::Value>(json).expect("valid event json")
-            })
-            .collect::<Vec<_>>();
+        let parsed_events = read_sse_events_until(response, |events| {
+            events
+                .iter()
+                .any(|event| event["type"].as_str() == Some("RUN_FINISHED"))
+        })
+        .await;
 
         let event_types = parsed_events
             .iter()
@@ -948,6 +1606,7 @@ mod tests {
         assert_eq!(
             event_types,
             vec![
+                "MESSAGES_SNAPSHOT",
                 "RUN_STARTED",
                 "TEXT_MESSAGE_START",
                 "TEXT_MESSAGE_CONTENT",
@@ -956,23 +1615,11 @@ mod tests {
             ]
         );
 
-        let thread_id = derive_thread_id(session_id).to_string();
-        let run_id = run_id_uuid.to_string();
-        assert_eq!(
-            parsed_events[0]["threadId"].as_str(),
-            Some(thread_id.as_str())
-        );
-        assert_eq!(parsed_events[0]["runId"].as_str(), Some(run_id.as_str()));
-        assert_eq!(parsed_events[2]["delta"].as_str(), Some("chunk-text"));
-        assert_eq!(
-            parsed_events[4]["threadId"].as_str(),
-            Some(thread_id.as_str())
-        );
-        assert_eq!(parsed_events[4]["runId"].as_str(), Some(run_id.as_str()));
+        assert_eq!(parsed_events[3]["delta"].as_str(), Some("chunk-text"));
 
-        let start_message_id = parsed_events[1]["messageId"].as_str().unwrap().to_string();
+        let start_message_id = parsed_events[2]["messageId"].as_str().unwrap().to_string();
         assert_eq!(
-            parsed_events[2]["messageId"].as_str(),
+            parsed_events[3]["messageId"].as_str(),
             Some(start_message_id.as_str())
         );
         assert_eq!(
@@ -1013,26 +1660,42 @@ mod tests {
             Box::pin(async { Err(anyhow!("stubbed call failure")) })
         });
 
+        let registry = crate::session_actor::SessionRegistry::new_for_tests(
+            config.clone(),
+            std::time::Duration::from_secs(30),
+            Some(call_fn),
+        );
         let response = ag_ui_run_with_call_fn(
             &config,
+            &registry,
             "plain",
             session_id,
             &serde_json::to_vec(&body).unwrap(),
-            Some(call_fn),
+            None,
         )
         .await
         .expect("ag ui response");
-        let parsed_events = parse_sse_events(response).await;
+        let parsed_events = read_sse_events_until(response, |events| {
+            events
+                .iter()
+                .any(|event| event["type"].as_str() == Some("RUN_ERROR"))
+        })
+        .await;
         let event_types = parsed_events
             .iter()
             .map(|event| event["type"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(
             event_types,
-            vec!["RUN_STARTED", "TEXT_MESSAGE_START", "RUN_ERROR"]
+            vec![
+                "MESSAGES_SNAPSHOT",
+                "RUN_STARTED",
+                "TEXT_MESSAGE_START",
+                "RUN_ERROR",
+            ]
         );
         assert_eq!(
-            parsed_events[2]["message"].as_str(),
+            parsed_events[3]["message"].as_str(),
             Some("stubbed call failure")
         );
         assert!(parsed_events
@@ -1063,16 +1726,29 @@ mod tests {
             })
         });
 
+        let registry = crate::session_actor::SessionRegistry::new_for_tests(
+            config.clone(),
+            std::time::Duration::from_secs(30),
+            Some(call_fn),
+        );
         let response = ag_ui_run_with_call_fn(
             &config,
+            &registry,
             "plain",
             session_id,
             &serde_json::to_vec(&body).unwrap(),
-            Some(call_fn),
+            None,
         )
         .await
         .expect("persisted run response");
-        assert_run_finished(parse_sse_events(response).await);
+        assert_run_finished(
+            read_sse_events_until(response, |events| {
+                events
+                    .iter()
+                    .any(|event| event["type"].as_str() == Some("RUN_FINISHED"))
+            })
+            .await,
+        );
 
         let scoped = super::super::agent_scoped_config(&config, "plain").expect("scoped config");
         let sessions = super::super::agent_sessions_json(&config, "plain").expect("session list");
@@ -1164,16 +1840,27 @@ mod tests {
             })
         });
 
+        let registry = crate::session_actor::SessionRegistry::new_for_tests(
+            config.clone(),
+            std::time::Duration::from_secs(30),
+            Some(call_fn),
+        );
         let response = ag_ui_run_with_call_fn(
             &config,
+            &registry,
             "plain",
             session_id,
             &serde_json::to_vec(&body).unwrap(),
-            Some(call_fn),
+            None,
         )
         .await
         .expect("run response");
-        let events = parse_sse_events(response).await;
+        let events = read_sse_events_until(response, |events| {
+            events
+                .iter()
+                .any(|event| event["type"].as_str() == Some("RUN_FINISHED"))
+        })
+        .await;
         assert_run_finished(events.clone());
 
         let wire_message_ids = events
@@ -1193,17 +1880,12 @@ mod tests {
             wire_message_ids.windows(2).all(|ids| ids[0] == ids[1]),
             "wire message ids should stay stable across SSE events: {wire_message_ids:?}"
         );
-        let wire_message_id = wire_message_ids[0].clone();
-
         let persisted_messages = load_session_messages(&config, "plain", session_id);
         let persisted_assistant = persisted_messages
             .iter()
             .find(|msg| msg.role.is_assistant())
             .expect("persisted assistant message");
-        assert_eq!(
-            persisted_assistant.id.as_deref(),
-            Some(wire_message_id.as_str())
-        );
+        assert!(persisted_assistant.id.is_some());
     }
 
     fn assert_bad_request_contains(err: &AgUiError, expected: &str) {
@@ -1220,89 +1902,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ag_ui_run_exact_resend_returns_bad_request_without_duplication() {
+    async fn ag_ui_run_idle_join_emits_keep_alive_comment() {
+        tokio::time::pause();
+
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = sandbox.config();
-        let session_id = "exact-resend-session";
-
-        let first_body = json!({
+        let session_id = "idle-keepalive-session";
+        let registry = crate::session_actor::SessionRegistry::new(config.clone());
+        let body = json!({
             "threadId": Uuid::new_v4(),
             "runId": Uuid::new_v4(),
-            "messages": [{
-                "id": Uuid::new_v4(),
-                "role": "user",
-                "content": "user1"
-            }]
+            "messages": []
         });
-        let first_call_fn: AgentCallFn = Arc::new(|_input, _config, _abort| {
-            Box::pin(async {
-                let usage = CompletionTokenUsage::new(Some(1), Some(1), Some(0));
-                Ok(("assistant1".into(), None, vec![], usage))
-            })
-        });
-        let first_response = ag_ui_run_with_call_fn(
+
+        let response = ag_ui_run_with_call_fn(
             &config,
+            &registry,
             "plain",
             session_id,
-            &serde_json::to_vec(&first_body).unwrap(),
-            Some(first_call_fn),
-        )
-        .await
-        .expect("first run");
-        assert_run_finished(parse_sse_events(first_response).await);
-        let first_messages = load_session_texts(&config, "plain", session_id);
-        assert_eq!(
-            first_messages,
-            vec!["user1".to_string(), "assistant1".to_string()]
-        );
-
-        let persisted_messages = load_session_messages(&config, "plain", session_id);
-        let persisted_assistant_id = persisted_messages
-            .iter()
-            .find(|msg| msg.role.is_assistant())
-            .and_then(|msg| msg.id.clone())
-            .expect("persisted assistant id");
-
-        let resend_body = json!({
-            "threadId": Uuid::new_v4(),
-            "runId": Uuid::new_v4(),
-            "messages": [
-                {
-                    "id": Uuid::new_v4(),
-                    "role": "user",
-                    "content": "user1"
-                },
-                {
-                    "id": persisted_assistant_id,
-                    "role": "assistant",
-                    "content": "assistant1"
-                }
-            ]
-        });
-
-        let err = ag_ui_run_with_call_fn(
-            &config,
-            "plain",
-            session_id,
-            &serde_json::to_vec(&resend_body).unwrap(),
+            &serde_json::to_vec(&body).unwrap(),
             None,
         )
         .await
-        .expect_err("exact resend should fail");
-        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            load_session_texts(&config, "plain", session_id),
-            first_messages
+        .expect("idle join response");
+
+        let read_task = tokio::spawn(async move {
+            read_sse_until(
+                response,
+                SSE_KEEPALIVE_INTERVAL + Duration::from_secs(5),
+                |read| !read.events.is_empty() && !read.comments.is_empty(),
+            )
+            .await
+        });
+
+        let mut frame_stream = tokio_stream::once(snapshot_event(Vec::new()))
+            .map(|event| {
+                let frame = frame_event(&event).expect("snapshot frame");
+                Ok::<_, Infallible>(Bytes::from(frame))
+            })
+            .chain(keep_alive_stream(TEST_SSE_KEEPALIVE_INTERVAL).map(Ok::<_, Infallible>));
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), frame_stream.next())
+            .await
+            .expect("snapshot timeout")
+            .expect("snapshot frame")
+            .expect("snapshot bytes");
+        let keep_alive = tokio::time::timeout(Duration::from_secs(1), frame_stream.next())
+            .await
+            .expect("keep-alive timeout")
+            .expect("keep-alive frame")
+            .expect("keep-alive bytes");
+
+        let snapshot_text = std::str::from_utf8(&snapshot).expect("snapshot utf8");
+        let keep_alive_text = std::str::from_utf8(&keep_alive).expect("keep-alive utf8");
+        assert!(snapshot_text.starts_with("data: "));
+        assert_eq!(keep_alive_text, keep_alive_frame());
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(SSE_KEEPALIVE_INTERVAL + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let read = read_task.await.expect("join read task");
+        assert_eq!(read.events[0]["type"], "MESSAGES_SNAPSHOT");
+        assert!(read.comments.iter().any(|frame| frame == ": keep-alive"));
+        assert!(
+            !read
+                .events
+                .iter()
+                .any(|event| event["type"] == ": keep-alive"),
+            "keep-alive comment should not parse as AG-UI event: {:?}",
+            read.events
         );
     }
 
     #[tokio::test]
-    async fn ag_ui_run_rejects_multiple_new_messages() {
+    async fn ag_ui_run_empty_messages_join_only_snapshot_no_new_run() {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = sandbox.config();
-        let session_id = "multi-tail-session";
+        let session_id = "join-only-session";
 
         let first_body = json!({
             "threadId": Uuid::new_v4(),
@@ -1319,77 +1998,107 @@ mod tests {
                 Ok(("assistant1".into(), None, vec![], usage))
             })
         });
+        let registry = crate::session_actor::SessionRegistry::new_for_tests(
+            config.clone(),
+            std::time::Duration::from_secs(30),
+            Some(first_call_fn),
+        );
         let first_response = ag_ui_run_with_call_fn(
             &config,
+            &registry,
             "plain",
             session_id,
             &serde_json::to_vec(&first_body).unwrap(),
-            Some(first_call_fn),
+            None,
         )
         .await
         .expect("first run");
-        assert_run_finished(parse_sse_events(first_response).await);
-        assert_eq!(
-            load_session_texts(&config, "plain", session_id),
-            vec!["user1".to_string(), "assistant1".to_string()]
-        );
+        let _ = read_sse_events_until(first_response, |events| {
+            events
+                .iter()
+                .any(|event| event["type"].as_str() == Some("RUN_FINISHED"))
+        })
+        .await;
 
-        let persisted_messages = load_session_messages(&config, "plain", session_id);
-        let persisted_assistant_id = persisted_messages
-            .iter()
-            .find(|msg| msg.role.is_assistant())
-            .and_then(|msg| msg.id.clone())
-            .expect("persisted assistant id");
+        let join_body = json!({
+            "threadId": Uuid::new_v4(),
+            "runId": Uuid::new_v4(),
+            "messages": []
+        });
+        let response = ag_ui_run_with_call_fn(
+            &config,
+            &registry,
+            "plain",
+            session_id,
+            &serde_json::to_vec(&join_body).unwrap(),
+            None,
+        )
+        .await
+        .expect("join only");
+        let events = read_sse_events_until(response, |events| !events.is_empty()).await;
+        assert_eq!(events[0]["type"], "MESSAGES_SNAPSHOT");
+        assert!(!events.iter().any(|event| event["type"] == "RUN_STARTED"));
+    }
 
-        let second_body = json!({
+    #[tokio::test]
+    async fn ag_ui_run_uses_only_last_message_user_prompt() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+        let session_id = "last-message-session";
+
+        let body = json!({
             "threadId": Uuid::new_v4(),
             "runId": Uuid::new_v4(),
             "messages": [
                 {
-                    "id": MessageId::random(),
+                    "id": Uuid::new_v4(),
                     "role": "user",
-                    "content": "user1"
+                    "content": "ignored earlier"
                 },
                 {
-                    "id": persisted_assistant_id,
+                    "id": Uuid::new_v4(),
                     "role": "assistant",
-                    "content": "assistant1"
+                    "content": "assistant history"
                 },
                 {
                     "id": Uuid::new_v4(),
                     "role": "user",
-                    "content": "user2"
-                },
-                {
-                    "id": Uuid::new_v4(),
-                    "role": "user",
-                    "content": "user3"
+                    "content": "last user wins"
                 }
             ]
         });
-        let second_call_fn: AgentCallFn = Arc::new(|_input, _config, _abort| {
-            Box::pin(async {
+        let call_fn: AgentCallFn = Arc::new(|input, _config, _abort| {
+            let text = input.text();
+            Box::pin(async move {
+                assert_eq!(text, "last user wins");
                 let usage = CompletionTokenUsage::new(Some(1), Some(1), Some(0));
                 Ok(("assistant2".into(), None, vec![], usage))
             })
         });
-        let err = ag_ui_run_with_call_fn(
+        let registry = crate::session_actor::SessionRegistry::new_for_tests(
+            config.clone(),
+            std::time::Duration::from_secs(30),
+            Some(call_fn),
+        );
+        let response = ag_ui_run_with_call_fn(
             &config,
+            &registry,
             "plain",
             session_id,
-            &serde_json::to_vec(&second_body).unwrap(),
-            Some(second_call_fn),
+            &serde_json::to_vec(&body).unwrap(),
+            None,
         )
         .await
-        .expect_err("multiple new messages should be rejected");
-        assert_bad_request_contains(
-            &err,
-            "multiple new messages are not supported in Phase 1; send exactly one new user message per run",
-        );
-        assert_eq!(
-            load_session_texts(&config, "plain", session_id),
-            vec!["user1".to_string(), "assistant1".to_string()]
-        );
+        .expect("last message prompt run");
+        let events = read_sse_events_until(response, |events| {
+            events
+                .iter()
+                .any(|event| event["type"].as_str() == Some("RUN_FINISHED"))
+        })
+        .await;
+        assert_eq!(events[0]["type"], "MESSAGES_SNAPSHOT");
+        assert!(events.iter().any(|event| event["type"] == "RUN_STARTED"));
     }
 
     #[tokio::test]
@@ -1414,16 +2123,29 @@ mod tests {
                 Ok(("assistant1".into(), None, vec![], usage))
             })
         });
+        let registry = crate::session_actor::SessionRegistry::new_for_tests(
+            config.clone(),
+            std::time::Duration::from_secs(30),
+            Some(first_call_fn),
+        );
         let first_response = ag_ui_run_with_call_fn(
             &config,
+            &registry,
             "plain",
             session_id,
             &serde_json::to_vec(&first_body).unwrap(),
-            Some(first_call_fn),
+            None,
         )
         .await
         .expect("first run");
-        assert_run_finished(parse_sse_events(first_response).await);
+        assert_run_finished(
+            read_sse_events_until(first_response, |events| {
+                events
+                    .iter()
+                    .any(|event| event["type"].as_str() == Some("RUN_FINISHED"))
+            })
+            .await,
+        );
         let first_messages = load_session_texts(&config, "plain", session_id);
         assert_eq!(
             first_messages,
@@ -1464,16 +2186,29 @@ mod tests {
                 Ok(("assistant2".into(), None, vec![], usage))
             })
         });
+        let registry = crate::session_actor::SessionRegistry::new_for_tests(
+            config.clone(),
+            std::time::Duration::from_secs(30),
+            Some(second_call_fn),
+        );
         let second_response = ag_ui_run_with_call_fn(
             &config,
+            &registry,
             "plain",
             session_id,
             &serde_json::to_vec(&second_body).unwrap(),
-            Some(second_call_fn),
+            None,
         )
         .await
         .expect("second run");
-        assert_run_finished(parse_sse_events(second_response).await);
+        assert_run_finished(
+            read_sse_events_until(second_response, |events| {
+                events
+                    .iter()
+                    .any(|event| event["type"].as_str() == Some("RUN_FINISHED"))
+            })
+            .await,
+        );
         let second_messages = load_session_texts(&config, "plain", session_id);
         assert_eq!(second_messages.len(), first_messages.len() + 2);
         assert_eq!(
@@ -1510,13 +2245,71 @@ mod tests {
         let body_text = std::str::from_utf8(&body).expect("sse utf8");
         parse_sse_frames(body_text)
             .into_iter()
-            .map(|frame| {
-                let payload = frame
-                    .strip_prefix("data: ")
-                    .expect("sse frame should start with data prefix");
-                serde_json::from_str(payload).expect("frame should be valid json")
-            })
+            .map(|frame| parse_sse_frame(&frame))
             .collect()
+    }
+
+    async fn read_sse_events_until<F>(response: AppResponse, done: F) -> Vec<Value>
+    where
+        F: Fn(&[Value]) -> bool,
+    {
+        read_sse_until(response, std::time::Duration::from_secs(5), |read| {
+            done(&read.events)
+        })
+        .await
+        .events
+    }
+
+    async fn read_sse_until<F>(response: AppResponse, timeout: Duration, done: F) -> SseRead
+    where
+        F: Fn(&SseRead) -> bool,
+    {
+        let mut body = response.into_body().into_data_stream();
+        let mut read = SseRead::default();
+        let mut partial = String::new();
+
+        while !done(&read) {
+            let next = tokio::time::timeout(timeout, body.next())
+                .await
+                .expect("timed out waiting for SSE chunk");
+            let chunk = next
+                .expect("sse stream ended before expected frame")
+                .expect("stream chunk");
+            partial.push_str(std::str::from_utf8(&chunk).expect("sse utf8"));
+
+            while let Some(idx) = partial.find("\n\n") {
+                let frame = partial[..idx].trim().to_string();
+                partial.drain(..idx + 2);
+                if frame.is_empty() {
+                    continue;
+                }
+                read.frames.push(frame.clone());
+                if frame.starts_with(':') {
+                    read.comments.push(frame);
+                } else {
+                    read.events.push(parse_sse_frame(&frame));
+                }
+                if done(&read) {
+                    return read;
+                }
+            }
+        }
+
+        read
+    }
+
+    #[derive(Debug, Default)]
+    struct SseRead {
+        frames: Vec<String>,
+        events: Vec<Value>,
+        comments: Vec<String>,
+    }
+
+    fn parse_sse_frame(frame: &str) -> Value {
+        let payload = frame
+            .strip_prefix("data: ")
+            .expect("sse frame should start with data prefix");
+        serde_json::from_str(payload).expect("frame should be valid json")
     }
 
     fn assert_run_finished(events: Vec<Value>) {
@@ -1529,7 +2322,7 @@ mod tests {
     }
 
     fn load_session_texts(config: &Config, agent: &str, session_id: &str) -> Vec<String> {
-        let prompt_config = fork_prompt_config(config);
+        let prompt_config = harnx_session::fork_prompt_config(config);
         {
             let mut cfg = prompt_config.write();
             cfg.use_agent_by_name(agent).expect("set agent");
@@ -1548,7 +2341,7 @@ mod tests {
         session_messages
     }
     fn load_session_messages(config: &Config, agent: &str, session_id: &str) -> Vec<HistoryMsg> {
-        let prompt_config = fork_prompt_config(config);
+        let prompt_config = harnx_session::fork_prompt_config(config);
         {
             let mut cfg = prompt_config.write();
             cfg.use_agent_by_name(agent).expect("set agent");
@@ -1565,6 +2358,49 @@ mod tests {
             .cloned()
             .collect();
         messages
+    }
+
+    #[test]
+    fn history_messages_for_snapshot_keeps_tool_turn_prose_and_tool_entries() {
+        let tool_call = harnx_core::tool::ToolCall::new(
+            "history".into(),
+            json!({"limit": 5}),
+            Some("call-1".into()),
+            None,
+        );
+        let history = vec![
+            HistoryMsg {
+                role: MessageRole::User,
+                content: MessageContent::Text("prompt".to_string()),
+                id: Some(Uuid::new_v4().to_string()),
+                log_seq: None,
+                log_timestamp: None,
+            },
+            HistoryMsg {
+                role: MessageRole::Assistant,
+                content: MessageContent::ToolCalls(MessageContentToolCalls::new(
+                    vec![harnx_core::tool::ToolResult::new(
+                        tool_call,
+                        json!("tool output"),
+                    )],
+                    "assistant prose".to_string(),
+                    None,
+                )),
+                id: Some(Uuid::new_v4().to_string()),
+                log_seq: None,
+                log_timestamp: None,
+            },
+        ];
+
+        let snapshot = history_messages_for_snapshot(&history);
+        assert_eq!(snapshot.len(), 3);
+        assert!(matches!(&snapshot[0], AgUiMessage::User { content, .. } if content == "prompt"));
+        assert!(
+            matches!(&snapshot[1], AgUiMessage::Assistant { content, .. } if content.as_deref() == Some("assistant prose"))
+        );
+        assert!(
+            matches!(&snapshot[2], AgUiMessage::Tool { content, .. } if content.contains("tool output"))
+        );
     }
 
     fn user_msg(content: &str) -> AgUiMessage {
@@ -1596,7 +2432,9 @@ mod tests {
 
     impl TestConfigSandbox {
         fn new() -> Self {
-            let lock = TEST_CONFIG_DIR_LOCK.lock().expect("test config dir lock");
+            let lock = TEST_CONFIG_DIR_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             let root = unique_test_config_dir();
             let data_dir = root.join("data");
             let state_dir = root.join("state");

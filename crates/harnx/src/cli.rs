@@ -50,9 +50,6 @@ pub struct Cli {
     /// Light theme for markdown rendering
     #[clap(long, hide = true)]
     pub light_theme: bool,
-    /// Serve mode, optionally specify address to bind
-    #[clap(long, value_name = "ADDRESS", num_args = 0..=1, hide = true)]
-    pub serve: Option<Option<String>>,
     /// Execute macro command(s) from config by name
     #[clap(long = "macro", value_name = "NAME", hide = true)]
     pub macro_name: Option<String>,

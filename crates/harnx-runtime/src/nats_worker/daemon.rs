@@ -612,6 +612,7 @@ impl WorkerRuntime {
                         header_insert_observer: None,
                         session_index: self.session_index.as_ref(),
                         on_tool_round: Some(on_tool_round),
+                        working_dir: None,
                     }
                     .with_lease(Arc::clone(&lease))
                     .with_after_seq_observer(Arc::clone(&after_seq_observer))

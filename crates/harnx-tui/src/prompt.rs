@@ -151,6 +151,7 @@ impl Tui {
             initial_resume_count: 0,
             max_resume: None,
             pending_async_context: None,
+            working_dir: None,
         };
 
         harnx_runtime::run_agent_loop(&loop_ctx, input).await

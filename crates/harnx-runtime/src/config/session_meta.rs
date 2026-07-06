@@ -23,14 +23,15 @@ pub struct PickerContext {
     pub current_remote: Option<String>,
 }
 
-pub fn build_picker_context() -> PickerContext {
+pub fn build_picker_context(working_dir: Option<&Path>) -> PickerContext {
     let current_branch = crate::utils::session_name::git_branch();
 
     PickerContext {
         current_terminal_id: crate::utils::terminal_session_id(),
         current_branch: (!current_branch.is_empty()).then_some(current_branch),
-        current_dir: std::env::current_dir()
-            .ok()
+        current_dir: working_dir
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
         current_remote: crate::utils::session_name::git_remote(),
@@ -538,7 +539,7 @@ Some other content here"#;
     }
     #[test]
     fn test_build_picker_context_no_panic() {
-        let _ = build_picker_context();
+        let _ = build_picker_context(None);
     }
 }
 

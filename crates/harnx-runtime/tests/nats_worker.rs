@@ -267,6 +267,7 @@ async fn run_worker_turn(params: WorkerTurnParams<'_>) -> Result<()> {
         header_insert_observer: None,
         session_index: None,
         on_tool_round: None,
+        working_dir: None,
     })
     .await
 }
@@ -1067,6 +1068,7 @@ async fn resume_aborts_when_tail_fence_exceeds_held_revision() -> Result<()> {
             header_insert_observer: None,
             session_index: None,
             on_tool_round: None,
+            working_dir: None,
         }
         .with_lease(lease),
     )

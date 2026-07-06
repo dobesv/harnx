@@ -17,7 +17,6 @@ mod test_regression_issue_68;
 
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::*;
-use harnx_hooks::{AsyncHookManager, PersistentHookManager};
 use std::{collections::HashMap, sync::Arc};
 
 use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, ToolEvent, UserEvent};
@@ -323,10 +322,8 @@ impl HarnxAgent {
         // loop. Detect from the configured agent name; local refs are unchanged.
         let remote_agent = parse_remote_agent(&self.agent_name);
 
-        let prompt_config: GlobalConfig = Arc::new(parking_lot::RwLock::new({
-            let shared_config = self.config.read();
-            shared_config.fork_session_scope()
-        }));
+        let prompt_config: GlobalConfig =
+            harnx_session::fork_prompt_config(&self.config.read().clone());
         // Local-agent setup (agent resolution + input building) only applies to
         // local refs. For remote thin-client mode the worker resolves the agent
         // and the input is the user's prompt text posted to the NATS log.
@@ -570,19 +567,13 @@ impl HarnxAgent {
         // `on_text_response` would re-emit the same final text and the
         // parent's transcript would render the assistant's reply twice.
 
-        let loop_ctx = harnx_runtime::AgentLoopContext {
-            config: prompt_config.clone(),
-            abort_signal: abort_signal.clone(),
-            async_manager: Arc::new(tokio::sync::Mutex::new(AsyncHookManager::default())),
-            persistent_manager: Arc::new(tokio::sync::Mutex::new(PersistentHookManager::default())),
-            call_fn: None,
-            on_tool_round: None,
-            on_text_response: None,
-            initial_with_embeddings: true,
-            initial_resume_count: 0,
-            max_resume: None,
-            pending_async_context: None,
-        };
+        let loop_ctx = harnx_session::build_context(
+            prompt_config.clone(),
+            None,
+            abort_signal.clone(),
+            None,
+            None,
+        );
 
         // Bridge cancel_notify → abort_signal for any caller that signals
         // via the notify without setting the signal directly (HarnxAgent::

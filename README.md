@@ -203,42 +203,16 @@ Harnx can spawn and manage local `llama-server` (from the [llama.cpp](https://gi
 See `example_config/clients/llama-server.yaml` for a configuration template.
 ### Local Server Capabilities
 
-Harnx includes a lightweight built-in HTTP server for easy deployment.
-
-```
-$ harnx --serve
-Chat Completions API: http://127.0.0.1:8000/v1/chat/completions
-Embeddings API:       http://127.0.0.1:8000/v1/embeddings
-Rerank API:           http://127.0.0.1:8000/v1/rerank
-LLM Playground:       http://127.0.0.1:8000/playground
-LLM Arena:            http://127.0.0.1:8000/arena?num=2
-```
-
-#### Proxy LLM APIs
-
-The LLM Arena is a web-based platform where you can compare different LLMs side-by-side. 
-
-Test with curl:
+Use standalone `harnx-serve` binary for HTTP deployment:
 
 ```sh
-curl -X POST -H "Content-Type: application/json" -d '{
-  "model":"claude:claude-3-5-sonnet-20240620",
-  "messages":[{"role":"user","content":"hello"}], 
-  "stream":true
-}' http://127.0.0.1:8000/v1/chat/completions
+$ harnx-serve --addr 127.0.0.1:8000
+Embeddings API:       http://127.0.0.1:8000/v1/embeddings
+Rerank API:           http://127.0.0.1:8000/v1/rerank
 ```
 
-#### LLM Playground
-
-A web application to interact with supported LLMs directly from your browser.
-
-<img width="1280" height="800" alt="playground" src="https://github.com/user-attachments/assets/a9cb2be7-56c3-4cd7-ac65-18d66524d705" />
-
-#### LLM Arena
-
-A web platform to compare different LLMs side-by-side.
-
-<img width="1280" height="800" alt="arena" src="https://github.com/user-attachments/assets/ecd3401f-334b-459c-9803-3d32cd0bec51" />
+Pass `--model <MODEL>`, `--dry-run`, or one or more `--mcp-root <PATH>` flags as needed.
+For interactive agent sessions, use AG-UI control plane exposed by `harnx-serve` under `/v1/agents`. See [crates/harnx-serve/README.md](crates/harnx-serve/README.md).
 
 ## Custom Themes
 

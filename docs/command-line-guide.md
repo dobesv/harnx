@@ -19,7 +19,6 @@ Options:
       --rag <RAG>                      Start a RAG
       --rebuild-rag                    Rebuild the RAG to sync document changes
       --macro <MACRO>                  Execute a macro
-      --serve [<ADDRESS>]              Serve the LLM API and WebAPP
   -t, --tool <TOOL>                    Use specific tools
   -f, --file <FILE>                    Include files, directories, or URLs
   -S, --no-stream                      Turn off stream mode
@@ -41,8 +40,8 @@ Options:
 harnx                                          # Enter the interactive TUI
 harnx Tell a joke                              # Generate response
 
-harnx --serve                                  # Run server
-harnx --serve 0.0.0.0:8080                     # Run server with addr
+harnx-serve                                    # Run server (standalone binary)
+harnx-serve --addr 0.0.0.0:8080                # Run server with addr
 
 harnx -m openai:gpt-4o                         # Select LLM
 
@@ -95,22 +94,21 @@ harnx -f https://example.com/page summarize
 
 ## Run Server
 
-Harnx comes with a built-in lightweight HTTP server.
+Use standalone `harnx-serve` binary for HTTP server mode.
 
-```
-$ harnx --serve
-Chat Completions API: http://127.0.0.1:8000/v1/chat/completions
+```sh
+harnx-serve --addr 127.0.0.1:8000
 Embeddings API:       http://127.0.0.1:8000/v1/embeddings
-LLM Playground:       http://127.0.0.1:8000/playground
-LLM Arena:            http://127.0.0.1:8000/arena?num=2
+Rerank API:           http://127.0.0.1:8000/v1/rerank
 ```
 
-Change the listening address:
+Common flags:
 
-```
-$ harnx --serve 0.0.0.0
-$ harnx --serve 8080
-$ harnx --serve 0.0.0.0:8080
+```sh
+harnx-serve --addr 0.0.0.0:8000
+harnx-serve --model claude:claude-3-5-sonnet-20240620
+harnx-serve --mcp-root /path/to/project --mcp-root /path/to/other/project
+harnx-serve --dry-run
 ```
 
 ## Inspect Agents and Sessions

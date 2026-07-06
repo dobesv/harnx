@@ -57,7 +57,7 @@ use crate::utils::{
     terminal_session_id,
 };
 
-pub fn new(config: &Config, name: &str) -> Result<Session> {
+pub fn new(config: &Config, name: &str, working_dir: Option<&std::path::Path>) -> Result<Session> {
     let agent = config.extract_agent();
     let session_id = if uuid::Uuid::parse_str(name)
         .ok()
@@ -72,8 +72,9 @@ pub fn new(config: &Config, name: &str) -> Result<Session> {
         id: name.to_string(),
         save_session: config.save_session,
         session_id: Some(session_id),
-        working_dir: std::env::current_dir()
-            .ok()
+        working_dir: working_dir
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
             .map(|path| path.to_string_lossy().into_owned()),
         git_branch: {
             let b = git_branch();
@@ -103,7 +104,7 @@ pub fn load(config: &Config, name: &str, path: &Path) -> Result<Session> {
         load_from_log(config, name, path, &content)?
     } else {
         // Old format: create a fresh session so we don't crash.
-        let mut session = new(config, name)?;
+        let mut session = new(config, name, None)?;
         apply_name_and_path(&mut session, name, path, config)?;
         session
     };
@@ -229,6 +230,7 @@ pub(crate) fn replay_log_entries_for_external(
                 if role == MessageRole::Tool {
                     anyhow::bail!(
                         "Invalid log entry in session {name}: Tool-role Message entries are                          no longer supported; use tool_calls/tool_results entries"
+
                     );
                 }
                 let mut message = Message::new(role, content).with_log_seq(seq);
@@ -1044,6 +1046,127 @@ pub fn add_assistant_text(
     Ok(())
 }
 
+#[cfg(test)]
+mod working_dir_tests {
+    use super::*;
+    use crate::tool::ToolCall;
+    use harnx_core::input::Input;
+    use harnx_core::message::{Message, MessageContent, MessageRole};
+    use harnx_core::session::SessionLogEntry;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn make_message(content: &str) -> Message {
+        Message {
+            role: MessageRole::User,
+            content: MessageContent::Text(content.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn new_uses_explicit_working_dir_when_provided() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("data").join("sessions")).unwrap();
+        fs::create_dir_all(root.path().join("state")).unwrap();
+        let config = Config {
+            sessions_dir_override: Some(root.path().join("sessions")),
+            ..Default::default()
+        };
+        fs::create_dir_all(config.sessions_dir()).unwrap();
+        let working_dir = root.path().join("repo-a");
+        fs::create_dir_all(&working_dir).unwrap();
+
+        let session = new(&config, "session-a", Some(&working_dir)).unwrap();
+        assert_eq!(
+            session.working_dir.as_deref(),
+            Some(working_dir.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn session_log_header_persists_distinct_working_dirs_per_session() {
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("data").join("sessions")).unwrap();
+        fs::create_dir_all(root.path().join("state")).unwrap();
+        let config = Config {
+            sessions_dir_override: Some(root.path().join("sessions")),
+            ..Default::default()
+        };
+        fs::create_dir_all(config.sessions_dir()).unwrap();
+        let working_dir_a = root.path().join("repo-a");
+        let working_dir_b = root.path().join("repo-b");
+        fs::create_dir_all(&working_dir_a).unwrap();
+        fs::create_dir_all(&working_dir_b).unwrap();
+
+        let mut session_a = new(&config, "session-a", Some(&working_dir_a)).unwrap();
+        session_a.messages.push(make_message("hello from a"));
+        add_tool_calls(
+            &mut session_a,
+            &Input::new(
+                "".to_string(),
+                ("".to_string(), vec![]),
+                config.extract_agent().into_config(),
+            ),
+            "out",
+            None,
+            &[ToolCall::new(
+                "noop".to_string(),
+                serde_json::json!({}),
+                None,
+                None,
+            )],
+        )
+        .unwrap();
+        save(
+            &mut session_a,
+            "session-a",
+            &config.session_file("session-a"),
+            false,
+        )
+        .unwrap();
+        let log_a = fs::read_to_string(config.session_file("session-a")).unwrap();
+
+        let mut session_b = new(&config, "session-b", Some(&working_dir_b)).unwrap();
+        session_b.messages.push(make_message("hello from b"));
+        save(
+            &mut session_b,
+            "session-b",
+            &config.session_file("session-b"),
+            false,
+        )
+        .unwrap();
+        let log_b = fs::read_to_string(config.session_file("session-b")).unwrap();
+
+        let header_a =
+            serde_yaml::from_str::<SessionLogEntry>(log_a.split("\n---\n").next().unwrap())
+                .unwrap();
+        let header_b =
+            serde_yaml::from_str::<SessionLogEntry>(log_b.split("\n---\n").next().unwrap())
+                .unwrap();
+
+        match header_a {
+            SessionLogEntry::Header { working_dir, .. } => {
+                assert_eq!(
+                    working_dir.as_deref(),
+                    Some(working_dir_a.to_str().unwrap())
+                );
+            }
+            other => panic!("expected header entry, got {other:?}"),
+        }
+        match header_b {
+            SessionLogEntry::Header { working_dir, .. } => {
+                assert_eq!(
+                    working_dir.as_deref(),
+                    Some(working_dir_b.to_str().unwrap())
+                );
+            }
+            other => panic!("expected header entry, got {other:?}"),
+        }
+        assert_ne!(working_dir_a, working_dir_b);
+    }
+}
+
 /// Record that the LLM issued tool calls.  Called BEFORE the tools
 /// actually execute, so the transcript captures what was requested
 /// even if the process is interrupted mid-round.  Writes a
@@ -1457,7 +1580,7 @@ mod tests {
     use super::*;
 
     fn test_session() -> Session {
-        new(&Config::default(), "test").unwrap()
+        new(&Config::default(), "test", None).unwrap()
     }
 
     fn message_view(messages: &[Message]) -> Vec<(MessageRole, String)> {

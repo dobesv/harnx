@@ -7,6 +7,7 @@ members = [
     "crates/harnx-engine",
     "crates/harnx-acp",
     "crates/harnx-acp-server",
+    "crates/harnx-session",
     "crates/harnx-aws-creds",
     "crates/harnx-k8s-creds",
     "crates/harnx-fetch",
@@ -154,6 +155,7 @@ syntect = { version = "5.0.0", features = ["parsing", "regex-onig", "plist-load"
 arboard = { version = "3.3.0", default-features = false }
 harnx-acp = { path = "crates/harnx-acp" }
 harnx-acp-server = { path = "crates/harnx-acp-server" }
+harnx-session = { path = "crates/harnx-session" }
 minijinja = { version = "2.21.0", default-features = false, features = ["builtins", "debug", "serde"] }
 harnx-mcp-history = { path = "crates/harnx-mcp-history" }
 harnx-sandbox-common = { path = "crates/harnx-sandbox-common" }

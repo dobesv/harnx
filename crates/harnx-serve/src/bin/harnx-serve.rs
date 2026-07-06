@@ -3,7 +3,7 @@
 //! crossterm UI, or agent-client-protocol) than the full `harnx` CLI.
 //!
 //! All advanced features (agents, sessions, macros, dry-run echo, interactive
-//! model selection) remain available through the primary `harnx --serve` path.
+//! model selection) remain available through this `harnx-serve` binary.
 
 use anyhow::{Context, Result};
 use clap::Parser;

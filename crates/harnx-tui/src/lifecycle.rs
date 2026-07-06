@@ -271,7 +271,7 @@ impl Tui {
                 (config.read().list_sessions_with_meta(), None)
             };
 
-            let ctx = build_picker_context();
+            let ctx = build_picker_context(None);
             let sorted = sort_sessions_for_picker(sessions, &ctx);
             // Always show picker when agent active but no session — even empty list
             // because picker now always has a "New session" first item
