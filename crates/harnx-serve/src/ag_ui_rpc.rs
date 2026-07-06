@@ -415,105 +415,19 @@ fn json_rpc_response(status: StatusCode, data: Value) -> anyhow::Result<AppRespo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_actor::{SessionKey, SessionRegistry};
+    use crate::{
+        session_actor::{SessionKey, SessionRegistry},
+        test_support::TestConfigSandbox,
+    };
     use bytes::Bytes;
     use harnx_runtime::{client::TestStateGuard, AgentCallFn};
     use http_body_util::BodyExt;
     use serde_json::json;
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::sync::Arc;
     use tokio::{
         sync::Notify,
         time::{sleep, Duration},
     };
-
-    struct TestConfigSandbox {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        root: PathBuf,
-        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl TestConfigSandbox {
-        fn new() -> Self {
-            let lock = crate::session_actor::TEST_CONFIG_DIR_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let root = unique_test_config_dir();
-            fs::create_dir_all(root.join("clients")).expect("create clients dir");
-            fs::create_dir_all(root.join("agents")).expect("create agents dir");
-            fs::create_dir_all(root.join("data")).expect("create data dir");
-            fs::create_dir_all(root.join("state")).expect("create state dir");
-            fs::write(
-                root.join("config.yaml"),
-                "model: openai:gpt-4o
-save_session: true
-",
-            )
-            .expect("write config");
-            fs::write(
-                root.join("clients/openai.yaml"),
-                "type: openai-compatible
-api_base: https://example.invalid/v1
-api_key: test-key
-models:
-  - name: gpt-4o
-",
-            )
-            .expect("write client cfg");
-            let vars = set_test_env_vars(&root);
-            Self {
-                _lock: lock,
-                root,
-                vars,
-            }
-        }
-
-        fn write_agent(&self, name: &str, prompt: &str) {
-            let body = format!("---\nmodel: openai:gpt-4o\n---\n{prompt}\n");
-            fs::write(self.root.join("agents").join(format!("{name}.md")), body)
-                .expect("write agent prompt");
-        }
-    }
-
-    impl Drop for TestConfigSandbox {
-        fn drop(&mut self) {
-            for (key, prev) in self.vars.iter().rev() {
-                match prev {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn unique_test_config_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_nanos();
-        std::env::temp_dir().join(format!("harnx-serve-rpc-tests-{nanos}"))
-    }
-
-    fn set_test_env_vars(
-        root: &std::path::Path,
-    ) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
-        let vars = [
-            ("HARNX_CONFIG_DIR", root.as_os_str().to_os_string()),
-            ("HARNX_DATA_DIR", root.join("data").into_os_string()),
-            ("HARNX_STATE_DIR", root.join("state").into_os_string()),
-        ];
-        let mut prev = Vec::new();
-        for (key, value) in vars {
-            prev.push((key, std::env::var_os(key)));
-            std::env::set_var(key, value);
-        }
-        prev
-    }
 
     fn registry_with_call_fn(call_fn: AgentCallFn) -> SessionRegistry {
         SessionRegistry::new_for_tests(

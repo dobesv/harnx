@@ -1,12 +1,16 @@
 use harnx_runtime::config::{Config, WorkingMode};
 use std::{
     fs,
-    path::PathBuf,
-    sync::{LazyLock, Mutex},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        LazyLock, Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 static TEST_CONFIG_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static TEST_CONFIG_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct TestConfigSandbox {
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -23,7 +27,7 @@ impl TestConfigSandbox {
         let lock = TEST_CONFIG_DIR_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let root = unique_test_config_dir();
+        let root = unique_test_config_dir("test-support");
         let data_dir = root.join("data");
         let state_dir = root.join("state");
 
@@ -53,6 +57,9 @@ impl TestConfigSandbox {
             ("HARNX_CONFIG_DIR", std::env::var_os("HARNX_CONFIG_DIR")),
             ("HARNX_DATA_DIR", std::env::var_os("HARNX_DATA_DIR")),
             ("HARNX_STATE_DIR", std::env::var_os("HARNX_STATE_DIR")),
+            // Saved so the `remove_var` below is restored on drop rather than
+            // leaking the deletion to the rest of the process.
+            ("HARNX_CONFIG_FILE", std::env::var_os("HARNX_CONFIG_FILE")),
         ];
         unsafe {
             std::env::set_var("HARNX_CONFIG_DIR", &root);
@@ -105,13 +112,30 @@ impl Drop for TestConfigSandbox {
     }
 }
 
-fn unique_test_config_dir() -> PathBuf {
+pub fn unique_test_config_dir(scope: &str) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time after unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "harnx-serve-test-support-{}-{timestamp}",
+    let counter = TEST_CONFIG_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    canonicalize_for_env(std::env::temp_dir().join(format!(
+        "harnx-serve-{scope}-{}-{timestamp}-{counter}",
         std::process::id()
-    ))
+    )))
+}
+
+fn canonicalize_for_env(path: PathBuf) -> PathBuf {
+    path.parent()
+        .and_then(canonicalize_existing_dir)
+        .map(|parent| {
+            parent.join(
+                path.file_name()
+                    .expect("temp dir path should include final component"),
+            )
+        })
+        .unwrap_or(path)
+}
+
+fn canonicalize_existing_dir(path: &Path) -> Option<PathBuf> {
+    fs::canonicalize(path).ok()
 }
