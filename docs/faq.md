@@ -22,6 +22,23 @@ Some models have built-in web search capabilities (e.g., Perplexity, OpenRouter 
 
 Use the `web_search` tool to give your LLM web search capabilities through tool use.
 
+## Why does my MCP server say its API key is missing (even though it's in `.env`)?
+
+If an MCP server — e.g. the Exa web-search server run via `npx` — reports a missing or empty API key even though you set it in `~/.local/share/harnx/.env`, the cause is almost always the **sandbox**. When `npx`/`node` is wrapped by a [harnx sandbox](sandbox-run.md), the server launches with a scrubbed environment, so the key never reaches it.
+
+Forward the specific variable through the sandbox from the server's config:
+
+```yaml
+# mcp_servers/exa.yaml
+env:
+  HARNX_BASH_ENV_PASSTHROUGH: EXA_API_KEY
+```
+
+Two related gotchas:
+
+- **`env:` values are not `$VAR`-expanded.** `EXA_API_KEY: "$EXA_API_KEY"` sends the literal string `$EXA_API_KEY`, not its value — use `HARNX_BASH_ENV_PASSTHROUGH` (above) to forward the real value instead.
+- **The error text tells you which problem you have.** "API key must be provided" means an *empty* value reached the server (stripped, or never set); "Invalid API key" means a *wrong* value reached it (e.g. the un-expanded literal `$EXA_API_KEY`).
+
 ## Why compress sessions?
 
 The Chat API is stateless, so the full conversation history is sent with every request. This means history grows rapidly, causing two problems:

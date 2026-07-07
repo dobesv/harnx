@@ -126,6 +126,19 @@ roots:                    # Directories the server can access
 description: "Filesystem access tools"
 ```
 
+> **Passing secrets to MCP servers.** Two things commonly trip people up:
+>
+> - **`env:` values are literal — they are *not* shell-expanded.** Unlike `roots:` above (and the NATS `token:` below), `$VAR`/`${VAR}` in an `env:` value is passed through verbatim rather than substituted. Writing `API_KEY: "$API_KEY"` sends the literal string `$API_KEY` to the server.
+> - **A sandbox wrapper strips the child environment.** If you've wrapped `npx`/`node` with a [harnx sandbox](sandbox-run.md), the server starts with a scrubbed environment, so neither an `env:` value nor an inherited host variable reaches it by default. Forward the specific variable with `HARNX_BASH_ENV_PASSTHROUGH` instead — the sandbox reads it and passes the host value through:
+>
+>   ```yaml
+>   # Server needs EXA_API_KEY, and npx is sandbox-wrapped:
+>   env:
+>     HARNX_BASH_ENV_PASSTHROUGH: EXA_API_KEY   # forwards the host's EXA_API_KEY
+>   ```
+>
+>   Set the actual secret (`EXA_API_KEY=…`) in `~/.local/share/harnx/.env`.
+
 ## ACP Servers (`acp_servers/`)
 
 Agent Client Protocol (ACP) servers allow Harnx to delegate tasks to other agents.
