@@ -216,6 +216,63 @@ fn history_json(config: &Config, agent: &str, session: &str) -> Value {
         .into()
 }
 
+fn is_content_event(event: &Value) -> bool {
+    matches!(
+        event["type"].as_str(),
+        Some(
+            "TEXT_MESSAGE_START"
+                | "TEXT_MESSAGE_CONTENT"
+                | "TEXT_MESSAGE_END"
+                | "THINKING_START"
+                | "THINKING_TEXT_MESSAGE_START"
+                | "THINKING_TEXT_MESSAGE_CONTENT"
+                | "THINKING_TEXT_MESSAGE_END"
+                | "THINKING_END"
+                | "TOOL_CALL_START"
+                | "TOOL_CALL_ARGS"
+                | "TOOL_CALL_END"
+                | "TOOL_CALL_RESULT"
+                | "STEP_STARTED"
+                | "STEP_FINISHED"
+        )
+    )
+}
+
+fn has_content_event(read: &SseRead) -> bool {
+    read.events.iter().any(is_content_event)
+}
+
+fn has_real_run_finished(read: &SseRead) -> bool {
+    let mut seen_content = false;
+    for event in &read.events {
+        if matches!(
+            event["type"].as_str(),
+            Some(
+                "TEXT_MESSAGE_START"
+                    | "TEXT_MESSAGE_CONTENT"
+                    | "TEXT_MESSAGE_END"
+                    | "THINKING_START"
+                    | "THINKING_TEXT_MESSAGE_START"
+                    | "THINKING_TEXT_MESSAGE_CONTENT"
+                    | "THINKING_TEXT_MESSAGE_END"
+                    | "THINKING_END"
+                    | "TOOL_CALL_START"
+                    | "TOOL_CALL_ARGS"
+                    | "TOOL_CALL_END"
+                    | "TOOL_CALL_RESULT"
+                    | "STEP_STARTED"
+                    | "STEP_FINISHED"
+            )
+        ) {
+            seen_content = true;
+        }
+        if seen_content && event["type"] == "RUN_FINISHED" {
+            return true;
+        }
+    }
+    false
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_success_criterion_1_sse_endpoint_returns_messages_snapshot_and_events() {
     let _guard = TestStateGuard::new(None).await;
@@ -239,9 +296,7 @@ async fn e2e_success_criterion_1_sse_endpoint_returns_messages_snapshot_and_even
     let response = open_sse(&config, &registry, "plain", "criteria-1", json!([])).await;
     let sse_task = tokio::spawn(async move {
         read_sse_until(response, Duration::from_secs(10), |read| {
-            read.events
-                .iter()
-                .any(|event| event["type"] == "RUN_FINISHED")
+            has_real_run_finished(read)
         })
         .await
     });
@@ -258,7 +313,7 @@ async fn e2e_success_criterion_1_sse_endpoint_returns_messages_snapshot_and_even
     assert!(prompt["result"]["run_id"].as_str().is_some());
 
     let read = sse_task.await.expect("sse task");
-    assert_eq!(read.events[0]["type"], "MESSAGES_SNAPSHOT");
+    assert_eq!(read.events[0]["type"], "RUN_STARTED");
     assert!(read
         .events
         .iter()
@@ -292,9 +347,7 @@ async fn e2e_success_criterion_2_rpc_prompt_starts_run_and_injects_prompt() {
     let response = open_sse(&config, &registry, "plain", "criteria-2", json!([])).await;
     let sse_task = tokio::spawn(async move {
         read_sse_until(response, Duration::from_secs(10), |read| {
-            read.events
-                .iter()
-                .any(|event| event["type"] == "RUN_FINISHED")
+            has_real_run_finished(read)
         })
         .await
     });
@@ -404,12 +457,7 @@ async fn e2e_success_criterion_3_prompt_while_running_injects_mid_loop() {
     let response = open_sse(&config, &registry, "plain", "criteria-3", json!([])).await;
     let sse_task = tokio::spawn(async move {
         read_sse_until(response, Duration::from_secs(10), |read| {
-            read.events.iter().any(|event| {
-                matches!(
-                    event["type"].as_str(),
-                    Some("RUN_FINISHED") | Some("RUN_ERROR")
-                )
-            })
+            has_real_run_finished(read)
         })
         .await
     });
@@ -500,9 +548,7 @@ async fn e2e_success_sse_stream_includes_thinking_events_before_text() {
     let response = open_sse(&config, &registry, "plain", "thinking-order", json!([])).await;
     let sse_task = tokio::spawn(async move {
         read_sse_until(response, Duration::from_secs(10), |read| {
-            read.events
-                .iter()
-                .any(|event| event["type"] == "RUN_FINISHED")
+            has_real_run_finished(read)
         })
         .await
     });
@@ -708,10 +754,7 @@ async fn e2e_success_criterion_10_sse_stream_includes_tool_call_events() {
                 .events
                 .iter()
                 .any(|event| event["type"] == "TOOL_CALL_RESULT");
-            let has_finished = read
-                .events
-                .iter()
-                .any(|event| event["type"] == "RUN_FINISHED");
+            let has_finished = has_real_run_finished(read);
             has_start && has_args && has_end && has_result && has_finished
         })
         .await;
@@ -825,12 +868,7 @@ async fn e2e_success_criterion_4_cancel_running_persists_partial_and_returns_idl
     let response = open_sse(&config, &registry, "plain", "criteria-4", json!([])).await;
     let sse_task = tokio::spawn(async move {
         read_sse_until(response, Duration::from_secs(10), |read| {
-            read.events.iter().any(|event| {
-                matches!(
-                    event["type"].as_str(),
-                    Some("RUN_FINISHED") | Some("RUN_ERROR")
-                )
-            })
+            has_content_event(read) && read.events.iter().any(|event| event["type"] == "RUN_ERROR")
         })
         .await
     });
@@ -869,7 +907,7 @@ async fn e2e_success_criterion_4_cancel_running_persists_partial_and_returns_idl
     let read = sse_task.await.expect("sse task");
     // Assert cancel path emits RUN_ERROR (not RUN_FINISHED)
     assert!(
-        read.events.iter().any(|event| event["type"] == "RUN_ERROR"),
+        has_content_event(&read) && read.events.iter().any(|event| event["type"] == "RUN_ERROR"),
         "cancel should emit RUN_ERROR"
     );
 
@@ -917,9 +955,7 @@ async fn e2e_success_criterion_5_history_snapshot_returns_persisted_messages() {
     let response = open_sse(&config, &registry, "plain", "criteria-5", json!([])).await;
     let sse_task = tokio::spawn(async move {
         read_sse_until(response, Duration::from_secs(10), |read| {
-            read.events
-                .iter()
-                .any(|event| event["type"] == "RUN_FINISHED")
+            has_real_run_finished(read)
         })
         .await
     });
@@ -988,17 +1024,13 @@ async fn e2e_success_criterion_6_two_sse_subscribers_receive_same_events() {
     let response_b = open_sse(&config, &registry, "plain", "criteria-6", json!([])).await;
     let task_a = tokio::spawn(async move {
         read_sse_until(response_a, Duration::from_secs(10), |read| {
-            read.events
-                .iter()
-                .any(|event| event["type"] == "RUN_FINISHED")
+            has_real_run_finished(read)
         })
         .await
     });
     let task_b = tokio::spawn(async move {
         read_sse_until(response_b, Duration::from_secs(10), |read| {
-            read.events
-                .iter()
-                .any(|event| event["type"] == "RUN_FINISHED")
+            has_real_run_finished(read)
         })
         .await
     });
