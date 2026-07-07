@@ -100,6 +100,7 @@ exec harnx-sandbox-run \
   --extra-rwx '$NODE_PROJECT_ROOT' \
   --extra-rwx '$GIT_COMMON_DIR' \
   --env 'AWS_PROFILE=' \
+  --env NODE_OPTIONS \
   --hook claude-command-persistent harnx-aws-creds --profile my-profile \; \
   -- "$tool" "$@"
 ```
