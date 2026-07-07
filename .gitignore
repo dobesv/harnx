@@ -5,3 +5,4 @@
 /.env
 *.log*.snap.new
 target-local/
+.pnpm-store/

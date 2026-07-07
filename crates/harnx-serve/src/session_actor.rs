@@ -19,13 +19,13 @@ use harnx_core::{
     tool::ToolResult,
 };
 use harnx_runtime::{
-    config::{self, Config, GlobalConfig, WorkingMode},
+    config::{self, Config, GlobalConfig},
     run_agent_loop, AgentCallFn, AgentLoopContext, OnToolRoundFn,
 };
 use std::{
     collections::VecDeque,
     hash::{Hash, Hasher},
-    sync::{Arc, LazyLock, Mutex as StdMutex},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -639,123 +639,31 @@ fn base_event() -> BaseEvent {
     }
 }
 
-pub(crate) static TEST_CONFIG_DIR_LOCK: LazyLock<StdMutex<()>> =
-    LazyLock::new(|| StdMutex::new(()));
-
+// Loads the base test config directly from `$HARNX_CONFIG_DIR/config.yaml`.
+//
+// This deliberately does NOT touch the process-global current directory and
+// does NOT acquire the sandbox env lock. `load_from_file` takes an explicit
+// path, so there is no shared mutable state to guard, and acquiring the lock
+// here would self-deadlock: callers routinely hold a live `TestConfigSandbox`
+// (which owns the same env lock guard for its whole lifetime) while calling
+// this function.
 pub(crate) fn load_base_config_for_tests() -> Config {
-    let prev = std::env::current_dir().expect("cwd");
-    let root = std::env::var("HARNX_CONFIG_DIR").expect("HARNX_CONFIG_DIR set");
-    std::env::set_current_dir(&root).expect("switch cwd");
-    let result = futures::executor::block_on(Config::init(WorkingMode::Cmd, false, vec![]));
-    std::env::set_current_dir(prev).expect("restore cwd");
-    result.expect("load config")
+    let root = std::env::var_os("HARNX_CONFIG_DIR").expect("HARNX_CONFIG_DIR set");
+    let config_file = std::path::PathBuf::from(&root).join("config.yaml");
+    Config::load_from_file(&config_file).expect("load config")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestConfigSandbox;
     use harnx_core::{message::Message, tool::ToolCall};
     use serde_json::json;
     use std::{
         fs,
-        path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
     };
     use tokio::{sync::Notify, time::sleep};
-
-    struct TestConfigSandbox {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        root: PathBuf,
-        data_dir: PathBuf,
-        state_dir: PathBuf,
-        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl TestConfigSandbox {
-        fn new() -> Self {
-            let lock = TEST_CONFIG_DIR_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let root = unique_test_config_dir();
-            let data_dir = root.join("data");
-            let state_dir = root.join("state");
-
-            fs::create_dir_all(root.join("clients")).expect("create clients dir");
-            fs::create_dir_all(root.join("agents")).expect("create agents dir");
-            fs::create_dir_all(&data_dir).expect("create data dir");
-            fs::create_dir_all(&state_dir).expect("create state dir");
-            fs::write(
-                root.join("config.yaml"),
-                "model: openai:gpt-4o\nsave_session: true\n",
-            )
-            .expect("write config");
-            fs::write(
-                root.join("clients/openai.yaml"),
-                "type: openai-compatible\napi_base: https://example.invalid/v1\napi_key: test-key\nmodels:\n  - name: gpt-4o\n",
-            )
-            .expect("write openai client config");
-
-            let vars = vec![
-                set_env_var("HARNX_CONFIG_DIR", &root),
-                set_env_var("HARNX_DATA_DIR", &data_dir),
-                set_env_var("HARNX_STATE_DIR", &state_dir),
-                set_env_var("HOME", &root),
-            ];
-
-            Self {
-                _lock: lock,
-                root,
-                data_dir,
-                state_dir,
-                vars,
-            }
-        }
-
-        fn write_agent(&self, name: &str, prompt: &str) {
-            self.write_agent_with_front_matter(name, "model: openai:gpt-4o", prompt);
-        }
-
-        fn write_agent_with_front_matter(&self, name: &str, front_matter: &str, prompt: &str) {
-            let body = format!("---\n{front_matter}\n---\n{prompt}\n");
-            fs::write(self.root.join("agents").join(format!("{name}.md")), body)
-                .expect("write agent");
-        }
-    }
-
-    impl Drop for TestConfigSandbox {
-        fn drop(&mut self) {
-            for (key, value) in self.vars.iter().rev() {
-                match value {
-                    Some(previous) => std::env::set_var(key, previous),
-                    None => std::env::remove_var(key),
-                }
-            }
-            let _ = fs::remove_dir_all(&self.data_dir);
-            let _ = fs::remove_dir_all(&self.state_dir);
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn unique_test_config_dir() -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "harnx-serve-session-actor-test-{}-{timestamp}",
-            std::process::id()
-        ))
-    }
-
-    fn set_env_var(
-        key: &'static str,
-        path: &std::path::Path,
-    ) -> (&'static str, Option<std::ffi::OsString>) {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, path);
-        (key, previous)
-    }
 
     fn key(agent: &str, session: &str) -> SessionKey {
         SessionKey {

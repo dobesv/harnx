@@ -5,6 +5,9 @@
 pub mod ag_ui;
 pub mod ag_ui_rpc;
 pub mod session_actor;
+// Not `#[cfg(test)]`: the `tests/` integration crates link the library built
+// WITHOUT the `test` cfg, so gating this out would break their
+// `harnx_serve::test_support` imports. Kept public for cross-crate test reuse.
 pub mod test_support;
 
 use crate::ag_ui::{resolve_agent, AgUiError, AppResponse as AgUiAppResponse};
@@ -809,112 +812,8 @@ fn status_from_error(err: &anyhow::Error) -> Option<StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestConfigSandbox;
     use http::HeaderValue;
-    use std::{
-        fs,
-        path::PathBuf,
-        sync::{LazyLock, Mutex},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    static TEST_CONFIG_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct TestConfigSandbox {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        root: PathBuf,
-        data_dir: PathBuf,
-        state_dir: PathBuf,
-        vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl TestConfigSandbox {
-        fn new() -> Self {
-            let lock = TEST_CONFIG_ENV_LOCK.lock().expect("config env lock");
-            let root = unique_test_config_dir();
-            let data_dir = root.join("data");
-            let state_dir = root.join("state");
-            fs::create_dir_all(root.join("clients")).expect("create clients dir");
-            fs::create_dir_all(root.join("agents")).expect("create agents dir");
-            fs::create_dir_all(&data_dir).expect("create data dir");
-            fs::create_dir_all(&state_dir).expect("create state dir");
-            fs::write(
-                root.join("config.yaml"),
-                "model: openai:gpt-4o\nclients: []\n",
-            )
-            .expect("write config");
-            fs::write(
-                root.join("clients/openai.yaml"),
-                concat!(
-                    "type: openai\n",
-                    "api_key: sk-test\n",
-                    "models:\n",
-                    "  - name: gpt-4o\n",
-                    "    type: chat\n",
-                    "    max_input_tokens: 4096\n"
-                ),
-            )
-            .expect("write openai client");
-
-            let vars = vec![
-                ("HARNX_CONFIG_DIR", std::env::var_os("HARNX_CONFIG_DIR")),
-                ("HARNX_DATA_DIR", std::env::var_os("HARNX_DATA_DIR")),
-                ("HARNX_STATE_DIR", std::env::var_os("HARNX_STATE_DIR")),
-            ];
-            unsafe {
-                std::env::set_var("HARNX_CONFIG_DIR", &root);
-                std::env::set_var("HARNX_DATA_DIR", &data_dir);
-                std::env::set_var("HARNX_STATE_DIR", &state_dir);
-                std::env::remove_var("HARNX_CONFIG_FILE");
-            }
-
-            Self {
-                _lock: lock,
-                root,
-                data_dir,
-                state_dir,
-                vars,
-            }
-        }
-
-        fn config(&self) -> Config {
-            let prev = std::env::current_dir().expect("cwd");
-            std::env::set_current_dir(&self.root).expect("switch cwd");
-            let result = futures::executor::block_on(Config::init(WorkingMode::Cmd, false, vec![]));
-            std::env::set_current_dir(prev).expect("restore cwd");
-            result.expect("load config")
-        }
-
-        fn write_agent(&self, name: &str, prompt: &str) {
-            let body = format!("---\nmodel: openai:gpt-4o\n---\n{prompt}\n");
-            fs::write(self.root.join("agents").join(format!("{name}.md")), body)
-                .expect("write agent");
-        }
-    }
-
-    impl Drop for TestConfigSandbox {
-        fn drop(&mut self) {
-            for (key, previous) in &self.vars {
-                match previous {
-                    Some(value) => unsafe { std::env::set_var(key, value) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
-            }
-            let _ = fs::remove_dir_all(&self.data_dir);
-            let _ = fs::remove_dir_all(&self.state_dir);
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn unique_test_config_dir() -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "harnx-serve-lib-test-{}-{timestamp}",
-            std::process::id()
-        ))
-    }
 
     #[test]
     fn parse_agents_route_extracts_agent_and_session_segments() {

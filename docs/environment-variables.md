@@ -77,9 +77,13 @@ Harnx can load environment variables from a `.env` file located in the data dire
 
 ## Bash MCP Server Envs
 
-- **HARNX_BASH_ENV_PASSTHROUGH**: Comma-separated list of extra host env var names to pass through to child bash processes spawned by `harnx-mcp-bash`. Example: `HARNX_BASH_ENV_PASSTHROUGH=GITHUB_TOKEN,SSH_AUTH_SOCK`.
+These are honored by **both** `harnx-mcp-bash` (for `bash_exec` child processes) and `harnx-sandbox-run` — so they apply not only to the bash tool but to any MCP server launched through a sandbox-wrapped `npx`/`node` shim (e.g. the Exa server, whose environment would otherwise be scrubbed). The same shell-profile settings work for both.
+
+- **HARNX_BASH_ENV_PASSTHROUGH**: Comma-separated list of extra host env var names to forward into the sandbox (e.g. so the Exa MCP server receives `EXA_API_KEY`). Example: `HARNX_BASH_ENV_PASSTHROUGH=GITHUB_TOKEN,SSH_AUTH_SOCK`.
 - **HARNX_BASH_EXTRA_READABLE**: Colon-separated extra sandbox read-only paths.
+- **HARNX_BASH_EXTRA_WRITABLE**: Colon-separated extra sandbox writable paths.
 - **HARNX_BASH_EXTRA_EXEC**: Colon-separated extra sandbox executable paths.
+- **HARNX_BASH_EXTRA_RWX**: Colon-separated extra sandbox read/write/execute paths.
 
 ## Generic Envs
 

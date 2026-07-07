@@ -100,6 +100,7 @@ exec harnx-sandbox-run \
   --extra-rwx '$NODE_PROJECT_ROOT' \
   --extra-rwx '$GIT_COMMON_DIR' \
   --env 'AWS_PROFILE=' \
+  --env NODE_OPTIONS \
   --hook claude-command-persistent harnx-aws-creds --profile my-profile \; \
   -- "$tool" "$@"
 ```
@@ -291,6 +292,8 @@ These match the `harnx-mcp-bash` environment variables, so the same shell profil
 | `HARNX_BASH_ENV_PASSTHROUGH` | Comma-separated names | Extra host env var names to pass through |
 
 Paths support `~` expansion and project-root pseudo-variables. CLI flags and env vars both accumulate — they are not mutually exclusive.
+
+> **MCP servers that need a static API key.** When an MCP server is launched through a sandbox-wrapped shim (e.g. `npx exa-mcp-server`), its environment is scrubbed like any other sandboxed process — so a key set in `~/.local/share/harnx/.env`, or in the server's `env:` block, will not reach it. Unlike the GitHub/Atlassian token flows below (where the real secret is kept out of the sandbox and injected into outbound requests by a proxy hook), a server that authenticates by sending the key itself just needs the value forwarded: add `HARNX_BASH_ENV_PASSTHROUGH=EXA_API_KEY` (or `--env EXA_API_KEY`). See the [MCP server config guide](configuration-guide.md#mcp-servers-mcp_servers).
 
 > **Note:** The `<COMMAND>` must come after `--` or at the very end of the arguments.
 

@@ -117,7 +117,7 @@ indexmap = { version = "2.2.6", features = ["serde"] }
 hmac = "0.13.0"
 aws-config = { version = "1", features = ["sso"] }
 aws-credential-types = "1"
-aws-smithy-eventstream = "0.60.4"
+aws-smithy-eventstream = "0.61.0"
 kube = { version = "4.0.0", features = ["client", "config"] }
 k8s-openapi = { version = "0.28.0", features = ["v1_35"] }
 secrecy = { version = "0.10" }
