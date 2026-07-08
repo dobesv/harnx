@@ -559,7 +559,74 @@ mod tests {
         );
     }
 
-    /// Test: default client (capability=false) gets attachments_dir = None
+    /// Test: attachment refs survive build_messages and expand through prepare_completion_data.
+    #[test]
+    fn build_messages_preserves_attachment_refs_for_runtime_expansion() {
+        use crate::config::attachments::write_attachment;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let session_path = tmp.path().join("attach-session.yaml");
+        let attachments_dir = crate::config::attachments::attachments_dir_for(&session_path);
+        std::fs::create_dir_all(&attachments_dir).unwrap();
+        let data_url = "data:image/png;base64,aGVsbG8h";
+        let cid = write_attachment(&attachments_dir, data_url).unwrap();
+
+        let mut config = Config {
+            data: ConfigData {
+                stream: false,
+                save_session: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut sess = session::new(&config, "attach-session", None).unwrap();
+        sess.set_sessions_dir(tmp.path().to_path_buf());
+        sess.path = Some(session_path.to_string_lossy().into_owned());
+        config.session = Some(sess);
+
+        let agent_config = config.extract_agent().into_config();
+        let global_config: GlobalConfig = Arc::new(RwLock::new(config));
+        let mut input = Input::new(
+            "look at this".to_string(),
+            ("look at this".to_string(), vec![]),
+            agent_config,
+        );
+        input.with_session = true;
+        input.set_attachment_refs(vec![cid.clone()]);
+
+        let messages = build_messages(&input, &global_config).unwrap();
+        let user = messages.last().unwrap();
+        match &user.content {
+            MessageContent::Array(parts) => {
+                assert!(parts.iter().any(|part| matches!(part, harnx_core::message::MessageContentPart::ImageUrl { image_url } if image_url.url == cid)));
+            }
+            other => panic!("expected multipart user content, got {other:?}"),
+        }
+
+        let mock_client = crate::test_utils::MockClient::builder()
+            .expands_attachments_internally(false)
+            .build();
+        let data = prepare_completion_data(
+            &input,
+            &global_config,
+            mock_client.model(),
+            false,
+            &mock_client,
+        )
+        .unwrap();
+        let user = data.messages.last().unwrap();
+        match &user.content {
+            MessageContent::Array(parts) => {
+                assert!(
+                    !parts.is_empty(),
+                    "expanded content should remain multipart"
+                );
+            }
+            other => panic!("expected expanded multipart user content, got {other:?}"),
+        }
+    }
+
     #[test]
     fn prepare_completion_data_default_client_expands_base64() {
         use crate::test_utils::{MockClient, MockTurnBuilder};

@@ -23,6 +23,7 @@ pub struct Input {
     pub continue_output: Option<String>,
     pub regenerate: bool,
     pub medias: Vec<String>,
+    pub attachment_refs: Vec<String>,
     pub data_urls: HashMap<String, String>,
     pub tool_calls: Option<MessageContentToolCalls>,
     pub agent: AgentConfig,
@@ -65,6 +66,7 @@ impl Input {
             continue_output: None,
             regenerate: false,
             medias: Vec::new(),
+            attachment_refs: Vec::new(),
             data_urls: HashMap::new(),
             tool_calls: None,
             agent,
@@ -248,12 +250,13 @@ impl Input {
     }
 
     pub fn message_content(&self) -> MessageContent {
-        if self.medias.is_empty() {
+        if self.medias.is_empty() && self.attachment_refs.is_empty() {
             MessageContent::Text(self.text())
         } else {
             let mut list: Vec<MessageContentPart> = self
                 .medias
                 .iter()
+                .chain(self.attachment_refs.iter())
                 .cloned()
                 .map(|url| MessageContentPart::ImageUrl {
                     image_url: ImageUrl { url },
@@ -264,6 +267,10 @@ impl Input {
             }
             MessageContent::Array(list)
         }
+    }
+
+    pub fn set_attachment_refs(&mut self, attachment_refs: Vec<String>) {
+        self.attachment_refs = attachment_refs;
     }
 }
 

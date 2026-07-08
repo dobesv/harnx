@@ -23,8 +23,55 @@ use std::sync::Arc;
 pub type ToolCallEmitFn = dyn Fn(&ToolCall, &Value) + Send + Sync;
 
 /// Callback invoked when a PreToolUse hook returns `Ask { reason }`.
-/// Receives the tool name, parsed arguments, and optional reason.
-pub type ConfirmToolUseFn = dyn Fn(&str, &Value, Option<&str>) -> bool + Send + Sync;
+/// The callback gets full `ToolCall` identity plus parsed args so
+/// callers can approve, deny, or defer execution.
+pub type ConfirmToolUseFn =
+    dyn Fn(&ToolCall, &Value, Option<&str>) -> ToolUseConfirmation + Send + Sync;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolUseConfirmation {
+    Approve,
+    Deny { reason: Option<String> },
+    Defer,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeferredToolCall {
+    pub call: ToolCall,
+    pub arguments: Value,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ToolApprovalRequiredError {
+    tool_calls: Vec<ToolCall>,
+    deferred_calls: Vec<DeferredToolCall>,
+}
+
+impl ToolApprovalRequiredError {
+    pub fn new(tool_calls: Vec<ToolCall>, deferred_calls: Vec<DeferredToolCall>) -> Self {
+        Self {
+            tool_calls,
+            deferred_calls,
+        }
+    }
+
+    pub fn tool_calls(&self) -> &[ToolCall] {
+        &self.tool_calls
+    }
+
+    pub fn deferred_calls(&self) -> &[DeferredToolCall] {
+        &self.deferred_calls
+    }
+}
+
+impl std::fmt::Display for ToolApprovalRequiredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tool approval required")
+    }
+}
+
+impl std::error::Error for ToolApprovalRequiredError {}
 
 /// Async callback used to dispatch hook events. Returns a `HookOutcome`
 /// so callers can inspect `control` (Block/Ask/Continue) and any future
@@ -70,9 +117,8 @@ pub struct ToolEvalContext {
     /// `AgentEvent::Tool(ToolEvent::Blocked { .. })`.
     pub emit_tool_blocked_fn: Arc<ToolCallEmitFn>,
     /// Called when a PreToolUse hook returns `Ask { reason }` and the
-    /// user needs to confirm before the tool runs. Returns `true` if
-    /// the user allows the tool; `false` otherwise. Harnx's default
-    /// uses an `inquire`-based terminal prompt.
+    /// user needs to confirm before the tool runs. Harnx's default uses
+    /// an `inquire`-based terminal prompt and returns Approve/Deny.
     pub confirm_tool_use_fn: Arc<ConfirmToolUseFn>,
     /// Called to dispatch a hook event (PreToolUse, PostToolUse,
     /// PostToolUseFailure). Harnx's default captures `hooks.entries`,
@@ -91,20 +137,22 @@ struct ApprovedToolCall {
 
 pub async fn eval_tool_calls(
     ctx: &ToolEvalContext,
-    mut calls: Vec<ToolCall>,
+    calls: Vec<ToolCall>,
     abort_signal: &AbortSignal,
 ) -> Result<Vec<ToolResult>> {
     let mut output = vec![];
     if calls.is_empty() {
         return Ok(output);
     }
-    calls = ToolCall::dedup(calls);
+    let calls = ToolCall::dedup(calls);
     if calls.is_empty() {
         bail!("The request was aborted because an infinite loop of function calls was detected.")
     }
 
     let mut is_all_null = true;
     let mut approved = Vec::new();
+    let mut deferred = Vec::new();
+    let all_calls = calls.clone();
 
     for call in calls {
         if abort_signal.aborted() {
@@ -158,13 +206,28 @@ pub async fn eval_tool_calls(
         };
 
         if let HookResultControl::Ask { reason } = pre_outcome.control {
-            if !(ctx.confirm_tool_use_fn)(&call.name, &json_data, reason.as_deref()) {
-                let deny_reason = reason.unwrap_or_else(|| "Denied by user".to_string());
-                let blocked_result = json!({"error": deny_reason, "blocked_by_hook": true});
-                (ctx.emit_tool_blocked_fn)(&call, &blocked_result);
-                output.push(ToolResult::new(call, blocked_result));
-                is_all_null = false;
-                continue;
+            match (ctx.confirm_tool_use_fn)(&call, &json_data, reason.as_deref()) {
+                ToolUseConfirmation::Approve => {}
+                ToolUseConfirmation::Deny {
+                    reason: deny_reason,
+                } => {
+                    let deny_reason = deny_reason
+                        .or(reason.clone())
+                        .unwrap_or_else(|| "Denied by user".to_string());
+                    let blocked_result = json!({"error": deny_reason, "blocked_by_hook": true});
+                    (ctx.emit_tool_blocked_fn)(&call, &blocked_result);
+                    output.push(ToolResult::new(call, blocked_result));
+                    is_all_null = false;
+                    continue;
+                }
+                ToolUseConfirmation::Defer => {
+                    deferred.push(DeferredToolCall {
+                        call,
+                        arguments: json_data,
+                        reason: reason.clone(),
+                    });
+                    continue;
+                }
             }
         }
 
@@ -175,6 +238,10 @@ pub async fn eval_tool_calls(
             tool_input,
             tool_use_id,
         });
+    }
+
+    if !deferred.is_empty() {
+        return Err(ToolApprovalRequiredError::new(all_calls, deferred).into());
     }
 
     let dispatch_futures = approved.iter().map(|approved_call| {
@@ -386,6 +453,7 @@ mod tests {
         delay: Duration,
         result: Mutex<Option<Result<Value, ToolError>>>,
         panic_on_call: bool,
+        call_count: Option<Arc<tokio::sync::Mutex<usize>>>,
     }
 
     impl MockToolProvider {
@@ -395,6 +463,7 @@ mod tests {
                 delay,
                 result: Mutex::new(Some(Ok(result))),
                 panic_on_call: false,
+                call_count: None,
             }
         }
 
@@ -404,6 +473,7 @@ mod tests {
                 delay,
                 result: Mutex::new(Some(Err(error))),
                 panic_on_call: false,
+                call_count: None,
             }
         }
 
@@ -413,6 +483,22 @@ mod tests {
                 delay: Duration::ZERO,
                 result: Mutex::new(None),
                 panic_on_call: true,
+                call_count: None,
+            }
+        }
+
+        fn ok_with_call_count(
+            tool_name: &str,
+            delay: Duration,
+            result: Value,
+            call_count: Arc<tokio::sync::Mutex<usize>>,
+        ) -> Self {
+            Self {
+                tool_name: tool_name.to_string(),
+                delay,
+                result: Mutex::new(Some(Ok(result))),
+                panic_on_call: false,
+                call_count: Some(call_count),
             }
         }
     }
@@ -441,6 +527,9 @@ mod tests {
             Box::pin(async move {
                 assert_eq!(tool_name, self.tool_name);
                 assert!(!self.panic_on_call, "tool should not have been dispatched");
+                if let Some(call_count) = &self.call_count {
+                    *call_count.lock().await += 1;
+                }
                 tokio::time::sleep(self.delay).await;
                 self.result
                     .lock()
@@ -526,7 +615,7 @@ mod tests {
             emit_tool_call_fn: Arc::new(emit_tool_call),
             emit_tool_result_fn: Arc::new(emit_tool_result),
             emit_tool_blocked_fn: Arc::new(emit_tool_blocked),
-            confirm_tool_use_fn: Arc::new(|_, _, _| true),
+            confirm_tool_use_fn: Arc::new(|_, _, _| ToolUseConfirmation::Approve),
             dispatch_hook_fn: Arc::new(move |event| {
                 let outcome = dispatch_hook(event);
                 Box::pin(async move { outcome })
@@ -908,6 +997,56 @@ mod tests {
                 .expect("lock post tool inputs")
                 .as_slice(),
             &[json!({"injected": true})]
+        );
+    }
+
+    #[tokio::test]
+    async fn defer_returns_typed_interrupt_and_executes_no_tools() {
+        let call_count = Arc::new(tokio::sync::Mutex::new(0usize));
+        let provider = Arc::new(MockToolProvider::ok_with_call_count(
+            "tool_a",
+            Duration::ZERO,
+            json!({"ok": true}),
+            Arc::clone(&call_count),
+        ));
+        let mut ctx = test_context(vec![provider], |_| HookOutcome {
+            control: HookResultControl::Ask {
+                reason: Some("approval needed".to_string()),
+            },
+            result: HookResult::default(),
+        });
+        ctx.confirm_tool_use_fn = Arc::new(|call, _args, reason| {
+            assert_eq!(call.id.as_deref(), Some("call-1"));
+            assert_eq!(reason, Some("approval needed"));
+            ToolUseConfirmation::Defer
+        });
+        let abort_signal = create_abort_signal();
+        let err = eval_tool_calls(
+            &ctx,
+            vec![ToolCall::new(
+                "tool_a".to_string(),
+                json!({}),
+                Some("call-1".to_string()),
+                None,
+            )],
+            &abort_signal,
+        )
+        .await
+        .expect_err("defer should interrupt before dispatch");
+
+        let typed = err
+            .downcast_ref::<ToolApprovalRequiredError>()
+            .expect("typed approval interrupt");
+        assert_eq!(typed.deferred_calls().len(), 1);
+        assert_eq!(typed.deferred_calls()[0].call.id.as_deref(), Some("call-1"));
+        assert_eq!(
+            typed.deferred_calls()[0].reason.as_deref(),
+            Some("approval needed")
+        );
+        assert_eq!(
+            *call_count.lock().await,
+            0,
+            "no tool should execute when deferred"
         );
     }
 

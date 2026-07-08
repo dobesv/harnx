@@ -537,7 +537,9 @@ impl harnx_core::event::AgentEventSink for AgUiSink {
                     serde_json::to_value(entries).expect("plan entries should serialize"),
                 );
             }
-            AgentEvent::Status(_status) => {}
+            AgentEvent::Status(status) => {
+                self.emit_custom("status", json!({ "text": status.text }));
+            }
             AgentEvent::Session(SessionEvent::Generic { text }) => {
                 self.finish_turn();
                 self.emit_custom("session_generic", json!({ "text": text }));
@@ -677,13 +679,15 @@ fn frame_live_event(
                 *state = FirstRunState::Active;
                 None
             }
-            Event::RunFinished(_) => {
+            Event::RunFinished(event) => {
                 *state = FirstRunState::Complete;
-                Some(Bytes::from(frame_run_boundary_event(
-                    "RUN_FINISHED",
-                    thread_id,
-                    run_id,
-                )))
+                let body = serde_json::json!({
+                    "type": "RUN_FINISHED",
+                    "threadId": thread_id,
+                    "runId": run_id,
+                    "result": event.result,
+                });
+                Some(Bytes::from(format!("data: {body}\n\n")))
             }
             Event::RunError(err) => {
                 *state = FirstRunState::Errored;
@@ -697,13 +701,15 @@ fn frame_live_event(
         },
         FirstRunState::Active => match event {
             Event::RunStarted(_) => None,
-            Event::RunFinished(_) => {
+            Event::RunFinished(event) => {
                 *state = FirstRunState::Complete;
-                Some(Bytes::from(frame_run_boundary_event(
-                    "RUN_FINISHED",
-                    thread_id,
-                    run_id,
-                )))
+                let body = serde_json::json!({
+                    "type": "RUN_FINISHED",
+                    "threadId": thread_id,
+                    "runId": run_id,
+                    "result": event.result,
+                });
+                Some(Bytes::from(format!("data: {body}\n\n")))
             }
             Event::RunError(err) => {
                 *state = FirstRunState::Errored;

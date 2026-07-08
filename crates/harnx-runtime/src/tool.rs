@@ -16,7 +16,8 @@ pub use harnx_core::tool::{
     SwitchAgentData, ToolCall, ToolDeclaration, ToolResult, Tools,
 };
 pub use harnx_engine::tool::{
-    eval_tool_calls, ConfirmToolUseFn, DispatchHookFn, ToolCallEmitFn, ToolEvalContext,
+    eval_tool_calls, ConfirmToolUseFn, DeferredToolCall, DispatchHookFn, ToolApprovalRequiredError,
+    ToolCallEmitFn, ToolEvalContext, ToolUseConfirmation,
 };
 
 /// The LLM text completion that immediately preceded a tool round.
@@ -25,6 +26,37 @@ pub use harnx_engine::tool::{
 pub struct CompletionText<'a> {
     pub output: &'a str,
     pub thought: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolApprovalInterrupt {
+    pub tool_calls: Vec<ToolCall>,
+    pub deferred_calls: Vec<DeferredToolCall>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ToolRoundPersistence {
+    pub persist_tool_calls: bool,
+}
+
+impl ToolRoundPersistence {
+    pub const DEFAULT: Self = Self {
+        persist_tool_calls: true,
+    };
+
+    pub const REUSE_EXISTING_CALLS: Self = Self {
+        persist_tool_calls: false,
+    };
+}
+
+impl ToolApprovalInterrupt {
+    pub fn from_error(err: &anyhow::Error) -> Option<Self> {
+        err.downcast_ref::<ToolApprovalRequiredError>()
+            .map(|typed| Self {
+                tool_calls: typed.tool_calls().to_vec(),
+                deferred_calls: typed.deferred_calls().to_vec(),
+            })
+    }
 }
 
 /// Persist a tool round and execute its calls.  Writes the
@@ -44,9 +76,33 @@ pub async fn execute_tool_round(
     persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
     working_dir: Option<&std::path::Path>,
 ) -> Result<Vec<ToolResult>> {
+    execute_tool_round_with_persistence(
+        config,
+        input,
+        completion,
+        tool_calls,
+        abort_signal,
+        persistent_manager,
+        working_dir,
+        ToolRoundPersistence::DEFAULT,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_tool_round_with_persistence(
+    config: &GlobalConfig,
+    input: &Input,
+    completion: &CompletionText<'_>,
+    tool_calls: Vec<ToolCall>,
+    abort_signal: &AbortSignal,
+    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
+    working_dir: Option<&std::path::Path>,
+    persistence: ToolRoundPersistence,
+) -> Result<Vec<ToolResult>> {
     let dry_run = config.read().dry_run;
 
-    if !dry_run {
+    if persistence.persist_tool_calls && !dry_run {
         config.write().save_session_tool_calls(
             input,
             completion.output,
@@ -70,6 +126,9 @@ pub async fn execute_tool_round(
     let results = match eval_tool_calls(&eval_ctx, tool_calls.clone(), abort_signal).await {
         Ok(results) => results,
         Err(err) => {
+            if ToolApprovalInterrupt::from_error(&err).is_some() {
+                return Err(err);
+            }
             let fallback: Vec<ToolResult> = tool_calls
                 .into_iter()
                 .map(|call| {
@@ -482,8 +541,18 @@ fn print_tool_result_fallback(
     println!("{}", dimmed_text(&truncated));
 }
 
-fn default_confirm_tool_use(tool_name: &str, arguments: &Value, reason: Option<&str>) -> bool {
-    harnx_hooks::prompt::confirm_tool_use(tool_name, arguments, reason)
+fn default_confirm_tool_use(
+    call: &ToolCall,
+    arguments: &Value,
+    reason: Option<&str>,
+) -> ToolUseConfirmation {
+    if harnx_hooks::prompt::confirm_tool_use(&call.name, arguments, reason) {
+        ToolUseConfirmation::Approve
+    } else {
+        ToolUseConfirmation::Deny {
+            reason: reason.map(str::to_string),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -565,20 +634,23 @@ mod tests {
         ));
 
         // Default (no override): the inquire-based prompt is used. In a
-        // non-terminal test process it denies, so this returns false.
+        // non-terminal test process it denies, so this returns Deny.
         let ctx = build_tool_eval_context(&config, None, None, &persistent_manager, None);
-        assert!(!(ctx.confirm_tool_use_fn)(
-            "t",
-            &serde_json::json!({}),
-            None
+        let call = ToolCall::new("t".to_string(), serde_json::json!({}), None, None);
+        assert!(matches!(
+            (ctx.confirm_tool_use_fn)(&call, &serde_json::json!({}), None),
+            ToolUseConfirmation::Deny { .. }
         ));
 
         // With an override installed, the context routes confirmation through it.
         config
             .write()
-            .set_tui_confirm_tool_use(Some(Arc::new(|_, _, _| true)));
+            .set_tui_confirm_tool_use(Some(Arc::new(|_, _, _| ToolUseConfirmation::Approve)));
         let ctx = build_tool_eval_context(&config, None, None, &persistent_manager, None);
-        assert!((ctx.confirm_tool_use_fn)("t", &serde_json::json!({}), None));
+        assert!(matches!(
+            (ctx.confirm_tool_use_fn)(&call, &serde_json::json!({}), None),
+            ToolUseConfirmation::Approve
+        ));
     }
 
     #[test]

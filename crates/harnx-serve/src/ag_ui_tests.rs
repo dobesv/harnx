@@ -157,6 +157,32 @@ fn ag_ui_sink_emits_run_error_for_notice_error() {
 }
 
 #[test]
+fn ag_ui_sink_emits_custom_status_event() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let sink = super::AgUiSink::new(tx, message_id);
+
+    sink.emit(
+        AgentEvent::Status(harnx_core::event::StatusLine {
+            text: "working...".to_string(),
+        }),
+        None,
+    );
+
+    let event = rx.try_recv().expect("should receive status event");
+    match event {
+        Event::Custom(CustomEvent { base, name, value }) => {
+            assert_eq!(base.timestamp, None);
+            assert_eq!(base.raw_event, None);
+            assert_eq!(name, "status");
+            assert_eq!(value["text"].as_str(), Some("working..."));
+        }
+        _ => panic!("expected Custom event with name 'status', got: {:?}", event),
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn ag_ui_sink_emits_final_as_content_when_non_empty() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let message_id = MessageId::from(uuid::Uuid::new_v4());
@@ -1308,6 +1334,115 @@ async fn ag_ui_run_empty_messages_join_only_snapshot_no_new_run() {
     assert_eq!(events[0]["type"], "RUN_STARTED");
     assert_eq!(events[1]["type"], "MESSAGES_SNAPSHOT");
     assert_eq!(events[2]["type"], "RUN_FINISHED");
+}
+
+#[tokio::test]
+async fn ag_ui_run_promptless_join_returns_persisted_history_in_snapshot() {
+    // Issue #959: promptless join must return MESSAGES_SNAPSHOT with prior history.
+    // Previously Subscribe sent stale (empty) snapshot; now it refreshes first.
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "You are plain.");
+    let config = sandbox.config();
+    let session_id = "promptless-history-session";
+
+    // First run: user + assistant message to seed history
+    let first_body = json!({
+        "threadId": Uuid::new_v4(),
+        "runId": Uuid::new_v4(),
+        "messages": [{
+            "id": Uuid::new_v4(),
+            "role": "user",
+            "content": "first user prompt"
+        }]
+    });
+    let first_call_fn: AgentCallFn = Arc::new(|_input, _config, _abort| {
+        Box::pin(async {
+            let usage = CompletionTokenUsage::new(Some(1), Some(1), Some(0));
+            Ok(("first assistant reply".into(), None, vec![], usage))
+        })
+    });
+    let registry = ag_ui_test_registry(&config, Some(first_call_fn));
+    let first_response = ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        session_id,
+        &serde_json::to_vec(&first_body).unwrap(),
+        None,
+    )
+    .await
+    .expect("first run");
+    let _ = read_sse_events_until(first_response, |events| {
+        events
+            .iter()
+            .any(|event| event["type"].as_str() == Some("RUN_FINISHED"))
+    })
+    .await;
+
+    // Promptless join: empty messages array
+    let join_body = json!({
+        "threadId": Uuid::new_v4(),
+        "runId": Uuid::new_v4(),
+        "messages": []
+    });
+    let response = ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        session_id,
+        &serde_json::to_vec(&join_body).unwrap(),
+        None,
+    )
+    .await
+    .expect("promptless join");
+    let events = read_sse_events_until(response, |events| events.len() >= 3).await;
+
+    // Expected sequence: RUN_STARTED → MESSAGES_SNAPSHOT (with prior messages) → RUN_FINISHED
+    assert_eq!(events[0]["type"], "RUN_STARTED");
+    assert_eq!(events[1]["type"], "MESSAGES_SNAPSHOT");
+    assert_eq!(events[2]["type"], "RUN_FINISHED");
+
+    // Verify snapshot contains the seeded history (at minimum user + assistant)
+    let snapshot = &events[1]["messages"];
+    assert!(
+        snapshot.is_array(),
+        "MESSAGES_SNAPSHOT should have messages array"
+    );
+    let messages = snapshot.as_array().expect("messages array");
+    assert!(
+        messages.len() >= 2,
+        "snapshot should have at least user + assistant"
+    );
+
+    // Find user and assistant messages by role (history may include system/tool entries)
+    let user_msg = messages
+        .iter()
+        .find(|m| m["role"] == "user")
+        .expect("should find user message in snapshot");
+    assert_eq!(
+        user_msg["content"].as_str().unwrap_or(""),
+        "first user prompt"
+    );
+
+    let assistant_msg = messages
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("should find assistant message in snapshot");
+    // Content may be null for empty-text assistant messages in snapshot
+    let content = assistant_msg["content"].as_str().unwrap_or("");
+    assert!(
+        content == "first assistant reply"
+            || content.is_empty()
+            || assistant_msg["content"].is_null(),
+        "assistant content should match or be empty: got {:?}",
+        assistant_msg["content"]
+    );
+
+    // Synthetic RUN_FINISHED must NOT have 'result' key (per P1 spec)
+    assert!(
+        events[2].get("result").is_none(),
+        "promptless synthetic RUN_FINISHED must not have result key"
+    );
 }
 
 #[tokio::test]
