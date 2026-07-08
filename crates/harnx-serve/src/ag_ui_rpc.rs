@@ -487,7 +487,35 @@ async fn handle_cancel(
     )
 }
 
-fn parse_rpc_path(path: &str) -> Option<(&str, &str)> {
+fn percent_decode(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut iter = input.bytes();
+    while let Some(b) = iter.next() {
+        if b == b'%' {
+            let hi = iter.next().and_then(hex_val);
+            let lo = iter.next().and_then(hex_val);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                bytes.push(h << 4 | l);
+            } else {
+                bytes.push(b'%');
+            }
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_rpc_path(path: &str) -> Option<(String, String)> {
     let suffix = path.strip_prefix("/v1/agents/")?;
     let mut segments = suffix.split('/');
     let agent = segments.next()?;
@@ -501,7 +529,7 @@ fn parse_rpc_path(path: &str) -> Option<(&str, &str)> {
     if segments.next().is_some() {
         return None;
     }
-    Some((agent, session))
+    Some((percent_decode(agent), percent_decode(session)))
 }
 
 fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {

@@ -5,9 +5,13 @@ export const PendingContext = createContext<{
   setPendingText: (t: string | null) => void;
   statusText: string | null;
   setStatusText: (t: string | null) => void;
+  errorText: string | null;
+  setErrorText: (t: string | null) => void;
 }>({ 
   pendingText: null, 
   setPendingText: () => {},
   statusText: null,
-  setStatusText: () => {} 
+  setStatusText: () => {},
+  errorText: null,
+  setErrorText: () => {} 
 });

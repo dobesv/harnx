@@ -15,6 +15,7 @@ export interface ChatProviderProps {
 export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId, children }) => {
   const [pendingText, setPendingText] = useState<string | null>(null);
   const [statusText, setStatusText] = useState<string | null>(null);
+  const [errorText, setErrorText] = useState<string | null>(null);
 
   const attachments: AttachmentAdapter = useMemo(() => ({
     accept: 'image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain',
@@ -56,68 +57,76 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId
       const isResume = params.resume && Array.isArray(params.resume) && params.resume.length > 0;
       let attachment_refs: string[] = [];
       let text = "";
+      
+      setErrorText(null);
 
-      if (messages.length > 0) {
-        const lastMsg = messages[messages.length - 1];
-        if (lastMsg.role === "user" && !isResume) {
-          if (Array.isArray(lastMsg.content)) {
-             for (const part of lastMsg.content) {
-                if (part.type === "text") {
-                   text += part.text + "\n";
-                } else if (part.type === "image" || part.type === "file") {
-                   const val = part.source?.value || part.source?.url;
-                   if (typeof val === "string" && val.startsWith("cid:")) {
-                      attachment_refs.push(val);
-                   }
-                }
-             }
-             text = text.trim();
-          } else if (typeof lastMsg.content === "string") {
-             text = lastMsg.content;
-          }
+      try {
+        if (messages.length > 0) {
+          const lastMsg = messages[messages.length - 1];
+          if (lastMsg.role === "user" && !isResume) {
+            if (Array.isArray(lastMsg.content)) {
+               for (const part of lastMsg.content) {
+                  if (part.type === "text") {
+                     text += part.text + "\n";
+                  } else if (part.type === "image" || part.type === "file") {
+                     const val = part.source?.value || part.source?.url;
+                     if (typeof val === "string" && val.startsWith("cid:")) {
+                        attachment_refs.push(val);
+                     }
+                  }
+               }
+               text = text.trim();
+            } else if (typeof lastMsg.content === "string") {
+               text = lastMsg.content;
+            }
 
-          await prompt(agentName, sessionId, text, attachment_refs);
-          params.messages = messages.slice(0, -1);
-        }
-      }
-
-      if (isResume) {
-        const transformedResume = params.resume.map((r: any) => ({
-          interrupt_id: r.interruptId,
-          status: r.status === 'resolved' ? 'approved' : 'denied',
-          payload: {
-             approved: r.status === 'resolved',
-             reason: r.payload?.reason || null
-          }
-        }));
-        await prompt(agentName, sessionId, "", [], transformedResume);
-      }
-
-      return inner.runAgent(params, {
-        ...originalSub,
-        onEvent: (payload: any) => {
-          if (payload?.event?.type === 'CUSTOM' && payload.event.name === 'pending_message_consumed') {
-             setPendingText(null);
-          }
-          if (payload?.event?.type === 'CUSTOM' && payload.event.name === 'status') {
-             setStatusText(payload.event.value?.text || null);
-          }
-          if (originalSub.onEvent) {
-             return originalSub.onEvent(payload);
-          }
-        },
-        onCustomEvent: (payload: any) => {
-          if (payload?.event?.name === 'pending_message_consumed') {
-             setPendingText(null);
-          }
-          if (payload?.event?.name === 'status') {
-             setStatusText(payload.event.value?.text || null);
-          }
-          if (originalSub.onCustomEvent) {
-             return originalSub.onCustomEvent(payload);
+            await prompt(agentName, sessionId, text, attachment_refs);
+            params.messages = messages.slice(0, -1);
           }
         }
-      });
+
+        if (isResume) {
+          const transformedResume = params.resume.map((r: any) => ({
+            interrupt_id: r.interruptId,
+            status: r.status === 'resolved' ? 'approved' : 'denied',
+            payload: {
+               approved: r.status === 'resolved',
+               reason: r.payload?.reason || null
+            }
+          }));
+          await prompt(agentName, sessionId, "", [], transformedResume);
+        }
+
+        return inner.runAgent(params, {
+          ...originalSub,
+          onEvent: (payload: any) => {
+            if (payload?.event?.type === 'CUSTOM' && payload.event.name === 'pending_message_consumed') {
+               setPendingText(null);
+            }
+            if (payload?.event?.type === 'CUSTOM' && payload.event.name === 'status') {
+               setStatusText(payload.event.value?.text || null);
+            }
+            if (originalSub.onEvent) {
+               return originalSub.onEvent(payload);
+            }
+          },
+          onCustomEvent: (payload: any) => {
+            if (payload?.event?.name === 'pending_message_consumed') {
+               setPendingText(null);
+            }
+            if (payload?.event?.name === 'status') {
+               setStatusText(payload.event.value?.text || null);
+            }
+            if (originalSub.onCustomEvent) {
+               return originalSub.onCustomEvent(payload);
+            }
+          }
+        });
+      } catch (err: any) {
+        console.error("Failed to run agent", err);
+        setErrorText(err.message || 'Failed to send message');
+        throw err;
+      }
     };
     return proxy;
   }, [agentName, sessionId]);
@@ -125,7 +134,7 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId
   const runtime = useAgUiRuntime({ agent, adapters: { attachments } });
 
   return (
-    <PendingContext.Provider value={{ pendingText, setPendingText, statusText, setStatusText }}>
+    <PendingContext.Provider value={{ pendingText, setPendingText, statusText, setStatusText, errorText, setErrorText }}>
       <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
         {children}
       </AssistantRuntimeProvider>

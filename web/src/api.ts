@@ -3,7 +3,7 @@ import type { Agent, SessionRef, HistoryMessage, AgentDetail, JsonRpcResponse, C
 const API_BASE = '/v1';
 
 export async function listAgents(): Promise<Agent[]> {
-  const res = await fetch(`${API_BASE}/agents`);
+  const res = await fetch(`${API_BASE}/agents?role=assistant`);
   if (!res.ok) throw new Error(`Failed to list agents: ${res.statusText}`);
   const json = await res.json() as { data: Agent[] };
   return json.data;

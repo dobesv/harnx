@@ -4,12 +4,15 @@ import type { Agent, SessionRef } from './types';
 
 export function useAgentSessions() {
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [agentsError, setAgentsError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionRef[]>([]);
+  const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<string>('');
   const [selectedSessionId, setSelectedSessionId] = useState<string>('');
 
   const refreshSessions = useCallback(() => {
     if (!selectedAgent) return;
+    setSessionsError(null);
     listSessions(selectedAgent).then(data => {
       setSessions(data);
       setSelectedSessionId(prev => {
@@ -20,16 +23,23 @@ export function useAgentSessions() {
         }
         return prev;
       });
-    }).catch(console.error);
+    }).catch((err) => {
+      console.error(err);
+      setSessionsError(err.message || 'Failed to fetch sessions');
+    });
   }, [selectedAgent]);
 
   useEffect(() => {
+    setAgentsError(null);
     listAgents().then(data => {
       setAgents(data);
       if (data.length > 0) {
         setSelectedAgent(data[0].name);
       }
-    }).catch(console.error);
+    }).catch((err) => {
+      console.error(err);
+      setAgentsError(err.message || 'Failed to fetch agents');
+    });
   }, []);
 
   useEffect(() => {
@@ -42,7 +52,9 @@ export function useAgentSessions() {
 
   return {
     agents,
+    agentsError,
     sessions,
+    sessionsError,
     selectedAgent,
     selectedSessionId,
     refreshSessions,
