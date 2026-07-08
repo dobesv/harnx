@@ -78,7 +78,7 @@ pub struct Server {
     session_registry: SessionRegistry,
 }
 
-type RouteMatch<'a> = (&'a str, Option<&'a str>, AgentsRoute);
+type RouteMatch = (String, Option<String>, AgentsRoute);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentsRoute {
@@ -200,7 +200,7 @@ impl Server {
         } else if path == "/v1/models" {
             self.list_models()
         } else if path == "/v1/agents" {
-            self.list_agents()
+            self.list_agents(req.uri().query()).await
         } else if is_agent_rpc_path(path) {
             let persistence = if self.config.nats_servers.is_empty() {
                 PersistenceKind::Filesystem
@@ -246,12 +246,28 @@ impl Server {
         Ok(res)
     }
 
-    fn list_agents(&self) -> Result<AppResponse> {
-        let data = json!({ "data": self.agents });
+    async fn list_agents(&self, query: Option<&str>) -> Result<AppResponse> {
+        let agents = self.filter_agents_by_role(query).await?;
+        let data = json!({ "data": agents });
         let res = Response::builder()
             .header("Content-Type", "application/json; charset=utf-8")
             .body(Full::new(Bytes::from(data.to_string())).boxed())?;
         Ok(res)
+    }
+
+    async fn filter_agents_by_role(&self, query: Option<&str>) -> Result<Vec<AgentConfig>> {
+        if !query_requests_assistant_role(query) {
+            return Ok(self.agents.clone());
+        }
+
+        let assistant_names = harnx_runtime::config::agent::list_assistant_agents().await;
+        let assistants = self
+            .agents
+            .iter()
+            .filter(|agent| assistant_names.iter().any(|name| name == agent.name()))
+            .cloned()
+            .collect();
+        Ok(assistants)
     }
 
     async fn handle_agent_tree(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
@@ -263,19 +279,19 @@ impl Server {
         };
         let (agent_name, session_name, agent_route) = route;
 
-        resolve_agent(&self.config, agent_name).map_err(ag_ui_error_to_anyhow)?;
+        resolve_agent(&self.config, &agent_name).map_err(ag_ui_error_to_anyhow)?;
 
         match agent_route {
             AgentsRoute::Agent => {
                 match negotiate_agents_route(&method, req.headers(), agent_route)? {
-                    AgentsRepresentation::Html => self.agent_html_page(agent_name),
-                    AgentsRepresentation::Json => self.agent_json(agent_name),
+                    AgentsRepresentation::Html => self.agent_html_page(&agent_name),
+                    AgentsRepresentation::Json => self.agent_json(&agent_name),
                     AgentsRepresentation::AgUiSse => Err(anyhow!("Not Acceptable")),
                 }
             }
             AgentsRoute::Sessions => {
                 match negotiate_agents_route(&method, req.headers(), agent_route)? {
-                    AgentsRepresentation::Json => self.sessions_json(agent_name),
+                    AgentsRepresentation::Json => self.sessions_json(&agent_name),
                     AgentsRepresentation::Html | AgentsRepresentation::AgUiSse => {
                         Err(anyhow!("Not Acceptable"))
                     }
@@ -284,12 +300,14 @@ impl Server {
             AgentsRoute::Session => {
                 let session_name = session_name.expect("session route always has session name");
                 match negotiate_agents_route(&method, req.headers(), agent_route)? {
-                    AgentsRepresentation::Html => self.session_html_page(agent_name, session_name),
+                    AgentsRepresentation::Html => {
+                        self.session_html_page(&agent_name, &session_name)
+                    }
                     AgentsRepresentation::Json => {
-                        self.session_history_json(agent_name, session_name)
+                        self.session_history_json(&agent_name, &session_name)
                     }
                     AgentsRepresentation::AgUiSse => {
-                        self.ag_ui_run_route(req, agent_name, session_name).await
+                        self.ag_ui_run_route(req, &agent_name, &session_name).await
                     }
                 }
             }
@@ -368,8 +386,8 @@ impl Server {
         .ok() else {
             bail!("Bad Request");
         };
-        let scoped = agent_scoped_config(&self.config, agent)?;
-        let session_path = scoped.session_file(session);
+        let scoped = agent_scoped_config(&self.config, &agent)?;
+        let session_path = scoped.session_file(&session);
         let attachments_dir = session_path.with_extension("attachments");
 
         // Stream body with size limit to prevent OOM
@@ -732,18 +750,64 @@ fn ret_err<T: std::fmt::Display>(err: T) -> AppResponse {
         .unwrap()
 }
 
-fn parse_agents_route(path: &str) -> Option<RouteMatch<'_>> {
+fn percent_decode(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut iter = input.bytes();
+    while let Some(b) = iter.next() {
+        if b == b'%' {
+            let hi = iter.next().and_then(hex_val);
+            let lo = iter.next().and_then(hex_val);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                bytes.push(h << 4 | l);
+            } else {
+                bytes.push(b'%');
+            }
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_agents_route(path: &str) -> Option<RouteMatch> {
     let suffix = path.strip_prefix("/v1/agents/")?;
     let segments: Vec<_> = suffix
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
     match segments.as_slice() {
-        [agent] => Some((*agent, None, AgentsRoute::Agent)),
-        [agent, "sessions"] => Some((*agent, None, AgentsRoute::Sessions)),
-        [agent, "sessions", session] => Some((*agent, Some(*session), AgentsRoute::Session)),
+        [agent] => Some((percent_decode(agent), None, AgentsRoute::Agent)),
+        [agent, "sessions"] => Some((percent_decode(agent), None, AgentsRoute::Sessions)),
+        [agent, "sessions", session] => Some((
+            percent_decode(agent),
+            Some(percent_decode(session)),
+            AgentsRoute::Session,
+        )),
         _ => None,
     }
+}
+
+fn query_requests_assistant_role(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+
+    query.split('&').any(|pair| {
+        let mut parts = pair.splitn(2, '=');
+        matches!(
+            (parts.next(), parts.next()),
+            (Some("role"), Some("assistant"))
+        )
+    })
 }
 
 /// Matches exactly the JSON-RPC control-plane path shape `/v1/agents/{agent}/rpc`
@@ -759,6 +823,7 @@ fn is_agent_rpc_path(path: &str) -> bool {
         .filter(|segment| !segment.is_empty())
         .collect();
     matches!(segments.as_slice(), [_agent, "rpc"])
+        || matches!(segments.as_slice(), [_agent, "sessions", _, "rpc"])
 }
 
 fn is_session_attachments_path(path: &str) -> bool {
@@ -775,14 +840,16 @@ fn is_session_attachments_path(path: &str) -> bool {
     )
 }
 
-fn parse_session_attachments_path(path: &str) -> Option<(&str, &str)> {
+fn parse_session_attachments_path(path: &str) -> Option<(String, String)> {
     let suffix = path.strip_prefix("/v1/agents/")?;
     let segments: Vec<_> = suffix
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
     match segments.as_slice() {
-        [agent, "sessions", session, "attachments"] => Some((agent, session)),
+        [agent, "sessions", session, "attachments"] => {
+            Some((percent_decode(agent), percent_decode(session)))
+        }
         _ => None,
     }
 }
@@ -965,34 +1032,74 @@ mod tests {
     use http::HeaderValue;
 
     #[test]
-    fn parse_agents_route_extracts_agent_and_session_segments() {
-        assert_eq!(
-            parse_agents_route("/v1/agents/hephaestus"),
-            Some(("hephaestus", None, AgentsRoute::Agent))
-        );
-        assert_eq!(
-            parse_agents_route("/v1/agents/hephaestus/sessions"),
-            Some(("hephaestus", None, AgentsRoute::Sessions))
-        );
-        assert_eq!(
-            parse_agents_route("/v1/agents/hephaestus/sessions/thread-1"),
-            Some(("hephaestus", Some("thread-1"), AgentsRoute::Session))
-        );
-        assert_eq!(parse_agents_route("/v1/agents"), None);
-        assert_eq!(parse_agents_route("/v1/agents/hephaestus/extra"), None);
+    fn percent_decode_decodes_slashes_and_preserves_invalid_escapes() {
+        assert_eq!(percent_decode("coding%2Fcoder"), "coding/coder");
+        assert_eq!(percent_decode("hephaestus"), "hephaestus");
+        assert_eq!(percent_decode("bad%2"), "bad%");
+        assert_eq!(percent_decode("bad%zz"), "bad%");
     }
 
     #[test]
-    fn is_agent_rpc_path_matches_only_agent_rpc_shape() {
-        // The real RPC endpoint.
+    fn query_requests_assistant_role_only_matches_explicit_assistant_filter() {
+        assert!(query_requests_assistant_role(Some("role=assistant")));
+        assert!(query_requests_assistant_role(Some(
+            "foo=bar&role=assistant"
+        )));
+        assert!(!query_requests_assistant_role(None));
+        assert!(!query_requests_assistant_role(Some("role=subagent")));
+        assert!(!query_requests_assistant_role(Some("assistants=true")));
+    }
+
+    #[test]
+    fn parse_agents_route_extracts_and_decodes_agent_and_session_segments_and_leaves_keywords_literal(
+    ) {
+        assert_eq!(
+            parse_agents_route("/v1/agents/hephaestus"),
+            Some(("hephaestus".to_string(), None, AgentsRoute::Agent))
+        );
+        assert_eq!(
+            parse_agents_route("/v1/agents/coding%2Fcoder"),
+            Some(("coding/coder".to_string(), None, AgentsRoute::Agent))
+        );
+        assert_eq!(
+            parse_agents_route("/v1/agents/coding%2Fcoder/sessions"),
+            Some(("coding/coder".to_string(), None, AgentsRoute::Sessions))
+        );
+        assert_eq!(
+            parse_agents_route("/v1/agents/coding%2Fcoder/sessions/thread%2F1"),
+            Some((
+                "coding/coder".to_string(),
+                Some("thread/1".to_string()),
+                AgentsRoute::Session,
+            ))
+        );
+        assert_eq!(parse_agents_route("/v1/agents"), None);
+        assert_eq!(parse_agents_route("/v1/agents/hephaestus/extra"), None);
+        assert_eq!(
+            parse_agents_route("/v1/agents/hephaestus%2Fsessions"),
+            Some(("hephaestus/sessions".to_string(), None, AgentsRoute::Agent,))
+        );
+    }
+
+    #[test]
+    fn is_agent_rpc_path_matches_agent_and_session_rpc_shapes_only() {
         assert!(is_agent_rpc_path("/v1/agents/hephaestus/rpc"));
-        // A session literally named "rpc" must NOT be treated as the RPC endpoint.
+        assert!(is_agent_rpc_path(
+            "/v1/agents/hephaestus/sessions/thread-1/rpc"
+        ));
+        assert!(is_agent_rpc_path(
+            "/v1/agents/coding%2Fcoder/sessions/thread-1/rpc"
+        ));
+        // A session literally named "rpc" without trailing RPC segment must NOT be treated as RPC.
         assert!(!is_agent_rpc_path("/v1/agents/hephaestus/sessions/rpc"));
         // Other agent-tree shapes are not RPC.
         assert!(!is_agent_rpc_path("/v1/agents/hephaestus"));
         assert!(!is_agent_rpc_path("/v1/agents/hephaestus/sessions"));
         assert!(!is_agent_rpc_path(
             "/v1/agents/hephaestus/sessions/thread-1"
+        ));
+        assert!(!is_agent_rpc_path(
+            "/v1/agents/hephaestus/sessions/thread-1/attachments"
         ));
         assert!(!is_agent_rpc_path("/v1/models"));
     }
@@ -1004,7 +1111,7 @@ mod tests {
         ));
         assert_eq!(
             parse_session_attachments_path("/v1/agents/hephaestus/sessions/thread-1/attachments"),
-            Some(("hephaestus", "thread-1"))
+            Some(("hephaestus".to_string(), "thread-1".to_string()))
         );
         assert!(!is_session_attachments_path("/v1/agents/hephaestus/rpc"));
         assert!(!is_session_attachments_path(
@@ -1173,6 +1280,67 @@ mod tests {
         );
         let err = ag_ui_error_to_anyhow(AgUiError::BadRequest("bad body".to_string()));
         assert_eq!(status_from_error(&err), Some(StatusCode::BAD_REQUEST));
+    }
+
+    async fn response_json(response: AppResponse) -> Value {
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        serde_json::from_slice(&body).expect("parse json")
+    }
+
+    #[tokio::test]
+    async fn list_agents_filters_assistants_without_changing_response_shape() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent_with_front_matter(
+            "assistant-alpha",
+            "role: assistant\nmodel: openai:gpt-4o\ndescription: Alpha",
+            "You are assistant alpha.",
+        );
+        sandbox.write_agent_with_front_matter(
+            "helper-beta",
+            "role: subagent\nmodel: openai:gpt-4o\ndescription: Beta",
+            "You are helper beta.",
+        );
+
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Server::new(&config);
+
+        let unfiltered = response_json(server.list_agents(None).await.expect("all agents")).await;
+        let filtered = response_json(
+            server
+                .list_agents(Some("role=assistant"))
+                .await
+                .expect("assistant agents"),
+        )
+        .await;
+
+        let unfiltered_agents = unfiltered["data"]
+            .as_array()
+            .expect("unfiltered agents array");
+        let filtered_agents = filtered["data"].as_array().expect("filtered agents array");
+
+        assert_eq!(unfiltered_agents.len(), 2);
+        assert_eq!(filtered_agents.len(), 1);
+        assert_eq!(filtered_agents[0]["name"], "assistant-alpha");
+        assert_eq!(filtered_agents[0]["role"], "assistant");
+        assert_eq!(filtered_agents[0]["description"], "Alpha");
+        assert!(unfiltered_agents
+            .iter()
+            .any(|agent| agent["name"] == "helper-beta"));
+        assert!(filtered_agents
+            .iter()
+            .all(|agent| agent["role"] == "assistant"));
+
+        let assistant_names = harnx_runtime::config::agent::list_assistant_agents().await;
+        let filtered_names: Vec<_> = filtered_agents
+            .iter()
+            .filter_map(|agent| agent["name"].as_str())
+            .collect();
+        assert_eq!(filtered_names, assistant_names);
     }
 
     #[test]
@@ -1365,6 +1533,37 @@ mod tests {
         }
         body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
         body
+    }
+
+    #[test]
+    fn server_handle_routes_session_scoped_rpc_requests_to_rpc_handler() {
+        let sandbox = TestConfigSandbox::new();
+        let agent_path = std::path::Path::new("coding");
+        std::fs::create_dir_all(
+            harnx_runtime::config::Config::agents_config_dir().join(agent_path),
+        )
+        .expect("create package dir for nested agent name");
+        sandbox.write_agent_with_front_matter(
+            "coding/coder",
+            "role: assistant\nmodel: openai:gpt-4o",
+            "You are coding/coder.",
+        );
+
+        assert!(is_agent_rpc_path(
+            "/v1/agents/coding%2Fcoder/sessions/thread-1/rpc"
+        ));
+        assert!(!is_agent_rpc_path(
+            "/v1/agents/coding%2Fcoder/sessions/thread-1"
+        ));
+        assert!(is_session_attachments_path(
+            "/v1/agents/coding%2Fcoder/sessions/thread-1/attachments"
+        ));
+        let session_route = parse_agents_route("/v1/agents/coding%2Fcoder/sessions/thread-1")
+            .expect("session route should parse");
+        assert_eq!(session_route.0, "coding/coder");
+        assert_eq!(session_route.1.as_deref(), Some("thread-1"));
+        assert_eq!(session_route.2, AgentsRoute::Session);
+        assert!(parse_agents_route("/v1/agents/coding%2Fcoder/sessions/thread-1/rpc").is_none());
     }
 
     /// Helper to build and execute an upload request through the real handler

@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:update": "playwright test --update-snapshots"
   },
   "dependencies": {
     "@ag-ui/client": "0.0.57",
@@ -17,13 +20,20 @@
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
-    "@types/node": "24.13.3",
+    "@playwright/test": "^1.61.1",
+    "@types/node": "24.13.2",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
+    "msw": "^2.14.7",
     "oxlint": "^1.71.0",
     "typescript": "~6.0.2",
     "vite": "^8.1.1"
   },
-  "packageManager": "pnpm@11.10.0"
+  "packageManager": "pnpm@11.10.0",
+  "msw": {
+    "workerDirectory": [
+      "public"
+    ]
+  }
 }

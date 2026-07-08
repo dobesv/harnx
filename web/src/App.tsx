@@ -45,7 +45,7 @@ const CancelButton = ({ agentName, sessionId }: { agentName: string, sessionId: 
 };
 
 const MyComposer = ({ agentName, sessionId }: { agentName: string, sessionId: string }) => {
-  const { pendingText, setPendingText } = useContext(PendingContext);
+  const { pendingText, setPendingText, setErrorText } = useContext(PendingContext);
   const isRunning = useThread(s => s.isRunning);
   const composerRuntime = useComposerRuntime();
   const text = useComposer(s => s.text);
@@ -57,13 +57,15 @@ const MyComposer = ({ agentName, sessionId }: { agentName: string, sessionId: st
       if (!state.text.trim() && state.attachments.length === 0) return;
       if (state.attachments.some((a: any) => a.status !== 'complete')) return;
 
+      setErrorText(null);
       try {
         const attachment_refs = state.attachments.map((a: any) => (a as any).url).filter(Boolean);
         await prompt(agentName, sessionId, state.text, attachment_refs);
         setPendingText(state.text || "Attached file");
         composerRuntime.reset();
-      } catch (err) {
+      } catch (err: any) {
         console.error("Failed to enqueue message", err);
+        setErrorText(err instanceof Error ? err.message : 'Failed to send message');
       }
     }
   };
@@ -121,6 +123,12 @@ const StatusIndicator = () => {
   const { statusText } = useContext(PendingContext);
   if (!statusText) return null;
   return <div className="aui-status-indicator" style={{ padding: '4px 8px', fontSize: '0.85em', color: '#666', fontStyle: 'italic' }}>{statusText}</div>;
+};
+
+const SendErrorIndicator = () => {
+  const { errorText } = useContext(PendingContext);
+  if (!errorText) return null;
+  return <div role="alert" className="aui-error" data-testid="send-error" style={{ margin: '8px' }}>{errorText}</div>;
 };
 
 const BatchInterruptUI = () => {
@@ -181,6 +189,7 @@ const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, se
         <ThreadPrimitive.Messages components={{ Message: MyMessage }} />
       </ThreadPrimitive.Viewport>
       <BatchInterruptUI />
+      <SendErrorIndicator />
       <MyComposer agentName={agentName} sessionId={sessionId} />
     </ThreadPrimitive.Root>
   );
@@ -188,31 +197,39 @@ const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, se
 
 const AgentSelector = ({
   agents,
+  agentsError,
   selectedAgent,
   onSelect
 }: {
   agents: Agent[];
+  agentsError: string | null;
   selectedAgent: string;
   onSelect: (agent: string) => void;
 }) => (
   <div className="sidebar-section">
     <h3>Agents</h3>
-    <select 
-      value={selectedAgent} 
-      onChange={e => onSelect(e.target.value)}
-    >
-      {agents.map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
-    </select>
+    {agentsError ? (
+      <div role="alert" className="aui-error" data-testid="agents-error">{agentsError}</div>
+    ) : (
+      <select 
+        value={selectedAgent} 
+        onChange={e => onSelect(e.target.value)}
+      >
+        {agents.map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
+      </select>
+    )}
   </div>
 );
 
 const SessionList = ({
   sessions,
+  sessionsError,
   selectedSessionId,
   onSelect,
   onNewChat
 }: {
   sessions: SessionRef[];
+  sessionsError: string | null;
   selectedSessionId: string;
   onSelect: (id: string) => void;
   onNewChat: () => void;
@@ -222,29 +239,35 @@ const SessionList = ({
       <h3>Sessions</h3>
       <button onClick={onNewChat}>New Chat</button>
     </div>
-    <ul className="sessions-list">
-      {sessions.map(s => (
-        <li 
-          key={s.session_id} 
-          className={s.session_id === selectedSessionId ? 'active' : ''}
-          onClick={() => onSelect(s.session_id)}
-        >
-          {s.session_id}
-        </li>
-      ))}
-      {selectedSessionId && !sessions.find(s => s.session_id === selectedSessionId) && (
-        <li className="active">
-          {selectedSessionId} (New)
-        </li>
-      )}
-    </ul>
+    {sessionsError ? (
+      <div role="alert" className="aui-error" data-testid="sessions-error">{sessionsError}</div>
+    ) : (
+      <ul className="sessions-list">
+        {sessions.map(s => (
+          <li 
+            key={s.session_id} 
+            className={s.session_id === selectedSessionId ? 'active' : ''}
+            onClick={() => onSelect(s.session_id)}
+          >
+            {s.session_id}
+          </li>
+        ))}
+        {selectedSessionId && !sessions.find(s => s.session_id === selectedSessionId) && (
+          <li className="active">
+            {selectedSessionId} (New)
+          </li>
+        )}
+      </ul>
+    )}
   </div>
 );
 
 export default function App() {
   const {
     agents,
+    agentsError,
     sessions,
+    sessionsError,
     selectedAgent,
     selectedSessionId,
     refreshSessions,
@@ -259,11 +282,13 @@ export default function App() {
         <h2>Harnx UI</h2>
         <AgentSelector 
           agents={agents} 
+          agentsError={agentsError}
           selectedAgent={selectedAgent} 
           onSelect={selectAgent} 
         />
         <SessionList 
           sessions={sessions} 
+          sessionsError={sessionsError}
           selectedSessionId={selectedSessionId} 
           onSelect={selectSession} 
           onNewChat={newChat} 

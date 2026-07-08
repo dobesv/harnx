@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# Playwright (keep committed *-snapshots/ PNGs; ignore reports/results/caches)
+/playwright-report/
+/test-results/
+/blob-report/
+/playwright/.cache/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
