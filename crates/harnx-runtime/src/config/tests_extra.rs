@@ -121,6 +121,29 @@ fn expand_use_tools_wildcard_returns_all_tools() {
     assert!(expanded.contains(&crate::session_history::TOOL_NAME.to_string()));
 }
 
+#[test]
+fn log_path_template_is_absolutized_and_pid_expanded() {
+    let _lock = crate::config::test_support::env_lock();
+    let prev_cwd = std::env::current_dir().unwrap();
+    let prev_path = std::env::var_os("HARNX_LOG_PATH");
+    let temp = tempfile::TempDir::new().unwrap();
+    std::env::set_current_dir(temp.path()).unwrap();
+    unsafe { std::env::set_var("HARNX_LOG_PATH", "logs/harnx-{pid}.log") };
+
+    let (_, log_path) = Config::log_config(false).unwrap();
+
+    std::env::set_current_dir(prev_cwd).unwrap();
+    match prev_path {
+        Some(value) => unsafe { std::env::set_var("HARNX_LOG_PATH", value) },
+        None => unsafe { std::env::remove_var("HARNX_LOG_PATH") },
+    }
+
+    let log_path = log_path.expect("log path");
+    let rendered = log_path.to_string_lossy().into_owned();
+    assert!(rendered.starts_with(temp.path().join("logs").to_string_lossy().as_ref()));
+    assert!(rendered.ends_with(&format!("harnx-{}.log", std::process::id())));
+}
+
 /// Empty selectors list should return empty (no tools).
 #[test]
 fn expand_use_tools_empty_list_returns_empty() {

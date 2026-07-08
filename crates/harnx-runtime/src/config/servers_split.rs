@@ -1,6 +1,8 @@
 //! MCP/ACP server management extracted from config/mod.rs for code health.
 use super::*;
+use harnx_acp::AcpServerConfig;
 use harnx_core::package_namespace::qualify_agent_name;
+use harnx_mcp::McpServerConfig;
 use std::env;
 
 fn normalize_package_acp_server_args(server: &mut AcpServerConfig, pkg_name: &str) {
@@ -11,6 +13,90 @@ fn normalize_package_acp_server_args(server: &mut AcpServerConfig, pkg_name: &st
             *arg = qualified.clone();
         }
     }
+}
+
+fn effective_mcp_servers(
+    mcp_servers: &[McpServerConfig],
+    mcp_root: &[String],
+    agent_package: Option<&str>,
+) -> Vec<McpServerConfig> {
+    let mut effective_servers: Vec<McpServerConfig> = mcp_servers
+        .iter()
+        .filter_map(|server| {
+            if !server.enabled {
+                return None;
+            }
+            let mut server = server.clone();
+            server.name = mcp_server_display_name(&server, agent_package);
+            Some(server)
+        })
+        .collect();
+
+    let mut extra_roots = mcp_root.to_vec();
+    if let Ok(cwd) = env::current_dir() {
+        #[cfg(unix)]
+        if path_is_home_or_ancestor(&cwd) {
+            warn!(
+                "sandbox: skipping CWD {:?} as MCP root — equals or is ancestor of $HOME",
+                cwd.display()
+            );
+        } else if let Ok(cwd_str) = cwd.into_os_string().into_string() {
+            if !extra_roots.contains(&cwd_str) {
+                extra_roots.insert(0, cwd_str);
+            }
+        }
+        #[cfg(not(unix))]
+        if let Ok(cwd_str) = cwd.into_os_string().into_string() {
+            if !extra_roots.contains(&cwd_str) {
+                extra_roots.insert(0, cwd_str);
+            }
+        }
+    }
+    if !extra_roots.is_empty() {
+        for server in &mut effective_servers {
+            for root in extra_roots.iter().rev() {
+                #[cfg(unix)]
+                if path_is_home_or_ancestor(Path::new(root)) {
+                    warn!(
+                        "sandbox: skipping root {:?} from mcp_roots — equals or is ancestor of $HOME",
+                        root
+                    );
+                    continue;
+                }
+                if !server.roots.contains(root) {
+                    server.roots.insert(0, root.clone());
+                }
+            }
+        }
+    }
+
+    // Sort by name so this matches the ordering of `McpManager::configs()`,
+    // which the manager-reuse check in `reinit_managers_for_agent` compares
+    // against. Without this, servers defined out of alphabetical order in YAML
+    // would compare unequal and defeat the #988 no-churn preservation.
+    effective_servers.sort_by(|left, right| left.name.cmp(&right.name));
+
+    effective_servers
+}
+
+fn effective_acp_servers(
+    acp_servers: &[AcpServerConfig],
+    agent_package: Option<&str>,
+) -> Vec<AcpServerConfig> {
+    let mut effective_servers: Vec<AcpServerConfig> = acp_servers
+        .iter()
+        .map(|server| {
+            let mut server = server.clone();
+            server.name = acp_server_display_name(&server, agent_package);
+            server
+        })
+        .collect();
+
+    // Sort by name to match `AcpManager::configs()` ordering (see the MCP note
+    // above) so the manager-reuse comparison is order-insensitive.
+    effective_servers.sort_by(|left, right| left.name.cmp(&right.name));
+
+    effective_servers
 }
 
 impl Config {
@@ -120,83 +206,39 @@ impl Config {
     /// keep their prefixed name (e.g. `otherpkg__db`), and top-level servers
     /// are always registered under their original name.
     ///
-    /// When switching agents this replaces the old managers entirely, killing
-    /// any running MCP server subprocesses, giving a clean slate.
+    /// Re-activating same agent/scope should preserve existing managers so MCP
+    /// and ACP subprocesses stay alive across prompts. Only rebuild when the
+    /// effective scoped server config changes.
     pub(crate) fn reinit_managers_for_agent(&mut self, agent_package: Option<&str>) {
-        // ── MCP ──────────────────────────────────────────────────────────────
-        self.mcp_manager = if self.mcp_servers.is_empty() {
+        let mcp_servers = effective_mcp_servers(&self.mcp_servers, &self.mcp_root, agent_package);
+        self.mcp_manager = if mcp_servers.is_empty() {
             None
+        } else if let Some(existing) = self.mcp_manager.as_ref() {
+            if existing.configs() == mcp_servers {
+                Some(existing.clone())
+            } else {
+                let manager = McpManager::new();
+                manager.initialize(mcp_servers);
+                Some(Arc::new(manager))
+            }
         } else {
-            let mut mcp_servers: Vec<McpServerConfig> = self
-                .mcp_servers
-                .iter()
-                .filter_map(|s| {
-                    if !s.enabled {
-                        return None;
-                    }
-                    let mut s = s.clone();
-                    s.name = mcp_server_display_name(&s, agent_package);
-                    Some(s)
-                })
-                .collect();
-
-            // Prepend cwd to roots for every server
-            let mut extra_roots = self.mcp_root.clone();
-            if let Ok(cwd) = env::current_dir() {
-                #[cfg(unix)]
-                if path_is_home_or_ancestor(&cwd) {
-                    warn!(
-                        "sandbox: skipping CWD {:?} as MCP root — equals or is ancestor of $HOME",
-                        cwd.display()
-                    );
-                } else if let Ok(cwd_str) = cwd.into_os_string().into_string() {
-                    if !extra_roots.contains(&cwd_str) {
-                        extra_roots.insert(0, cwd_str);
-                    }
-                }
-                #[cfg(not(unix))]
-                if let Ok(cwd_str) = cwd.into_os_string().into_string() {
-                    if !extra_roots.contains(&cwd_str) {
-                        extra_roots.insert(0, cwd_str);
-                    }
-                }
-            }
-            if !extra_roots.is_empty() {
-                for server in mcp_servers.iter_mut() {
-                    for root in extra_roots.iter().rev() {
-                        #[cfg(unix)]
-                        if path_is_home_or_ancestor(Path::new(root)) {
-                            warn!(
-                                "sandbox: skipping root {:?} from mcp_roots — equals or is ancestor of $HOME",
-                                root
-                            );
-                            continue;
-                        }
-                        if !server.roots.contains(root) {
-                            server.roots.insert(0, root.clone());
-                        }
-                    }
-                }
-            }
-
             let manager = McpManager::new();
             manager.initialize(mcp_servers);
             Some(Arc::new(manager))
         };
 
-        // ── ACP ──────────────────────────────────────────────────────────────
-        self.acp_manager = if self.acp_servers.is_empty() {
+        let acp_servers = effective_acp_servers(&self.acp_servers, agent_package);
+        self.acp_manager = if acp_servers.is_empty() {
             None
+        } else if let Some(existing) = self.acp_manager.as_ref() {
+            if existing.configs() == acp_servers {
+                Some(existing.clone())
+            } else {
+                let manager = AcpManager::new();
+                manager.initialize(acp_servers);
+                Some(Arc::new(manager))
+            }
         } else {
-            let acp_servers: Vec<AcpServerConfig> = self
-                .acp_servers
-                .iter()
-                .map(|s| {
-                    let mut s = s.clone();
-                    s.name = acp_server_display_name(&s, agent_package);
-                    s
-                })
-                .collect();
             let manager = AcpManager::new();
             manager.initialize(acp_servers);
             Some(Arc::new(manager))

@@ -150,6 +150,197 @@ fn test_init_mcp_manager_with_roots() {
     assert_eq!(roots[2], "/existing");
 }
 
+#[test]
+fn reinit_managers_preserves_manager_arcs_when_effective_scope_is_unchanged() {
+    #[cfg(unix)]
+    let _env_guard = env_lock();
+
+    let mut config = Config {
+        mcp_servers: vec![McpServerConfig {
+            name: "fs".to_string(),
+            command: "fs-server".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            roots: vec!["/workspace".to_string()],
+            enabled: true,
+            description: None,
+            rename_tools: HashMap::new(),
+            tool_templates: HashMap::new(),
+            hooks: None,
+            package: None,
+        }],
+        acp_servers: vec![AcpServerConfig {
+            name: "atlas".to_string(),
+            command: "atlas-server".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            enabled: true,
+            description: Some("Atlas".to_string()),
+            idle_timeout_secs: 600,
+            operation_timeout_secs: 3600,
+            package: None,
+        }],
+        ..Default::default()
+    };
+
+    config.reinit_managers_for_agent(None);
+    let first_mcp = config.mcp_manager.as_ref().expect("mcp_manager").clone();
+    let first_mcp_client = first_mcp.get_client("fs").expect("fs client");
+    let first_acp = config.acp_manager.as_ref().expect("acp_manager").clone();
+    let first_acp_client = first_acp.get_client("atlas").expect("atlas client");
+
+    config.reinit_managers_for_agent(None);
+
+    let second_mcp = config.mcp_manager.as_ref().expect("mcp_manager");
+    let second_mcp_client = second_mcp.get_client("fs").expect("fs client");
+    let second_acp = config.acp_manager.as_ref().expect("acp_manager");
+    let second_acp_client = second_acp.get_client("atlas").expect("atlas client");
+
+    assert!(Arc::ptr_eq(&first_mcp, second_mcp));
+    assert!(Arc::ptr_eq(&first_mcp_client, &second_mcp_client));
+    assert!(Arc::ptr_eq(&first_acp, second_acp));
+    assert!(Arc::ptr_eq(&first_acp_client, &second_acp_client));
+}
+
+#[test]
+fn reinit_managers_rebuilds_when_effective_scope_changes() {
+    #[cfg(unix)]
+    let _env_guard = env_lock();
+
+    let mut config = Config {
+        mcp_servers: vec![McpServerConfig {
+            name: "fs".to_string(),
+            command: "fs-server".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            roots: vec!["/workspace".to_string()],
+            enabled: true,
+            description: None,
+            rename_tools: HashMap::new(),
+            tool_templates: HashMap::new(),
+            hooks: None,
+            package: Some("pantheon".to_string()),
+        }],
+        acp_servers: vec![AcpServerConfig {
+            name: "atlas".to_string(),
+            command: "atlas-server".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            enabled: true,
+            description: Some("Atlas".to_string()),
+            idle_timeout_secs: 600,
+            operation_timeout_secs: 3600,
+            package: Some("pantheon".to_string()),
+        }],
+        ..Default::default()
+    };
+
+    config.reinit_managers_for_agent(None);
+    let first_mcp = config.mcp_manager.as_ref().expect("mcp_manager").clone();
+    let first_acp = config.acp_manager.as_ref().expect("acp_manager").clone();
+    assert!(first_mcp.get_client("pantheon__fs").is_some());
+    assert!(first_acp.get_client("pantheon__atlas").is_some());
+
+    config.reinit_managers_for_agent(Some("pantheon"));
+
+    let second_mcp = config.mcp_manager.as_ref().expect("mcp_manager");
+    let second_acp = config.acp_manager.as_ref().expect("acp_manager");
+    assert!(!Arc::ptr_eq(&first_mcp, second_mcp));
+    assert!(!Arc::ptr_eq(&first_acp, second_acp));
+    assert!(second_mcp.get_client("fs").is_some());
+    assert!(second_acp.get_client("atlas").is_some());
+}
+
+/// Regression for #988 review (blocker F1): a change to a server's `hooks`
+/// alone must rebuild the MCP manager. `McpServerConfig`'s `PartialEq` used to
+/// omit `hooks`, so a hooks-only edit was silently ignored and the old hook
+/// policy kept running. `hooks` is now part of equality, so the effective
+/// config differs and the manager is rebuilt.
+#[test]
+fn reinit_managers_rebuilds_when_only_hooks_change() {
+    #[cfg(unix)]
+    let _env_guard = env_lock();
+
+    let mut config = Config {
+        mcp_servers: vec![McpServerConfig {
+            name: "fs".to_string(),
+            command: "fs-server".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            roots: vec!["/workspace".to_string()],
+            enabled: true,
+            description: None,
+            rename_tools: HashMap::new(),
+            tool_templates: HashMap::new(),
+            hooks: None,
+            package: None,
+        }],
+        ..Default::default()
+    };
+
+    config.reinit_managers_for_agent(None);
+    let first_mcp = config.mcp_manager.as_ref().expect("mcp_manager").clone();
+
+    // Change ONLY the hooks config, nothing else.
+    config.mcp_servers[0].hooks = Some(HooksConfig {
+        max_resume: Some(3),
+        entries: vec![],
+    });
+
+    config.reinit_managers_for_agent(None);
+    let second_mcp = config.mcp_manager.as_ref().expect("mcp_manager");
+
+    assert!(
+        !Arc::ptr_eq(&first_mcp, second_mcp),
+        "hooks-only change must rebuild the MCP manager"
+    );
+}
+
+/// Regression for #988 review (blocker F2): re-selecting the same agent with
+/// the server list defined in a *different order* must still preserve the
+/// existing manager. `effective_mcp_servers`/`effective_acp_servers` now sort
+/// by name to match `configs()`, so definition order does not cause spurious
+/// rebuilds (which would defeat the no-churn goal).
+#[test]
+fn reinit_managers_preserves_when_server_definition_order_differs() {
+    #[cfg(unix)]
+    let _env_guard = env_lock();
+
+    let mk = |name: &str| McpServerConfig {
+        name: name.to_string(),
+        command: format!("{name}-server"),
+        args: vec![],
+        env: HashMap::new(),
+        roots: vec!["/workspace".to_string()],
+        enabled: true,
+        description: None,
+        rename_tools: HashMap::new(),
+        tool_templates: HashMap::new(),
+        hooks: None,
+        package: None,
+    };
+
+    // Defined out of alphabetical order: "zeta" before "alpha".
+    let mut config = Config {
+        mcp_servers: vec![mk("zeta"), mk("alpha")],
+        ..Default::default()
+    };
+
+    config.reinit_managers_for_agent(None);
+    let first_mcp = config.mcp_manager.as_ref().expect("mcp_manager").clone();
+
+    // Same servers, reversed definition order.
+    config.mcp_servers = vec![mk("alpha"), mk("zeta")];
+
+    config.reinit_managers_for_agent(None);
+    let second_mcp = config.mcp_manager.as_ref().expect("mcp_manager");
+
+    assert!(
+        Arc::ptr_eq(&first_mcp, second_mcp),
+        "reordering server definitions must not rebuild the manager"
+    );
+}
+
 // ── handoff session emptying tests ─────────────────────────────────────
 
 /// Verify that empty_session clears messages from a session that was loaded

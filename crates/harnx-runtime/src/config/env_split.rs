@@ -153,6 +153,10 @@ pub fn load_env_file() -> Result<()> {
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
             if !key.is_empty() {
+                if matches!(key, "HARNX_LOG_LEVEL" | "HARNX_LOG_PATH") && env::var_os(key).is_some()
+                {
+                    continue;
+                }
                 unsafe {
                     env::set_var(key, value.trim());
                 }
@@ -202,5 +206,54 @@ mod tests {
         if let Some(v) = prev {
             unsafe { std::env::set_var("HARNX_CLEANUP_REMOTE_SESSIONS_DAYS", v) }
         }
+    }
+
+    #[test]
+    fn load_env_file_does_not_override_inherited_harnx_log_vars() {
+        let _lock = crate::config::test_support::env_lock();
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp.path().join(".env"),
+            "HARNX_LOG_LEVEL=info\nHARNX_LOG_PATH=from-dot-env.log\nOTHER_VAR=ok\n",
+        )
+        .unwrap();
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        let prev_level = std::env::var_os("HARNX_LOG_LEVEL");
+        let prev_path = std::env::var_os("HARNX_LOG_PATH");
+        let prev_other = std::env::var_os("OTHER_VAR");
+
+        let result = {
+            unsafe {
+                std::env::set_var("HARNX_LOG_LEVEL", "debug");
+                std::env::set_var("HARNX_LOG_PATH", "/tmp/inherited.log");
+                std::env::remove_var("OTHER_VAR");
+            }
+            std::env::set_current_dir(temp.path()).unwrap();
+
+            load_env_file().unwrap();
+
+            let level = std::env::var("HARNX_LOG_LEVEL").unwrap();
+            let path = std::env::var("HARNX_LOG_PATH").unwrap();
+            let other = std::env::var("OTHER_VAR").ok();
+            (level, path, other)
+        };
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        match prev_level {
+            Some(value) => unsafe { std::env::set_var("HARNX_LOG_LEVEL", value) },
+            None => unsafe { std::env::remove_var("HARNX_LOG_LEVEL") },
+        }
+        match prev_path {
+            Some(value) => unsafe { std::env::set_var("HARNX_LOG_PATH", value) },
+            None => unsafe { std::env::remove_var("HARNX_LOG_PATH") },
+        }
+        match prev_other {
+            Some(value) => unsafe { std::env::set_var("OTHER_VAR", value) },
+            None => unsafe { std::env::remove_var("OTHER_VAR") },
+        }
+
+        assert_eq!(result.0, "debug");
+        assert_eq!(result.1, "/tmp/inherited.log");
     }
 }

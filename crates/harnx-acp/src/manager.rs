@@ -92,6 +92,17 @@ impl AcpManager {
         self.clients.read().get(server_name).cloned()
     }
 
+    pub fn configs(&self) -> Vec<AcpServerConfig> {
+        let mut configs: Vec<AcpServerConfig> = self
+            .clients
+            .read()
+            .values()
+            .map(|client| client.config().clone())
+            .collect();
+        configs.sort_by(|left, right| left.name.cmp(&right.name));
+        configs
+    }
+
     pub async fn get_all_tools(&self) -> Vec<ToolDeclaration> {
         let clients = self.clients.read();
         let mut tools: Vec<_> = clients

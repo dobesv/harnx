@@ -127,7 +127,7 @@ fn default_timeout() -> Option<u64> {
 }
 
 /// Configuration for a single hook entry
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HookConfig {
     /// Hook event name (e.g., "PreToolUse", "Stop")
     pub event: String,
@@ -168,7 +168,7 @@ impl HookConfig {
 }
 
 /// Configuration for all hooks (global or per-agent)
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HooksConfig {
     /// Maximum number of resume iterations
     #[serde(default)]

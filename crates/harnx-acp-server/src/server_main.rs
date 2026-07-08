@@ -49,6 +49,14 @@ pub async fn run(config: GlobalConfig, agent_name: String) -> Result<()> {
 
 async fn run_local(config: GlobalConfig, agent_name: String) -> Result<()> {
     let config_for_cleanup = config.clone();
+    // `HARNX_MCP_KEEP_SERVICES_AFTER_DISCOVERY` is an INTERNAL, undocumented
+    // flag (not a user-facing config knob). The ACP server runs on a
+    // current-thread runtime and re-runs MCP tool discovery on every prompt;
+    // without this, discovery would invalidate freshly-connected MCP services
+    // and churn subprocesses each turn (see #988). Set here at process startup
+    // before the async runtime spawns any worker threads, so the `set_var` is
+    // effectively single-threaded (the `unsafe` contract is upheld).
+    unsafe { std::env::set_var("HARNX_MCP_KEEP_SERVICES_AFTER_DISCOVERY", "1") };
     let agent = Arc::new(HarnxAgent::new(agent_name, config));
 
     let result = acp::Agent

@@ -8,7 +8,7 @@ fn default_true() -> bool {
 
 /// Per-tool display template overrides. Keys are the server-side tool name
 /// (e.g. `"exec"`, `"read_file"`), not the prefixed display name.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ToolDisplayTemplates {
     #[serde(default)]
     pub call_template: Option<String>,
@@ -16,7 +16,7 @@ pub struct ToolDisplayTemplates {
     pub result_template: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct McpServerConfig {
     #[serde(default)]
     pub name: String,

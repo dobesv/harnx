@@ -2,6 +2,8 @@ use crate::config::{McpServerConfig, ToolDisplayTemplates};
 use crate::convert::{mcp_tool_to_declaration, ToolTemplates};
 use crate::safety::path_to_file_uri;
 use harnx_core::abort::{wait_abort_signal, AbortSignal};
+use harnx_core::event::NoticeEvent;
+use harnx_core::sink::emit_agent_event;
 use harnx_core::tool::{ToolDeclaration, ToolError, ToolProvider};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -17,7 +19,6 @@ use rmcp::model::{
     ListRootsResult, Root,
 };
 use rmcp::service::{RequestContext, RoleClient, RunningService, ServiceError};
-use rmcp::transport::TokioChildProcess;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::process::Stdio;
@@ -30,6 +31,126 @@ use tokio::runtime::{Builder, Handle, RuntimeFlavor};
 /// Maximum number of stderr lines to keep from an MCP child process for
 /// inclusion in connection error messages. Old lines are dropped first.
 const MCP_STDERR_TAIL_LINES: usize = 64;
+
+/// Minimum time between duplicate notices for the same server+key.
+const NOTICE_DEDUP_WINDOW: Duration = Duration::from_secs(5);
+
+/// Shared per-client dedup state: the (key, timestamp) of the last emitted
+/// notice. Wrapped in `Arc` so the background child-wait task can share the
+/// same state as the synchronous reconnect path — this keeps notice
+/// deduplication consistent across reconnects rather than resetting per
+/// connection.
+type NoticeDedupState = Arc<RwLock<Option<(String, std::time::Instant)>>>;
+
+/// Emit a `NoticeEvent` through the global agent-event sink, suppressing a
+/// duplicate `(key)` within `NOTICE_DEDUP_WINDOW`. Returns true if emitted,
+/// false if suppressed. Shared by `McpClient::emit_notice` and the detached
+/// child-wait task so both honour the same dedup window.
+fn emit_notice_dedup(state: &NoticeDedupState, key: &str, event: NoticeEvent) -> bool {
+    let now = std::time::Instant::now();
+    let mut last_notice = state.write();
+    if let Some((ref last_key, ref last_time)) = *last_notice {
+        if last_key == key && now.duration_since(*last_time) < NOTICE_DEDUP_WINDOW {
+            return false;
+        }
+    }
+    *last_notice = Some((key.to_string(), now));
+    drop(last_notice);
+    emit_agent_event(harnx_core::event::AgentEvent::Notice(event));
+    true
+}
+
+// --- Part A: log env forwarding helpers -------------------------------------
+
+/// Resolve a `HARNX_LOG_PATH` value to an absolute path.
+/// - If already absolute, return as-is.
+/// - If relative, resolve relative to `cwd`.
+/// - If the path contains `{pid}` template token, preserve the token but
+///   absolutize the directory portion (e.g., `logs/{pid}.log` → `<cwd>/logs/{pid}.log`).
+pub fn resolve_forwarded_log_path(raw: &str, cwd: &Path) -> String {
+    // If already absolute, return as-is
+    if Path::new(raw).is_absolute() {
+        return raw.to_string();
+    }
+
+    // If contains {pid} template, absolutize the directory portion
+    if raw.contains("{pid}") {
+        // The {pid} might be in the filename or directory
+        // We want to make the whole path absolute but preserve {pid}
+        let abs = cwd.join(raw);
+        abs.to_string_lossy().into_owned()
+    } else {
+        // Simple relative path - absolutize fully
+        let abs = cwd.join(raw);
+        abs.to_string_lossy().into_owned()
+    }
+}
+
+/// Forward `HARNX_LOG_LEVEL` and `HARNX_LOG_PATH` from the current process
+/// environment to `child_env`, if set. Does NOT overwrite existing values.
+pub fn apply_forwarded_log_env(child_env: &mut HashMap<String, String>) {
+    if let Ok(level) = std::env::var("HARNX_LOG_LEVEL") {
+        // Don't overwrite if already set from config
+        if !child_env.contains_key("HARNX_LOG_LEVEL") {
+            child_env.insert("HARNX_LOG_LEVEL".to_string(), level);
+        }
+    }
+
+    if let Ok(path) = std::env::var("HARNX_LOG_PATH") {
+        // Don't overwrite if already set from config
+        if !child_env.contains_key("HARNX_LOG_PATH") {
+            // Resolve to absolute path (relative to current_dir)
+            if let Ok(cwd) = std::env::current_dir() {
+                let resolved = resolve_forwarded_log_path(&path, &cwd);
+                child_env.insert("HARNX_LOG_PATH".to_string(), resolved);
+            }
+        }
+    }
+}
+
+// --- Part B: exit status classification -------------------------------------
+
+/// Classify exit status into a NoticeEvent.
+/// - Clean exit (code 0, or SIGTERM/SIGINT on Unix) → Warning
+/// - Nonzero code or SIGKILL/other signals → Error
+/// - No status available → Error
+#[cfg(unix)]
+pub fn classify_exit(name: &str, code: Option<i32>, signal: Option<i32>) -> NoticeEvent {
+    // Check signal first (if killed by signal)
+    if let Some(sig) = signal {
+        // Common signal mappings
+        match sig {
+            15 | 2 => NoticeEvent::Warning(format!(
+                "MCP server '{}' terminated by SIG{}",
+                name,
+                if sig == 15 { "TERM" } else { "INT" }
+            )),
+            9 => NoticeEvent::Error(format!("MCP server '{}' killed by SIGKILL", name)),
+            _ => NoticeEvent::Error(format!("MCP server '{}' died: signal {}", name, sig)),
+        }
+    } else if let Some(c) = code {
+        if c == 0 {
+            NoticeEvent::Warning(format!("MCP server '{}' exited cleanly", name))
+        } else {
+            NoticeEvent::Error(format!("MCP server '{}' exited with code {}", name, c))
+        }
+    } else {
+        NoticeEvent::Error(format!("MCP server '{}' exited (status unavailable)", name))
+    }
+}
+
+#[cfg(not(unix))]
+pub fn classify_exit(name: &str, code: Option<i32>, _signal: Option<i32>) -> NoticeEvent {
+    if let Some(c) = code {
+        if c == 0 {
+            NoticeEvent::Warning(format!("MCP server '{}' exited cleanly", name))
+        } else {
+            NoticeEvent::Error(format!("MCP server '{}' exited with code {}", name, c))
+        }
+    } else {
+        NoticeEvent::Error(format!("MCP server '{}' exited (status unavailable)", name))
+    }
+}
 
 /// How long to wait for the stderr reader to drain after a connection
 /// error before snapshotting the buffer for the error message. Short
@@ -67,6 +188,15 @@ pub struct McpClient {
     connected: Arc<RwLock<bool>>,
     connection_failed: Arc<RwLock<bool>>,
     service: Arc<RwLock<Option<RunningService<RoleClient, McpClientHandler>>>>,
+    /// Persistent stderr buffer for notice messages (survives reconnects)
+    stderr_buffer: StderrBuffer,
+    /// Last emitted notice (key, timestamp) for deduplication. Shared with the
+    /// background child-wait task so exit and reconnect notices dedup together.
+    last_notice: NoticeDedupState,
+    /// Handle to the background task that waits for the current child process
+    /// and emits an exit notice. Aborted and replaced on each (re)connect so a
+    /// stale task from a prior connection cannot linger past teardown.
+    child_wait_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -126,6 +256,7 @@ impl fmt::Debug for McpClient {
             .field("roots", &*self.roots.read())
             .field("connected", &*self.connected.read())
             .field("service", &service)
+            .field("stderr_buffer_len", &self.stderr_buffer.lock().len())
             .finish()
     }
 }
@@ -135,6 +266,12 @@ impl McpClient {
         shellexpand::full(path)
             .map(|p| p.to_string())
             .unwrap_or_else(|_| path.to_string())
+    }
+
+    /// Emit a notice event with deduplication against this client's shared
+    /// dedup state. Returns true if emitted, false if suppressed as duplicate.
+    fn emit_notice(&self, key: &str, event: NoticeEvent) -> bool {
+        emit_notice_dedup(&self.last_notice, key, event)
     }
 
     pub fn new(config: McpServerConfig) -> Self {
@@ -152,6 +289,9 @@ impl McpClient {
             connected: Arc::new(RwLock::new(false)),
             connection_failed: Arc::new(RwLock::new(false)),
             service: Arc::new(RwLock::new(None)),
+            stderr_buffer: new_stderr_buffer(),
+            last_notice: Arc::new(RwLock::new(None)),
+            child_wait_task: RwLock::new(None),
         }
     }
 
@@ -191,7 +331,16 @@ impl McpClient {
     async fn connect_inner(&self) -> Result<()> {
         let mut command = Command::new(&self.config.command);
         command.args(&self.config.args);
-        command.envs(&self.config.env);
+
+        // Apply forwarded log env (HARNX_LOG_LEVEL, HARNX_LOG_PATH)
+        let mut child_env = self.config.env.clone();
+        apply_forwarded_log_env(&mut child_env);
+        command.envs(&child_env);
+
+        // Pipe stdin/stdout/stderr for MCP transport
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
 
         // Spawn in a new process group so SIGINT (Ctrl+C) in the parent
         // terminal doesn't propagate to MCP server child processes.
@@ -200,16 +349,71 @@ impl McpClient {
         #[cfg(unix)]
         wrap.wrap(ProcessGroup::leader());
 
-        let stderr_buffer = new_stderr_buffer();
-
-        let (transport, stderr) = TokioChildProcess::builder(wrap)
-            .stderr(Stdio::piped())
+        // Spawn the child process ourselves (instead of using TokioChildProcess)
+        // so we can own the child handle and wait for exit.
+        let mut child = wrap
             .spawn()
             .with_context(|| format!("Failed to spawn MCP server '{}'", self.name))?;
 
+        let stdin = child
+            .stdin()
+            .take()
+            .ok_or_else(|| anyhow!("MCP server '{}' stdin not piped", self.name))?;
+        let stdout = child
+            .stdout()
+            .take()
+            .ok_or_else(|| anyhow!("MCP server '{}' stdout not piped", self.name))?;
+        let stderr = child.stderr().take();
+
+        // Spawn a background task that waits for the child and emits an exit
+        // notice. It shares the client's `last_notice` dedup state so exit and
+        // reconnect notices are deduplicated together. Any wait task from a
+        // prior connection is aborted first so stale tasks don't linger.
+        let name_for_wait = self.name.clone();
+        let stderr_buffer_for_wait = self.stderr_buffer.clone();
+        let dedup_state = self.last_notice.clone();
+        let wait_handle = tokio::spawn(async move {
+            if let Ok(status) = child.wait().await {
+                #[cfg(unix)]
+                let (code, signal) = {
+                    use std::os::unix::process::ExitStatusExt;
+                    (status.code(), status.signal())
+                };
+                #[cfg(not(unix))]
+                let (code, signal) = (status.code(), None);
+
+                // Snapshot stderr tail for the notice message
+                let stderr_tail = {
+                    let buf = stderr_buffer_for_wait.lock();
+                    if buf.is_empty() {
+                        String::new()
+                    } else {
+                        let joined = buf.iter().cloned().collect::<Vec<_>>().join("\n");
+                        format!("\nMCP server stderr:\n{joined}")
+                    }
+                };
+
+                let event = match classify_exit(&name_for_wait, code, signal) {
+                    NoticeEvent::Warning(msg) if !stderr_tail.is_empty() => {
+                        NoticeEvent::Warning(format!("{}\n{}", msg, stderr_tail))
+                    }
+                    NoticeEvent::Error(msg) if !stderr_tail.is_empty() => {
+                        NoticeEvent::Error(format!("{}\n{}", msg, stderr_tail))
+                    }
+                    other => other,
+                };
+                let key = format!("exit:{}", name_for_wait);
+                emit_notice_dedup(&dedup_state, &key, event);
+            }
+        });
+        if let Some(prev) = self.child_wait_task.write().replace(wait_handle) {
+            prev.abort();
+        }
+
+        // Spawn stderr reader task using the persistent buffer
         if let Some(stderr) = stderr {
             let server_name = self.name.clone();
-            let buffer = stderr_buffer.clone();
+            let buffer = self.stderr_buffer.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
@@ -224,6 +428,10 @@ impl McpClient {
             });
         }
 
+        // Create transport from (stdout, stdin) pair
+        let transport =
+            rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(stdout, stdin);
+
         let handler = McpClientHandler::new(self.roots.clone());
         let serve_result = tokio::time::timeout(
             Duration::from_secs(30),
@@ -232,7 +440,7 @@ impl McpClient {
         .await;
         let service = match serve_result {
             Err(_) => {
-                let tail = snapshot_stderr_tail(&stderr_buffer).await;
+                let tail = snapshot_stderr_tail(&self.stderr_buffer).await;
                 bail!(
                     "MCP server '{}' timed out during initialization (30s){}",
                     self.name,
@@ -240,7 +448,7 @@ impl McpClient {
                 );
             }
             Ok(Err(err)) => {
-                let tail = snapshot_stderr_tail(&stderr_buffer).await;
+                let tail = snapshot_stderr_tail(&self.stderr_buffer).await;
                 return Err(anyhow::Error::from(err)).with_context(|| {
                     format!(
                         "Failed to initialize MCP client for server '{}'{}",
@@ -258,7 +466,7 @@ impl McpClient {
         .await;
         let tools_result = match list_result {
             Err(_) => {
-                let tail = snapshot_stderr_tail(&stderr_buffer).await;
+                let tail = snapshot_stderr_tail(&self.stderr_buffer).await;
                 bail!(
                     "MCP server '{}' timed out listing tools (10s){}",
                     self.name,
@@ -266,7 +474,7 @@ impl McpClient {
                 );
             }
             Ok(Err(err)) => {
-                let tail = snapshot_stderr_tail(&stderr_buffer).await;
+                let tail = snapshot_stderr_tail(&self.stderr_buffer).await;
                 return Err(anyhow::Error::from(err)).with_context(|| {
                     format!(
                         "Failed to list tools for MCP server '{}'{}",
@@ -447,8 +655,25 @@ impl McpClient {
                         err,
                     );
 
+                    // Snapshot stderr tail BEFORE reconnect for the notice
+                    let stderr_tail = render_stderr_tail(&self.stderr_buffer);
+
                     *self.connected.write() = false;
                     self.service.write().take();
+
+                    // Emit Warning notice about the transport failure and reconnect attempt
+                    self.emit_notice(
+                        &format!("reconnect:{}", self.name),
+                        NoticeEvent::Warning(format!(
+                            "MCP server '{}' disconnected, reconnecting{}",
+                            self.name,
+                            if stderr_tail.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", stderr_tail.trim())
+                            }
+                        )),
+                    );
 
                     // Heal the connection for future calls (best-effort)
                     if let Err(reconnect_err) = self.connect().await {
@@ -456,6 +681,14 @@ impl McpClient {
                             "Failed to reconnect to MCP server '{}' after transport error: {}",
                             self.name,
                             reconnect_err,
+                        );
+                        // Emit Error notice about failed reconnect
+                        self.emit_notice(
+                            &format!("reconnect-failed:{}", self.name),
+                            NoticeEvent::Error(format!(
+                                "MCP server '{}' reconnection failed: {}",
+                                self.name, reconnect_err
+                            )),
                         );
                     }
 
@@ -1121,6 +1354,18 @@ pub struct McpManager {
     clients: Arc<RwLock<HashMap<String, Arc<McpClient>>>>,
 }
 
+/// Whether tool discovery on a short-lived runtime should invalidate the
+/// just-connected MCP services afterwards.
+///
+/// The ACP server runs on a current-thread runtime and re-runs discovery on
+/// every prompt; invalidating there would tear down freshly-connected MCP
+/// subprocesses each turn (see #988). It sets
+/// `HARNX_MCP_KEEP_SERVICES_AFTER_DISCOVERY=1` to opt out of invalidation.
+/// The multi-thread (TUI) path never reaches this code and is unaffected.
+fn should_invalidate_after_discovery() -> bool {
+    std::env::var_os("HARNX_MCP_KEEP_SERVICES_AFTER_DISCOVERY").is_none_or(|value| value != "1")
+}
+
 impl McpManager {
     pub fn new() -> Self {
         Self {
@@ -1130,6 +1375,21 @@ impl McpManager {
 
     pub fn get_client(&self, server_name: &str) -> Option<Arc<McpClient>> {
         self.clients.read().get(server_name).cloned()
+    }
+
+    /// Snapshot of the effective configs of the currently-registered clients,
+    /// sorted by server name. Used by the runtime to detect whether an agent
+    /// re-activation changed the effective MCP server set; if it hasn't, the
+    /// existing manager (and its live subprocesses) is preserved (see #988).
+    pub fn configs(&self) -> Vec<McpServerConfig> {
+        let mut configs: Vec<McpServerConfig> = self
+            .clients
+            .read()
+            .values()
+            .map(|client| client.config.clone())
+            .collect();
+        configs.sort_by(|left, right| left.name.cmp(&right.name));
+        configs
     }
 
     pub fn initialize(&self, configs: Vec<McpServerConfig>) {
@@ -1277,7 +1537,9 @@ impl McpManager {
                                 .build()
                                 .expect("create runtime for MCP tool discovery");
                             let tools = rt.block_on(fut());
-                            self.invalidate_all_services();
+                            if should_invalidate_after_discovery() {
+                                self.invalidate_all_services();
+                            }
                             tools
                         })
                         .join()
@@ -1289,7 +1551,9 @@ impl McpManager {
             match Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => {
                     let tools = runtime.block_on(fut());
-                    self.invalidate_all_services();
+                    if should_invalidate_after_discovery() {
+                        self.invalidate_all_services();
+                    }
                     tools
                 }
                 Err(err) => {
@@ -1396,7 +1660,8 @@ impl ToolProvider for McpManager {
 
 #[cfg(test)]
 mod selector_filter_tests {
-    use super::selector_could_match_server;
+    use super::{classify_exit, resolve_forwarded_log_path, selector_could_match_server};
+    use harnx_core::event::NoticeEvent;
 
     #[test]
     fn star_matches_every_server() {
@@ -1473,5 +1738,132 @@ mod selector_filter_tests {
             "context7",
             &targets
         ));
+    }
+
+    // --- Part A tests: log env forwarding ---
+
+    #[test]
+    fn test_resolve_forwarded_log_path_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs_path = if cfg!(windows) {
+            "C:\\logs\\app.log"
+        } else {
+            "/var/log/app.log"
+        };
+        let resolved = resolve_forwarded_log_path(abs_path, &cwd);
+        assert_eq!(resolved, abs_path);
+    }
+
+    #[test]
+    fn test_resolve_forwarded_log_path_relative() {
+        let cwd = std::env::current_dir().unwrap();
+        let resolved = resolve_forwarded_log_path("logs/app.log", &cwd);
+        let expected = cwd.join("logs/app.log");
+        assert_eq!(resolved, expected.to_string_lossy());
+    }
+
+    #[test]
+    fn test_resolve_forwarded_log_path_with_pid_template() {
+        let cwd = std::env::current_dir().unwrap();
+        let resolved = resolve_forwarded_log_path("logs/{pid}.log", &cwd);
+        let expected = cwd.join("logs/{pid}.log");
+        assert_eq!(resolved, expected.to_string_lossy());
+    }
+
+    #[test]
+    fn test_resolve_forwarded_log_path_with_pid_template_preserved() {
+        let cwd = std::env::current_dir().unwrap();
+        // The {pid} should be preserved, not expanded
+        let resolved = resolve_forwarded_log_path("app-{pid}.log", &cwd);
+        assert!(
+            resolved.contains("{pid}"),
+            "resolved path should preserve {{pid}} template: {}",
+            resolved
+        );
+        let expected = cwd.join("app-{pid}.log");
+        assert_eq!(resolved, expected.to_string_lossy());
+    }
+
+    // --- Part B tests: exit classification ---
+
+    #[test]
+    fn test_classify_exit_clean_exit_code_zero() {
+        let event = classify_exit("test-server", Some(0), None);
+        match event {
+            NoticeEvent::Warning(msg) => {
+                assert!(msg.contains("exited cleanly"));
+            }
+            _ => panic!("expected Warning for clean exit"),
+        }
+    }
+
+    #[test]
+    fn test_classify_exit_nonzero_code() {
+        let event = classify_exit("test-server", Some(3), None);
+        match event {
+            NoticeEvent::Error(msg) => {
+                assert!(msg.contains("exited with code 3"));
+            }
+            _ => panic!("expected Error for nonzero exit code"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_classify_exit_sigterm_warning() {
+        let event = classify_exit("test-server", None, Some(15));
+        match event {
+            NoticeEvent::Warning(msg) => {
+                assert!(msg.contains("terminated by SIGTERM"));
+            }
+            _ => panic!("expected Warning for SIGTERM"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_classify_exit_sigint_warning() {
+        let event = classify_exit("test-server", None, Some(2));
+        match event {
+            NoticeEvent::Warning(msg) => {
+                assert!(msg.contains("terminated by SIGINT"));
+            }
+            _ => panic!("expected Warning for SIGINT"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_classify_exit_sigkill_error() {
+        let event = classify_exit("test-server", None, Some(9));
+        match event {
+            NoticeEvent::Error(msg) => {
+                assert!(msg.contains("killed by SIGKILL"));
+            }
+            _ => panic!("expected Error for SIGKILL"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_classify_exit_unknown_signal_error() {
+        let event = classify_exit("test-server", None, Some(11)); // SIGSEGV
+        match event {
+            NoticeEvent::Error(msg) => {
+                assert!(msg.contains("died: signal 11"));
+            }
+            _ => panic!("expected Error for unknown signal"),
+        }
+    }
+
+    #[test]
+    fn test_classify_exit_no_status_error() {
+        let event = classify_exit("test-server", None, None);
+        match event {
+            NoticeEvent::Error(msg) => {
+                assert!(msg.contains("status unavailable"));
+            }
+            _ => panic!("expected Error for no status"),
+        }
     }
 }

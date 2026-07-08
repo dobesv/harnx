@@ -17,6 +17,7 @@ use harnx_core::event::{
 };
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::thread;
@@ -56,6 +57,41 @@ fn idle_activity_resets_timer(
         Err(broadcast::error::RecvError::Lagged(_)) => true,
         Err(broadcast::error::RecvError::Closed) => false,
     }
+}
+
+fn absolutize_log_path_template(path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn forwarded_log_env() -> HashMap<String, String> {
+    let mut env_map = HashMap::new();
+    if let Ok(level) = std::env::var("HARNX_LOG_LEVEL") {
+        if !level.is_empty() {
+            env_map.insert("HARNX_LOG_LEVEL".to_string(), level);
+        }
+    }
+    if let Ok(path) = std::env::var("HARNX_LOG_PATH") {
+        if !path.is_empty() {
+            env_map.insert(
+                "HARNX_LOG_PATH".to_string(),
+                absolutize_log_path_template(&path)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    env_map
+}
+
+fn apply_forwarded_log_env(env_map: &mut HashMap<String, String>) {
+    env_map.extend(forwarded_log_env());
 }
 
 pub struct AcpClient {
@@ -382,6 +418,10 @@ impl AcpClient {
 
     pub fn description(&self) -> Option<&str> {
         self.config.description.as_deref()
+    }
+
+    pub fn config(&self) -> &AcpServerConfig {
+        &self.config
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -713,12 +753,15 @@ async fn worker_main(
     mut abort_rx: oneshot::Receiver<()>,
     activity_tx: broadcast::Sender<String>,
 ) -> Result<()> {
+    let mut child_env = config.env.clone();
+    apply_forwarded_log_env(&mut child_env);
+
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .envs(&config.env)
+        .envs(&child_env)
         .kill_on_drop(true);
 
     #[cfg(unix)]
@@ -1971,6 +2014,81 @@ mod tests {
         assert!(
             !idle_activity_resets_timer(&result, "sess-1"),
             "a closed activity channel must NOT reset the idle timer"
+        );
+    }
+
+    #[test]
+    fn forwarded_log_env_absolutizes_relative_path_and_keeps_pid_template() {
+        let prev_level = std::env::var_os("HARNX_LOG_LEVEL");
+        let prev_path = std::env::var_os("HARNX_LOG_PATH");
+        let prev_cwd = std::env::current_dir().unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+
+        unsafe {
+            std::env::set_var("HARNX_LOG_LEVEL", "debug");
+            std::env::set_var("HARNX_LOG_PATH", "logs/harnx-{pid}.log");
+        }
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let env_map = forwarded_log_env();
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        match prev_level {
+            Some(value) => unsafe { std::env::set_var("HARNX_LOG_LEVEL", value) },
+            None => unsafe { std::env::remove_var("HARNX_LOG_LEVEL") },
+        }
+        match prev_path {
+            Some(value) => unsafe { std::env::set_var("HARNX_LOG_PATH", value) },
+            None => unsafe { std::env::remove_var("HARNX_LOG_PATH") },
+        }
+
+        assert_eq!(
+            env_map.get("HARNX_LOG_LEVEL").map(String::as_str),
+            Some("debug")
+        );
+        assert_eq!(
+            env_map.get("HARNX_LOG_PATH").map(String::as_str),
+            Some(
+                temp.path()
+                    .join("logs/harnx-{pid}.log")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+    }
+
+    #[test]
+    fn apply_forwarded_log_env_injects_explicit_harnx_log_vars() {
+        let prev_level = std::env::var_os("HARNX_LOG_LEVEL");
+        let prev_path = std::env::var_os("HARNX_LOG_PATH");
+        let temp = tempfile::TempDir::new().unwrap();
+        let absolute = temp.path().join("harnx.log");
+
+        unsafe {
+            std::env::set_var("HARNX_LOG_LEVEL", "debug");
+            std::env::set_var("HARNX_LOG_PATH", &absolute);
+        }
+
+        let mut env_map = HashMap::from([("EXISTING".to_string(), "value".to_string())]);
+        apply_forwarded_log_env(&mut env_map);
+
+        match prev_level {
+            Some(value) => unsafe { std::env::set_var("HARNX_LOG_LEVEL", value) },
+            None => unsafe { std::env::remove_var("HARNX_LOG_LEVEL") },
+        }
+        match prev_path {
+            Some(value) => unsafe { std::env::set_var("HARNX_LOG_PATH", value) },
+            None => unsafe { std::env::remove_var("HARNX_LOG_PATH") },
+        }
+
+        assert_eq!(env_map.get("EXISTING").map(String::as_str), Some("value"));
+        assert_eq!(
+            env_map.get("HARNX_LOG_LEVEL").map(String::as_str),
+            Some("debug")
+        );
+        assert_eq!(
+            env_map.get("HARNX_LOG_PATH").map(String::as_str),
+            Some(absolute.to_string_lossy().as_ref())
         );
     }
 

@@ -552,6 +552,25 @@ impl Config {
         Ok((log_level, Self::resolve_log_path(is_serve)))
     }
 
+    pub fn forwarded_log_env() -> HashMap<String, String> {
+        let mut env_map = HashMap::new();
+        if let Ok(level) = env::var(get_env_name("log_level")) {
+            if !level.is_empty() {
+                env_map.insert(get_env_name("log_level"), level);
+            }
+        }
+        if let Ok(path) = env::var(get_env_name("log_path")) {
+            if !path.is_empty() {
+                let absolute = Self::absolutize_log_path_template(&path);
+                env_map.insert(
+                    get_env_name("log_path"),
+                    absolute.to_string_lossy().into_owned(),
+                );
+            }
+        }
+        env_map
+    }
+
     /// Default log level when `log_level` is unset: `Debug` in debug builds,
     /// otherwise `Info` for serve mode and `Off` for interactive use.
     fn default_log_level(is_serve: bool) -> LevelFilter {
@@ -566,19 +585,39 @@ impl Config {
 
     /// Resolve the log file path: an explicit `log_path` env value wins;
     /// otherwise default to the state-dir log file (or none in serve mode).
+    /// Supports a `{pid}` token, expanded when the current process opens the log.
     fn resolve_log_path(is_serve: bool) -> Option<PathBuf> {
         if let Ok(v) = env::var(get_env_name("log_path")) {
             if !v.is_empty() {
-                return Some(PathBuf::from(v));
+                return Some(Self::expand_log_path_pid(
+                    Self::absolutize_log_path_template(&v),
+                ));
             }
         }
         if is_serve {
             return None;
         }
-        Some(paths::state_path(&format!(
+        Some(Self::expand_log_path_pid(paths::state_path(&format!(
             "{}.log",
             env!("CARGO_CRATE_NAME")
-        )))
+        ))))
+    }
+
+    pub fn absolutize_log_path_template(path: &str) -> PathBuf {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    }
+
+    pub fn expand_log_path_pid(path: PathBuf) -> PathBuf {
+        let pid = std::process::id().to_string();
+        let rendered = path.to_string_lossy().replace("{pid}", &pid);
+        PathBuf::from(rendered)
     }
 
     pub fn edit_config(&mut self) -> Result<()> {
