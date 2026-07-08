@@ -38,8 +38,11 @@ pub use nats_client_session::{
 pub use nats_worker::ControlCommand;
 
 pub use agent_loop::{
-    run_agent_loop, AgentCallFn, AgentLoopContext, OnTextResponseFn, OnToolRoundFn,
+    continue_agent_loop_from_tool_round, run_agent_loop, AgentCallFn, AgentLoopContext,
+    OnTextResponseFn, OnToolRoundFn, ToolApprovalDecision,
 };
+
+pub use tool::{ConfirmToolUseFn, ToolApprovalInterrupt, ToolUseConfirmation};
 
 /// Re-export for integration tests — verifies scoped-ACP display naming logic.
 pub use config::acp_server_display_name as acp_server_display_name_for_test;

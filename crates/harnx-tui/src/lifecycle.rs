@@ -512,18 +512,24 @@ impl Tui {
     fn install_tool_confirm_bridge(&self) {
         let event_tx = self.event_tx.clone();
         let confirm: std::sync::Arc<harnx_runtime::tool::ConfirmToolUseFn> = std::sync::Arc::new(
-            move |tool_name: &str, input: &serde_json::Value, reason: Option<&str>| {
+            move |call: &harnx_core::tool::ToolCall,
+                  input: &serde_json::Value,
+                  reason: Option<&str>| {
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
                 let event = TuiEvent::ConfirmToolUse {
-                    tool_name: tool_name.to_string(),
+                    tool_name: call.name.clone(),
                     input_preview: confirm_input_preview(input),
                     reason: reason.map(str::to_string),
                     reply: reply_tx,
                 };
                 if event_tx.send(event).is_err() {
-                    return false;
+                    return harnx_runtime::tool::ToolUseConfirmation::Deny { reason: None };
                 }
-                reply_rx.recv().unwrap_or(false)
+                if reply_rx.recv().unwrap_or(false) {
+                    harnx_runtime::tool::ToolUseConfirmation::Approve
+                } else {
+                    harnx_runtime::tool::ToolUseConfirmation::Deny { reason: None }
+                }
             },
         );
         self.config.write().set_tui_confirm_tool_use(Some(confirm));

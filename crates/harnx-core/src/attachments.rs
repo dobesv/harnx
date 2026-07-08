@@ -94,6 +94,38 @@ pub fn expand_passthrough_reference(reference: &str) -> ExpandedAttachment {
     }
 }
 
+pub fn store_attachment_bytes(dir: &Path, bytes: &[u8], mime_type: &str) -> Result<String> {
+    let ext = mime_type
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_ascii_lowercase();
+    let ext = match ext.as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "application/pdf" => "pdf",
+        "text/plain" => "txt",
+        _ => "bin",
+    };
+    let data = format!(
+        "data:{mime_type};base64,{}",
+        crate::crypto::base64_encode(bytes)
+    );
+    let cid = cid_for_data_url(&data);
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create attachments dir {}", dir.display()))?;
+    let hash = cid.trim_start_matches(CID_PREFIX);
+    let path = dir.join(format!("{hash}.{ext}"));
+    if !path.exists() {
+        std::fs::write(&path, bytes)
+            .with_context(|| format!("Failed to write attachment {}", path.display()))?;
+    }
+    Ok(cid)
+}
+
 pub fn read_attachment(dir: &Path, reference: &str) -> Result<(Vec<u8>, String)> {
     let hash = reference.strip_prefix(CID_PREFIX).ok_or_else(|| {
         anyhow::anyhow!("attachment reference must start with {CID_PREFIX}: {reference}")
@@ -209,6 +241,16 @@ mod tests {
         assert_eq!(cache.get_valid("cid:fresh", now), Some(entry));
     }
 
+    #[test]
+    fn store_attachment_bytes_round_trips_via_read_attachment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cid = store_attachment_bytes(tmp.path(), b"hello attachment", "image/png").unwrap();
+        assert!(cid.starts_with(CID_PREFIX));
+
+        let (bytes, mime_type) = read_attachment(tmp.path(), &cid).unwrap();
+        assert_eq!(bytes, b"hello attachment");
+        assert_eq!(mime_type, "image/png");
+    }
     #[test]
     fn attachment_cache_missing_cid_is_none() {
         let cache = AttachmentRefCache::new();

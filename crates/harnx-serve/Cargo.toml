@@ -30,10 +30,12 @@ harnx-render = { path = "../harnx-render" }
 harnx-runtime = { path = "../harnx-runtime" }
 harnx-session = { path = "../harnx-session" }
 http = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 log = { workspace = true }
+multer = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

@@ -393,7 +393,7 @@ impl Clone for Config {
             remote_agent: self.remote_agent.clone(),
             tui_before_editor: None,
             tui_after_editor: None,
-            tui_confirm_tool_use: None,
+            tui_confirm_tool_use: self.tui_confirm_tool_use.clone(),
             sessions_dir_override: self.sessions_dir_override.clone(),
             temp_dir_override: self.temp_dir_override.clone(),
         }
@@ -444,7 +444,7 @@ impl Config {
             // trying to clone `FnMut` trait objects.
             tui_before_editor: None,
             tui_after_editor: None,
-            tui_confirm_tool_use: None,
+            tui_confirm_tool_use: self.tui_confirm_tool_use.clone(),
             sessions_dir_override: self.sessions_dir_override.clone(),
             temp_dir_override: self.temp_dir_override.clone(),
         }

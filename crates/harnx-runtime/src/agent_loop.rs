@@ -112,6 +112,137 @@ pub struct AgentLoopContext {
     pub working_dir: Option<PathBuf>,
 }
 
+/// Resume a tool round that was interrupted for approval.
+///
+/// This is the continuation seam for Design B interrupt/resume:
+/// - Takes saved assistant output/thought from the interrupted round
+/// - Takes the pending ToolCalls that were deferred
+/// - Takes resolved approve/deny decisions for each call
+/// - Executes the approved calls with a preseeded confirm function
+/// - Persists ToolResults via existing session helpers
+/// - Continues the canonical loop from the post-tool state
+pub async fn continue_agent_loop_from_tool_round(
+    ctx: &AgentLoopContext,
+    mut input: Input,
+    output: String,
+    thought: Option<String>,
+    tool_calls: Vec<ToolCall>,
+    decisions: Vec<ToolApprovalDecision>,
+    pending_interrupt_ids: std::collections::BTreeSet<String>,
+) -> Result<()> {
+    use crate::tool::ToolApprovalInterrupt;
+
+    let config = &ctx.config;
+    let abort_signal = &ctx.abort_signal;
+
+    // Build a preseeded confirm function that returns decisions for known call IDs.
+    let decisions = std::sync::Arc::new(decisions);
+    let decisions_for_confirm = std::sync::Arc::clone(&decisions);
+    let confirm_override: std::sync::Arc<crate::tool::ConfirmToolUseFn> = std::sync::Arc::new(
+        move |call: &ToolCall, _args: &serde_json::Value, reason: Option<&str>| {
+            if let Some(call_id) = call.id.as_deref() {
+                if let Some(decision) = decisions_for_confirm
+                    .iter()
+                    .find(|d| d.tool_call_id == call_id)
+                {
+                    return if decision.approved {
+                        crate::tool::ToolUseConfirmation::Approve
+                    } else {
+                        crate::tool::ToolUseConfirmation::Deny {
+                            reason: decision
+                                .reason
+                                .clone()
+                                .or_else(|| reason.map(str::to_string)),
+                        }
+                    };
+                }
+                if !pending_interrupt_ids.contains(call_id) {
+                    return crate::tool::ToolUseConfirmation::Approve;
+                }
+            }
+            crate::tool::ToolUseConfirmation::Defer
+        },
+    );
+
+    // Install the override for this resumption
+    config
+        .write()
+        .set_tui_confirm_tool_use(Some(confirm_override));
+
+    // Execute full pending tool round using normal helper. Deferred calls resolve via
+    // preseeded confirm function; already-approved calls execute normally.
+    let tool_results = match crate::tool::execute_tool_round_with_persistence(
+        config,
+        &input,
+        &crate::tool::CompletionText {
+            output: &output,
+            thought: thought.as_deref(),
+        },
+        tool_calls,
+        abort_signal,
+        &ctx.persistent_manager,
+        ctx.working_dir.as_deref(),
+        crate::tool::ToolRoundPersistence::REUSE_EXISTING_CALLS,
+    )
+    .await
+    {
+        Ok(results) => results,
+        Err(err) => {
+            // If we hit another interrupt, propagate it (shouldn't happen with preseeded decisions)
+            if ToolApprovalInterrupt::from_error(&err).is_some() {
+                return Err(err);
+            }
+            // Other errors: propagate
+            return Err(err);
+        }
+    };
+
+    // Merge tool results into input for the next round
+    if !tool_results.is_empty() {
+        let switch_agent = tool_results.iter().find_map(|v| v.switch_agent.clone());
+        let mut merged_input =
+            input.merge_tool_results(output.clone(), thought.clone(), tool_results.clone());
+
+        // Invoke on_tool_round callback
+        if let Some(ref cb) = ctx.on_tool_round {
+            cb(&mut merged_input, &tool_results).await;
+        }
+
+        // Handle agent switch
+        if let Some(switch) = switch_agent {
+            config.write().exit_agent()?;
+            crate::config::Config::use_agent(
+                config,
+                &switch.agent,
+                switch.session_id.as_deref(),
+                abort_signal.clone(),
+            )
+            .await?;
+            if config.read().session.is_some() {
+                config.write().empty_session()?;
+            }
+            let new_input = crate::config::input::from_str(config, &switch.prompt, None);
+            return run_agent_loop(ctx, new_input).await;
+        }
+
+        input = merged_input;
+    }
+
+    // Continue the canonical loop from post-tool state
+    run_agent_loop(ctx, input).await
+}
+
+/// A resolved approval decision for a single pending tool call.
+#[derive(Debug, Clone)]
+pub struct ToolApprovalDecision {
+    /// The tool call ID being resolved.
+    pub tool_call_id: String,
+    /// Whether the call was approved.
+    pub approved: bool,
+    /// Optional reason for denial.
+    pub reason: Option<String>,
+}
+
 /// Run the canonical agent loop.
 ///
 /// Executes: embeddings → async-hook drain → `before_chat_completion` →

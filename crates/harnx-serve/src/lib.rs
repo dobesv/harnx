@@ -22,10 +22,14 @@ use log::{debug, error, info};
 use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures_util::stream::StreamExt;
+use harnx_core::attachments::store_attachment_bytes;
 use http::{Method, Response, StatusCode};
+use http_body::Body;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use multer::Multipart;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -35,13 +39,11 @@ use tokio_graceful::Shutdown;
 
 const DEFAULT_MODEL_NAME: &str = "default";
 
-type AppResponse = Response<BoxBody<Bytes, Infallible>>;
+/// Maximum upload size in bytes (20 MiB).
+/// Enforced during streaming to prevent OOM from oversized payloads.
+pub const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
-// Helper trait for test request bodies
-#[doc(hidden)]
-pub trait IntoIncoming {
-    fn into_incoming(self) -> Incoming;
-}
+type AppResponse = Response<BoxBody<Bytes, Infallible>>;
 
 pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
     let addr = match addr {
@@ -206,6 +208,8 @@ impl Server {
                 PersistenceKind::Nats
             };
             handle_ag_ui_rpc(req, &self.config, &self.session_registry, persistence).await
+        } else if is_session_attachments_path(path) {
+            self.upload_session_attachments(req).await
         } else if path.starts_with("/v1/agents/") {
             self.handle_agent_tree(req).await
         } else if path == "/v1/rags" {
@@ -326,6 +330,117 @@ impl Server {
 
     fn sessions_json(&self, agent: &str) -> Result<AppResponse> {
         json_response(Value::Array(agent_sessions_json(&self.config, agent)?))
+    }
+
+    async fn upload_session_attachments<B>(&self, req: hyper::Request<B>) -> Result<AppResponse>
+    where
+        B: Body<Data = Bytes> + Send + Unpin,
+        <B as Body>::Error: std::fmt::Display,
+    {
+        if req.method() != Method::POST {
+            bail!("Method Not Allowed");
+        }
+        let path = req.uri().path().to_string();
+        let (agent, session) =
+            parse_session_attachments_path(&path).ok_or_else(|| anyhow!("Not Found"))?;
+
+        // Check Content-Length header first (early rejection for oversized payloads)
+        if let Some(length) = req
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            if length > MAX_UPLOAD_BYTES {
+                return json_response_with_status(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
+                );
+            }
+        }
+
+        let Some(boundary) = multer::parse_boundary(
+            req.headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow!("Bad Request"))?,
+        )
+        .ok() else {
+            bail!("Bad Request");
+        };
+        let scoped = agent_scoped_config(&self.config, agent)?;
+        let session_path = scoped.session_file(session);
+        let attachments_dir = session_path.with_extension("attachments");
+
+        // Stream body with size limit to prevent OOM
+        let body = req.into_body();
+        let mut cumulative: usize = 0;
+        let mut chunks: Vec<Bytes> = Vec::new();
+        let mut body_stream = body.into_data_stream();
+
+        while let Some(chunk_result) = body_stream.next().await {
+            let chunk = chunk_result.map_err(|e| anyhow!("Failed to read body: {}", e))?;
+            cumulative += chunk.len();
+            if cumulative > MAX_UPLOAD_BYTES {
+                return json_response_with_status(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    json!({"error":"payload too large","max_bytes":MAX_UPLOAD_BYTES}),
+                );
+            }
+            chunks.push(chunk);
+        }
+
+        let body_bytes = chunks.into_iter().flatten().collect::<Vec<u8>>();
+        let stream = futures_util::stream::once(async move {
+            Ok::<Bytes, std::io::Error>(Bytes::from(body_bytes))
+        });
+        let mut multipart = Multipart::new(stream, boundary);
+        let mut refs = Vec::new();
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|err| anyhow!("Bad Request: {err}"))?
+        {
+            let name = field.name().unwrap_or_default().to_string();
+            if name != "attachment" && name != "attachments" && name != "file" {
+                continue;
+            }
+            let mime = field
+                .content_type()
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let field_name = field.name().unwrap_or_default().to_string();
+            match mime.as_str() {
+                "image/png" | "image/jpeg" | "image/webp" | "image/gif" | "application/pdf"
+                | "text/plain" => {}
+                _ => {
+                    return json_response_with_status(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        json!({"error":"unsupported attachment content type","field": field_name, "content_type":mime}),
+                    );
+                }
+            }
+            let data = field
+                .bytes()
+                .await
+                .map_err(|err| anyhow!("Bad Request: {err}"))?;
+            if data.len() > MAX_UPLOAD_BYTES {
+                return json_response_with_status(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    json!({"error":"attachment too large","max_bytes":MAX_UPLOAD_BYTES}),
+                );
+            }
+            refs.push(store_attachment_bytes(&attachments_dir, &data, &mime)?);
+        }
+        if refs.is_empty() {
+            return json_response_with_status(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"no attachment parts found"}),
+            );
+        }
+        json_response(
+            json!({"attachment_refs": refs, "attachments": refs.iter().map(|cid| json!({"cid": cid})).collect::<Vec<_>>() }),
+        )
     }
 
     fn session_history_json(&self, agent: &str, session: &str) -> Result<AppResponse> {
@@ -646,6 +761,32 @@ fn is_agent_rpc_path(path: &str) -> bool {
     matches!(segments.as_slice(), [_agent, "rpc"])
 }
 
+fn is_session_attachments_path(path: &str) -> bool {
+    let Some(suffix) = path.strip_prefix("/v1/agents/") else {
+        return false;
+    };
+    let segments: Vec<_> = suffix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    matches!(
+        segments.as_slice(),
+        [_agent, "sessions", _session, "attachments"]
+    )
+}
+
+fn parse_session_attachments_path(path: &str) -> Option<(&str, &str)> {
+    let suffix = path.strip_prefix("/v1/agents/")?;
+    let segments: Vec<_> = suffix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    match segments.as_slice() {
+        [agent, "sessions", session, "attachments"] => Some((agent, session)),
+        _ => None,
+    }
+}
+
 fn negotiate_agents_route(
     method: &Method,
     headers: &http::HeaderMap,
@@ -788,6 +929,14 @@ fn json_response(data: Value) -> Result<AppResponse> {
     Ok(res)
 }
 
+fn json_response_with_status(status: StatusCode, data: Value) -> Result<AppResponse> {
+    let res = Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .body(Full::new(Bytes::from(data.to_string())).boxed())?;
+    Ok(res)
+}
+
 fn ag_ui_error_to_anyhow(err: AgUiError) -> anyhow::Error {
     anyhow!(format!("{}::__status={}", err, err.status_code().as_u16()))
 }
@@ -846,6 +995,21 @@ mod tests {
             "/v1/agents/hephaestus/sessions/thread-1"
         ));
         assert!(!is_agent_rpc_path("/v1/models"));
+    }
+
+    #[test]
+    fn session_attachments_path_matches_only_attachment_route() {
+        assert!(is_session_attachments_path(
+            "/v1/agents/hephaestus/sessions/thread-1/attachments"
+        ));
+        assert_eq!(
+            parse_session_attachments_path("/v1/agents/hephaestus/sessions/thread-1/attachments"),
+            Some(("hephaestus", "thread-1"))
+        );
+        assert!(!is_session_attachments_path("/v1/agents/hephaestus/rpc"));
+        assert!(!is_session_attachments_path(
+            "/v1/agents/hephaestus/sessions/thread-1"
+        ));
     }
 
     #[test]
@@ -1179,5 +1343,255 @@ mod tests {
                 json!({"id": "seq:8:0", "role": "tool", "content": "tool text"}),
             ]
         );
+    }
+
+    // ===== Attachment upload endpoint tests (B5) =====
+
+    /// Helper to build a multipart/form-data body
+    fn build_multipart_body(boundary: &str, parts: &[(&str, &str, &str, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, filename, content_type, data) in parts {
+            body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+            body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                    name, filename
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes());
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+        body
+    }
+
+    /// Helper to build and execute an upload request through the real handler
+    async fn call_upload_handler(
+        server: Arc<Server>,
+        path: &str,
+        boundary: &str,
+        body: Vec<u8>,
+        content_length: Option<usize>,
+    ) -> Result<AppResponse> {
+        // Build a proper multipart/form-data request
+        let mut builder = hyper::Request::builder().method("POST").uri(path).header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={}", boundary),
+        );
+
+        if let Some(len) = content_length {
+            builder = builder.header("Content-Length", len);
+        }
+
+        let req = builder.body(Full::new(Bytes::from(body)).boxed())?;
+
+        // Call the real handler
+        server.upload_session_attachments(req).await
+    }
+
+    #[test]
+    fn upload_attachments_success_returns_cid_refs() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Arc::new(Server::new(&config));
+
+        let boundary = "boundary123";
+        let image_data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]; // PNG magic bytes
+        let body = build_multipart_body(
+            boundary,
+            &[("attachment", "test.png", "image/png", &image_data)],
+        );
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let response = rt
+            .block_on(call_upload_handler(
+                server,
+                "/v1/agents/plain/sessions/test-session/attachments",
+                boundary,
+                body,
+                None,
+            ))
+            .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = rt
+            .block_on(http_body_util::BodyExt::collect(response.into_body()))
+            .expect("collect body")
+            .to_bytes();
+        let json: Value = serde_json::from_slice(&body_bytes).expect("parse json");
+
+        assert!(json.get("attachment_refs").is_some());
+        assert!(json.get("attachments").is_some());
+        let refs = json
+            .get("attachment_refs")
+            .unwrap()
+            .as_array()
+            .expect("refs array");
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].as_str().unwrap().starts_with("cid:"));
+
+        // Verify file was stored in attachments directory
+        // Note: The handler uses agent_scoped_config which scopes the config for the agent,
+        // so we need to use the scoped config to find the session path
+        let scoped = agent_scoped_config(&config.read(), "plain").expect("scope config");
+        let session_path = scoped.session_file("test-session");
+        let attachments_dir = session_path.with_extension("attachments");
+        assert!(
+            attachments_dir.exists(),
+            "attachments dir should exist at {:?}",
+            attachments_dir
+        );
+    }
+
+    #[test]
+    fn upload_attachments_malformed_multipart_returns_400() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Arc::new(Server::new(&config));
+
+        // Build a malformed multipart body (missing proper headers)
+        let boundary = "boundary123";
+        let invalid_body = b"--boundary123\r\nnot-a-valid-part\r\n--boundary123--\r\n".to_vec();
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let response = rt.block_on(call_upload_handler(
+            server,
+            "/v1/agents/plain/sessions/test-session/attachments",
+            boundary,
+            invalid_body,
+            None,
+        ));
+
+        // Handler returns Err for malformed multipart, which gets converted to BAD_REQUEST
+        match response {
+            Ok(resp) => {
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            }
+            Err(_) => {
+                // Error case is acceptable - handler bubbles up "Bad Request" error
+            }
+        }
+    }
+
+    #[test]
+    fn upload_attachments_no_parts_returns_400() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Arc::new(Server::new(&config));
+
+        // Build a valid multipart with no attachment fields (field named "other")
+        let boundary = "boundary123";
+        let body = {
+            let mut b = Vec::new();
+            b.extend_from_slice(b"--boundary123\r\n");
+            b.extend_from_slice(
+                b"Content-Disposition: form-data; name=\"other\"; filename=\"test.txt\"\r\n",
+            );
+            b.extend_from_slice(b"Content-Type: text/plain\r\n\r\n");
+            b.extend_from_slice(b"data");
+            b.extend_from_slice(b"\r\n--boundary123--\r\n");
+            b
+        };
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let response = rt
+            .block_on(call_upload_handler(
+                server,
+                "/v1/agents/plain/sessions/test-session/attachments",
+                boundary,
+                body,
+                None,
+            ))
+            .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn upload_attachments_oversized_returns_413() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Arc::new(Server::new(&config));
+
+        // Build a multipart body that exceeds MAX_UPLOAD_BYTES
+        let boundary = "boundary123";
+        let oversized_data = vec![0u8; MAX_UPLOAD_BYTES + 1024];
+        let body = build_multipart_body(
+            boundary,
+            &[("attachment", "test.png", "image/png", &oversized_data)],
+        );
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let response = rt
+            .block_on(call_upload_handler(
+                server,
+                "/v1/agents/plain/sessions/test-session/attachments",
+                boundary,
+                body,
+                None,
+            ))
+            .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn upload_attachments_oversized_content_length_header_returns_413_early() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Arc::new(Server::new(&config));
+
+        // Build a request with a Content-Length header that exceeds MAX_UPLOAD_BYTES
+        let boundary = "boundary123";
+        let body = vec![0u8; 100]; // Small body, but Content-Length header says it's huge
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let response = rt
+            .block_on(call_upload_handler(
+                server,
+                "/v1/agents/plain/sessions/test-session/attachments",
+                boundary,
+                body,
+                Some(MAX_UPLOAD_BYTES + 1), // Oversized Content-Length header
+            ))
+            .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn upload_attachments_unsupported_content_type_returns_415() {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        let server = Arc::new(Server::new(&config));
+
+        // Build a multipart with an unsupported MIME type
+        let boundary = "boundary123";
+        let data = b"some binary data".to_vec();
+        let body = build_multipart_body(
+            boundary,
+            &[("attachment", "test.exe", "application/octet-stream", &data)],
+        );
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let response = rt
+            .block_on(call_upload_handler(
+                server,
+                "/v1/agents/plain/sessions/test-session/attachments",
+                boundary,
+                body,
+                None,
+            ))
+            .expect("handler response");
+
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 }

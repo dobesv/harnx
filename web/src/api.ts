@@ -57,6 +57,50 @@ export async function cancel(agent: string, session: string): Promise<CancelResu
   return json.result as CancelResult;
 }
 
+export async function uploadAttachment(agent: string, session: string, file: File): Promise<string[]> {
+  const formData = new FormData();
+  formData.append('attachment', file);
+  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}/attachments`, {
+    method: 'POST',
+    body: formData
+  });
+  if (!res.ok) {
+    let msg = res.statusText;
+    try {
+      const j = await res.json();
+      if (j.error) msg = j.error;
+    } catch {}
+    throw new Error(`Upload failed (${res.status}): ${msg}`);
+  }
+  const json = await res.json();
+  return json.attachment_refs || [];
+}
+
+export async function prompt(agent: string, session: string, text: string, attachment_refs?: string[], resume?: any[]): Promise<any> {
+  const params: any = { text, attachment_refs: attachment_refs || [] };
+  if (resume) {
+    params.resume = resume;
+  }
+  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}/rpc`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: Date.now(),
+      method: 'session/prompt',
+      params
+    })
+  });
+  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
+  const json = await res.json() as JsonRpcResponse<any>;
+  if (json.error) {
+    throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
+  }
+  return json.result;
+}
+
 export function newSessionId(): string {
   return crypto.randomUUID();
 }
