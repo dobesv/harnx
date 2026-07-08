@@ -1089,6 +1089,24 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+    - name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 2
+      output_price: 10
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-sonnet-5:thinking
+      real_name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
 
 # Links:
 #  - https://docs.mistral.ai/getting-started/models/models_overview/
@@ -2434,6 +2452,42 @@
       supports_tool_use: true
       patches:
       - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+    - name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 2
+      output_price: 10
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-sonnet-5:thinking
+      real_name: claude-sonnet-5
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
+    - name: claude-sonnet-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 128000
+      input_price: 2
+      output_price: 10
+      supports_vision: true
+      supports_tool_use: true
+    - name: claude-sonnet-5@default:thinking
+      real_name: claude-sonnet-5@default
+      max_input_tokens: 1000000
+      max_output_tokens: 24000
+      require_max_tokens: true
+      input_price: 2
+      output_price: 10
+      supports_vision: true
+      supports_tool_use: true
+      patches:
+      - del(.body.temperature) | del(.body.top_p) | .body.thinking = {"type":"enabled","budget_tokens":16000}
     - name: codestral-2
       max_input_tokens: 128000
       max_output_tokens: 128000
@@ -3514,6 +3568,20 @@
 #  - https://cloud.tencent.com/document/product/1729/111007
 - provider: hunyuan
   models:
+    - name: deepseek-v4-flash
+      max_input_tokens: 1000000
+      max_output_tokens: 384000
+      input_price: 0.14
+      output_price: 0.28
+      supports_vision: false
+      supports_tool_use: true
+    - name: deepseek-v4-pro
+      max_input_tokens: 1000000
+      max_output_tokens: 384000
+      input_price: 0.435
+      output_price: 0.87
+      supports_vision: false
+      supports_tool_use: true
     - name: hunyuan-2.0-instruct-20251111
       max_input_tokens: 131072
       input_price: 0.112
