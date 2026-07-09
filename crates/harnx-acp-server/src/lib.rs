@@ -17,11 +17,16 @@ mod test_regression_issue_68;
 
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::*;
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, ToolEvent, UserEvent};
+use harnx_core::event::{AgentEvent, AgentSource, ModelEvent, NoticeEvent, ToolEvent, UserEvent};
 use harnx_runtime::config::GlobalConfig;
 use harnx_runtime::utils::{AbortSignal, AbortSignalInner};
+
+/// Idle session reaper TTL: evict SessionContexts idle > 15 minutes.
+const SESSION_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Update payloads forwarded from the per-prompt `AcpChunkSink` to the
 /// local `fwd_task`. Each variant carries the original `AgentSource` so
@@ -29,6 +34,7 @@ use harnx_runtime::utils::{AbortSignal, AbortSignalInner};
 /// which agent (parent vs. some sub-agent) actually produced the event;
 /// the parent's `AcpNotificationClient::resolve_notification_source`
 /// reads that meta to render the right `> agent ▸ session` heading.
+#[derive(Debug)]
 enum AcpForward {
     /// Text chunk for `SessionUpdate::AgentMessageChunk`.
     Text(String, Option<AgentSource>),
@@ -88,7 +94,10 @@ impl harnx_core::event::AgentEventSink for AcpChunkSink {
 /// Map an `AgentEvent` to the `AcpForward` it should produce, or `None`
 /// when the event carries no forwardable payload (e.g. empty text). Kept
 /// as a free function so `AcpChunkSink::emit` stays a trivial dispatch.
-fn event_to_forward(event: AgentEvent, source: Option<AgentSource>) -> Option<AcpForward> {
+pub(crate) fn event_to_forward(
+    event: AgentEvent,
+    source: Option<AgentSource>,
+) -> Option<AcpForward> {
     match event {
         AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
             let text: String = blocks
@@ -144,50 +153,124 @@ fn event_to_forward(event: AgentEvent, source: Option<AgentSource>) -> Option<Ac
             markdown,
             source,
         }),
+        // Only surface Warning/Error notices to ACP clients — these carry the
+        // #990 MCP server restart/death signals. Info notices are a
+        // presentation-layer artifact (nested sub-agent activity headings
+        // routed through NestedAcpEvent::Text → NoticeEvent::Info) and must
+        // NOT leak into the ACP message stream, or they corrupt the transcript
+        // (regression guarded by tmux_e2e::nested_sub_agent_activity_no_duplicates).
+        AgentEvent::Notice(notice) => {
+            let forwarded = match notice {
+                NoticeEvent::Info(_) => None,
+                NoticeEvent::Warning(m) => (!m.is_empty()).then_some(("⚠", m)),
+                NoticeEvent::Error(m) => (!m.is_empty()).then_some(("🔴", m)),
+            };
+            forwarded.map(|(prefix, msg)| AcpForward::Text(format!("{prefix} {msg}"), source))
+        }
         _ => None,
+    }
+}
+
+/// Per-session context owned by HarnxAgent.
+///
+/// Holds a forked GlobalConfig with its OWN McpManager/AcpManager, set up once
+/// at session creation (or lazy resume). The managers persist for the lifetime
+/// of this SessionContext, so MCP subprocesses stay alive across prompts.
+///
+/// Mirrors the NATS worker's per-session config pattern: fork once, reuse
+/// for every turn in the session.
+pub struct SessionContext {
+    /// Session ID (matches the on-disk session log filename).
+    pub session_id: String,
+    /// Forked config with agent+session bound, owning its own managers.
+    pub config: GlobalConfig,
+    /// Abort signal for cancellation.
+    pub abort_signal: AbortSignal,
+    /// Fires when the session receives an ACP `session/cancel` notification.
+    pub cancel_notify: Arc<tokio::sync::Notify>,
+    /// Serializes prompts targeting this session.
+    pub prompt_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Last activity timestamp for idle reaper.
+    last_activity: parking_lot::Mutex<Instant>,
+}
+
+impl Drop for SessionContext {
+    fn drop(&mut self) {
+        debug!(
+            "SessionContext drop: session_id={} — managers will be torn down",
+            self.session_id
+        );
+        // The Arc<SessionContext> drop triggers Config drop, which drops
+        // McpManager → clients.clear() → drops Arc<McpClient> → stdin closes
+        // → MCP subprocess exits.
+    }
+}
+
+impl SessionContext {
+    fn new(session_id: String, config: GlobalConfig) -> Self {
+        Self {
+            session_id,
+            config,
+            abort_signal: AbortSignalInner::new(),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            last_activity: parking_lot::Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Update the last activity timestamp. Called whenever the session sees
+    /// activity: at prompt start, when a prompt stops (completion OR
+    /// cancellation), and on a `session/cancel` notification.
+    fn touch(&self) {
+        *self.last_activity.lock() = Instant::now();
+    }
+
+    /// Test-only: force last activity far enough into the past that the idle
+    /// TTL is considered elapsed, so reaper decisions can be exercised without
+    /// sleeping for the real TTL.
+    #[cfg(test)]
+    fn mark_idle_for_test(&self) {
+        *self.last_activity.lock() = Instant::now()
+            .checked_sub(SESSION_IDLE_TTL + Duration::from_secs(1))
+            .expect("subtract TTL from now");
+    }
+
+    /// Check if this session is currently running a prompt.
+    fn is_running(&self) -> bool {
+        // If we can NOT acquire the lock, a prompt is running.
+        // try_lock returns Ok(MutexGuard) if successful (no lock held),
+        // Err(TryLockError) if locked (prompt running).
+        self.prompt_lock.try_lock().is_err()
+    }
+
+    /// Check if the idle TTL has elapsed.
+    fn is_idle_expired(&self) -> bool {
+        self.last_activity.lock().elapsed() >= SESSION_IDLE_TTL
+    }
+
+    /// Whether the idle reaper should evict this session: it must be idle past
+    /// the TTL AND have no in-flight prompt. A running prompt (prompt_lock held)
+    /// is never reaped, so its live MCP subprocesses aren't pulled out from
+    /// under it.
+    fn should_reap(&self) -> bool {
+        self.is_idle_expired() && !self.is_running()
     }
 }
 
 pub struct HarnxAgent {
     agent_name: String,
-    config: GlobalConfig,
-    sessions: Arc<tokio::sync::Mutex<HashMap<String, HarnxSession>>>,
+    /// Base config to fork from for each new session.
+    base_config: GlobalConfig,
+    /// Active sessions keyed by session_id.
+    sessions: Arc<tokio::sync::Mutex<HashMap<String, Arc<SessionContext>>>>,
     connection: Arc<tokio::sync::Mutex<Option<acp::ConnectionTo<acp::Client>>>>,
-}
-
-#[derive(Clone)]
-struct HarnxSession {
-    abort_signal: AbortSignal,
-    /// Fires when the session receives an ACP `session/cancel` notification.
-    /// We use `notify_one` (rather than `notify_waiters`) so a cancel that
-    /// arrives in the tiny window between the prompt handler entering and
-    /// its `.notified()` future being polled still fires — the permit is
-    /// held until the next listener observes it.
-    ///
-    /// Known limitation: a cancel that arrives AFTER a prompt returns and
-    /// BEFORE the next prompt starts will be consumed by the next prompt's
-    /// first `.notified()` poll. Drain-at-entry was attempted but racing
-    /// the drain against a concurrent cancel is itself unsound (polling a
-    /// Notified registers a waiter that can absorb a concurrent
-    /// notify_one even after we drop it). In practice cancel notifications
-    /// are only sent while a prompt is active, so this case isn't
-    /// exercised by any test.
-    cancel_notify: Arc<tokio::sync::Notify>,
-    /// Serializes prompts that target THIS session. Prompts to *different*
-    /// sessions still run fully concurrently (each holds its own lock).
-    /// Without this, two concurrent prompts with the same `session_id` would
-    /// each fork their own in-memory `Session`, independently load the same
-    /// on-disk log, and clobber each other's appends (last-writer-wins). The
-    /// lock makes the load → run → persist cycle for one session atomic with
-    /// respect to other prompts on the same session.
-    prompt_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl HarnxAgent {
     pub fn new(agent_name: String, config: GlobalConfig) -> Self {
         Self {
             agent_name,
-            config,
+            base_config: config,
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             connection: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -197,30 +280,30 @@ impl HarnxAgent {
         *self.connection.lock().await = Some(conn);
     }
 
-    /// Build the local-agent turn input: select the agent + session on the
-    /// forked prompt config, resolve agent variables, and construct the `Input`
-    /// from the user's prompt text. Only used for local agent refs (remote
-    /// thin-client mode drives the turn over NATS instead).
-    fn build_local_input(
-        &self,
-        prompt_config: &GlobalConfig,
-        session_key: &str,
-        prompt_text: &str,
-    ) -> acp::Result<harnx_runtime::config::Input> {
+    /// Build a per-session config: fork base, set agent+session.
+    /// Called once at session creation (new_session) and at lazy resume.
+    fn build_session_config(&self, session_id: &str) -> acp::Result<GlobalConfig> {
+        let config = harnx_session::fork_prompt_config(&self.base_config.read().clone());
         {
-            let mut config = prompt_config.write();
-            config
-                .use_agent_by_name(&self.agent_name)
+            let mut cfg = config.write();
+            cfg.use_agent_by_name(&self.agent_name)
                 .map_err(|e| acp::Error::new(-32603, format!("Failed to set agent: {e}")))?;
-            config
-                .use_session(Some(session_key))
+            cfg.use_session(Some(session_id))
                 .map_err(|e| acp::Error::new(-32603, format!("Failed to use session: {e}")))?;
         }
+        Ok(config)
+    }
 
-        // Build a fresh agent for the input. The forked prompt config keeps
-        // per-request session state isolated while still sharing Arc-backed
-        // runtime resources cloned from the base config.
-        let mut agent = prompt_config
+    /// Build the local-agent turn input from an already-configured session.
+    fn build_local_input_from_config(
+        &self,
+        session_config: &GlobalConfig,
+        _session_key: &str,
+        prompt_text: &str,
+    ) -> acp::Result<harnx_runtime::config::Input> {
+        // Agent and session are already set on session_config.
+        // Build a fresh agent for the input.
+        let mut agent = session_config
             .read()
             .retrieve_agent(&self.agent_name)
             .map_err(|e| acp::Error::new(-32603, format!("Failed to retrieve agent: {e}")))?;
@@ -231,8 +314,8 @@ impl HarnxAgent {
             );
         }
 
-        let mut input = harnx_runtime::config::input::from_str(prompt_config, prompt_text, None);
-        harnx_runtime::config::input::set_agent(&mut input, prompt_config, agent.into_config());
+        let mut input = harnx_runtime::config::input::from_str(session_config, prompt_text, None);
+        harnx_runtime::config::input::set_agent(&mut input, session_config, agent.into_config());
         Ok(input)
     }
 }
@@ -252,39 +335,40 @@ impl HarnxAgent {
     }
 
     async fn new_session(&self, _args: NewSessionRequest) -> acp::Result<NewSessionResponse> {
-        let session_id;
-        {
-            let mut config = self.config.write();
-            if config.session.is_some() {
-                config
-                    .exit_session()
+        // Create a new session id and config (managers set up once here).
+        let session_id = {
+            let mut base = self.base_config.write();
+            if base.session.is_some() {
+                base.exit_session()
                     .map_err(|e| acp::Error::new(-32603, format!("Failed to exit session: {e}")))?;
             }
-            config
-                .use_agent_by_name(&self.agent_name)
+            base.use_agent_by_name(&self.agent_name)
                 .map_err(|e| acp::Error::new(-32603, format!("Failed to set agent: {e}")))?;
-            config
-                .use_session(None)
+            base.use_session(None)
                 .map_err(|e| acp::Error::new(-32603, format!("Failed to create session: {e}")))?;
-            session_id = config
+            let id = base
                 .session
                 .as_ref()
                 .expect("session must exist after use_session(None)")
                 .id
                 .clone();
-            config
-                .exit_session()
+            base.exit_session()
                 .map_err(|e| acp::Error::new(-32603, format!("Failed to persist session: {e}")))?;
-        }
-        let session = HarnxSession {
-            abort_signal: AbortSignalInner::new(),
-            cancel_notify: Arc::new(tokio::sync::Notify::new()),
-            prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            id
         };
+
+        // Build the per-session config with its own managers.
+        let session_config = self.build_session_config(&session_id)?;
+        let ctx = Arc::new(SessionContext::new(session_id.clone(), session_config));
+
         self.sessions
             .lock()
             .await
-            .insert(session_id.clone(), session);
+            .insert(session_id.clone(), ctx.clone());
+
+        // Start the idle reaper task (spawns once per session, exits when ctx drops).
+        self.spawn_idle_reaper(ctx);
+
         Ok(NewSessionResponse::new(SessionId::new(session_id)))
     }
 
@@ -292,52 +376,31 @@ impl HarnxAgent {
         let session_key = args.session_id.0.to_string();
         let prompt_text = prompt_blocks_to_text(&args.prompt);
 
-        let (abort_signal, cancel_notify, prompt_lock) = {
-            let sessions = self.sessions.lock().await;
-            let session = sessions
-                .get(session_key.as_str())
-                .ok_or_else(acp::Error::invalid_params)?;
-            (
-                session.abort_signal.clone(),
-                session.cancel_notify.clone(),
-                session.prompt_lock.clone(),
-            )
-        };
+        // Look up or lazily build the SessionContext.
+        let session_ctx = self.get_or_build_session(&session_key).await?;
 
-        // Hold the per-session lock for the whole prompt so two prompts to the
-        // SAME session_id can't fork independent in-memory sessions and clobber
-        // each other's on-disk transcript. The `sessions` map lock above is
-        // already released, so prompts to different sessions never contend
-        // here. Guard is kept alive until the function returns.
-        let _prompt_guard = prompt_lock.lock_owned().await;
+        // Update activity timestamp.
+        session_ctx.touch();
 
-        // Reset the abort signal only AFTER winning the per-session lock. If we
-        // reset before acquiring it, a queued same-session prompt could clear a
-        // cancellation that the still-running prompt holding the lock has not
-        // yet observed, effectively un-cancelling it against user intent.
-        abort_signal.reset();
+        // Hold the per-session lock for the whole prompt.
+        let _prompt_guard = session_ctx.prompt_lock.clone().lock_owned().await;
 
-        // P4.2: remote agents (`agent@cluster`) run in thin-client mode — the
-        // turn is driven over NATS by a worker daemon, not by a local agent
-        // loop. Detect from the configured agent name; local refs are unchanged.
+        // Reset abort signal after acquiring lock.
+        session_ctx.abort_signal.reset();
+
+        // P4.2: remote agents (`agent@cluster`) run in thin-client mode.
         let remote_agent = parse_remote_agent(&self.agent_name);
 
-        let prompt_config: GlobalConfig =
-            harnx_session::fork_prompt_config(&self.config.read().clone());
-        // Local-agent setup (agent resolution + input building) only applies to
-        // local refs. For remote thin-client mode the worker resolves the agent
-        // and the input is the user's prompt text posted to the NATS log.
+        // Use the session's own config (managers already initialized).
+        let prompt_config = session_ctx.config.clone();
+
         let input = if remote_agent.is_none() {
-            Some(self.build_local_input(&prompt_config, &session_key, &prompt_text)?)
+            Some(self.build_local_input_from_config(&prompt_config, &session_key, &prompt_text)?)
         } else {
             None
         };
 
-        // Install a per-prompt AgentEventSink for streaming chunks
-        // (MessageChunk events) and tool calls (ToolEvent::Started).
-        // Nested ACP activity from sub-agent delegations also flows through
-        // this sink because `AcpManager::call_tool` captures and reinstalls
-        // the current task-local sink inside its spawned forwarder task.
+        // Install a per-prompt AgentEventSink for streaming chunks.
         let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<AcpForward>();
         let sink: Arc<dyn harnx_core::event::AgentEventSink> =
             Arc::new(AcpChunkSink { tx: chunk_tx });
@@ -345,20 +408,6 @@ impl HarnxAgent {
         // Spawn local task to drain chunk_rx → session_notification.
         let connection_for_fwd = self.connection.lock().await.clone();
         let session_key_for_fwd = session_key.clone();
-        // Helpers: fire a session_notification without blocking the LocalSet
-        // thread. Each notification is spawned as its own local task so
-        // run_agent_loop / execute_tool_round are never starved waiting for
-        // the parent to acknowledge a notification write.
-        // Build the `meta` payload that `AcpNotificationClient::resolve_
-        // notification_source` reads to determine `AgentSource`. Without
-        // these fields the parent infers source from the connection's
-        // agent_name, which (a) loses sub-agent identity when this
-        // server is forwarding a nested chunk and (b) prevents
-        // `render_ui_output_heading` from emitting `> agent ▸ session`.
-        // `agent_from_meta_value` / `session_from_meta_value` in
-        // `harnx-acp::client` read `agent` and `session` keys (no
-        // namespace prefix). Match those exactly so the parent recovers
-        // sub-agent identity.
 
         fn spawn_notify_text(
             conn: &Option<acp::ConnectionTo<acp::Client>>,
@@ -405,9 +454,6 @@ impl HarnxAgent {
                             chunk = chunk.meta(meta);
                         }
                     }
-                    // Use `UserMessageChunk` (not `AgentMessageChunk`) so the
-                    // parent renders this as a user turn and does NOT append it
-                    // to `response_text` (the next agent's input).
                     let notification = SessionNotification::new(
                         SessionId::new(sid),
                         SessionUpdate::UserMessageChunk(chunk),
@@ -523,14 +569,14 @@ impl HarnxAgent {
         fn spawn_notify_forward(
             conn: &Option<acp::ConnectionTo<acp::Client>>,
             session_key: &str,
-            update: AcpForward,
+            forward: AcpForward,
         ) {
-            match update {
+            match forward {
                 AcpForward::Text(text, source) => {
-                    spawn_notify_text(conn, session_key, text, source)
+                    spawn_notify_text(conn, session_key, text, source);
                 }
                 AcpForward::UserText(text, source) => {
-                    spawn_notify_user_text(conn, session_key, text, source)
+                    spawn_notify_user_text(conn, session_key, text, source);
                 }
                 AcpForward::ToolCall {
                     id,
@@ -538,34 +584,38 @@ impl HarnxAgent {
                     input,
                     markdown,
                     source,
-                } => spawn_notify_tool_call(conn, session_key, id, name, input, markdown, source),
+                } => {
+                    spawn_notify_tool_call(conn, session_key, id, name, input, markdown, source);
+                }
                 AcpForward::ToolUpdate {
                     id,
                     markdown,
                     status,
                     source,
-                } => spawn_notify_tool_update(conn, session_key, id, markdown, status, source),
+                } => {
+                    spawn_notify_tool_update(conn, session_key, id, markdown, status, source);
+                }
                 AcpForward::ToolCompleted {
                     id,
                     output,
                     markdown,
                     source,
-                } => spawn_notify_tool_completed(conn, session_key, id, output, markdown, source),
+                } => {
+                    spawn_notify_tool_completed(conn, session_key, id, output, markdown, source);
+                }
             }
         }
 
+        // Forward task: drain chunk_rx → session_notification.
         let fwd_task = tokio::task::spawn_local(async move {
-            while let Some(update) = chunk_rx.recv().await {
-                spawn_notify_forward(&connection_for_fwd, &session_key_for_fwd, update);
+            while let Some(forward) = chunk_rx.recv().await {
+                spawn_notify_forward(&connection_for_fwd, &session_key_for_fwd, forward);
             }
         });
 
-        // We deliberately do NOT register an `on_text_response` here:
-        // streaming `MessageChunk` events already flow through the
-        // `AcpChunkSink` / `chunk_rx` / `fwd_task` chain, which
-        // session_notification each chunk to the parent. Adding an
-        // `on_text_response` would re-emit the same final text and the
-        // parent's transcript would render the assistant's reply twice.
+        // Build the agent loop context from the session's config.
+        let abort_signal = session_ctx.abort_signal.clone();
+        let cancel_notify = session_ctx.cancel_notify.clone();
 
         let loop_ctx = harnx_session::build_context(
             prompt_config.clone(),
@@ -575,53 +625,24 @@ impl HarnxAgent {
             None,
         );
 
-        // Bridge cancel_notify → abort_signal for any caller that signals
-        // via the notify without setting the signal directly (HarnxAgent::
-        // cancel does both, but this keeps the contract resilient).
-        let abort_for_listener = abort_signal.clone();
+        // Cancel listener: wait on cancel_notify, fire abort.
+        let cancel_abort = abort_signal.clone();
         let cancel_listener = tokio::task::spawn_local(async move {
             cancel_notify.notified().await;
-            abort_for_listener.set_ctrlc();
+            cancel_abort.set_ctrlc();
         });
 
-        // Two-stage cancellation:
-        //   1. When `abort_signal` fires, give cooperative-cancel layers
-        //      (e.g. AcpManager.session_prompt_with_abort) a grace
-        //      window to dispatch `session/cancel` down to any
-        //      sub-agents. They poll abort every ~25 ms and then send
-        //      a JSON-RPC cancel notification — fast, but not free.
-        //   2. After the grace window, hard-cancel `run_agent_loop` by
-        //      losing the select! race. This drops any stuck SSE/TCP
-        //      reads or stuck tool dispatchers that don't observe
-        //      abort — so a hung upstream can't pin the prompt.
-        // Pure hard-cancel-on-notify (the previous approach) skipped
-        // step 1 — sub-agents were leaked because the AcpManager call
-        // was dropped before it could dispatch `session/cancel`.
-        // 250 ms is well above the ~30 ms a single AcpManager
-        // observes-abort + dispatches-cancel takes; nested layers each
-        // run their own grace in parallel, so the bound doesn't
-        // compound across depth.
+        // Grace period after abort before hard cancellation.
         let abort_for_grace = abort_signal.clone();
         let grace_cancel = async move {
             harnx_core::abort::wait_abort_signal(&abort_for_grace).await;
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         };
 
-        // Scope the per-prompt event sink to this prompt's task tree so
-        // concurrent prompts to the same agent never clobber each other's
-        // streaming output. The scope wraps the whole select! (including the
-        // grace-cancel arm) so any chunks emitted up to the cancellation
-        // point still route to this prompt's sink. `loop_result` is
-        // `Option<Result<()>>`: `None` means the grace-cancel arm won, a
-        // `Some` carries the agent loop's own result.
-        // Clone the sink for the remote driver before `sink` is moved into the
-        // scoped-sink wrapper used by the local path.
+        // Run the agent loop.
         let remote_sink = sink.clone();
         let loop_result = harnx_core::sink::with_agent_event_sink(sink, async {
             match &remote_agent {
-                // Remote thin-client mode (P4.2): drive the turn over NATS via a
-                // worker daemon. Events render through the same `remote_sink`
-                // (an AcpChunkSink), so chunks reach the parent identically.
                 Some((agent, cluster)) => {
                     let thin_cfg = harnx_runtime::ThinClientConfig {
                         cluster: cluster.clone(),
@@ -645,13 +666,7 @@ impl HarnxAgent {
                         _ = grace_cancel => None,
                     }
                 }
-                // Local mode: run the agent loop in-process.
                 None => {
-                    // Box the agent-loop future before racing it. `run_agent_loop`
-                    // produces a very large future; embedding it inline in `select!`
-                    // (which itself lives inside the prompt future + LocalSet frames)
-                    // can overflow the thread stack before the first poll. Pinning it
-                    // on the heap keeps the synchronous stack frame small.
                     let input = input.expect("local mode always builds input");
                     let mut run_loop = Box::pin(harnx_runtime::run_agent_loop(&loop_ctx, input));
                     tokio::select! {
@@ -663,6 +678,16 @@ impl HarnxAgent {
         })
         .await;
 
+        // Refresh activity when the turn STOPS being active — on EVERY exit
+        // path (normal completion AND cancellation), not just at prompt start.
+        // A turn can run longer than SESSION_IDLE_TTL; touching only at start
+        // would leave last_activity stale, so the very next reaper tick after a
+        // long turn would evict the just-active session and tear down its warm
+        // MCP subprocesses. Placing this before the cancellation early-return
+        // keeps the session alive for the full TTL measured from when it last
+        // finished doing work, whether it completed or was cancelled.
+        session_ctx.touch();
+
         let Some(loop_result) = loop_result else {
             cancel_listener.abort();
             fwd_task.abort();
@@ -670,8 +695,6 @@ impl HarnxAgent {
         };
 
         cancel_listener.abort();
-        // Drop loop_ctx so all senders into chunk_rx are dropped and
-        // fwd_task can exit cleanly.
         drop(loop_ctx);
         let _ = fwd_task.await;
 
@@ -684,9 +707,98 @@ impl HarnxAgent {
         let session = sessions
             .get(session_id.as_ref())
             .ok_or_else(acp::Error::invalid_params)?;
+        // A cancel is direct user interaction — count it as activity so the
+        // idle reaper doesn't evict a session the user is actively steering.
+        session.touch();
         session.abort_signal.set_ctrlc();
         session.cancel_notify.notify_one();
         Ok(())
+    }
+}
+
+impl HarnxAgent {
+    /// Get an existing session or lazily build one from disk.
+    async fn get_or_build_session(&self, session_id: &str) -> acp::Result<Arc<SessionContext>> {
+        // First check if it's already in memory.
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(ctx) = sessions.get(session_id) {
+                return Ok(ctx.clone());
+            }
+        }
+
+        // Session not in memory. Check if it exists on disk.
+        let session_path = self.base_config.read().session_file(session_id);
+        if !tokio::fs::try_exists(&session_path).await.unwrap_or(false) {
+            return Err(acp::Error::invalid_params());
+        }
+
+        // Lazy rebuild: fork config, load session from disk.
+        info!("Lazy rebuilding session {} from disk", session_id);
+        let session_config = self.build_session_config(session_id)?;
+        let ctx = Arc::new(SessionContext::new(session_id.to_string(), session_config));
+
+        // Insert and start reaper.
+        let mut sessions = self.sessions.lock().await;
+        // Check again under lock (race with concurrent prompt).
+        if let Some(existing) = sessions.get(session_id) {
+            return Ok(existing.clone());
+        }
+        sessions.insert(session_id.to_string(), ctx.clone());
+        drop(sessions);
+
+        self.spawn_idle_reaper(ctx.clone());
+
+        Ok(ctx)
+    }
+
+    /// Spawn an idle reaper task for a session.
+    /// The task periodically checks if the session is idle past TTL
+    /// and evicts it from the map. Exits when the SessionContext is dropped.
+    fn spawn_idle_reaper(&self, ctx: Arc<SessionContext>) {
+        let sessions = self.sessions.clone();
+        let session_id = ctx.session_id.clone();
+
+        // Hold a weak reference: if the session is evicted by another path,
+        // the reaper task should exit.
+        let weak_ctx = Arc::downgrade(&ctx);
+        drop(ctx); // Don't hold an extra strong ref.
+
+        tokio::task::spawn_local(async move {
+            // Check every minute.
+            let check_interval = Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(check_interval).await;
+
+                // If the SessionContext was already dropped, exit.
+                let Some(ctx) = weak_ctx.upgrade() else {
+                    debug!("Idle reaper: session {} already dropped", session_id);
+                    break;
+                };
+
+                // Evict only if idle past the TTL and no prompt is in flight.
+                if ctx.should_reap() {
+                    info!(
+                        "Idle reaper: evicting session {} (idle > {:?})",
+                        session_id, SESSION_IDLE_TTL
+                    );
+                    let mut sessions = sessions.lock().await;
+                    // Remove only if it's still this exact session and still idle.
+                    if let Some(existing) = sessions.get(&session_id) {
+                        if Arc::ptr_eq(existing, &ctx) {
+                            if ctx.should_reap() {
+                                sessions.remove(&session_id);
+                                drop(sessions);
+                                // ctx drops here, triggering manager teardown.
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    drop(sessions);
+                }
+            }
+        });
     }
 }
 

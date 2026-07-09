@@ -12,9 +12,16 @@ use harnx_core::path::ensure_parent_exists;
 
 /// Initialise the process-wide `log` facade. Reads log level + path from
 /// `Config::log_config` and applies an optional `HARNX_LOG_FILTER` env
-/// override. `is_server` is a hint for the default filter: server modes
-/// (HTTP serve, ACP) default to `harnx::serve` whereas CLI/TUI default to
-/// the top-level `harnx` filter so dot-command logs aren't suppressed.
+/// override. Both server modes (HTTP serve, ACP) and CLI/TUI use `harnx`
+/// as the default filter, matching all `harnx_*` crate targets via prefix
+/// matching (simplelog 0.12 uses `path.starts_with(filter)`). Use
+/// `HARNX_LOG_FILTER` to narrow to a specific crate/module.
+///
+/// # Historical note
+///
+/// Previously, server modes defaulted to `harnx::serve`, but this matched
+/// no `harnx_*` crate targets (underscores vs colons), silently dropping
+/// all logs including startup banners and subagent output. Fixed in #989.
 pub fn setup_logger(is_server: bool) -> Result<()> {
     // LLM trace is independent of the simplelog filter — it must work even
     // when log_level is Off, since it's the user's primary tool for debugging
@@ -32,10 +39,7 @@ pub fn setup_logger(is_server: bool) -> Result<()> {
     const LOG_CRATE_NAME: &str = "harnx";
     let log_filter = match std::env::var(get_env_name("log_filter")) {
         Ok(v) => v,
-        Err(_) => match is_server {
-            true => format!("{LOG_CRATE_NAME}::serve"),
-            false => LOG_CRATE_NAME.into(),
-        },
+        Err(_) => default_log_filter(LOG_CRATE_NAME),
     };
     let config = ConfigBuilder::new()
         .add_filter_allow(log_filter)
@@ -83,4 +87,79 @@ pub fn setup_logger(is_server: bool) -> Result<()> {
         log_target,
     );
     Ok(())
+}
+
+/// Returns the default log filter for simplelog.
+///
+/// Both server and CLI modes use the same default `"harnx"` filter, which
+/// matches all `harnx_*` crate targets via simplelog's prefix matching.
+fn default_log_filter(crate_name: &str) -> String {
+    crate_name.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_log_filter_returns_harnx() {
+        assert_eq!(default_log_filter("harnx"), "harnx");
+    }
+
+    #[test]
+    fn harnx_filter_matches_harnx_underscore_targets() {
+        // simplelog 0.12 uses path.starts_with(filter) for prefix matching.
+        // The fix ensures "harnx" (correct) is used, not "harnx::serve" (bug).
+        let filter = default_log_filter("harnx");
+
+        // All harnx_* crate targets should match the "harnx" prefix.
+        assert!(
+            "harnx_acp::client".starts_with(&filter),
+            "harnx_acp::client should match filter {:?}",
+            filter
+        );
+        assert!(
+            "harnx_mcp::client".starts_with(&filter),
+            "harnx_mcp::client should match filter {:?}",
+            filter
+        );
+        assert!(
+            "harnx_runtime::bootstrap".starts_with(&filter),
+            "harnx_runtime::bootstrap should match filter {:?}",
+            filter
+        );
+        assert!(
+            "harnx_acp_server::server".starts_with(&filter),
+            "harnx_acp_server::server should match filter {:?}",
+            filter
+        );
+    }
+
+    #[test]
+    fn harnx_serve_filter_matches_no_harnx_underscore_targets() {
+        // Bug regression test: "harnx::serve" matches NONE of the harnx_* targets.
+        // simplelog 0.12 uses prefix matching, and underscores != colons.
+        let buggy_filter = "harnx::serve";
+
+        assert!(
+            !"harnx_acp::client".starts_with(buggy_filter),
+            "harnx_acp::client should NOT match buggy filter {:?}",
+            buggy_filter
+        );
+        assert!(
+            !"harnx_mcp::client".starts_with(buggy_filter),
+            "harnx_mcp::client should NOT match buggy filter {:?}",
+            buggy_filter
+        );
+        assert!(
+            !"harnx_runtime::bootstrap".starts_with(buggy_filter),
+            "harnx_runtime::bootstrap should NOT match buggy filter {:?}",
+            buggy_filter
+        );
+        assert!(
+            !"harnx_acp_server::server".starts_with(buggy_filter),
+            "harnx_acp_server::server should NOT match buggy filter {:?}",
+            buggy_filter
+        );
+    }
 }
