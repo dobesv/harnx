@@ -11,7 +11,7 @@ use harnx_render::render_error;
 use harnx_runtime::bootstrap::setup_logger;
 use harnx_runtime::config::{load_env_file, Config, WorkingMode};
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "harnx HTTP server", long_about = None)]
@@ -28,6 +28,10 @@ struct Cli {
     /// Add MCP roots (comma-separated)
     #[clap(long, value_name = "PATH", value_delimiter = ',')]
     mcp_root: Vec<String>,
+    /// Directory of web-ui static assets to serve
+    /// (default: ~/.local/share/harnx/web-assets, XDG-aware)
+    #[clap(long, value_name = "PATH")]
+    web_assets: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -50,7 +54,7 @@ async fn main() -> Result<()> {
         config.write().set_model(model_id)?;
     }
 
-    if let Err(err) = harnx_serve::run(config, cli.addr).await {
+    if let Err(err) = harnx_serve::run(config, cli.addr, cli.web_assets).await {
         render_error(err);
         std::process::exit(1);
     }

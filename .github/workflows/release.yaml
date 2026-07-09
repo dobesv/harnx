@@ -9,6 +9,10 @@ on:
     - 'harnx/v[0-9]+.[0-9]+.[0-9]+*'
     - 'v[0-9]+.[0-9]+.[0-9]+*'
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     name: Publish to GitHub Release
@@ -197,6 +201,85 @@ jobs:
         draft: false
         files: ${{ steps.package.outputs.archives }}
         prerelease: ${{ steps.check-tag.outputs.rc == 'true' }}
+
+  web-assets:
+    name: Publish Web UI assets
+    runs-on: ubuntu-latest
+    # Run after the binary build matrix so web assets attach to the release
+    # after the binaries rather than racing them. `always() && !cancelled()`
+    # mirrors the docker job and matches the release job's `fail-fast: false`
+    # policy (partial success is intentionally shippable), so a single failed
+    # target still lets the web assets publish.
+    needs: release
+    if: always() && !cancelled()
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm/Node setup mirrors the existing web-ci.yml / web-e2e.yml
+      # workflows (pinned action majors and explicit versions) for consistency.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.10.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.18.0'
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Check Tag
+        id: vars
+        shell: bash
+        run: |
+          ver=${GITHUB_REF##*/}
+          echo "version=$ver" >> $GITHUB_OUTPUT
+          if [[ "$ver" =~ [0-9]+.[0-9]+.[0-9]+$ ]]; then
+            echo "rc=false" >> $GITHUB_OUTPUT
+          else
+            echo "rc=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Web UI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd web
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Package Web UI assets
+        shell: bash
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euxo pipefail
+          tar --exclude='mockServiceWorker.js' --exclude='*.map' -czf "harnx-web-assets-$VERSION.tar.gz" -C web/dist .
+          (
+            cd web/dist
+            zip -r "$OLDPWD/harnx-web-assets-$VERSION.zip" . -x 'mockServiceWorker.js' '*.map'
+          )
+          # Sanity-check the archives before they are published: both must be
+          # non-empty and contain index.html at the root. Fail loudly rather
+          # than publish a broken/empty asset bundle.
+          test -s "harnx-web-assets-$VERSION.tar.gz"
+          test -s "harnx-web-assets-$VERSION.zip"
+          tar -tzf "harnx-web-assets-$VERSION.tar.gz" | grep -qx './index.html'
+          tar -tzf "harnx-web-assets-$VERSION.tar.gz" | grep -qE '^\./assets/.*\.js$'
+          unzip -l "harnx-web-assets-$VERSION.zip" | grep -q ' index.html$'
+
+      - name: Publish Web UI assets
+        uses: softprops/action-gh-release@v3
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        with:
+          draft: false
+          files: |
+            harnx-web-assets-${{ steps.vars.outputs.version }}.tar.gz
+            harnx-web-assets-${{ steps.vars.outputs.version }}.zip
+          prerelease: ${{ steps.vars.outputs.rc == 'true' }}
 
   docker:
     name: Publish Docker Images
