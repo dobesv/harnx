@@ -33,7 +33,14 @@ use multer::Multipart;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, convert::Infallible, net::IpAddr, sync::Arc, time::SystemTime};
+use std::{
+    collections::BTreeMap,
+    convert::Infallible,
+    net::IpAddr,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_graceful::Shutdown;
 
@@ -45,7 +52,11 @@ pub const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
 type AppResponse = Response<BoxBody<Bytes, Infallible>>;
 
-pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
+pub async fn run(
+    config: GlobalConfig,
+    addr: Option<String>,
+    web_assets: Option<PathBuf>,
+) -> Result<()> {
     let addr = match addr {
         Some(addr) => {
             if let Ok(port) = addr.parse::<u16>() {
@@ -58,7 +69,9 @@ pub async fn run(config: GlobalConfig, addr: Option<String>) -> Result<()> {
         }
         None => config.read().serve_addr(),
     };
-    let server = Arc::new(Server::new(&config));
+    let web_assets =
+        web_assets.unwrap_or_else(|| harnx_core::config_paths::data_dir().join("web-assets"));
+    let server = Arc::new(Server::new(&config, web_assets));
     let listener = TcpListener::bind(&addr).await?;
     let stop_server = server.run(listener).await?;
     println!("Embeddings API:       http://{addr}/v1/embeddings");
@@ -76,6 +89,8 @@ pub struct Server {
     rags: Vec<String>,
     #[allow(dead_code)]
     session_registry: SessionRegistry,
+    /// Root directory for web-ui static assets served over HTTP.
+    web_assets: PathBuf,
 }
 
 type RouteMatch = (String, Option<String>, AgentsRoute);
@@ -96,7 +111,7 @@ enum AgentsRepresentation {
 
 impl Server {
     #[doc(hidden)]
-    pub fn new(config: &GlobalConfig) -> Self {
+    pub fn new(config: &GlobalConfig, web_assets: PathBuf) -> Self {
         let config = config.read().clone();
         let mut models = list_all_models(&config.clients);
         let mut default_model = config.model.clone();
@@ -128,6 +143,7 @@ impl Server {
             agents: Config::all_agents(),
             rags: Config::list_rags(),
             session_registry,
+            web_assets,
         }
     }
 
@@ -216,6 +232,8 @@ impl Server {
             self.list_rags()
         } else if path == "/v1/rags/search" {
             self.search_rag(req).await
+        } else if method == Method::GET || method == Method::HEAD {
+            self.serve_web_asset(&method, path, req.headers()).await
         } else {
             status = StatusCode::NOT_FOUND;
             Err(anyhow!("Not Found"))
@@ -268,6 +286,111 @@ impl Server {
             .cloned()
             .collect();
         Ok(assistants)
+    }
+
+    /// Serve a static web-ui asset for a GET/HEAD request that did not match an
+    /// API route. Maps the request path to a file under `self.web_assets`,
+    /// guarding against path traversal. Returns 404 (`"Not Found"`) when the
+    /// assets directory or the requested file is absent. For navigation
+    /// requests (`Accept: text/html`) that do not name a concrete file, falls
+    /// back to serving `index.html` to support single-page-app routing.
+    async fn serve_web_asset(
+        &self,
+        method: &Method,
+        path: &str,
+        headers: &http::HeaderMap,
+    ) -> Result<AppResponse> {
+        // Canonicalize the root once; if it does not exist, nothing to serve.
+        let root = match tokio::fs::canonicalize(&self.web_assets).await {
+            Ok(root) => root,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => bail!("Not Found"),
+            Err(err) => return Err(err.into()),
+        };
+
+        let request_path = path.trim_start_matches('/');
+        let requested = match sanitize_asset_path(request_path) {
+            Some(path) => path,
+            None => bail!("Not Found"),
+        };
+
+        let candidate = if requested.as_os_str().is_empty() {
+            root.join("index.html")
+        } else {
+            root.join(&requested)
+        };
+
+        if let Some(response) = self
+            .serve_asset_candidate(method, &root, &candidate, requested.as_os_str().is_empty())
+            .await?
+        {
+            return Ok(response);
+        }
+
+        // SPA fallback: navigation requests for a route (no file extension) get
+        // index.html so client-side routing can take over.
+        if wants_html(headers) && !has_file_extension(&requested) {
+            let index = root.join("index.html");
+            if let Some(response) = self
+                .serve_asset_candidate(method, &root, &index, true)
+                .await?
+            {
+                return Ok(response);
+            }
+        }
+
+        bail!("Not Found")
+    }
+
+    /// Attempt to serve a single candidate file. Returns `Ok(None)` when the
+    /// file does not exist or is not a regular file so the caller can try a
+    /// fallback. Rejects any file whose canonical path escapes `root`.
+    async fn serve_asset_candidate(
+        &self,
+        method: &Method,
+        root: &Path,
+        candidate: &Path,
+        force_html: bool,
+    ) -> Result<Option<AppResponse>> {
+        let metadata = match tokio::fs::metadata(candidate).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+
+        // Defense in depth against symlinks/traversal: the resolved path must
+        // stay within the canonical assets root.
+        let canonical = match tokio::fs::canonicalize(candidate).await {
+            Ok(path) => path,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        if !canonical.starts_with(root) {
+            bail!("Not Found");
+        }
+
+        let content_type = if force_html {
+            "text/html; charset=utf-8"
+        } else {
+            content_type_for_path(candidate)
+        };
+
+        let body = if *method == Method::HEAD {
+            Bytes::new()
+        } else {
+            tokio::fs::read(&canonical).await?.into()
+        };
+
+        // Advertise the full file size even for HEAD so caches/proxies and
+        // client probes see an accurate Content-Length.
+        let response = Response::builder()
+            .header("Content-Type", content_type)
+            .header(http::header::CONTENT_LENGTH, metadata.len())
+            .body(Full::new(body).boxed())?;
+        Ok(Some(response))
     }
 
     async fn handle_agent_tree(&self, req: hyper::Request<Incoming>) -> Result<AppResponse> {
@@ -886,6 +1009,74 @@ fn accepts_html(headers: &http::HeaderMap) -> bool {
         .is_some_and(|value| value.contains("text/html"))
 }
 
+/// Turn a URL-relative request path into a safe relative filesystem path.
+///
+/// Each `/`-separated segment is percent-decoded (so filenames containing
+/// `%20`, `%2B`, etc. resolve correctly and consistently with the agent/session
+/// routes). Decoding is per-segment so an encoded separator (`%2F`) cannot
+/// smuggle an extra path boundary. Returns `None` if the path attempts to
+/// traverse out of the assets root (a `..` component or an absolute prefix
+/// survives normalization). Current-dir and root components are skipped so
+/// leading slashes are harmless.
+fn sanitize_asset_path(path: &str) -> Option<PathBuf> {
+    let decoded = path
+        .split('/')
+        .map(percent_decode)
+        .collect::<Vec<_>>()
+        .join("/");
+    let mut sanitized = PathBuf::new();
+    for component in Path::new(&decoded).components() {
+        match component {
+            Component::Normal(segment) => sanitized.push(segment),
+            Component::CurDir | Component::RootDir => continue,
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(sanitized)
+}
+
+/// Whether the request path names a concrete file (has an extension). Used to
+/// decide if the SPA index.html fallback should apply.
+fn has_file_extension(path: &Path) -> bool {
+    path.extension().is_some()
+}
+
+/// Whether the client accepts HTML (a navigation request).
+fn wants_html(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|item| item.trim().starts_with("text/html"))
+        })
+        .unwrap_or(false)
+}
+
+/// Best-effort Content-Type from a file extension. Unknown extensions default
+/// to `application/octet-stream`.
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("wasm") => "application/wasm",
+        Some("map") => "application/json; charset=utf-8",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
 fn accepts_event_stream(headers: &http::HeaderMap) -> bool {
     headers
         .get(http::header::ACCEPT)
@@ -1307,7 +1498,7 @@ mod tests {
         );
 
         let config = Arc::new(RwLock::new(sandbox.config()));
-        let server = Server::new(&config);
+        let server = Server::new(&config, std::path::PathBuf::from("web-assets"));
 
         let unfiltered = response_json(server.list_agents(None).await.expect("all agents")).await;
         let filtered = response_json(
@@ -1595,7 +1786,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(RwLock::new(sandbox.config()));
-        let server = Arc::new(Server::new(&config));
+        let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         let boundary = "boundary123";
         let image_data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]; // PNG magic bytes
@@ -1650,7 +1841,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(RwLock::new(sandbox.config()));
-        let server = Arc::new(Server::new(&config));
+        let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a malformed multipart body (missing proper headers)
         let boundary = "boundary123";
@@ -1681,7 +1872,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(RwLock::new(sandbox.config()));
-        let server = Arc::new(Server::new(&config));
+        let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a valid multipart with no attachment fields (field named "other")
         let boundary = "boundary123";
@@ -1716,7 +1907,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(RwLock::new(sandbox.config()));
-        let server = Arc::new(Server::new(&config));
+        let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a multipart body that exceeds MAX_UPLOAD_BYTES
         let boundary = "boundary123";
@@ -1745,7 +1936,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(RwLock::new(sandbox.config()));
-        let server = Arc::new(Server::new(&config));
+        let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a request with a Content-Length header that exceeds MAX_UPLOAD_BYTES
         let boundary = "boundary123";
@@ -1770,7 +1961,7 @@ mod tests {
         let sandbox = TestConfigSandbox::new();
         sandbox.write_agent("plain", "You are plain.");
         let config = Arc::new(RwLock::new(sandbox.config()));
-        let server = Arc::new(Server::new(&config));
+        let server = Arc::new(Server::new(&config, std::path::PathBuf::from("web-assets")));
 
         // Build a multipart with an unsupported MIME type
         let boundary = "boundary123";
@@ -1792,5 +1983,230 @@ mod tests {
             .expect("handler response");
 
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // ===== Web-ui static asset serving tests (#1006) =====
+
+    fn asset_server(assets_dir: PathBuf) -> Server {
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        // Server::new snapshots the config at construction, so the sandbox can
+        // be dropped afterwards without affecting the built Server.
+        let config = Arc::new(RwLock::new(sandbox.config()));
+        Server::new(&config, assets_dir)
+    }
+
+    async fn asset_body(response: AppResponse) -> Vec<u8> {
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn serve_web_asset_returns_file_with_content_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("app.js"), b"console.log('hi');").expect("write asset");
+        let server = asset_server(dir.path().to_path_buf());
+
+        let response = server
+            .serve_web_asset(&Method::GET, "/app.js", &http::HeaderMap::new())
+            .await
+            .expect("serve asset");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert_eq!(asset_body(response).await, b"console.log('hi');");
+    }
+
+    #[tokio::test]
+    async fn serve_web_asset_root_serves_index_html() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), b"<h1>home</h1>").expect("write index");
+        let server = asset_server(dir.path().to_path_buf());
+
+        let response = server
+            .serve_web_asset(&Method::GET, "/", &http::HeaderMap::new())
+            .await
+            .expect("serve index");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(asset_body(response).await, b"<h1>home</h1>");
+    }
+
+    #[tokio::test]
+    async fn serve_web_asset_rejects_path_traversal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), b"ok").expect("write index");
+        // A secret file that lives OUTSIDE the assets root.
+        let secret = dir.path().parent().expect("parent").join("secret.txt");
+        std::fs::write(&secret, b"top secret").expect("write secret");
+        let server = asset_server(dir.path().to_path_buf());
+
+        let err = server
+            .serve_web_asset(&Method::GET, "/../secret.txt", &http::HeaderMap::new())
+            .await
+            .expect_err("traversal must be rejected");
+        assert_eq!(err.to_string(), "Not Found");
+        assert_eq!(status_from_error(&err), Some(StatusCode::NOT_FOUND));
+
+        let _ = std::fs::remove_file(&secret);
+    }
+
+    #[tokio::test]
+    async fn serve_web_asset_missing_file_returns_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = asset_server(dir.path().to_path_buf());
+
+        let err = server
+            .serve_web_asset(&Method::GET, "/missing.css", &http::HeaderMap::new())
+            .await
+            .expect_err("missing file should 404");
+        assert_eq!(status_from_error(&err), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn serve_web_asset_missing_root_returns_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing_root = dir.path().join("does-not-exist");
+        let server = asset_server(missing_root);
+
+        let err = server
+            .serve_web_asset(&Method::GET, "/index.html", &http::HeaderMap::new())
+            .await
+            .expect_err("missing root should 404");
+        assert_eq!(status_from_error(&err), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn serve_web_asset_spa_fallback_for_navigation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), b"<h1>spa</h1>").expect("write index");
+        let server = asset_server(dir.path().to_path_buf());
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::ACCEPT, HeaderValue::from_static("text/html"));
+
+        // Unknown extensionless route + Accept: text/html => index.html.
+        let response = server
+            .serve_web_asset(&Method::GET, "/dashboard/settings", &headers)
+            .await
+            .expect("spa fallback");
+        assert_eq!(asset_body(response).await, b"<h1>spa</h1>");
+    }
+
+    #[tokio::test]
+    async fn serve_web_asset_percent_decodes_filename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("my file.txt"), b"spaced").expect("write asset");
+        let server = asset_server(dir.path().to_path_buf());
+
+        let response = server
+            .serve_web_asset(&Method::GET, "/my%20file.txt", &http::HeaderMap::new())
+            .await
+            .expect("serve percent-encoded asset");
+        assert_eq!(asset_body(response).await, b"spaced");
+    }
+
+    #[tokio::test]
+    async fn serve_web_asset_sets_content_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("app.js"), b"payload").expect("write asset");
+        let server = asset_server(dir.path().to_path_buf());
+
+        let response = server
+            .serve_web_asset(&Method::GET, "/app.js", &http::HeaderMap::new())
+            .await
+            .expect("serve asset");
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("7")
+        );
+
+        // HEAD advertises the same length with an empty body.
+        let head = server
+            .serve_web_asset(&Method::HEAD, "/app.js", &http::HeaderMap::new())
+            .await
+            .expect("serve head");
+        assert_eq!(
+            head.headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("7")
+        );
+        assert!(asset_body(head).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_web_asset_head_omits_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("app.js"), b"payload").expect("write asset");
+        let server = asset_server(dir.path().to_path_buf());
+
+        let response = server
+            .serve_web_asset(&Method::HEAD, "/app.js", &http::HeaderMap::new())
+            .await
+            .expect("serve head");
+        assert_eq!(
+            response
+                .headers()
+                .get("Content-Type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert!(asset_body(response).await.is_empty());
+    }
+
+    #[test]
+    fn sanitize_asset_path_blocks_traversal() {
+        assert!(sanitize_asset_path("../etc/passwd").is_none());
+        assert!(sanitize_asset_path("a/../../b").is_none());
+        assert_eq!(
+            sanitize_asset_path("assets/app.js"),
+            Some(PathBuf::from("assets/app.js"))
+        );
+        assert_eq!(
+            sanitize_asset_path("/assets/app.js"),
+            Some(PathBuf::from("assets/app.js"))
+        );
+        assert_eq!(sanitize_asset_path(""), Some(PathBuf::new()));
+    }
+
+    #[test]
+    fn content_type_for_path_covers_common_extensions() {
+        assert_eq!(
+            content_type_for_path(Path::new("x.html")),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            content_type_for_path(Path::new("x.css")),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(content_type_for_path(Path::new("x.png")), "image/png");
+        assert_eq!(
+            content_type_for_path(Path::new("x.wasm")),
+            "application/wasm"
+        );
+        assert_eq!(
+            content_type_for_path(Path::new("x.unknown")),
+            "application/octet-stream"
+        );
     }
 }

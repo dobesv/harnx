@@ -22,6 +22,30 @@ cargo install --path crates/harnx-serve
 | `--model <MODEL>` | `-m` | Select a specific LLM model to use. |
 | `--dry-run` | | Echo prompts instead of sending them to the LLM. |
 | `--mcp-root <PATH>` | | Add one or more MCP roots (comma-separated). |
+| `--web-assets <PATH>` | | Directory of web-ui static assets to serve (default: `~/.local/share/harnx/web-assets`, XDG-aware). |
+
+## Web UI assets
+
+The `--web-assets` option specifies the directory where the server looks for the Web UI's static files (HTML, JS, CSS).
+
+- **Default path**: `~/.local/share/harnx/web-assets` (XDG-aware; honors `HARNX_DATA_DIR` and `XDG_DATA_HOME`).
+- **Behavior**: Assets are optional. If the directory or a requested file is missing, the server returns 404 for those paths but continues to function. `/v1/*` API routes take precedence.
+- **Obtaining assets**: Each release publishes prebuilt `harnx-web-assets-<version>.tar.gz` and `harnx-web-assets-<version>.zip` archives on the [GitHub Releases page](https://github.com/dobesv/harnx/releases). Download one, extract it into `~/.local/share/harnx/web-assets`, or point `--web-assets` at the extracted directory.
+- **Build from source**: If you prefer, build the UI yourself and copy it into the assets directory:
+
+```sh
+# From the repository root
+cd web
+pnpm install
+pnpm build
+mkdir -p ~/.local/share/harnx/web-assets
+cp -r dist/* ~/.local/share/harnx/web-assets/
+```
+
+Alternatively, point the server directly at the build output:
+```sh
+harnx-serve --web-assets ./web/dist
+```
 
 ## AG-UI (Agent User Interaction Protocol)
 
