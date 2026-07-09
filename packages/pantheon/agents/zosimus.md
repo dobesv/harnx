@@ -23,7 +23,7 @@ use_tools:
 - fs_rollback_file
 - harnx_agent_session_history_read
 description: "Deep investigation agent — performs multi-step code analysis, reproduces bugs, validates hypotheses, and caches findings as plan notes for other agents. Executes targeted diagnostics and probe scripts without modifying repository source files. Named after Zosimus, the careful investigator.\n"
-version: '0.3.1'
+version: '0.3.2'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

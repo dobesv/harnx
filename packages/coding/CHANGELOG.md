@@ -1,6 +1,30 @@
 # Changelog
 
 All notable changes to the `coding` agent package will be documented here.
+## 0.3.2 (2026-07-09)
+
+### Features
+
+- add unified error handling for streaming events across LLMs (#908)
+- add static remote agent catalog to cluster configuration (#929)
+- achieve remote agent tool parity and fix thin-client N… (#930)
+- implement remote session enumeration protocol (#938)
+- wire remote control surface for agent@cluster (#915) (#956)
+- add opt-in background GC for remote sessions (#960)
+- implement AG-UI protocol server support (#966)
+- add AG-UI follow-up features and fixes (#1005)
+
+### Fixes
+
+- prevent infinite loops and panics in scrolling widget rendering (#907)
+- use leader-authoritative read for mid-turn injection decision points (#917) (#928)
+- resize height cache instead of underflowing when items shrink (#952)
+- don't restore the panic hook while unwinding (#954)
+- surface mid-stream streaming LLM errors instead of stopping silently (#963)
+- keep transcript visible after compaction (#904) (#967)
+- forward EXA_API_KEY through the sandbox for the exa MCP server (#973)
+- Fix the Exa MCP server so web search works when `npx`/`node` is wrapped by a harnx sandbox. The configs previously set `EXA_API_KEY: "$EXA_API_KEY"`, but harnx does not expand `$VAR` in MCP `env:` values and the sandbox scrubs the child environment — so the server received no usable key and returned `API key must be provided`. They now use `HARNX_BASH_ENV_PASSTHROUGH: EXA_API_KEY`, which `harnx-sandbox-run` honors to forward the real host value. Also documents both footguns (literal `env:` values; sandbox env stripping) in the configuration guide, environment-variables, sandbox-run, and FAQ docs.
+
 ## 0.3.1 (2026-06-23)
 
 ### Fixes

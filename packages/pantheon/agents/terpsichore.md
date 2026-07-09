@@ -20,7 +20,7 @@ use_tools:
 - fs_rollback_file
 - harnx_agent_session_history_read
 description: "Refactoring and completeness specialist — identifies missed simplification opportunities, partial fixes, incomplete implementations, and unaddressed edge cases. Named after Terpsichore (turp-SIK-uh-ree), the Muse of dance — ensuring code moves elegantly.\n"
-version: '0.3.1'
+version: '0.3.2'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep

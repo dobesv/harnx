@@ -11,6 +11,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add GitHub auth proxy hook (`harnx-proxy-auth`): persistent hook binary that acts as an HTTPS MITM proxy, injecting configurable auth headers for matching URLs into `bash_exec`/`bash_spawn` tool environments (closes #531)
 
+## 0.33.2 (2026-07-09)
+
+### Features
+
+- add unified error handling for streaming events across LLMs (#908)
+- add static remote agent catalog to cluster configuration (#929)
+- achieve remote agent tool parity and fix thin-client N… (#930)
+- implement remote session enumeration protocol (#938)
+- wire remote control surface for agent@cluster (#915) (#956)
+- add opt-in background GC for remote sessions (#960)
+- implement AG-UI protocol server support (#966)
+- add AG-UI follow-up features and fixes (#1005)
+- Add AG-UI Phase 2 control plane to harnx-serve: a per-(agent,session) actor with a tokio::broadcast event bus, a JSON-RPC 2.0 control endpoint (`session/get|prompt|cancel`), and a subscription-style SSE endpoint that emits a MESSAGES_SNAPSHOT on join then streams live events to all subscribers (with ~15s keep-alive). Dropping an SSE connection no longer stops a run — only `session/cancel` aborts, and cancellation persists partial state. The SSE run POST now inspects only the last message and drops the previous reconcile/empty/multi-message 400s.
+- Add AG-UI protocol server support to harnx-serve (content-negotiated /v1/agents tree with SSE run, session enumeration, history, and durable message ids).
+- Add #984 assistant-role filtering to the `/v1/agents` server endpoint.
+- Surface MCP server transport failures and subprocess churn as user-visible notices, including reconnect warnings and child stderr/closure signals, so ACP/TUI users can see MCP restarts and deaths without digging through logs. Fixes #990.
+- Add an optional `agents:` list to NATS cluster config (`nats_servers/<cluster>.yaml`). Declared remote agents appear as `name@cluster` in `--list-agents`/shell completion, and assistant-role entries also appear in the interactive picker. Static config only — no network calls.
+- Add server-side multipart attachment uploads with `cid:` reference prompt plumbing for AG-UI sessions.
+- harnx-serve and the AG-UI web client now support composing and injecting pending messages while an agent run is active. The server queues prompts sent via `session/prompt` (returning `Enqueued`) and consumes them on the next tool round, emitting a `pending_message_consumed` `CUSTOM_EVENT`. The web client uses this event to clear its queued message UI indicator reliably.
+- Adds opt-in background GC for remote sessions stored in NATS KV. Enable via `cleanup_remote_sessions_days` config field or `HARNX_CLEANUP_REMOTE_SESSIONS_DAYS` environment variable. When set, runs hourly to purge stale session index entries across all configured NATS clusters.
+- The web client now allows uploading attachments using `assistant-ui`'s native attachment UI. Images and files are transparently uploaded and their CID references are piped through the JSON-RPC `session/prompt` mechanism to the server.
+- Surface previously-silent errors in the AG-UI web UI: agents-list and sessions-list fetch failures (#983) now show inline error text, and message-send failures (#987) show an inline composer-area error.
+
+#### Fix #988: ACP server now creates per-session context once instead of forking config per-prompt, preventing MCP subprocess respawn on every turn.
+
+**Problem:** The ACP server re-derived config per prompt via `fork_prompt_config` → `use_agent_by_name` → `reinit_managers_for_agent`, which unconditionally rebuilt McpManager. This killed and respawned all MCP subprocesses (bash, fs, time, plans) on every prompt, breaking `read_exec_log` and degrading performance.
+
+**Solution:** Introduced `SessionContext` that holds a forked `GlobalConfig` (with its own `McpManager`/`AcpManager`) set up once at session creation. The `HarnxAgent.sessions` map now stores `Arc<SessionContext>` instead of bare concurrency primitives.
+
+- `new_session`: Fork config once, call `use_agent_by_name` + `use_session`, store `Arc<SessionContext>`.
+- `prompt`: Look up `Arc<SessionContext>`, reuse its stored config (no per-prompt fork).
+- `cancel`: Works identically via `SessionContext.abort_signal`/`cancel_notify`.
+- Lazy resume: Sessions on disk but absent from memory are rebuilt on-demand via `get_or_build_session`.
+- Idle reaper: Sessions idle > 15 minutes are evicted (reusing `session_actor.rs` pattern), reaping only when not holding the `prompt_lock`.
+
+This mirrors the NATS worker's correct per-session config pattern from `daemon.rs::execute_session`.
+
+#### High-availability distributed agent execution backed by NATS JetStream.
+
+This feature enables a distributed mode where thin clients (TUI, CLI, ACP) communicate with backend workers over NATS. Key capabilities include:
+- **Durable Persistence**: Session logs are stored as append-only streams in NATS JetStream.
+- **High Availability**: Multiple workers can provide failover, using a NATS KV-based lease for single-active-worker mutual exclusion and fence tokens to prevent stale writes.
+- **Thin Client Driver**: Automatic routing for `agent@cluster` agent references, separating client-side UI/tooling from backend execution.
+- **Live Event Fan-out**: Real-time streaming of model chunks and status updates to multiple connected clients for multiplayer visibility.
+- **Control Plane**: Remote cancellation and pending message management across the NATS cluster.
+- **Security**: Support for NATS token authentication and mTLS.
+- **Operations**: New `harnx worker` command, session management tools, and comprehensive HA documentation.
+
+#### Enables remote session enumeration for NATS-backed agents in the TUI session picker, CLI `--list-sessions`, and shell completion. 
+
+Previously, remote (`agent@cluster`) sessions were invisible to enumeration tools unless they existed in the local session directory. This change introduces a NATS KV-backed session index (`harnx_sessions`) that workers populate upon session activation and refresh during lease renewal. Clients now automatically route enumeration requests to this remote index when a remote agent is in context, with graceful degradation and timeouts to ensure local operations remain responsive even during NATS connectivity issues.
+
+#### Wire the remote control surface for NATS-backed `agent@cluster` sessions into the TUI, mirroring existing local-session operations.
+
+Remote sessions can now be resumed from the session picker (the picked session id is threaded into the thin-client turn instead of always starting a new session), cancelled with Ctrl+C (publishes `ControlCommand::Cancel` to the session's NATS control subject, fire-and-forget), and retracted/edited with the existing `d`/`e` keybindings (routed to the thin-client `retract_user_message`/`edit_user_message`, converting the displayed index to the JetStream user-message sequence). Local-agent execution paths are unchanged. CI now installs `nats-server` on Linux so the NATS integration tests run.
+
+### Fixes
+
+- prevent infinite loops and panics in scrolling widget rendering (#907)
+- use leader-authoritative read for mid-turn injection decision points (#917) (#928)
+- resize height cache instead of underflowing when items shrink (#952)
+- don't restore the panic hook while unwinding (#954)
+- surface mid-stream streaming LLM errors instead of stopping silently (#963)
+- keep transcript visible after compaction (#904) (#967)
+- forward EXA_API_KEY through the sandbox for the exa MCP server (#973)
+- harnx-serve now maps `AgentEvent::Status` to an AG-UI `CUSTOM_EVENT` (name `status`, payload `{ "text": string }`), emitted within run boundaries, so web clients can surface agent status the way the TUI does. Previously these status updates were dropped.
+- harnx-serve now streams AG-UI step, compaction, plan, status, and usage events so clients can observe turn boundaries, transcript compaction, and plan updates live.
+- harnx-serve now streams AG-UI thinking events from model thought chunks and preserves assistant prose plus tool-result entries in AG-UI history snapshots for tool-call turns.
+- Fix the Exa MCP server so web search works when `npx`/`node` is wrapped by a harnx sandbox. The configs previously set `EXA_API_KEY: "$EXA_API_KEY"`, but harnx does not expand `$VAR` in MCP `env:` values and the sandbox scrubs the child environment — so the server received no usable key and returned `API key must be provided`. They now use `HARNX_BASH_ENV_PASSTHROUGH: EXA_API_KEY`, which `harnx-sandbox-run` honors to forward the real host value. Also documents both footguns (literal `env:` values; sandbox env stripping) in the configuration guide, environment-variables, sandbox-run, and FAQ docs.
+- Fix #985 by percent-decoding encoded agent names in AG-UI server routes.
+- Fix server-mode log filter default (`harnx::serve` → `harnx`) so logs from `harnx_*` crates are captured. Correct `.env` precedence to standard dotenv semantics: the ambient/inherited environment always wins and the `.env` file only fills in variables that are not already set (previously `.env` unconditionally overrode inherited variables, silently clobbering operator-set values like `HARNX_LOG_LEVEL`). Fixes #989.
+- Fix a crash where a panic in the TUI aborted the process (and dumped core) instead of exiting cleanly. Restoring the terminal's panic hook while a panic was already unwinding triggered a fatal double-panic ("panic in a destructor during cleanup"); the guard now skips hook restoration when it is dropped during unwinding, so the original panic is reported and the terminal is restored normally.
+- Fix promptless session join returning empty MESSAGES_SNAPSHOT when session has persisted history (issue #959).
+- Emit tool-result events to sinks for recoverable tool execution errors, so AG-UI/CLI/TUI subscribers see terminal tool-call events for failed tool runs.
+- Fix infinite loop and potential panics in scrolling widget by limiting render attempts and using safe indexing.
+- Fix a crash when scrolling the transcript after compaction. The scrolling widget's per-width height cache assumed the number of items only ever grows; when compaction shrank or blanked the transcript, an internal length calculation underflowed — panicking in debug builds and, in release builds, wrapping into an unbounded allocation that could exhaust memory. The cache now resizes to the current item count.
+- Fix silent stop with no output when a streaming LLM response returns a mid-stream error (issue #905).
+- Fix AG-UI tool approval resume handling so browser resumes can omit original prompt text, resumed batches must cover every pending interrupt, and mixed approved/deferred tool rounds preserve results for every emitted tool call.
+- Release binaries now ship with line-table debug info and are no longer stripped, so crash backtraces — including the heap-guard abort trace and panic backtraces — resolve to real function names and line numbers instead of `<unknown>`. This makes crash reports from release builds actionable out of the box, at the cost of a somewhat larger binary.
+- Remove `harnx --serve` from core CLI. Use standalone `harnx-serve` binary for HTTP server mode instead.
+- Removed harnx-serve legacy chat-completions proxy, playground, and arena endpoints so AG-UI is sole interactive surface, while preserving configured tools for AG-UI sessions.
+- Thread explicit per-session working directories through harnx runtime so in-process runs keep tool execution, hooks, and persisted session metadata bound to each session's own working directory while preserving CLI and ACP fallback to process cwd when no per-session directory is set.
+- Fix session-scoped AG-UI RPC routing so web prompts and cancels no longer 404.
+- fix: thin client now waits for assistant reply to current NATS turn instead of returning early on transient Idle state, and returns no stale prior response on abnormal turn termination
+
 ## 0.33.1 (2026-06-23)
 
 ### Fixes

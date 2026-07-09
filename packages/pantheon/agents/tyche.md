@@ -23,7 +23,7 @@ description: "Deployment verification specialist \u2014 produces Go/No-Go deploy
   \ checklists with pre-deployment checks, migration verification, rollback procedures,\
   \ and monitoring plans. Named after Tyche (TY-kee), goddess of fortune who determines\
   \ whether chance favors the prepared.\n"
-version: '0.3.1'
+version: '0.3.2'
 variables:
 - name: ast_grep_search
   description: Guide for structural code search with ast-grep
