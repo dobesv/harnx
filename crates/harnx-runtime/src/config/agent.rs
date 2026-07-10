@@ -5,7 +5,7 @@ use inquire::{validator::Validation, Text};
 use std::path::Path;
 
 pub use harnx_core::agent_config::{
-    AgentConfig, AgentRole, AgentVariable, AgentVariables, TEMP_AGENT_NAME,
+    split_tool_selectors, AgentConfig, AgentRole, AgentVariable, AgentVariables, TEMP_AGENT_NAME,
 };
 
 const DEFAULT_AGENT_NAME: &str = "rag";
@@ -239,6 +239,24 @@ pub fn resolve_variables(agent: &mut Agent) -> Result<()> {
     Ok(())
 }
 
+fn expand_agent_use_tool_selectors(config: &Config, use_tools: Option<Vec<String>>) -> Vec<String> {
+    let Some(use_tools) = use_tools.filter(|selectors| !selectors.is_empty()) else {
+        return Vec::new();
+    };
+
+    split_tool_selectors(&use_tools.join(","))
+        .into_iter()
+        .flat_map(|selector| {
+            let selector = selector.trim();
+            config
+                .toolsets
+                .get(selector)
+                .cloned()
+                .unwrap_or_else(|| vec![selector.to_string()])
+        })
+        .collect()
+}
+
 pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) -> Result<Agent> {
     let agent_file_path = Config::agent_file(name);
     let mut agent = if agent_file_path.exists() {
@@ -247,11 +265,19 @@ pub async fn init(config: &GlobalConfig, name: &str, abort_signal: AbortSignal) 
         builtin(name)?
     };
 
+    let prefetched_tool_selectors = {
+        let guard = config.read();
+        expand_agent_use_tool_selectors(&guard, agent.config.use_tools())
+    };
     let mcp_manager = config.read().mcp_manager.clone();
     agent.mcp_manager = mcp_manager.clone();
 
     let mcp_tools = match &mcp_manager {
-        Some(manager) => Some(manager.get_all_tools().await),
+        Some(manager) => Some(
+            manager
+                .get_tools_for_selectors(&prefetched_tool_selectors)
+                .await,
+        ),
         None => None,
     };
     agent.config.set_tools(Tools::init_from_mcp(mcp_tools));
