@@ -299,10 +299,11 @@ impl Config {
             config.write().exit_agent()?;
         }
         // Scope the MCP/ACP managers to the incoming agent's package BEFORE
-        // `agent::init` snapshots the MCP tool declarations (it reads
-        // `mcp_manager.get_all_tools()` during init). Without this the agent
-        // would inherit the global (`None`) scope left by `Config::init` and
-        // its same-package tools would be wrongly prefixed (#826).
+        // `agent::init` snapshots selector-filtered MCP tool declarations (it
+        // reads `mcp_manager.get_tools_for_selectors(...)` during init).
+        // Without this the agent would inherit the global (`None`) scope left
+        // by `Config::init` and its same-package tools would be wrongly
+        // prefixed (#826).
         //
         // Scoping + install go through the same `scope_managers_for_agent` /
         // `set_active_agent` helpers as the synchronous `use_agent_obj` path, so
