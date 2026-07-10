@@ -18,6 +18,7 @@ mod test_regression_issue_68;
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,10 +69,10 @@ enum AcpForward {
 }
 
 /// An `AgentEventSink` installed during each ACP prompt turn.
-/// Forwards events from the unified `run_agent_loop` through a channel
-/// to a spawned local task that calls `session_notification`. The
-/// channel is required because the ACP `connection` is `Rc<...>` (`!Send`)
-/// and can't be captured in the sink itself.
+/// Forwards events from unified `run_agent_loop` through channel to spawned
+/// task that emits ACP `session_notification`s. Channel keeps sink cheap,
+/// decouples event production from notification I/O, and preserves ordered
+/// forwarding without holding caller on notification send path.
 struct AcpChunkSink {
     tx: tokio::sync::mpsc::UnboundedSender<AcpForward>,
 }
@@ -192,6 +193,9 @@ pub struct SessionContext {
     pub prompt_lock: Arc<tokio::sync::Mutex<()>>,
     /// Last activity timestamp for idle reaper.
     last_activity: parking_lot::Mutex<Instant>,
+    /// Test override to force session into idle-expired state without relying
+    /// on backdating `Instant` before monotonic clock origin.
+    force_idle: AtomicBool,
 }
 
 impl Drop for SessionContext {
@@ -215,6 +219,7 @@ impl SessionContext {
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_activity: parking_lot::Mutex::new(Instant::now()),
+            force_idle: AtomicBool::new(false),
         }
     }
 
@@ -222,17 +227,15 @@ impl SessionContext {
     /// activity: at prompt start, when a prompt stops (completion OR
     /// cancellation), and on a `session/cancel` notification.
     fn touch(&self) {
+        self.force_idle.store(false, Ordering::Relaxed);
         *self.last_activity.lock() = Instant::now();
     }
 
-    /// Test-only: force last activity far enough into the past that the idle
-    /// TTL is considered elapsed, so reaper decisions can be exercised without
-    /// sleeping for the real TTL.
+    /// Test-only: force idle-expired state without relying on subtracting
+    /// past monotonic clock origin on freshly booted machines.
     #[cfg(test)]
     fn mark_idle_for_test(&self) {
-        *self.last_activity.lock() = Instant::now()
-            .checked_sub(SESSION_IDLE_TTL + Duration::from_secs(1))
-            .expect("subtract TTL from now");
+        self.force_idle.store(true, Ordering::Relaxed);
     }
 
     /// Check if this session is currently running a prompt.
@@ -245,7 +248,8 @@ impl SessionContext {
 
     /// Check if the idle TTL has elapsed.
     fn is_idle_expired(&self) -> bool {
-        self.last_activity.lock().elapsed() >= SESSION_IDLE_TTL
+        self.force_idle.load(Ordering::Relaxed)
+            || self.last_activity.lock().elapsed() >= SESSION_IDLE_TTL
     }
 
     /// Whether the idle reaper should evict this session: it must be idle past
@@ -420,7 +424,7 @@ impl HarnxAgent {
             }
             if let Some(conn) = conn.clone() {
                 let sid = session_key.to_string();
-                tokio::task::spawn_local(async move {
+                tokio::spawn(async move {
                     let mut chunk = ContentChunk::new(text.into());
                     if let Some(source) = source.as_ref() {
                         if let Some(meta) = meta_from_source(source) {
@@ -447,7 +451,7 @@ impl HarnxAgent {
             }
             if let Some(conn) = conn.clone() {
                 let sid = session_key.to_string();
-                tokio::task::spawn_local(async move {
+                tokio::spawn(async move {
                     let mut chunk = ContentChunk::new(text.into());
                     if let Some(source) = source.as_ref() {
                         if let Some(meta) = meta_from_source(source) {
@@ -474,7 +478,7 @@ impl HarnxAgent {
         ) {
             if let Some(conn) = conn.clone() {
                 let sid = session_key.to_string();
-                tokio::task::spawn_local(async move {
+                tokio::spawn(async move {
                     let tool_call_id = if id.is_empty() { name.clone() } else { id };
                     let mut tc = ToolCall::new(tool_call_id, name).raw_input(input);
                     let mut meta_map: Option<serde_json::Map<String, serde_json::Value>> = None;
@@ -505,7 +509,7 @@ impl HarnxAgent {
         ) {
             if let Some(conn) = conn.clone() {
                 let sid = session_key.to_string();
-                tokio::task::spawn_local(async move {
+                tokio::spawn(async move {
                     let acp_status = status.map(|s| match s {
                         harnx_core::event::ToolStatus::Pending => ToolCallStatus::Pending,
                         harnx_core::event::ToolStatus::InProgress => ToolCallStatus::InProgress,
@@ -544,7 +548,7 @@ impl HarnxAgent {
         ) {
             if let Some(conn) = conn.clone() {
                 let sid = session_key.to_string();
-                tokio::task::spawn_local(async move {
+                tokio::spawn(async move {
                     let mut fields = ToolCallUpdateFields::new()
                         .status(ToolCallStatus::Completed)
                         .raw_output(output);
@@ -607,7 +611,7 @@ impl HarnxAgent {
         }
 
         // Forward task: drain chunk_rx → session_notification.
-        let fwd_task = tokio::task::spawn_local(async move {
+        let fwd_task = tokio::spawn(async move {
             while let Some(forward) = chunk_rx.recv().await {
                 spawn_notify_forward(&connection_for_fwd, &session_key_for_fwd, forward);
             }
@@ -627,7 +631,7 @@ impl HarnxAgent {
 
         // Cancel listener: wait on cancel_notify, fire abort.
         let cancel_abort = abort_signal.clone();
-        let cancel_listener = tokio::task::spawn_local(async move {
+        let cancel_listener = tokio::spawn(async move {
             cancel_notify.notified().await;
             cancel_abort.set_ctrlc();
         });
@@ -764,7 +768,7 @@ impl HarnxAgent {
         let weak_ctx = Arc::downgrade(&ctx);
         drop(ctx); // Don't hold an extra strong ref.
 
-        tokio::task::spawn_local(async move {
+        tokio::spawn(async move {
             // Check every minute.
             let check_interval = Duration::from_secs(60);
             loop {

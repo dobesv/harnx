@@ -26,3 +26,5 @@ tokio = { workspace = true, features = ["io-util", "process"] }
 [dev-dependencies]
 dirs = { workspace = true }
 uuid = { workspace = true }
+harnx-test-bins = { path = "../harnx-test-bins" }
+tempfile = "3"

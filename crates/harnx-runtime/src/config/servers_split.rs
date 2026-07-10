@@ -286,3 +286,119 @@ impl Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harnx_mcp::McpServerConfig;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    fn mock_mcp_bin() -> PathBuf {
+        let exe_name = format!("harnx-mock-mcp{}", std::env::consts::EXE_SUFFIX);
+        let current_exe = std::env::current_exe().expect("current test binary path");
+        let target_dir = current_exe
+            .parent()
+            .expect("deps dir")
+            .parent()
+            .expect("target profile dir");
+        let candidate = target_dir.join(&exe_name);
+        assert!(
+            candidate.exists(),
+            "expected mock MCP binary at {}",
+            candidate.display()
+        );
+        candidate
+    }
+
+    fn spawn_log_lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .map(|contents| {
+                contents
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn wait_for_spawn_count(path: &Path, min_lines: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let lines = spawn_log_lines(path);
+            if lines.len() >= min_lines {
+                return lines;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {} spawn-log lines in {}. current contents: {:?}",
+                min_lines,
+                path.display(),
+                lines
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn force_mcp_spawn(config: &Config) {
+        let manager = config
+            .mcp_manager
+            .as_ref()
+            .expect("mcp_manager initialized");
+        let tools = manager.get_all_tools_blocking();
+        assert!(
+            !tools.is_empty(),
+            "expected mock MCP server to expose at least one tool"
+        );
+    }
+
+    /// Regression reproduction for issue #988 residual churn:
+    /// `reinit_managers_for_agent` unconditionally rebuilds the MCP manager,
+    /// so an agent switch restarts every MCP subprocess even when its spawn
+    /// config is unchanged. When fix lands (diff-and-preserve unchanged
+    /// servers), flip assertion to `assert_eq!(n1, n2)`.
+    #[test]
+    fn reinit_managers_restarts_mcp_subprocess_on_agent_switch() {
+        let spawn_log = tempfile::NamedTempFile::new().expect("spawn log temp file");
+        let spawn_log_path = spawn_log.path().to_path_buf();
+        let mock_bin = mock_mcp_bin();
+
+        let mut config = Config {
+            mcp_servers: vec![McpServerConfig {
+                name: "mock".to_string(),
+                command: mock_bin.to_string_lossy().into_owned(),
+                args: vec![
+                    "--spawn-log".to_string(),
+                    spawn_log_path.to_string_lossy().into_owned(),
+                ],
+                env: Default::default(),
+                roots: vec![],
+                enabled: true,
+                description: None,
+                rename_tools: Default::default(),
+                tool_templates: Default::default(),
+                hooks: None,
+                package: None,
+            }],
+            ..Config::default()
+        };
+
+        config.reinit_managers_for_agent(None);
+        force_mcp_spawn(&config);
+        let first_lines = wait_for_spawn_count(&spawn_log_path, 1);
+        let n1 = first_lines.len();
+
+        config.reinit_managers_for_agent(None);
+        force_mcp_spawn(&config);
+        let second_lines = wait_for_spawn_count(&spawn_log_path, n1 + 1);
+        let n2 = second_lines.len();
+
+        assert!(
+            n2 > n1,
+            "expected reinit_managers_for_agent to restart MCP subprocess; n1={n1}, n2={n2}, log={:?}",
+            second_lines
+        );
+    }
+}
