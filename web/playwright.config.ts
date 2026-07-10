@@ -15,7 +15,7 @@ export default defineConfig({
   },
 
   use: {
-    baseURL: 'http://localhost:5174',
+    baseURL: 'http://localhost:5180',
     trace: 'on-first-retry',
     animations: 'disabled',
     timezoneId: 'UTC',
@@ -23,14 +23,18 @@ export default defineConfig({
 
   projects: [
     {
-      name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      name: 'chromium-light',
+      use: { ...devices['Desktop Chrome'], colorScheme: 'light' },
+    },
+    {
+      name: 'chromium-dark',
+      use: { ...devices['Desktop Chrome'], colorScheme: 'dark' },
     },
   ],
 
   webServer: {
-    command: 'VITE_ENABLE_MSW=true pnpm dev --port 5174',
-    url: 'http://localhost:5174',
+    command: 'VITE_ENABLE_MSW=true pnpm dev --port 5180',
+    url: 'http://localhost:5180',
     reuseExistingServer: !process.env.CI,
   },
 });

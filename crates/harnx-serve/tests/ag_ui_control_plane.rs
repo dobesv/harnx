@@ -131,7 +131,8 @@ async fn rpc_call(
 ) -> Value {
     let response = handle_ag_ui_rpc_bytes(
         Method::POST,
-        format!("/v1/agents/{agent}/sessions/{session}/rpc"),
+        agent,
+        session,
         Bytes::from(request.to_string()),
         config,
         registry,
@@ -293,26 +294,23 @@ async fn e2e_success_criterion_1_sse_endpoint_returns_messages_snapshot_and_even
     let registry =
         SessionRegistry::new_for_tests(config.clone(), Duration::from_secs(30), Some(call_fn));
 
-    let response = open_sse(&config, &registry, "plain", "criteria-1", json!([])).await;
-    let sse_task = tokio::spawn(async move {
-        read_sse_until(response, Duration::from_secs(10), |read| {
-            has_real_run_finished(read)
-        })
-        .await
-    });
-
-    let prompt = rpc_call(
+    // Open one PROMPTED run (single writer) to receive live events.
+    let response = open_sse(
         &config,
         &registry,
         "plain",
         "criteria-1",
-        json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"text":"hello"}}),
+        json!([{
+            "id": Uuid::new_v4(),
+            "role": "user",
+            "content": "hello"
+        }]),
     )
     .await;
-    assert_eq!(prompt["result"]["status"], "accepted");
-    assert!(prompt["result"]["run_id"].as_str().is_some());
-
-    let read = sse_task.await.expect("sse task");
+    let read = read_sse_until(response, Duration::from_secs(10), |read| {
+        has_real_run_finished(read)
+    })
+    .await;
     assert_eq!(read.events[0]["type"], "RUN_STARTED");
     assert!(read
         .events
@@ -344,33 +342,29 @@ async fn e2e_success_criterion_2_rpc_prompt_starts_run_and_injects_prompt() {
     let registry =
         SessionRegistry::new_for_tests(config.clone(), Duration::from_secs(30), Some(call_fn));
 
-    let response = open_sse(&config, &registry, "plain", "criteria-2", json!([])).await;
-    let sse_task = tokio::spawn(async move {
-        read_sse_until(response, Duration::from_secs(10), |read| {
-            has_real_run_finished(read)
-        })
-        .await
-    });
-
-    let first = rpc_call(
+    let response = open_sse(
         &config,
         &registry,
         "plain",
         "criteria-2",
-        json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"text":"one"}}),
+        json!([{
+            "id": Uuid::new_v4(),
+            "role": "user",
+            "content": "one"
+        }]),
     )
     .await;
-    assert_eq!(first["result"]["status"], "accepted");
-
-    let read = sse_task.await.expect("sse task");
-    assert!(read
-        .events
-        .iter()
-        .any(|event| event["type"] == "RUN_STARTED"));
-    assert!(read
-        .events
-        .iter()
-        .any(|event| event["type"] == "RUN_FINISHED"));
+    let read = read_sse_until(response, Duration::from_secs(10), |read| {
+        has_real_run_finished(read)
+    })
+    .await;
+    assert_eq!(
+        read.events
+            .iter()
+            .filter(|event| event["type"] == "RUN_FINISHED")
+            .count(),
+        1
+    );
 
     // Verify assistant response persisted
     let persisted = load_session_messages(&config, "plain", "criteria-2");
@@ -454,7 +448,19 @@ async fn e2e_success_criterion_3_prompt_while_running_injects_mid_loop() {
     let registry =
         SessionRegistry::new_for_tests(config.clone(), Duration::from_secs(30), Some(call_fn));
 
-    let response = open_sse(&config, &registry, "plain", "criteria-3", json!([])).await;
+    // Open a prompted run to watch events permanently (won't close until run finishes)
+    let response = open_sse(
+        &config,
+        &registry,
+        "plain",
+        "criteria-3",
+        json!([{
+            "id": Uuid::new_v4(),
+            "role": "user",
+            "content": "first"
+        }]),
+    )
+    .await;
     let sse_task = tokio::spawn(async move {
         read_sse_until(response, Duration::from_secs(10), |read| {
             has_real_run_finished(read)
@@ -462,16 +468,18 @@ async fn e2e_success_criterion_3_prompt_while_running_injects_mid_loop() {
         .await
     });
 
-    // Send first prompt to start the run
+    // The SSE stream opened with "first" prompt, so the run already has this prompt.
+    // Verify the first prompt is accepted.
     let first = rpc_call(
         &config,
         &registry,
         "plain",
         "criteria-3",
-        json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"text":"first"}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"session/get"}),
     )
     .await;
-    assert_eq!(first["result"]["status"], "accepted");
+    // Session should already be running from the SSE POST
+    assert_eq!(first["result"]["state"]["status"], "running");
 
     // Wait for round 0 to start (deterministic - notify_one stores permit)
     round0_started.notified().await;
@@ -545,25 +553,23 @@ async fn e2e_success_sse_stream_includes_thinking_events_before_text() {
     let registry =
         SessionRegistry::new_for_tests(config.clone(), Duration::from_secs(30), Some(call_fn));
 
-    let response = open_sse(&config, &registry, "plain", "thinking-order", json!([])).await;
-    let sse_task = tokio::spawn(async move {
-        read_sse_until(response, Duration::from_secs(10), |read| {
-            has_real_run_finished(read)
-        })
-        .await
-    });
-
-    let prompt = rpc_call(
+    // Open one PROMPTED run (single writer) to receive live events.
+    let response = open_sse(
         &config,
         &registry,
         "plain",
         "thinking-order",
-        json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"text":"hello"}}),
+        json!([{
+            "id": Uuid::new_v4(),
+            "role": "user",
+            "content": "hello"
+        }]),
     )
     .await;
-    assert_eq!(prompt["result"]["status"], "accepted");
-
-    let read = sse_task.await.expect("sse task");
+    let read = read_sse_until(response, Duration::from_secs(10), |read| {
+        has_real_run_finished(read)
+    })
+    .await;
     let types: Vec<_> = read
         .events
         .iter()
@@ -865,7 +871,19 @@ async fn e2e_success_criterion_4_cancel_running_persists_partial_and_returns_idl
     let registry =
         SessionRegistry::new_for_tests(config.clone(), Duration::from_secs(30), Some(call_fn));
 
-    let response = open_sse(&config, &registry, "plain", "criteria-4", json!([])).await;
+    // Open a PROMPTED run (with messages) to receive live events
+    let response = open_sse(
+        &config,
+        &registry,
+        "plain",
+        "criteria-4",
+        json!([{
+            "id": Uuid::new_v4(),
+            "role": "user",
+            "content": "cancel me"
+        }]),
+    )
+    .await;
     let sse_task = tokio::spawn(async move {
         read_sse_until(response, Duration::from_secs(10), |read| {
             has_content_event(read) && read.events.iter().any(|event| event["type"] == "RUN_ERROR")
@@ -873,16 +891,17 @@ async fn e2e_success_criterion_4_cancel_running_persists_partial_and_returns_idl
         .await
     });
 
-    // Start run
+    // The SSE stream was already opened with a user message. Now just wait for it.
     let prompt = rpc_call(
         &config,
         &registry,
         "plain",
         "criteria-4",
-        json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"text":"cancel me"}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"session/get"}),
     )
     .await;
-    assert_eq!(prompt["result"]["status"], "accepted");
+    // Session should be running
+    assert_eq!(prompt["result"]["state"]["status"], "running");
 
     // Wait for run to start (deterministic)
     started.notified().await;
@@ -952,26 +971,29 @@ async fn e2e_success_criterion_5_history_snapshot_returns_persisted_messages() {
     let registry =
         SessionRegistry::new_for_tests(config.clone(), Duration::from_secs(30), Some(call_fn));
 
-    let response = open_sse(&config, &registry, "plain", "criteria-5", json!([])).await;
-    let sse_task = tokio::spawn(async move {
-        read_sse_until(response, Duration::from_secs(10), |read| {
-            has_real_run_finished(read)
-        })
-        .await
-    });
-
-    let prompt = rpc_call(
+    let response = open_sse(
         &config,
         &registry,
         "plain",
         "criteria-5",
-        json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"text":"history test"}}),
+        json!([{
+            "id": Uuid::new_v4(),
+            "role": "user",
+            "content": "history test"
+        }]),
     )
     .await;
-
-    assert_eq!(prompt["result"]["status"], "accepted");
-
-    let _ = sse_task.await.expect("sse task");
+    let read = read_sse_until(response, Duration::from_secs(10), |read| {
+        has_real_run_finished(read)
+    })
+    .await;
+    assert_eq!(
+        read.events
+            .iter()
+            .filter(|event| event["type"] == "RUN_FINISHED")
+            .count(),
+        1
+    );
 
     // Check known session returns history via session/get
     let history = rpc_call(
@@ -1043,7 +1065,10 @@ async fn e2e_success_criterion_6_two_sse_subscribers_receive_same_events() {
         json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"text":"broadcast"}}),
     )
     .await;
-    assert_eq!(prompt["result"]["status"], "accepted");
+    assert!(matches!(
+        prompt["result"]["status"].as_str(),
+        Some("accepted") | Some("enqueued")
+    ));
 
     let a = task_a.await.expect("task a");
     let b = task_b.await.expect("task b");
@@ -1105,7 +1130,10 @@ async fn e2e_success_criterion_7_drop_sse_mid_run_run_continues_and_persists() {
         json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"text":"keep running"}}),
     )
     .await;
-    assert_eq!(prompt["result"]["status"], "accepted");
+    assert!(matches!(
+        prompt["result"]["status"].as_str(),
+        Some("accepted") | Some("enqueued")
+    ));
 
     // Wait for run to start (deterministic)
     started.notified().await;
@@ -1130,7 +1158,9 @@ async fn e2e_success_criterion_7_drop_sse_mid_run_run_continues_and_persists() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn e2e_success_criterion_8_heartbeat_keeps_sse_alive() {
+async fn e2e_success_criterion_8_sse_terminates_after_run_finish() {
+    // After the server fix, promptless subscribe streams terminate after RUN_FINISHED.
+    // This test verifies that an idle subscribe stream closes promptly (no keepalive).
     let _guard = TestStateGuard::new(None).await;
     let sandbox = TestConfigSandbox::new();
     sandbox.write_agent("plain", "You are plain.");
@@ -1149,51 +1179,24 @@ async fn e2e_success_criterion_8_heartbeat_keeps_sse_alive() {
     let registry =
         SessionRegistry::new_for_tests(config.clone(), Duration::from_secs(30), Some(call_fn));
 
+    // Open idle SSE stream (promptless subscribe)
     let response = open_sse(&config, &registry, "plain", "criteria-8", json!([])).await;
     let task = tokio::spawn(async move {
-        read_sse_until(response, Duration::from_secs(15), |read| {
-            read.events
-                .iter()
-                .filter(|event| event["type"] == "RUN_FINISHED")
-                .count()
-                >= 2
+        read_sse_until(response, Duration::from_secs(5), |read| {
+            // Expect just one RUN_FINISHED (the idle subscribe) and stream to close
+            read.events.iter().any(|e| e["type"] == "RUN_FINISHED")
         })
         .await
     });
 
-    // Start first run
-    let first = rpc_call(
-        &config,
-        &registry,
-        "plain",
-        "criteria-8",
-        json!({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"text":"one"}}),
-    )
-    .await;
-    assert_eq!(first["result"]["status"], "accepted");
-
-    // Wait for first run to complete
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Start second run (now idle, so accepted)
-    let second = rpc_call(
-        &config,
-        &registry,
-        "plain",
-        "criteria-8",
-        json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"text":"two"}}),
-    )
-    .await;
-    assert_eq!(second["result"]["status"], "accepted");
-
-    let read = task.await.expect("heartbeat task");
-    // Two runs should complete; heartbeat existence is optional in fast test
+    let read = task.await.expect("sse task");
+    // The idle subscribe should deliver the synthetic envelope and close
     assert_eq!(
         read.events
             .iter()
             .filter(|event| event["type"] == "RUN_FINISHED")
             .count(),
-        2
+        1
     );
 }
 
@@ -1266,4 +1269,260 @@ async fn e2e_success_criterion_9_legacy_endpoints_and_history_unchanged() {
         .list_session_history("plain", "missing-session")
         .await;
     assert!(unknown.is_err(), "missing AG-UI session should error");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn route_post_both_headers_prefers_sse_and_rejects_json_rpc_shape_as_ag_ui() {
+    let _guard = TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "You are plain.");
+    let config = sandbox.config();
+    let registry = SessionRegistry::new(config.clone());
+
+    let response = harnx_serve::ag_ui::ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        "both-headers-sse",
+        json!({"jsonrpc":"2.0","id":1,"method":"session/get"})
+            .to_string()
+            .as_bytes(),
+        None,
+    )
+    .await
+    .expect_err("JSON-RPC body should be parsed as AG-UI on SSE plane");
+
+    match response {
+        harnx_serve::ag_ui::AgUiError::BadRequest(message) => {
+            assert!(message.contains("invalid AG-UI request body"));
+        }
+        other => panic!("expected bad request, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn route_post_malformed_json_maps_to_sse_400_and_rpc_parse_error() {
+    let _guard = TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "You are plain.");
+    let config = sandbox.config();
+    let registry = SessionRegistry::new(config.clone());
+
+    let sse_err = harnx_serve::ag_ui::ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "plain",
+        "malformed-sse",
+        b"{not json",
+        None,
+    )
+    .await
+    .expect_err("malformed SSE body should be AG-UI bad request");
+    assert!(matches!(
+        sse_err,
+        harnx_serve::ag_ui::AgUiError::BadRequest(_)
+    ));
+
+    let rpc = handle_ag_ui_rpc_bytes(
+        Method::POST,
+        "plain",
+        "malformed-rpc",
+        Bytes::from_static(b"{not json"),
+        &config,
+        &registry,
+        PersistenceKind::Filesystem,
+    )
+    .await
+    .expect("rpc response");
+    assert_eq!(rpc.status(), http::StatusCode::BAD_REQUEST);
+    let body = rpc
+        .into_body()
+        .collect()
+        .await
+        .expect("collect rpc body")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&body).expect("parse rpc body");
+    assert_eq!(body["error"]["code"], -32700);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sse_cancel_mid_run_closes_after_run_error_without_extra_frames() {
+    let _guard = TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "You are plain.");
+    let config = sandbox.config();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let call_fn: AgentCallFn = {
+        let started = started.clone();
+        let release = release.clone();
+        Arc::new(move |_input, _config, abort| {
+            let started = started.clone();
+            let release = release.clone();
+            Box::pin(async move {
+                started.notify_one();
+                tokio::select! {
+                    _ = release.notified() => Ok((
+                        "late success".to_string(),
+                        None,
+                        Vec::<ToolCall>::new(),
+                        CompletionTokenUsage::default(),
+                    )),
+                    _ = harnx_core::abort::wait_abort_signal(&abort) => Err(anyhow!("cancelled")),
+                }
+            })
+        })
+    };
+    let registry =
+        SessionRegistry::new_for_tests(config.clone(), Duration::from_secs(30), Some(call_fn));
+    let response = open_sse(
+        &config,
+        &registry,
+        "plain",
+        "prompted-cancel-close",
+        json!([{"id":Uuid::new_v4(),"role":"user","content":"cancel me"}]),
+    )
+    .await;
+
+    started.notified().await;
+    let cancel = rpc_call(
+        &config,
+        &registry,
+        "plain",
+        "prompted-cancel-close",
+        json!({"jsonrpc":"2.0","id":9,"method":"session/cancel"}),
+    )
+    .await;
+    assert_eq!(cancel["result"]["cancelled"], true);
+
+    let read = read_sse_until(response, Duration::from_secs(5), |read| {
+        read.events.iter().any(|event| event["type"] == "RUN_ERROR")
+    })
+    .await;
+    assert_eq!(
+        read.events.last().and_then(|event| event["type"].as_str()),
+        Some("RUN_ERROR")
+    );
+    assert!(
+        read.comments.is_empty(),
+        "no keepalive comments after terminal frame"
+    );
+    release.notify_one();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_prompted_sse_runs_do_not_cross_streams() {
+    let _guard = TestStateGuard::new(None).await;
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "You are plain.");
+    let config = sandbox.config();
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let call_fn: AgentCallFn = {
+        let first_started = first_started.clone();
+        let release_first = release_first.clone();
+        let seen = seen.clone();
+        let turn = Arc::new(AtomicUsize::new(0));
+        Arc::new(move |input, _config, _abort| {
+            let first_started = first_started.clone();
+            let release_first = release_first.clone();
+            let seen = seen.clone();
+            let turn = turn.clone();
+            let text = input.text();
+            Box::pin(async move {
+                seen.lock().await.push(text.clone());
+                match turn.fetch_add(1, Ordering::SeqCst) {
+                    0 => {
+                        first_started.notify_one();
+                        release_first.notified().await;
+                        Ok((
+                            format!("assistant {text}"),
+                            None,
+                            Vec::<ToolCall>::new(),
+                            CompletionTokenUsage::default(),
+                        ))
+                    }
+                    1 => Ok((
+                        format!("assistant {text}"),
+                        None,
+                        Vec::<ToolCall>::new(),
+                        CompletionTokenUsage::default(),
+                    )),
+                    other => panic!("unexpected turn {other}"),
+                }
+            })
+        })
+    };
+    let registry =
+        SessionRegistry::new_for_tests(config.clone(), Duration::from_secs(30), Some(call_fn));
+
+    let first_response = open_sse(
+        &config,
+        &registry,
+        "plain",
+        "queue-sse",
+        json!([{"id":Uuid::new_v4(),"role":"user","content":"first"}]),
+    )
+    .await;
+    first_started.notified().await;
+
+    let second_future = open_sse(
+        &config,
+        &registry,
+        "plain",
+        "queue-sse",
+        json!([{"id":Uuid::new_v4(),"role":"user","content":"second"}]),
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release_first.notify_one();
+    let first_read = read_sse_until(first_response, Duration::from_secs(5), |read| {
+        read.events
+            .iter()
+            .any(|event| event["type"] == "RUN_FINISHED")
+    })
+    .await;
+    let second_response = second_future.await;
+    let second_read = read_sse_until(second_response, Duration::from_secs(5), |read| {
+        read.events
+            .iter()
+            .any(|event| event["type"] == "RUN_FINISHED")
+    })
+    .await;
+
+    let first_run_finished = first_read
+        .events
+        .iter()
+        .filter(|event| event["type"] == "RUN_FINISHED")
+        .count();
+    let second_run_finished = second_read
+        .events
+        .iter()
+        .filter(|event| event["type"] == "RUN_FINISHED")
+        .count();
+    assert_eq!(
+        first_run_finished, 1,
+        "first prompted stream should terminate after its own run"
+    );
+    assert_eq!(
+        second_run_finished, 1,
+        "second prompted stream should terminate after its own run"
+    );
+
+    let first_run_id = first_read
+        .events
+        .first()
+        .and_then(|event| event["runId"].as_str());
+    let second_run_id = second_read
+        .events
+        .first()
+        .and_then(|event| event["runId"].as_str());
+    assert_ne!(
+        first_run_id, second_run_id,
+        "queued prompt should get a separate prompted stream run id"
+    );
+
+    let seen = seen.lock().await.clone();
+    assert_eq!(seen, vec!["first".to_string(), "second".to_string()]);
 }

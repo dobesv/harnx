@@ -1,19 +1,147 @@
-import React, { useMemo, useState } from 'react';
-import { AssistantRuntimeProvider } from '@assistant-ui/react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { AssistantRuntimeProvider, useThreadRuntime } from '@assistant-ui/react';
 import type { AttachmentAdapter } from '@assistant-ui/react';
 import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
 import { HttpAgent } from '@ag-ui/client';
+import type { AgentSubscriber, Message } from '@ag-ui/client';
 import { PendingContext } from './PendingContext';
-import { uploadAttachment, prompt } from './api';
+import { uploadAttachment } from './api';
 
 export interface ChatProviderProps {
   agentName: string;
   sessionId: string;
+  isFreshSession: boolean;
   children: React.ReactNode;
 }
 
-export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId, children }) => {
-  const [pendingText, setPendingText] = useState<string | null>(null);
+const EMPTY_STATE = {};
+
+const RuntimeSessionSubscriber = ({ enabled }: { enabled: boolean }) => {
+  const threadRuntime = useThreadRuntime();
+
+  useEffect(() => {
+    if (!enabled) return;
+    threadRuntime.startRun({
+      parentId: threadRuntime.getState().messages.at(-1)?.id ?? null,
+    });
+  }, [enabled, threadRuntime]);
+
+  return null;
+};
+
+export interface AttachmentPart {
+  type: string;
+  image?: string;
+  data?: string;
+  mimeType?: string;
+  filename?: string;
+}
+
+export interface Attachment {
+  type?: string;
+  name?: string;
+  content?: AttachmentPart[];
+}
+
+type MessagePart =
+  | { type: 'image'; image: string; filename?: string }
+  | { type: 'file'; data: string; mimeType: string; filename?: string };
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function attachmentToMessageParts(attachment: Attachment): MessagePart[] {
+  if (!attachment.content || attachment.content.length === 0) return [];
+
+  return attachment.content.flatMap((part) => {
+    if (part.type === 'image' && typeof part.image === 'string') {
+      return [{ type: 'image', image: part.image, filename: attachment.name ?? part.filename } as MessagePart];
+    }
+
+    if (part.type === 'file' && typeof part.data === 'string' && typeof part.mimeType === 'string') {
+      return [{ type: 'file', data: part.data, mimeType: part.mimeType, filename: attachment.name ?? part.filename } as MessagePart];
+    }
+
+    return [];
+  });
+}
+
+// Pass assistant-ui messages through to the AG-UI RunAgentInput, folding any
+// uploaded attachments (cid: refs) into the user message content parts. We do NOT
+// flatten multi-part content — that would drop attachments and rich content.
+// eslint-disable-next-line react-refresh/only-export-components
+export function toAgUiMessages(messages: readonly Message[]): Message[] {
+  return messages
+    .filter((message) => message.role !== 'activity')
+    .map((message) => {
+      if (message.role !== 'user') return message;
+
+      const userMessage = message as Message & { attachments?: Attachment[] };
+      const attachmentParts = (userMessage.attachments ?? []).flatMap(attachmentToMessageParts);
+      if (attachmentParts.length === 0) return message;
+
+      const content = Array.isArray(message.content)
+        ? [...message.content, ...attachmentParts]
+        : typeof message.content === 'string'
+          ? [{ type: 'text', text: message.content }, ...attachmentParts]
+          : message.content == null
+            ? attachmentParts
+            : message.content;
+      return { ...message, content } as any;
+    });
+}
+
+class HarnxHttpAgent extends HttpAgent {
+  private readonly onStatus: (text: string | null) => void;
+  private readonly onRunFailedCb: (message: string) => void;
+
+  constructor(
+    url: string,
+    onStatus: (text: string | null) => void,
+    onRunFailed: (message: string) => void,
+  ) {
+    super({ url });
+    this.onStatus = onStatus;
+    this.onRunFailedCb = onRunFailed;
+  }
+
+  override async runAgent(params: any, subscriber?: AgentSubscriber) {
+    const wrappedSubscriber: AgentSubscriber = {
+      ...subscriber,
+      onEvent: async (payload) => {
+        const event = payload.event as any;
+        if (event?.type === 'CUSTOM' && event.name === 'status') {
+          this.onStatus(event.value?.text || null);
+        }
+        return subscriber?.onEvent?.(payload as any);
+      },
+      onCustomEvent: async (payload) => {
+        const event = payload.event as any;
+        if (event?.name === 'status') {
+          this.onStatus(event.value?.text || null);
+        }
+        return subscriber?.onCustomEvent?.(payload as any);
+      },
+      onRunFailed: async (payload) => {
+        this.onRunFailedCb(payload.error.message || 'Failed to send message');
+        return subscriber?.onRunFailed?.(payload as any);
+      },
+    };
+
+    const nextParams = {
+      ...params,
+      state: params?.state ?? EMPTY_STATE,
+      messages: toAgUiMessages(params?.messages ?? []),
+    };
+
+    try {
+      return await super.runAgent(nextParams, wrappedSubscriber);
+    } catch (err: any) {
+      this.onRunFailedCb(err.message || 'Failed to send message');
+      throw err;
+    }
+  }
+}
+
+export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId, isFreshSession, children }) => {
   const [statusText, setStatusText] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
 
@@ -23,20 +151,34 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId
       return {
         id: crypto.randomUUID(),
         type: file.type.startsWith('image/') ? 'image' : 'file',
-        file,
         name: file.name,
         contentType: file.type,
-        status: 'pending',
+        file,
+        status: {
+          type: 'running',
+          reason: 'uploading',
+          progress: 0,
+        },
       } as any;
     },
     async send(attachment) {
-      if (!attachment.file) return attachment as any;
       try {
-        const refs = await uploadAttachment(agentName, sessionId, attachment.file);
+        const refs = await uploadAttachment(agentName, sessionId, attachment.file as File);
+        const cid = refs[0];
+        if (!cid) {
+          // A successful upload with no cid ref would produce a malformed
+          // message part (image/data: undefined) and silently lose the file.
+          throw new Error('Attachment upload returned no reference');
+        }
+        const fileName = attachment.name ?? (attachment.file as File).name;
+        const contentType = attachment.contentType ?? (attachment.file as File).type;
         return {
           ...attachment,
-          status: 'complete',
-          url: refs[0],
+          contentType,
+          status: { type: 'complete' },
+          content: attachment.type === 'image'
+            ? [{ type: 'image', image: cid, filename: fileName }]
+            : [{ type: 'file', data: cid, mimeType: contentType || 'application/octet-stream', filename: fileName }],
         } as any;
       } catch (err: any) {
         throw new Error(err.message);
@@ -45,97 +187,28 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId
     async remove() {}
   }), [agentName, sessionId]);
 
-  const agent = useMemo(() => {
-    const inner = new HttpAgent({ url: `/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}` });
-    
-    // Proxy the run method to listen for CUSTOM events
-    const proxy = Object.create(inner);
-    proxy.runAgent = async (params: any, subscriber: any) => {
-      const originalSub = subscriber || {};
+  const agent = useMemo(() => new HarnxHttpAgent(
+    `/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}`,
+    (text) => setStatusText(text),
+    (message) => setErrorText(message),
+  ), [agentName, sessionId]);
 
-      const messages = params.messages || [];
-      const isResume = params.resume && Array.isArray(params.resume) && params.resume.length > 0;
-      let attachment_refs: string[] = [];
-      let text = "";
-      
-      setErrorText(null);
+  const runtime = useAgUiRuntime({
+    agent,
+    adapters: {
+      attachments,
+    }
+  });
 
-      try {
-        if (messages.length > 0) {
-          const lastMsg = messages[messages.length - 1];
-          if (lastMsg.role === "user" && !isResume) {
-            if (Array.isArray(lastMsg.content)) {
-               for (const part of lastMsg.content) {
-                  if (part.type === "text") {
-                     text += part.text + "\n";
-                  } else if (part.type === "image" || part.type === "file") {
-                     const val = part.source?.value || part.source?.url;
-                     if (typeof val === "string" && val.startsWith("cid:")) {
-                        attachment_refs.push(val);
-                     }
-                  }
-               }
-               text = text.trim();
-            } else if (typeof lastMsg.content === "string") {
-               text = lastMsg.content;
-            }
-
-            await prompt(agentName, sessionId, text, attachment_refs);
-            params.messages = messages.slice(0, -1);
-          }
-        }
-
-        if (isResume) {
-          const transformedResume = params.resume.map((r: any) => ({
-            interrupt_id: r.interruptId,
-            status: r.status === 'resolved' ? 'approved' : 'denied',
-            payload: {
-               approved: r.status === 'resolved',
-               reason: r.payload?.reason || null
-            }
-          }));
-          await prompt(agentName, sessionId, "", [], transformedResume);
-        }
-
-        return inner.runAgent(params, {
-          ...originalSub,
-          onEvent: (payload: any) => {
-            if (payload?.event?.type === 'CUSTOM' && payload.event.name === 'pending_message_consumed') {
-               setPendingText(null);
-            }
-            if (payload?.event?.type === 'CUSTOM' && payload.event.name === 'status') {
-               setStatusText(payload.event.value?.text || null);
-            }
-            if (originalSub.onEvent) {
-               return originalSub.onEvent(payload);
-            }
-          },
-          onCustomEvent: (payload: any) => {
-            if (payload?.event?.name === 'pending_message_consumed') {
-               setPendingText(null);
-            }
-            if (payload?.event?.name === 'status') {
-               setStatusText(payload.event.value?.text || null);
-            }
-            if (originalSub.onCustomEvent) {
-               return originalSub.onCustomEvent(payload);
-            }
-          }
-        });
-      } catch (err: any) {
-        console.error("Failed to run agent", err);
-        setErrorText(err.message || 'Failed to send message');
-        throw err;
-      }
-    };
-    return proxy;
+  useEffect(() => {
+    setStatusText(null);
+    setErrorText(null);
   }, [agentName, sessionId]);
 
-  const runtime = useAgUiRuntime({ agent, adapters: { attachments } });
-
   return (
-    <PendingContext.Provider value={{ pendingText, setPendingText, statusText, setStatusText, errorText, setErrorText }}>
+    <PendingContext.Provider value={{ statusText, setStatusText, errorText, setErrorText }}>
       <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
+        <RuntimeSessionSubscriber enabled={!isFreshSession} />
         {children}
       </AssistantRuntimeProvider>
     </PendingContext.Provider>

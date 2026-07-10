@@ -9,7 +9,6 @@ use harnx_core::{
 use harnx_runtime::{client::ToolCall, config::Config};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use tokio_stream::StreamExt;
 
 fn assert_event_type_sequence(events: &[Value], expected: &[&str]) {
     let event_types = events
@@ -902,17 +901,19 @@ async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
         Some("text/event-stream")
     );
 
-    let parsed_events = read_sse_events_until(response, |events| events.len() >= 6).await;
+    let parsed_events = read_sse_events_until(response, |events| events.len() >= 5).await;
 
     let event_types = parsed_events
         .iter()
         .map(|event| event["type"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
+    // A prompted run is a pure delta stream: no MESSAGES_SNAPSHOT (that would wipe
+    // the client's optimistically-appended user message). Hydration happens on the
+    // separate promptless subscribe stream instead.
     assert_eq!(
         event_types,
         vec![
             "RUN_STARTED",
-            "MESSAGES_SNAPSHOT",
             "TEXT_MESSAGE_START",
             "TEXT_MESSAGE_CONTENT",
             "TEXT_MESSAGE_END",
@@ -924,17 +925,19 @@ async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
         Some(run_id_uuid.to_string().as_str())
     );
     assert_eq!(
-        parsed_events[5]["runId"].as_str(),
+        parsed_events[4]["runId"].as_str(),
         Some(run_id_uuid.to_string().as_str())
     );
 
-    assert_eq!(parsed_events[3]["delta"].as_str(), Some("chunk-text"));
+    assert_eq!(parsed_events[2]["delta"].as_str(), Some("chunk-text"));
 
-    let start_message_id = parsed_events[2]["messageId"].as_str().unwrap().to_string();
+    let start_message_id = parsed_events[1]["messageId"].as_str().unwrap().to_string();
+    // TEXT_MESSAGE_CONTENT carries the same messageId as TEXT_MESSAGE_START.
     assert_eq!(
-        parsed_events[3]["messageId"].as_str(),
+        parsed_events[2]["messageId"].as_str(),
         Some(start_message_id.as_str())
     );
+    // TEXT_MESSAGE_END (next frame) must also carry the same messageId.
     assert_eq!(
         parsed_events[3]["messageId"].as_str(),
         Some(start_message_id.as_str())
@@ -951,6 +954,127 @@ async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
             .any(|text| text == "assistant final"),
         "assistant output should persist via loop"
     );
+}
+
+#[tokio::test]
+async fn ag_ui_prompted_run_stream_terminates_after_run_finished() {
+    // Regression guard: a prompted run's SSE stream MUST end after RUN_FINISHED.
+    // If it stays open (keep-alive / broadcast), the client's runAgent() promise
+    // never resolves and assistant-ui's thread is stuck `isRunning` forever.
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("hephaestus", "You are Hephaestus.");
+    let config = sandbox.config();
+
+    let run_id_uuid = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let session_id = "terminate-session-1";
+    let req_body = serde_json::to_vec(&json!({
+        "threadId": Uuid::new_v4(),
+        "runId": run_id_uuid,
+        "state": {},
+        "messages": [{ "id": Uuid::new_v4(), "role": "user", "content": "hello" }],
+        "tools": [],
+        "context": [],
+        "forwardedProps": {}
+    }))
+    .unwrap();
+
+    let call_fn: AgentCallFn = Arc::new(|_input, _config, _abort| {
+        Box::pin(async move {
+            harnx_core::sink::emit_agent_event(AgentEvent::Model(ModelEvent::MessageChunk {
+                blocks: vec![ContentBlock::Text("hi".to_string())],
+            }));
+            Ok((
+                "hi".to_string(),
+                None,
+                Vec::<ToolCall>::new(),
+                CompletionTokenUsage::default(),
+            ))
+        })
+    });
+
+    let registry = ag_ui_test_registry(&config, Some(call_fn));
+    let response = ag_ui_run_with_call_fn(
+        &config,
+        &registry,
+        "hephaestus",
+        session_id,
+        &req_body,
+        None,
+    )
+    .await
+    .expect("AG-UI run should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Drain the ENTIRE stream to completion (with a timeout). If the stream never
+    // ends, this times out and fails — which is exactly the bug we are guarding.
+    let mut body = response.into_body().into_data_stream();
+    let mut partial = String::new();
+    let mut events: Vec<Value> = Vec::new();
+    loop {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio_stream::StreamExt::next(&mut body),
+        )
+        .await
+        .expect("prompted run SSE stream did not terminate (stayed open past RUN_FINISHED)");
+        let Some(chunk) = next else { break }; // stream ended cleanly
+        partial.push_str(std::str::from_utf8(&chunk.expect("chunk")).expect("utf8"));
+        while let Some(idx) = partial.find("\n\n") {
+            let frame = partial[..idx].trim().to_string();
+            partial.drain(..idx + 2);
+            if frame.is_empty() || frame.starts_with(':') {
+                continue;
+            }
+            events.push(parse_sse_frame(&frame));
+        }
+    }
+
+    let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert!(
+        !types.is_empty(),
+        "stream should have emitted at least one event"
+    );
+    assert_eq!(
+        types.first(),
+        Some(&"RUN_STARTED"),
+        "stream must start with RUN_STARTED; got {types:?}"
+    );
+    assert_eq!(
+        types.last(),
+        Some(&"RUN_FINISHED"),
+        "prompted stream must END on RUN_FINISHED; got {types:?}"
+    );
+    // No events may follow the terminal RUN_FINISHED.
+    let run_finished_idx = types.iter().position(|t| *t == "RUN_FINISHED").unwrap();
+    assert_eq!(
+        run_finished_idx,
+        types.len() - 1,
+        "no events may follow RUN_FINISHED; got {types:?}"
+    );
+
+    // STEP_STARTED / STEP_FINISHED must be balanced with matching stepName, and all
+    // steps closed before RUN_FINISHED (required by @ag-ui/client verifyEvents).
+    let mut open_steps: Vec<String> = Vec::new();
+    for e in &events {
+        match e["type"].as_str().unwrap() {
+            "STEP_STARTED" => open_steps.push(e["stepName"].as_str().unwrap_or("").to_string()),
+            "STEP_FINISHED" => {
+                let name = e["stepName"].as_str().unwrap_or("");
+                let popped = open_steps.pop();
+                assert_eq!(
+                    popped.as_deref(),
+                    Some(name),
+                    "STEP_FINISHED stepName must match the open STEP_STARTED"
+                );
+            }
+            "RUN_FINISHED" => assert!(
+                open_steps.is_empty(),
+                "all steps must be closed before RUN_FINISHED; still open: {open_steps:?}"
+            ),
+            _ => {}
+        }
+    }
+    assert!(open_steps.is_empty(), "unbalanced steps: {open_steps:?}");
 }
 
 #[tokio::test]
@@ -994,17 +1118,13 @@ async fn ag_ui_run_emits_run_error_without_run_finished_when_call_fn_fails() {
         .iter()
         .map(|event| event["type"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
+    // Prompted run: no MESSAGES_SNAPSHOT (pure delta stream).
     assert_eq!(
         event_types,
-        vec![
-            "RUN_STARTED",
-            "MESSAGES_SNAPSHOT",
-            "TEXT_MESSAGE_START",
-            "RUN_ERROR",
-        ]
+        vec!["RUN_STARTED", "TEXT_MESSAGE_START", "RUN_ERROR",]
     );
     assert_eq!(
-        parsed_events[3]["message"].as_str(),
+        parsed_events[2]["message"].as_str(),
         Some("stubbed call failure")
     );
     assert!(parsed_events
@@ -1200,8 +1320,9 @@ fn assert_bad_request_contains(err: &AgUiError, expected: &str) {
 }
 
 #[tokio::test]
-async fn ag_ui_run_idle_join_emits_keep_alive_comment() {
-    tokio::time::pause();
+async fn ag_ui_run_idle_join_snapshot_and_close() {
+    // Promptless subscribe now terminates after RUN_FINISHED (no keepalive passthrough).
+    // The stream should emit the synthetic envelope and close promptly.
     let sandbox = TestConfigSandbox::new();
     sandbox.write_agent("plain", "You are plain.");
     let config = sandbox.config();
@@ -1215,63 +1336,19 @@ async fn ag_ui_run_idle_join_emits_keep_alive_comment() {
         &config,
         &registry,
         "plain",
-        "idle-keepalive-session",
+        "idle-snapshot-session",
         &serde_json::to_vec(&body).unwrap(),
         None,
     )
     .await
     .expect("idle join response");
-    let read_task = tokio::spawn(async move {
-        read_sse_until(
-            response,
-            SSE_KEEPALIVE_INTERVAL + Duration::from_secs(5),
-            |read| !read.events.is_empty() && !read.comments.is_empty(),
-        )
-        .await
-    });
-    let mut frame_stream = tokio_stream::StreamExt::chain(
-        tokio_stream::StreamExt::map(tokio_stream::once(snapshot_event(Vec::new())), |event| {
-            let frame = frame_event(&event).expect("snapshot frame");
-            Ok::<_, Infallible>(Bytes::from(frame))
-        }),
-        tokio_stream::StreamExt::map(
-            keep_alive_stream(TEST_SSE_KEEPALIVE_INTERVAL),
-            Ok::<_, Infallible>,
-        ),
-    );
-    let snapshot = tokio::time::timeout(Duration::from_secs(1), frame_stream.next())
-        .await
-        .expect("snapshot timeout")
-        .expect("snapshot frame")
-        .expect("snapshot bytes");
-    let keep_alive = tokio::time::timeout(Duration::from_secs(1), frame_stream.next())
-        .await
-        .expect("keep-alive timeout")
-        .expect("keep-alive frame")
-        .expect("keep-alive bytes");
-    assert!(std::str::from_utf8(&snapshot)
-        .expect("snapshot utf8")
-        .starts_with("data: "));
-    assert_eq!(
-        std::str::from_utf8(&keep_alive).expect("keep-alive utf8"),
-        keep_alive_frame()
-    );
-    tokio::task::yield_now().await;
-    tokio::time::advance(SSE_KEEPALIVE_INTERVAL + Duration::from_secs(1)).await;
-    tokio::task::yield_now().await;
-    let read = read_task.await.expect("join read task");
+    let events = read_sse_events_until(response, |events| {
+        events.iter().any(|e| e["type"] == "RUN_FINISHED")
+    })
+    .await;
     assert_event_type_sequence(
-        &read.events,
+        &events,
         &["RUN_STARTED", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
-    );
-    assert!(read.comments.iter().any(|frame| frame == ": keep-alive"));
-    assert!(
-        !read
-            .events
-            .iter()
-            .any(|event| event["type"] == ": keep-alive"),
-        "keep-alive comment should not parse as AG-UI event: {:?}",
-        read.events
     );
 }
 
@@ -1496,9 +1573,11 @@ async fn ag_ui_run_uses_only_last_message_user_prompt() {
         events.iter().any(|event| event["type"] == "RUN_FINISHED")
     })
     .await;
+    // Prompted run: pure delta stream, no MESSAGES_SNAPSHOT. The call_fn above
+    // already asserts the last user message ("last user wins") is used as the prompt.
     assert_eq!(events[0]["type"], "RUN_STARTED");
-    assert_eq!(events[1]["type"], "MESSAGES_SNAPSHOT");
-    assert!(events.iter().any(|event| event["type"] == "RUN_STARTED"));
+    assert_eq!(events[1]["type"], "TEXT_MESSAGE_START");
+    assert!(events.iter().any(|event| event["type"] == "RUN_FINISHED"));
 }
 
 #[tokio::test]
@@ -1856,4 +1935,70 @@ fn assistant_msg(content: &str) -> AgUiMessage {
         name: None,
         tool_calls: None,
     }
+}
+
+#[test]
+fn last_user_prompt_ignores_empty_or_whitespace_user_messages() {
+    let empty = parse_run_input(&ag_ui_request_body(Uuid::new_v4(), "")).expect("parse empty");
+    assert_eq!(last_user_prompt(&empty), None);
+
+    let whitespace = parse_run_input(&ag_ui_request_body(
+        Uuid::new_v4(),
+        "   
+	  ",
+    ))
+    .expect("parse whitespace");
+    assert_eq!(last_user_prompt(&whitespace), None);
+
+    let text = parse_run_input(&ag_ui_request_body(Uuid::new_v4(), "hello")).expect("parse text");
+    assert_eq!(last_user_prompt(&text).as_deref(), Some("hello"));
+}
+
+#[tokio::test]
+async fn ag_ui_run_empty_last_user_message_joins_only_and_does_not_start_run() {
+    let sandbox = TestConfigSandbox::new();
+    sandbox.write_agent("plain", "You are plain.");
+    let config = sandbox.config();
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_fn: AgentCallFn = {
+        let call_count = call_count.clone();
+        Arc::new(move |_input, _config, _abort| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                Ok((
+                    "should not run".to_string(),
+                    None,
+                    Vec::<ToolCall>::new(),
+                    CompletionTokenUsage::default(),
+                ))
+            })
+        })
+    };
+    let registry = ag_ui_test_registry(&config, Some(call_fn));
+    let body = ag_ui_request_body(
+        Uuid::new_v4(),
+        "   
+	 ",
+    );
+
+    let response =
+        ag_ui_run_with_call_fn(&config, &registry, "plain", "empty-last-user", &body, None)
+            .await
+            .expect("ag-ui response");
+    let read = read_sse_until(response, Duration::from_secs(5), |read| {
+        read.events
+            .iter()
+            .any(|event| event["type"] == "RUN_FINISHED")
+    })
+    .await;
+
+    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_event_type_sequence(
+        &read.events,
+        &["RUN_STARTED", "MESSAGES_SNAPSHOT", "RUN_FINISHED"],
+    );
+    assert!(
+        load_session_messages(&config, "plain", "empty-last-user").is_empty(),
+        "join-only empty prompt should not persist history"
+    );
 }

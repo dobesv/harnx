@@ -722,7 +722,9 @@ fn frame_live_event(
             other => frame_event(&other).ok().map(Bytes::from),
         },
         FirstRunState::Complete | FirstRunState::Errored => {
-            frame_event(&event).ok().map(Bytes::from)
+            // Terminal state: stop forwarding events. The stream must end after
+            // RUN_FINISHED/RUN_ERROR so the client's runAgent() promise resolves.
+            None
         }
     }
 }
@@ -739,7 +741,9 @@ fn snapshot_event(messages: Vec<AgUiMessage>) -> Event {
 
 fn last_user_prompt(run_input: &RunAgentInput<JsonValue, JsonValue>) -> Option<String> {
     match run_input.messages.last() {
-        Some(AgUiMessage::User { content, .. }) => Some(content.clone()),
+        Some(AgUiMessage::User { content, .. }) if !content.trim().is_empty() => {
+            Some(content.clone())
+        }
         _ => None,
     }
 }
@@ -801,25 +805,57 @@ fn build_prompted_event_stream(
     let thread_id_text = thread_id_text.to_string();
     let run_id_for_closure = run_id.clone();
     let thread_id_text_for_closure = thread_id_text.clone();
-    let live_stream = tokio_stream::StreamExt::filter_map(live_stream, {
+    // A prompted run's SSE stream must TERMINATE once the run reaches a terminal
+    // state (RUN_FINISHED / RUN_ERROR). Otherwise the body stays open on the (now
+    // idle) broadcast channel, the client's runAgent() promise never resolves, and
+    // the assistant-ui thread stays `isRunning` forever.
+    //
+    // We forward non-terminal frames via `take_while` (which ENDS the stream — and
+    // drops the broadcast subscription — as soon as a terminal event is seen, without
+    // waiting for any further broadcast item), stashing the terminal frame in a cell.
+    // We then chain that stashed terminal frame as the final item. This guarantees
+    // the response body closes immediately after RUN_FINISHED/RUN_ERROR.
+    let terminal_frame: std::sync::Arc<std::sync::Mutex<Option<Bytes>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let live_stream = {
         let mut state = FirstRunState::AwaitingStarted;
-        move |event| {
-            frame_live_event(
-                event,
-                &mut state,
-                &thread_id_text_for_closure,
-                &run_id_for_closure,
-            )
-        }
-    });
+        let thread_id_text = thread_id_text_for_closure;
+        let run_id = run_id_for_closure;
+        let terminal_frame = terminal_frame.clone();
+        let framed = tokio_stream::StreamExt::map(live_stream, move |event| {
+            let is_terminal = matches!(event, Event::RunFinished(_) | Event::RunError(_));
+            let bytes = frame_live_event(event, &mut state, &thread_id_text, &run_id);
+            (bytes, is_terminal)
+        });
+        // Stop when a terminal event arrives, capturing its frame to emit last.
+        let body = tokio_stream::StreamExt::take_while(framed, move |(bytes, is_terminal)| {
+            if *is_terminal {
+                *terminal_frame.lock().expect("terminal frame lock") = bytes.clone();
+                false // end the passthrough (drops the broadcast subscription)
+            } else {
+                true
+            }
+        });
+        tokio_stream::StreamExt::filter_map(body, |(bytes, _)| bytes)
+    };
+    // Terminal frame (RUN_FINISHED / RUN_ERROR), appended after the passthrough ends.
+    let terminal_stream = {
+        let terminal_frame = terminal_frame.clone();
+        tokio_stream::StreamExt::filter_map(tokio_stream::once(()), move |_| {
+            terminal_frame.lock().expect("terminal frame lock").take()
+        })
+    };
+    let live_stream = tokio_stream::StreamExt::chain(live_stream, terminal_stream);
     let remaining = tokio_stream::StreamExt::chain(tokio_stream::iter(snapshot_frame), live_stream);
+    // No keep_alive for prompted runs — the stream must terminate so the client's
+    // runAgent() promise resolves. Multiplayer/persistent watch is a separate endpoint.
     Box::pin(tokio_stream::StreamExt::chain(
         tokio_stream::once(Bytes::from(frame_run_boundary_event(
             "RUN_STARTED",
             &thread_id_text,
             &run_id,
         ))),
-        futures_util::stream::select(remaining, keep_alive_stream(SSE_KEEPALIVE_INTERVAL)),
+        remaining,
     ))
 }
 
@@ -827,7 +863,7 @@ fn build_promptless_event_stream(
     run_id: &str,
     thread_id_text: &str,
     snapshot_frame: Option<Bytes>,
-    live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
+    _live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
     let synthetic = tokio_stream::StreamExt::chain(
         tokio_stream::StreamExt::chain(
@@ -844,18 +880,10 @@ fn build_promptless_event_stream(
             run_id,
         ))),
     );
-    let passthrough =
-        tokio_stream::StreamExt::filter_map(live_stream, |event| match frame_event(&event) {
-            Ok(frame) => Some(Bytes::from(frame)),
-            Err(err) => {
-                log::warn!("failed to serialize AG-UI passthrough frame: {err}");
-                None
-            }
-        });
-    Box::pin(futures_util::stream::select(
-        tokio_stream::StreamExt::chain(synthetic, passthrough),
-        keep_alive_stream(SSE_KEEPALIVE_INTERVAL),
-    ))
+    // Promptless subscribe: just the synthetic RUN_STARTED -> MESSAGES_SNAPSHOT -> RUN_FINISHED.
+    // Do NOT forward live events from the prompted run's stream — a promptless subscribe
+    // is a one-shot hydrate, not a persistent watch. The stream ends after RUN_FINISHED.
+    Box::pin(synthetic)
 }
 
 fn build_ag_ui_event_stream(
@@ -888,7 +916,14 @@ fn build_ag_ui_event_stream(
     });
     let live_stream = tokio_stream::StreamExt::filter_map(live_stream, |event| event);
     match has_prompt {
-        Some(_) => build_prompted_event_stream(run_id, thread_id_text, snapshot_frame, live_stream),
+        // A prompted run is a pure delta stream (RUN_STARTED -> TEXT_MESSAGE_*/... ->
+        // RUN_FINISHED). We deliberately do NOT emit MESSAGES_SNAPSHOT here: the
+        // snapshot is captured before the new prompt is recorded, so it would not
+        // contain the just-sent user message, and a client that applies it mid-run
+        // (assistant-ui's applyExternalMessages is a full replace) would wipe the
+        // optimistically-appended user message and the streaming reply. Clients
+        // hydrate via their own promptless subscribe stream instead (multiplayer-safe).
+        Some(_) => build_prompted_event_stream(run_id, thread_id_text, None, live_stream),
         None => build_promptless_event_stream(run_id, thread_id_text, snapshot_frame, live_stream),
     }
 }
