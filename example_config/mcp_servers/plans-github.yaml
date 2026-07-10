@@ -1,0 +1,28 @@
+command: harnx-mcp-plans-github
+enabled: false # Requires GitHub repository and auth setup
+description: >-
+  GitHub Issues-backed plan/task/note management. Stores plans as issues,
+  tasks as sub-issues, and notes as comments. Supports PAT and GitHub App auth.
+args:
+  # Repository auto-detected from git origin of working directory (github.com required)
+  - "--plan-label"
+  - "harnx-plan"
+  # Optional: bind HTTP mode to all interfaces only when intentionally exposing server
+  # - "--http"
+  # - "--host"
+  # - "0.0.0.0"
+env:
+  # Use EITHER GITHUB_TOKEN for PAT:
+  # Provide GITHUB_TOKEN via your environment / secrets manager (do not hardcode here).
+  # GITHUB_TOKEN: "${GITHUB_TOKEN}"
+  
+  # OR GitHub App credentials:
+  # GITHUB_APP_ID: "123456"
+  # GITHUB_APP_PRIVATE_KEY: "/path/to/app-private-key.pem"
+  # GITHUB_APP_INSTALLATION_ID: "654321"
+
+  # Optional: API base URL (e.g. for caching proxy)
+  # GITHUB_API_URL: "https://api.github.com"
+  
+  # Optional: Retention (days to close stale plans)
+  # AGENT_PLANS_RETENTION_DAYS: "14"

@@ -1,0 +1,24 @@
+[package]
+name = "harnx-mcp-plans-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared storage trait and domain models for harnx plans MCP backends"
+
+[features]
+conformance = []
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+jiff = { workspace = true }
+rmcp = { workspace = true, features = ["server", "macros"] }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+similar = { workspace = true }
+thiserror = "2"
+uuid = { workspace = true, features = ["v4"] }

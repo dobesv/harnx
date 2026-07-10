@@ -1,0 +1,38 @@
+[package]
+name = "harnx-mcp-plans-github"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GitHub Issues-backed auth and client layer for harnx plans MCP"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+harnx-mcp-plans-core = { path = "../harnx-mcp-plans-core" }
+http = { workspace = true }
+jiff = { workspace = true }
+jsonwebtoken = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { workspace = true }
+wait-timeout = "0.2"
+
+[dev-dependencies]
+harnx-mcp-plans-core = { path = "../harnx-mcp-plans-core", features = ["conformance"] }
+wiremock = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { workspace = true, features = ["v4"] }
+tempfile = { workspace = true }
+[[bin]]
+name = "harnx-mcp-plans-github"
+path = "src/main.rs"
