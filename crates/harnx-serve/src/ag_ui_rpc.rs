@@ -94,6 +94,8 @@ fn parse_resume_params(params: &[InterruptResumeParam]) -> anyhow::Result<Vec<In
 
 pub async fn handle_ag_ui_rpc(
     req: Request<Incoming>,
+    agent: &str,
+    session: &str,
     config: &harnx_runtime::config::Config,
     registry: &SessionRegistry,
     persistence: PersistenceKind,
@@ -101,7 +103,8 @@ pub async fn handle_ag_ui_rpc(
     let (parts, body) = req.into_parts();
     handle_ag_ui_rpc_bytes(
         parts.method,
-        parts.uri.path().to_string(),
+        agent,
+        session,
         body.collect().await?.to_bytes(),
         config,
         registry,
@@ -112,14 +115,13 @@ pub async fn handle_ag_ui_rpc(
 
 pub async fn handle_ag_ui_rpc_bytes(
     method: Method,
-    path: String,
+    agent: &str,
+    session: &str,
     req_body: Bytes,
     config: &harnx_runtime::config::Config,
     registry: &SessionRegistry,
     persistence: PersistenceKind,
 ) -> anyhow::Result<AppResponse> {
-    let (agent, session) = parse_rpc_path(&path).ok_or_else(|| anyhow::anyhow!("Not Found"))?;
-
     if method != Method::POST {
         return json_rpc_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -487,51 +489,6 @@ async fn handle_cancel(
     )
 }
 
-fn percent_decode(input: &str) -> String {
-    let mut bytes = Vec::with_capacity(input.len());
-    let mut iter = input.bytes();
-    while let Some(b) = iter.next() {
-        if b == b'%' {
-            let hi = iter.next().and_then(hex_val);
-            let lo = iter.next().and_then(hex_val);
-            if let (Some(h), Some(l)) = (hi, lo) {
-                bytes.push(h << 4 | l);
-            } else {
-                bytes.push(b'%');
-            }
-        } else {
-            bytes.push(b);
-        }
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn parse_rpc_path(path: &str) -> Option<(String, String)> {
-    let suffix = path.strip_prefix("/v1/agents/")?;
-    let mut segments = suffix.split('/');
-    let agent = segments.next()?;
-    if segments.next()? != "sessions" {
-        return None;
-    }
-    let session = segments.next()?;
-    if segments.next()? != "rpc" {
-        return None;
-    }
-    if segments.next().is_some() {
-        return None;
-    }
-    Some((percent_decode(agent), percent_decode(session)))
-}
-
 fn session_exists(config: &harnx_runtime::config::Config, key: &SessionKey) -> bool {
     let Ok(config) = agent_scoped_config(config, &key.agent) else {
         return false;
@@ -685,7 +642,8 @@ mod tests {
 
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/rpc-get/rpc".to_string(),
+            "plain",
+            "rpc-get",
             Bytes::from(json!({"jsonrpc":"2.0","id":1,"method":"session/get"}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
@@ -716,7 +674,8 @@ mod tests {
 
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/never-ran/rpc".to_string(),
+            "plain",
+            "never-ran",
             Bytes::from(json!({"jsonrpc":"2.0","id":"x","method":"session/get"}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
@@ -741,7 +700,7 @@ mod tests {
             session: "never-prompted".into(),
         };
 
-        let response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/never-prompted/rpc".to_string(), Bytes::from(json!({"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{"text":"hello"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
+        let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "never-prompted", Bytes::from(json!({"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{"text":"hello"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = response_json(response).await;
         assert_eq!(body["error"]["code"], JSON_RPC_UNKNOWN_SESSION_CODE);
@@ -762,7 +721,8 @@ mod tests {
 
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/never-cancelled/rpc".to_string(),
+            "plain",
+            "never-cancelled",
             Bytes::from(json!({"jsonrpc":"2.0","id":12,"method":"session/cancel"}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
@@ -803,7 +763,7 @@ mod tests {
         let _ = prompt(&handle, "seed history", SessionPromptOptions::default()).await;
         sleep(Duration::from_millis(80)).await;
 
-        let response = handle_ag_ui_rpc_bytes(Method::POST, "/v1/agents/plain/sessions/rpc-prompt/rpc".to_string(), Bytes::from(json!({"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"text":"run me"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
+        let response = handle_ag_ui_rpc_bytes(Method::POST, "plain", "rpc-prompt", Bytes::from(json!({"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"text":"run me"}}).to_string()), &crate::session_actor::load_base_config_for_tests(), &registry, PersistenceKind::Filesystem).await.expect("rpc response");
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["result"]["status"], "accepted");
@@ -863,7 +823,8 @@ mod tests {
 
         let start = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/rpc-resume/rpc".to_string(),
+            "plain",
+            "rpc-resume",
             Bytes::from(json!({"jsonrpc":"2.0","id":20,"method":"session/prompt","params":{"text":"resume me"}}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
@@ -885,7 +846,8 @@ mod tests {
 
         let bad_id = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/rpc-resume/rpc".to_string(),
+            "plain",
+            "rpc-resume",
             Bytes::from(json!({
                 "jsonrpc":"2.0",
                 "id":21,
@@ -909,7 +871,8 @@ mod tests {
 
         let bad_status = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/rpc-resume/rpc".to_string(),
+            "plain",
+            "rpc-resume",
             Bytes::from(json!({
                 "jsonrpc":"2.0",
                 "id":22,
@@ -935,7 +898,8 @@ mod tests {
 
         let ok = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/rpc-resume/rpc".to_string(),
+            "plain",
+            "rpc-resume",
             Bytes::from(json!({
                 "jsonrpc":"2.0",
                 "id":23,
@@ -1016,7 +980,8 @@ mod tests {
 
         let partial = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/rpc-partial/rpc".to_string(),
+            "plain",
+            "rpc-partial",
             Bytes::from(json!({
                 "jsonrpc":"2.0",
                 "id":24,
@@ -1081,7 +1046,8 @@ mod tests {
 
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/rpc-cancel/rpc".to_string(),
+            "plain",
+            "rpc-cancel",
             Bytes::from(json!({"jsonrpc":"2.0","id":9,"method":"session/cancel"}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
@@ -1104,7 +1070,8 @@ mod tests {
 
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/whatever/rpc".to_string(),
+            "plain",
+            "whatever",
             Bytes::from(json!({"jsonrpc":"2.0","id":3,"method":"session/nope"}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
@@ -1132,7 +1099,8 @@ mod tests {
 
         let response = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/attach-rpc/rpc".to_string(),
+            "plain",
+            "attach-rpc",
             Bytes::from(
                 json!({
                     "jsonrpc": "2.0",
@@ -1168,7 +1136,8 @@ mod tests {
 
         let parse_response = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/oops/rpc".to_string(),
+            "plain",
+            "oops",
             Bytes::from("{not json".to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
@@ -1182,7 +1151,8 @@ mod tests {
 
         let invalid_response = handle_ag_ui_rpc_bytes(
             Method::POST,
-            "/v1/agents/plain/sessions/oops/rpc".to_string(),
+            "plain",
+            "oops",
             Bytes::from(json!({"jsonrpc":"2.0","id":4}).to_string()),
             &crate::session_actor::load_base_config_for_tests(),
             &registry,
@@ -1193,5 +1163,141 @@ mod tests {
         assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
         let invalid_body = response_json(invalid_response).await;
         assert_eq!(invalid_body["error"]["code"], -32600);
+    }
+}
+
+#[cfg(test)]
+mod extra_rpc_tests {
+    use super::*;
+    use crate::{session_actor::load_base_config_for_tests, test_support::TestConfigSandbox};
+    use bytes::Bytes;
+    use harnx_runtime::client::TestStateGuard;
+    use http_body_util::BodyExt;
+    use serde_json::{json, Value};
+
+    async fn response_json(response: AppResponse) -> Value {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect rpc body")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("parse rpc json")
+    }
+
+    #[tokio::test]
+    async fn rpc_cancel_idle_missing_params_wrong_text_type_and_id_shapes() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = load_base_config_for_tests();
+        let registry = SessionRegistry::new(config.clone());
+
+        let handle = registry.get_or_spawn(SessionKey {
+            agent: "plain".into(),
+            session: "idle-cancel".into(),
+        });
+        let _ = get_info(&handle).await.expect("seed idle session");
+
+        let idle_cancel = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            "idle-cancel",
+            Bytes::from(json!({"jsonrpc":"2.0","id":"idle","method":"session/cancel"}).to_string()),
+            &config,
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("idle cancel response");
+        assert_eq!(idle_cancel.status(), StatusCode::BAD_REQUEST);
+        let idle_body = response_json(idle_cancel).await;
+        assert_eq!(idle_body["id"], "idle");
+        assert_eq!(idle_body["error"]["code"], JSON_RPC_IDLE_CANCEL_CODE);
+
+        let missing_params = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            "idle-cancel",
+            Bytes::from(json!({"jsonrpc":"2.0","id":null,"method":"session/prompt"}).to_string()),
+            &config,
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("missing params response");
+        let missing_body = response_json(missing_params).await;
+        assert_eq!(missing_body["id"], Value::Null);
+        assert_eq!(missing_body["error"]["code"], -32602);
+
+        let wrong_text_type = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            "idle-cancel",
+            Bytes::from(
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":{"kind":"object"},
+                    "method":"session/prompt",
+                    "params":{"text":42}
+                })
+                .to_string(),
+            ),
+            &config,
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("wrong text response");
+        let wrong_body = response_json(wrong_text_type).await;
+        assert_eq!(wrong_body["id"], json!({"kind":"object"}));
+        assert_eq!(wrong_body["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn rpc_batch_and_notification_are_pinned_as_invalid_requests() {
+        let _guard = TestStateGuard::new(None).await;
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = load_base_config_for_tests();
+        let registry = SessionRegistry::new(config.clone());
+
+        // Current behavior: top-level arrays and notification-style bodies fail request deserialization
+        // first, so handler returns JSON-RPC parse errors instead of batch/notification semantics.
+        let batch = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            "batchish",
+            Bytes::from(
+                json!([
+                    {"jsonrpc":"2.0","id":1,"method":"session/get"},
+                    {"jsonrpc":"2.0","method":"session/get"}
+                ])
+                .to_string(),
+            ),
+            &config,
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("batch response");
+        assert_eq!(batch.status(), StatusCode::BAD_REQUEST);
+        let batch_body = response_json(batch).await;
+        assert_eq!(batch_body["error"]["code"], -32700);
+
+        let notification = handle_ag_ui_rpc_bytes(
+            Method::POST,
+            "plain",
+            "notify",
+            Bytes::from(json!({"jsonrpc":"2.0","method":"session/get"}).to_string()),
+            &config,
+            &registry,
+            PersistenceKind::Filesystem,
+        )
+        .await
+        .expect("notification response");
+        let notification_body = response_json(notification).await;
+        assert_eq!(notification_body["id"], Value::Null);
+        assert_eq!(notification_body["error"]["code"], -32700);
     }
 }

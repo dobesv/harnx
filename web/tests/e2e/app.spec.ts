@@ -1,39 +1,54 @@
 import { test, expect } from '@playwright/test';
 
 test.beforeEach(async ({ page }) => {
-  // Make the UI deterministic
-  await page.addInitScript(() => {
-    // Freeze Date to make the relative times stable (if any are used in Assistant-UI)
-    const fixedTime = new Date('2024-01-01T12:00:00Z').getTime();
-    Date.now = () => fixedTime;
-  });
+  // NOTE: do NOT freeze Date.now here. The assistant-ui / @ag-ui/client runtime
+  // derives message ids/ordering from the clock; a frozen clock collides the
+  // optimistic user message with the streamed assistant reply and drops it.
+  // Determinism for screenshots comes from the mock returning a fixed
+  // session `updated_at` instead.
   await page.setViewportSize({ width: 1280, height: 720 });
 });
 
-test('happy path: chat with slash-named agent', async ({ page }) => {
+test('initial load: shows agent picker, URL stays /', async ({ page }) => {
   await page.goto('/?scenario=happy');
 
-  // Should have mock assistant agent available
-  await expect(page.locator('select')).toHaveValue('coding/coder');
-  
-  // Sessions list should contain 'session-1'
-  await expect(page.locator('.sessions-list')).toContainText('session-1');
+  await expect(page.locator('h2')).toHaveText('Select an Agent');
+  await expect(page.locator('.grid-item')).toContainText('coding/coder');
+  expect(new URL(page.url()).pathname).toBe('/');
+});
 
-  // Send a message
-  await page.locator('.aui-composer').locator('textarea').fill('Hello agent');
+test('happy path: picker flow to chat with slash-named agent', async ({ page }) => {
+  await page.goto('/?scenario=happy');
+
+  await page.locator('.grid-item').filter({ hasText: 'coding/coder' }).click();
+  await expect(page).toHaveURL(/\/agents\/coding%2Fcoder/);
+  await expect(page.locator('h2')).toContainText('Sessions for coding/coder');
+  await expect(page.locator('.sessions-grid')).toContainText('session-1');
+
+  await page.locator('.new-chat-button').click();
+
+  await expect(page.locator('.aui-status-indicator')).not.toBeVisible();
+  await expect(page.locator('.aui-composer-send')).toHaveText('Send');
+  await expect(page).toHaveURL(/\/agents\/coding%2Fcoder\/sessions\//);
+
+  await page.locator('.aui-composer-input').fill('Hello agent');
   await page.locator('.aui-composer-send').click();
 
-  // Wait for the response status text to appear
-  await expect(page.locator('.aui-status-indicator')).toContainText('Mock stream finished');
+  // The user message and the streamed assistant reply must both render in the
+  // transcript (proves the stream is consumed by the runtime, not just received).
+  const transcript = page.locator('.aui-thread');
+  await expect(transcript).toContainText('Hello agent', { timeout: 10000 });
+  await expect(transcript).toContainText('Mock streamed reply to: Hello agent', { timeout: 10000 });
+  // The run finished, so the composer returns to its idle "Send" state.
+  await expect(page.locator('.aui-composer-send')).toHaveText('Send');
+  await expect(page.locator('.aui-status-indicator')).not.toBeVisible();
 
-  // Take screenshot
   await expect(page).toHaveScreenshot('happy-path.png');
 });
 
 test('agents-fetch error', async ({ page }) => {
   await page.goto('/?scenario=agentsFail');
-  
-  // The error element should be visible
+
   const errorEl = page.getByTestId('agents-error');
   await expect(errorEl).toBeVisible();
   await expect(errorEl).toHaveText(/Internal Server Error/i);
@@ -42,9 +57,8 @@ test('agents-fetch error', async ({ page }) => {
 });
 
 test('sessions-fetch error', async ({ page }) => {
-  await page.goto('/?scenario=sessionsFail');
-  
-  // The error element should be visible
+  await page.goto('/agents/coding%2Fcoder?scenario=sessionsFail');
+
   const errorEl = page.getByTestId('sessions-error');
   await expect(errorEl).toBeVisible();
   await expect(errorEl).toHaveText(/Not Found/i);
@@ -54,48 +68,37 @@ test('sessions-fetch error', async ({ page }) => {
 
 test('send-failure error (initial send)', async ({ page }) => {
   await page.goto('/?scenario=sendFail');
+  await page.locator('.grid-item').filter({ hasText: 'coding/coder' }).click();
+  await page.locator('.new-chat-button').click();
 
-  // Make sure it loaded the initial list
-  await expect(page.locator('select')).toHaveValue('coding/coder');
-
-  // Type and send a message
-  await page.locator('.aui-composer').locator('textarea').fill('Break it!');
+  await page.locator('.aui-composer-input').fill('Break it!');
   await page.locator('.aui-composer-send').click();
 
-  // The send-error element should appear
   const errorEl = page.getByTestId('send-error');
   await expect(errorEl).toBeVisible();
-  await expect(errorEl).toHaveText(/RPC call failed/i);
+  await expect(errorEl).toHaveText(/HTTP 500/i);
 
   await expect(page).toHaveScreenshot('send-failure-error.png');
 });
 
 test('send-failure error (queued send)', async ({ page }) => {
   await page.goto('/?scenario=happy');
+  await page.locator('.grid-item').filter({ hasText: 'coding/coder' }).click();
+  await page.locator('.new-chat-button').click();
 
-  // Load app, start a happy-path stream which is slow (50ms per chunk).
-  await expect(page.locator('select')).toHaveValue('coding/coder');
-  
-  // Type and send first message to get into isRunning state
-  await page.locator('.aui-composer').locator('textarea').fill('Start running');
+  await page.locator('.aui-composer-input').fill('Start running');
   await page.locator('.aui-composer-send').click();
-
-  // Make sure we are in isRunning state (the composer should show 'Queue' or similar)
-  // Our CSS disables the input when running except for queuing
   await expect(page.locator('.aui-composer-send')).toHaveText(/Queue/i, { timeout: 1000 });
 
-  // Now, inject the sendFail scenario dynamically
   await page.evaluate(() => {
     const msw = (window as any).__msw;
     msw.worker.use(...msw.scenarios.sendFail);
   });
 
-  // Type a second message while it's still running, to hit MyComposer.handleSubmit
-  await page.locator('.aui-composer').locator('textarea').fill('Queue this failure');
+  await page.locator('.aui-composer-input').fill('Queue this failure');
   await page.locator('.aui-composer-send').click();
 
-  // The send-error element should appear inline
   const errorEl = page.getByTestId('send-error');
   await expect(errorEl).toBeVisible();
-  await expect(errorEl).toHaveText(/RPC call failed/i);
+  await expect(errorEl).toHaveText(/HTTP 500/i);
 });

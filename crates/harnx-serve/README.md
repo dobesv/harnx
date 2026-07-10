@@ -49,7 +49,7 @@ harnx-serve --web-assets ./web/dist
 
 ## AG-UI (Agent User Interaction Protocol)
 
-`harnx-serve` implements the AG-UI protocol, providing a content-negotiated, permalinkable REST surface under `/v1/agents`. AG-UI is the sole interactive surface.
+`harnx-serve` implements AG-UI as a content-negotiated, permalinkable REST surface under `/v1/agents`. SSE subscription and JSON-RPC control both use same canonical session URL.
 
 The AG-UI surface allows modern web interfaces to interact with `harnx` agents using a real-time event stream and a JSON-RPC control plane.
 
@@ -61,12 +61,22 @@ The AG-UI surface allows modern web interfaces to interact with `harnx` agents u
 | `GET` | `/v1/agents/:agent` | `application/json` | Agent details (name, description, active sessions). |
 | `GET` | `/v1/agents/:agent/sessions` | `application/json` | List sessions for the agent. |
 | `GET` | `/v1/agents/:agent/sessions/:session` | `application/json` | Session history in AG-UI format. |
-| `POST` | `/v1/agents/:agent/sessions/:session` | `text/event-stream` | **Subscription Plane**: SSE event stream. |
-| `POST` | `/v1/agents/:agent/sessions/:session/rpc`| `application/json` | **Control Plane**: JSON-RPC 2.0 interface. |
+| `POST` | `/v1/agents/:agent/sessions/:session` | `Accept: text/event-stream` | **Subscription Plane**: SSE event stream. |
+| `POST` | `/v1/agents/:agent/sessions/:session` | `Content-Type: application/json` | **Control Plane**: JSON-RPC 2.0 interface. |
 
 ## AG-UI Support (Phase 2)
 
-`harnx-serve` implements a tailored two-plane communication model. This model provides real-time event streaming and a JSON-RPC control plane for managing agent sessions.
+`harnx-serve` implements a two-plane communication model on one URL. Content negotiation decides whether a session `POST` becomes an SSE subscription or a JSON-RPC control call.
+
+### Single-URL Negotiation
+
+For `POST /v1/agents/:agent/sessions/:session`, negotiation follows this tiebreak rule:
+
+1. If request has `Accept: text/event-stream` → SSE subscription plane.
+2. Else if request has `Content-Type: application/json` → JSON-RPC control plane.
+3. Else → `406 Not Acceptable`.
+
+This rule keeps subscriber requests and JSON-RPC calls unambiguous even if both target same session URL. `GET` on same URL keeps existing behavior: `Accept: text/html` returns HTML page, otherwise server returns JSON history snapshot.
 
 ### Two-Plane Architecture
 
@@ -74,20 +84,26 @@ The AG-UI surface allows modern web interfaces to interact with `harnx` agents u
 **Endpoint:** `POST /v1/agents/:agent/sessions/:session`  
 **Header:** `Accept: text/event-stream`
 
-Provides a live stream of AG-UI events. Multiple concurrent subscribers are supported via broadcast.
+Provides AG-UI events for a run. The body's **last message** selects the mode:
 
-- **Initialization:** Emits a `MESSAGES_SNAPSHOT` event immediately upon connection with the current history.
-- **Run Triggering:** Inspects the **last message** of the JSON body.
-  - If the last message is a `user` message → starts/continues a run.
-  - Otherwise (or empty body) → joins/resumes the session without starting a new run.
-- **Keep-Alive:** Sends `: keep-alive` SSE comments approximately every 15 seconds.
-- **Events:** Streams `RUN_STARTED`, `STEP_STARTED`, `TEXT_MESSAGE_START`, `THINKING_*`, `TEXT_MESSAGE_CONTENT`, `TOOL_CALL_*`, `CUSTOM`, `STEP_FINISHED`, `RUN_FINISHED`, and `RUN_ERROR`.
+- **Prompted run** (last message is a non-empty `user` message): a pure delta
+  stream — `RUN_STARTED` → `STEP_*`/`TEXT_MESSAGE_*`/`THINKING_*`/`TOOL_CALL_*`/
+  `CUSTOM` → `RUN_FINISHED` (or `RUN_ERROR`). The stream **terminates** after the
+  terminal event so the client's `runAgent()` promise resolves. No
+  `MESSAGES_SNAPSHOT` is emitted (it would predate the just-sent user message).
+- **Promptless join** (empty `messages`, i.e. `{"messages":[]}`, or an empty/
+  whitespace-only last user message): a one-shot hydrate — synthetic
+  `RUN_STARTED` → `MESSAGES_SNAPSHOT` (current history) → `RUN_FINISHED`, then the
+  stream closes. It does not forward another run's live events.
+
+Note: the request body must be a JSON object containing a `messages` array (e.g.
+`{"messages":[]}`); a bare `{}` is rejected as an invalid AG-UI request.
 
 #### 2. JSON-RPC 2.0 Control Plane
-**Endpoint:** `POST /v1/agents/:agent/sessions/:session/rpc`  
+**Endpoint:** `POST /v1/agents/:agent/sessions/:session`  
 **Header:** `Content-Type: application/json`
 
-Sibling endpoint for programmatic control.
+Same canonical session URL, negotiated into programmatic control.
 
 - **`session/get`**: Returns session state and capabilities.
   ```json
@@ -99,7 +115,7 @@ Sibling endpoint for programmatic control.
   { "jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": { "text": "hello" } }
   ```
   **Result:** `{ "status": "accepted", "run_id": "..." }` (idle) or `{ "status": "enqueued", "run_id": "..." }` (running).
-- **`session/cancel`**: Aborts the running agent loop.
+- **`session/cancel`**: Aborts running agent loop.
   ```json
   { "jsonrpc": "2.0", "id": 3, "method": "session/cancel" }
   ```
@@ -112,19 +128,20 @@ Sibling endpoint for programmatic control.
 
 ### Client Implementation Flow
 
-1. **Connect**: Open an SSE connection to receive history and subscribe to live events.
-2. **Drive**: Use the JSON-RPC endpoint to send prompts (`session/prompt`) or cancel runs (`session/cancel`).
-3. **Stateless UI**: Clients only send new inputs via RPC; they do not need to re-POST the full transcript.
+1. **Connect**: Open SSE connection on session URL to receive history and subscribe to live events.
+2. **Drive**: Use JSON-RPC on same session URL to send prompts (`session/prompt`) or cancel runs (`session/cancel`).
+3. **Stateless UI**: Clients only send new inputs via RPC; they do not need to re-POST full transcript.
 
 ### Disconnect Semantics (D5)
 
-SSE connections are decoupled from execution. Dropping an SSE connection (e.g., reloading the page) **does not stop** a running agent. The run continues to completion and persists. Only `session/cancel` or a terminal error stops a run.
+SSE connections are decoupled from execution. Dropping an SSE connection (e.g., reloading page) **does not stop** a running agent. Run continues to completion and persists. Only `session/cancel` or terminal error stops a run.
 
 ### Divergence from AG-UI Standards
 
 This implementation deliberately diverges from generic AG-UI/assistant-ui standards for optimization:
-- **Last-Message Inspection:** Decision to start a run is based on the last message in the SSE POST body.
+- **Last-Message Inspection:** Decision to start a run is based on last message in SSE POST body.
 - **Two-Plane Control:** Uses JSON-RPC instead of standard RESTful run endpoints to support mid-run injection.
+- **Single Canonical URL:** Both planes share one session permalink and rely on content negotiation instead of sibling routes.
 - **No Staleness Guards:** Omits request reconciliation and version/sequence guards.
 
 ### Phase B Scope
@@ -160,7 +177,7 @@ Intentionally dropped today:
 
 ## Quickstart
 
-1. **Start the server:**
+1. **Start server:**
    ```sh
    harnx-serve --addr 127.0.0.1:8000
    ```
@@ -169,12 +186,13 @@ Intentionally dropped today:
    ```bash
    curl -N -X POST http://127.0.0.1:8000/v1/agents/my-agent/sessions/my-session \
      -H "Accept: text/event-stream" \
-     -d '{}'
+     -H "Content-Type: application/json" \
+     -d '{"messages":[]}'
    ```
 
 3. **Send a prompt via JSON-RPC:**
    ```bash
-   curl -X POST http://127.0.0.1:8000/v1/agents/my-agent/sessions/my-session/rpc \
+   curl -X POST http://127.0.0.1:8000/v1/agents/my-agent/sessions/my-session \
      -H "Content-Type: application/json" \
      -d '{
        "jsonrpc": "2.0",

@@ -3,29 +3,75 @@ import {
   ThreadPrimitive,
   MessagePrimitive,
   ComposerPrimitive,
+  AttachmentPrimitive,
   useThread,
-  useComposer,
-  useComposerRuntime
+  useComposerRuntime,
+  useMessage,
 } from '@assistant-ui/react';
 import { useAgUiInterrupts, useAgUiSubmitInterruptResponses } from '@assistant-ui/react-ag-ui';
 import { ChatProvider } from './ChatProvider';
 import { PendingContext } from './PendingContext';
-import { cancel, prompt } from './api';
+import { cancel } from './api';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import './chat.css';
 
+// Activate a click-like handler from the keyboard (Enter / Space) so div-based
+// "button" affordances (picker cards) are usable without a mouse.
+function activateOnKey(e: React.KeyboardEvent, action: () => void) {
+  if (e.key === 'Enter' || e.key === ' ') {
+    e.preventDefault();
+    action();
+  }
+}
+
 const MyMessage = () => {
+  const role = useMessage((state) => state.role);
+  const [systemExpanded, setSystemExpanded] = useState(false);
+
+  if (role === 'system') {
+    return (
+      <MessagePrimitive.Root className="aui-message aui-system-message">
+        <details className="aui-system-message-details" open={systemExpanded} onToggle={(e) => setSystemExpanded((e.currentTarget as HTMLDetailsElement).open)}>
+          <summary className="aui-system-message-summary" aria-label={systemExpanded ? 'Collapse system prompt' : 'Expand system prompt'}>
+            {systemExpanded ? 'System prompt ▾' : 'System prompt ▸'}
+          </summary>
+          <div className="aui-message-content">
+            <MessagePrimitive.Content components={{
+              tools: { Fallback: (props: any) => (
+              <div className="aui-tool-call">
+                <div className="aui-tool-call-header">
+                  <span className="aui-tool-call-icon">⚙️</span>
+                  <span className="aui-tool-call-label">{props.toolName}</span>
+                </div>
+                <div className="aui-tool-call-body">
+                  {JSON.stringify(props.args, null, 2)}
+                </div>
+              </div>
+            ) }
+            }} />
+          </div>
+        </details>
+      </MessagePrimitive.Root>
+    );
+  }
+
   return (
     <MessagePrimitive.Root className="aui-message">
-      <MessagePrimitive.If user>
-        <div className="aui-message-role">You</div>
-      </MessagePrimitive.If>
-      <MessagePrimitive.If assistant>
-        <div className="aui-message-role">AI</div>
-      </MessagePrimitive.If>
       <div className="aui-message-content">
-        <MessagePrimitive.Content />
+        <MessagePrimitive.Content components={{
+          tools: { Fallback: (props: any) => (
+              <div className="aui-tool-call">
+                <div className="aui-tool-call-header">
+                  <span className="aui-tool-call-icon">⚙️</span>
+                  <span className="aui-tool-call-label">{props.toolName}</span>
+                </div>
+                <div className="aui-tool-call-body">
+                  {JSON.stringify(props.args, null, 2)}
+                </div>
+              </div>
+            ) }
+        }} />
       </div>
     </MessagePrimitive.Root>
   );
@@ -35,100 +81,92 @@ const CancelButton = ({ agentName, sessionId }: { agentName: string, sessionId: 
   const isRunning = useThread((s) => s.isRunning);
   if (!isRunning) return null;
   return (
-    <button 
-      className="aui-cancel-button" 
-      onClick={() => cancel(agentName, sessionId).catch(e => console.error("Cancel failed", e))}
+    <button
+      className="aui-cancel-button"
+      onClick={() => cancel(agentName, sessionId).catch(console.error)}
     >
-      Cancel Run
+      Stop
     </button>
   );
 };
 
+const MyAttachment = () => (
+  <AttachmentPrimitive.Root className="aui-attachment">
+    <AttachmentPrimitive.unstable_Thumb className="aui-attachment-thumb" />
+    <div className="aui-attachment-info">
+      <span className="aui-attachment-name"><AttachmentPrimitive.Name /></span>
+      <AttachmentPrimitive.Remove className="aui-attachment-remove">✖</AttachmentPrimitive.Remove>
+    </div>
+  </AttachmentPrimitive.Root>
+);
+
 const MyComposer = ({ agentName, sessionId }: { agentName: string, sessionId: string }) => {
-  const { pendingText, setPendingText, setErrorText } = useContext(PendingContext);
+  const { setErrorText } = useContext(PendingContext);
   const isRunning = useThread(s => s.isRunning);
   const composerRuntime = useComposerRuntime();
-  const text = useComposer(s => s.text);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (isRunning) {
-      const state = composerRuntime.getState();
-      if (!state.text.trim() && state.attachments.length === 0) return;
-      if (state.attachments.some((a: any) => a.status !== 'complete')) return;
+    setErrorText(null);
 
-      setErrorText(null);
-      try {
-        const attachment_refs = state.attachments.map((a: any) => (a as any).url).filter(Boolean);
-        await prompt(agentName, sessionId, state.text, attachment_refs);
-        setPendingText(state.text || "Attached file");
-        composerRuntime.reset();
-      } catch (err: any) {
-        console.error("Failed to enqueue message", err);
-        setErrorText(err instanceof Error ? err.message : 'Failed to send message');
-      }
-    }
+    const state = composerRuntime.getState();
+    if (!state.text.trim() && state.attachments.length === 0) return;
+    if (state.attachments.some((a: any) => a.status?.type !== 'complete')) return;
+
+    composerRuntime.send();
   };
 
   return (
-    <ComposerPrimitive.Root className="aui-composer">
-      {isRunning && pendingText ? (
-        <div className="aui-composer-pending">Pending: {pendingText}</div>
-      ) : isRunning ? (
-        <form onSubmit={handleSubmit} style={{ display: 'flex', width: '100%', alignItems: 'center' }}>
-          <div className="aui-composer-attachments">
-             <ComposerPrimitive.Attachments components={{}} />
-          </div>
-          <ComposerPrimitive.AddAttachment className="aui-composer-add-attachment">Attach</ComposerPrimitive.AddAttachment>
-          <input 
-            className="aui-composer-input" 
-            value={text} 
-            onChange={e => composerRuntime.setText(e.target.value)} 
-            placeholder="Type a message (queued)..." 
-            style={{ flex: 1 }}
-          />
-          <button type="submit" className="aui-composer-send">Queue</button>
-          <CancelButton agentName={agentName} sessionId={sessionId} />
-        </form>
-      ) : (
-        <>
-          <div className="aui-composer-attachments">
-             <ComposerPrimitive.Attachments components={{}} />
-          </div>
-          <ComposerPrimitive.AddAttachment className="aui-composer-add-attachment">Attach</ComposerPrimitive.AddAttachment>
-          <ComposerPrimitive.Input className="aui-composer-input" placeholder="Type a message..." />
-          <ComposerPrimitive.Send className="aui-composer-send">Send</ComposerPrimitive.Send>
-          <CancelButton agentName={agentName} sessionId={sessionId} />
-        </>
-      )}
+    <ComposerPrimitive.Root className="aui-composer" onSubmit={handleSubmit}>
+      <div style={{ display: 'flex', width: '100%', alignItems: 'center' }}>
+        <div className="aui-composer-attachments">
+          <ComposerPrimitive.Attachments components={{ Attachment: MyAttachment }} />
+        </div>
+        <ComposerPrimitive.AddAttachment className="aui-composer-add-attachment">Attach</ComposerPrimitive.AddAttachment>
+        <ComposerPrimitive.Input
+          className="aui-composer-input"
+          placeholder={isRunning ? 'Type a message (queued)...' : 'Type a message...'}
+          render={<textarea />}
+        />
+        <button type="submit" className="aui-composer-send">{isRunning ? 'Queue' : 'Send'}</button>
+        <CancelButton agentName={agentName} sessionId={sessionId} />
+      </div>
     </ComposerPrimitive.Root>
   );
 };
 
 const RunStateMonitor = ({ onRunFinish }: { onRunFinish: () => void }) => {
-  const isRunning = useThread((s) => s.isRunning);
+  const isRunning = useThread(s => s.isRunning);
   const wasRunning = useRef(isRunning);
-  
   useEffect(() => {
     if (wasRunning.current && !isRunning) {
       onRunFinish();
     }
     wasRunning.current = isRunning;
   }, [isRunning, onRunFinish]);
-  
   return null;
 };
 
 const StatusIndicator = () => {
   const { statusText } = useContext(PendingContext);
-  if (!statusText) return null;
-  return <div className="aui-status-indicator" style={{ padding: '4px 8px', fontSize: '0.85em', color: '#666', fontStyle: 'italic' }}>{statusText}</div>;
+  const isRunning = useThread(s => s.isRunning);
+  if (!isRunning) return null;
+  return (
+    <div className="aui-status-indicator">
+      <span className="aui-spinner"><span></span></span>
+      <span className="aui-status-text">{statusText || 'Running...'}</span>
+    </div>
+  );
 };
 
 const SendErrorIndicator = () => {
   const { errorText } = useContext(PendingContext);
   if (!errorText) return null;
-  return <div role="alert" className="aui-error" data-testid="send-error" style={{ margin: '8px' }}>{errorText}</div>;
+  return (
+    <div className="aui-error" data-testid="send-error">
+      {errorText}
+    </div>
+  );
 };
 
 const BatchInterruptUI = () => {
@@ -136,43 +174,37 @@ const BatchInterruptUI = () => {
   const submitResponses = useAgUiSubmitInterruptResponses();
   const [responses, setResponses] = useState<Record<string, 'resolved' | 'cancelled'>>({});
 
-  useEffect(() => {
-    if (!interrupts || interrupts.length === 0) {
-      setResponses({});
-    }
-  }, [interrupts]);
-
-  if (!interrupts || interrupts.length === 0) return null;
+  if (!interrupts.length) return null;
 
   const handleSubmit = () => {
-     const payload = interrupts.map(i => ({
-        interruptId: i.id,
-        status: responses[i.id] || 'cancelled'
-     }));
-     submitResponses(payload);
+    const payload = interrupts.map(i => ({
+      interruptId: i.id,
+      status: responses[i.id] || 'cancelled'
+    }));
+    submitResponses(payload);
   };
 
   return (
-    <div className="aui-interrupts-batch" style={{ padding: '12px', borderTop: '1px solid #ccc', background: '#fefefe' }}>
-      <h4 style={{ margin: '0 0 8px 0' }}>Action Required: Approve Tool Calls</h4>
+    <div className="aui-interrupts-batch">
+      <h4 className="aui-interrupts-title">Action Required: Approve Tool Calls</h4>
       {interrupts.map((interrupt) => (
-        <div key={interrupt.id} className="aui-interrupt" style={{ marginBottom: '8px', padding: '8px', border: '1px solid #eee', borderRadius: '4px' }}>
-          <p style={{ margin: '0 0 4px 0', fontSize: '0.9em' }}>Tool: <strong>{interrupt.toolCallId || interrupt.reason}</strong></p>
-          {interrupt.message && <pre style={{ fontSize: '0.8em', margin: '4px 0', background: '#f5f5f5', padding: '4px' }}>{interrupt.message}</pre>}
-          <div className="aui-interrupt-actions" style={{ display: 'flex', gap: '12px', fontSize: '0.9em' }}>
+        <div key={interrupt.id} className="aui-interrupt">
+          <p className="aui-interrupt-tool-name">Tool: <strong>{interrupt.toolCallId || interrupt.reason}</strong></p>
+          {interrupt.message && <pre className="aui-interrupt-message">{interrupt.message}</pre>}
+          <div className="aui-interrupt-actions">
             <label>
-               <input type="radio" name={`action-${interrupt.id}`} checked={responses[interrupt.id] === 'resolved'} onChange={() => setResponses((prev: Record<string, 'resolved' | 'cancelled'>) => ({ ...prev, [interrupt.id]: 'resolved' }))} /> Approve
+              <input type="radio" name={`action-${interrupt.id}`} checked={responses[interrupt.id] === 'resolved'} onChange={() => setResponses((prev: Record<string, 'resolved' | 'cancelled'>) => ({ ...prev, [interrupt.id]: 'resolved' }))} /> Approve
             </label>
             <label>
-               <input type="radio" name={`action-${interrupt.id}`} checked={responses[interrupt.id] === 'cancelled'} onChange={() => setResponses((prev: Record<string, 'resolved' | 'cancelled'>) => ({ ...prev, [interrupt.id]: 'cancelled' }))} /> Deny
+              <input type="radio" name={`action-${interrupt.id}`} checked={responses[interrupt.id] === 'cancelled'} onChange={() => setResponses((prev: Record<string, 'resolved' | 'cancelled'>) => ({ ...prev, [interrupt.id]: 'cancelled' }))} /> Deny
             </label>
           </div>
         </div>
       ))}
-      <button 
-        disabled={Object.keys(responses).length !== interrupts.length} 
+      <button
+        disabled={Object.keys(responses).length !== interrupts.length}
         onClick={handleSubmit}
-        style={{ padding: '6px 12px', cursor: 'pointer' }}
+        className="aui-interrupt-submit"
       >
         Submit Decisions
       </button>
@@ -181,84 +213,135 @@ const BatchInterruptUI = () => {
 };
 
 const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, sessionId: string, onRunFinish: () => void }) => {
+  const isEmpty = useThread(s => s.messages.length === 0);
+
   return (
-    <ThreadPrimitive.Root className="aui-thread">
+    <ThreadPrimitive.Root className={`aui-thread ${isEmpty ? 'aui-thread-empty' : ''}`}>
       <RunStateMonitor onRunFinish={onRunFinish} />
       <StatusIndicator />
-      <ThreadPrimitive.Viewport className="aui-thread-viewport">
-        <ThreadPrimitive.Messages components={{ Message: MyMessage }} />
-      </ThreadPrimitive.Viewport>
-      <BatchInterruptUI />
-      <SendErrorIndicator />
-      <MyComposer agentName={agentName} sessionId={sessionId} />
+
+      {!isEmpty && (
+        <ThreadPrimitive.Viewport className="aui-thread-viewport">
+          <ThreadPrimitive.Messages components={{ Message: MyMessage }} />
+        </ThreadPrimitive.Viewport>
+      )}
+
+      <div className="aui-thread-bottom">
+        <BatchInterruptUI />
+        <SendErrorIndicator />
+        <div className="aui-composer-container">
+          <MyComposer agentName={agentName} sessionId={sessionId} />
+        </div>
+      </div>
     </ThreadPrimitive.Root>
   );
 };
 
-const AgentSelector = ({
+const AgentPicker = ({
   agents,
   agentsError,
-  selectedAgent,
   onSelect
 }: {
   agents: Agent[];
   agentsError: string | null;
-  selectedAgent: string;
   onSelect: (agent: string) => void;
 }) => (
-  <div className="sidebar-section">
-    <h3>Agents</h3>
+  <div className="picker-container">
+    <h2>Select an Agent</h2>
     {agentsError ? (
       <div role="alert" className="aui-error" data-testid="agents-error">{agentsError}</div>
     ) : (
-      <select 
-        value={selectedAgent} 
-        onChange={e => onSelect(e.target.value)}
-      >
-        {agents.map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
-      </select>
+      <div className="grid-list">
+        {agents.map(a => (
+          <div
+            key={a.name}
+            className="grid-item"
+            role="button"
+            tabIndex={0}
+            onClick={() => onSelect(a.name)}
+            onKeyDown={(e) => activateOnKey(e, () => onSelect(a.name))}
+          >
+            <h3>{a.name}</h3>
+            {a.description && <p>{a.description}</p>}
+          </div>
+        ))}
+      </div>
     )}
   </div>
 );
 
-const SessionList = ({
+const SessionPicker = ({
+  agentName,
   sessions,
   sessionsError,
-  selectedSessionId,
   onSelect,
-  onNewChat
+  onNewChat,
+  onBack
 }: {
+  agentName: string;
   sessions: SessionRef[];
   sessionsError: string | null;
-  selectedSessionId: string;
   onSelect: (id: string) => void;
   onNewChat: () => void;
+  onBack: () => void;
 }) => (
-  <div className="sidebar-section">
-    <div className="sessions-header">
-      <h3>Sessions</h3>
-      <button onClick={onNewChat}>New Chat</button>
+  <div className="picker-container">
+    <button className="back-button" onClick={onBack}>&larr; Back to agents</button>
+    <h2>Sessions for {agentName}</h2>
+    <div className="actions-bar">
+      <button className="new-chat-button" onClick={onNewChat}>New Chat</button>
     </div>
     {sessionsError ? (
       <div role="alert" className="aui-error" data-testid="sessions-error">{sessionsError}</div>
     ) : (
-      <ul className="sessions-list">
-        {sessions.map(s => (
-          <li 
-            key={s.session_id} 
-            className={s.session_id === selectedSessionId ? 'active' : ''}
-            onClick={() => onSelect(s.session_id)}
-          >
-            {s.session_id}
-          </li>
-        ))}
-        {selectedSessionId && !sessions.find(s => s.session_id === selectedSessionId) && (
-          <li className="active">
-            {selectedSessionId} (New)
-          </li>
+      <div className="grid-list sessions-grid">
+        {sessions.length === 0 ? (
+          <p className="no-sessions-msg">No existing sessions found.</p>
+        ) : (
+          sessions.map(s => (
+            <div
+              key={s.session_id}
+              className="grid-item session-item"
+              role="button"
+              tabIndex={0}
+              onClick={() => onSelect(s.session_id)}
+              onKeyDown={(e) => activateOnKey(e, () => onSelect(s.session_id))}
+            >
+              <h3>{s.session_id}</h3>
+              {s.updated_at && <p>Updated: {new Date(s.updated_at).toLocaleString()}</p>}
+            </div>
+          ))
         )}
-      </ul>
+      </div>
     )}
+  </div>
+);
+
+const TopNav = ({
+  agentName,
+  sessionId,
+  onSwitchAgent,
+  onSwitchSession
+}: {
+  agentName: string;
+  sessionId: string;
+  onSwitchAgent: () => void;
+  onSwitchSession: () => void;
+}) => (
+  <div className="top-nav">
+    <div className="top-nav-brand">Harnx UI</div>
+    <div className="top-nav-controls">
+      <div className="top-nav-item">
+        <span className="top-nav-label">Agent:</span>
+        <span className="top-nav-value">{agentName}</span>
+        <button onClick={onSwitchAgent}>Switch agent</button>
+      </div>
+      <div className="top-nav-item">
+        <span className="top-nav-label">Session:</span>
+        <span className="top-nav-value">{sessionId}</span>
+        <button onClick={onSwitchSession}>Switch session</button>
+      </div>
+    </div>
   </div>
 );
 
@@ -273,37 +356,44 @@ export default function App() {
     refreshSessions,
     selectAgent,
     selectSession,
-    newChat
+    newChat,
+    clearAgent,
+    clearSession,
+    isFreshSession
   } = useAgentSessions();
 
   return (
-    <div className="app-layout">
-      <div className="sidebar">
-        <h2>Harnx UI</h2>
-        <AgentSelector 
-          agents={agents} 
+    <div className="app-container">
+      {!selectedAgent ? (
+        <AgentPicker
+          agents={agents}
           agentsError={agentsError}
-          selectedAgent={selectedAgent} 
-          onSelect={selectAgent} 
+          onSelect={selectAgent}
         />
-        <SessionList 
-          sessions={sessions} 
+      ) : !selectedSessionId ? (
+        <SessionPicker
+          agentName={selectedAgent}
+          sessions={sessions}
           sessionsError={sessionsError}
-          selectedSessionId={selectedSessionId} 
-          onSelect={selectSession} 
-          onNewChat={newChat} 
+          onSelect={selectSession}
+          onNewChat={newChat}
+          onBack={clearAgent}
         />
-      </div>
-      
-      <div className="main-pane">
-        {selectedAgent && selectedSessionId ? (
-          <ChatProvider agentName={selectedAgent} sessionId={selectedSessionId}>
-            <MyThread agentName={selectedAgent} sessionId={selectedSessionId} onRunFinish={refreshSessions} />
-          </ChatProvider>
-        ) : (
-          <div className="empty-pane">Select an agent and session</div>
-        )}
-      </div>
+      ) : (
+        <div className="chat-layout">
+          <TopNav
+            agentName={selectedAgent}
+            sessionId={selectedSessionId}
+            onSwitchAgent={clearAgent}
+            onSwitchSession={clearSession}
+          />
+          <div className="chat-main">
+            <ChatProvider agentName={selectedAgent} sessionId={selectedSessionId} isFreshSession={isFreshSession}>
+              <MyThread agentName={selectedAgent} sessionId={selectedSessionId} onRunFinish={refreshSessions} />
+            </ChatProvider>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

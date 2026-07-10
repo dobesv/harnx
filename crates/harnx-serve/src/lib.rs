@@ -107,6 +107,7 @@ enum AgentsRepresentation {
     Html,
     Json,
     AgUiSse,
+    AgUiRpc,
 }
 
 impl Server {
@@ -217,13 +218,6 @@ impl Server {
             self.list_models()
         } else if path == "/v1/agents" {
             self.list_agents(req.uri().query()).await
-        } else if is_agent_rpc_path(path) {
-            let persistence = if self.config.nats_servers.is_empty() {
-                PersistenceKind::Filesystem
-            } else {
-                PersistenceKind::Nats
-            };
-            handle_ag_ui_rpc(req, &self.config, &self.session_registry, persistence).await
         } else if is_session_attachments_path(path) {
             self.upload_session_attachments(req).await
         } else if path.starts_with("/v1/agents/") {
@@ -409,15 +403,17 @@ impl Server {
                 match negotiate_agents_route(&method, req.headers(), agent_route)? {
                     AgentsRepresentation::Html => self.agent_html_page(&agent_name),
                     AgentsRepresentation::Json => self.agent_json(&agent_name),
-                    AgentsRepresentation::AgUiSse => Err(anyhow!("Not Acceptable")),
+                    AgentsRepresentation::AgUiSse | AgentsRepresentation::AgUiRpc => {
+                        Err(anyhow!("Not Acceptable"))
+                    }
                 }
             }
             AgentsRoute::Sessions => {
                 match negotiate_agents_route(&method, req.headers(), agent_route)? {
                     AgentsRepresentation::Json => self.sessions_json(&agent_name),
-                    AgentsRepresentation::Html | AgentsRepresentation::AgUiSse => {
-                        Err(anyhow!("Not Acceptable"))
-                    }
+                    AgentsRepresentation::Html
+                    | AgentsRepresentation::AgUiSse
+                    | AgentsRepresentation::AgUiRpc => Err(anyhow!("Not Acceptable")),
                 }
             }
             AgentsRoute::Session => {
@@ -431,6 +427,22 @@ impl Server {
                     }
                     AgentsRepresentation::AgUiSse => {
                         self.ag_ui_run_route(req, &agent_name, &session_name).await
+                    }
+                    AgentsRepresentation::AgUiRpc => {
+                        let persistence = if self.config.nats_servers.is_empty() {
+                            PersistenceKind::Filesystem
+                        } else {
+                            PersistenceKind::Nats
+                        };
+                        handle_ag_ui_rpc(
+                            req,
+                            &agent_name,
+                            &session_name,
+                            &self.config,
+                            &self.session_registry,
+                            persistence,
+                        )
+                        .await
                     }
                 }
             }
@@ -933,22 +945,6 @@ fn query_requests_assistant_role(query: Option<&str>) -> bool {
     })
 }
 
-/// Matches exactly the JSON-RPC control-plane path shape `/v1/agents/{agent}/rpc`
-/// (a single agent segment followed by `rpc`). A naive `ends_with("/rpc")` check
-/// would also match a session literally named `rpc`
-/// (`/v1/agents/{agent}/sessions/rpc`) and misroute it to the RPC handler.
-fn is_agent_rpc_path(path: &str) -> bool {
-    let Some(suffix) = path.strip_prefix("/v1/agents/") else {
-        return false;
-    };
-    let segments: Vec<_> = suffix
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    matches!(segments.as_slice(), [_agent, "rpc"])
-        || matches!(segments.as_slice(), [_agent, "sessions", _, "rpc"])
-}
-
 fn is_session_attachments_path(path: &str) -> bool {
     let Some(suffix) = path.strip_prefix("/v1/agents/") else {
         return false;
@@ -992,8 +988,10 @@ fn negotiate_agents_route(
         }
         (&Method::GET, AgentsRoute::Sessions) => Ok(AgentsRepresentation::Json),
         (&Method::POST, AgentsRoute::Session) => {
-            if accepts_event_stream(headers) || content_type_is_json(headers) {
+            if accepts_event_stream(headers) {
                 Ok(AgentsRepresentation::AgUiSse)
+            } else if content_type_is_json(headers) {
+                Ok(AgentsRepresentation::AgUiRpc)
             } else {
                 Err(anyhow!("Not Acceptable"))
             }
@@ -1081,7 +1079,32 @@ fn accepts_event_stream(headers: &http::HeaderMap) -> bool {
     headers
         .get(http::header::ACCEPT)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("text/event-stream"))
+        .is_some_and(accept_header_allows_event_stream)
+}
+
+fn accept_header_allows_event_stream(value: &str) -> bool {
+    value.split(',').any(|raw_item| {
+        let mut parts = raw_item.split(';');
+        let media_type = parts.next().unwrap_or_default().trim();
+        if !media_type.eq_ignore_ascii_case("text/event-stream") {
+            return false;
+        }
+
+        for param in parts {
+            let mut kv = param.splitn(2, '=');
+            let name = kv.next().unwrap_or_default().trim();
+            let value = kv.next().unwrap_or_default().trim().trim_matches('"');
+            if name.eq_ignore_ascii_case("q") {
+                match value.parse::<f32>() {
+                    Ok(q) if q <= 0.0 => return false,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+        }
+
+        true
+    })
 }
 
 fn agent_scoped_config(config: &Config, agent: &str) -> Result<Config> {
@@ -1177,7 +1200,12 @@ fn content_type_is_json(headers: &http::HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("application/json"))
+        .is_some_and(|value| {
+            // Case-insensitive media-type match; tolerate parameters like
+            // `application/json; charset=utf-8`.
+            let media_type = value.split(';').next().unwrap_or_default().trim();
+            media_type.eq_ignore_ascii_case("application/json")
+        })
 }
 
 fn json_response(data: Value) -> Result<AppResponse> {
@@ -1270,29 +1298,6 @@ mod tests {
             parse_agents_route("/v1/agents/hephaestus%2Fsessions"),
             Some(("hephaestus/sessions".to_string(), None, AgentsRoute::Agent,))
         );
-    }
-
-    #[test]
-    fn is_agent_rpc_path_matches_agent_and_session_rpc_shapes_only() {
-        assert!(is_agent_rpc_path("/v1/agents/hephaestus/rpc"));
-        assert!(is_agent_rpc_path(
-            "/v1/agents/hephaestus/sessions/thread-1/rpc"
-        ));
-        assert!(is_agent_rpc_path(
-            "/v1/agents/coding%2Fcoder/sessions/thread-1/rpc"
-        ));
-        // A session literally named "rpc" without trailing RPC segment must NOT be treated as RPC.
-        assert!(!is_agent_rpc_path("/v1/agents/hephaestus/sessions/rpc"));
-        // Other agent-tree shapes are not RPC.
-        assert!(!is_agent_rpc_path("/v1/agents/hephaestus"));
-        assert!(!is_agent_rpc_path("/v1/agents/hephaestus/sessions"));
-        assert!(!is_agent_rpc_path(
-            "/v1/agents/hephaestus/sessions/thread-1"
-        ));
-        assert!(!is_agent_rpc_path(
-            "/v1/agents/hephaestus/sessions/thread-1/attachments"
-        ));
-        assert!(!is_agent_rpc_path("/v1/models"));
     }
 
     #[test]
@@ -1418,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_agents_route_accept_header_drives_html_json_and_sse_cases() {
+    fn negotiate_agents_route_accept_header_drives_html_json_and_post_tiebreak_cases() {
         let mut html_headers = http::HeaderMap::new();
         html_headers.insert(http::header::ACCEPT, HeaderValue::from_static("text/html"));
         assert_eq!(
@@ -1453,6 +1458,30 @@ mod tests {
             negotiate_agents_route(&Method::POST, &sse_headers, AgentsRoute::Session).unwrap(),
             AgentsRepresentation::AgUiSse
         );
+
+        let mut rpc_headers = http::HeaderMap::new();
+        rpc_headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::POST, &rpc_headers, AgentsRoute::Session).unwrap(),
+            AgentsRepresentation::AgUiRpc
+        );
+
+        let mut both_headers = http::HeaderMap::new();
+        both_headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        both_headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(
+            negotiate_agents_route(&Method::POST, &both_headers, AgentsRoute::Session).unwrap(),
+            AgentsRepresentation::AgUiSse
+        );
     }
 
     #[test]
@@ -1471,6 +1500,21 @@ mod tests {
         );
         let err = ag_ui_error_to_anyhow(AgUiError::BadRequest("bad body".to_string()));
         assert_eq!(status_from_error(&err), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn accept_header_allows_event_stream_requires_exact_media_type_and_positive_q() {
+        assert!(accept_header_allows_event_stream("text/event-stream"));
+        assert!(accept_header_allows_event_stream(
+            "application/json, text/event-stream;q=0.2"
+        ));
+        assert!(!accept_header_allows_event_stream(
+            "application/json, text/event-stream;q=0"
+        ));
+        assert!(!accept_header_allows_event_stream("text/event-streamish"));
+        assert!(!accept_header_allows_event_stream(
+            "text/event-stream; q=bogus"
+        ));
     }
 
     async fn response_json(response: AppResponse) -> Value {
@@ -1727,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn server_handle_routes_session_scoped_rpc_requests_to_rpc_handler() {
+    fn session_route_accepts_rpc_named_session_without_special_rpc_suffix_routing() {
         let sandbox = TestConfigSandbox::new();
         let agent_path = std::path::Path::new("coding");
         std::fs::create_dir_all(
@@ -1740,12 +1784,6 @@ mod tests {
             "You are coding/coder.",
         );
 
-        assert!(is_agent_rpc_path(
-            "/v1/agents/coding%2Fcoder/sessions/thread-1/rpc"
-        ));
-        assert!(!is_agent_rpc_path(
-            "/v1/agents/coding%2Fcoder/sessions/thread-1"
-        ));
         assert!(is_session_attachments_path(
             "/v1/agents/coding%2Fcoder/sessions/thread-1/attachments"
         ));
@@ -1754,7 +1792,11 @@ mod tests {
         assert_eq!(session_route.0, "coding/coder");
         assert_eq!(session_route.1.as_deref(), Some("thread-1"));
         assert_eq!(session_route.2, AgentsRoute::Session);
-        assert!(parse_agents_route("/v1/agents/coding%2Fcoder/sessions/thread-1/rpc").is_none());
+        let rpc_named_session = parse_agents_route("/v1/agents/coding%2Fcoder/sessions/rpc")
+            .expect("rpc-named session should parse");
+        assert_eq!(rpc_named_session.0, "coding/coder");
+        assert_eq!(rpc_named_session.1.as_deref(), Some("rpc"));
+        assert_eq!(rpc_named_session.2, AgentsRoute::Session);
     }
 
     /// Helper to build and execute an upload request through the real handler

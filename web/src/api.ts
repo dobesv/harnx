@@ -1,4 +1,4 @@
-import type { Agent, SessionRef, HistoryMessage, AgentDetail, JsonRpcResponse, CancelResult } from './types';
+import type { Agent, SessionRef, AgentDetail, JsonRpcResponse, CancelResult } from './types';
 
 const API_BASE = '/v1';
 
@@ -16,13 +16,6 @@ export async function listSessions(agent: string): Promise<SessionRef[]> {
   return json;
 }
 
-export async function getSessionHistory(agent: string, session: string): Promise<HistoryMessage[]> {
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`);
-  if (!res.ok) throw new Error(`Failed to fetch history for session ${session}: ${res.statusText}`);
-  const json = await res.json() as HistoryMessage[];
-  return json;
-}
-
 export async function getAgent(agent: string): Promise<AgentDetail> {
   const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}`);
   if (!res.ok) throw new Error(`Failed to get agent ${agent}: ${res.statusText}`);
@@ -31,7 +24,7 @@ export async function getAgent(agent: string): Promise<AgentDetail> {
 }
 
 export async function cancel(agent: string, session: string): Promise<CancelResult> {
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}/rpc`, {
+  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -42,19 +35,29 @@ export async function cancel(agent: string, session: string): Promise<CancelResu
       method: 'session/cancel'
     })
   });
-  
-  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
-  
-  const json = await res.json() as JsonRpcResponse<CancelResult>;
-  
-  if (json.error) {
+
+  // Parse the JSON-RPC body BEFORE checking res.ok: the backend returns
+  // HTTP 400 for an idle-session cancel with a JSON-RPC error body carrying
+  // code -32002, which we treat as a successful no-op. Throwing on !res.ok
+  // first would make that branch unreachable.
+  let json: JsonRpcResponse<CancelResult> | undefined;
+  try {
+    json = await res.json() as JsonRpcResponse<CancelResult>;
+  } catch {
+    json = undefined;
+  }
+
+  if (json?.error) {
     if (json.error.code === -32002) {
-      return { cancelled: true }; // Benign no-op
+      // Cancelling an already-idle session is a benign no-op.
+      return { cancelled: true };
     }
     throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
   }
-  
-  return json.result as CancelResult;
+
+  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
+
+  return json?.result as CancelResult;
 }
 
 export async function uploadAttachment(agent: string, session: string, file: File): Promise<string[]> {
@@ -74,31 +77,6 @@ export async function uploadAttachment(agent: string, session: string, file: Fil
   }
   const json = await res.json();
   return json.attachment_refs || [];
-}
-
-export async function prompt(agent: string, session: string, text: string, attachment_refs?: string[], resume?: any[]): Promise<any> {
-  const params: any = { text, attachment_refs: attachment_refs || [] };
-  if (resume) {
-    params.resume = resume;
-  }
-  const res = await fetch(`${API_BASE}/agents/${encodeURIComponent(agent)}/sessions/${encodeURIComponent(session)}/rpc`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: Date.now(),
-      method: 'session/prompt',
-      params
-    })
-  });
-  if (!res.ok) throw new Error(`RPC call failed with HTTP ${res.status}`);
-  const json = await res.json() as JsonRpcResponse<any>;
-  if (json.error) {
-    throw new Error(`RPC Error: ${json.error.message || json.error.code}`);
-  }
-  return json.result;
 }
 
 export function newSessionId(): string {
