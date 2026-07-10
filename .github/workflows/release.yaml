@@ -126,7 +126,7 @@ jobs:
       run: |
         $BUILD_CMD build --locked --release --target=${{ matrix.target }} ${{ matrix.cargo-flags }} \
           -p harnx -p harnx-serve -p harnx-acp-server \
-          -p harnx-mcp-bash -p harnx-mcp-fs -p harnx-mcp-plans -p harnx-mcp-time \
+          -p harnx-mcp-bash -p harnx-mcp-fs -p harnx-mcp-plans -p harnx-mcp-plans-github -p harnx-mcp-time \
           -p harnx-aws-creds -p harnx-k8s-creds -p harnx-pkg -p harnx-proxy-auth -p harnx-mcp-hooks-proxy \
           -p harnx-sandbox-run \
           -p harnx-sandbox-common
@@ -153,6 +153,7 @@ jobs:
           "harnx-mcp-bash:harnx-mcp-bash,harnx-mcp-bash-sandbox-run"
           "harnx-mcp-fs:harnx-mcp-fs"
           "harnx-mcp-plans:harnx-mcp-plans"
+          "harnx-mcp-plans-github:harnx-mcp-plans-github"
           "harnx-mcp-time:harnx-mcp-time"
           "harnx-aws-creds:harnx-aws-creds"
           "harnx-k8s-creds:harnx-k8s-creds"
@@ -388,7 +389,7 @@ jobs:
         run: |
           missing=0
           for dir in linux-amd64 linux-arm64; do
-            for bin in harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-bash-sandbox-run harnx-mcp-fs harnx-mcp-plans harnx-mcp-time harnx-aws-creds harnx-k8s-creds harnx-pkg harnx-proxy-auth harnx-mcp-hooks-proxy harnx-sandbox-run harnx-sandbox-exec; do
+            for bin in harnx harnx-serve harnx-acp-server harnx-mcp-bash harnx-mcp-bash-sandbox-run harnx-mcp-fs harnx-mcp-plans harnx-mcp-plans-github harnx-mcp-time harnx-aws-creds harnx-k8s-creds harnx-pkg harnx-proxy-auth harnx-mcp-hooks-proxy harnx-sandbox-run harnx-sandbox-exec; do
               if [ ! -f "$dir/$bin" ]; then
                 echo "ERROR: missing $dir/$bin"
                 missing=1
