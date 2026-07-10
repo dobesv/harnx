@@ -23,7 +23,12 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::time::Duration;
-use std::{collections::HashMap, fmt, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::Path,
+    sync::Arc,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::runtime::{Builder, Handle, RuntimeFlavor};
@@ -1418,9 +1423,35 @@ impl McpManager {
         self.get_tools_from_clients(clients).await
     }
 
-    fn invalidate_all_services(&self) {
+    /// Snapshot the names of every currently-connected MCP client.
+    ///
+    /// Used to distinguish services that were already warm *before* a
+    /// short-lived-runtime discovery pass from those the discovery pass itself
+    /// opened. See [`Self::invalidate_services_connected_since`].
+    fn connected_client_names(&self) -> HashSet<String> {
+        self.clients
+            .read()
+            .values()
+            .filter(|client| client.is_connected())
+            .map(|client| client.name().to_string())
+            .collect()
+    }
+
+    /// Invalidate only services that became connected *after* the given
+    /// snapshot — i.e. connections opened by a discovery pass running on a
+    /// short-lived runtime, which would otherwise be left bound to a runtime
+    /// that is about to be dropped.
+    ///
+    /// Services that were already connected before the snapshot (warm
+    /// subprocesses established on the caller's persistent runtime by real
+    /// tool calls) are preserved. Blanket-invalidating those was the cause of
+    /// per-tool-round MCP subprocess churn on the single-threaded ACP server
+    /// runtime (#988): each completion request reads the cached tool list via
+    /// blocking discovery, and the old blanket invalidation tore down every
+    /// live connection as a side effect, forcing a respawn on the next call.
+    fn invalidate_services_connected_since(&self, previously_connected: &HashSet<String>) {
         for client in self.clients.read().values() {
-            if client.is_connected() {
+            if client.is_connected() && !previously_connected.contains(client.name()) {
                 client.invalidate_service();
             }
         }
@@ -1431,12 +1462,14 @@ impl McpManager {
     /// thread, or none).
     ///
     /// On the current-thread and no-runtime paths the discovery future runs on
-    /// a short-lived runtime; `invalidate_all_services()` is called afterwards
-    /// so the now-orphaned services aren't left half-alive and are
-    /// re-established on demand. On the multi-thread path the future runs on
-    /// the caller's persistent runtime, so connections opened during discovery
-    /// stay usable and are intentionally *not* invalidated (avoiding needless
-    /// reconnect churn). This mirrors the original `get_all_tools_blocking`.
+    /// a short-lived runtime; only services *opened by that discovery pass*
+    /// are invalidated afterwards (they'd otherwise be orphaned when the
+    /// short-lived runtime is dropped), while services that were already warm
+    /// beforehand are preserved and re-used. On the multi-thread path the
+    /// future runs on the caller's persistent runtime, so connections opened
+    /// during discovery stay usable and nothing is invalidated. Either way,
+    /// already-connected MCP subprocesses survive across discovery passes —
+    /// avoiding the per-tool-round churn described in #988.
     fn run_tool_discovery_blocking<Fut>(
         &self,
         fut: impl FnOnce() -> Fut + Send,
@@ -1453,6 +1486,7 @@ impl McpManager {
                     // On a single-threaded runtime (e.g., the ACP server),
                     // block_in_place panics. Run the async operation on a
                     // dedicated thread with its own runtime instead.
+                    let previously_connected = self.connected_client_names();
                     std::thread::scope(|s| {
                         s.spawn(|| {
                             let rt = Builder::new_current_thread()
@@ -1460,7 +1494,7 @@ impl McpManager {
                                 .build()
                                 .expect("create runtime for MCP tool discovery");
                             let tools = rt.block_on(fut());
-                            self.invalidate_all_services();
+                            self.invalidate_services_connected_since(&previously_connected);
                             tools
                         })
                         .join()
@@ -1471,8 +1505,9 @@ impl McpManager {
         } else {
             match Builder::new_current_thread().enable_all().build() {
                 Ok(runtime) => {
+                    let previously_connected = self.connected_client_names();
                     let tools = runtime.block_on(fut());
-                    self.invalidate_all_services();
+                    self.invalidate_services_connected_since(&previously_connected);
                     tools
                 }
                 Err(err) => {
@@ -1579,7 +1614,8 @@ impl ToolProvider for McpManager {
 
 #[cfg(test)]
 mod selector_filter_tests {
-    use super::{classify_exit, selector_could_match_server};
+    use super::{classify_exit, selector_could_match_server, McpManager};
+    use crate::McpServerConfig;
     use harnx_core::event::NoticeEvent;
 
     #[test]
@@ -1670,6 +1706,120 @@ mod selector_filter_tests {
             }
             _ => panic!("expected Warning for clean exit"),
         }
+    }
+
+    fn mock_mcp_bin() -> std::path::PathBuf {
+        let exe_name = format!("harnx-mock-mcp{}", std::env::consts::EXE_SUFFIX);
+        let current_exe = std::env::current_exe().expect("current test binary path");
+        let target_dir = current_exe
+            .parent()
+            .expect("deps dir")
+            .parent()
+            .expect("target profile dir");
+        let candidate = target_dir.join(&exe_name);
+        assert!(
+            candidate.exists(),
+            "expected mock MCP binary at {}",
+            candidate.display()
+        );
+        candidate
+    }
+
+    fn spawn_log_lines(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .map(|contents| {
+                contents
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn wait_for_spawn_count(path: &std::path::Path, min_lines: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let lines = spawn_log_lines(path);
+            if lines.len() >= min_lines {
+                return lines;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {} spawn-log lines in {}. current contents: {:?}",
+                min_lines,
+                path.display(),
+                lines
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_subprocess_survives_repeated_discovery_on_current_thread() {
+        let spawn_log = tempfile::NamedTempFile::new().expect("spawn log temp file");
+        let spawn_log_path = spawn_log.path().to_path_buf();
+        let manager = McpManager::new();
+        manager.initialize(vec![McpServerConfig {
+            name: "mock".to_string(),
+            command: mock_mcp_bin().to_string_lossy().into_owned(),
+            args: vec![
+                "--spawn-log".to_string(),
+                spawn_log_path.to_string_lossy().into_owned(),
+            ],
+            env: Default::default(),
+            roots: vec![],
+            enabled: true,
+            description: None,
+            rename_tools: Default::default(),
+            tool_templates: Default::default(),
+            hooks: None,
+            package: None,
+        }]);
+
+        let tools = manager.get_all_tools_blocking();
+        let echo_tool_name = tools
+            .iter()
+            .find(|tool| tool.name == "mock_echo")
+            .map(|tool| tool.name.clone())
+            .unwrap_or_else(|| panic!("expected mock_echo in tool list: {:?}", tools));
+
+        manager
+            .call_tool(&echo_tool_name, serde_json::json!({"text": "hi"}))
+            .await
+            .expect("initial mock_echo call should connect MCP subprocess");
+        let first_lines = wait_for_spawn_count(&spawn_log_path, 1);
+        let n1 = first_lines.len();
+
+        for round in 0..3 {
+            let rediscovered = manager.get_all_tools_blocking();
+            assert!(
+                rediscovered.iter().any(|tool| tool.name == echo_tool_name),
+                "round {} rediscovery lost mock_echo: {:?}",
+                round + 1,
+                rediscovered
+            );
+            manager
+                .call_tool(
+                    &echo_tool_name,
+                    serde_json::json!({"text": format!("hi-{round}")}),
+                )
+                .await
+                .expect("repeated mock_echo call should reuse warm MCP subprocess");
+        }
+
+        let final_lines = spawn_log_lines(&spawn_log_path);
+        let n2 = final_lines.len();
+        eprintln!(
+            "mcp_subprocess_survives_repeated_discovery_on_current_thread: n1={n1}, n2={n2}, log={:?}",
+            final_lines
+        );
+        assert_eq!(
+            n2, n1,
+            "expected warm MCP subprocess to survive repeated discovery on current-thread runtime; n1={n1}, n2={n2}, log={:?}",
+            final_lines
+        );
     }
 
     #[test]

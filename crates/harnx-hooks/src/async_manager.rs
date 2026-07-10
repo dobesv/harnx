@@ -113,7 +113,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use tokio::time::{sleep, Duration};
 
     fn test_payload(cwd: &Path) -> HookPayload {
@@ -156,9 +156,19 @@ mod tests {
         let mut manager = AsyncHookManager::new();
 
         manager.spawn_hook(payload, echo_command().to_string(), Some(5));
-        sleep(Duration::from_millis(150)).await;
 
-        let drained = manager.drain_pending().expect("expected async hook result");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let drained = loop {
+            if let Some(result) = manager.drain_pending() {
+                break result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for async hook result after {:?}",
+                Duration::from_secs(5)
+            );
+            sleep(Duration::from_millis(50)).await;
+        };
         assert_eq!(
             drained.additional_context.as_deref(),
             Some("async hook complete")

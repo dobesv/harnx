@@ -5,9 +5,17 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde_json::{Map, Value};
+use std::sync::OnceLock;
 
 const TOOL_NAME: &str = "repro249_unique_mcp_tool";
 const TOOL_RESPONSE: &str = "repro249 fixed tool response";
+
+fn process_pid() -> &'static str {
+    static PROCESS_PID: OnceLock<String> = OnceLock::new();
+    PROCESS_PID
+        .get_or_init(|| std::process::id().to_string())
+        .as_str()
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Repro249Server;
@@ -50,7 +58,10 @@ impl ServerHandler for Repro249Server {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         match request.name.as_ref() {
-            TOOL_NAME => Ok(CallToolResult::success(vec![Content::text(TOOL_RESPONSE)])),
+            TOOL_NAME => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{TOOL_RESPONSE}\nPROCESS_PID={}",
+                process_pid()
+            ))])),
             other => Err(ErrorData::invalid_params(
                 format!("unknown tool: {other}"),
                 None,

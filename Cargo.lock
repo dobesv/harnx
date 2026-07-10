@@ -3783,6 +3783,7 @@ dependencies = [
  "futures-util",
  "globset",
  "harnx-core",
+ "harnx-test-bins",
  "indexmap 2.14.0",
  "log",
  "parking_lot",
@@ -3791,6 +3792,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shellexpand",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -4044,6 +4046,7 @@ dependencies = [
  "harnx-rag",
  "harnx-render",
  "harnx-spinner",
+ "harnx-test-bins",
  "http 1.4.2",
  "indexmap 2.14.0",
  "inquire",

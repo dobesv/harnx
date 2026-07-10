@@ -1,7 +1,8 @@
 //! Public entry point for running the ACP server over stdin/stdout.
 //!
-//! [`run`] spawns a dedicated thread with a single-threaded tokio runtime
-//! so ACP server can own its local state and stdio event loop.
+//! [`run`] spawns a dedicated thread with a multi-thread tokio runtime so ACP
+//! server owns its stdio event loop while matching runtime flavor used by TUI,
+//! serve, and NATS worker paths.
 
 use std::sync::Arc;
 
@@ -14,15 +15,13 @@ use harnx_runtime::config::GlobalConfig;
 
 use crate::HarnxAgent;
 
-/// Run the ACP server on its own thread with a current-thread tokio runtime.
+/// Run ACP server on dedicated thread with multi-thread tokio runtime.
 pub async fn run(config: GlobalConfig, agent_name: String) -> Result<()> {
-    use tokio::task::LocalSet;
-
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("acp-server".to_string())
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
             {
@@ -34,9 +33,7 @@ pub async fn run(config: GlobalConfig, agent_name: String) -> Result<()> {
                 }
             };
 
-            let local_set = LocalSet::new();
-            let result =
-                local_set.block_on(&runtime, async move { run_local(config, agent_name).await });
+            let result = runtime.block_on(async move { run_local(config, agent_name).await });
             let _ = result_tx.send(result);
         })
         .context("Failed to start ACP server thread")?;
@@ -102,7 +99,7 @@ async fn run_local(config: GlobalConfig, agent_name: String) -> Result<()> {
                     // until after the prompt completes, breaking cancel
                     // propagation to sub-agents.
                     let task_agent = Arc::clone(&agent);
-                    tokio::task::spawn_local(async move {
+                    tokio::spawn(async move {
                         let result = task_agent.prompt(request).await;
                         match result {
                             Ok(response) => {
