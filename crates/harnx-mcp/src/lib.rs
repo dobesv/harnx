@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod config;
+pub mod content;
 pub mod convert;
 pub mod peer;
 pub mod safety;

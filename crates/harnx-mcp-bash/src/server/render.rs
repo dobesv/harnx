@@ -62,7 +62,7 @@ pub(crate) fn parse_arguments<T: DeserializeOwned>(
 }
 
 pub(crate) fn tool_error(msg: impl Into<String>) -> Result<CallToolResult, ErrorData> {
-    Ok(CallToolResult::error(vec![Content::text(msg.into())]))
+    Ok(CallToolResult::error(vec![ContentBlock::text(msg.into())]))
 }
 
 pub(crate) fn invalid_params(msg: impl Into<Cow<'static, str>>) -> ErrorData {

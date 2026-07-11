@@ -1,3 +1,8 @@
+// rmcp deprecated the MCP Roots feature (SEP-2577), but this client still
+// implements roots support that connected MCP servers rely on. Keep using the
+// deprecated APIs until roots support is dropped here or removed upstream.
+#![allow(deprecated)]
+
 use crate::config::{McpServerConfig, ToolDisplayTemplates};
 use crate::convert::{mcp_tool_to_declaration, ToolTemplates};
 use crate::safety::path_to_file_uri;
@@ -677,7 +682,7 @@ mod tests {
     use super::*;
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::{
-        CallToolRequestParams, CallToolResult, Content, InitializeResult, ListToolsResult,
+        CallToolRequestParams, CallToolResult, ContentBlock, InitializeResult, ListToolsResult,
         ServerCapabilities, Tool,
     };
     use rmcp::service::{serve_server, NotificationContext, RoleServer};
@@ -740,7 +745,7 @@ mod tests {
                         .get("path")
                         .and_then(Value::as_str)
                         .unwrap_or("<missing>");
-                    Ok(CallToolResult::success(vec![Content::text(format!(
+                    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "mock contents from {path}"
                     ))]))
                 }

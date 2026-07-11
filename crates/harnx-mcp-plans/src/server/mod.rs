@@ -5,8 +5,8 @@
 //! `<data-dir>/<plan>/notes/<id>.md`.
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    Meta, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
+    ListToolsResult, Meta, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{RequestContext, RoleServer};

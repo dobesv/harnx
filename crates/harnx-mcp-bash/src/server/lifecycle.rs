@@ -1,4 +1,6 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
+// rmcp deprecated the MCP Roots feature (SEP-2577); this server still uses it.
+#![allow(deprecated)]
 use super::*;
 
 impl BashServer {

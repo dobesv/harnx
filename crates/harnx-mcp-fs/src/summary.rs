@@ -1,7 +1,8 @@
+use harnx_mcp::content::WithAudience;
 use harnx_mcp::safety::{
     format_size, truncate_output, TruncateOpts, DEFAULT_MAX_BYTES, LS_SCAN_HARD_LIMIT,
 };
-use rmcp::model::{CallToolResult, Content, ErrorData, Role};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData, Role};
 use std::fmt::Write as _;
 
 use crate::server::ReadFileParams;
@@ -46,8 +47,8 @@ pub(crate) fn render_read_result(
     };
     let summary = read_file_summary(&params.path, &slice);
     Ok(CallToolResult::success(vec![
-        Content::text(output).with_audience(vec![Role::Assistant]),
-        Content::text(summary).with_audience(vec![Role::User]),
+        ContentBlock::text(output).with_audience(vec![Role::Assistant]),
+        ContentBlock::text(summary).with_audience(vec![Role::User]),
     ]))
 }
 

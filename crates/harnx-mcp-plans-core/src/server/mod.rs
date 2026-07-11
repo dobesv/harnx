@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use jiff::Timestamp;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    Meta, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
+    ListToolsResult, Meta, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{RequestContext, RoleServer};
@@ -138,7 +138,7 @@ fn result_json(value: Value) -> Result<CallToolResult, ErrorData> {
 }
 
 fn result_text(text: String) -> Result<CallToolResult, ErrorData> {
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 #[allow(dead_code)]

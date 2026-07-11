@@ -2,10 +2,30 @@ use chrono::{Datelike, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use jiff::{civil, Span, Timestamp};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    Meta, PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    Annotations, CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
+    ListToolsResult, Meta, PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool,
+    ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
+
+/// rmcp moved audience annotations off the content block onto each content type;
+/// this restores the one-line `content.with_audience(..)` builder for local use.
+trait WithAudience {
+    fn with_audience(self, audience: Vec<Role>) -> Self;
+}
+
+impl WithAudience for ContentBlock {
+    fn with_audience(self, audience: Vec<Role>) -> Self {
+        let annotations = Annotations::default().with_audience(audience);
+        match self {
+            ContentBlock::Text(c) => ContentBlock::Text(c.with_annotations(annotations)),
+            ContentBlock::Image(c) => ContentBlock::Image(c.with_annotations(annotations)),
+            ContentBlock::Audio(c) => ContentBlock::Audio(c.with_annotations(annotations)),
+            ContentBlock::Resource(c) => ContentBlock::Resource(c.with_annotations(annotations)),
+            other => other,
+        }
+    }
+}
 use rmcp::ServerHandler;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
@@ -53,8 +73,8 @@ impl TimeServer {
         let full = serde_json::to_string_pretty(&result).unwrap_or_default();
         let summary = format!("Current time in {timezone}: {datetime_str}");
         Ok(CallToolResult::success(vec![
-            Content::text(full).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
+            ContentBlock::text(full).with_audience(vec![Role::Assistant]),
+            ContentBlock::text(summary).with_audience(vec![Role::User]),
         ]))
     }
 
@@ -125,8 +145,8 @@ impl TimeServer {
             epoch_millis,
         );
         Ok(CallToolResult::success(vec![
-            Content::text(full).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
+            ContentBlock::text(full).with_audience(vec![Role::Assistant]),
+            ContentBlock::text(summary).with_audience(vec![Role::User]),
         ]))
     }
 
@@ -144,7 +164,7 @@ impl TimeServer {
         let duration = std::time::Duration::from_secs_f64(seconds);
         tokio::time::sleep(duration).await;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Waited {seconds:.1} seconds",
         ))]))
     }
@@ -220,7 +240,7 @@ impl TimeServer {
         tokio::time::sleep(duration).await;
 
         let arrived = Utc::now().with_timezone(&tz);
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Waited until {} ({:.0} seconds). Current time: {}",
             actual_target.format("%Y-%m-%dT%H:%M:%S%:z"),
             duration.as_secs_f64(),
@@ -564,6 +584,8 @@ fn schema_object(
 }
 
 #[cfg(test)]
+// rmcp deprecated the MCP Roots feature (SEP-2577); this test enables roots.
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -607,7 +629,7 @@ mod tests {
         result
             .content
             .iter()
-            .find_map(|content| content.raw.as_text().map(|text| text.text.clone()))
+            .find_map(|content| content.as_text().map(|text| text.text.clone()))
             .unwrap()
     }
 

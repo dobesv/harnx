@@ -1,5 +1,6 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
 use super::*;
+use harnx_mcp::content::WithAudience;
 
 impl BashServer {
     // exec
@@ -145,7 +146,7 @@ impl BashServer {
             .await
             .map_err(|e| ErrorData::internal_error(format!("rollback failed: {e}"), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Rolled back to harnx snapshot {}; new commit {} created (can be reverted)",
             &params.commit_id[..8.min(params.commit_id.len())],
             new_commit_id.to_hex(),
@@ -324,11 +325,11 @@ impl BashServer {
             output.push('\n');
         }
         let mut contents = vec![
-            Content::text(output).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
+            ContentBlock::text(output).with_audience(vec![Role::Assistant]),
+            ContentBlock::text(summary).with_audience(vec![Role::User]),
         ];
         for diff in diff_parts {
-            contents.push(Content::text(diff));
+            contents.push(ContentBlock::text(diff));
         }
         CallToolResult::success(contents)
     }

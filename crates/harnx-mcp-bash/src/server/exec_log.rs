@@ -1,5 +1,6 @@
 // Auto-split from server.rs / handlers.rs for cohesion. See server/mod.rs.
 use super::*;
+use harnx_mcp::content::WithAudience;
 
 impl BashServer {
     pub(crate) fn select_log_lines(
@@ -122,8 +123,8 @@ impl BashServer {
             format_size(raw_output.len())
         );
         Ok(CallToolResult::success(vec![
-            Content::text(output).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
+            ContentBlock::text(output).with_audience(vec![Role::Assistant]),
+            ContentBlock::text(summary).with_audience(vec![Role::User]),
         ]))
     }
 
@@ -198,8 +199,8 @@ impl BashServer {
         }
         let summary = format!("Read {} (0 lines)", path.display());
         CallToolResult::success(vec![
-            Content::text(output).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
+            ContentBlock::text(output).with_audience(vec![Role::Assistant]),
+            ContentBlock::text(summary).with_audience(vec![Role::User]),
         ])
     }
 

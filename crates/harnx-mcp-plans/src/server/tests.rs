@@ -11,7 +11,6 @@ fn temp_test_dir(label: &str) -> PathBuf {
 
 fn extract_text(result: CallToolResult) -> String {
     result.content[0]
-        .raw
         .as_text()
         .map(|text| text.text.clone())
         .unwrap_or_else(|| panic!("unexpected content: {:?}", result.content[0]))
