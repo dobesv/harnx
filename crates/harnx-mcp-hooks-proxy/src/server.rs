@@ -1,3 +1,7 @@
+// rmcp deprecated the MCP Roots and Logging features (SEP-2577); this proxy
+// still forwards them for connected servers, so keep using the deprecated APIs.
+#![allow(deprecated)]
+
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,9 +11,9 @@ use harnx_hooks::{dispatch_hooks_with_count_and_manager, AsyncHookManager, Persi
 use parking_lot::RwLock;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, Content, ErrorData, Implementation,
-    InitializeRequestParams, ListRootsResult, ListToolsResult, PaginatedRequestParams, Root,
-    ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, ClientCapabilities, ContentBlock, ErrorData,
+    Implementation, InitializeRequestParams, ListRootsResult, ListToolsResult,
+    PaginatedRequestParams, Root, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer, RunningService};
 use rmcp::transport::TokioChildProcess;
@@ -131,7 +135,7 @@ impl HooksProxyServer {
                     .iter()
                     .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
                     .filter_map(|item| item.get("text").and_then(Value::as_str))
-                    .map(|text| Content::text(text.to_string()))
+                    .map(|text| ContentBlock::text(text.to_string()))
                     .collect::<Vec<_>>()
             })
             .filter(|c: &Vec<_>| !c.is_empty());
@@ -144,11 +148,11 @@ impl HooksProxyServer {
             Value::String(s) => s,
             other => serde_json::to_string(&other).unwrap_or_else(|_| "null".to_string()),
         };
-        CallToolResult::success(vec![Content::text(text)])
+        CallToolResult::success(vec![ContentBlock::text(text)])
     }
 
     fn error_result(message: String) -> CallToolResult {
-        CallToolResult::error(vec![Content::text(message)])
+        CallToolResult::error(vec![ContentBlock::text(message)])
     }
 
     async fn initialize_child(&self) -> Result<(), ErrorData> {

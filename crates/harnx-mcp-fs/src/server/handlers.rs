@@ -1,4 +1,8 @@
+// rmcp deprecated the MCP Roots feature (SEP-2577); this server still uses it.
+#![allow(deprecated)]
+
 use base64::Engine;
+use harnx_mcp::content::WithAudience;
 
 // Auto-split from server.rs for cohesion. See server/mod.rs.
 use super::*;
@@ -52,9 +56,9 @@ impl FsServer {
     }
 
     fn mutation_success(message: String, diff: Option<String>) -> CallToolResult {
-        let mut contents = vec![Content::text(message)];
+        let mut contents = vec![ContentBlock::text(message)];
         if let Some(diff_content) = diff.filter(|diff| !diff.is_empty()) {
-            contents.push(Content::text(diff_content));
+            contents.push(ContentBlock::text(diff_content));
         }
         CallToolResult::success(contents)
     }
@@ -354,8 +358,8 @@ impl FsServer {
         );
 
         Some(Ok(CallToolResult::success(vec![
-            Content::image(data, mime.to_string()).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
+            ContentBlock::image(data, mime.to_string()).with_audience(vec![Role::Assistant]),
+            ContentBlock::text(summary).with_audience(vec![Role::User]),
         ])))
     }
     pub(crate) async fn read_file_impl(
@@ -406,7 +410,7 @@ impl FsServer {
         let all_lines = text.lines().collect::<Vec<_>>();
 
         if all_lines.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "{} (empty file, 0 lines)",
                 params.path
             ))]));
@@ -434,7 +438,7 @@ impl FsServer {
             .collect::<Vec<_>>();
 
         if numbered_lines.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "No matching lines found".to_string(),
             )]));
         }
@@ -734,7 +738,7 @@ impl FsServer {
         entries.truncate(DEFAULT_LS_LIMIT);
 
         if entries.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "{} (empty directory)",
                 params.path
             ))]));
@@ -759,8 +763,8 @@ impl FsServer {
 
         let summary = ls_summary(&params.path, entry_count, scan_count, limit_reached);
         Ok(CallToolResult::success(vec![
-            Content::text(output).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
+            ContentBlock::text(output).with_audience(vec![Role::Assistant]),
+            ContentBlock::text(summary).with_audience(vec![Role::User]),
         ]))
     }
 
@@ -806,7 +810,7 @@ impl FsServer {
         );
 
         if results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "No matches found".to_string(),
             )]));
         }
@@ -832,8 +836,8 @@ impl FsServer {
             },
         );
         Ok(CallToolResult::success(vec![
-            Content::text(output).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
+            ContentBlock::text(output).with_audience(vec![Role::Assistant]),
+            ContentBlock::text(summary).with_audience(vec![Role::User]),
         ]))
     }
 
@@ -866,7 +870,7 @@ impl FsServer {
         let mut paths = Self::collect_found_paths(&search_path, glob_results, max_results);
 
         if paths.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
                 "No files found matching pattern".to_string(),
             )]));
         }
@@ -887,8 +891,8 @@ impl FsServer {
 
         let summary = find_summary(path_count, max_results, limit_reached);
         Ok(CallToolResult::success(vec![
-            Content::text(output).with_audience(vec![Role::Assistant]),
-            Content::text(summary).with_audience(vec![Role::User]),
+            ContentBlock::text(output).with_audience(vec![Role::Assistant]),
+            ContentBlock::text(summary).with_audience(vec![Role::User]),
         ]))
     }
 }
@@ -915,7 +919,7 @@ impl FsServer {
             .await
             .map_err(|e| ErrorData::internal_error(format!("rollback failed: {e}"), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Rolled back to harnx snapshot {}; new commit {} created (can be reverted)",
             &params.commit_id[..8.min(params.commit_id.len())],
             new_commit_id.to_hex(),

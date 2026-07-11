@@ -79,7 +79,7 @@ pub(crate) fn result_json(value: Value) -> Result<CallToolResult, ErrorData> {
 }
 
 pub(crate) fn result_text(text: String) -> Result<CallToolResult, ErrorData> {
-    Ok(CallToolResult::success(vec![Content::text(text)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
 pub(crate) fn diff_text(before: &str, after: &str, path: &str) -> String {

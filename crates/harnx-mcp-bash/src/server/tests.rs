@@ -1,3 +1,5 @@
+// rmcp deprecated the MCP Roots feature (SEP-2577); these tests exercise it.
+#![allow(deprecated)]
 use super::*;
 
 #[cfg(unix)]
@@ -93,8 +95,8 @@ fn text_content(result: &CallToolResult) -> String {
     result
         .content
         .iter()
-        .filter_map(|content| match &content.raw {
-            rmcp::model::RawContent::Text(text) => Some(text.text.clone()),
+        .filter_map(|content| match content {
+            rmcp::model::ContentBlock::Text(text) => Some(text.text.clone()),
             _ => None,
         })
         .collect::<Vec<_>>()

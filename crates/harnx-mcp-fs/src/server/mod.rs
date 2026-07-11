@@ -15,8 +15,9 @@ use harnx_mcp_history::HistoryManager;
 
 use fancy_regex::Regex;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    Meta, PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
+    ListToolsResult, Meta, PaginatedRequestParams, Role, ServerCapabilities, ServerInfo, Tool,
+    ToolAnnotations,
 };
 use rmcp::schemars::{generate::SchemaGenerator, JsonSchema, Schema};
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
@@ -71,7 +72,7 @@ fn parse_arguments<T: DeserializeOwned>(
 }
 
 fn tool_error(msg: impl Into<String>) -> Result<CallToolResult, ErrorData> {
-    Ok(CallToolResult::error(vec![Content::text(msg.into())]))
+    Ok(CallToolResult::error(vec![ContentBlock::text(msg.into())]))
 }
 
 fn invalid_params(msg: impl Into<Cow<'static, str>>) -> ErrorData {

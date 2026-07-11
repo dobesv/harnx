@@ -1,12 +1,14 @@
 #![cfg(unix)]
+// rmcp deprecated the MCP Roots feature (SEP-2577); this test exercises roots.
+#![allow(deprecated)]
 
 use std::path::{Path, PathBuf};
 
 use process_wrap::tokio::{CommandWrap, KillOnDrop, ProcessGroup};
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ErrorData, Implementation, InitializeRequestParams,
-    ListRootsResult, RawContent, Root,
+    CallToolRequestParams, ClientCapabilities, ContentBlock, ErrorData, Implementation,
+    InitializeRequestParams, ListRootsResult, Root,
 };
 use rmcp::service::{RequestContext, RoleClient};
 use rmcp::transport::TokioChildProcess;
@@ -358,11 +360,11 @@ async fn spawn_proxy(
     Ok(service)
 }
 
-fn text_content(content: &[rmcp::model::Content]) -> String {
+fn text_content(content: &[ContentBlock]) -> String {
     content
         .iter()
-        .filter_map(|item| match &item.raw {
-            RawContent::Text(text) => Some(text.text.to_string()),
+        .filter_map(|item| match item {
+            ContentBlock::Text(text) => Some(text.text.to_string()),
             _ => None,
         })
         .collect::<Vec<_>>()

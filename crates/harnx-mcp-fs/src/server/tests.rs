@@ -1,5 +1,9 @@
+// rmcp deprecated the MCP Roots feature (SEP-2577); these tests exercise it.
+#![allow(deprecated)]
+
 use super::*;
 
+use harnx_mcp::content::audience;
 use harnx_mcp::safety::path_to_file_uri;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
@@ -89,7 +93,7 @@ fn text_content(result: &CallToolResult) -> String {
     result
         .content
         .iter()
-        .find_map(|content| content.raw.as_text().map(|text| text.text.clone()))
+        .find_map(|content| content.as_text().map(|text| text.text.clone()))
         .unwrap()
 }
 
@@ -116,12 +120,11 @@ fn user_summary(result: &CallToolResult) -> String {
         .content
         .iter()
         .filter(|content| {
-            content
-                .audience()
+            audience(content)
                 .map(|a| a.contains(&Role::User))
                 .unwrap_or(false)
         })
-        .find_map(|content| content.raw.as_text().map(|text| text.text.clone()))
+        .find_map(|content| content.as_text().map(|text| text.text.clone()))
         .unwrap_or_default()
 }
 
@@ -390,7 +393,7 @@ async fn edit_file_emits_unaudienced_diff_content() {
     let texts: Vec<&str> = result
         .content
         .iter()
-        .filter_map(|c| c.raw.as_text().map(|t| t.text.as_str()))
+        .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
         .collect();
     assert!(
         texts.len() >= 2,
@@ -401,8 +404,8 @@ async fn edit_file_emits_unaudienced_diff_content() {
     assert!(texts[1].contains("-old value"), "diff missing: {texts:?}");
     // The diff/summary must not be assistant-only — that would hide
     // them from the MCP client's audience-aware generic renderer.
-    assert!(result.content[0].audience().is_none(), "summary audience");
-    assert!(result.content[1].audience().is_none(), "diff audience");
+    assert!(audience(&result.content[0]).is_none(), "summary audience");
+    assert!(audience(&result.content[1]).is_none(), "diff audience");
 }
 
 /// Production launch path: harnx-mcp-fs starts with empty
@@ -439,7 +442,7 @@ async fn edit_file_emits_diff_when_roots_only_set_via_protocol() {
     let texts: Vec<&str> = result
         .content
         .iter()
-        .filter_map(|c| c.raw.as_text().map(|t| t.text.as_str()))
+        .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
         .collect();
     assert!(
         texts.len() >= 2,

@@ -1,6 +1,6 @@
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Implementation,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
@@ -58,7 +58,7 @@ impl ServerHandler for Repro249Server {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         match request.name.as_ref() {
-            TOOL_NAME => Ok(CallToolResult::success(vec![Content::text(format!(
+            TOOL_NAME => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "{TOOL_RESPONSE}\nPROCESS_PID={}",
                 process_pid()
             ))])),
