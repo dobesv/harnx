@@ -6693,6 +6693,69 @@ async fn test_d4_key_r_opens_rewind_modal_assistant_text() {
 }
 
 #[tokio::test]
+async fn rewind_on_tool_call_row_resolves_to_prior_seq() {
+    // Session log on disk: seq 1 user message, seq 2 ToolCalls, seq 3 ToolResults.
+    // Rewinding a row whose seq is the ToolCalls entry must resolve to seq 1
+    // (the message that preceded the round) rather than orphaning the pair.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config: GlobalConfig = Arc::new(RwLock::new(Config {
+        sessions_dir_override: Some(tmp.path().to_path_buf()),
+        ..Config::default()
+    }));
+    {
+        let mut guard = config.write();
+        guard.use_session(Some("rewind")).unwrap();
+        let session = guard.session.as_mut().unwrap();
+        harnx_runtime::config::session::append_event(
+            session,
+            &harnx_core::session::SessionLogEntry::Message {
+                id: None,
+                timestamp: None,
+                fence_token: None,
+                role: harnx_core::message::MessageRole::User,
+                content: harnx_core::message::MessageContent::Text("hi".into()),
+            },
+        );
+        harnx_runtime::config::session::append_event(
+            session,
+            &harnx_core::session::SessionLogEntry::ToolCalls {
+                text: String::new(),
+                thought: None,
+                calls: vec![],
+                timestamp: None,
+                fence_token: None,
+            },
+        );
+        harnx_runtime::config::session::append_event(
+            session,
+            &harnx_core::session::SessionLogEntry::ToolResults {
+                results: vec![],
+                timestamp: None,
+            },
+        );
+    }
+
+    let mut harness = TuiTestHarness::with_config(config).await;
+    harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        tool_name: "read".to_string(),
+        id: "c1".to_string(),
+        body: None,
+        seq: Some(2),
+        timestamp: Some(chrono::Utc::now()),
+        rendered_cache: None,
+    });
+    harness.tui().app.transcript_focus = Some(harness.tui().app.transcript.len() - 1);
+    harness.tui().app.transcript_selection_anchor = None;
+
+    harness.tui().handle_transcript_rewind_for_test();
+
+    match &harness.tui().app.modal {
+        Some(crate::types::ModalState::ConfirmRewind { seq, .. }) => assert_eq!(*seq, 1),
+        other => panic!("expected ConfirmRewind {{ seq: 1 }}, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_d4_enter_opens_detail_view() {
     let mut harness = TuiTestHarness::new().await;
     harness.tui().app.transcript.clear();

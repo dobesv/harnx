@@ -202,16 +202,23 @@ impl Config {
         Ok(())
     }
 
+    /// Read and split the active session's on-disk log into YAML documents,
+    /// one per log entry (seq `n` is `documents[n]`). Returns `None` when
+    /// there is no active session or the session file cannot be read.
+    fn read_session_log_documents(&self) -> Option<Vec<String>> {
+        let session = self.session.as_ref()?;
+        let session_path = self.session_file(session.id());
+        let raw_log = std::fs::read_to_string(&session_path).ok()?;
+        Some(split_session_log_documents(&raw_log))
+    }
+
     /// Return the raw YAML documents for sequence numbers `from_seq..=to_seq`
     /// exactly as `.edit message` would open them in the editor, including
     /// auto-expansion for tool-call/result pairs.  Returns `None` when there is
     /// no active session, the session file cannot be read, or the range is
     /// invalid.  Documents are joined with `\n---\n`.
     pub fn get_message_range_yaml(&self, from_seq: usize, to_seq: usize) -> Option<String> {
-        let session = self.session.as_ref()?;
-        let session_path = self.session_file(session.id());
-        let raw_log = std::fs::read_to_string(&session_path).ok()?;
-        let documents = split_session_log_documents(&raw_log);
+        let documents = self.read_session_log_documents()?;
         if from_seq == 0 || to_seq >= documents.len() {
             return None;
         }
@@ -220,6 +227,26 @@ impl Config {
             return None;
         }
         Some(documents[from..=to].join("\n---\n"))
+    }
+
+    /// Resolve a user-selected seq to a safe rewind target. A `ToolCalls` entry
+    /// cannot be a rewind point (it would orphan its paired `ToolResults`), so
+    /// map it back to the entry just before the round — the message that
+    /// prompted it. Any other seq is returned unchanged; callers still validate
+    /// via `compute_rewind_point`.
+    pub fn resolve_rewind_seq(&self, seq: usize) -> usize {
+        let Some(documents) = self.read_session_log_documents() else {
+            return seq;
+        };
+        let is_tool_calls = documents
+            .get(seq)
+            .and_then(|raw| serde_yaml::from_str::<SessionLogEntry>(raw).ok())
+            .is_some_and(|entry| matches!(entry, SessionLogEntry::ToolCalls { .. }));
+        if is_tool_calls {
+            seq.saturating_sub(1)
+        } else {
+            seq
+        }
     }
 
     pub fn delete_message_range(&mut self, from: usize, to: usize) -> Result<()> {
@@ -572,5 +599,52 @@ mod tests_remote_sessions {
         let meta = session_index_record_to_meta(&record);
 
         assert!(meta.modified.is_none());
+    }
+}
+
+#[cfg(test)]
+mod resolve_rewind_seq_tests {
+    use super::super::test_support::editor_test_config;
+    use super::*;
+    use harnx_core::message::{MessageContent, MessageRole};
+
+    #[test]
+    fn resolve_rewind_seq_maps_tool_calls_to_prior_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = editor_test_config(tmp.path().to_path_buf());
+        config.use_session(Some("rewind")).unwrap();
+        let session = config.session.as_mut().unwrap();
+        // seq 1: a user message
+        crate::config::session::append_event(
+            session,
+            &SessionLogEntry::Message {
+                id: None,
+                timestamp: None,
+                fence_token: None,
+                role: MessageRole::User,
+                content: MessageContent::Text("hi".into()),
+            },
+        );
+        // seq 2: a ToolCalls entry, seq 3: its ToolResults entry
+        crate::config::session::append_event(
+            session,
+            &SessionLogEntry::ToolCalls {
+                text: String::new(),
+                thought: None,
+                calls: vec![],
+                timestamp: None,
+                fence_token: None,
+            },
+        );
+        crate::config::session::append_event(
+            session,
+            &SessionLogEntry::ToolResults {
+                results: vec![],
+                timestamp: None,
+            },
+        );
+
+        assert_eq!(config.resolve_rewind_seq(2), 1);
+        assert_eq!(config.resolve_rewind_seq(1), 1);
     }
 }

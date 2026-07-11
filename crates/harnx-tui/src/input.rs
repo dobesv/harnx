@@ -2839,11 +2839,17 @@ impl Tui {
         let Some(seq) = item.seq() else {
             return;
         };
+        let seq = self.config.read().resolve_rewind_seq(seq);
         let user_text = match item {
             TranscriptItem::UserText { text, .. } => Some(text.clone()),
             _ => None,
         };
         self.app.modal = Some(crate::types::ModalState::ConfirmRewind { seq, user_text });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_transcript_rewind_for_test(&mut self) {
+        self.handle_transcript_rewind();
     }
 }
 
