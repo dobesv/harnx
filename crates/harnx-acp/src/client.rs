@@ -1,15 +1,16 @@
 use crate::{compat::TokioCompat, AcpServerConfig, NestedAcpEvent};
 
 use agent_client_protocol as acp;
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock as AcpContentBlock, CreateTerminalRequest,
     CreateTerminalResponse, Implementation, InitializeRequest, InitializeResponse,
     KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, ProtocolVersion, ReadTextFileRequest,
-    ReadTextFileResponse, RequestPermissionRequest, RequestPermissionResponse, SessionInfoUpdate,
-    SessionNotification, SessionUpdate, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest, WriteTextFileResponse,
+    NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
+    RequestPermissionRequest, RequestPermissionResponse, SessionInfoUpdate, SessionNotification,
+    SessionUpdate, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
+use agent_client_protocol::schema::ProtocolVersion;
 use anyhow::{anyhow, bail, Context, Result};
 use harnx_core::event::{
     AgentEvent, AgentSource, ContentBlock, ModelEvent, PlanEntry, ToolEvent, ToolKind, ToolStatus,
@@ -1220,7 +1221,7 @@ fn chunk_text(content: &AcpContentBlock) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         ContentChunk, SessionId, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     };
     use serde_json::json;

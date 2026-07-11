@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{AcpChunkSink, AcpForward, HarnxAgent};
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         CancelNotification, ContentBlock, NewSessionRequest, PromptRequest, PromptResponse,
     };
     use harnx_core::event::{AgentEvent, AgentEventSink, ToolEvent, ToolStatus, UserEvent};
@@ -188,7 +188,7 @@ mod tests {
         /// Drive a prompt against this session.
         async fn prompt(&self, text: &str) -> agent_client_protocol::Result<PromptResponse> {
             let request = PromptRequest::new(
-                agent_client_protocol::schema::SessionId::new(self.id.clone()),
+                agent_client_protocol::schema::v1::SessionId::new(self.id.clone()),
                 vec![ContentBlock::from(text.to_string())],
             );
             // Note: caller should wrap in LocalSet
@@ -265,7 +265,7 @@ mod tests {
         for response in [resp1, resp2, resp3] {
             assert_eq!(
                 response.expect("prompt should succeed").stop_reason,
-                agent_client_protocol::schema::StopReason::EndTurn
+                agent_client_protocol::schema::v1::StopReason::EndTurn
             );
         }
 
@@ -331,7 +331,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_echoes_protocol_version_and_reports_capabilities() {
-        use agent_client_protocol::schema::{InitializeRequest, ProtocolVersion};
+        use agent_client_protocol::schema::v1::InitializeRequest;
+        use agent_client_protocol::schema::ProtocolVersion;
 
         let config = test_config();
         let agent = HarnxAgent::new("my-agent".to_string(), config);
@@ -546,7 +547,7 @@ mod tests {
             .run_until(async {
                 agent
                     .prompt(PromptRequest::new(
-                        agent_client_protocol::schema::SessionId::new(session_id.clone()),
+                        agent_client_protocol::schema::v1::SessionId::new(session_id.clone()),
                         vec![ContentBlock::from("prompt one".to_string())],
                     ))
                     .await
@@ -554,7 +555,7 @@ mod tests {
             .await;
         assert_eq!(
             resp1.expect("prompt 1 succeeds").stop_reason,
-            agent_client_protocol::schema::StopReason::EndTurn
+            agent_client_protocol::schema::v1::StopReason::EndTurn
         );
 
         // Get the SessionContext after first prompt - should be the same Arc.
@@ -569,7 +570,7 @@ mod tests {
             .run_until(async {
                 agent
                     .prompt(PromptRequest::new(
-                        agent_client_protocol::schema::SessionId::new(session_id.clone()),
+                        agent_client_protocol::schema::v1::SessionId::new(session_id.clone()),
                         vec![ContentBlock::from("prompt two".to_string())],
                     ))
                     .await
@@ -577,7 +578,7 @@ mod tests {
             .await;
         assert_eq!(
             resp2.expect("prompt 2 succeeds").stop_reason,
-            agent_client_protocol::schema::StopReason::EndTurn
+            agent_client_protocol::schema::v1::StopReason::EndTurn
         );
 
         // Get the SessionContext after second prompt.
@@ -702,7 +703,7 @@ mod tests {
             .run_until(async {
                 agent
                     .prompt(PromptRequest::new(
-                        agent_client_protocol::schema::SessionId::new(session_id.clone()),
+                        agent_client_protocol::schema::v1::SessionId::new(session_id.clone()),
                         vec![ContentBlock::from("initial prompt".to_string())],
                     ))
                     .await
@@ -734,7 +735,7 @@ mod tests {
             .run_until(async {
                 agent
                     .prompt(PromptRequest::new(
-                        agent_client_protocol::schema::SessionId::new(session_id.clone()),
+                        agent_client_protocol::schema::v1::SessionId::new(session_id.clone()),
                         vec![ContentBlock::from("resumed prompt".to_string())],
                     ))
                     .await
@@ -744,7 +745,7 @@ mod tests {
         // Should succeed.
         assert_eq!(
             resp2.expect("lazy resume succeeds").stop_reason,
-            agent_client_protocol::schema::StopReason::EndTurn
+            agent_client_protocol::schema::v1::StopReason::EndTurn
         );
 
         // Session is back in memory with a new SessionContext.
