@@ -169,7 +169,7 @@ impl Tui {
             last_usage_transcript_idx: None,
             pending_thought_source: None,
             pending_thought_text: String::new(),
-            pending_tool_seq: None,
+            current_group_seq: None,
             pending_message: None,
             completions: vec![],
             completion_index: 0,

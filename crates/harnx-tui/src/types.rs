@@ -88,7 +88,11 @@ pub(super) struct App {
     pub(super) last_usage_transcript_idx: Option<usize>,
     pub(super) pending_thought_source: Option<AgentSource>,
     pub(super) pending_thought_text: String,
-    pub(super) pending_tool_seq: Option<usize>,
+    /// Log seq of the entry currently being assembled from the live event
+    /// stream. Assigned when `LogSeqAssigned` arrives and read by tool-call
+    /// rows created afterward, so every row belonging to one logged entry
+    /// (accompanying assistant text + all tool calls of a round) shares its seq.
+    pub(super) current_group_seq: Option<usize>,
     pub(super) pending_message: Option<PendingMessage>,
     pub(super) completions: Vec<(String, Option<String>)>,
     pub(super) completion_index: usize,

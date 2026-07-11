@@ -953,47 +953,43 @@ impl Tui {
         // is a pure seq-assignment event and should not create stray headings
         // or flush pending thoughts.
         if let AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }) = event {
-            // Try to backfill the seq into the most recent unsequenced transcript
-            // item (UserText, AssistantText, or ToolCall). If an item is found and
-            // patched, the seq has been consumed — clear pending_tool_seq.  If no
-            // item is found yet (e.g. ToolEvent::Started arrives after this event),
-            // store seq in pending_tool_seq so the upcoming ToolCall can pick it up.
-            let mut backfilled = false;
+            // This seq identifies the log entry currently being assembled.
+            // Assign it to every not-yet-sequenced *live* row belonging to that
+            // entry's group: walk back from the tail and stop at the first row
+            // that already carries a seq (the previous group's boundary). Rows
+            // without a timestamp (the agent banner, replayed history) are not
+            // live and are skipped so they neither consume nor block a seq.
+            // Then remember it as the current group seq: tool-call rows are
+            // created *after* this event (ToolEvent::Started fires once
+            // execution begins) and inherit it, so all parallel calls of a
+            // round share the round's ToolCalls seq — matching
+            // messages_to_transcript_items.
             for item in self.app.transcript.iter_mut().rev() {
                 match item {
-                    // Only backfill "live" entries — items with a timestamp are
-                    // created during an active session.  The agent banner is
-                    // AssistantText { seq: None, timestamp: None } and must not
-                    // consume a seq that belongs to the first real message.
                     TranscriptItem::UserText {
-                        seq: item_seq @ None,
+                        seq: item_seq,
                         timestamp: Some(_),
                         ..
                     }
                     | TranscriptItem::AssistantText {
-                        seq: item_seq @ None,
+                        seq: item_seq,
                         timestamp: Some(_),
                         ..
                     }
                     | TranscriptItem::ToolCall {
-                        seq: item_seq @ None,
+                        seq: item_seq,
                         timestamp: Some(_),
                         ..
                     } => {
+                        if item_seq.is_some() {
+                            break;
+                        }
                         *item_seq = Some(seq);
-                        backfilled = true;
-                        break;
                     }
                     _ => {}
                 }
             }
-            if backfilled {
-                // Seq consumed by an existing item; clear any pending slot.
-                self.app.pending_tool_seq = None;
-            } else {
-                // No existing item to patch; save for the next ToolCall creation.
-                self.app.pending_tool_seq = Some(seq);
-            }
+            self.app.current_group_seq = Some(seq);
             return;
         }
 
@@ -1259,7 +1255,7 @@ impl Tui {
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
                     body: tool_call_body(markdown.as_deref(), &input),
-                    seq: self.app.pending_tool_seq,
+                    seq: self.app.current_group_seq,
                     timestamp: Some(chrono::Utc::now()),
                     rendered_cache: None,
                 }]
@@ -1285,7 +1281,7 @@ impl Tui {
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
                     body,
-                    seq: self.app.pending_tool_seq,
+                    seq: self.app.current_group_seq,
                     timestamp: Some(chrono::Utc::now()),
                     rendered_cache: None,
                 }]
