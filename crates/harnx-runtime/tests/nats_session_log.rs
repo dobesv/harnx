@@ -179,6 +179,7 @@ fn mixed_entries() -> Vec<SessionLogEntry> {
                 id: Some("call-1".to_string()),
                 name: "Bash".to_string(),
                 output: json!({"stdout": "Cargo.toml"}),
+                markdown: None,
                 content: vec![],
                 switch_agent: None,
             }],

@@ -595,6 +595,7 @@ fn test_non_idempotent_output_is_synthesized() {
         output: json!({
             "error": "tool response lost (session was interrupted before results were persisted)"
         }),
+        markdown: None,
         content: Vec::new(),
         switch_agent: None,
     };
@@ -2258,6 +2259,7 @@ async fn load_remote_transcript_for_render_keeps_tool_rows_and_compressed_prefix
             id: tool_call.id.clone(),
             name: tool_call.name.clone(),
             output: json!({"ok": true}),
+            markdown: None,
             content: vec![],
             switch_agent: None,
         }],

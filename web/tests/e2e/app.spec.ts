@@ -27,7 +27,7 @@ test('happy path: picker flow to chat with slash-named agent', async ({ page }) 
 
   await page.locator('.new-chat-button').click();
 
-  await expect(page.locator('.aui-status-indicator')).not.toBeVisible();
+  await expect(page.locator('.aui-status-bar')).not.toBeVisible();
   await expect(page.locator('.aui-composer-send')).toHaveText('Send');
   await expect(page).toHaveURL(/\/agents\/coding%2Fcoder\/sessions\//);
 
@@ -41,8 +41,6 @@ test('happy path: picker flow to chat with slash-named agent', async ({ page }) 
   await expect(transcript).toContainText('Mock streamed reply to: Hello agent', { timeout: 10000 });
   // The run finished, so the composer returns to its idle "Send" state.
   await expect(page.locator('.aui-composer-send')).toHaveText('Send');
-  await expect(page.locator('.aui-status-indicator')).not.toBeVisible();
-
   await expect(page).toHaveScreenshot('happy-path.png');
 });
 

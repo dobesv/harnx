@@ -771,7 +771,7 @@ fn render_tool_results_entry(
             AgentEvent::Tool(ToolEvent::Completed {
                 id: result.id.clone().unwrap_or_default(),
                 output: result.output.clone(),
-                markdown: None,
+                markdown: result.markdown.clone(),
             }),
             None,
         );
@@ -1128,6 +1128,7 @@ mod tests {
     }
     #[test]
     fn test_render_tool_results_entry() {
+        use harnx_core::event::ToolEvent;
         use harnx_core::session::ToolOutput;
 
         let count = Arc::new(AtomicUsize::new(0));
@@ -1141,6 +1142,7 @@ mod tests {
                 id: Some("test".to_string()),
                 name: "echo".to_string(),
                 output: serde_json::json!({"result": "ok"}),
+                markdown: Some("rendered summary".to_string()),
                 content: vec![],
                 switch_agent: None,
             }],
@@ -1150,6 +1152,14 @@ mod tests {
         let window = active_context_window(&empty);
         render_log_entry_to_sink(&entry, 0, &window, sink.clone());
         assert_eq!(count.load(Ordering::SeqCst), 1);
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::Tool(ToolEvent::Completed { markdown, .. }) => {
+                assert_eq!(markdown.as_deref(), Some("rendered summary"));
+            }
+            other => panic!("expected Completed event, got {other:?}"),
+        }
     }
 
     #[test]

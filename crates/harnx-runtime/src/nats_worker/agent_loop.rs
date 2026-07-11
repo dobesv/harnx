@@ -686,6 +686,7 @@ async fn rerun_or_synthesize_tool_results(
                 id: result.call.id.clone(),
                 name: result.call.name.clone(),
                 output: result.output,
+                markdown: result.markdown,
                 content: result.content,
                 switch_agent: result.switch_agent,
             })
@@ -730,6 +731,7 @@ fn interrupt_error_output(call: &harnx_core::tool::ToolCall) -> harnx_core::sess
         output: serde_json::json!({
             "error": "tool response lost (session was interrupted before results were persisted)"
         }),
+        markdown: None,
         content: Vec::new(),
         switch_agent: None,
     }
@@ -745,6 +747,7 @@ fn rerun_failure_output(
         output: serde_json::json!({
             "error": format!("tool re-run failed: {err:#}")
         }),
+        markdown: None,
         content: Vec::new(),
         switch_agent: None,
     }

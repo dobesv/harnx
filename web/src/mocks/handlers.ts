@@ -31,6 +31,27 @@ function buildSnapshot(session: string) {
       }
     ];
   }
+  if (session === 'session-restored') {
+    return [
+      {
+        id: 'm-system',
+        role: 'system',
+        content: 'System prompt.'
+      },
+      {
+        id: 'user-1',
+        role: 'user',
+        content: 'Show me restored tool call'
+      },
+      {
+        id: 'tool-result-1',
+        role: 'tool',
+        toolCallId: 'call_1',
+        toolName: 'test_tool',
+        content: 'Restored tool summary *with markdown*'
+      }
+    ];
+  }
   if (session !== 'session-1') return [];
   return [
     {
@@ -119,6 +140,23 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
       
       if (session === 'session-gallery') {
         await new Promise((resolve) => setTimeout(resolve, 25));
+
+        controller.enqueue(encodeSseEvent({
+          type: 'CUSTOM',
+          threadId,
+          runId,
+          name: 'usage',
+          value: {
+            input: 100,
+            output: 200,
+            cached: 50,
+            session_label: 'Mock Session',
+            context_tokens: 300,
+            max_context_tokens: 1000,
+            context_percent: 30
+          }
+        }));
+
         // Tool call round first (self-contained: start -> args -> end -> result).
         controller.enqueue(encodeSseEvent({
           type: 'TOOL_CALL_START',
@@ -126,6 +164,18 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
           toolCallName: 'fetch_data',
           parentMessageId: 'assistant-1'
         }));
+
+        controller.enqueue(encodeSseEvent({
+          type: 'CUSTOM',
+          threadId,
+          runId,
+          name: 'tool_summary',
+          value: {
+            tool_call_id: 'call_123',
+            markdown: 'Fetched **data** from API.'
+          }
+        }));
+
         // NOTE: AG-UI client (@ag-ui/core Zod schemas) require specific field
         // names. TOOL_CALL_ARGS uses `delta` (NOT `argsText`) — a wrong field
         // makes the client's EventSchemas.parse() throw and aborts the whole
@@ -158,7 +208,7 @@ function createAgUiStream({ session, body }: { session: string; body: any }) {
         controller.enqueue(encodeSseEvent({
           type: 'TEXT_MESSAGE_CONTENT',
           messageId: 'assistant-1',
-          delta: 'Here is the data I fetched for you. The request returned status 200 with the example records you asked for.'
+          delta: 'Here is a table:\n\n| Column 1 | Column 2 | Column 3 | Column 4 |\n|---|---|---|---|\n| A | B | C | D |\n\nAnd some code:\n\n```javascript\nconsole.log("hello");\n```\n'
         }));
         controller.enqueue(encodeSseEvent({
           type: 'TEXT_MESSAGE_END',
@@ -237,7 +287,7 @@ export const happyPathHandlers = [
       // Fixed timestamp so session-list screenshots are deterministic without
       // needing to freeze the browser's Date.now (freezing it collides message
       // ids/timestamps in the assistant-ui runtime and drops streamed messages).
-      { session_id: 'session-1', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-gallery', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-pending', updated_at: '2024-01-01T12:00:00.000Z' }
+      { session_id: 'session-1', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-gallery', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-pending', updated_at: '2024-01-01T12:00:00.000Z' }, { session_id: 'session-restored', updated_at: '2024-01-01T12:00:00.000Z' }
     ]);
   }),
 

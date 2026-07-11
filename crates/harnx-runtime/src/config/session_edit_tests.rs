@@ -45,6 +45,7 @@ fn tool_results_yaml_with_optional_ids(result_ids: &[Option<String>]) -> String 
                 id: id.clone(),
                 name: "bash_exec".to_string(),
                 output: serde_json::json!({"ok": true}),
+                markdown: None,
                 content: Vec::new(),
                 switch_agent: None,
             })
@@ -319,6 +320,7 @@ fn tool_results_entry(id: &str) -> SessionLogEntry {
             id: Some(id.to_string()),
             name: "bash_exec".to_string(),
             output: serde_json::json!("ok"),
+            markdown: None,
             content: Vec::new(),
             switch_agent: None,
         }],

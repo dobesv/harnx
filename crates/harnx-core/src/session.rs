@@ -174,6 +174,8 @@ pub struct ToolOutput {
     pub id: Option<String>,
     pub name: String,
     pub output: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<crate::message::MessageContentPart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -889,5 +891,24 @@ field: value
 
         assert_eq!(session.model_fallbacks(), &["anthropic:claude".to_string()]);
         assert!(session.dirty);
+    }
+
+    #[test]
+    fn tool_output_deserializes_without_markdown_field() {
+        let serialized = json!({
+            "id": "tool-1",
+            "name": "read_history",
+            "output": {"ok": true},
+            "content": [],
+            "switch_agent": null
+        });
+
+        let decoded: ToolOutput = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.id.as_deref(), Some("tool-1"));
+        assert_eq!(decoded.name, "read_history");
+        assert_eq!(decoded.output, json!({"ok": true}));
+        assert!(decoded.markdown.is_none());
+        assert!(decoded.content.is_empty());
+        assert!(decoded.switch_agent.is_none());
     }
 }

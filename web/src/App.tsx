@@ -8,9 +8,16 @@ import {
   useComposerRuntime,
   useMessage,
 } from '@assistant-ui/react';
+import { MarkdownTextPrimitive } from '@assistant-ui/react-markdown';
+import { makeLightAsyncSyntaxHighlighter } from '@assistant-ui/react-syntax-highlighter';
+import remarkGfm from 'remark-gfm';
+
+const SyntaxHighlighter = makeLightAsyncSyntaxHighlighter({ useInlineStyles: false });
+import { ToolCallCard } from './ToolCallCard';
 import { useAgUiInterrupts, useAgUiSubmitInterruptResponses } from '@assistant-ui/react-ag-ui';
 import { ChatProvider } from './ChatProvider';
 import { PendingContext } from './PendingContext';
+import { UsageContext } from './UsageContext';
 import { cancel } from './api';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
@@ -25,6 +32,25 @@ function activateOnKey(e: React.KeyboardEvent, action: () => void) {
   }
 }
 
+const MessageContent = () => (
+  <MessagePrimitive.Content components={{
+    Text: () => (
+      <MarkdownTextPrimitive
+        remarkPlugins={[remarkGfm]}
+        components={{
+          SyntaxHighlighter,
+          table: ({ node: _node, ...props }: any) => (
+            <div className="overflow-x-auto">
+              <table {...props} />
+            </div>
+          )
+        }}
+      />
+    ),
+    tools: { Fallback: ToolCallCard }
+  }} />
+);
+
 const MyMessage = () => {
   const role = useMessage((state) => state.role);
   const [systemExpanded, setSystemExpanded] = useState(false);
@@ -37,19 +63,7 @@ const MyMessage = () => {
             {systemExpanded ? 'System prompt ▾' : 'System prompt ▸'}
           </summary>
           <div className="aui-message-content">
-            <MessagePrimitive.Content components={{
-              tools: { Fallback: (props: any) => (
-              <div className="aui-tool-call">
-                <div className="aui-tool-call-header">
-                  <span className="aui-tool-call-icon">⚙️</span>
-                  <span className="aui-tool-call-label">{props.toolName}</span>
-                </div>
-                <div className="aui-tool-call-body">
-                  {JSON.stringify(props.args, null, 2)}
-                </div>
-              </div>
-            ) }
-            }} />
+            <MessageContent />
           </div>
         </details>
       </MessagePrimitive.Root>
@@ -59,19 +73,7 @@ const MyMessage = () => {
   return (
     <MessagePrimitive.Root className="aui-message">
       <div className="aui-message-content">
-        <MessagePrimitive.Content components={{
-          tools: { Fallback: (props: any) => (
-              <div className="aui-tool-call">
-                <div className="aui-tool-call-header">
-                  <span className="aui-tool-call-icon">⚙️</span>
-                  <span className="aui-tool-call-label">{props.toolName}</span>
-                </div>
-                <div className="aui-tool-call-body">
-                  {JSON.stringify(props.args, null, 2)}
-                </div>
-              </div>
-            ) }
-        }} />
+        <MessageContent />
       </div>
     </MessagePrimitive.Root>
   );
@@ -147,14 +149,42 @@ const RunStateMonitor = ({ onRunFinish }: { onRunFinish: () => void }) => {
   return null;
 };
 
-const StatusIndicator = () => {
-  const { statusText } = useContext(PendingContext);
-  const isRunning = useThread(s => s.isRunning);
-  if (!isRunning) return null;
-  return (
-    <div className="aui-status-indicator">
+const StatusIndicator = ({ isRunning, statusText }: { isRunning: boolean, statusText: string | null }) => (
+  <div className="aui-status-left">
+    {isRunning ? (
       <span className="aui-spinner"><span></span></span>
-      <span className="aui-status-text">{statusText || 'Running...'}</span>
+    ) : (
+      <span className="aui-idle-dot"></span>
+    )}
+    <span className="aui-status-text">{statusText || (isRunning ? 'Running...' : 'Idle')}</span>
+  </div>
+);
+
+const UsageIndicator = ({ usage }: { usage: any }) => (
+  <div className="aui-status-usage">
+    <span>In: {usage.input}</span>
+    <span>Out: {usage.output}</span>
+    {usage.cached ? <span>Cached: {usage.cached}</span> : null}
+    {usage.context_tokens !== undefined && (
+      <span>
+        Context: {usage.context_tokens}
+        {usage.context_percent !== undefined ? ` (${usage.context_percent}%)` : ''}
+      </span>
+    )}
+  </div>
+);
+
+const StatusBar = () => {
+  const { statusText } = useContext(PendingContext);
+  const { usage } = useContext(UsageContext);
+  const isRunning = useThread(s => s.isRunning);
+
+  if (!isRunning && !usage && !statusText) return null;
+
+  return (
+    <div className="aui-status-bar">
+      <StatusIndicator isRunning={isRunning} statusText={statusText} />
+      {usage && <UsageIndicator usage={usage} />}
     </div>
   );
 };
@@ -218,7 +248,6 @@ const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, se
   return (
     <ThreadPrimitive.Root className={`aui-thread ${isEmpty ? 'aui-thread-empty' : ''}`}>
       <RunStateMonitor onRunFinish={onRunFinish} />
-      <StatusIndicator />
 
       {!isEmpty && (
         <ThreadPrimitive.Viewport className="aui-thread-viewport">
@@ -227,6 +256,7 @@ const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, se
       )}
 
       <div className="aui-thread-bottom">
+        <StatusBar />
         <BatchInterruptUI />
         <SendErrorIndicator />
         <div className="aui-composer-container">

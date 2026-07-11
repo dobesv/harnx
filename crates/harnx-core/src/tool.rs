@@ -17,9 +17,11 @@ use std::collections::HashSet;
 pub struct ToolResult {
     pub call: ToolCall,
     pub output: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content: Vec<MessageContentPart>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_agent: Option<SwitchAgentData>,
 }
 
@@ -36,6 +38,7 @@ impl ToolResult {
         Self {
             call,
             output,
+            markdown: None,
             content: Vec::new(),
             switch_agent: None,
         }
