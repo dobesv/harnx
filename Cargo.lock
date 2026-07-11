@@ -22,8 +22,8 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.14.0"
-source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=5ce2e5d40fac5bf2596dfba1b8e4d562defff177#5ce2e5d40fac5bf2596dfba1b8e4d562defff177"
+version = "1.2.0"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=0976cc26bacc0c656e1d888f2d46749d79a6fba0#0976cc26bacc0c656e1d888f2d46749d79a6fba0"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -32,18 +32,20 @@ dependencies = [
  "futures",
  "futures-concurrency",
  "rustc-hash",
+ "rustix 1.1.4",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "shell-words",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "agent-client-protocol-derive"
-version = "0.14.0"
-source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=5ce2e5d40fac5bf2596dfba1b8e4d562defff177#5ce2e5d40fac5bf2596dfba1b8e4d562defff177"
+version = "1.2.0"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=0976cc26bacc0c656e1d888f2d46749d79a6fba0#0976cc26bacc0c656e1d888f2d46749d79a6fba0"
 dependencies = [
  "quote",
  "syn 2.0.118",
@@ -51,9 +53,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "0.13.6"
+version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c290bfa00c6b52339db66f8e9cf711d5f08530800529f7d619ff24d6cba253d0"
+checksum = "06679e1542356341f4550ccfb16338b64f37f6af70de2105446ef6fbb078234c"
 dependencies = [
  "anyhow",
  "derive_more",

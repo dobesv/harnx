@@ -16,7 +16,7 @@ mod lib_tests;
 mod test_regression_issue_68;
 
 use agent_client_protocol as acp;
-use agent_client_protocol::schema::*;
+use agent_client_protocol::schema::v1::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
