@@ -6756,6 +6756,76 @@ async fn rewind_on_tool_call_row_resolves_to_prior_seq() {
 }
 
 #[tokio::test]
+async fn transcript_edit_targets_selected_seq_range() {
+    let mut harness = TuiTestHarness::new().await;
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "first".to_string(),
+        seq: Some(3),
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "second".to_string(),
+            seq: Some(4),
+            timestamp: None,
+            rendered_cache: None,
+        });
+
+    // Single selection.
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().app.transcript_selection_anchor = None;
+    assert_eq!(
+        harness.tui().transcript_edit_command_for_test().as_deref(),
+        Some(".edit message 3")
+    );
+
+    // Range selection across both rows.
+    harness.tui().app.transcript_focus = Some(1);
+    harness.tui().app.transcript_selection_anchor = Some(0);
+    assert_eq!(
+        harness.tui().transcript_edit_command_for_test().as_deref(),
+        Some(".edit message 3-4")
+    );
+}
+
+#[tokio::test]
+async fn detail_view_edit_restores_focus_when_index_valid() {
+    let mut harness = TuiTestHarness::new().await;
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "row".to_string(),
+        seq: None,
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().app.transcript_browsing = true;
+    harness.tui().app.detail_view_open = true;
+
+    // Selection has no seq -> handle_transcript_edit is a no-op (returns
+    // early), so this exercises the reopen/focus-restoration bookkeeping
+    // without invoking an editor.
+    harness
+        .tui()
+        .handle_detail_view_key_for_test(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        harness.tui().app.transcript_focus,
+        Some(0),
+        "focus restored"
+    );
+    assert!(
+        harness.tui().app.transcript_browsing,
+        "browsing state restored"
+    );
+}
+
+#[tokio::test]
 async fn test_d4_enter_opens_detail_view() {
     let mut harness = TuiTestHarness::new().await;
     harness.tui().app.transcript.clear();

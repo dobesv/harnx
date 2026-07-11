@@ -202,6 +202,11 @@ impl Tui {
         self.open_detail_view_for_focused_item();
     }
 
+    #[cfg(test)]
+    pub(crate) async fn handle_detail_view_key_for_test(&mut self, key: KeyEvent) -> Result<()> {
+        self.handle_detail_view_key(key).await
+    }
+
     async fn handle_detail_view_key(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, KeyModifiers::NONE) => {
@@ -2762,15 +2767,27 @@ impl Tui {
         }
     }
 
-    /// Handle 'e' key: open edit command for selected item(s).
-    async fn handle_transcript_edit(&mut self) -> Result<()> {
-        let Some((from, to)) = self.selected_seq_range() else {
-            return Ok(());
-        };
-        let cmd = if from == to {
+    /// Build the `.edit message ...` command for the current selection, from
+    /// its resolved seq range. Shared by `handle_transcript_edit` and the
+    /// test seam below so tests exercise the real construction.
+    fn transcript_edit_command(&self) -> Option<String> {
+        let (from, to) = self.selected_seq_range()?;
+        Some(if from == to {
             format!(".edit message {}", from)
         } else {
             format!(".edit message {}-{}", from, to)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcript_edit_command_for_test(&self) -> Option<String> {
+        self.transcript_edit_command()
+    }
+
+    /// Handle 'e' key: open edit command for selected item(s).
+    async fn handle_transcript_edit(&mut self) -> Result<()> {
+        let Some(cmd) = self.transcript_edit_command() else {
+            return Ok(());
         };
         self.run_command(&cmd).await?;
         self.app.transcript_focus = None;
