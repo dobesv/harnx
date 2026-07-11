@@ -6794,26 +6794,79 @@ async fn transcript_edit_targets_selected_seq_range() {
 
 #[tokio::test]
 async fn detail_view_edit_restores_focus_when_index_valid() {
-    let mut harness = TuiTestHarness::new().await;
+    // Drive a *real* `.edit message 1` (via a stubbed `true` editor and an
+    // after-hook that writes the replacement YAML) so `handle_transcript_edit`
+    // actually clears transcript_focus/transcript_browsing/detail_view_open,
+    // forcing the 'e' arm's restoration + reopen block to do real work.
+    // With a `seq: None` row (the old version of this test), that clearing
+    // never happens and the block is never exercised.
+    let sessions_tmp = tempfile::TempDir::new().unwrap();
+    let editor_tmp = tempfile::TempDir::new().unwrap();
+
+    let config = test_config();
+    {
+        let mut guard = config.write();
+        guard.sessions_dir_override = Some(sessions_tmp.path().to_path_buf());
+        guard.editor = Some("true".to_string());
+        guard.use_session(Some("detail-edit")).unwrap();
+
+        let session = guard.session.as_mut().unwrap();
+        harnx_runtime::config::session::append_event(
+            session,
+            &harnx_core::session::SessionLogEntry::Message {
+                id: None,
+                timestamp: None,
+                fence_token: None,
+                role: harnx_core::message::MessageRole::User,
+                content: harnx_core::message::MessageContent::Text("original".into()),
+            },
+        );
+
+        let editor_tmp_path = editor_tmp.path().to_path_buf();
+        guard.temp_dir_override = Some(editor_tmp_path.clone());
+        guard.set_tui_editor_hooks(
+            None,
+            Some(Box::new(move || {
+                let temp_path = std::fs::read_dir(&editor_tmp_path)
+                    .unwrap()
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .find(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
+                    .expect("message edit temp file");
+                let replacement =
+                    serde_yaml::to_string(&harnx_core::session::SessionLogEntry::Message {
+                        id: None,
+                        timestamp: None,
+                        fence_token: None,
+                        role: harnx_core::message::MessageRole::User,
+                        content: harnx_core::message::MessageContent::Text("edited".into()),
+                    })
+                    .unwrap();
+                std::fs::write(&temp_path, replacement).unwrap();
+            })),
+        );
+    }
+
+    let mut harness = TuiTestHarness::with_config(config).await;
     harness.tui().app.transcript.clear();
     harness.tui().app.transcript.push(TranscriptItem::UserText {
-        text: "row".to_string(),
-        seq: None,
+        text: "original".to_string(),
+        seq: Some(1),
         timestamp: None,
     });
     harness.tui().app.transcript_focus = Some(0);
     harness.tui().app.transcript_browsing = true;
     harness.tui().app.detail_view_open = true;
 
-    // Selection has no seq -> handle_transcript_edit is a no-op (returns
-    // early), so this exercises the reopen/focus-restoration bookkeeping
-    // without invoking an editor.
     harness
         .tui()
         .handle_detail_view_key_for_test(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
         .await
         .unwrap();
 
+    assert!(
+        harness.tui().app.detail_view_open,
+        "detail view reopened after edit"
+    );
     assert_eq!(
         harness.tui().app.transcript_focus,
         Some(0),
