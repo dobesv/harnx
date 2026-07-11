@@ -640,6 +640,7 @@ pub(crate) fn messages_to_transcript_items(
                         };
                         items.push(TranscriptItem::ToolCall {
                             tool_name: r.call.name.clone(),
+                            id: r.call.id.clone().unwrap_or_default(),
                             body,
                             seq: msg.log_seq,
                             timestamp: msg.log_timestamp,
@@ -663,6 +664,7 @@ pub(crate) fn messages_to_transcript_items(
                         if !trimmed.is_empty() {
                             items.push(TranscriptItem::ToolResultMarkdown {
                                 text: trimmed.to_string(),
+                                id: r.call.id.clone().unwrap_or_default(),
                                 rendered_cache: None,
                             });
                         }

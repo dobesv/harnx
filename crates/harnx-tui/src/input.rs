@@ -141,6 +141,7 @@ fn tool_call_body(
 /// string outputs before extraction so pre-dimmed test inputs render
 /// cleanly.
 fn tool_completed_to_transcript_items(
+    id: &str,
     output: &serde_json::Value,
     markdown: Option<&str>,
 ) -> Vec<TranscriptItem> {
@@ -155,6 +156,7 @@ fn tool_completed_to_transcript_items(
     }
     vec![TranscriptItem::ToolResultMarkdown {
         text: clean,
+        id: id.to_string(),
         rendered_cache: None,
     }]
 }
@@ -186,6 +188,11 @@ impl Tui {
             }
         }
         self.app.detail_view_open = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_detail_view_for_focused_item_for_test(&mut self) {
+        self.open_detail_view_for_focused_item();
     }
 
     async fn handle_detail_view_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1055,8 +1062,11 @@ impl Tui {
                 }]
             }
             AgentEvent::Tool(ToolEvent::Completed {
-                output, markdown, ..
-            }) => tool_completed_to_transcript_items(&output, markdown.as_deref()),
+                id,
+                output,
+                markdown,
+                ..
+            }) => tool_completed_to_transcript_items(&id, &output, markdown.as_deref()),
             AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
                 let text = concat_text_blocks(&blocks);
                 if text.is_empty() {
@@ -1247,6 +1257,7 @@ impl Tui {
                 }
             }
             AgentEvent::Tool(ToolEvent::Started {
+                id,
                 name,
                 markdown,
                 input,
@@ -1254,6 +1265,7 @@ impl Tui {
             }) => {
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
+                    id,
                     body: tool_call_body(markdown.as_deref(), &input),
                     seq: self.app.current_group_seq,
                     timestamp: Some(chrono::Utc::now()),
@@ -1261,6 +1273,7 @@ impl Tui {
                 }]
             }
             AgentEvent::Tool(ToolEvent::Blocked {
+                id,
                 name,
                 input,
                 reason,
@@ -1280,6 +1293,7 @@ impl Tui {
                 };
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
+                    id,
                     body,
                     seq: self.app.current_group_seq,
                     timestamp: Some(chrono::Utc::now()),
@@ -2848,7 +2862,7 @@ mod tests {
             "isError": false
         });
 
-        let items = tool_completed_to_transcript_items(&output, None);
+        let items = tool_completed_to_transcript_items("call_1", &output, None);
 
         assert_eq!(items.len(), 1);
         match &items[0] {

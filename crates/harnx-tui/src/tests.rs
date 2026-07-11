@@ -6117,6 +6117,7 @@ async fn tui_assistant_text_preserves_line_breaks() {
 async fn tool_call_display_format() {
     let mut harness = TuiTestHarness::new().await;
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "exec".to_string(),
         body: Some(ToolCallBody::Yaml(
             "command: ls -la\nworking_dir: /tmp\n".to_string(),
@@ -6126,6 +6127,7 @@ async fn tool_call_display_format() {
         rendered_cache: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "write_file".to_string(),
         body: Some(ToolCallBody::Markdown(
             "write **hello.txt** with 3 lines".to_string(),
@@ -6135,6 +6137,7 @@ async fn tool_call_display_format() {
         rendered_cache: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "think".to_string(),
         body: None,
         seq: None,
@@ -6142,6 +6145,7 @@ async fn tool_call_display_format() {
         rendered_cache: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "search".to_string(),
         body: Some(ToolCallBody::Yaml(
             "query: rust async patterns\nmax_results: 10\ninclude_code: true\n".to_string(),
@@ -6159,6 +6163,7 @@ async fn tool_call_display_format() {
 fn render_tool_call_markdown_body_suppresses_header() {
     let lines = render_entry_lines(
         &TranscriptItem::ToolCall {
+            id: String::new(),
             tool_name: "write_file".to_string(),
             body: Some(ToolCallBody::Markdown(
                 "write **hello.txt** with 3 lines".to_string(),
@@ -6181,6 +6186,7 @@ fn render_tool_call_markdown_body_suppresses_header() {
 fn render_tool_call_yaml_body_keeps_header() {
     let lines = render_entry_lines(
         &TranscriptItem::ToolCall {
+            id: String::new(),
             tool_name: "read".to_string(),
             body: Some(ToolCallBody::Yaml("path: /tmp/foo.txt\n".to_string())),
             seq: None,
@@ -6203,6 +6209,7 @@ fn render_tool_call_meta_line_precedes_markdown_body() {
         .with_timezone(&chrono::Utc);
     let lines = render_entry_lines(
         &TranscriptItem::ToolCall {
+            id: String::new(),
             tool_name: "write_file".to_string(),
             body: Some(ToolCallBody::Markdown("write hello.txt".to_string())),
             seq: Some(3),
@@ -6226,6 +6233,7 @@ async fn tool_call_with_seq_number() {
     let mut harness = TuiTestHarness::new().await;
     harness.tui().app.show_sequence_numbers = true;
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "read".to_string(),
         body: Some(ToolCallBody::Yaml("path: /tmp/foo.txt\n".to_string())),
         seq: Some(7),
@@ -6609,6 +6617,7 @@ async fn test_d4_key_i_copies_tool_call() {
     let mut harness = TuiTestHarness::new().await;
     harness.tui().app.transcript.clear();
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "search".to_string(),
         body: Some(crate::types::ToolCallBody::Yaml("query: rust".to_string())),
         seq: Some(9),
@@ -8285,6 +8294,7 @@ async fn test_browsing_mode_non_navigable_items_visible_not_focusable() {
         .transcript
         .push(TranscriptItem::ToolResultMarkdown {
             text: "thinking...".to_string(),
+            id: String::new(),
             rendered_cache: None,
         });
     harness
@@ -8313,6 +8323,45 @@ async fn test_browsing_mode_non_navigable_items_visible_not_focusable() {
         harness.tui().app.transcript_focus,
         Some(2),
         "Down should skip non-navigable ToolResultMarkdown at index 1 and focus AssistantText at index 2"
+    );
+}
+
+#[tokio::test]
+async fn detail_fallback_pairs_tool_result_by_id_when_not_adjacent() {
+    let mut harness = crate::test_utils::TuiTestHarness::new().await;
+    let tui = harness.tui();
+
+    // Clear the initial welcome banner so transcript_focus 0 lands on the
+    // ToolCall pushed below rather than that seeded row.
+    tui.app.transcript.clear();
+
+    // A tool call and its result separated by an interleaving row. No session,
+    // so the detail view uses the fallback render path.
+    tui.app.transcript.push(TranscriptItem::ToolCall {
+        tool_name: "read".to_string(),
+        body: None,
+        seq: None,
+        timestamp: Some(chrono::Utc::now()),
+        rendered_cache: None,
+        id: "call_x".to_string(),
+    });
+    tui.app
+        .transcript
+        .push(TranscriptItem::SystemText("noise".to_string()));
+    tui.app.transcript.push(TranscriptItem::ToolResultMarkdown {
+        text: "RESULT-X-CONTENT".to_string(),
+        rendered_cache: None,
+        id: "call_x".to_string(),
+    });
+
+    tui.app.transcript_focus = Some(0);
+    tui.app.transcript_selection_anchor = None;
+    tui.open_detail_view_for_focused_item_for_test();
+    harness.render();
+
+    assert!(
+        harness.screen_contents().contains("RESULT-X-CONTENT"),
+        "detail view must show the id-matched result even when not adjacent"
     );
 }
 

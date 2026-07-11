@@ -266,6 +266,9 @@ pub enum TranscriptItem {
     /// inline emphasis from a `result_template` both display correctly.
     ToolResultMarkdown {
         text: String,
+        /// Tool-call id this result answers; used to pair a result with its
+        /// ToolCall row independent of transcript position. Empty when unknown.
+        id: String,
         rendered_cache: RenderedCache,
     },
     StatusLine(String),
@@ -280,6 +283,9 @@ pub enum TranscriptItem {
     UsageLine(String),
     ToolCall {
         tool_name: String,
+        /// Stable tool-call id from the event stream / session log. Empty when
+        /// unknown. Pairs this call with its ToolResultMarkdown row.
+        id: String,
         body: Option<ToolCallBody>,
         seq: Option<usize>,
         timestamp: Option<DateTime<Utc>>,
