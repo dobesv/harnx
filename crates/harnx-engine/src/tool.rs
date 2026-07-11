@@ -79,7 +79,13 @@ impl std::error::Error for ToolApprovalRequiredError {}
 pub type DispatchHookFn =
     dyn Fn(HookEvent) -> Pin<Box<dyn Future<Output = HookOutcome> + Send>> + Send + Sync;
 
+#[derive(Clone)]
+pub struct ToolEvalRenderContext {
+    pub decl_map: Arc<HashMap<String, harnx_core::tool::ToolDeclaration>>,
+}
+
 pub struct ToolEvalContext {
+    pub render: Option<ToolEvalRenderContext>,
     /// Ordered tool providers to search when dispatching a call.
     pub providers: Vec<Arc<dyn ToolProvider>>,
     /// Optional session name used when synthesizing `_session_handoff`
@@ -607,6 +613,7 @@ mod tests {
         emit_tool_blocked: impl Fn(&ToolCall, &Value) + Send + Sync + 'static,
     ) -> ToolEvalContext {
         ToolEvalContext {
+            render: None,
             providers,
             session_name: None,
             allowed_tool_names: HashSet::new(),

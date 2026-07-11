@@ -1171,6 +1171,7 @@ mod tests {
                 id: Some("call-1".to_string()),
                 name: name.to_string(),
                 output: json!({"ok": true}),
+                markdown: None,
                 content: vec![],
                 switch_agent: None,
             }],

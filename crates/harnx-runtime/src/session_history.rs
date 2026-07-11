@@ -327,6 +327,7 @@ mod tests {
                         id: Some("c1".into()),
                         name: "bash".into(),
                         output: json!({"content":[{"type":"text","text":"build ok"}]}),
+                        markdown: None,
                         content: vec![],
                         switch_agent: None,
                     }],

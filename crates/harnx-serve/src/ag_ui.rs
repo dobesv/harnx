@@ -206,18 +206,26 @@ pub struct AgUiSink {
     tx: AgUiEventTx,
     message_id: MessageId,
     history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
+    session_context: Option<Arc<dyn Fn() -> Option<UsageContextSnapshot> + Send + Sync>>,
     in_thinking_segment: std::sync::atomic::AtomicBool,
     text_message_started: std::sync::atomic::AtomicBool,
     turn_counter: std::sync::atomic::AtomicUsize,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct UsageContextSnapshot {
+    pub(crate) context_tokens: usize,
+    pub(crate) max_context_tokens: Option<usize>,
+    pub(crate) context_percent: Option<f32>,
+}
+
 impl AgUiSink {
     pub fn new(tx: UnboundedSender<Event>, message_id: MessageId) -> Self {
-        Self::with_snapshot(tx, message_id, true, None)
+        Self::with_snapshot_and_context(tx, message_id, true, None, None)
     }
 
     pub fn new_broadcast(tx: broadcast::Sender<Event>, message_id: MessageId) -> Self {
-        Self::with_snapshot(tx, message_id, true, None)
+        Self::with_snapshot_and_context(tx, message_id, true, None, None)
     }
 
     pub fn new_broadcast_with_snapshot(
@@ -225,7 +233,22 @@ impl AgUiSink {
         message_id: MessageId,
         history_snapshot: Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>,
     ) -> Self {
-        Self::with_snapshot(tx, message_id, true, Some(history_snapshot))
+        Self::with_snapshot_and_context(tx, message_id, true, Some(history_snapshot), None)
+    }
+
+    pub(crate) fn new_broadcast_with_snapshot_and_context(
+        tx: broadcast::Sender<Event>,
+        message_id: MessageId,
+        history_snapshot: Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>,
+        session_context: Arc<dyn Fn() -> Option<UsageContextSnapshot> + Send + Sync>,
+    ) -> Self {
+        Self::with_snapshot_and_context(
+            tx,
+            message_id,
+            true,
+            Some(history_snapshot),
+            Some(session_context),
+        )
     }
 
     fn with_snapshot(
@@ -234,10 +257,27 @@ impl AgUiSink {
         text_message_started: bool,
         history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
     ) -> Self {
+        Self::with_snapshot_and_context(
+            tx,
+            message_id,
+            text_message_started,
+            history_snapshot,
+            None,
+        )
+    }
+
+    fn with_snapshot_and_context(
+        tx: impl Into<AgUiEventTx>,
+        message_id: MessageId,
+        text_message_started: bool,
+        history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
+        session_context: Option<Arc<dyn Fn() -> Option<UsageContextSnapshot> + Send + Sync>>,
+    ) -> Self {
         Self {
             tx: tx.into(),
             message_id,
             history_snapshot,
+            session_context,
             in_thinking_segment: std::sync::atomic::AtomicBool::new(false),
             text_message_started: std::sync::atomic::AtomicBool::new(text_message_started),
             turn_counter: std::sync::atomic::AtomicUsize::new(0),
@@ -364,11 +404,54 @@ impl AgUiSink {
         }));
     }
 
+    fn session_usage_context(&self) -> Option<UsageContextSnapshot> {
+        self.session_context
+            .as_ref()
+            .and_then(|session_context| session_context())
+    }
+
+    fn build_usage_payload(
+        &self,
+        input: u64,
+        output: u64,
+        cached: u64,
+        session_label: Option<String>,
+    ) -> serde_json::Value {
+        let mut payload = json!({
+            "input": input,
+            "output": output,
+            "cached": cached,
+            "session_label": session_label,
+        });
+        if let Some(context) = self.session_usage_context() {
+            payload["context_tokens"] = json!(context.context_tokens);
+            payload["max_context_tokens"] = json!(context.max_context_tokens);
+            if let Some(percent) = context.context_percent {
+                payload["context_percent"] = json!(percent);
+            }
+        }
+        payload
+    }
+
+    fn emit_tool_summary(&self, tool_call_id: String, markdown: String) {
+        self.emit_custom(
+            "tool_summary",
+            json!({
+                "tool_call_id": tool_call_id,
+                "markdown": markdown,
+            }),
+        );
+    }
+
     fn emit_tool_event(&self, event: ToolEvent) {
         self.close_thinking_segment();
         match event {
             ToolEvent::Started {
-                id, name, input, ..
+                id,
+                name,
+                markdown,
+                input,
+                ..
             } => {
                 self.send(Event::ToolCallStart(ToolCallStartEvent {
                     base: Self::base_event(),
@@ -376,6 +459,9 @@ impl AgUiSink {
                     tool_call_name: name,
                     parent_message_id: Some(self.message_id.clone()),
                 }));
+                if let Some(markdown) = markdown {
+                    self.emit_tool_summary(id.clone(), markdown);
+                }
                 self.send(Event::ToolCallArgs(ToolCallArgsEvent {
                     base: Self::base_event(),
                     tool_call_id: Self::tool_call_id(id),
@@ -434,12 +520,7 @@ impl harnx_core::event::AgentEventSink for AgUiSink {
             }) => {
                 self.emit_custom(
                     "usage",
-                    json!({
-                        "input": input,
-                        "output": output,
-                        "cached": cached,
-                        "session_label": session_label,
-                    }),
+                    self.build_usage_payload(input, output, cached, session_label),
                 );
             }
             AgentEvent::Model(ModelEvent::Error(message))
@@ -1097,9 +1178,9 @@ pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiM
                 }
                 for tool_result in &tool_calls.tool_results {
                     let content = tool_result
-                        .output
-                        .as_str()
-                        .map(ToOwned::to_owned)
+                        .markdown
+                        .clone()
+                        .or_else(|| tool_result.output.as_str().map(ToOwned::to_owned))
                         .unwrap_or_else(|| tool_result.output.to_string());
                     messages.push(AgUiMessage::Tool {
                         id: MessageId::random(),

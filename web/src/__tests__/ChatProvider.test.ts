@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { attachmentToMessageParts, toAgUiMessages } from '../ChatProvider';
 import type { Message } from '@ag-ui/client';
 
@@ -164,3 +164,68 @@ describe('toAgUiMessages', () => {
     ]);
   });
 });
+
+  describe('HarnxHttpAgent', () => {
+    it('handles custom events correctly', async () => {
+      const onStatus = vi.fn();
+      const onUsage = vi.fn();
+      const onToolSummary = vi.fn();
+      const onRunFailed = vi.fn();
+
+      const { HarnxHttpAgent } = await import('../ChatProvider');
+      const agent = new HarnxHttpAgent({
+        url: '/url',
+        onStatus,
+        onRunFailed,
+        onUsage,
+        onToolSummary
+      });
+
+      const subscriber: any = {};
+      vi.spyOn(Object.getPrototypeOf(Object.getPrototypeOf(agent)), 'runAgent').mockImplementation((_params: any, sub: any) => {
+        Object.assign(subscriber, sub);
+        return Promise.resolve();
+      });
+
+      await agent.runAgent({});
+
+      // Simulate onEvent CUSTOM usage
+      await subscriber.onEvent({
+        event: {
+          type: 'CUSTOM',
+          name: 'usage',
+          value: { input: 1, output: 2, context_tokens: 10 }
+        }
+      });
+      expect(onUsage).toHaveBeenCalledWith({ input: 1, output: 2, context_tokens: 10 });
+
+      // Simulate onEvent CUSTOM tool_summary
+      await subscriber.onEvent({
+        event: {
+          type: 'CUSTOM',
+          name: 'tool_summary',
+          value: { tool_call_id: 'call_1', markdown: 'md' }
+        }
+      });
+      expect(onToolSummary).toHaveBeenCalledWith('call_1', 'md');
+
+      // Simulate onCustomEvent status
+      await subscriber.onCustomEvent({
+        event: {
+          name: 'status',
+          value: { text: 'Running' }
+        }
+      });
+      expect(onStatus).toHaveBeenCalledWith('Running');
+
+      // Test missing fields tolerance (e.g. older server without context_tokens)
+      await subscriber.onEvent({
+        event: {
+          type: 'CUSTOM',
+          name: 'usage',
+          value: { input: 1, output: 2 }
+        }
+      });
+      expect(onUsage).toHaveBeenCalledWith({ input: 1, output: 2 });
+    });
+  });

@@ -618,17 +618,13 @@ impl SessionActor {
         let run_id_for_task = run_id.clone();
         let thread_id_for_task = thread_id.clone();
         let message_id_for_task = message_id.clone();
-        let base_config_for_snapshot = self.actor_config.base_config.clone();
-        let session_key_for_snapshot = self.key.clone();
+        let session_event_context =
+            SessionEventContext::new(self.actor_config.base_config.clone(), self.key.clone());
         let task = tokio::spawn(async move {
-            let history_snapshot = Arc::new(move || {
-                load_history_snapshot(&base_config_for_snapshot, &session_key_for_snapshot)
-                    .unwrap_or_default()
-            });
             let sink = Arc::new(BroadcastEventSender::new(
                 event_tx,
                 message_id_for_task.clone(),
-                history_snapshot,
+                session_event_context,
             ));
             let loop_result = with_agent_event_sink(sink, async {
                 Box::pin(run_agent_loop(&loop_ctx, input)).await
@@ -784,14 +780,42 @@ struct BroadcastEventSender {
     sink: AgUiSink,
 }
 
+#[derive(Clone)]
+struct SessionEventContext {
+    base_config: Config,
+    key: SessionKey,
+}
+
+impl SessionEventContext {
+    fn new(base_config: Config, key: SessionKey) -> Self {
+        Self { base_config, key }
+    }
+
+    fn history_snapshot(&self) -> Vec<AgUiMessage> {
+        load_history_snapshot(&self.base_config, &self.key).unwrap_or_default()
+    }
+
+    fn usage_context(&self) -> Option<crate::ag_ui::UsageContextSnapshot> {
+        usage_context_snapshot(&self.base_config, &self.key)
+    }
+}
+
 impl BroadcastEventSender {
     fn new(
         tx: broadcast::Sender<Event>,
         message_id: MessageId,
-        history_snapshot: Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>,
+        session_event_context: SessionEventContext,
     ) -> Self {
+        let history_context = session_event_context.clone();
+        let history_snapshot = Arc::new(move || history_context.history_snapshot());
+        let session_context = Arc::new(move || session_event_context.usage_context());
         Self {
-            sink: AgUiSink::new_broadcast_with_snapshot(tx, message_id, history_snapshot),
+            sink: AgUiSink::new_broadcast_with_snapshot_and_context(
+                tx,
+                message_id,
+                history_snapshot,
+                session_context,
+            ),
         }
     }
 }
@@ -866,17 +890,13 @@ impl SessionActor {
         let run_id_for_task = run_id.clone();
         let thread_id_for_task = thread_id.clone();
         let message_id_for_task = message_id.clone();
-        let base_config_for_snapshot = self.actor_config.base_config.clone();
-        let session_key_for_snapshot = self.key.clone();
+        let session_event_context =
+            SessionEventContext::new(self.actor_config.base_config.clone(), self.key.clone());
         let task = tokio::spawn(async move {
-            let history_snapshot = Arc::new(move || {
-                load_history_snapshot(&base_config_for_snapshot, &session_key_for_snapshot)
-                    .unwrap_or_default()
-            });
             let sink = Arc::new(BroadcastEventSender::new(
                 event_tx,
                 message_id_for_task.clone(),
-                history_snapshot,
+                session_event_context,
             ));
             let loop_result = with_agent_event_sink(sink, async {
                 continue_agent_loop_from_tool_round(
@@ -987,6 +1007,22 @@ fn build_input(
     let mut input = config::input::from_str(prompt_config, text, None);
     input.set_attachment_refs(attachment_refs.to_vec());
     Ok(input)
+}
+
+fn usage_context_snapshot(
+    base_config: &Config,
+    key: &SessionKey,
+) -> Option<crate::ag_ui::UsageContextSnapshot> {
+    let prompt_config = prompt_config_for_agent_session_from_global(base_config, key);
+    let config = prompt_config.read();
+    let session = config.session.as_ref()?;
+    let (context_tokens, percent) = session.tokens_usage();
+    let max_context_tokens = session.model().max_input_tokens();
+    Some(crate::ag_ui::UsageContextSnapshot {
+        context_tokens,
+        max_context_tokens,
+        context_percent: max_context_tokens.map(|_| percent),
+    })
 }
 
 fn load_history_snapshot(

@@ -130,6 +130,7 @@ fn render_tool_calls(calls: &MessageContentToolCalls, max_tool_chars: usize) -> 
             id: result.call.id.clone(),
             name: result.call.name.clone(),
             output: result.output.clone(),
+            markdown: result.markdown.clone(),
             content: result.content.clone(),
             switch_agent: result.switch_agent.clone(),
         };
@@ -291,6 +292,7 @@ summarize\n";
                 "content": [{"type": "text", "text": "long full output..."}],
                 "_meta": {"harnx.dev/compaction": "exit 0; built ok"}
             }),
+            markdown: None,
             content: vec![],
             switch_agent: None,
         };
@@ -310,6 +312,7 @@ summarize\n";
                     {"type": "text", "text": "wrote 3 files", "annotations": {"audience": ["user"]}}
                 ]
             }),
+            markdown: None,
             content: vec![],
             switch_agent: None,
         };
@@ -325,6 +328,7 @@ summarize\n";
             id: None,
             name: "bash".into(),
             output: json!({ "data": big }),
+            markdown: None,
             content: vec![],
             switch_agent: None,
         };
@@ -417,6 +421,7 @@ summarize\n";
                             thought_signature: None,
                         },
                         output: json!({"_meta": {"harnx.dev/compaction": "3 files"}}),
+                        markdown: None,
                         content: vec![],
                         switch_agent: None,
                     }],

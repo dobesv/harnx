@@ -1,10 +1,12 @@
 use crate::{
-    config::{GlobalConfig, Input},
+    config::{Config, GlobalConfig, Input},
     utils::*,
 };
 use anyhow::Result;
+use harnx_acp::manager::AcpManager;
 use harnx_core::hooks::HookConfig;
 use harnx_hooks::{HookEvent, PersistentHookManager};
+use harnx_mcp::client::McpManager;
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -15,6 +17,7 @@ pub use harnx_core::tool::{
     extract_user_display_text, render_tool_call_template, render_tool_result_template, JsonSchema,
     SwitchAgentData, ToolCall, ToolDeclaration, ToolResult, Tools,
 };
+use harnx_engine::tool::ToolEvalRenderContext;
 pub use harnx_engine::tool::{
     eval_tool_calls, ConfirmToolUseFn, DeferredToolCall, DispatchHookFn, ToolApprovalRequiredError,
     ToolCallEmitFn, ToolEvalContext, ToolUseConfirmation,
@@ -141,11 +144,13 @@ pub async fn execute_tool_round_with_persistence(
                 })
                 .collect();
             if !dry_run {
+                let fallback = populate_result_markdown(fallback, &eval_ctx);
                 let _ = config.write().save_session_tool_results(&fallback);
             }
             return Err(err);
         }
     };
+    let results = populate_result_markdown(results, &eval_ctx);
     if !dry_run {
         config.write().save_session_tool_results(&results)?;
     }
@@ -276,22 +281,59 @@ pub fn build_tool_eval_context(
     let guard = config.read();
     let (tool_declarations, handoff_targets) =
         guard.tool_declarations_for_use_tools(agent_use_tools, current_agent_package.as_deref());
-    let decl_map: Arc<HashMap<String, ToolDeclaration>> = Arc::new(
-        tool_declarations
-            .into_iter()
-            .map(|d| (d.name.clone(), d))
-            .collect(),
-    );
+    let decl_map = Arc::new(build_decl_map(tool_declarations));
     let allowed_tool_names: HashSet<String> = decl_map.keys().cloned().collect();
     let hooks = guard.resolved_hooks();
     let acp_manager = guard.acp_manager.clone();
     let mcp_manager = guard.mcp_manager.clone();
+    let per_tool_hooks = build_per_tool_hooks(decl_map.as_ref(), mcp_manager.as_ref());
+    let session_name = guard.session.as_ref().map(|s| s.id().to_string());
+    let confirm_tool_use_fn = build_confirm_tool_use_fn(&guard);
+    drop(guard);
+
+    let providers = build_tool_providers(config, acp_manager, mcp_manager);
+    let dispatch_hook_fn = build_dispatch_hook_fn(
+        &hooks,
+        per_tool_hooks,
+        session_name.as_deref(),
+        persistent_manager,
+        working_dir,
+    );
+    let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn) = build_emit_fns(&decl_map);
+    ToolEvalContext {
+        render: Some(ToolEvalRenderContext {
+            decl_map: Arc::clone(&decl_map),
+        }),
+        providers,
+        session_name,
+        allowed_tool_names,
+        current_agent_package,
+        handoff_targets,
+        emit_tool_call_fn,
+        emit_tool_result_fn,
+        emit_tool_blocked_fn,
+        confirm_tool_use_fn,
+        dispatch_hook_fn,
+    }
+}
+
+fn build_decl_map(tool_declarations: Vec<ToolDeclaration>) -> HashMap<String, ToolDeclaration> {
+    tool_declarations
+        .into_iter()
+        .map(|declaration| (declaration.name.clone(), declaration))
+        .collect()
+}
+
+fn build_per_tool_hooks(
+    decl_map: &HashMap<String, ToolDeclaration>,
+    mcp_manager: Option<&Arc<McpManager>>,
+) -> HashMap<String, (String, Vec<HookConfig>)> {
     // Build a map from display tool name → (bare_tool_name, server_hook_entries).
-    // Look up hooks via the McpManager (which stores clients keyed by display name),
-    // so packaged/prefixed servers are found correctly. Server hooks are filtered to
-    // only tool-use events; their matchers are evaluated against the bare name so
-    // renaming a server doesn't require updating hook matchers.
-    let per_tool_hooks: HashMap<String, (String, Vec<HookConfig>)> = decl_map
+    // Look up hooks via McpManager (stores clients keyed by display name) so
+    // packaged/prefixed servers are found correctly. Server hooks are filtered to
+    // only tool-use events; matchers run against bare name so renaming server does
+    // not require updating hook matchers.
+    decl_map
         .iter()
         .filter_map(|(tool_name, decl)| {
             let server_name = decl.mcp_server_name.as_ref()?;
@@ -299,34 +341,48 @@ pub fn build_tool_eval_context(
                 .mcp_tool_name
                 .clone()
                 .unwrap_or_else(|| tool_name.clone());
-            let server_hooks = mcp_manager
-                .as_ref()?
-                .get_client(server_name)
-                .and_then(|client| client.hooks().cloned())?;
-            let hook_entries = server_hooks
-                .entries
-                .iter()
-                .filter(|hook| {
-                    matches!(
-                        hook.event.as_str(),
-                        "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            let hook_entries = tool_use_hook_entries(mcp_manager?, server_name)?;
             (!hook_entries.is_empty()).then(|| (tool_name.clone(), (bare_name, hook_entries)))
         })
-        .collect();
-    let session_name = guard.session.as_ref().map(|s| s.id().to_string());
-    // Runtime-only TUI confirmation override (falls back to the inquire prompt).
-    let confirm_tool_use_fn: Arc<ConfirmToolUseFn> = guard
+        .collect()
+}
+
+fn tool_use_hook_entries(
+    mcp_manager: &Arc<McpManager>,
+    server_name: &str,
+) -> Option<Vec<HookConfig>> {
+    Some(
+        mcp_manager
+            .get_client(server_name)
+            .and_then(|client| client.hooks().cloned())?
+            .entries
+            .iter()
+            .filter(|hook| {
+                matches!(
+                    hook.event.as_str(),
+                    "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+                )
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+fn build_confirm_tool_use_fn(config: &Config) -> Arc<ConfirmToolUseFn> {
+    // Runtime-only TUI confirmation override (falls back to inquire prompt).
+    config
         .tui_confirm_tool_use
         .clone()
-        .unwrap_or_else(|| Arc::new(default_confirm_tool_use));
-    drop(guard);
+        .unwrap_or_else(|| Arc::new(default_confirm_tool_use))
+}
 
-    // Build the provider list in ACP-first order so ACP sub-agent
-    // handoffs take priority over any namespaced MCP tool with the same name.
+fn build_tool_providers(
+    config: &GlobalConfig,
+    acp_manager: Option<Arc<AcpManager>>,
+    mcp_manager: Option<Arc<McpManager>>,
+) -> Vec<Arc<dyn ToolProvider>> {
+    // Build provider list in ACP-first order so ACP sub-agent handoffs take
+    // priority over any namespaced MCP tool with same name.
     let mut providers: Vec<Arc<dyn ToolProvider>> = Vec::new();
     if let Some(acp) = acp_manager {
         providers.push(acp as Arc<dyn ToolProvider>);
@@ -339,28 +395,35 @@ pub fn build_tool_eval_context(
             config.clone(),
         )) as Arc<dyn ToolProvider>,
     );
+    providers
+}
 
-    let dispatch_hook_fn = build_dispatch_hook_fn(
-        &hooks,
-        per_tool_hooks,
-        session_name.as_deref(),
-        persistent_manager,
-        working_dir,
-    );
-    let (emit_tool_call_fn, emit_tool_result_fn, emit_tool_blocked_fn) = build_emit_fns(&decl_map);
+fn populate_result_markdown(
+    results: Vec<ToolResult>,
+    eval_ctx: &ToolEvalContext,
+) -> Vec<ToolResult> {
+    results
+        .into_iter()
+        .map(|mut result| {
+            let raw_fallback = tool_result_raw_fallback(&result.output);
+            result.markdown = eval_ctx.render.as_ref().and_then(|render| {
+                render_result_for_display(
+                    &result.call,
+                    &result.output,
+                    &raw_fallback,
+                    render.decl_map.as_ref(),
+                )
+            });
+            result
+        })
+        .collect()
+}
 
-    ToolEvalContext {
-        providers,
-        session_name,
-        allowed_tool_names,
-        current_agent_package,
-        handoff_targets,
-        emit_tool_call_fn,
-        emit_tool_result_fn,
-        emit_tool_blocked_fn,
-        confirm_tool_use_fn,
-        dispatch_hook_fn,
-    }
+fn tool_result_raw_fallback(output: &Value) -> String {
+    extract_user_display_text(output).unwrap_or_else(|| match output {
+        Value::String(text) => text.clone(),
+        _ => pretty_yaml_block(output),
+    })
 }
 
 /// Look up and render the call template for a tool, returning rendered string or None.
@@ -468,7 +531,7 @@ fn emit_tool_result_with_template(
     let event = AgentEvent::Tool(ToolEvent::Completed {
         id: call.id.clone().unwrap_or_default(),
         output: result.clone(),
-        markdown,
+        markdown: markdown.clone(),
     });
 
     if !harnx_core::sink::emit_agent_event(event) && *IS_STDOUT_TERMINAL {
@@ -922,6 +985,64 @@ mod tests {
             source: "test".to_string(),
             model: "test-model".to_string(),
         }
+    }
+
+    #[test]
+    fn populate_result_markdown_renders_templates_and_leaves_missing_templates_none() {
+        let mut decl_map = HashMap::new();
+        decl_map.insert(
+            "bash_exec".to_string(),
+            make_decl_with_templates("bash_exec", None, Some("OK: {{ result.content[0].text }}")),
+        );
+        let eval_ctx = ToolEvalContext {
+            render: Some(ToolEvalRenderContext {
+                decl_map: Arc::new(decl_map),
+            }),
+            providers: Vec::new(),
+            session_name: None,
+            allowed_tool_names: HashSet::new(),
+            current_agent_package: None,
+            handoff_targets: HashMap::new(),
+            emit_tool_call_fn: Arc::new(|_, _| {}),
+            emit_tool_result_fn: Arc::new(|_, _| {}),
+            emit_tool_blocked_fn: Arc::new(|_, _| {}),
+            confirm_tool_use_fn: Arc::new(|_, _, _| ToolUseConfirmation::Approve),
+            dispatch_hook_fn: Arc::new(|_| {
+                Box::pin(async {
+                    harnx_core::hooks::HookOutcome {
+                        control: harnx_core::hooks::HookResultControl::Continue,
+                        result: harnx_core::hooks::HookResult::default(),
+                    }
+                })
+            }),
+        };
+
+        let results = populate_result_markdown(
+            vec![
+                ToolResult::new(
+                    ToolCall::new(
+                        "bash_exec".to_string(),
+                        json!({"command": "echo hi"}),
+                        Some("call-1".to_string()),
+                        None,
+                    ),
+                    json!({"content": [{"type": "text", "text": "hello"}]}),
+                ),
+                ToolResult::new(
+                    ToolCall::new(
+                        "plain_tool".to_string(),
+                        json!({"command": "echo hi"}),
+                        Some("call-2".to_string()),
+                        None,
+                    ),
+                    json!({"content": [{"type": "text", "text": "raw"}]}),
+                ),
+            ],
+            &eval_ctx,
+        );
+
+        assert_eq!(results[0].markdown.as_deref(), Some("OK: hello"));
+        assert!(results[1].markdown.is_none());
     }
 
     fn make_per_tool_hooks(

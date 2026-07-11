@@ -3,8 +3,8 @@ use crate::test_support::TestConfigSandbox;
 use anyhow::anyhow;
 use harnx_core::{
     api_types::CompletionTokenUsage,
-    event::{AgentEventSink, ModelEvent, SessionEvent, TurnEvent},
-    message::MessageContentToolCalls,
+    event::{AgentEventSink, ModelEvent, SessionEvent, ToolEvent, TurnEvent},
+    message::{Message, MessageContent, MessageContentToolCalls},
 };
 use harnx_runtime::{client::ToolCall, config::Config};
 use http_body_util::BodyExt;
@@ -496,6 +496,108 @@ fn ag_ui_sink_maps_tool_started_completed_to_ag_ui_events() {
             assert_eq!(event.role, Role::Tool);
         }
         other => panic!("expected ToolCallResult, got: {other:?}"),
+    }
+
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn ag_ui_sink_emits_tool_summary_custom_event_and_preserves_start_args() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+
+    sink.emit(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "history-2".to_string(),
+            name: "read_history".to_string(),
+            kind: harnx_core::event::ToolKind::Other,
+            markdown: Some("### Summary\n- item".to_string()),
+            input: json!({"limit": 2}),
+            locations: vec![],
+        }),
+        None,
+    );
+
+    match rx.try_recv().expect("tool start") {
+        Event::ToolCallStart(event) => {
+            assert_eq!(
+                event.tool_call_id,
+                serde_json::from_value(json!("history-2")).unwrap()
+            );
+            assert_eq!(event.tool_call_name, "read_history");
+            assert_eq!(event.parent_message_id, Some(message_id.clone()));
+        }
+        other => panic!("expected ToolCallStart, got: {other:?}"),
+    }
+
+    match rx.try_recv().expect("tool summary") {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "tool_summary");
+            assert_eq!(
+                value,
+                json!({
+                    "tool_call_id": "history-2",
+                    "markdown": "### Summary\n- item"
+                })
+            );
+        }
+        other => panic!("expected tool_summary custom event, got: {other:?}"),
+    }
+
+    match rx.try_recv().expect("tool args") {
+        Event::ToolCallArgs(event) => {
+            assert_eq!(
+                event.tool_call_id,
+                serde_json::from_value(json!("history-2")).unwrap()
+            );
+            assert_eq!(event.delta, json!({"limit": 2}).to_string());
+        }
+        other => panic!("expected ToolCallArgs, got: {other:?}"),
+    }
+
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn ag_ui_sink_usage_event_includes_context_fields_and_legacy_fields() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let context = Arc::new(|| {
+        Some(super::UsageContextSnapshot {
+            context_tokens: 321,
+            max_context_tokens: Some(1000),
+            context_percent: Some(32.1),
+        })
+    });
+    let sink =
+        super::AgUiSink::with_snapshot_and_context(tx, message_id, true, None, Some(context));
+
+    sink.emit(
+        AgentEvent::Model(ModelEvent::Usage {
+            input: 12,
+            output: 34,
+            cached: 5,
+            session_label: Some("sess-a".to_string()),
+        }),
+        None,
+    );
+
+    match rx.try_recv().expect("usage event") {
+        Event::Custom(CustomEvent { name, value, .. }) => {
+            assert_eq!(name, "usage");
+            assert_eq!(value["input"], json!(12));
+            assert_eq!(value["output"], json!(34));
+            assert_eq!(value["cached"], json!(5));
+            assert_eq!(value["session_label"], json!("sess-a"));
+            assert_eq!(value["context_tokens"], json!(321));
+            assert_eq!(value["max_context_tokens"], json!(1000));
+            let pct = value["context_percent"]
+                .as_f64()
+                .expect("context_percent is a number");
+            assert!((pct - 32.1).abs() < 0.01, "context_percent was {pct}");
+        }
+        other => panic!("expected usage custom event, got: {other:?}"),
     }
 
     assert!(rx.try_recv().is_err());
@@ -1917,6 +2019,56 @@ fn history_messages_for_snapshot_keeps_tool_turn_prose_and_tool_entries() {
     );
     assert!(
         matches!(&snapshot[2], AgUiMessage::Tool { content, .. } if content.contains("tool output"))
+    );
+}
+
+#[test]
+fn history_snapshot_prefers_tool_markdown_and_falls_back_to_output() {
+    let tool_call_markdown = ToolCall::new(
+        "read_history".to_string(),
+        json!({"limit": 1}),
+        Some("call-1".to_string()),
+        None,
+    );
+    let mut result_with_markdown =
+        harnx_core::tool::ToolResult::new(tool_call_markdown, json!("plain output"));
+    result_with_markdown.markdown = Some("### Rendered summary".to_string());
+
+    let tool_call_fallback = ToolCall::new(
+        "read_history".to_string(),
+        json!({"limit": 2}),
+        Some("call-2".to_string()),
+        None,
+    );
+    let result_without_markdown =
+        harnx_core::tool::ToolResult::new(tool_call_fallback, json!("fallback output"));
+
+    let history = vec![Message {
+        role: MessageRole::Tool,
+        content: MessageContent::ToolCalls(MessageContentToolCalls::new(
+            vec![result_with_markdown, result_without_markdown],
+            "assistant prose".to_string(),
+            None,
+        )),
+        id: Some(Uuid::new_v4().to_string()),
+        log_seq: None,
+        log_timestamp: None,
+    }];
+
+    let snapshot = history_messages_for_snapshot(&history);
+    assert_eq!(snapshot.len(), 3);
+    assert!(
+        matches!(&snapshot[0], AgUiMessage::Assistant { content, .. } if content.as_deref() == Some("assistant prose"))
+    );
+    assert!(
+        matches!(&snapshot[1], AgUiMessage::Tool { content, tool_call_id, .. }
+        if content == "### Rendered summary"
+            && tool_call_id == &serde_json::from_value(json!("call-1")).unwrap())
+    );
+    assert!(
+        matches!(&snapshot[2], AgUiMessage::Tool { content, tool_call_id, .. }
+        if content == "fallback output"
+            && tool_call_id == &serde_json::from_value(json!("call-2")).unwrap())
     );
 }
 

@@ -146,6 +146,7 @@ mod tests {
                 None,
             ),
             output: json!({ "status": "ok" }),
+            markdown: None,
             content,
             switch_agent: None,
         }

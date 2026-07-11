@@ -5,6 +5,7 @@ import { useAgUiRuntime } from '@assistant-ui/react-ag-ui';
 import { HttpAgent } from '@ag-ui/client';
 import type { AgentSubscriber, Message } from '@ag-ui/client';
 import { PendingContext } from './PendingContext';
+import { UsageContext, type UsageData } from './UsageContext';
 import { uploadAttachment } from './api';
 
 export interface ChatProviderProps {
@@ -89,18 +90,37 @@ export function toAgUiMessages(messages: readonly Message[]): Message[] {
     });
 }
 
-class HarnxHttpAgent extends HttpAgent {
+export interface HarnxHttpAgentOptions {
+  url: string;
+  onStatus: (text: string | null) => void;
+  onRunFailed: (message: string) => void;
+  onUsage: (usage: UsageData) => void;
+  onToolSummary: (id: string, summary: string) => void;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export class HarnxHttpAgent extends HttpAgent {
   private readonly onStatus: (text: string | null) => void;
   private readonly onRunFailedCb: (message: string) => void;
+  private readonly onUsageCb: (usage: UsageData) => void;
+  private readonly onToolSummaryCb: (id: string, summary: string) => void;
 
-  constructor(
-    url: string,
-    onStatus: (text: string | null) => void,
-    onRunFailed: (message: string) => void,
-  ) {
-    super({ url });
-    this.onStatus = onStatus;
-    this.onRunFailedCb = onRunFailed;
+  constructor(options: HarnxHttpAgentOptions) {
+    super({ url: options.url });
+    this.onStatus = options.onStatus;
+    this.onRunFailedCb = options.onRunFailed;
+    this.onUsageCb = options.onUsage;
+    this.onToolSummaryCb = options.onToolSummary;
+  }
+
+  private handleCustomEvent(name: string, value: any) {
+    if (name === 'status') {
+      this.onStatus(value?.text || null);
+    } else if (name === 'usage') {
+      this.onUsageCb(value);
+    } else if (name === 'tool_summary') {
+      this.onToolSummaryCb(value?.tool_call_id, value?.markdown);
+    }
   }
 
   override async runAgent(params: any, subscriber?: AgentSubscriber) {
@@ -108,16 +128,14 @@ class HarnxHttpAgent extends HttpAgent {
       ...subscriber,
       onEvent: async (payload) => {
         const event = payload.event as any;
-        if (event?.type === 'CUSTOM' && event.name === 'status') {
-          this.onStatus(event.value?.text || null);
+        if (event?.type === 'CUSTOM') {
+          this.handleCustomEvent(event.name, event.value);
         }
         return subscriber?.onEvent?.(payload as any);
       },
       onCustomEvent: async (payload) => {
         const event = payload.event as any;
-        if (event?.name === 'status') {
-          this.onStatus(event.value?.text || null);
-        }
+        this.handleCustomEvent(event?.name, event?.value);
         return subscriber?.onCustomEvent?.(payload as any);
       },
       onRunFailed: async (payload) => {
@@ -144,6 +162,8 @@ class HarnxHttpAgent extends HttpAgent {
 export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId, isFreshSession, children }) => {
   const [statusText, setStatusText] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
+  const [usage, setUsage] = useState<UsageData | null>(null);
+  const [toolSummaries, setToolSummaries] = useState<Map<string, string>>(new Map());
 
   const attachments: AttachmentAdapter = useMemo(() => ({
     accept: 'image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain',
@@ -187,11 +207,21 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId
     async remove() {}
   }), [agentName, sessionId]);
 
-  const agent = useMemo(() => new HarnxHttpAgent(
-    `/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}`,
-    (text) => setStatusText(text),
-    (message) => setErrorText(message),
-  ), [agentName, sessionId]);
+  const agent = useMemo(() => new HarnxHttpAgent({
+    url: `/v1/agents/${encodeURIComponent(agentName)}/sessions/${encodeURIComponent(sessionId)}`,
+    onStatus: (text) => setStatusText(text),
+    onRunFailed: (message) => setErrorText(message),
+    onUsage: (newUsage) => setUsage(newUsage),
+    onToolSummary: (id, summary) => {
+      if (id && summary) {
+        setToolSummaries((prev) => {
+          const next = new Map(prev);
+          next.set(id, summary);
+          return next;
+        });
+      }
+    },
+  }), [agentName, sessionId]);
 
   const runtime = useAgUiRuntime({
     agent,
@@ -207,10 +237,12 @@ export const ChatProvider: React.FC<ChatProviderProps> = ({ agentName, sessionId
 
   return (
     <PendingContext.Provider value={{ statusText, setStatusText, errorText, setErrorText }}>
-      <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
-        <RuntimeSessionSubscriber enabled={!isFreshSession} />
-        {children}
-      </AssistantRuntimeProvider>
+      <UsageContext.Provider value={{ usage, toolSummaries }}>
+        <AssistantRuntimeProvider key={`${agentName}:${sessionId}`} runtime={runtime}>
+          <RuntimeSessionSubscriber enabled={!isFreshSession} />
+          {children}
+        </AssistantRuntimeProvider>
+      </UsageContext.Provider>
     </PendingContext.Provider>
   );
 };

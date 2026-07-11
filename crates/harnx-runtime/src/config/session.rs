@@ -346,6 +346,7 @@ fn repair_orphan_tool_calls(pending: PendingToolCalls, _name: &str) -> Result<Me
         output: serde_json::json!({
             "error": "tool response lost (session was interrupted before results were persisted)"
         }),
+        markdown: None,
         content: Vec::new(),
         switch_agent: None,
     };
@@ -395,6 +396,7 @@ fn assemble_tool_message(
                 Some(out) => ToolResult {
                     call,
                     output: out.output,
+                    markdown: out.markdown,
                     content: out.content,
                     switch_agent: out.switch_agent,
                 },
@@ -736,6 +738,7 @@ fn append_message_entries(content: &mut String, msg: &Message, session_id: &str)
                     id: r.call.id.clone(),
                     name: r.call.name.clone(),
                     output: r.output.clone(),
+                    markdown: r.markdown.clone(),
                     content: r.content.clone(),
                     switch_agent: r.switch_agent.clone(),
                 })
@@ -956,6 +959,7 @@ fn relog_message(session: &mut Session, msg: &Message) -> usize {
                     id: r.call.id.clone(),
                     name: r.call.name.clone(),
                     output: r.output.clone(),
+                    markdown: r.markdown.clone(),
                     content: r.content.clone(),
                     switch_agent: r.switch_agent.clone(),
                 })
@@ -1297,6 +1301,7 @@ pub fn add_tool_results(session: &mut Session, results: &[crate::tool::ToolResul
             id: r.call.id.clone(),
             name: r.call.name.clone(),
             output: r.output.clone(),
+            markdown: r.markdown.clone(),
             content: r.content.clone(),
             switch_agent: r.switch_agent.clone(),
         })
@@ -2552,6 +2557,7 @@ results:
                     "data": "<image: image/png, 4 base64 chars>"
                 }]
             }),
+            markdown: None,
             content: vec![MessageContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: data_uri.clone(),
@@ -2632,6 +2638,7 @@ results:
         let result = ToolResult {
             call: call.clone(),
             output: redacted_output.clone(),
+            markdown: None,
             content: vec![MessageContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: data_uri.clone(),
