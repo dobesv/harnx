@@ -179,12 +179,19 @@ impl Tui {
                 // would be computed but never displayed. Skip it.
                 self.app.detail_view_text = Some(detail_text.clone());
                 self.app.detail_view_raw_yaml = None;
+                self.app.detail_view_raw_unavailable = false;
             }
             _ => {
                 self.app.detail_view_text = None;
-                self.app.detail_view_raw_yaml = self
-                    .selected_seq_range()
+                let range = self.selected_seq_range();
+                self.app.detail_view_raw_yaml = range
                     .and_then(|(from, to)| self.config.read().get_message_range_yaml(from, to));
+                // A seq-bearing selection in an active session that fails to
+                // resolve is a real failure, not a "no raw available" case:
+                // surface it instead of silently showing the rendered summary.
+                let has_session = self.config.read().session.is_some();
+                self.app.detail_view_raw_unavailable =
+                    range.is_some() && has_session && self.app.detail_view_raw_yaml.is_none();
             }
         }
         self.app.detail_view_open = true;

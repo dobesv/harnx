@@ -8365,6 +8365,36 @@ async fn detail_fallback_pairs_tool_result_by_id_when_not_adjacent() {
     );
 }
 
+#[tokio::test]
+async fn detail_view_shows_explicit_message_when_raw_entry_unresolvable() {
+    // Session present (so resolution is expected) but the row's seq points past
+    // the log, so get_message_range_yaml returns None.
+    let config = test_config_with_mock_client_and_agent("test-agent", Some("detail-unavailable"));
+    let mut harness = crate::test_utils::TuiTestHarness::with_config(config).await;
+    let tui = harness.tui();
+
+    // Clear the initial welcome banner so transcript_focus lands on the row
+    // pushed below rather than that seeded row.
+    tui.app.transcript.clear();
+
+    tui.app.transcript.push(TranscriptItem::AssistantText {
+        text: "SUMMARY-ONLY".to_string(),
+        seq: Some(9999),
+        timestamp: Some(chrono::Utc::now()),
+        rendered_cache: None,
+    });
+    tui.app.transcript_focus = Some(tui.app.transcript.len() - 1);
+    tui.app.transcript_selection_anchor = None;
+    tui.open_detail_view_for_focused_item_for_test();
+    harness.render();
+
+    let screen = harness.screen_contents();
+    assert!(
+        screen.contains("Raw log entry unavailable"),
+        "expected explicit unavailable message, got: {screen}"
+    );
+}
+
 /// Regression test for GitHub issue #507.
 ///
 /// When entering browsing mode with enough items to overflow the viewport,

@@ -1286,6 +1286,12 @@ impl Tui {
                 format!("Detail ({doc_count} entries)")
             };
             (entries, title)
+        } else if self.app.detail_view_raw_unavailable {
+            let entries = vec![vec![Line::from(Span::styled(
+                "⚠ Raw log entry unavailable for this item.",
+                Style::default().fg(Color::Yellow),
+            ))]];
+            (entries, "Detail".to_string())
         } else {
             // Fallback: no session / no seq — render TUI fields verbatim
             let (from, to) = self.app.selected_transcript_range();

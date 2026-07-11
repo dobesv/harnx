@@ -130,6 +130,11 @@ pub(super) struct App {
     /// detail_view_open is set.  None when no session is active or the item
     /// has no sequence number.
     pub(super) detail_view_raw_yaml: Option<String>,
+    /// True when the focused row should resolve to a raw log entry (active
+    /// session + the selection carries a seq) but resolution failed. Drives an
+    /// explicit "unavailable" line instead of silently falling back to the
+    /// already-rendered (summarized) row.
+    pub(super) detail_view_raw_unavailable: bool,
     pub(super) detail_view_text: Option<String>,
     /// True when the user is browsing history in fullscreen mode.
     /// Distinct from detail_view_open which shows raw YAML.

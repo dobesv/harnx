@@ -196,6 +196,7 @@ impl Tui {
             },
             detail_view_open: false,
             detail_view_raw_yaml: None,
+            detail_view_raw_unavailable: false,
             detail_view_text: None,
             transcript_browsing: false,
             browsing_view_scroll: {
