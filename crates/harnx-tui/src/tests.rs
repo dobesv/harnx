@@ -2177,22 +2177,22 @@ async fn live_log_seq_assignment_applies_to_tool_calls_started_after_seq_event()
         other => panic!("expected ToolCall transcript item, got {other:?}"),
     }
 
-    // Verify pending_tool_seq is still set: multiple tool calls in the same round
+    // Verify current_group_seq is still set: multiple tool calls in the same round
     // share the same log_seq, so we intentionally do NOT clear it after first use.
-    // It will be cleared when the next LogSeqAssigned arrives (for a different round)
-    // and successfully backfills a UserText or AssistantText item, or overwritten by
-    // the next tool round's LogSeqAssigned.
+    // It is only replaced when the next LogSeqAssigned arrives, for the next group.
     assert_eq!(
-        tui.app.pending_tool_seq,
+        tui.app.current_group_seq,
         Some(5),
-        "pending_tool_seq should remain set so subsequent ToolCalls in same round share seq"
+        "current_group_seq should remain set so subsequent ToolCalls in same round share seq"
     );
 }
 
 #[tokio::test]
-async fn log_seq_backfill_clears_pending_tool_seq() {
-    // When LogSeqAssigned arrives and backfills an EXISTING transcript item,
-    // pending_tool_seq must be cleared (not left set for the next ToolCall).
+async fn log_seq_assignment_sets_current_group_seq_even_after_backfill() {
+    // LogSeqAssigned always records the incoming seq as current_group_seq,
+    // regardless of whether it also backfilled an existing transcript row.
+    // Tool-call rows created afterward (for the same group) must still be
+    // able to read it.
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
@@ -2209,7 +2209,7 @@ async fn log_seq_backfill_clears_pending_tool_seq() {
     .await
     .unwrap();
 
-    // Now LogSeqAssigned should backfill the AssistantText and NOT set pending_tool_seq.
+    // LogSeqAssigned backfills the AssistantText AND records current_group_seq.
     tui.handle_tui_event(TuiEvent::Agent(
         AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 3 }),
         None,
@@ -2217,16 +2217,16 @@ async fn log_seq_backfill_clears_pending_tool_seq() {
     .await
     .unwrap();
 
-    // Backfill succeeded — pending should be None.
     assert_eq!(
-        tui.app.pending_tool_seq, None,
-        "pending_tool_seq must be None after backfill consumed the seq"
+        tui.app.current_group_seq,
+        Some(3),
+        "current_group_seq must be set to the assigned seq even after backfilling an existing row"
     );
 }
 
 #[tokio::test]
 async fn live_log_seq_assignment_applies_to_blocked_tool_calls() {
-    // ToolEvent::Blocked also uses pending_tool_seq, same as ToolEvent::Started.
+    // ToolEvent::Blocked also uses current_group_seq, same as ToolEvent::Started.
     let config = test_config();
     let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
     let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
@@ -2264,11 +2264,552 @@ async fn live_log_seq_assignment_applies_to_blocked_tool_calls() {
             assert_eq!(
                 *seq,
                 Some(7),
-                "blocked ToolCall should inherit pending_tool_seq"
+                "blocked ToolCall should inherit current_group_seq"
             );
         }
         other => panic!("expected ToolCall, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn live_seq_assistant_text_and_tools_share_round_seq() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    // User turn logged at seq 1.
+    tui.app.transcript.push(TranscriptItem::UserText {
+        text: "do it".to_string(),
+        seq: None,
+        timestamp: Some(chrono::Utc::now()),
+    });
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 1 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Assistant streams accompanying text, THEN the round's tool-calls entry is
+    // logged at seq 2 (LogSeqAssigned arrives before ToolEvent::Started), then
+    // two parallel tool calls execute.
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("calling tools".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 2 }),
+        None,
+    ))
+    .await
+    .unwrap();
+    for id in ["call_a", "call_b"] {
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Tool(harnx_core::event::ToolEvent::Started {
+                id: id.to_string(),
+                name: "read".to_string(),
+                kind: Default::default(),
+                markdown: None,
+                input: serde_json::Value::Null,
+                locations: vec![],
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    }
+
+    let user_seq = tui.app.transcript.iter().find_map(|i| match i {
+        TranscriptItem::UserText { seq, .. } => Some(*seq),
+        _ => None,
+    });
+    let assistant_seq = tui.app.transcript.iter().find_map(|i| match i {
+        TranscriptItem::AssistantText { seq, .. } => Some(*seq),
+        _ => None,
+    });
+    let tool_seqs: Vec<Option<usize>> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|i| match i {
+            TranscriptItem::ToolCall { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(user_seq, Some(Some(1)), "user text keeps its own seq");
+    assert_eq!(
+        assistant_seq,
+        Some(Some(2)),
+        "accompanying text joins the tool round"
+    );
+    assert_eq!(
+        tool_seqs,
+        vec![Some(2), Some(2)],
+        "both parallel tool calls share the round seq"
+    );
+}
+
+#[tokio::test]
+async fn live_seq_plain_assistant_turn_gets_own_seq() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.app.transcript.push(TranscriptItem::UserText {
+        text: "hi".to_string(),
+        seq: None,
+        timestamp: Some(chrono::Utc::now()),
+    });
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 1 }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("hello".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 2 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let seqs: Vec<Option<usize>> =
+        tui.app
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::UserText { seq, .. }
+                | TranscriptItem::AssistantText { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(seqs, vec![Some(1), Some(2)]);
+}
+
+#[tokio::test]
+async fn live_seq_banner_excluded_from_grouping() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+    // Clear the startup welcome/banner items so the pushed rows below land at
+    // known indices 0 and 1.
+    tui.clear_transcript();
+
+    // Agent banner: AssistantText with no timestamp. Must never consume a seq.
+    tui.app.transcript.push(TranscriptItem::AssistantText {
+        text: "agent ready".to_string(),
+        seq: None,
+        timestamp: None,
+        rendered_cache: None,
+    });
+    tui.app.transcript.push(TranscriptItem::UserText {
+        text: "hi".to_string(),
+        seq: None,
+        timestamp: Some(chrono::Utc::now()),
+    });
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 1 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let banner_seq = match &tui.app.transcript[0] {
+        TranscriptItem::AssistantText { seq, .. } => *seq,
+        other => panic!("expected banner, got {other:?}"),
+    };
+    let user_seq = match &tui.app.transcript[1] {
+        TranscriptItem::UserText { seq, .. } => *seq,
+        other => panic!("expected user text, got {other:?}"),
+    };
+    assert_eq!(banner_seq, None, "banner never gets a seq");
+    assert_eq!(user_seq, Some(1), "seq lands on the live user row");
+}
+
+/// Extracts the (kind, seq) pairs for every seq-bearing row (`UserText`,
+/// `AssistantText`, `ToolCall`), in transcript order. Other row kinds
+/// (thoughts, notices, tool results, …) are intentionally omitted: they
+/// never carry a seq, and their exact interleaving position can legally
+/// differ between the live and reconstruction paths.
+fn seq_bearing_rows(items: &[TranscriptItem]) -> Vec<(&'static str, Option<usize>)> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::UserText { seq, .. } => Some(("user", *seq)),
+            TranscriptItem::AssistantText { seq, .. } => Some(("assistant", *seq)),
+            TranscriptItem::ToolCall { seq, .. } => Some(("tool_call", *seq)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Keystone regression guard: the live seq-assignment path in
+/// `handle_agent_event` (`LogSeqAssigned` + `current_group_seq`) must
+/// produce the exact same per-row seq mapping as the reconstruction path
+/// `messages_to_transcript_items`. This drives an equivalent multi-round
+/// session through both paths and compares the seq-bearing rows directly,
+/// rather than relying on hand-substituted scenario tests to imply
+/// equivalence.
+#[tokio::test]
+async fn live_seq_map_matches_reconstruction() {
+    use harnx_core::message::{Message, MessageContent, MessageContentToolCalls, MessageRole};
+    use harnx_core::tool::{ToolCall, ToolResult};
+
+    let call_a = ToolCall::new(
+        "read".to_string(),
+        serde_json::Value::Null,
+        Some("a".to_string()),
+        None,
+    );
+    let call_b = ToolCall::new(
+        "write".to_string(),
+        serde_json::Value::Null,
+        Some("b".to_string()),
+        None,
+    );
+
+    let messages = vec![
+        make_compacted_message(MessageRole::User, MessageContent::Text("q1".to_string()), 1),
+        Message {
+            role: MessageRole::Tool,
+            content: MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![
+                    ToolResult::new(call_a, serde_json::json!({"ok": 1})),
+                    ToolResult::new(call_b, serde_json::json!({"ok": 2})),
+                ],
+                "working".to_string(),
+                None,
+            )),
+            id: None,
+            log_seq: Some(2),
+            log_timestamp: None,
+        },
+        make_compacted_message(
+            MessageRole::Assistant,
+            MessageContent::Text("answer".to_string()),
+            3,
+        ),
+    ];
+
+    let expected = crate::lifecycle::messages_to_transcript_items(
+        &messages,
+        &std::collections::HashMap::new(),
+    );
+
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+    tui.clear_transcript();
+
+    // Round 1: user turn logged at seq 1.
+    tui.app.transcript.push(TranscriptItem::UserText {
+        text: "q1".to_string(),
+        seq: None,
+        timestamp: Some(chrono::Utc::now()),
+    });
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 1 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Round 2: accompanying text + two parallel tool calls, all logged at
+    // seq 2 (mirrors the Tool-role message with two ToolResults above).
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("working".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 2 }),
+        None,
+    ))
+    .await
+    .unwrap();
+    for (id, name) in [("a", "read"), ("b", "write")] {
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: id.to_string(),
+                name: name.to_string(),
+                kind: Default::default(),
+                markdown: None,
+                input: serde_json::Value::Null,
+                locations: vec![],
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    }
+    for (id, ok) in [("a", 1), ("b", 2)] {
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Completed {
+                id: id.to_string(),
+                output: serde_json::json!({"ok": ok}),
+                markdown: None,
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    }
+
+    // Round 3: plain assistant turn logged at seq 3.
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("answer".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 3 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let expected_rows = seq_bearing_rows(&expected);
+    let actual_rows = seq_bearing_rows(&tui.app.transcript);
+
+    assert_eq!(
+        expected_rows,
+        vec![
+            ("user", Some(1)),
+            ("assistant", Some(2)),
+            ("tool_call", Some(2)),
+            ("tool_call", Some(2)),
+            ("assistant", Some(3)),
+        ],
+        "sanity-check the reconstruction side matches the documented mapping"
+    );
+    assert_eq!(
+        actual_rows, expected_rows,
+        "live seq-bearing row map must match reconstruction exactly"
+    );
+
+    // Tool results carry no seq at all (in either path) — just confirm the
+    // count of rendered result rows lines up.
+    let expected_result_count = expected
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::ToolResultMarkdown { .. }))
+        .count();
+    let actual_result_count = tui
+        .app
+        .transcript
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::ToolResultMarkdown { .. }))
+        .count();
+    assert_eq!(expected_result_count, 2);
+    assert_eq!(actual_result_count, expected_result_count);
+}
+
+/// A `ThoughtChunk` and a `NoticeEvent::Info` land between the round's
+/// accompanying `MessageChunk` and its tool calls. Neither should steal the
+/// round's `LogSeqAssigned` seq (they don't match the walk-back patterns in
+/// `handle_agent_event`) nor block it from reaching the still-unsequenced
+/// `AssistantText` row further back in the transcript.
+#[tokio::test]
+async fn live_seq_interleaved_thoughts_and_notices_within_round() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.app.transcript.push(TranscriptItem::UserText {
+        text: "q".to_string(),
+        seq: None,
+        timestamp: Some(chrono::Utc::now()),
+    });
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 1 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("thinking about tools".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::ThoughtChunk {
+            blocks: vec![ContentBlock::Text("considering options".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Notice(NoticeEvent::Info("checking cache".to_string())),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 2 }),
+        None,
+    ))
+    .await
+    .unwrap();
+    for id in ["call_a", "call_b"] {
+        tui.handle_tui_event(TuiEvent::Agent(
+            AgentEvent::Tool(ToolEvent::Started {
+                id: id.to_string(),
+                name: "read".to_string(),
+                kind: Default::default(),
+                markdown: None,
+                input: serde_json::Value::Null,
+                locations: vec![],
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    }
+
+    let has_thought = tui
+        .app
+        .transcript
+        .iter()
+        .any(|i| matches!(i, TranscriptItem::ThoughtText(_)));
+    let has_notice =
+        tui.app.transcript.iter().any(
+            |i| matches!(i, TranscriptItem::SystemText(text) if text.contains("checking cache")),
+        );
+    let assistant_seq = tui.app.transcript.iter().find_map(|i| match i {
+        TranscriptItem::AssistantText { seq, .. } => Some(*seq),
+        _ => None,
+    });
+    let tool_seqs: Vec<Option<usize>> = tui
+        .app
+        .transcript
+        .iter()
+        .filter_map(|i| match i {
+            TranscriptItem::ToolCall { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect();
+
+    assert!(has_thought, "the thought row should still be rendered");
+    assert!(has_notice, "the notice row should still be rendered");
+    assert_eq!(
+        assistant_seq,
+        Some(Some(2)),
+        "accompanying text still joins the round despite the interleaving thought/notice"
+    );
+    assert_eq!(
+        tool_seqs,
+        vec![Some(2), Some(2)],
+        "interleaving thought/notice rows must not steal or block the round seq"
+    );
+}
+
+/// Two consecutive plain user/assistant turns: each row gets its own seq
+/// and no seq leaks across the turn boundary (the second `LogSeqAssigned`
+/// walk-back must stop at the first already-sequenced row).
+#[tokio::test]
+async fn live_seq_back_to_back_turns() {
+    let config = test_config();
+    let persistent = Arc::new(Mutex::new(PersistentHookManager::new()));
+    let mut tui = Tui::init(&config, AsyncHookManager::new(), persistent)
+        .await
+        .unwrap();
+
+    tui.app.transcript.push(TranscriptItem::UserText {
+        text: "user1".to_string(),
+        seq: None,
+        timestamp: Some(chrono::Utc::now()),
+    });
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 1 }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("assistant1".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 2 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    tui.app.transcript.push(TranscriptItem::UserText {
+        text: "user2".to_string(),
+        seq: None,
+        timestamp: Some(chrono::Utc::now()),
+    });
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 3 }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("assistant2".to_string())],
+        }),
+        None,
+    ))
+    .await
+    .unwrap();
+    tui.handle_tui_event(TuiEvent::Agent(
+        AgentEvent::Session(SessionEvent::LogSeqAssigned { seq: 4 }),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let rows: Vec<(&'static str, Option<usize>)> = seq_bearing_rows(&tui.app.transcript);
+    assert_eq!(
+        rows,
+        vec![
+            ("user", Some(1)),
+            ("assistant", Some(2)),
+            ("user", Some(3)),
+            ("assistant", Some(4)),
+        ],
+        "each turn's rows get their own seq with no leakage across the turn boundary"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5943,6 +6484,7 @@ async fn tui_assistant_text_preserves_line_breaks() {
 async fn tool_call_display_format() {
     let mut harness = TuiTestHarness::new().await;
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "exec".to_string(),
         body: Some(ToolCallBody::Yaml(
             "command: ls -la\nworking_dir: /tmp\n".to_string(),
@@ -5952,6 +6494,7 @@ async fn tool_call_display_format() {
         rendered_cache: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "write_file".to_string(),
         body: Some(ToolCallBody::Markdown(
             "write **hello.txt** with 3 lines".to_string(),
@@ -5961,6 +6504,7 @@ async fn tool_call_display_format() {
         rendered_cache: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "think".to_string(),
         body: None,
         seq: None,
@@ -5968,6 +6512,7 @@ async fn tool_call_display_format() {
         rendered_cache: None,
     });
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "search".to_string(),
         body: Some(ToolCallBody::Yaml(
             "query: rust async patterns\nmax_results: 10\ninclude_code: true\n".to_string(),
@@ -5985,6 +6530,7 @@ async fn tool_call_display_format() {
 fn render_tool_call_markdown_body_suppresses_header() {
     let lines = render_entry_lines(
         &TranscriptItem::ToolCall {
+            id: String::new(),
             tool_name: "write_file".to_string(),
             body: Some(ToolCallBody::Markdown(
                 "write **hello.txt** with 3 lines".to_string(),
@@ -6007,6 +6553,7 @@ fn render_tool_call_markdown_body_suppresses_header() {
 fn render_tool_call_yaml_body_keeps_header() {
     let lines = render_entry_lines(
         &TranscriptItem::ToolCall {
+            id: String::new(),
             tool_name: "read".to_string(),
             body: Some(ToolCallBody::Yaml("path: /tmp/foo.txt\n".to_string())),
             seq: None,
@@ -6029,6 +6576,7 @@ fn render_tool_call_meta_line_precedes_markdown_body() {
         .with_timezone(&chrono::Utc);
     let lines = render_entry_lines(
         &TranscriptItem::ToolCall {
+            id: String::new(),
             tool_name: "write_file".to_string(),
             body: Some(ToolCallBody::Markdown("write hello.txt".to_string())),
             seq: Some(3),
@@ -6052,6 +6600,7 @@ async fn tool_call_with_seq_number() {
     let mut harness = TuiTestHarness::new().await;
     harness.tui().app.show_sequence_numbers = true;
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "read".to_string(),
         body: Some(ToolCallBody::Yaml("path: /tmp/foo.txt\n".to_string())),
         seq: Some(7),
@@ -6435,6 +6984,7 @@ async fn test_d4_key_i_copies_tool_call() {
     let mut harness = TuiTestHarness::new().await;
     harness.tui().app.transcript.clear();
     harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        id: String::new(),
         tool_name: "search".to_string(),
         body: Some(crate::types::ToolCallBody::Yaml("query: rust".to_string())),
         seq: Some(9),
@@ -6506,6 +7056,192 @@ async fn test_d4_key_r_opens_rewind_modal_assistant_text() {
             seq: 12,
             user_text: None,
         })
+    );
+}
+
+#[tokio::test]
+async fn rewind_on_tool_call_row_resolves_to_prior_seq() {
+    // Session log on disk: seq 1 user message, seq 2 ToolCalls, seq 3 ToolResults.
+    // Rewinding a row whose seq is the ToolCalls entry must resolve to seq 1
+    // (the message that preceded the round) rather than orphaning the pair.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config: GlobalConfig = Arc::new(RwLock::new(Config {
+        sessions_dir_override: Some(tmp.path().to_path_buf()),
+        ..Config::default()
+    }));
+    {
+        let mut guard = config.write();
+        guard.use_session(Some("rewind")).unwrap();
+        let session = guard.session.as_mut().unwrap();
+        harnx_runtime::config::session::append_event(
+            session,
+            &harnx_core::session::SessionLogEntry::Message {
+                id: None,
+                timestamp: None,
+                fence_token: None,
+                role: harnx_core::message::MessageRole::User,
+                content: harnx_core::message::MessageContent::Text("hi".into()),
+            },
+        );
+        harnx_runtime::config::session::append_event(
+            session,
+            &harnx_core::session::SessionLogEntry::ToolCalls {
+                text: String::new(),
+                thought: None,
+                calls: vec![],
+                timestamp: None,
+                fence_token: None,
+            },
+        );
+        harnx_runtime::config::session::append_event(
+            session,
+            &harnx_core::session::SessionLogEntry::ToolResults {
+                results: vec![],
+                timestamp: None,
+            },
+        );
+    }
+
+    let mut harness = TuiTestHarness::with_config(config).await;
+    harness.tui().app.transcript.push(TranscriptItem::ToolCall {
+        tool_name: "read".to_string(),
+        id: "c1".to_string(),
+        body: None,
+        seq: Some(2),
+        timestamp: Some(chrono::Utc::now()),
+        rendered_cache: None,
+    });
+    harness.tui().app.transcript_focus = Some(harness.tui().app.transcript.len() - 1);
+    harness.tui().app.transcript_selection_anchor = None;
+
+    harness.tui().handle_transcript_rewind_for_test();
+
+    match &harness.tui().app.modal {
+        Some(crate::types::ModalState::ConfirmRewind { seq, .. }) => assert_eq!(*seq, 1),
+        other => panic!("expected ConfirmRewind {{ seq: 1 }}, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn transcript_edit_targets_selected_seq_range() {
+    let mut harness = TuiTestHarness::new().await;
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "first".to_string(),
+        seq: Some(3),
+        timestamp: None,
+    });
+    harness
+        .tui()
+        .app
+        .transcript
+        .push(TranscriptItem::AssistantText {
+            text: "second".to_string(),
+            seq: Some(4),
+            timestamp: None,
+            rendered_cache: None,
+        });
+
+    // Single selection.
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().app.transcript_selection_anchor = None;
+    assert_eq!(
+        harness.tui().transcript_edit_command_for_test().as_deref(),
+        Some(".edit message 3")
+    );
+
+    // Range selection across both rows.
+    harness.tui().app.transcript_focus = Some(1);
+    harness.tui().app.transcript_selection_anchor = Some(0);
+    assert_eq!(
+        harness.tui().transcript_edit_command_for_test().as_deref(),
+        Some(".edit message 3-4")
+    );
+}
+
+#[tokio::test]
+async fn detail_view_edit_restores_focus_when_index_valid() {
+    // Drive a *real* `.edit message 1` (via a stubbed `true` editor and an
+    // after-hook that writes the replacement YAML) so `handle_transcript_edit`
+    // actually clears transcript_focus/transcript_browsing/detail_view_open,
+    // forcing the 'e' arm's restoration + reopen block to do real work.
+    // With a `seq: None` row (the old version of this test), that clearing
+    // never happens and the block is never exercised.
+    let sessions_tmp = tempfile::TempDir::new().unwrap();
+    let editor_tmp = tempfile::TempDir::new().unwrap();
+
+    let config = test_config();
+    {
+        let mut guard = config.write();
+        guard.sessions_dir_override = Some(sessions_tmp.path().to_path_buf());
+        guard.editor = Some("true".to_string());
+        guard.use_session(Some("detail-edit")).unwrap();
+
+        let session = guard.session.as_mut().unwrap();
+        harnx_runtime::config::session::append_event(
+            session,
+            &harnx_core::session::SessionLogEntry::Message {
+                id: None,
+                timestamp: None,
+                fence_token: None,
+                role: harnx_core::message::MessageRole::User,
+                content: harnx_core::message::MessageContent::Text("original".into()),
+            },
+        );
+
+        let editor_tmp_path = editor_tmp.path().to_path_buf();
+        guard.temp_dir_override = Some(editor_tmp_path.clone());
+        guard.set_tui_editor_hooks(
+            None,
+            Some(Box::new(move || {
+                let temp_path = std::fs::read_dir(&editor_tmp_path)
+                    .unwrap()
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .find(|p| p.extension().and_then(|e| e.to_str()) == Some("yaml"))
+                    .expect("message edit temp file");
+                let replacement =
+                    serde_yaml::to_string(&harnx_core::session::SessionLogEntry::Message {
+                        id: None,
+                        timestamp: None,
+                        fence_token: None,
+                        role: harnx_core::message::MessageRole::User,
+                        content: harnx_core::message::MessageContent::Text("edited".into()),
+                    })
+                    .unwrap();
+                std::fs::write(&temp_path, replacement).unwrap();
+            })),
+        );
+    }
+
+    let mut harness = TuiTestHarness::with_config(config).await;
+    harness.tui().app.transcript.clear();
+    harness.tui().app.transcript.push(TranscriptItem::UserText {
+        text: "original".to_string(),
+        seq: Some(1),
+        timestamp: None,
+    });
+    harness.tui().app.transcript_focus = Some(0);
+    harness.tui().app.transcript_browsing = true;
+    harness.tui().app.detail_view_open = true;
+
+    harness
+        .tui()
+        .handle_detail_view_key_for_test(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        harness.tui().app.detail_view_open,
+        "detail view reopened after edit"
+    );
+    assert_eq!(
+        harness.tui().app.transcript_focus,
+        Some(0),
+        "focus restored"
+    );
+    assert!(
+        harness.tui().app.transcript_browsing,
+        "browsing state restored"
     );
 }
 
@@ -8111,6 +8847,7 @@ async fn test_browsing_mode_non_navigable_items_visible_not_focusable() {
         .transcript
         .push(TranscriptItem::ToolResultMarkdown {
             text: "thinking...".to_string(),
+            id: String::new(),
             rendered_cache: None,
         });
     harness
@@ -8139,6 +8876,75 @@ async fn test_browsing_mode_non_navigable_items_visible_not_focusable() {
         harness.tui().app.transcript_focus,
         Some(2),
         "Down should skip non-navigable ToolResultMarkdown at index 1 and focus AssistantText at index 2"
+    );
+}
+
+#[tokio::test]
+async fn detail_fallback_pairs_tool_result_by_id_when_not_adjacent() {
+    let mut harness = crate::test_utils::TuiTestHarness::new().await;
+    let tui = harness.tui();
+
+    // Clear the initial welcome banner so transcript_focus 0 lands on the
+    // ToolCall pushed below rather than that seeded row.
+    tui.app.transcript.clear();
+
+    // A tool call and its result separated by an interleaving row. No session,
+    // so the detail view uses the fallback render path.
+    tui.app.transcript.push(TranscriptItem::ToolCall {
+        tool_name: "read".to_string(),
+        body: None,
+        seq: None,
+        timestamp: Some(chrono::Utc::now()),
+        rendered_cache: None,
+        id: "call_x".to_string(),
+    });
+    tui.app
+        .transcript
+        .push(TranscriptItem::SystemText("noise".to_string()));
+    tui.app.transcript.push(TranscriptItem::ToolResultMarkdown {
+        text: "RESULT-X-CONTENT".to_string(),
+        rendered_cache: None,
+        id: "call_x".to_string(),
+    });
+
+    tui.app.transcript_focus = Some(0);
+    tui.app.transcript_selection_anchor = None;
+    tui.open_detail_view_for_focused_item_for_test();
+    harness.render();
+
+    assert!(
+        harness.screen_contents().contains("RESULT-X-CONTENT"),
+        "detail view must show the id-matched result even when not adjacent"
+    );
+}
+
+#[tokio::test]
+async fn detail_view_shows_explicit_message_when_raw_entry_unresolvable() {
+    // Session present (so resolution is expected) but the row's seq points past
+    // the log, so get_message_range_yaml returns None.
+    let config = test_config_with_mock_client_and_agent("test-agent", Some("detail-unavailable"));
+    let mut harness = crate::test_utils::TuiTestHarness::with_config(config).await;
+    let tui = harness.tui();
+
+    // Clear the initial welcome banner so transcript_focus lands on the row
+    // pushed below rather than that seeded row.
+    tui.app.transcript.clear();
+
+    tui.app.transcript.push(TranscriptItem::AssistantText {
+        text: "SUMMARY-ONLY".to_string(),
+        seq: Some(9999),
+        timestamp: Some(chrono::Utc::now()),
+        rendered_cache: None,
+    });
+    tui.app.transcript_focus = Some(tui.app.transcript.len() - 1);
+    tui.app.transcript_selection_anchor = None;
+    tui.open_detail_view_for_focused_item_for_test();
+    harness.render();
+
+    let screen = harness.screen_contents();
+    assert!(
+        screen.contains("Raw log entry unavailable"),
+        "expected explicit unavailable message, got: {screen}"
     );
 }
 

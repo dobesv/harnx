@@ -141,6 +141,7 @@ fn tool_call_body(
 /// string outputs before extraction so pre-dimmed test inputs render
 /// cleanly.
 fn tool_completed_to_transcript_items(
+    id: &str,
     output: &serde_json::Value,
     markdown: Option<&str>,
 ) -> Vec<TranscriptItem> {
@@ -155,6 +156,7 @@ fn tool_completed_to_transcript_items(
     }
     vec![TranscriptItem::ToolResultMarkdown {
         text: clean,
+        id: id.to_string(),
         rendered_cache: None,
     }]
 }
@@ -177,15 +179,32 @@ impl Tui {
                 // would be computed but never displayed. Skip it.
                 self.app.detail_view_text = Some(detail_text.clone());
                 self.app.detail_view_raw_yaml = None;
+                self.app.detail_view_raw_unavailable = false;
             }
             _ => {
                 self.app.detail_view_text = None;
-                self.app.detail_view_raw_yaml = self
-                    .selected_seq_range()
+                let range = self.selected_seq_range();
+                self.app.detail_view_raw_yaml = range
                     .and_then(|(from, to)| self.config.read().get_message_range_yaml(from, to));
+                // A seq-bearing selection in an active session that fails to
+                // resolve is a real failure, not a "no raw available" case:
+                // surface it instead of silently showing the rendered summary.
+                let has_session = self.config.read().session.is_some();
+                self.app.detail_view_raw_unavailable =
+                    range.is_some() && has_session && self.app.detail_view_raw_yaml.is_none();
             }
         }
         self.app.detail_view_open = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_detail_view_for_focused_item_for_test(&mut self) {
+        self.open_detail_view_for_focused_item();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn handle_detail_view_key_for_test(&mut self, key: KeyEvent) -> Result<()> {
+        self.handle_detail_view_key(key).await
     }
 
     async fn handle_detail_view_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -953,47 +972,43 @@ impl Tui {
         // is a pure seq-assignment event and should not create stray headings
         // or flush pending thoughts.
         if let AgentEvent::Session(SessionEvent::LogSeqAssigned { seq }) = event {
-            // Try to backfill the seq into the most recent unsequenced transcript
-            // item (UserText, AssistantText, or ToolCall). If an item is found and
-            // patched, the seq has been consumed — clear pending_tool_seq.  If no
-            // item is found yet (e.g. ToolEvent::Started arrives after this event),
-            // store seq in pending_tool_seq so the upcoming ToolCall can pick it up.
-            let mut backfilled = false;
+            // This seq identifies the log entry currently being assembled.
+            // Assign it to every not-yet-sequenced *live* row belonging to that
+            // entry's group: walk back from the tail and stop at the first row
+            // that already carries a seq (the previous group's boundary). Rows
+            // without a timestamp (the agent banner, replayed history) are not
+            // live and are skipped so they neither consume nor block a seq.
+            // Then remember it as the current group seq: tool-call rows are
+            // created *after* this event (ToolEvent::Started fires once
+            // execution begins) and inherit it, so all parallel calls of a
+            // round share the round's ToolCalls seq — matching
+            // messages_to_transcript_items.
             for item in self.app.transcript.iter_mut().rev() {
                 match item {
-                    // Only backfill "live" entries — items with a timestamp are
-                    // created during an active session.  The agent banner is
-                    // AssistantText { seq: None, timestamp: None } and must not
-                    // consume a seq that belongs to the first real message.
                     TranscriptItem::UserText {
-                        seq: item_seq @ None,
+                        seq: item_seq,
                         timestamp: Some(_),
                         ..
                     }
                     | TranscriptItem::AssistantText {
-                        seq: item_seq @ None,
+                        seq: item_seq,
                         timestamp: Some(_),
                         ..
                     }
                     | TranscriptItem::ToolCall {
-                        seq: item_seq @ None,
+                        seq: item_seq,
                         timestamp: Some(_),
                         ..
                     } => {
+                        if item_seq.is_some() {
+                            break;
+                        }
                         *item_seq = Some(seq);
-                        backfilled = true;
-                        break;
                     }
                     _ => {}
                 }
             }
-            if backfilled {
-                // Seq consumed by an existing item; clear any pending slot.
-                self.app.pending_tool_seq = None;
-            } else {
-                // No existing item to patch; save for the next ToolCall creation.
-                self.app.pending_tool_seq = Some(seq);
-            }
+            self.app.current_group_seq = Some(seq);
             return;
         }
 
@@ -1059,8 +1074,11 @@ impl Tui {
                 }]
             }
             AgentEvent::Tool(ToolEvent::Completed {
-                output, markdown, ..
-            }) => tool_completed_to_transcript_items(&output, markdown.as_deref()),
+                id,
+                output,
+                markdown,
+                ..
+            }) => tool_completed_to_transcript_items(&id, &output, markdown.as_deref()),
             AgentEvent::Model(ModelEvent::MessageChunk { blocks }) => {
                 let text = concat_text_blocks(&blocks);
                 if text.is_empty() {
@@ -1251,6 +1269,7 @@ impl Tui {
                 }
             }
             AgentEvent::Tool(ToolEvent::Started {
+                id,
                 name,
                 markdown,
                 input,
@@ -1258,13 +1277,15 @@ impl Tui {
             }) => {
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
+                    id,
                     body: tool_call_body(markdown.as_deref(), &input),
-                    seq: self.app.pending_tool_seq,
+                    seq: self.app.current_group_seq,
                     timestamp: Some(chrono::Utc::now()),
                     rendered_cache: None,
                 }]
             }
             AgentEvent::Tool(ToolEvent::Blocked {
+                id,
                 name,
                 input,
                 reason,
@@ -1284,8 +1305,9 @@ impl Tui {
                 };
                 vec![TranscriptItem::ToolCall {
                     tool_name: name,
+                    id,
                     body,
-                    seq: self.app.pending_tool_seq,
+                    seq: self.app.current_group_seq,
                     timestamp: Some(chrono::Utc::now()),
                     rendered_cache: None,
                 }]
@@ -2745,15 +2767,27 @@ impl Tui {
         }
     }
 
-    /// Handle 'e' key: open edit command for selected item(s).
-    async fn handle_transcript_edit(&mut self) -> Result<()> {
-        let Some((from, to)) = self.selected_seq_range() else {
-            return Ok(());
-        };
-        let cmd = if from == to {
+    /// Build the `.edit message ...` command for the current selection, from
+    /// its resolved seq range. Shared by `handle_transcript_edit` and the
+    /// test seam below so tests exercise the real construction.
+    fn transcript_edit_command(&self) -> Option<String> {
+        let (from, to) = self.selected_seq_range()?;
+        Some(if from == to {
             format!(".edit message {}", from)
         } else {
             format!(".edit message {}-{}", from, to)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcript_edit_command_for_test(&self) -> Option<String> {
+        self.transcript_edit_command()
+    }
+
+    /// Handle 'e' key: open edit command for selected item(s).
+    async fn handle_transcript_edit(&mut self) -> Result<()> {
+        let Some(cmd) = self.transcript_edit_command() else {
+            return Ok(());
         };
         self.run_command(&cmd).await?;
         self.app.transcript_focus = None;
@@ -2822,11 +2856,17 @@ impl Tui {
         let Some(seq) = item.seq() else {
             return;
         };
+        let seq = self.config.read().resolve_rewind_seq(seq);
         let user_text = match item {
             TranscriptItem::UserText { text, .. } => Some(text.clone()),
             _ => None,
         };
         self.app.modal = Some(crate::types::ModalState::ConfirmRewind { seq, user_text });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handle_transcript_rewind_for_test(&mut self) {
+        self.handle_transcript_rewind();
     }
 }
 
@@ -2852,7 +2892,7 @@ mod tests {
             "isError": false
         });
 
-        let items = tool_completed_to_transcript_items(&output, None);
+        let items = tool_completed_to_transcript_items("call_1", &output, None);
 
         assert_eq!(items.len(), 1);
         match &items[0] {

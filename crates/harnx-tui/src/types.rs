@@ -88,7 +88,11 @@ pub(super) struct App {
     pub(super) last_usage_transcript_idx: Option<usize>,
     pub(super) pending_thought_source: Option<AgentSource>,
     pub(super) pending_thought_text: String,
-    pub(super) pending_tool_seq: Option<usize>,
+    /// Log seq of the entry currently being assembled from the live event
+    /// stream. Assigned when `LogSeqAssigned` arrives and read by tool-call
+    /// rows created afterward, so every row belonging to one logged entry
+    /// (accompanying assistant text + all tool calls of a round) shares its seq.
+    pub(super) current_group_seq: Option<usize>,
     pub(super) pending_message: Option<PendingMessage>,
     pub(super) completions: Vec<(String, Option<String>)>,
     pub(super) completion_index: usize,
@@ -126,6 +130,11 @@ pub(super) struct App {
     /// detail_view_open is set.  None when no session is active or the item
     /// has no sequence number.
     pub(super) detail_view_raw_yaml: Option<String>,
+    /// True when the focused row should resolve to a raw log entry (active
+    /// session + the selection carries a seq) but resolution failed. Drives an
+    /// explicit "unavailable" line instead of silently falling back to the
+    /// already-rendered (summarized) row.
+    pub(super) detail_view_raw_unavailable: bool,
     pub(super) detail_view_text: Option<String>,
     /// True when the user is browsing history in fullscreen mode.
     /// Distinct from detail_view_open which shows raw YAML.
@@ -262,6 +271,9 @@ pub enum TranscriptItem {
     /// inline emphasis from a `result_template` both display correctly.
     ToolResultMarkdown {
         text: String,
+        /// Tool-call id this result answers; used to pair a result with its
+        /// ToolCall row independent of transcript position. Empty when unknown.
+        id: String,
         rendered_cache: RenderedCache,
     },
     StatusLine(String),
@@ -276,6 +288,9 @@ pub enum TranscriptItem {
     UsageLine(String),
     ToolCall {
         tool_name: String,
+        /// Stable tool-call id from the event stream / session log. Empty when
+        /// unknown. Pairs this call with its ToolResultMarkdown row.
+        id: String,
         body: Option<ToolCallBody>,
         seq: Option<usize>,
         timestamp: Option<DateTime<Utc>>,

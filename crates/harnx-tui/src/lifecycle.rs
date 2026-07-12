@@ -169,7 +169,7 @@ impl Tui {
             last_usage_transcript_idx: None,
             pending_thought_source: None,
             pending_thought_text: String::new(),
-            pending_tool_seq: None,
+            current_group_seq: None,
             pending_message: None,
             completions: vec![],
             completion_index: 0,
@@ -196,6 +196,7 @@ impl Tui {
             },
             detail_view_open: false,
             detail_view_raw_yaml: None,
+            detail_view_raw_unavailable: false,
             detail_view_text: None,
             transcript_browsing: false,
             browsing_view_scroll: {
@@ -640,6 +641,7 @@ pub(crate) fn messages_to_transcript_items(
                         };
                         items.push(TranscriptItem::ToolCall {
                             tool_name: r.call.name.clone(),
+                            id: r.call.id.clone().unwrap_or_default(),
                             body,
                             seq: msg.log_seq,
                             timestamp: msg.log_timestamp,
@@ -663,6 +665,7 @@ pub(crate) fn messages_to_transcript_items(
                         if !trimmed.is_empty() {
                             items.push(TranscriptItem::ToolResultMarkdown {
                                 text: trimmed.to_string(),
+                                id: r.call.id.clone().unwrap_or_default(),
                                 rendered_cache: None,
                             });
                         }
