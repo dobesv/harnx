@@ -120,9 +120,9 @@ test.describe('Gallery', () => {
     // Open the restored session
     await page.click('text=session-restored');
     
-    // Wait for the tool summary to show up from snapshot markdown
+    // Wait for the tool summary to show up from snapshot markdown (fallback to command args)
     await expect(page.locator('.aui-tool-call')).toBeVisible();
-    await expect(page.locator('text=Restored tool summary')).toBeVisible();
+    await expect(page.locator('text=$ ls -la')).toBeVisible();
     
     await page.waitForTimeout(200);
 

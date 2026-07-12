@@ -217,26 +217,23 @@ body {
 }
 
 .aui-thread-viewport {
-  flex-grow: 1;
+  flex: 1 1 auto;
+  min-height: 0; /* allow the flex child to shrink so it, not the page, scrolls */
   overflow-y: auto;
-  padding: 1rem 1.5rem 180px 1.5rem; /* bottom padding for sticky composer */
+  padding: 1rem 1.5rem;
   display: flex;
   flex-direction: column;
 }
 
+/* Composer/status area stacked BELOW the scrollable transcript in the flex
+   column (not overlaying it), so the end of the transcript and the bottom of
+   the scrollbar are never hidden under the composer. */
 .aui-thread-bottom {
   display: flex;
   flex-direction: column;
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  background: linear-gradient(to bottom, transparent, var(--bg) 15%);
-  pointer-events: none;
+  flex: 0 0 auto;
+  background: var(--bg);
   z-index: 10;
-}
-.aui-thread-bottom > * {
-  pointer-events: auto;
 }
 
 .aui-composer-container {

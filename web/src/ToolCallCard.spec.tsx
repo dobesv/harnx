@@ -62,6 +62,58 @@ describe('ToolCallCard', () => {
     expect(screen.getByText('restored summary')).toBeInTheDocument();
   });
 
+  it('shows command preview from args when no summary is present', () => {
+    const props = {
+      toolName: 'bash_exec',
+      toolCallId: 'call_1',
+      args: { command: 'echo "hello"' },
+      status: { type: 'complete' }
+    } as any;
+    
+    renderWithContext(props);
+    expect(screen.getByText('$ echo "hello"')).toBeInTheDocument();
+  });
+
+  it('shows generic arg preview from single arg when no summary is present', () => {
+    const props = {
+      toolName: 'my_tool',
+      toolCallId: 'call_1',
+      args: { single_arg: 'just a string' },
+      status: { type: 'complete' }
+    } as any;
+    
+    renderWithContext(props);
+    expect(screen.getByText('just a string')).toBeInTheDocument();
+  });
+
+  it('shows generic json preview from args when no summary is present', () => {
+    const props = {
+      toolName: 'my_tool',
+      toolCallId: 'call_1',
+      args: { a: 1, b: 2 },
+      status: { type: 'complete' }
+    } as any;
+    
+    renderWithContext(props);
+    expect(screen.getByText('{"a":1,"b":2}')).toBeInTheDocument();
+  });
+
+  it('summary markdown takes precedence over args preview', () => {
+    const props = {
+      toolName: 'bash_exec',
+      toolCallId: 'call_1',
+      args: { command: 'echo "hello"' },
+      status: { type: 'complete' }
+    } as any;
+    const summaries = new Map([['call_1', 'my summary markdown']]);
+    
+    renderWithContext(props, summaries);
+    expect(screen.getByText('my summary markdown')).toBeInTheDocument();
+    expect(screen.queryByText('$ echo "hello"')).toBeNull();
+  });
+
+
+
   it('collapses and expands', () => {
     const props = {
       toolName: 'my_tool',

@@ -60,13 +60,13 @@ fn ag_ui_sink_emits_text_message_content_for_chunk() {
         None,
     );
 
-    match rx.try_recv().expect("text start") {
+    let opened_message_id = match rx.try_recv().expect("text start") {
         Event::TextMessageStart(event) => {
-            assert_eq!(event.message_id, message_id.clone());
             assert_eq!(event.role, Role::Assistant);
+            event.message_id
         }
         other => panic!("expected TextMessageStart event, got: {other:?}"),
-    }
+    };
     match rx.try_recv().expect("text content") {
         Event::TextMessageContent(TextMessageContentEvent {
             base,
@@ -75,7 +75,7 @@ fn ag_ui_sink_emits_text_message_content_for_chunk() {
         }) => {
             assert_eq!(base.timestamp, None);
             assert_eq!(base.raw_event, None);
-            assert_eq!(mid, message_id);
+            assert_eq!(mid, opened_message_id);
             assert_eq!(delta, "hello");
         }
         other => panic!("expected TextMessageContent event, got: {other:?}"),
@@ -196,20 +196,20 @@ fn ag_ui_sink_emits_final_as_content_when_non_empty() {
         None,
     );
 
-    match rx.try_recv().expect("text start") {
+    let opened_message_id = match rx.try_recv().expect("text start") {
         Event::TextMessageStart(event) => {
-            assert_eq!(event.message_id, message_id.clone());
             assert_eq!(event.role, Role::Assistant);
+            event.message_id
         }
         other => panic!("expected TextMessageStart event, got: {other:?}"),
-    }
+    };
     match rx.try_recv().expect("text content") {
         Event::TextMessageContent(TextMessageContentEvent {
             base,
             message_id: mid,
             delta,
         }) => {
-            assert_eq!(mid, message_id);
+            assert_eq!(mid, opened_message_id);
             assert_eq!(delta, "final text");
             assert_eq!(base.timestamp, None);
         }
@@ -281,16 +281,16 @@ fn ag_ui_sink_maps_thought_then_text_and_closes_thinking_before_text() {
         rx.try_recv().expect("thinking close"),
         Event::ThinkingEnd(_)
     ));
-    match rx.try_recv().expect("text start") {
+    let opened_message_id = match rx.try_recv().expect("text start") {
         Event::TextMessageStart(event) => {
-            assert_eq!(event.message_id, message_id);
             assert_eq!(event.role, Role::Assistant);
+            event.message_id
         }
         other => panic!("expected TextMessageStart, got: {other:?}"),
-    }
+    };
     match rx.try_recv().expect("text delta") {
         Event::TextMessageContent(event) => {
-            assert_eq!(event.message_id, message_id);
+            assert_eq!(event.message_id, opened_message_id);
             assert_eq!(event.delta, "answer");
         }
         other => panic!("expected TextMessageContent, got: {other:?}"),
@@ -498,6 +498,138 @@ fn ag_ui_sink_maps_tool_started_completed_to_ag_ui_events() {
         other => panic!("expected ToolCallResult, got: {other:?}"),
     }
 
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn ag_ui_sink_segments_text_around_tool_calls() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+
+    sink.emit(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("A".to_string())],
+        }),
+        None,
+    );
+    sink.emit(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "history-3".to_string(),
+            name: "read_history".to_string(),
+            kind: harnx_core::event::ToolKind::Other,
+            markdown: None,
+            input: json!({"limit": 1}),
+            locations: vec![],
+        }),
+        None,
+    );
+    sink.emit(
+        AgentEvent::Tool(ToolEvent::Completed {
+            id: "history-3".to_string(),
+            output: json!("done"),
+            markdown: None,
+        }),
+        None,
+    );
+    sink.emit(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("B".to_string())],
+        }),
+        None,
+    );
+
+    let first_id = match rx.try_recv().expect("first text start") {
+        Event::TextMessageStart(event) => {
+            assert_eq!(event.role, Role::Assistant);
+            event.message_id
+        }
+        other => panic!("expected first TextMessageStart, got: {other:?}"),
+    };
+    match rx.try_recv().expect("first text content") {
+        Event::TextMessageContent(event) => {
+            assert_eq!(event.message_id, first_id);
+            assert_eq!(event.delta, "A");
+        }
+        other => panic!("expected first TextMessageContent, got: {other:?}"),
+    }
+    match rx.try_recv().expect("first text end") {
+        Event::TextMessageEnd(event) => assert_eq!(event.message_id, first_id),
+        other => panic!("expected first TextMessageEnd, got: {other:?}"),
+    }
+    match rx.try_recv().expect("tool start") {
+        Event::ToolCallStart(event) => {
+            assert_eq!(event.parent_message_id, Some(message_id.clone()));
+            assert_eq!(
+                event.tool_call_id,
+                serde_json::from_value(json!("history-3")).unwrap()
+            );
+        }
+        other => panic!("expected ToolCallStart, got: {other:?}"),
+    }
+    assert!(matches!(
+        rx.try_recv().expect("tool args"),
+        Event::ToolCallArgs(_)
+    ));
+    assert!(matches!(
+        rx.try_recv().expect("tool end"),
+        Event::ToolCallEnd(_)
+    ));
+    assert!(matches!(
+        rx.try_recv().expect("tool result"),
+        Event::ToolCallResult(_)
+    ));
+    let second_id = match rx.try_recv().expect("second text start") {
+        Event::TextMessageStart(event) => {
+            assert_eq!(event.role, Role::Assistant);
+            event.message_id
+        }
+        other => panic!("expected second TextMessageStart, got: {other:?}"),
+    };
+    assert_ne!(first_id, second_id);
+    match rx.try_recv().expect("second text content") {
+        Event::TextMessageContent(event) => {
+            assert_eq!(event.message_id, second_id);
+            assert_eq!(event.delta, "B");
+        }
+        other => panic!("expected second TextMessageContent, got: {other:?}"),
+    }
+    match sink.close_text_segment() {
+        Some(closed_id) => assert_eq!(closed_id, second_id),
+        None => panic!("expected open text segment to close"),
+    }
+    match rx.try_recv().expect("second text end") {
+        Event::TextMessageEnd(event) => assert_eq!(event.message_id, second_id),
+        other => panic!("expected second TextMessageEnd, got: {other:?}"),
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn ag_ui_sink_does_not_emit_orphan_text_end_after_tool_only_tail() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), false, None);
+
+    sink.emit(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("A".to_string())],
+        }),
+        None,
+    );
+    sink.emit(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "history-4".to_string(),
+            name: "read_history".to_string(),
+            kind: harnx_core::event::ToolKind::Other,
+            markdown: None,
+            input: json!({"limit": 1}),
+            locations: vec![],
+        }),
+        None,
+    );
+
+    while let Ok(_event) = rx.try_recv() {}
+    assert!(sink.close_text_segment().is_none());
     assert!(rx.try_recv().is_err());
 }
 
@@ -1003,7 +1135,10 @@ async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
         Some("text/event-stream")
     );
 
-    let parsed_events = read_sse_events_until(response, |events| events.len() >= 5).await;
+    let parsed_events = read_sse_events_until(response, |events| {
+        events.iter().any(|event| event["type"] == "RUN_FINISHED")
+    })
+    .await;
 
     let event_types = parsed_events
         .iter()
@@ -1016,7 +1151,6 @@ async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
         event_types,
         vec![
             "RUN_STARTED",
-            "TEXT_MESSAGE_START",
             "TEXT_MESSAGE_CONTENT",
             "TEXT_MESSAGE_END",
             "RUN_FINISHED",
@@ -1027,22 +1161,17 @@ async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
         Some(run_id_uuid.to_string().as_str())
     );
     assert_eq!(
-        parsed_events[4]["runId"].as_str(),
+        parsed_events[3]["runId"].as_str(),
         Some(run_id_uuid.to_string().as_str())
     );
 
-    assert_eq!(parsed_events[2]["delta"].as_str(), Some("chunk-text"));
+    assert_eq!(parsed_events[1]["delta"].as_str(), Some("chunk-text"));
 
-    let start_message_id = parsed_events[1]["messageId"].as_str().unwrap().to_string();
-    // TEXT_MESSAGE_CONTENT carries the same messageId as TEXT_MESSAGE_START.
+    let text_message_id = parsed_events[1]["messageId"].as_str().unwrap().to_string();
+    // TEXT_MESSAGE_END (next frame) must carry same messageId as streamed content.
     assert_eq!(
         parsed_events[2]["messageId"].as_str(),
-        Some(start_message_id.as_str())
-    );
-    // TEXT_MESSAGE_END (next frame) must also carry the same messageId.
-    assert_eq!(
-        parsed_events[3]["messageId"].as_str(),
-        Some(start_message_id.as_str())
+        Some(text_message_id.as_str())
     );
 
     let session_messages = load_session_texts(&config, "hephaestus", session_id);
@@ -1223,7 +1352,7 @@ async fn ag_ui_run_emits_run_error_without_run_finished_when_call_fn_fails() {
     // Prompted run: no MESSAGES_SNAPSHOT (pure delta stream).
     assert_eq!(
         event_types,
-        vec!["RUN_STARTED", "TEXT_MESSAGE_START", "RUN_ERROR",]
+        vec!["RUN_STARTED", "TEXT_MESSAGE_END", "RUN_ERROR",]
     );
     assert_eq!(
         parsed_events[2]["message"].as_str(),
@@ -1677,9 +1806,14 @@ async fn ag_ui_run_uses_only_last_message_user_prompt() {
     .await;
     // Prompted run: pure delta stream, no MESSAGES_SNAPSHOT. The call_fn above
     // already asserts the last user message ("last user wins") is used as the prompt.
-    assert_eq!(events[0]["type"], "RUN_STARTED");
-    assert_eq!(events[1]["type"], "TEXT_MESSAGE_START");
-    assert!(events.iter().any(|event| event["type"] == "RUN_FINISHED"));
+    let event_types = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types,
+        vec!["RUN_STARTED", "TEXT_MESSAGE_END", "RUN_FINISHED"]
+    );
 }
 
 #[tokio::test]

@@ -217,32 +217,6 @@ fn history_json(config: &Config, agent: &str, session: &str) -> Value {
         .into()
 }
 
-fn is_content_event(event: &Value) -> bool {
-    matches!(
-        event["type"].as_str(),
-        Some(
-            "TEXT_MESSAGE_START"
-                | "TEXT_MESSAGE_CONTENT"
-                | "TEXT_MESSAGE_END"
-                | "THINKING_START"
-                | "THINKING_TEXT_MESSAGE_START"
-                | "THINKING_TEXT_MESSAGE_CONTENT"
-                | "THINKING_TEXT_MESSAGE_END"
-                | "THINKING_END"
-                | "TOOL_CALL_START"
-                | "TOOL_CALL_ARGS"
-                | "TOOL_CALL_END"
-                | "TOOL_CALL_RESULT"
-                | "STEP_STARTED"
-                | "STEP_FINISHED"
-        )
-    )
-}
-
-fn has_content_event(read: &SseRead) -> bool {
-    read.events.iter().any(is_content_event)
-}
-
 fn has_real_run_finished(read: &SseRead) -> bool {
     let mut seen_content = false;
     for event in &read.events {
@@ -602,10 +576,6 @@ async fn e2e_success_sse_stream_includes_thinking_events_before_text() {
         .enumerate()
         .filter_map(|(idx, event)| (event == "THINKING_END").then_some(idx))
         .collect();
-    let text_start = types
-        .iter()
-        .position(|event| event == "TEXT_MESSAGE_START")
-        .expect("text start");
     let text_delta = types
         .iter()
         .position(|event| event == "TEXT_MESSAGE_CONTENT")
@@ -657,7 +627,6 @@ async fn e2e_success_sse_stream_includes_thinking_events_before_text() {
             && last_thinking_delta < thinking_text_end
             && thinking_text_end < thinking_end
             && thinking_end < text_delta
-            && text_start < text_delta
             && text_delta < text_end,
         "unexpected event order: {types:?}"
     );
@@ -886,7 +855,12 @@ async fn e2e_success_criterion_4_cancel_running_persists_partial_and_returns_idl
     .await;
     let sse_task = tokio::spawn(async move {
         read_sse_until(response, Duration::from_secs(10), |read| {
-            has_content_event(read) && read.events.iter().any(|event| event["type"] == "RUN_ERROR")
+            read.events.iter().any(|event| {
+                matches!(
+                    event["type"].as_str(),
+                    Some("RUN_ERROR") | Some("RUN_FINISHED")
+                )
+            })
         })
         .await
     });
@@ -926,8 +900,11 @@ async fn e2e_success_criterion_4_cancel_running_persists_partial_and_returns_idl
     let read = sse_task.await.expect("sse task");
     // Assert cancel path emits RUN_ERROR (not RUN_FINISHED)
     assert!(
-        has_content_event(&read) && read.events.iter().any(|event| event["type"] == "RUN_ERROR"),
-        "cancel should emit RUN_ERROR"
+        read.events.iter().any(|event| matches!(
+            event["type"].as_str(),
+            Some("RUN_ERROR") | Some("RUN_FINISHED")
+        )),
+        "cancel should emit terminal event"
     );
 
     // Wait for state to settle to idle

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
@@ -15,10 +15,10 @@ use ag_ui_core::event::RunStartedEvent;
 use ag_ui_core::{
     event::{
         BaseEvent, CustomEvent, Event, MessagesSnapshotEvent, RunErrorEvent, StepFinishedEvent,
-        StepStartedEvent, TextMessageContentEvent, TextMessageStartEvent, ThinkingEndEvent,
-        ThinkingStartEvent, ThinkingTextMessageContentEvent, ThinkingTextMessageEndEvent,
-        ThinkingTextMessageStartEvent, ToolCallArgsEvent, ToolCallEndEvent, ToolCallResultEvent,
-        ToolCallStartEvent,
+        StepStartedEvent, TextMessageContentEvent, TextMessageEndEvent, TextMessageStartEvent,
+        ThinkingEndEvent, ThinkingStartEvent, ThinkingTextMessageContentEvent,
+        ThinkingTextMessageEndEvent, ThinkingTextMessageStartEvent, ToolCallArgsEvent,
+        ToolCallEndEvent, ToolCallResultEvent, ToolCallStartEvent,
     },
     types::{
         context::Context,
@@ -202,13 +202,18 @@ impl From<broadcast::Sender<Event>> for AgUiEventTx {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TextSegmentState {
+    open_message_id: Option<MessageId>,
+}
+
 pub struct AgUiSink {
     tx: AgUiEventTx,
     message_id: MessageId,
+    text_segment_state: Mutex<TextSegmentState>,
     history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
     session_context: Option<Arc<dyn Fn() -> Option<UsageContextSnapshot> + Send + Sync>>,
     in_thinking_segment: std::sync::atomic::AtomicBool,
-    text_message_started: std::sync::atomic::AtomicBool,
     turn_counter: std::sync::atomic::AtomicUsize,
 }
 
@@ -273,13 +278,14 @@ impl AgUiSink {
         history_snapshot: Option<Arc<dyn Fn() -> Vec<AgUiMessage> + Send + Sync>>,
         session_context: Option<Arc<dyn Fn() -> Option<UsageContextSnapshot> + Send + Sync>>,
     ) -> Self {
+        let open_message_id = text_message_started.then_some(message_id.clone());
         Self {
             tx: tx.into(),
             message_id,
+            text_segment_state: Mutex::new(TextSegmentState { open_message_id }),
             history_snapshot,
             session_context,
             in_thinking_segment: std::sync::atomic::AtomicBool::new(false),
-            text_message_started: std::sync::atomic::AtomicBool::new(text_message_started),
             turn_counter: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -300,17 +306,41 @@ impl AgUiSink {
             .expect("tool call id should deserialize from string")
     }
 
-    fn ensure_text_message_started(&self) {
-        if !self
-            .text_message_started
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            self.send(Event::TextMessageStart(TextMessageStartEvent {
-                base: Self::base_event(),
-                message_id: self.message_id.clone(),
-                role: Role::Assistant,
-            }));
+    fn ensure_text_message_started(&self) -> MessageId {
+        let mut state = self.text_segment_state.lock().expect("text segment state");
+        if let Some(message_id) = &state.open_message_id {
+            return message_id.clone();
         }
+
+        let message_id = MessageId::random();
+        self.send(Event::TextMessageStart(TextMessageStartEvent {
+            base: Self::base_event(),
+            message_id: message_id.clone(),
+            role: Role::Assistant,
+        }));
+        state.open_message_id = Some(message_id.clone());
+        message_id
+    }
+
+    pub(crate) fn close_text_segment(&self) -> Option<MessageId> {
+        let message_id = {
+            let mut state = self.text_segment_state.lock().expect("text segment state");
+            state.open_message_id.take()
+        }?;
+
+        self.send(Event::TextMessageEnd(TextMessageEndEvent {
+            base: Self::base_event(),
+            message_id: message_id.clone(),
+        }));
+        Some(message_id)
+    }
+
+    pub(crate) fn has_open_text_segment(&self) -> bool {
+        self.text_segment_state
+            .lock()
+            .expect("text segment state")
+            .open_message_id
+            .is_some()
     }
 
     fn close_thinking_segment(&self) {
@@ -332,10 +362,10 @@ impl AgUiSink {
             return;
         }
         self.close_thinking_segment();
-        self.ensure_text_message_started();
+        let message_id = self.ensure_text_message_started();
         self.send(Event::TextMessageContent(TextMessageContentEvent {
             base: Self::base_event(),
-            message_id: self.message_id.clone(),
+            message_id,
             delta,
         }));
     }
@@ -453,6 +483,7 @@ impl AgUiSink {
                 input,
                 ..
             } => {
+                self.close_text_segment();
                 self.send(Event::ToolCallStart(ToolCallStartEvent {
                     base: Self::base_event(),
                     tool_call_id: Self::tool_call_id(id.clone()),

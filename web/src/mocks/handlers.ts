@@ -44,11 +44,38 @@ function buildSnapshot(session: string) {
         content: 'Show me restored tool call'
       },
       {
+        id: 'assistant-1',
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_1',
+            type: 'function',
+            call_type: 'function',
+            function: {
+              name: 'bash_exec',
+              arguments: '{"command":"ls -la"}'
+            }
+          }
+        ],
+        toolCalls: [
+          {
+            id: 'call_1',
+            type: 'function',
+            call_type: 'function',
+            function: {
+              name: 'bash_exec',
+              arguments: '{"command":"ls -la"}'
+            }
+          }
+        ]
+      },
+      {
         id: 'tool-result-1',
         role: 'tool',
         toolCallId: 'call_1',
-        toolName: 'test_tool',
-        content: 'Restored tool summary *with markdown*'
+        toolName: 'bash_exec',
+        content: ''
       }
     ];
   }
