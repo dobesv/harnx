@@ -24,8 +24,8 @@ use ag_ui_core::{
         context::Context,
         ids::{MessageId, RunId, ThreadId, ToolCallId},
         input::RunAgentInput,
-        message::{Message as AgUiMessage, Role},
-        tool::Tool,
+        message::{FunctionCall, Message as AgUiMessage, Role},
+        tool::{Tool, ToolCall},
     },
     JsonValue,
 };
@@ -876,32 +876,48 @@ impl Drop for UnsubscribeOnDrop {
     }
 }
 
-fn build_prompted_event_stream(
+/// Whether a session has a live run that a fresh (promptless) subscribe/reload
+/// should FOLLOW rather than terminate.
+///
+/// Both `Running` and `Interrupted` are active: `Interrupted` means the run is
+/// paused awaiting a tool approval (HITL). A reload during that window must
+/// attach to the live broadcast so the pending approval prompt reappears — NOT
+/// emit a synthetic RUN_FINISHED that would close the stream and drop the gate.
+fn session_state_is_active(state: &crate::session_actor::SessionState) -> bool {
+    matches!(
+        state,
+        crate::session_actor::SessionState::Running { .. }
+            | crate::session_actor::SessionState::Interrupted { .. }
+    )
+}
+
+/// Frame the live broadcast body of an active run WITHOUT a leading RUN_STARTED
+/// boundary — the caller is responsible for emitting exactly one RUN_STARTED
+/// before this body. Shared by the prompted and promptless-while-active paths
+/// so a reload never sees a duplicate RUN_STARTED for the same run.
+///
+/// The body TERMINATES once the run reaches a terminal state (RUN_FINISHED /
+/// RUN_ERROR). Otherwise the body stays open on the (now idle) broadcast
+/// channel, the client's runAgent() promise never resolves, and the
+/// assistant-ui thread stays `isRunning` forever.
+///
+/// Non-terminal frames are forwarded via `take_while` (which ENDS the stream —
+/// and drops the broadcast subscription — as soon as a terminal event is seen,
+/// without waiting for any further broadcast item), stashing the terminal frame
+/// in a cell. That stashed terminal frame is then chained as the final item so
+/// the response body closes immediately after RUN_FINISHED/RUN_ERROR.
+fn build_live_event_body(
     run_id: &str,
     thread_id_text: &str,
     snapshot_frame: Option<Bytes>,
     live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
-) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
+) -> impl tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static {
     let run_id = run_id.to_string();
     let thread_id_text = thread_id_text.to_string();
-    let run_id_for_closure = run_id.clone();
-    let thread_id_text_for_closure = thread_id_text.clone();
-    // A prompted run's SSE stream must TERMINATE once the run reaches a terminal
-    // state (RUN_FINISHED / RUN_ERROR). Otherwise the body stays open on the (now
-    // idle) broadcast channel, the client's runAgent() promise never resolves, and
-    // the assistant-ui thread stays `isRunning` forever.
-    //
-    // We forward non-terminal frames via `take_while` (which ENDS the stream — and
-    // drops the broadcast subscription — as soon as a terminal event is seen, without
-    // waiting for any further broadcast item), stashing the terminal frame in a cell.
-    // We then chain that stashed terminal frame as the final item. This guarantees
-    // the response body closes immediately after RUN_FINISHED/RUN_ERROR.
     let terminal_frame: std::sync::Arc<std::sync::Mutex<Option<Bytes>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let live_stream = {
         let mut state = FirstRunState::AwaitingStarted;
-        let thread_id_text = thread_id_text_for_closure;
-        let run_id = run_id_for_closure;
         let terminal_frame = terminal_frame.clone();
         let framed = tokio_stream::StreamExt::map(live_stream, move |event| {
             let is_terminal = matches!(event, Event::RunFinished(_) | Event::RunError(_));
@@ -927,16 +943,25 @@ fn build_prompted_event_stream(
         })
     };
     let live_stream = tokio_stream::StreamExt::chain(live_stream, terminal_stream);
-    let remaining = tokio_stream::StreamExt::chain(tokio_stream::iter(snapshot_frame), live_stream);
+    tokio_stream::StreamExt::chain(tokio_stream::iter(snapshot_frame), live_stream)
+}
+
+fn build_prompted_event_stream(
+    run_id: &str,
+    thread_id_text: &str,
+    snapshot_frame: Option<Bytes>,
+    live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
+) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
+    let body = build_live_event_body(run_id, thread_id_text, snapshot_frame, live_stream);
     // No keep_alive for prompted runs — the stream must terminate so the client's
     // runAgent() promise resolves. Multiplayer/persistent watch is a separate endpoint.
     Box::pin(tokio_stream::StreamExt::chain(
         tokio_stream::once(Bytes::from(frame_run_boundary_event(
             "RUN_STARTED",
-            &thread_id_text,
-            &run_id,
+            thread_id_text,
+            run_id,
         ))),
-        remaining,
+        body,
     ))
 }
 
@@ -944,27 +969,36 @@ fn build_promptless_event_stream(
     run_id: &str,
     thread_id_text: &str,
     snapshot_frame: Option<Bytes>,
-    _live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
+    live_stream: impl tokio_stream::Stream<Item = Event> + Send + Sync + 'static,
+    is_active: bool,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
-    let synthetic = tokio_stream::StreamExt::chain(
-        tokio_stream::StreamExt::chain(
+    let started = tokio_stream::once(Bytes::from(frame_run_boundary_event(
+        "RUN_STARTED",
+        thread_id_text,
+        run_id,
+    )));
+
+    if !is_active {
+        // Idle session: hydrate history then emit a synthetic RUN_FINISHED so the
+        // client's stream terminates cleanly.
+        let hydrated = tokio_stream::StreamExt::chain(started, tokio_stream::iter(snapshot_frame));
+        return Box::pin(tokio_stream::StreamExt::chain(
+            hydrated,
             tokio_stream::once(Bytes::from(frame_run_boundary_event(
-                "RUN_STARTED",
+                "RUN_FINISHED",
                 thread_id_text,
                 run_id,
             ))),
-            tokio_stream::iter(snapshot_frame),
-        ),
-        tokio_stream::once(Bytes::from(frame_run_boundary_event(
-            "RUN_FINISHED",
-            thread_id_text,
-            run_id,
-        ))),
-    );
-    // Promptless subscribe: just the synthetic RUN_STARTED -> MESSAGES_SNAPSHOT -> RUN_FINISHED.
-    // Do NOT forward live events from the prompted run's stream — a promptless subscribe
-    // is a one-shot hydrate, not a persistent watch. The stream ends after RUN_FINISHED.
-    Box::pin(synthetic)
+        ));
+    }
+
+    // Active session (Running or Interrupted — e.g. page reload mid-run or during a
+    // tool-approval wait): emit exactly ONE RUN_STARTED, hydrate history, then
+    // follow the live broadcast body until the real terminal event.
+    // `build_live_event_body` carries the snapshot_frame and does NOT emit its own
+    // RUN_STARTED, so the client never sees a duplicate boundary.
+    let body = build_live_event_body(run_id, thread_id_text, snapshot_frame, live_stream);
+    Box::pin(tokio_stream::StreamExt::chain(started, body))
 }
 
 fn build_ag_ui_event_stream(
@@ -974,6 +1008,7 @@ fn build_ag_ui_event_stream(
     snapshot: Vec<AgUiMessage>,
     events: broadcast::Receiver<Event>,
     has_prompt: Option<&str>,
+    is_active: bool,
 ) -> std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Bytes> + Send + Sync + 'static>> {
     let snapshot_frame = match frame_event(&snapshot_event(snapshot)) {
         Ok(frame) => Some(Bytes::from(frame)),
@@ -1005,7 +1040,13 @@ fn build_ag_ui_event_stream(
         // optimistically-appended user message and the streaming reply. Clients
         // hydrate via their own promptless subscribe stream instead (multiplayer-safe).
         Some(_) => build_prompted_event_stream(run_id, thread_id_text, None, live_stream),
-        None => build_promptless_event_stream(run_id, thread_id_text, snapshot_frame, live_stream),
+        None => build_promptless_event_stream(
+            run_id,
+            thread_id_text,
+            snapshot_frame,
+            live_stream,
+            is_active,
+        ),
     }
 }
 
@@ -1030,6 +1071,8 @@ pub async fn ag_ui_run_with_call_fn(
     };
     let handle = registry.get_or_spawn(key);
     let SubscribeResult { snapshot, events } = subscribe(&handle).await;
+    let session_info = get_info(&handle).await;
+    let is_active = session_state_is_active(&session_info.state);
     let has_prompt = last_user_prompt(&run_input);
     let thread_id = derive_thread_id(session);
     let thread_id_text = thread_id.to_string();
@@ -1045,6 +1088,7 @@ pub async fn ag_ui_run_with_call_fn(
         snapshot,
         events,
         has_prompt.as_deref(),
+        is_active,
     );
     let unsubscribe_guard = UnsubscribeOnDrop {
         handle: handle.clone(),
@@ -1069,6 +1113,15 @@ pub fn resolve_agent(config: &Config, name: &str) -> Result<AgentConfig, AgUiErr
         .retrieve_agent(name)
         .map(Agent::into_config)
         .map_err(|_| AgUiError::NotFound(format!("agent '{name}' not found")))
+}
+
+#[cfg(test)]
+async fn emit_test_event(handle: &SessionHandle, event: Event) {
+    handle
+        .tx
+        .send(SessionCommand::EmitTestEvent { event })
+        .await
+        .expect("send test event");
 }
 
 pub fn derive_thread_id(session_id: &str) -> ThreadId {
@@ -1156,9 +1209,36 @@ fn history_content_text(content: &MessageContent) -> String {
     }
 }
 
+fn history_tool_call_id(stable_base: &str, index: usize, persisted_id: Option<&str>) -> ToolCallId {
+    // Prefer the persisted tool-call id. When absent, derive a DETERMINISTIC id
+    // from a stable per-message base (persisted message id, else its log
+    // sequence, else its ordinal in the history) so the same tool call keeps the
+    // same id across reloads — a random message id here would break @assistant-ui
+    // re-attaching the tool result to its call on every hydration.
+    let raw_id = persisted_id
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{stable_base}-tool-{index}"));
+    serde_json::from_value(serde_json::Value::String(raw_id))
+        .expect("tool call id should deserialize from string")
+}
+
+/// Deterministic per-message base key used to synthesize tool-call ids when no
+/// persisted id exists. Falls back through: persisted message id → `seq:{n}`
+/// (log sequence) → `ord:{n}` (position in the history slice). Never random, so
+/// the derived tool-call ids are stable across session reloads.
+fn history_stable_base(message: &HistoryMsg, ordinal: usize) -> String {
+    if let Some(id) = message.id.as_deref().filter(|id| !id.is_empty()) {
+        return id.to_string();
+    }
+    match message.log_seq {
+        Some(seq) => format!("seq:{seq}"),
+        None => format!("ord:{ordinal}"),
+    }
+}
+
 pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiMessage> {
     let mut messages = Vec::with_capacity(history.len());
-    for message in history {
+    for (ordinal, message) in history.iter().enumerate() {
         let role = ag_ui_role_for_history(message.role);
         let visible = history_content_text(&message.content);
         let id = message
@@ -1166,17 +1246,38 @@ pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiM
             .as_ref()
             .and_then(|value| serde_json::from_value(serde_json::Value::String(value.clone())).ok())
             .unwrap_or_else(MessageId::random);
+        // Stable base for synthesizing tool-call ids — never the random `id` above.
+        let stable_base = history_stable_base(message, ordinal);
         match &message.content {
             MessageContent::ToolCalls(tool_calls) => {
-                if !visible.is_empty() {
-                    messages.push(AgUiMessage::Assistant {
-                        id,
-                        content: Some(visible),
-                        name: None,
-                        tool_calls: None,
-                    });
-                }
-                for tool_result in &tool_calls.tool_results {
+                let assistant_tool_calls = tool_calls
+                    .tool_results
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool_result)| {
+                        let tool_call_id = history_tool_call_id(
+                            &stable_base,
+                            index,
+                            tool_result.call.id.as_deref(),
+                        );
+                        ToolCall {
+                            id: tool_call_id,
+                            call_type: "function".to_string(),
+                            function: FunctionCall {
+                                name: tool_result.call.name.clone(),
+                                arguments: serde_json::to_string(&tool_result.call.arguments)
+                                    .expect("tool call args should serialize"),
+                            },
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                messages.push(AgUiMessage::Assistant {
+                    id: id.clone(),
+                    content: Some(visible),
+                    name: None,
+                    tool_calls: Some(assistant_tool_calls.clone()),
+                });
+                for (index, tool_result) in tool_calls.tool_results.iter().enumerate() {
                     let content = tool_result
                         .markdown
                         .clone()
@@ -1185,14 +1286,7 @@ pub(crate) fn history_messages_for_snapshot(history: &[HistoryMsg]) -> Vec<AgUiM
                     messages.push(AgUiMessage::Tool {
                         id: MessageId::random(),
                         content,
-                        tool_call_id: serde_json::from_value(serde_json::Value::String(
-                            tool_result
-                                .call
-                                .id
-                                .clone()
-                                .unwrap_or_else(|| "tool-call".to_string()),
-                        ))
-                        .expect("tool call id should deserialize from string"),
+                        tool_call_id: assistant_tool_calls[index].id.clone(),
                         error: None,
                     });
                 }

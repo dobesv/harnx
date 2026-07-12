@@ -1,4 +1,4 @@
-import { useEffect, useRef, useContext, useState } from 'react';
+import { useEffect, useRef, useContext, useState, useCallback } from 'react';
 import {
   ThreadPrimitive,
   MessagePrimitive,
@@ -17,19 +17,28 @@ import { ToolCallCard } from './ToolCallCard';
 import { useAgUiInterrupts, useAgUiSubmitInterruptResponses } from '@assistant-ui/react-ag-ui';
 import { ChatProvider } from './ChatProvider';
 import { PendingContext } from './PendingContext';
-import { UsageContext } from './UsageContext';
+import { UsageContext, type UsageData } from './UsageContext';
 import { cancel } from './api';
 import type { Agent, SessionRef } from './types';
 import { useAgentSessions } from './useAgentSessions';
 import './chat.css';
 
-// Activate a click-like handler from the keyboard (Enter / Space) so div-based
-// "button" affordances (picker cards) are usable without a mouse.
+interface QueuedMessage {
+  text: string;
+}
+
+// Activate a click-like handler from keyboard (Enter / Space) so div-based
+// "button" affordances (picker cards) are usable without mouse.
 function activateOnKey(e: React.KeyboardEvent, action: () => void) {
   if (e.key === 'Enter' || e.key === ' ') {
     e.preventDefault();
     action();
   }
+}
+
+function formatTokenCount(value: number | undefined) {
+  if (value === undefined) return '';
+  return value.toLocaleString();
 }
 
 const MessageContent = () => (
@@ -102,35 +111,90 @@ const MyAttachment = () => (
   </AttachmentPrimitive.Root>
 );
 
-const MyComposer = ({ agentName, sessionId }: { agentName: string, sessionId: string }) => {
+const MyComposer = ({
+  agentName,
+  sessionId,
+  queuedMessage,
+  setQueuedMessage,
+}: {
+  agentName: string;
+  sessionId: string;
+  queuedMessage: QueuedMessage | null;
+  setQueuedMessage: React.Dispatch<React.SetStateAction<QueuedMessage | null>>;
+}) => {
   const { setErrorText } = useContext(PendingContext);
   const isRunning = useThread(s => s.isRunning);
   const composerRuntime = useComposerRuntime();
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const resizeTextarea = useCallback((el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }, []);
+
+  const setTextareaRef = useCallback((el: HTMLTextAreaElement | null) => {
+    textareaRef.current = el;
+    resizeTextarea(el);
+  }, [resizeTextarea]);
+
+  const resetComposerInput = useCallback(() => {
+    composerRuntime.setText('');
+    void composerRuntime.clearAttachments();
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.style.height = 'auto';
+    }
+  }, [composerRuntime]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setErrorText(null);
 
     const state = composerRuntime.getState();
-    if (!state.text.trim() && state.attachments.length === 0) return;
+    const text = state.text.trim();
+    if (!text && state.attachments.length === 0) return;
     if (state.attachments.some((a: any) => a.status?.type !== 'complete')) return;
 
+    if (isRunning) {
+      setQueuedMessage((current) => {
+        if (!current) return { text };
+        return { text: current.text.trim() ? `${current.text}\n${text}` : text };
+      });
+      resetComposerInput();
+      return;
+    }
+
     composerRuntime.send();
+    const textarea = textareaRef.current;
+    if (textarea) {
+      requestAnimationFrame(() => {
+        textarea.style.height = 'auto';
+      });
+    }
   };
+
+  const queueCountLabel = queuedMessage ? '1 message queued' : null;
+  const placeholder = queuedMessage
+    ? 'Current run in progress. Next message queued.'
+    : isRunning
+      ? 'Type a message to queue after this run...'
+      : 'Type a message...';
 
   return (
     <ComposerPrimitive.Root className="aui-composer" onSubmit={handleSubmit}>
-      <div style={{ display: 'flex', width: '100%', alignItems: 'center' }}>
+      {queueCountLabel ? <div className="aui-composer-queue-hint">{queueCountLabel}</div> : null}
+      <div className="aui-composer-row">
         <div className="aui-composer-attachments">
           <ComposerPrimitive.Attachments components={{ Attachment: MyAttachment }} />
         </div>
         <ComposerPrimitive.AddAttachment className="aui-composer-add-attachment">Attach</ComposerPrimitive.AddAttachment>
         <ComposerPrimitive.Input
           className="aui-composer-input"
-          placeholder={isRunning ? 'Type a message (queued)...' : 'Type a message...'}
-          render={<textarea />}
+          placeholder={placeholder}
+          render={<textarea ref={setTextareaRef} rows={1} onInput={(e) => resizeTextarea(e.currentTarget)} />}
         />
-        <button type="submit" className="aui-composer-send">{isRunning ? 'Queue' : 'Send'}</button>
+        <button type="submit" className="aui-composer-send">{queuedMessage ? 'Queued' : isRunning ? 'Queue' : 'Send'}</button>
         <CancelButton agentName={agentName} sessionId={sessionId} />
       </div>
     </ComposerPrimitive.Root>
@@ -160,19 +224,31 @@ const StatusIndicator = ({ isRunning, statusText }: { isRunning: boolean, status
   </div>
 );
 
-const UsageIndicator = ({ usage }: { usage: any }) => (
-  <div className="aui-status-usage">
-    <span>In: {usage.input}</span>
-    <span>Out: {usage.output}</span>
-    {usage.cached ? <span>Cached: {usage.cached}</span> : null}
-    {usage.context_tokens !== undefined && (
-      <span>
-        Context: {usage.context_tokens}
-        {usage.context_percent !== undefined ? ` (${usage.context_percent}%)` : ''}
-      </span>
-    )}
-  </div>
+const UsageItem = ({ icon, label, value }: { icon: string, label: string, value: string }) => (
+  <span className="aui-status-usage-item" title={label} aria-label={`${label}: ${value}`}>
+    <span className="aui-status-usage-icon" aria-hidden="true">{icon}</span>
+    <span>{value}</span>
+  </span>
 );
+
+const UsageIndicator = ({ usage }: { usage: UsageData }) => {
+  const roundedContextPercent = usage.context_percent !== undefined ? Math.round(usage.context_percent) : undefined;
+
+  return (
+    <div className="aui-status-usage">
+      <UsageItem icon="↘" label="Input tokens" value={formatTokenCount(usage.input)} />
+      <UsageItem icon="↗" label="Output tokens" value={formatTokenCount(usage.output)} />
+      {usage.cached ? <UsageItem icon="◌" label="Cached tokens" value={formatTokenCount(usage.cached)} /> : null}
+      {usage.context_tokens !== undefined && (
+        <UsageItem
+          icon="◔"
+          label="Context usage"
+          value={`${formatTokenCount(usage.context_tokens)}${roundedContextPercent !== undefined ? ` (${roundedContextPercent}%)` : ''}`}
+        />
+      )}
+    </div>
+  );
+};
 
 const StatusBar = () => {
   const { statusText } = useContext(PendingContext);
@@ -244,10 +320,28 @@ const BatchInterruptUI = () => {
 
 const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, sessionId: string, onRunFinish: () => void }) => {
   const isEmpty = useThread(s => s.messages.length === 0);
+  const composerRuntime = useComposerRuntime();
+  const [queuedMessage, setQueuedMessage] = useState<QueuedMessage | null>(null);
+
+  const handleRunFinish = useCallback(() => {
+    onRunFinish();
+    if (!queuedMessage?.text.trim()) return;
+
+    // Flush the queued message now that the run has finished. Keep the queued
+    // state until send() succeeds so a synchronous failure doesn't silently
+    // drop the user's text.
+    try {
+      composerRuntime.setText(queuedMessage.text);
+      composerRuntime.send();
+      setQueuedMessage(null);
+    } catch (err) {
+      console.error('Failed to send queued message', err);
+    }
+  }, [composerRuntime, onRunFinish, queuedMessage]);
 
   return (
     <ThreadPrimitive.Root className={`aui-thread ${isEmpty ? 'aui-thread-empty' : ''}`}>
-      <RunStateMonitor onRunFinish={onRunFinish} />
+      <RunStateMonitor onRunFinish={handleRunFinish} />
 
       {!isEmpty && (
         <ThreadPrimitive.Viewport className="aui-thread-viewport">
@@ -260,7 +354,12 @@ const MyThread = ({ agentName, sessionId, onRunFinish }: { agentName: string, se
         <BatchInterruptUI />
         <SendErrorIndicator />
         <div className="aui-composer-container">
-          <MyComposer agentName={agentName} sessionId={sessionId} />
+          <MyComposer
+            agentName={agentName}
+            sessionId={sessionId}
+            queuedMessage={queuedMessage}
+            setQueuedMessage={setQueuedMessage}
+          />
         </div>
       </div>
     </ThreadPrimitive.Root>
@@ -347,6 +446,12 @@ const SessionPicker = ({
   </div>
 );
 
+const BreadcrumbButton = ({ children, onClick }: { children: React.ReactNode, onClick: () => void }) => (
+  <button type="button" className="top-nav-crumb-button" onClick={onClick}>
+    {children}
+  </button>
+);
+
 const TopNav = ({
   agentName,
   sessionId,
@@ -358,19 +463,21 @@ const TopNav = ({
   onSwitchAgent: () => void;
   onSwitchSession: () => void;
 }) => (
-  <div className="top-nav">
-    <div className="top-nav-brand">Harnx UI</div>
-    <div className="top-nav-controls">
-      <div className="top-nav-item">
-        <span className="top-nav-label">Agent:</span>
-        <span className="top-nav-value">{agentName}</span>
-        <button onClick={onSwitchAgent}>Switch agent</button>
-      </div>
-      <div className="top-nav-item">
-        <span className="top-nav-label">Session:</span>
-        <span className="top-nav-value">{sessionId}</span>
-        <button onClick={onSwitchSession}>Switch session</button>
-      </div>
+  <div className="top-nav" aria-label="Breadcrumb">
+    <div className="top-nav-breadcrumbs">
+      <BreadcrumbButton onClick={onSwitchAgent}>harnx</BreadcrumbButton>
+      {agentName ? (
+        <>
+          <span className="top-nav-separator" aria-hidden="true">›</span>
+          <BreadcrumbButton onClick={onSwitchSession}>{agentName}</BreadcrumbButton>
+        </>
+      ) : null}
+      {sessionId ? (
+        <>
+          <span className="top-nav-separator" aria-hidden="true">›</span>
+          <span className="top-nav-crumb-active" aria-current="page">{sessionId}</span>
+        </>
+      ) : null}
     </div>
   </div>
 );

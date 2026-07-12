@@ -293,7 +293,6 @@ impl Tui {
             TranscriptItem::ToolResultMarkdown {
                 text,
                 rendered_cache,
-                ..
             } => {
                 if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
                     if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
@@ -356,7 +355,6 @@ impl Tui {
                 seq,
                 timestamp,
                 rendered_cache,
-                ..
             } => {
                 if let Some((w, ss, sts, utc, cached)) = rendered_cache.as_ref() {
                     if *w == width && *ss == show_seq && *sts == show_ts && *utc == use_utc {
@@ -1098,7 +1096,6 @@ impl Tui {
                 seq,
                 timestamp,
                 rendered_cache: _,
-                id: _,
             } => {
                 lines.push(Line::from(Span::styled("── tool call ──", label_style)));
                 if let Some(s) = seq {
@@ -1253,80 +1250,76 @@ impl Tui {
         //
         // Fallback: render_entry_detail() for items that have no seq number or
         // when no session is active.
-        let (entries_as_vec, title): (Vec<Vec<Line<'static>>>, String) = if let Some(text) =
-            &self.app.detail_view_text
-        {
-            let entries = vec![text
-                .lines()
-                .map(|line| Line::from(Span::raw(line.to_string())))
-                .collect()];
-            (entries, "Compacted session".to_string())
-        } else if let Some(yaml) = &self.app.detail_view_raw_yaml {
-            // Split on the same separator edit_message_range joins with.
-            let docs: Vec<&str> = yaml.split("\n---\n").collect();
-            let doc_count = docs.len();
-            let mut entries: Vec<Vec<Line<'static>>> = Vec::new();
-            for (i, doc) in docs.into_iter().enumerate() {
-                let doc_lines: Vec<Line<'static>> = doc
+        let (entries_as_vec, title): (Vec<Vec<Line<'static>>>, String) =
+            if let Some(text) = &self.app.detail_view_text {
+                let entries = vec![text
                     .lines()
-                    .map(|l| Line::from(Span::raw(l.to_string())))
-                    .collect();
-                entries.push(doc_lines);
-                if i + 1 < doc_count {
-                    // Visual separator between documents
-                    entries.push(vec![Line::from(Span::styled(
-                        "---",
-                        Style::default().fg(Color::DarkGray),
-                    ))]);
+                    .map(|line| Line::from(Span::raw(line.to_string())))
+                    .collect()];
+                // Use the overlay's own title (e.g. "Agent Info", "Session Info",
+                // "Compacted session"); fall back to a generic label if unset.
+                let title = self
+                    .app
+                    .detail_view_title
+                    .clone()
+                    .unwrap_or_else(|| "Detail".to_string());
+                (entries, title)
+            } else if let Some(yaml) = &self.app.detail_view_raw_yaml {
+                // Split on the same separator edit_message_range joins with.
+                let docs: Vec<&str> = yaml.split("\n---\n").collect();
+                let doc_count = docs.len();
+                let mut entries: Vec<Vec<Line<'static>>> = Vec::new();
+                for (i, doc) in docs.into_iter().enumerate() {
+                    let doc_lines: Vec<Line<'static>> = doc
+                        .lines()
+                        .map(|l| Line::from(Span::raw(l.to_string())))
+                        .collect();
+                    entries.push(doc_lines);
+                    if i + 1 < doc_count {
+                        // Visual separator between documents
+                        entries.push(vec![Line::from(Span::styled(
+                            "---",
+                            Style::default().fg(Color::DarkGray),
+                        ))]);
+                    }
                 }
-            }
-            let title = if doc_count == 1 {
-                "Detail".to_string()
+                let title = if doc_count == 1 {
+                    "Detail".to_string()
+                } else {
+                    format!("Detail ({doc_count} entries)")
+                };
+                (entries, title)
             } else {
-                format!("Detail ({doc_count} entries)")
-            };
-            (entries, title)
-        } else if self.app.detail_view_raw_unavailable {
-            let entries = vec![vec![Line::from(Span::styled(
-                "⚠ Raw log entry unavailable for this item.",
-                Style::default().fg(Color::Yellow),
-            ))]];
-            (entries, "Detail".to_string())
-        } else {
-            // Fallback: no session / no seq — render TUI fields verbatim
-            let (from, to) = self.app.selected_transcript_range();
-            let mut entries = Vec::new();
-            for i in from..=to {
-                if i < self.app.transcript.len() {
-                    let entry = &self.app.transcript[i];
-                    entries.push(Self::render_entry_detail(entry));
-                    // A selected ToolCall shows its paired result by id,
-                    // regardless of where the result row sits in the
-                    // transcript (they can be separated by interleaving
-                    // rows). Only look outside the range for a single
-                    // ToolCall selection.
-                    if from == to {
-                        if let TranscriptItem::ToolCall { id, .. } = entry {
-                            if let Some(result) = self.app.transcript.iter().find(|it| {
-                                    matches!(it, TranscriptItem::ToolResultMarkdown { id: rid, .. } if !rid.is_empty() && rid == id)
-                                }) {
+                // Fallback: no session / no seq — render TUI fields verbatim
+                let (from, to) = self.app.selected_transcript_range();
+                let mut entries = Vec::new();
+                for i in from..=to {
+                    if i < self.app.transcript.len() {
+                        let entry = &self.app.transcript[i];
+                        entries.push(Self::render_entry_detail(entry));
+                        // When the selected range is a single ToolCall with no
+                        // adjacent result in the range, peek at the next item so
+                        // the fallback view includes the paired result.
+                        if matches!(entry, TranscriptItem::ToolCall { .. }) && i + 1 > to {
+                            if let Some(next) = self.app.transcript.get(i + 1) {
+                                if matches!(next, TranscriptItem::ToolResultMarkdown { .. }) {
                                     entries.push(vec![Line::from("")]);
-                                    entries.push(Self::render_entry_detail(result));
+                                    entries.push(Self::render_entry_detail(next));
                                 }
+                            }
+                        }
+                        if i < to {
+                            entries.push(vec![Line::from("")]);
                         }
                     }
-                    if i < to {
-                        entries.push(vec![Line::from("")]);
-                    }
                 }
-            }
-            let title = if from == to {
-                "Detail".to_string()
-            } else {
-                format!("Detail ({from}–{to})")
+                let title = if from == to {
+                    "Detail".to_string()
+                } else {
+                    format!("Detail ({from}–{to})")
+                };
+                (entries, title)
             };
-            (entries, title)
-        };
 
         // Create block with horizontal (top + bottom) borders and a title.
         //

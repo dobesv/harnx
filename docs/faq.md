@@ -39,6 +39,10 @@ Two related gotchas:
 - **`env:` values are not `$VAR`-expanded.** `EXA_API_KEY: "$EXA_API_KEY"` sends the literal string `$EXA_API_KEY`, not its value — use `HARNX_BASH_ENV_PASSTHROUGH` (above) to forward the real value instead.
 - **The error text tells you which problem you have.** "API key must be provided" means an *empty* value reached the server (stripped, or never set); "Invalid API key" means a *wrong* value reached it (e.g. the un-expanded literal `$EXA_API_KEY`).
 
+## Why do sub-agents fail with "missing credentials" only in the web UI (`harnx-serve`)?
+
+If credentials work in the TUI but fail in the web UI, the `harnx-serve` process likely lacks the necessary environment variables or cannot resolve your `.env` file. See the [Sub-Agent Credentials Troubleshooting Guide](harnx-serve-subagent-credentials.md) for a detailed fix.
+
 ## Why compress sessions?
 
 The Chat API is stateless, so the full conversation history is sent with every request. This means history grows rapidly, causing two problems:

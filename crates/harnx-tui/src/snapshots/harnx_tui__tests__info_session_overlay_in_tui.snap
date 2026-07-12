@@ -2,7 +2,7 @@
 source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
-Compacted session───────────────────────────────────────────────────────
+Session Info────────────────────────────────────────────────────────────
 Error: session 'overlay-session-test' not found for agent '<top-level>' 
                                                                         
                                                                         

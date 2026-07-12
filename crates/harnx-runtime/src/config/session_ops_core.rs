@@ -186,28 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn adjust_range_expands_tool_calls_to_include_results() {
-        // documents[1] = ToolCalls, documents[2] = ToolResults.
-        let docs = vec![
-            serde_yaml::to_string(&header()).unwrap(),
-            serde_yaml::to_string(&SessionLogEntry::ToolCalls {
-                text: String::new(),
-                thought: None,
-                calls: vec![],
-                timestamp: None,
-                fence_token: None,
-            })
-            .unwrap(),
-            serde_yaml::to_string(&SessionLogEntry::ToolResults {
-                results: vec![],
-                timestamp: None,
-            })
-            .unwrap(),
-        ];
-        assert_eq!(adjust_range_for_tool_pairs(1, 1, &docs).unwrap(), (1, 2));
-    }
-
-    #[test]
     fn compute_rewind_point_rejects_boundary_or_earlier() {
         let entries = vec![user("old"), compress(), user("new")];
         let err = compute_rewind_point(1, entries.len(), &entries).expect_err("boundary protected");

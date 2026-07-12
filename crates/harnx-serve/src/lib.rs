@@ -52,11 +52,100 @@ pub const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 
 type AppResponse = Response<BoxBody<Bytes, Infallible>>;
 
+/// Log a redacted snapshot of the process environment relevant to credential
+/// and config-path resolution for spawned ACP sub-agents.
+///
+/// harnx-serve does not clear or filter the environment it hands to ACP child
+/// processes — they inherit it exactly like the TUI does. When sub-agents fail
+/// with "missing credentials" only under harnx-serve, the usual cause is that
+/// the *service* environment (systemd unit, container, launcher) lacks the
+/// user-session context the TUI runs with: a different or missing `HOME` /
+/// `XDG_DATA_HOME` / `HARNX_DATA_DIR` (so `~/.local/share/harnx/.env` never
+/// resolves), no inherited `*_API_KEY` vars, or no `DBUS_SESSION_BUS_ADDRESS` /
+/// `XDG_RUNTIME_DIR` (so keyring/`secret-tool` lookups fail).
+///
+/// This never logs secret values — only presence/absence and, for API keys,
+/// the variable *names*. See `docs/harnx-serve-subagent-credentials.md`.
+fn log_startup_environment_diagnostics() {
+    fn present(var: &str) -> &'static str {
+        match std::env::var_os(var) {
+            Some(value) if !value.is_empty() => "present",
+            Some(_) => "present-but-empty",
+            None => "MISSING",
+        }
+    }
+
+    info!(
+        "harnx-serve environment diagnostics (redacted; for sub-agent credential troubleshooting):"
+    );
+    for var in [
+        "HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_STATE_HOME",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "HARNX_DATA_DIR",
+        "HARNX_STATE_DIR",
+        "HARNX_ENV_FILE",
+        "PATH",
+    ] {
+        info!("  env {var}: {}", present(var));
+    }
+
+    // The `.env` file the runtime loads at startup; ACP children resolve the
+    // same path, so a missing file here means neither inherits its credentials.
+    let env_file = harnx_core::config_paths::env_file();
+    let env_file_status = if env_file.is_file() {
+        "found"
+    } else {
+        "NOT FOUND"
+    };
+    info!(
+        "  resolved .env file: {} ({env_file_status})",
+        env_file.display()
+    );
+    info!(
+        "  resolved data dir: {}",
+        harnx_core::config_paths::data_dir().display()
+    );
+
+    // Names only (never values) of credential-looking vars visible to child
+    // agents. Matches common suffixes across providers so troubleshooting isn't
+    // limited to the `_API_KEY` convention (e.g. AWS_SECRET_ACCESS_KEY, GH_TOKEN,
+    // ANTHROPIC_AUTH_TOKEN). Value bytes are never read or logged.
+    let mut credential_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .filter(|key| {
+            key.ends_with("_API_KEY")
+                || key.ends_with("_TOKEN")
+                || key.ends_with("_SECRET")
+                || key.ends_with("_ACCESS_KEY")
+                || key.ends_with("_KEY")
+        })
+        .collect();
+    credential_names.sort();
+    if credential_names.is_empty() {
+        info!(
+            "  credential-like env vars (*_API_KEY/_TOKEN/_SECRET/_KEY): none visible \
+             in process env (sub-agents relying on env-var credentials will fail \
+             unless creds live in the .env file or a reachable keyring)"
+        );
+    } else {
+        info!(
+            "  credential-like env vars visible ({}, names only): {}",
+            credential_names.len(),
+            credential_names.join(", ")
+        );
+    }
+}
+
 pub async fn run(
     config: GlobalConfig,
     addr: Option<String>,
     web_assets: Option<PathBuf>,
 ) -> Result<()> {
+    log_startup_environment_diagnostics();
+
     let addr = match addr {
         Some(addr) => {
             if let Ok(port) = addr.parse::<u16>() {
@@ -1117,13 +1206,33 @@ fn agent_scoped_config(config: &Config, agent: &str) -> Result<Config> {
     Ok(config)
 }
 
+/// Ordering for the web session list: most-recently-modified first so active
+/// work surfaces at the top. Sessions without a modified time sort last; ties
+/// (equal or both-missing modified) fall back to id (descending) for stable,
+/// deterministic ordering.
+fn session_recency_ordering(
+    left: &harnx_runtime::config::SessionMeta,
+    right: &harnx_runtime::config::SessionMeta,
+) -> std::cmp::Ordering {
+    right
+        .modified
+        .cmp(&left.modified)
+        .then_with(|| right.id.cmp(&left.id))
+}
+
 fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>> {
-    Ok(agent_scoped_config(config, agent)?
+    let mut sessions: Vec<_> = agent_scoped_config(config, agent)?
         .list_sessions_with_meta()
         .into_iter()
         // Per-agent endpoints must not leak sessions without agent attribution or for other agents.
         // Missing/empty agent_name stays excluded from per-agent lists until a later backfill pass.
         .filter(|session| session.agent_name.as_deref() == Some(agent))
+        .collect();
+
+    sessions.sort_by(session_recency_ordering);
+
+    Ok(sessions
+        .into_iter()
         .map(|session| {
             let session_id = session.session_id.unwrap_or(session.id);
             let mut value = serde_json::Map::from_iter([(
@@ -1142,7 +1251,11 @@ fn agent_sessions_json(config: &Config, agent: &str) -> Result<Vec<Value>> {
 }
 
 fn format_system_time(value: SystemTime) -> String {
-    DateTime::<Utc>::from(value).to_rfc3339()
+    // Fixed millisecond precision so every emitted `updated_at` is uniform length.
+    // The session list itself is sorted on the underlying `SystemTime` (not the
+    // string), so ordering is always chronologically correct; uniform precision
+    // just keeps the serialized values consistent for any downstream consumer.
+    DateTime::<Utc>::from(value).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn history_role_name(role: MessageRole) -> &'static str {
@@ -1701,6 +1814,143 @@ mod tests {
             "hi from scoped dir"
         );
         assert!(!scoped.session_file("flat-only").exists());
+    }
+
+    #[test]
+    fn agent_sessions_json_orders_by_recency_desc() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let sandbox = TestConfigSandbox::new();
+        sandbox.write_agent("plain", "You are plain.");
+        let config = sandbox.config();
+
+        // Persist three sessions for the same agent via the real save API, then
+        // stamp distinct mtimes. Ordering must be most-recently-modified first,
+        // independent of id order.
+        let scoped = agent_scoped_config(&config, "plain").expect("scope config");
+        let write_session = |session_id: &str, mtime: SystemTime| {
+            let path = scoped.session_file(session_id);
+            std::fs::create_dir_all(path.parent().expect("session parent"))
+                .expect("create sessions dir");
+
+            let prompt_config = harnx_session::fork_prompt_config(&config);
+            {
+                let mut prompt = prompt_config.write();
+                prompt.use_agent_by_name("plain").expect("set agent");
+                prompt.use_session(Some(session_id)).expect("open session");
+                let session = prompt.session.as_mut().expect("session loaded");
+                session.messages.push(Message::new(
+                    MessageRole::User,
+                    harnx_core::message::MessageContent::Text("hi".into()),
+                ));
+                harnx_runtime::config::session::save(session, "agent-real", &path, false)
+                    .expect("save scoped session");
+            }
+
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open session for mtime")
+                .set_modified(mtime)
+                .expect("set mtime");
+        };
+
+        let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // Deliberately write in non-recency, non-alpha order.
+        write_session("bbb", base + Duration::from_secs(20)); // newest
+        write_session("aaa", base + Duration::from_secs(10)); // middle
+        write_session("ccc", base); // oldest
+
+        let listed = agent_sessions_json(&config, "plain").expect("list scoped sessions");
+        assert_eq!(listed.len(), 3, "all three sessions listed");
+
+        // Every entry surfaces updated_at, and the list is ordered most-recent-first.
+        let updated_at: Vec<&str> = listed
+            .iter()
+            .map(|session| {
+                session
+                    .get("updated_at")
+                    .and_then(Value::as_str)
+                    .expect("updated_at present")
+            })
+            .collect();
+
+        let mut sorted_desc = updated_at.clone();
+        sorted_desc.sort_by(|left, right| right.cmp(left));
+        assert_eq!(
+            updated_at, sorted_desc,
+            "sessions must be ordered by updated_at descending"
+        );
+        // Confirm the stamped mtimes actually differ so the ordering check is meaningful.
+        assert!(
+            updated_at[0] > updated_at[1] && updated_at[1] > updated_at[2],
+            "distinct descending timestamps expected, got {updated_at:?}"
+        );
+    }
+
+    #[test]
+    fn session_recency_ordering_covers_ties_and_missing_modified() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let meta = |id: &str, modified: Option<SystemTime>| SessionMeta {
+            id: id.into(),
+            session_id: Some(id.into()),
+            working_dir: None,
+            git_branch: None,
+            git_remote: None,
+            terminal_session_id: None,
+            agent_name: Some("plain".into()),
+            modified,
+        };
+
+        let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let newer = meta("aaa", Some(base + Duration::from_secs(10)));
+        let older = meta("zzz", Some(base));
+
+        // Distinct modified: most-recent-first regardless of id order.
+        assert_eq!(
+            session_recency_ordering(&newer, &older),
+            std::cmp::Ordering::Less,
+            "newer modified must sort before older"
+        );
+
+        // Equal modified: tie-break on id DESC (id "b" before id "a").
+        let same_a = meta("aaa", Some(base));
+        let same_b = meta("bbb", Some(base));
+        assert_eq!(
+            session_recency_ordering(&same_b, &same_a),
+            std::cmp::Ordering::Less,
+            "equal modified must tie-break on id descending (higher id first)"
+        );
+
+        // Some(modified) sorts before None (None goes last).
+        let has_time = meta("aaa", Some(base));
+        let no_time = meta("zzz", None);
+        assert_eq!(
+            session_recency_ordering(&has_time, &no_time),
+            std::cmp::Ordering::Less,
+            "a session with a modified time must sort before one without"
+        );
+
+        // Both None: tie-break on id DESC.
+        let none_a = meta("aaa", None);
+        let none_b = meta("bbb", None);
+        assert_eq!(
+            session_recency_ordering(&none_b, &none_a),
+            std::cmp::Ordering::Less,
+            "both-missing modified must tie-break on id descending"
+        );
+
+        // Full sort of a mixed vector puts newest first, None last, id-desc ties.
+        let mut sessions = [
+            meta("s-old", Some(base)),
+            meta("s-none-1", None),
+            meta("s-new", Some(base + Duration::from_secs(100))),
+            meta("s-none-2", None),
+        ];
+        sessions.sort_by(session_recency_ordering);
+        let order: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(order, ["s-new", "s-old", "s-none-2", "s-none-1"]);
     }
 
     #[test]

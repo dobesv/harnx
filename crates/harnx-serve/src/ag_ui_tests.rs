@@ -2014,12 +2014,30 @@ fn history_messages_for_snapshot_keeps_tool_turn_prose_and_tool_entries() {
     let snapshot = history_messages_for_snapshot(&history);
     assert_eq!(snapshot.len(), 3);
     assert!(matches!(&snapshot[0], AgUiMessage::User { content, .. } if content == "prompt"));
-    assert!(
-        matches!(&snapshot[1], AgUiMessage::Assistant { content, .. } if content.as_deref() == Some("assistant prose"))
-    );
-    assert!(
-        matches!(&snapshot[2], AgUiMessage::Tool { content, .. } if content.contains("tool output"))
-    );
+    match &snapshot[1] {
+        AgUiMessage::Assistant {
+            content,
+            tool_calls: Some(tool_calls),
+            ..
+        } => {
+            assert_eq!(content.as_deref(), Some("assistant prose"));
+            assert_eq!(tool_calls.len(), 1);
+            assert_eq!(tool_calls[0].function.name, "history");
+            assert_eq!(tool_calls[0].function.arguments, r#"{"limit":5}"#);
+            match &snapshot[2] {
+                AgUiMessage::Tool {
+                    content,
+                    tool_call_id,
+                    ..
+                } => {
+                    assert_eq!(content, "tool output");
+                    assert_eq!(tool_call_id, &tool_calls[0].id);
+                }
+                other => panic!("expected tool snapshot, got: {other:?}"),
+            }
+        }
+        other => panic!("expected assistant snapshot, got: {other:?}"),
+    }
 }
 
 #[test]
@@ -2057,19 +2075,258 @@ fn history_snapshot_prefers_tool_markdown_and_falls_back_to_output() {
 
     let snapshot = history_messages_for_snapshot(&history);
     assert_eq!(snapshot.len(), 3);
-    assert!(
-        matches!(&snapshot[0], AgUiMessage::Assistant { content, .. } if content.as_deref() == Some("assistant prose"))
+    match &snapshot[0] {
+        AgUiMessage::Assistant {
+            content,
+            tool_calls: Some(tool_calls),
+            ..
+        } => {
+            assert_eq!(content.as_deref(), Some("assistant prose"));
+            assert_eq!(tool_calls.len(), 2);
+            assert_eq!(tool_calls[0].function.arguments, r#"{"limit":1}"#);
+            assert_eq!(tool_calls[1].function.arguments, r#"{"limit":2}"#);
+            assert!(
+                matches!(&snapshot[1], AgUiMessage::Tool { content, tool_call_id, .. }
+                if content == "### Rendered summary" && tool_call_id == &tool_calls[0].id)
+            );
+            assert!(
+                matches!(&snapshot[2], AgUiMessage::Tool { content, tool_call_id, .. }
+                if content == "fallback output" && tool_call_id == &tool_calls[1].id)
+            );
+        }
+        other => panic!("expected assistant snapshot, got: {other:?}"),
+    }
+}
+
+#[test]
+fn history_snapshot_tool_call_id_is_deterministic_without_persisted_ids() {
+    // Neither the message id NOR the tool-call id is persisted. The synthesized
+    // tool_call_id must be DETERMINISTIC across reloads (derived from the message
+    // log sequence) so @assistant-ui keeps re-attaching the tool result to its
+    // call. A random fallback would change on every hydration.
+    let build_history = || {
+        let tool_call = ToolCall::new(
+            "history".to_string(),
+            json!({ "limit": 5 }),
+            None, // no persisted tool-call id
+            None,
+        );
+        vec![Message {
+            role: MessageRole::Assistant,
+            content: MessageContent::ToolCalls(MessageContentToolCalls::new(
+                vec![harnx_core::tool::ToolResult::new(
+                    tool_call,
+                    json!("tool output"),
+                )],
+                "assistant prose".to_string(),
+                None,
+            )),
+            id: None, // no persisted message id → random AgUiMessage id, but…
+            log_seq: Some(7),
+            log_timestamp: None,
+        }]
+    };
+
+    let first = history_messages_for_snapshot(&build_history());
+    let second = history_messages_for_snapshot(&build_history());
+
+    let tool_call_id_of = |snapshot: &[AgUiMessage]| -> ToolCallId {
+        match &snapshot[0] {
+            AgUiMessage::Assistant {
+                tool_calls: Some(tool_calls),
+                ..
+            } => {
+                assert_eq!(tool_calls.len(), 1);
+                // Assistant tool_call id and the Tool result tool_call_id must match.
+                match &snapshot[1] {
+                    AgUiMessage::Tool { tool_call_id, .. } => {
+                        assert_eq!(&tool_calls[0].id, tool_call_id);
+                    }
+                    other => panic!("expected tool snapshot, got: {other:?}"),
+                }
+                tool_calls[0].id.clone()
+            }
+            other => panic!("expected assistant snapshot, got: {other:?}"),
+        }
+    };
+
+    let first_id = tool_call_id_of(&first);
+    let second_id = tool_call_id_of(&second);
+
+    // Deterministic across independent hydrations.
+    assert_eq!(first_id, second_id);
+    // …and derived from the stable log sequence, not a random message id.
+    assert_eq!(
+        first_id,
+        serde_json::from_value(json!("seq:7-tool-0")).unwrap()
     );
-    assert!(
-        matches!(&snapshot[1], AgUiMessage::Tool { content, tool_call_id, .. }
-        if content == "### Rendered summary"
-            && tool_call_id == &serde_json::from_value(json!("call-1")).unwrap())
+}
+
+#[test]
+fn history_snapshot_tool_call_id_falls_back_to_ordinal_without_id_or_seq() {
+    // Neither message id, tool-call id, NOR log sequence available: fall back to
+    // the message ordinal in the history slice — still deterministic per position.
+    let tool_call = ToolCall::new("history".to_string(), json!({}), None, None);
+    let history = vec![Message {
+        role: MessageRole::Assistant,
+        content: MessageContent::ToolCalls(MessageContentToolCalls::new(
+            vec![harnx_core::tool::ToolResult::new(tool_call, json!("out"))],
+            "prose".to_string(),
+            None,
+        )),
+        id: None,
+        log_seq: None,
+        log_timestamp: None,
+    }];
+
+    let snapshot = history_messages_for_snapshot(&history);
+    match &snapshot[0] {
+        AgUiMessage::Assistant {
+            tool_calls: Some(tool_calls),
+            ..
+        } => {
+            assert_eq!(
+                tool_calls[0].id,
+                serde_json::from_value(json!("ord:0-tool-0")).unwrap()
+            );
+        }
+        other => panic!("expected assistant snapshot, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ag_ui_run_promptless_join_forwards_live_events_when_session_active() {
+    let snapshot = vec![
+        user_msg("persisted prompt"),
+        assistant_msg("persisted reply"),
+    ];
+    let (tx, rx) = tokio::sync::broadcast::channel(8);
+    let run_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    let snapshot_frame = Some(Bytes::from(
+        frame_event(&snapshot_event(snapshot)).expect("snapshot frame"),
+    ));
+    let stream = build_promptless_event_stream(
+        &run_id.to_string(),
+        &thread_id.to_string(),
+        snapshot_frame,
+        tokio_stream::StreamExt::filter_map(
+            tokio_stream::StreamExt::then(
+                BroadcastStream::new(rx),
+                |item| async move { item.ok() },
+            ),
+            |event| event,
+        ),
+        true,
     );
+
+    let sender = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send(Event::TextMessageContent(TextMessageContentEvent {
+            base: BaseEvent {
+                timestamp: None,
+                raw_event: None,
+            },
+            message_id: MessageId::random(),
+            delta: "live delta".to_string(),
+        }))
+        .expect("send live delta");
+        tx.send(Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+            base: BaseEvent {
+                timestamp: None,
+                raw_event: None,
+            },
+            thread_id: ThreadId::from(thread_id),
+            run_id: RunId::from(run_id),
+            result: None,
+        }))
+        .expect("send run finished");
+    });
+
+    let frames = tokio_stream::StreamExt::collect::<Vec<_>>(stream).await;
+    sender.await.expect("sender task");
+    let events = frames
+        .into_iter()
+        .map(|frame| {
+            let text = String::from_utf8(frame.to_vec()).expect("utf8 frame");
+            parse_sse_frame(text.trim())
+        })
+        .collect::<Vec<_>>();
+
     assert!(
-        matches!(&snapshot[2], AgUiMessage::Tool { content, tool_call_id, .. }
-        if content == "fallback output"
-            && tool_call_id == &serde_json::from_value(json!("call-2")).unwrap())
+        events.len() >= 4,
+        "expected snapshot + live + terminal events: {:?}",
+        events
     );
+    assert_eq!(events[0]["type"], "RUN_STARTED");
+    assert_eq!(events[1]["type"], "MESSAGES_SNAPSHOT");
+    let live_index = events
+        .iter()
+        .position(|event| event["type"] == "TEXT_MESSAGE_CONTENT")
+        .expect("live text event should be forwarded");
+    let finished_index = events
+        .iter()
+        .position(|event| event["type"] == "RUN_FINISHED")
+        .expect("real run finished should arrive");
+    assert!(
+        live_index < finished_index,
+        "live event should arrive before terminal: {:?}",
+        events
+    );
+    assert_eq!(events[live_index]["delta"], "live delta");
+    assert!(
+        events[..finished_index]
+            .iter()
+            .all(|event| event["type"] != "RUN_FINISHED"),
+        "synthetic RUN_FINISHED emitted before live events: {:?}",
+        events
+    );
+
+    // Regression: the active-reload path must emit exactly ONE RUN_STARTED.
+    // Previously it emitted its own boundary and then delegated to the prompted
+    // builder, which emitted a second RUN_STARTED for the same run.
+    let run_started_count = events
+        .iter()
+        .filter(|event| event["type"] == "RUN_STARTED")
+        .count();
+    assert_eq!(
+        run_started_count, 1,
+        "exactly one RUN_STARTED expected on active-reload; got {run_started_count}: {events:?}"
+    );
+}
+
+#[test]
+fn session_state_is_active_treats_running_and_interrupted_as_live() {
+    use crate::session_actor::{PendingInterruptBatch, SessionState};
+
+    let now = chrono::Utc::now();
+
+    // Idle: not active — a promptless reload should terminate with RUN_FINISHED.
+    assert!(!session_state_is_active(&SessionState::Idle));
+
+    // Running: active.
+    assert!(session_state_is_active(&SessionState::Running {
+        run_id: "run-1".into(),
+        started_at: now,
+    }));
+
+    // Interrupted (awaiting tool approval): active. A reload here must follow the
+    // live broadcast so the pending approval prompt reappears, not close the stream.
+    let pending = PendingInterruptBatch {
+        interrupt_run_id: "run-1".into(),
+        text: "approve?".into(),
+        attachment_refs: Vec::new(),
+        completion_output: String::new(),
+        completion_thought: None,
+        tool_calls: Vec::new(),
+        interrupts: Vec::new(),
+        metadata: serde_json::Value::Null,
+    };
+    assert!(session_state_is_active(&SessionState::Interrupted {
+        run_id: "run-1".into(),
+        started_at: now,
+        pending: Box::new(pending),
+    }));
 }
 
 fn user_msg(content: &str) -> AgUiMessage {
