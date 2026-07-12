@@ -121,6 +121,12 @@ mod tests {
     /// not abort during cleanup.
     #[test]
     fn guard_drop_during_panic_does_not_double_panic() {
+        // Installs and mutates the process-global panic hook, and its guard
+        // deliberately leaves that hook in place when dropped mid-unwind
+        // (restoring it there would abort). Under `cargo test` that leaked hook
+        // bleeds into every later panic in the shared process and destabilizes
+        // sibling tests; nextest's per-test process isolation contains it.
+        harnx_core::require_nextest();
         let result = std::panic::catch_unwind(|| {
             let _guard = PanicTerminalHookGuard::install();
             panic!("boom");

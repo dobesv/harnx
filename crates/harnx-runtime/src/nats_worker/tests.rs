@@ -613,6 +613,11 @@ fn test_non_idempotent_output_is_synthesized() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_header_matches_local_header_source_of_truth() {
+    // Changes the process-global current directory (via CurrentDirGuard) to
+    // generate the header from a hermetic git repo. Under `cargo test` that cwd
+    // mutation races every other test that resolves paths against the cwd;
+    // nextest's per-test process isolation is required to keep it hermetic.
+    harnx_core::require_nextest();
     let _env_guard = env_lock().await;
     let Some((url, mut child, _store_dir)) = spawn_test_nats().await else {
         return;
