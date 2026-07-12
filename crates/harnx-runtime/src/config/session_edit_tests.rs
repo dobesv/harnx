@@ -76,7 +76,32 @@ fn assistant_yaml(text: &str) -> String {
     .unwrap()
 }
 
-use super::test_support::editor_test_config;
+/// Build a `Config` wired with a dummy `test:model` client and an isolated
+/// sessions dir, for the message-edit tests.
+fn editor_test_config(sessions_dir: std::path::PathBuf) -> Config {
+    let mut config = Config {
+        sessions_dir_override: Some(sessions_dir),
+        working_mode: WorkingMode::Cmd,
+        ..Config::default()
+    };
+    config
+        .clients
+        .push(harnx_client::ClientConfig::OpenAICompatibleConfig(
+            harnx_core::provider_config::openai_compatible::OpenAICompatibleConfig {
+                name: "test".to_string(),
+                api_base: None,
+                api_key: None,
+                models: vec![],
+                patches: None,
+                extra: None,
+                system_prompt_prefix: None,
+                package: None,
+            },
+        ));
+    config.model = harnx_client::Model::new("test", "model");
+    config.model_id = "test:model".to_string();
+    config
+}
 
 #[test]
 fn validate_edited_session_documents_accepts_valid_yaml_documents() {

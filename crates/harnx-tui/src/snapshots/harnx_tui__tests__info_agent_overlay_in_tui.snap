@@ -2,7 +2,7 @@
 source: crates/harnx-tui/src/tests.rs
 expression: rendered
 ---
-Compacted session───────────────────────────────────────────────────────
+Agent Info──────────────────────────────────────────────────────────────
 Error: agent 'overlay-agent' not found
 
 

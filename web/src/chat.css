@@ -136,55 +136,57 @@ body {
 .top-nav {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   padding: 1rem 2rem;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   color: var(--text-h);
 }
 
-.top-nav-brand {
-  font-weight: 800;
-  font-size: 1.2rem;
-  color: var(--text-h);
-}
-
-.top-nav-controls {
-  display: flex;
-  gap: 1.5rem;
-}
-
-.top-nav-item {
+.top-nav-breadcrumbs {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  font-size: 0.9rem;
+  min-width: 0;
+  flex-wrap: nowrap;
+  white-space: nowrap;
 }
 
-.top-nav-label {
-  color: var(--text);
+.top-nav-crumb-button,
+.top-nav-crumb-active {
+  font-size: 0.95rem;
+  line-height: 1.2;
 }
 
-.top-nav-value {
-  font-weight: 600;
+.top-nav-crumb-button {
   color: var(--text-h);
-}
-
-.top-nav-item button {
-  color: var(--text-h);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  padding: 0.3rem 0.6rem;
-  border-radius: 4px;
-  font-size: 0.8rem;
+  background: none;
+  border: none;
+  padding: 0;
   cursor: pointer;
-  transition: all 0.2s;
-  margin-left: 0.5rem;
+  font-weight: 600;
 }
 
-.top-nav-item button:hover {
-  background: var(--muted);
-  border-color: var(--border);
+.top-nav-crumb-button:hover {
+  color: var(--accent);
+}
+
+.top-nav-crumb-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.top-nav-crumb-active {
+  color: var(--text);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.top-nav-separator {
+  color: var(--text);
+  opacity: 0.7;
 }
 
 .chat-main {
@@ -210,8 +212,8 @@ body {
 
 .aui-thread-empty .aui-thread-bottom {
   width: 100%;
-  max-width: 800px;
-  padding: 0 2rem;
+  padding: 0;
+  background: var(--bg);
 }
 
 .aui-thread-viewport {
@@ -239,11 +241,10 @@ body {
 
 .aui-composer-container {
   position: relative;
-  max-width: 900px;
-  margin: 0 auto;
   width: 100%;
-  padding: 0 1rem 1rem;
+  padding: 0;
   background: var(--bg);
+  border-top: 1px solid var(--border);
 }
 
 .aui-message {
@@ -289,14 +290,9 @@ body {
   border: 1px solid var(--border);
 }
 
-
-
-
 .aui-composer-input:focus {
   outline: none;
 }
-
-
 
 .aui-composer-send:hover:not(:disabled) {
   background: var(--accent-border);
@@ -312,11 +308,11 @@ body {
   background: var(--danger);
   color: white;
   border: none;
-  padding: 0.8rem 1.5rem;
+  padding: 0.7rem 0.95rem;
   cursor: pointer;
-  font-weight: bold;
-  font-size: 0.95rem;
-  border-left: 1px solid var(--danger-hover);
+  font-weight: 600;
+  font-size: 0.9rem;
+  border-radius: 4px;
 }
 
 .aui-cancel-button:hover {
@@ -330,23 +326,54 @@ body {
   max-width: 900px;
   width: 100%;
   margin: 0 auto;
-  padding: 0.25rem 1rem;
+  padding: 0.35rem 1rem;
   background: var(--bg);
   color: var(--text);
-  font-size: 0.8rem;
-  border-radius: 6px 6px 0 0;
+  font-size: 0.78rem;
+  white-space: nowrap;
+  gap: 0.75rem;
+  flex-wrap: nowrap;
+  overflow-x: hidden;
 }
-.aui-status-left, .aui-status-usage {
+
+.aui-status-left,
+.aui-status-usage {
   display: flex;
   align-items: center;
-  gap: 1rem;
+  min-width: 0;
+  flex-wrap: nowrap;
+  white-space: nowrap;
 }
+
+.aui-status-left {
+  gap: 0.5rem;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.aui-status-usage {
+  gap: 0.75rem;
+  flex: 0 0 auto;
+}
+
+.aui-status-usage-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.aui-status-usage-icon {
+  font-size: 0.9em;
+  opacity: 0.8;
+}
+
 .aui-idle-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background-color: var(--text);
   opacity: 0.5;
+  flex: 0 0 auto;
 }
 
 .aui-error {
@@ -367,8 +394,6 @@ body {
   text-align: center;
 }
 
-
-
 .aui-composer-add-attachment:hover {
   background: var(--border);
 }
@@ -378,7 +403,7 @@ body {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
-  padding: 8px;
+  padding: 0;
 }
 
 .aui-attachment {
@@ -430,7 +455,6 @@ body {
   color: var(--danger);
 }
 
-
 .aui-message[data-role="user"] {
   align-self: flex-end;
   background: var(--accent-bg);
@@ -469,59 +493,72 @@ body {
   margin-bottom: 0.75rem;
 }
 
-
-
 .aui-composer {
   display: flex;
   flex-direction: column;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  padding: 0.5rem 1rem;
-  margin: 1rem auto;
-  box-shadow: var(--shadow);
+  background: var(--bg);
+  padding: 0.5rem 1rem 1rem;
+  margin: 0 auto;
   width: 100%;
-  max-width: 800px;
-  transition: box-shadow 0.2s;
+  max-width: 900px;
 }
-.aui-composer:focus-within {
-  box-shadow: var(--focus-ring);
+
+.aui-composer-row {
+  display: flex;
+  width: 100%;
+  align-items: flex-end;
+  gap: 0.5rem;
 }
+
+.aui-composer-queue-hint {
+  margin: 0 auto 0.4rem;
+  width: 100%;
+  max-width: 900px;
+  font-size: 0.78rem;
+  color: var(--text);
+}
+
 .aui-composer-input {
   flex: 1;
-  border: none;
-  background: transparent;
-  padding: 0.5rem;
+  min-height: 2.5rem;
+  max-height: 50vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  padding: 0.6rem 0.75rem;
   font-family: var(--sans);
   color: var(--text);
   outline: none;
   resize: none;
+  line-height: 1.4;
 }
+
 .aui-composer-send {
   background: var(--accent);
   color: var(--accent-contrast);
   border: none;
-  border-radius: var(--radius-full);
-  padding: 0.5rem 1rem;
+  border-radius: 4px;
+  padding: 0.6rem 0.95rem;
   cursor: pointer;
   font-weight: 600;
   transition: all 0.2s;
-  margin-left: 0.5rem;
 }
+
 .aui-composer-send:disabled {
   background: var(--muted);
   color: var(--text);
   cursor: not-allowed;
 }
+
 .aui-composer-add-attachment {
   background: transparent;
   border: 1px solid var(--border);
-  border-radius: var(--radius-full);
-  padding: 0.25rem 0.75rem;
+  border-radius: 4px;
+  padding: 0.55rem 0.75rem;
   cursor: pointer;
   font-size: 0.875rem;
   color: var(--text);
-  margin-right: 0.5rem;
 }
 
 .aui-interrupts-batch {
@@ -608,6 +645,7 @@ body {
 .aui-spinner {
   display: inline-flex;
   gap: 4px;
+  flex: 0 0 auto;
 }
 .aui-spinner::before,
 .aui-spinner::after,
@@ -635,6 +673,8 @@ body {
   color: var(--text);
   opacity: 0.8;
   font-size: 0.9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .aui-message {

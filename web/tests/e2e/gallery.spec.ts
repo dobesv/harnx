@@ -38,8 +38,8 @@ test.describe('Gallery', () => {
     
     // (d) Status bar showing completion usage
     await expect(page.locator('.aui-status-bar')).toBeVisible();
-    await expect(page.locator('text=In: 100')).toBeVisible();
-    await expect(page.locator('text=Context: 300 (30%)')).toBeVisible();
+    await expect(page.locator('.aui-status-usage-item[aria-label="Input tokens: 100"]')).toBeVisible();
+    await expect(page.locator('.aui-status-usage-item[aria-label="Context usage: 300 (30%)"]')).toBeVisible();
 
     // Small delay to ensure any CSS transitions finish
     await page.waitForTimeout(200);

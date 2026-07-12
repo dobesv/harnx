@@ -48,33 +48,6 @@ pub(super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     }
 }
 
-/// Build a `Config` wired with a dummy `test:model` client and an isolated
-/// sessions dir. Shared by the message-edit and session-ops test modules.
-pub(super) fn editor_test_config(sessions_dir: std::path::PathBuf) -> Config {
-    let mut config = Config {
-        sessions_dir_override: Some(sessions_dir),
-        working_mode: WorkingMode::Cmd,
-        ..Config::default()
-    };
-    config
-        .clients
-        .push(harnx_client::ClientConfig::OpenAICompatibleConfig(
-            harnx_core::provider_config::openai_compatible::OpenAICompatibleConfig {
-                name: "test".to_string(),
-                api_base: None,
-                api_key: None,
-                models: vec![],
-                patches: None,
-                extra: None,
-                system_prompt_prefix: None,
-                package: None,
-            },
-        ));
-    config.model = harnx_client::Model::new("test", "model");
-    config.model_id = "test:model".to_string();
-    config
-}
-
 /// A package-loaded server identity: the bare yaml stem plus the package it
 /// belongs to. Mirrors what `load_package_servers` records on disk.
 pub(super) struct PackageServer<'a> {
