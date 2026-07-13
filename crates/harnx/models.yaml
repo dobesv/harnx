@@ -475,6 +475,34 @@
       output_price: 30
       supports_vision: true
       supports_tool_use: true
+    - name: gpt-5.6
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 30
+      supports_vision: true
+      supports_tool_use: true
+    - name: gpt-5.6-luna
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 1
+      output_price: 6
+      supports_vision: true
+      supports_tool_use: true
+    - name: gpt-5.6-sol
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 5
+      output_price: 30
+      supports_vision: true
+      supports_tool_use: true
+    - name: gpt-5.6-terra
+      max_input_tokens: 1050000
+      max_output_tokens: 128000
+      input_price: 2.5
+      output_price: 15
+      supports_vision: true
+      supports_tool_use: true
     - name: gpt-audio
       max_input_tokens: 128000
       max_output_tokens: 16384
@@ -534,6 +562,18 @@
       max_output_tokens: 4096
       input_price: 4
       output_price: 16
+      supports_tool_use: true
+    - name: gpt-realtime-2.1
+      max_input_tokens: 128000
+      max_output_tokens: 32000
+      input_price: 4
+      output_price: 24
+      supports_tool_use: true
+    - name: gpt-realtime-2.1-mini
+      max_input_tokens: 128000
+      max_output_tokens: 4096
+      input_price: 0.6
+      output_price: 2.4
       supports_tool_use: true
     - name: gpt-realtime-2025-08-28
       max_input_tokens: 32000
