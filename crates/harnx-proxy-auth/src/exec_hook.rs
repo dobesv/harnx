@@ -570,7 +570,7 @@ fn merge_headers(original_headers: &mut Map<String, Value>, response_headers: Ma
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -645,6 +645,7 @@ mod tests {
         assert!(env.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn sparse_exec_response_merges_with_original_request() {
         let original = json!({
@@ -665,6 +666,7 @@ mod tests {
         assert_eq!(merged["headers"]["x"], "1");
     }
 
+    #[cfg(unix)]
     #[test]
     fn respond_exec_response_bypasses_merge() {
         let original = json!({
@@ -680,6 +682,7 @@ mod tests {
         assert_eq!(merged, response);
     }
 
+    #[cfg(unix)]
     #[test]
     fn header_null_removes_existing_key() {
         let original = json!({
@@ -698,6 +701,7 @@ mod tests {
         assert_eq!(merged["headers"]["accept"], "application/json");
     }
 
+    #[cfg(unix)]
     #[test]
     fn mixed_case_hook_header_key_is_lowercased_and_replaces_original() {
         let original = json!({

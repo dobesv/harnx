@@ -159,6 +159,7 @@ mod tests {
     use crate::sentinel::Sentinels;
     use serde_json::json;
     use std::sync::Arc;
+    #[cfg(unix)]
     use std::time::Duration;
     #[cfg(unix)]
     use tempfile::NamedTempFile;
