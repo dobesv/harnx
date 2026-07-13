@@ -519,7 +519,7 @@ body {
   flex: 1;
   min-height: 2.5rem;
   max-height: 50vh;
-  overflow-y: auto;
+  overflow-y: hidden;
   border: 1px solid var(--border);
   border-radius: 4px;
   background: var(--surface);
