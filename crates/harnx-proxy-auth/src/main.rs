@@ -1,11 +1,12 @@
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 
 use harnx_proxy_auth::{
-    ca, cli, exec_load, filter, fs_gen, hook, load, proxy, sentinel,
+    ca, cli, exec_load, filter, fs_gen, hook, load, notice, proxy, sentinel,
     transform::{build_stages, TransformPipeline},
 };
 
@@ -18,6 +19,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = <cli::Args as Parser>::parse();
+    // Register the notice channel before starting the proxy, so exec hooks can
+    // surface structured notices that the JSONL loop drains to stdout.
+    let notice_rx = notice::init_channel();
     let sentinels = Arc::new(sentinel::Sentinels::generate());
     let load_specs = load::parse_load_specs(&args.load_yaml, &args.load_json, &args.load_raw)?;
     let loaded_vars: Vec<(String, jaq_all::json::Val)> = load_specs
@@ -64,14 +68,33 @@ async fn main() -> Result<()> {
     let (ca_setup, _ca_temp_dir) = ca::setup()?;
     let ca_cert_path = ca_setup.cert_pem_path.clone();
     let ca_cert_pem = std::fs::read_to_string(&ca_cert_path)?;
-    let port = proxy::start_proxy_with_log(pipeline, ca_setup, args.log_file).await?;
+    let port = proxy::start_proxy_with_log(pipeline.clone(), ca_setup, args.log_file).await?;
     let env_vars = filter::JaqVars::new_from_values(
         &sentinels,
         temp_file_root.clone(),
         Some(port),
         loaded_vars.clone(),
     )?;
-    let extra_env = filter::eval_env_scripts(&args.env, &env_vars)?;
+    let mut extra_env = filter::eval_env_scripts(&args.env, &env_vars)?;
+    let startup_vars = env_vars.safe_request_vars();
+    let startup_env = pipeline
+        .run_startup(startup_vars, Duration::from_secs(args.hook_timeout_secs))
+        .await;
+    for (key, value) in startup_env {
+        if extra_env.contains_key(&key) {
+            continue;
+        }
+
+        // SAFETY: startup hooks run after proxy listener tasks start but before
+        // JSONL request loop begins. In this window, harnx-proxy-auth startup
+        // path is sole code mutating process env, and proxy/background tasks
+        // spawned by start_proxy_with_log do not read or write process env.
+        // That keeps this mutation race-free in practice for current code.
+        unsafe {
+            std::env::set_var(&key, value.as_str().expect("startup env strings only"));
+        }
+        extra_env.insert(key, value);
+    }
 
     // Write readiness lines then explicitly drop the lock before entering the
     // async JSONL loop. Holding a std::io::StdoutLock across an .await would
@@ -89,7 +112,7 @@ async fn main() -> Result<()> {
 
     if let Some(temp_dir) = fs_temp_dir {
         tokio::select! {
-            result = hook::run_jsonl_loop(port, ca_cert_path, extra_env) => result,
+            result = hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx) => result,
             _ = shutdown_signal() => {
                 // `TempDir`'s Drop removes the directory on the way out.
                 drop(temp_dir);
@@ -97,7 +120,7 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        hook::run_jsonl_loop(port, ca_cert_path, extra_env).await
+        hook::run_jsonl_loop(port, ca_cert_path, extra_env, notice_rx).await
     }
 }
 

@@ -63,6 +63,7 @@ pub async fn run_hooks(
                 status_message: None,
                 async_hook: Some(false),
                 hook_type: def.hook_type.clone(),
+                package_dir: None,
             }
         })
         .collect();

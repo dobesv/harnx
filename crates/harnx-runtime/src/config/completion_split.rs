@@ -21,7 +21,7 @@ impl Config {
                 ".agent" => map_completion_values(precomputed_agents),
                 ".macro" => map_completion_values(Self::list_macros()),
                 ".info" => map_completion_values(vec![
-                    "session", "model", "agent", "rag", "tools", "theme",
+                    "session", "model", "agent", "rag", "tools", "theme", "mcp", "env",
                 ]),
                 ".mcp" => map_completion_values(vec![
                     "list",
