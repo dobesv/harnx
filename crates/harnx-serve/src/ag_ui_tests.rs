@@ -60,13 +60,13 @@ fn ag_ui_sink_emits_text_message_content_for_chunk() {
         None,
     );
 
-    match rx.try_recv().expect("text start") {
+    let opened_message_id = match rx.try_recv().expect("text start") {
         Event::TextMessageStart(event) => {
-            assert_eq!(event.message_id, message_id.clone());
             assert_eq!(event.role, Role::Assistant);
+            event.message_id
         }
         other => panic!("expected TextMessageStart event, got: {other:?}"),
-    }
+    };
     match rx.try_recv().expect("text content") {
         Event::TextMessageContent(TextMessageContentEvent {
             base,
@@ -75,7 +75,7 @@ fn ag_ui_sink_emits_text_message_content_for_chunk() {
         }) => {
             assert_eq!(base.timestamp, None);
             assert_eq!(base.raw_event, None);
-            assert_eq!(mid, message_id);
+            assert_eq!(mid, opened_message_id);
             assert_eq!(delta, "hello");
         }
         other => panic!("expected TextMessageContent event, got: {other:?}"),
@@ -196,20 +196,20 @@ fn ag_ui_sink_emits_final_as_content_when_non_empty() {
         None,
     );
 
-    match rx.try_recv().expect("text start") {
+    let opened_message_id = match rx.try_recv().expect("text start") {
         Event::TextMessageStart(event) => {
-            assert_eq!(event.message_id, message_id.clone());
             assert_eq!(event.role, Role::Assistant);
+            event.message_id
         }
         other => panic!("expected TextMessageStart event, got: {other:?}"),
-    }
+    };
     match rx.try_recv().expect("text content") {
         Event::TextMessageContent(TextMessageContentEvent {
             base,
             message_id: mid,
             delta,
         }) => {
-            assert_eq!(mid, message_id);
+            assert_eq!(mid, opened_message_id);
             assert_eq!(delta, "final text");
             assert_eq!(base.timestamp, None);
         }
@@ -281,16 +281,16 @@ fn ag_ui_sink_maps_thought_then_text_and_closes_thinking_before_text() {
         rx.try_recv().expect("thinking close"),
         Event::ThinkingEnd(_)
     ));
-    match rx.try_recv().expect("text start") {
+    let opened_message_id = match rx.try_recv().expect("text start") {
         Event::TextMessageStart(event) => {
-            assert_eq!(event.message_id, message_id);
             assert_eq!(event.role, Role::Assistant);
+            event.message_id
         }
         other => panic!("expected TextMessageStart, got: {other:?}"),
-    }
+    };
     match rx.try_recv().expect("text delta") {
         Event::TextMessageContent(event) => {
-            assert_eq!(event.message_id, message_id);
+            assert_eq!(event.message_id, opened_message_id);
             assert_eq!(event.delta, "answer");
         }
         other => panic!("expected TextMessageContent, got: {other:?}"),
@@ -498,6 +498,138 @@ fn ag_ui_sink_maps_tool_started_completed_to_ag_ui_events() {
         other => panic!("expected ToolCallResult, got: {other:?}"),
     }
 
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn ag_ui_sink_segments_text_around_tool_calls() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let message_id = MessageId::from(uuid::Uuid::new_v4());
+    let sink = super::AgUiSink::with_snapshot(tx, message_id.clone(), false, None);
+
+    sink.emit(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("A".to_string())],
+        }),
+        None,
+    );
+    sink.emit(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "history-3".to_string(),
+            name: "read_history".to_string(),
+            kind: harnx_core::event::ToolKind::Other,
+            markdown: None,
+            input: json!({"limit": 1}),
+            locations: vec![],
+        }),
+        None,
+    );
+    sink.emit(
+        AgentEvent::Tool(ToolEvent::Completed {
+            id: "history-3".to_string(),
+            output: json!("done"),
+            markdown: None,
+        }),
+        None,
+    );
+    sink.emit(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("B".to_string())],
+        }),
+        None,
+    );
+
+    let first_id = match rx.try_recv().expect("first text start") {
+        Event::TextMessageStart(event) => {
+            assert_eq!(event.role, Role::Assistant);
+            event.message_id
+        }
+        other => panic!("expected first TextMessageStart, got: {other:?}"),
+    };
+    match rx.try_recv().expect("first text content") {
+        Event::TextMessageContent(event) => {
+            assert_eq!(event.message_id, first_id);
+            assert_eq!(event.delta, "A");
+        }
+        other => panic!("expected first TextMessageContent, got: {other:?}"),
+    }
+    match rx.try_recv().expect("first text end") {
+        Event::TextMessageEnd(event) => assert_eq!(event.message_id, first_id),
+        other => panic!("expected first TextMessageEnd, got: {other:?}"),
+    }
+    match rx.try_recv().expect("tool start") {
+        Event::ToolCallStart(event) => {
+            assert_eq!(event.parent_message_id, Some(message_id.clone()));
+            assert_eq!(
+                event.tool_call_id,
+                serde_json::from_value(json!("history-3")).unwrap()
+            );
+        }
+        other => panic!("expected ToolCallStart, got: {other:?}"),
+    }
+    assert!(matches!(
+        rx.try_recv().expect("tool args"),
+        Event::ToolCallArgs(_)
+    ));
+    assert!(matches!(
+        rx.try_recv().expect("tool end"),
+        Event::ToolCallEnd(_)
+    ));
+    assert!(matches!(
+        rx.try_recv().expect("tool result"),
+        Event::ToolCallResult(_)
+    ));
+    let second_id = match rx.try_recv().expect("second text start") {
+        Event::TextMessageStart(event) => {
+            assert_eq!(event.role, Role::Assistant);
+            event.message_id
+        }
+        other => panic!("expected second TextMessageStart, got: {other:?}"),
+    };
+    assert_ne!(first_id, second_id);
+    match rx.try_recv().expect("second text content") {
+        Event::TextMessageContent(event) => {
+            assert_eq!(event.message_id, second_id);
+            assert_eq!(event.delta, "B");
+        }
+        other => panic!("expected second TextMessageContent, got: {other:?}"),
+    }
+    match sink.close_text_segment() {
+        Some(closed_id) => assert_eq!(closed_id, second_id),
+        None => panic!("expected open text segment to close"),
+    }
+    match rx.try_recv().expect("second text end") {
+        Event::TextMessageEnd(event) => assert_eq!(event.message_id, second_id),
+        other => panic!("expected second TextMessageEnd, got: {other:?}"),
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn ag_ui_sink_does_not_emit_orphan_text_end_after_tool_only_tail() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let sink = super::AgUiSink::with_snapshot(tx, MessageId::random(), false, None);
+
+    sink.emit(
+        AgentEvent::Model(ModelEvent::MessageChunk {
+            blocks: vec![ContentBlock::Text("A".to_string())],
+        }),
+        None,
+    );
+    sink.emit(
+        AgentEvent::Tool(ToolEvent::Started {
+            id: "history-4".to_string(),
+            name: "read_history".to_string(),
+            kind: harnx_core::event::ToolKind::Other,
+            markdown: None,
+            input: json!({"limit": 1}),
+            locations: vec![],
+        }),
+        None,
+    );
+
+    while let Ok(_event) = rx.try_recv() {}
+    assert!(sink.close_text_segment().is_none());
     assert!(rx.try_recv().is_err());
 }
 
@@ -1003,7 +1135,10 @@ async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
         Some("text/event-stream")
     );
 
-    let parsed_events = read_sse_events_until(response, |events| events.len() >= 5).await;
+    let parsed_events = read_sse_events_until(response, |events| {
+        events.iter().any(|event| event["type"] == "RUN_FINISHED")
+    })
+    .await;
 
     let event_types = parsed_events
         .iter()
@@ -1033,16 +1168,15 @@ async fn ag_ui_run_streams_ordered_events_with_stubbed_call_fn() {
 
     assert_eq!(parsed_events[2]["delta"].as_str(), Some("chunk-text"));
 
-    let start_message_id = parsed_events[1]["messageId"].as_str().unwrap().to_string();
-    // TEXT_MESSAGE_CONTENT carries the same messageId as TEXT_MESSAGE_START.
+    let text_message_id = parsed_events[1]["messageId"].as_str().unwrap().to_string();
     assert_eq!(
         parsed_events[2]["messageId"].as_str(),
-        Some(start_message_id.as_str())
+        Some(text_message_id.as_str())
     );
-    // TEXT_MESSAGE_END (next frame) must also carry the same messageId.
+    // TEXT_MESSAGE_END (next frame) must carry same messageId as streamed content.
     assert_eq!(
         parsed_events[3]["messageId"].as_str(),
-        Some(start_message_id.as_str())
+        Some(text_message_id.as_str())
     );
 
     let session_messages = load_session_texts(&config, "hephaestus", session_id);
@@ -1223,10 +1357,15 @@ async fn ag_ui_run_emits_run_error_without_run_finished_when_call_fn_fails() {
     // Prompted run: no MESSAGES_SNAPSHOT (pure delta stream).
     assert_eq!(
         event_types,
-        vec!["RUN_STARTED", "TEXT_MESSAGE_START", "RUN_ERROR",]
+        vec![
+            "RUN_STARTED",
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_END",
+            "RUN_ERROR",
+        ]
     );
     assert_eq!(
-        parsed_events[2]["message"].as_str(),
+        parsed_events[3]["message"].as_str(),
         Some("stubbed call failure")
     );
     assert!(parsed_events
@@ -1677,9 +1816,19 @@ async fn ag_ui_run_uses_only_last_message_user_prompt() {
     .await;
     // Prompted run: pure delta stream, no MESSAGES_SNAPSHOT. The call_fn above
     // already asserts the last user message ("last user wins") is used as the prompt.
-    assert_eq!(events[0]["type"], "RUN_STARTED");
-    assert_eq!(events[1]["type"], "TEXT_MESSAGE_START");
-    assert!(events.iter().any(|event| event["type"] == "RUN_FINISHED"));
+    let event_types = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types,
+        vec![
+            "RUN_STARTED",
+            "TEXT_MESSAGE_START",
+            "TEXT_MESSAGE_END",
+            "RUN_FINISHED",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1929,6 +2078,19 @@ fn parse_sse_frame(frame: &str) -> Value {
         .strip_prefix("data: ")
         .expect("sse frame should start with data prefix");
     serde_json::from_str(payload).expect("frame should be valid json")
+}
+
+fn decode_sse_bytes_chunks(chunks: Vec<Bytes>) -> Vec<Value> {
+    chunks
+        .into_iter()
+        .flat_map(|chunk| {
+            let text = String::from_utf8(chunk.to_vec()).expect("utf8 frame");
+            parse_sse_frames(&text)
+                .into_iter()
+                .map(|frame| parse_sse_frame(&frame))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn assert_run_finished(events: Vec<Value>) {
@@ -2245,13 +2407,7 @@ async fn ag_ui_run_promptless_join_forwards_live_events_when_session_active() {
 
     let frames = tokio_stream::StreamExt::collect::<Vec<_>>(stream).await;
     sender.await.expect("sender task");
-    let events = frames
-        .into_iter()
-        .map(|frame| {
-            let text = String::from_utf8(frame.to_vec()).expect("utf8 frame");
-            parse_sse_frame(text.trim())
-        })
-        .collect::<Vec<_>>();
+    let events = decode_sse_bytes_chunks(frames);
 
     assert!(
         events.len() >= 4,
@@ -2264,14 +2420,27 @@ async fn ag_ui_run_promptless_join_forwards_live_events_when_session_active() {
         .iter()
         .position(|event| event["type"] == "TEXT_MESSAGE_CONTENT")
         .expect("live text event should be forwarded");
+    let live_start_index = events
+        .iter()
+        .position(|event| event["type"] == "TEXT_MESSAGE_START")
+        .expect("missing synthesized text start");
     let finished_index = events
         .iter()
         .position(|event| event["type"] == "RUN_FINISHED")
         .expect("real run finished should arrive");
     assert!(
+        live_start_index < live_index,
+        "synthesized start should precede live content: {:?}",
+        events
+    );
+    assert!(
         live_index < finished_index,
         "live event should arrive before terminal: {:?}",
         events
+    );
+    assert_eq!(
+        events[live_start_index]["messageId"],
+        events[live_index]["messageId"]
     );
     assert_eq!(events[live_index]["delta"], "live delta");
     assert!(
@@ -2293,6 +2462,460 @@ async fn ag_ui_run_promptless_join_forwards_live_events_when_session_active() {
         run_started_count, 1,
         "exactly one RUN_STARTED expected on active-reload; got {run_started_count}: {events:?}"
     );
+}
+
+#[tokio::test]
+async fn ag_ui_promptless_active_reconnect_synthesizes_text_start_before_unmatched_end() {
+    let run_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
+    let stream = build_promptless_event_stream(
+        &run_id.to_string(),
+        &thread_id.to_string(),
+        None,
+        tokio_stream::StreamExt::filter_map(
+            tokio_stream::StreamExt::then(
+                BroadcastStream::new(rx),
+                |item| async move { item.ok() },
+            ),
+            |event| event,
+        ),
+        true,
+    );
+    let message_id = MessageId::random();
+
+    tx.send(Event::TextMessageEnd(TextMessageEndEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        message_id: message_id.clone(),
+    }))
+    .expect("send unmatched text end");
+    tx.send(Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: ThreadId::from(thread_id),
+        run_id: RunId::from(run_id),
+        result: None,
+    }))
+    .expect("send run finished");
+
+    let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+    let start_index = events
+        .iter()
+        .position(|event| event["type"] == "TEXT_MESSAGE_START")
+        .expect("missing synthesized text start");
+    let end_index = events
+        .iter()
+        .position(|event| event["type"] == "TEXT_MESSAGE_END")
+        .expect("missing text end");
+
+    assert!(
+        start_index < end_index,
+        "text start must precede text end: {events:?}"
+    );
+    assert_eq!(events[start_index]["messageId"], json!(message_id));
+    assert_eq!(events[end_index]["messageId"], json!(message_id));
+}
+
+#[tokio::test]
+async fn ag_ui_promptless_active_reconnect_drops_unmatched_tool_call_events() {
+    let run_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
+    let stream = build_promptless_event_stream(
+        &run_id.to_string(),
+        &thread_id.to_string(),
+        None,
+        tokio_stream::StreamExt::filter_map(
+            tokio_stream::StreamExt::then(
+                BroadcastStream::new(rx),
+                |item| async move { item.ok() },
+            ),
+            |event| event,
+        ),
+        true,
+    );
+    let tool_call_id = ToolCallId::random();
+    let message_id = MessageId::random();
+
+    tx.send(Event::ToolCallArgs(ToolCallArgsEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        tool_call_id: tool_call_id.clone(),
+        delta: "{\"arg\":1}".to_string(),
+    }))
+    .expect("send unmatched tool args");
+    tx.send(Event::ToolCallEnd(ToolCallEndEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        tool_call_id: tool_call_id.clone(),
+    }))
+    .expect("send unmatched tool end");
+    tx.send(Event::ToolCallResult(ToolCallResultEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        message_id,
+        tool_call_id: tool_call_id.clone(),
+        content: "done".to_string(),
+        role: Role::Tool,
+    }))
+    .expect("send unmatched tool result");
+    tx.send(Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: ThreadId::from(thread_id),
+        run_id: RunId::from(run_id),
+        result: None,
+    }))
+    .expect("send run finished");
+
+    let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+    assert!(
+        events.iter().all(|event| {
+            !matches!(
+                event["type"].as_str(),
+                Some("TOOL_CALL_ARGS" | "TOOL_CALL_END" | "TOOL_CALL_RESULT")
+            )
+        }),
+        "unmatched tool events should be dropped: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn ag_ui_promptless_active_reconnect_forwards_started_tool_call_lifecycle() {
+    let run_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
+    let stream = build_promptless_event_stream(
+        &run_id.to_string(),
+        &thread_id.to_string(),
+        None,
+        tokio_stream::StreamExt::filter_map(
+            tokio_stream::StreamExt::then(
+                BroadcastStream::new(rx),
+                |item| async move { item.ok() },
+            ),
+            |event| event,
+        ),
+        true,
+    );
+    let tool_call_id = ToolCallId::random();
+    let result_message_id = MessageId::random();
+
+    tx.send(Event::ToolCallStart(ToolCallStartEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        tool_call_id: tool_call_id.clone(),
+        tool_call_name: "search".to_string(),
+        parent_message_id: None,
+    }))
+    .expect("send tool start");
+    tx.send(Event::ToolCallArgs(ToolCallArgsEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        tool_call_id: tool_call_id.clone(),
+        delta: "{\"q\":\"rust\"}".to_string(),
+    }))
+    .expect("send tool args");
+    tx.send(Event::ToolCallEnd(ToolCallEndEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        tool_call_id: tool_call_id.clone(),
+    }))
+    .expect("send tool end");
+    tx.send(Event::ToolCallResult(ToolCallResultEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        message_id: result_message_id,
+        tool_call_id: tool_call_id.clone(),
+        content: "done".to_string(),
+        role: Role::Tool,
+    }))
+    .expect("send tool result");
+    tx.send(Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: ThreadId::from(thread_id),
+        run_id: RunId::from(run_id),
+        result: None,
+    }))
+    .expect("send run finished");
+
+    let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+    let tool_events = events
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .filter(|kind| kind.starts_with("TOOL_CALL_"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_events,
+        vec![
+            "TOOL_CALL_START",
+            "TOOL_CALL_ARGS",
+            "TOOL_CALL_END",
+            "TOOL_CALL_RESULT",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn ag_ui_promptless_active_reconnect_synthesizes_step_start_before_unmatched_finish() {
+    let run_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
+    let stream = build_promptless_event_stream(
+        &run_id.to_string(),
+        &thread_id.to_string(),
+        None,
+        tokio_stream::StreamExt::filter_map(
+            tokio_stream::StreamExt::then(
+                BroadcastStream::new(rx),
+                |item| async move { item.ok() },
+            ),
+            |event| event,
+        ),
+        true,
+    );
+    let step_name = "turn-99".to_string();
+
+    tx.send(Event::StepFinished(StepFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        step_name: step_name.clone(),
+    }))
+    .expect("send unmatched step finish");
+    tx.send(Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: ThreadId::from(thread_id),
+        run_id: RunId::from(run_id),
+        result: None,
+    }))
+    .expect("send run finished");
+
+    let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+    let start_index = events
+        .iter()
+        .position(|event| event["type"] == "STEP_STARTED")
+        .expect("missing synthesized step start");
+    let finish_index = events
+        .iter()
+        .position(|event| event["type"] == "STEP_FINISHED")
+        .expect("missing step finish");
+
+    assert!(
+        start_index < finish_index,
+        "step start must precede step finish: {events:?}"
+    );
+    assert_eq!(events[start_index]["stepName"], json!(step_name));
+    assert_eq!(events[finish_index]["stepName"], json!(step_name));
+}
+
+#[tokio::test]
+async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_before_unmatched_end() {
+    let run_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
+    let stream = build_promptless_event_stream(
+        &run_id.to_string(),
+        &thread_id.to_string(),
+        None,
+        tokio_stream::StreamExt::filter_map(
+            tokio_stream::StreamExt::then(
+                BroadcastStream::new(rx),
+                |item| async move { item.ok() },
+            ),
+            |event| event,
+        ),
+        true,
+    );
+
+    tx.send(Event::ThinkingEnd(ThinkingEndEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+    }))
+    .expect("send unmatched thinking end");
+    tx.send(Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: ThreadId::from(thread_id),
+        run_id: RunId::from(run_id),
+        result: None,
+    }))
+    .expect("send run finished");
+
+    let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+    let thinking_start_index = events
+        .iter()
+        .position(|event| event["type"] == "THINKING_START")
+        .expect("missing synthesized thinking start");
+    let thinking_end_index = events
+        .iter()
+        .position(|event| event["type"] == "THINKING_END")
+        .expect("missing thinking end");
+
+    assert!(
+        thinking_start_index < thinking_end_index,
+        "thinking start must precede thinking end: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_and_text_start_before_unmatched_text_end(
+) {
+    let run_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
+    let stream = build_promptless_event_stream(
+        &run_id.to_string(),
+        &thread_id.to_string(),
+        None,
+        tokio_stream::StreamExt::filter_map(
+            tokio_stream::StreamExt::then(
+                BroadcastStream::new(rx),
+                |item| async move { item.ok() },
+            ),
+            |event| event,
+        ),
+        true,
+    );
+
+    tx.send(Event::ThinkingTextMessageEnd(ThinkingTextMessageEndEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+    }))
+    .expect("send unmatched thinking text end");
+    tx.send(Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: ThreadId::from(thread_id),
+        run_id: RunId::from(run_id),
+        result: None,
+    }))
+    .expect("send run finished");
+
+    let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+    let thinking_start_index = events
+        .iter()
+        .position(|event| event["type"] == "THINKING_START")
+        .expect("missing synthesized thinking start");
+    let thinking_text_start_index = events
+        .iter()
+        .position(|event| event["type"] == "THINKING_TEXT_MESSAGE_START")
+        .expect("missing synthesized thinking text start");
+    let thinking_text_end_index = events
+        .iter()
+        .position(|event| event["type"] == "THINKING_TEXT_MESSAGE_END")
+        .expect("missing thinking text end");
+
+    assert!(
+        thinking_start_index < thinking_text_start_index,
+        "thinking start must precede thinking text start: {events:?}"
+    );
+    assert!(
+        thinking_text_start_index < thinking_text_end_index,
+        "thinking text start must precede thinking text end: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn ag_ui_promptless_active_reconnect_synthesizes_thinking_start_and_text_start_before_unmatched_text_content(
+) {
+    let run_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
+    let stream = build_promptless_event_stream(
+        &run_id.to_string(),
+        &thread_id.to_string(),
+        None,
+        tokio_stream::StreamExt::filter_map(
+            tokio_stream::StreamExt::then(
+                BroadcastStream::new(rx),
+                |item| async move { item.ok() },
+            ),
+            |event| event,
+        ),
+        true,
+    );
+
+    tx.send(Event::ThinkingTextMessageContent(
+        ThinkingTextMessageContentEvent {
+            base: BaseEvent {
+                timestamp: None,
+                raw_event: None,
+            },
+            delta: "plan".to_string(),
+        },
+    ))
+    .expect("send unmatched thinking text content");
+    tx.send(Event::RunFinished(ag_ui_core::event::RunFinishedEvent {
+        base: BaseEvent {
+            timestamp: None,
+            raw_event: None,
+        },
+        thread_id: ThreadId::from(thread_id),
+        run_id: RunId::from(run_id),
+        result: None,
+    }))
+    .expect("send run finished");
+
+    let events = decode_sse_bytes_chunks(tokio_stream::StreamExt::collect::<Vec<_>>(stream).await);
+    let thinking_start_index = events
+        .iter()
+        .position(|event| event["type"] == "THINKING_START")
+        .expect("missing synthesized thinking start");
+    let thinking_text_start_index = events
+        .iter()
+        .position(|event| event["type"] == "THINKING_TEXT_MESSAGE_START")
+        .expect("missing synthesized thinking text start");
+    let thinking_text_content_index = events
+        .iter()
+        .position(|event| event["type"] == "THINKING_TEXT_MESSAGE_CONTENT")
+        .expect("missing thinking text content");
+
+    assert!(
+        thinking_start_index < thinking_text_start_index,
+        "thinking start must precede thinking text start: {events:?}"
+    );
+    assert!(
+        thinking_text_start_index < thinking_text_content_index,
+        "thinking text start must precede thinking text content: {events:?}"
+    );
+    assert_eq!(events[thinking_text_content_index]["delta"], "plan");
 }
 
 #[test]

@@ -130,7 +130,15 @@ const MyComposer = ({
   const resizeTextarea = useCallback((el: HTMLTextAreaElement | null) => {
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = `${el.scrollHeight}px`;
+    const maxHeight = parseFloat(getComputedStyle(el).maxHeight) || Infinity;
+    const contentHeight = el.scrollHeight;
+    if (contentHeight > maxHeight) {
+      el.style.height = `${maxHeight}px`;
+      el.style.overflowY = 'auto';
+    } else {
+      el.style.height = `${contentHeight}px`;
+      el.style.overflowY = 'hidden';
+    }
   }, []);
 
   const setTextareaRef = useCallback((el: HTMLTextAreaElement | null) => {
@@ -138,14 +146,24 @@ const MyComposer = ({
     resizeTextarea(el);
   }, [resizeTextarea]);
 
+  // Collapse the textarea back to its single-line, no-scrollbar state.
+  // Deferred to the next frame so it runs after React has cleared the input
+  // value in the DOM; otherwise height/scrollHeight would be measured against
+  // the stale (pre-clear) content and the textarea would stay expanded.
+  const collapseTextarea = useCallback(() => {
+    requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.style.height = 'auto';
+      textarea.style.overflowY = 'hidden';
+    });
+  }, []);
+
   const resetComposerInput = useCallback(() => {
     composerRuntime.setText('');
     void composerRuntime.clearAttachments();
-    const textarea = textareaRef.current;
-    if (textarea) {
-      textarea.style.height = 'auto';
-    }
-  }, [composerRuntime]);
+    collapseTextarea();
+  }, [composerRuntime, collapseTextarea]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -166,12 +184,7 @@ const MyComposer = ({
     }
 
     composerRuntime.send();
-    const textarea = textareaRef.current;
-    if (textarea) {
-      requestAnimationFrame(() => {
-        textarea.style.height = 'auto';
-      });
-    }
+    collapseTextarea();
   };
 
   const queueCountLabel = queuedMessage ? '1 message queued' : null;

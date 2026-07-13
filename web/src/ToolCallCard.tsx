@@ -127,6 +127,20 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
     }
   }
 
+  let fallbackPreview: string | null = null;
+  if (!summaryMarkdown && parsedArgs && typeof parsedArgs === 'object') {
+    if (typeof parsedArgs.command === 'string') {
+      fallbackPreview = `$ ${parsedArgs.command}`;
+    } else {
+      const keys = Object.keys(parsedArgs);
+      if (keys.length === 1 && typeof parsedArgs[keys[0]] === 'string') {
+        fallbackPreview = parsedArgs[keys[0]];
+      } else if (keys.length > 0) {
+        fallbackPreview = JSON.stringify(parsedArgs);
+      }
+    }
+  }
+
   const isDarkMode = typeof document !== 'undefined' && document.body.classList.contains('dark');
   const jsonStyles = isDarkMode ? darkStyles : defaultStyles;
 
@@ -153,7 +167,13 @@ export const ToolCallCard: React.FC<ToolCallMessagePartProps> = (props) => {
           <span className="aui-tool-call-label">
             <strong>{toolName}</strong>
           </span>
-          {summaryMarkdown ? <ToolSummaryPreview markdown={summaryMarkdown} /> : null}
+          {summaryMarkdown ? (
+            <ToolSummaryPreview markdown={summaryMarkdown} />
+          ) : fallbackPreview ? (
+            <div className="aui-tool-summary" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {fallbackPreview}
+            </div>
+          ) : null}
         </div>
         <div>
           {expanded ? '▾' : '▸'}
