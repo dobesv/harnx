@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -779,9 +780,213 @@ enum FirstRunState {
     Errored,
 }
 
+#[derive(Default)]
+struct LiveStreamGuard {
+    started_text_messages: HashSet<MessageId>,
+    seen_tool_call_ids: Vec<ToolCallId>,
+    started_steps: HashSet<String>,
+    thinking_open: bool,
+    thinking_text_open: bool,
+}
+
+fn frame_guarded_live_event(event: Event, guard: &mut LiveStreamGuard) -> Option<Bytes> {
+    match event {
+        Event::TextMessageStart(event) => {
+            guard.started_text_messages.insert(event.message_id.clone());
+            frame_event(&Event::TextMessageStart(event))
+                .ok()
+                .map(Bytes::from)
+        }
+        Event::TextMessageContent(event) => {
+            let mut frames = String::new();
+            if guard.started_text_messages.insert(event.message_id.clone()) {
+                frames.push_str(
+                    &frame_event(&Event::TextMessageStart(TextMessageStartEvent {
+                        base: BaseEvent {
+                            timestamp: None,
+                            raw_event: None,
+                        },
+                        message_id: event.message_id.clone(),
+                        role: Role::Assistant,
+                    }))
+                    .ok()?,
+                );
+            }
+            frames.push_str(&frame_event(&Event::TextMessageContent(event)).ok()?);
+            Some(Bytes::from(frames))
+        }
+        Event::TextMessageEnd(event) => {
+            let mut frames = String::new();
+            if guard.started_text_messages.insert(event.message_id.clone()) {
+                frames.push_str(
+                    &frame_event(&Event::TextMessageStart(TextMessageStartEvent {
+                        base: BaseEvent {
+                            timestamp: None,
+                            raw_event: None,
+                        },
+                        message_id: event.message_id.clone(),
+                        role: Role::Assistant,
+                    }))
+                    .ok()?,
+                );
+            }
+            frames.push_str(&frame_event(&Event::TextMessageEnd(event.clone())).ok()?);
+            guard.started_text_messages.remove(&event.message_id);
+            Some(Bytes::from(frames))
+        }
+        Event::ToolCallStart(event) => {
+            guard.seen_tool_call_ids.push(event.tool_call_id.clone());
+            frame_event(&Event::ToolCallStart(event))
+                .ok()
+                .map(Bytes::from)
+        }
+        Event::ToolCallArgs(event) => guard
+            .seen_tool_call_ids
+            .iter()
+            .any(|seen| seen == &event.tool_call_id)
+            .then(|| frame_event(&Event::ToolCallArgs(event)).ok())
+            .flatten()
+            .map(Bytes::from),
+        Event::ToolCallEnd(event) => guard
+            .seen_tool_call_ids
+            .iter()
+            .any(|seen| seen == &event.tool_call_id)
+            .then(|| frame_event(&Event::ToolCallEnd(event)).ok())
+            .flatten()
+            .map(Bytes::from),
+        Event::ToolCallResult(event) => guard
+            .seen_tool_call_ids
+            .iter()
+            .any(|seen| seen == &event.tool_call_id)
+            .then(|| frame_event(&Event::ToolCallResult(event)).ok())
+            .flatten()
+            .map(Bytes::from),
+        Event::StepStarted(event) => {
+            guard.started_steps.insert(event.step_name.clone());
+            frame_event(&Event::StepStarted(event))
+                .ok()
+                .map(Bytes::from)
+        }
+        Event::StepFinished(event) => {
+            let mut frames = String::new();
+            if guard.started_steps.insert(event.step_name.clone()) {
+                frames.push_str(
+                    &frame_event(&Event::StepStarted(StepStartedEvent {
+                        base: BaseEvent {
+                            timestamp: None,
+                            raw_event: None,
+                        },
+                        step_name: event.step_name.clone(),
+                    }))
+                    .ok()?,
+                );
+            }
+            frames.push_str(&frame_event(&Event::StepFinished(event.clone())).ok()?);
+            guard.started_steps.remove(&event.step_name);
+            Some(Bytes::from(frames))
+        }
+        Event::ThinkingStart(event) => {
+            guard.thinking_open = true;
+            frame_event(&Event::ThinkingStart(event))
+                .ok()
+                .map(Bytes::from)
+        }
+        Event::ThinkingEnd(event) => {
+            let mut frames = String::new();
+            if !guard.thinking_open {
+                frames.push_str(
+                    &frame_event(&Event::ThinkingStart(ThinkingStartEvent {
+                        base: BaseEvent {
+                            timestamp: None,
+                            raw_event: None,
+                        },
+                        title: None,
+                    }))
+                    .ok()?,
+                );
+            }
+            frames.push_str(&frame_event(&Event::ThinkingEnd(event)).ok()?);
+            guard.thinking_open = false;
+            Some(Bytes::from(frames))
+        }
+        Event::ThinkingTextMessageStart(event) => {
+            guard.thinking_text_open = true;
+            frame_event(&Event::ThinkingTextMessageStart(event))
+                .ok()
+                .map(Bytes::from)
+        }
+        Event::ThinkingTextMessageContent(event) => {
+            let mut frames = String::new();
+            if !guard.thinking_open {
+                frames.push_str(
+                    &frame_event(&Event::ThinkingStart(ThinkingStartEvent {
+                        base: BaseEvent {
+                            timestamp: None,
+                            raw_event: None,
+                        },
+                        title: None,
+                    }))
+                    .ok()?,
+                );
+                guard.thinking_open = true;
+            }
+            if !guard.thinking_text_open {
+                frames.push_str(
+                    &frame_event(&Event::ThinkingTextMessageStart(
+                        ThinkingTextMessageStartEvent {
+                            base: BaseEvent {
+                                timestamp: None,
+                                raw_event: None,
+                            },
+                        },
+                    ))
+                    .ok()?,
+                );
+                guard.thinking_text_open = true;
+            }
+            frames.push_str(&frame_event(&Event::ThinkingTextMessageContent(event)).ok()?);
+            Some(Bytes::from(frames))
+        }
+        Event::ThinkingTextMessageEnd(event) => {
+            let mut frames = String::new();
+            if !guard.thinking_open {
+                frames.push_str(
+                    &frame_event(&Event::ThinkingStart(ThinkingStartEvent {
+                        base: BaseEvent {
+                            timestamp: None,
+                            raw_event: None,
+                        },
+                        title: None,
+                    }))
+                    .ok()?,
+                );
+                guard.thinking_open = true;
+            }
+            if !guard.thinking_text_open {
+                frames.push_str(
+                    &frame_event(&Event::ThinkingTextMessageStart(
+                        ThinkingTextMessageStartEvent {
+                            base: BaseEvent {
+                                timestamp: None,
+                                raw_event: None,
+                            },
+                        },
+                    ))
+                    .ok()?,
+                );
+            }
+            frames.push_str(&frame_event(&Event::ThinkingTextMessageEnd(event)).ok()?);
+            guard.thinking_text_open = false;
+            Some(Bytes::from(frames))
+        }
+        other => frame_event(&other).ok().map(Bytes::from),
+    }
+}
+
 fn frame_live_event(
     event: Event,
     state: &mut FirstRunState,
+    guard: &mut LiveStreamGuard,
     thread_id: &str,
     run_id: &str,
 ) -> Option<Bytes> {
@@ -809,7 +1014,7 @@ fn frame_live_event(
                     &err.message,
                 )))
             }
-            other => frame_event(&other).ok().map(Bytes::from),
+            other => frame_guarded_live_event(other, guard),
         },
         FirstRunState::Active => match event {
             Event::RunStarted(_) => None,
@@ -831,7 +1036,7 @@ fn frame_live_event(
                     &err.message,
                 )))
             }
-            other => frame_event(&other).ok().map(Bytes::from),
+            other => frame_guarded_live_event(other, guard),
         },
         FirstRunState::Complete | FirstRunState::Errored => {
             // Terminal state: stop forwarding events. The stream must end after
@@ -949,10 +1154,11 @@ fn build_live_event_body(
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let live_stream = {
         let mut state = FirstRunState::AwaitingStarted;
+        let mut guard = LiveStreamGuard::default();
         let terminal_frame = terminal_frame.clone();
         let framed = tokio_stream::StreamExt::map(live_stream, move |event| {
             let is_terminal = matches!(event, Event::RunFinished(_) | Event::RunError(_));
-            let bytes = frame_live_event(event, &mut state, &thread_id_text, &run_id);
+            let bytes = frame_live_event(event, &mut state, &mut guard, &thread_id_text, &run_id);
             (bytes, is_terminal)
         });
         // Stop when a terminal event arrives, capturing its frame to emit last.
