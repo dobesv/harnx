@@ -169,6 +169,65 @@ def _parse_via_yq(text):
     return None
 
 
+def _indent_of(text):
+    return len(text) - len(text.lstrip(" \t"))
+
+
+def _is_profile_item(stripped):
+    return stripped == "-" or stripped.startswith("- ")
+
+
+def _assign_profile_key(profile, pair_text):
+    """Store a `key: value` scalar on `profile`; ignore non-pairs."""
+    if not pair_text or ":" not in pair_text:
+        return
+    key, value = pair_text.split(":", 1)
+    profile[key.strip()] = parse_scalar(value)
+
+
+def _consume_profiles_line(state, stripped):
+    """Handle a line known to belong to the `profiles:` list."""
+    if _is_profile_item(stripped):
+        current = {}
+        state["profiles"].append(current)
+        state["current"] = current
+        rest = stripped[2:].strip() if stripped.startswith("- ") else ""
+        _assign_profile_key(current, rest)
+    elif state["current"] is not None:
+        _assign_profile_key(state["current"], stripped)
+
+
+def _consume_toplevel_line(state, stripped, indent):
+    """Handle a top-level (or dedented) line, updating parser state."""
+    state["in_profiles"] = False
+    state["current"] = None
+    if stripped.startswith("current_profile:"):
+        state["current_profile"] = parse_scalar(stripped.split(":", 1)[1])
+    elif stripped.startswith("profiles:"):
+        state["in_profiles"] = True
+        state["profiles_indent"] = indent
+
+
+def _parse_host_config_line(state, line):
+    """Route one config line to the profiles-list or top-level handler.
+
+    A list item (any indent) starts a new profile; a deeper-indented
+    "key: value" belongs to the current one. YAML allows the "-" at the same
+    indent as `profiles:`, so match on the item marker, not a fixed width.
+    """
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return
+    indent = _indent_of(line)
+    in_list = state["in_profiles"] and (
+        _is_profile_item(stripped) or indent > state["profiles_indent"]
+    )
+    if in_list:
+        _consume_profiles_line(state, stripped)
+    else:
+        _consume_toplevel_line(state, stripped, indent)
+
+
 def _parse_host_config_text(text):
     """Return (current_profile, [profile_dict, ...]) from config text.
 
@@ -184,50 +243,17 @@ def _parse_host_config_text(text):
         return _extract_profiles(data)
 
     log("parsed config via builtin line parser")
-    current_profile = None
-    profiles = []
-    current = None
-    in_profiles = False
-    profiles_indent = 0
-
-    def indent_of(s):
-        return len(s) - len(s.lstrip(" \t"))
-
+    state = {
+        "current_profile": None,
+        "profiles": [],
+        "current": None,
+        "in_profiles": False,
+        "profiles_indent": 0,
+    }
     for raw_line in text.splitlines():
-        line = raw_line.rstrip("\n")
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = indent_of(line)
-        is_item = stripped == "-" or stripped.startswith("- ")
+        _parse_host_config_line(state, raw_line.rstrip("\n"))
 
-        # Still inside the profiles list: a list item (any indent) starts a new
-        # profile; a deeper-indented "key: value" belongs to the current one.
-        # YAML allows the "-" at the same indent as `profiles:`, so match on the
-        # item marker, not a fixed indent width.
-        if in_profiles and (is_item or indent > profiles_indent):
-            if is_item:
-                current = {}
-                profiles.append(current)
-                rest = stripped[2:].strip() if stripped.startswith("- ") else ""
-                if rest and ":" in rest:
-                    key, value = rest.split(":", 1)
-                    current[key.strip()] = parse_scalar(value)
-            elif current is not None and ":" in stripped:
-                key, value = stripped.split(":", 1)
-                current[key.strip()] = parse_scalar(value)
-            continue
-
-        # Top level (or dedented back out of the profiles list).
-        in_profiles = False
-        current = None
-        if stripped.startswith("current_profile:"):
-            current_profile = parse_scalar(stripped.split(":", 1)[1])
-        elif stripped.startswith("profiles:"):
-            in_profiles = True
-            profiles_indent = indent
-
-    return current_profile, profiles
+    return state["current_profile"], state["profiles"]
 
 
 def resolve_host_config_path():

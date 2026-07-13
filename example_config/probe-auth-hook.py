@@ -45,42 +45,27 @@ def mask_auth(value):
     return f"{scheme} …"
 
 
-def main():
+def parse_args(argv):
+    """Return (hook_path, [host, ...]) from CLI args."""
     hook = DEFAULT_HOOK
     hosts = []
-    for arg in sys.argv[1:]:
+    for arg in argv:
         if arg.endswith(".py") or "/" in arg:
             hook = os.path.expanduser(arg)
         else:
             hosts.append(arg)
     if not hosts:
         hosts = ["as.atlassian.com", "api.atlassian.com"]
+    return hook, hosts
 
-    print(f"probing hook: {hook}\n(hook stderr shown with ┆)\n")
-    proc = subprocess.Popen(
-        [sys.executable, hook],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
 
-    def pump_stderr():
-        for line in proc.stderr:
-            sys.stderr.write("  ┆ " + line)
+def pump_stderr(proc):
+    for line in proc.stderr:
+        sys.stderr.write("  ┆ " + line)
 
-    threading.Thread(target=pump_stderr, daemon=True).start()
 
-    startup_root = tempfile.mkdtemp(prefix="probe-auth-hook-", dir="/tmp")
-    startup_request = {
-        "id": "probe-startup",
-        "event": "startup",
-        "vars": {
-            "temp_file_root": startup_root,
-            "proxy_port": 4444,
-        },
-    }
+def build_requests(hosts):
+    """Return the debug + per-host transform request messages."""
     requests = [
         {
             "id": "debug",
@@ -101,18 +86,38 @@ def main():
                 "headers": {"authorization": "Basic c2VudGluZWw6c2VudGluZWw="},
             }
         )
+    return requests
 
-    proc.stdin.write(json.dumps(startup_request) + "\n")
-    proc.stdin.flush()
 
-    pending = {r["id"]: r for r in requests}
-    for r in requests:
-        proc.stdin.write(json.dumps(r) + "\n")
-        proc.stdin.flush()
+def send_line(stdin, payload):
+    stdin.write(json.dumps(payload) + "\n")
+    stdin.flush()
 
+
+def print_startup_response(resp, startup_root):
+    print(f"[startup] temp_file_root={startup_root}")
+    print(f"[startup] env={json.dumps(resp.get('env') or {}, sort_keys=True)}")
+
+
+def print_request_response(resp, pending):
+    rid = resp.get("id")
+    if rid == "debug":
+        print(f"[debug] {resp.get('respond', {}).get('body')}")
+        return
+    req = pending.get(rid)
+    host = req["host"] if req else "?"
+    injected = resp.get("headers", {}).get("authorization")
+    if injected:
+        print(f"[{host}] injects → {mask_auth(injected)}")
+    else:
+        print(f"[{host}] no injection (request auth passed through unchanged)")
+
+
+def read_responses(proc, pending, request_count, startup_root):
+    """Read hook responses until the startup reply and all requests are seen."""
     got = 0
     startup_seen = False
-    while not startup_seen or got < len(requests):
+    while not startup_seen or got < request_count:
         line = proc.stdout.readline()
         if not line:
             break
@@ -128,23 +133,45 @@ def main():
             notice = resp["notice"]
             print(f"  ⚑ NOTICE [{notice.get('level')}] {notice.get('message')}")
             continue
-        rid = resp.get("id")
-        if rid == "probe-startup":
+        if resp.get("id") == "probe-startup":
             startup_seen = True
-            print(f"[startup] temp_file_root={startup_root}")
-            print(f"[startup] env={json.dumps(resp.get('env') or {}, sort_keys=True)}")
+            print_startup_response(resp, startup_root)
             continue
-        req = pending.get(rid)
         got += 1
-        if rid == "debug":
-            print(f"[debug] {resp.get('respond', {}).get('body')}")
-            continue
-        host = req["host"] if req else "?"
-        injected = resp.get("headers", {}).get("authorization")
-        if injected:
-            print(f"[{host}] injects → {mask_auth(injected)}")
-        else:
-            print(f"[{host}] no injection (request auth passed through unchanged)")
+        print_request_response(resp, pending)
+
+
+def main():
+    hook, hosts = parse_args(sys.argv[1:])
+
+    print(f"probing hook: {hook}\n(hook stderr shown with ┆)\n")
+    proc = subprocess.Popen(
+        [sys.executable, hook],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    threading.Thread(target=pump_stderr, args=(proc,), daemon=True).start()
+
+    startup_root = tempfile.mkdtemp(prefix="probe-auth-hook-", dir="/tmp")
+    startup_request = {
+        "id": "probe-startup",
+        "event": "startup",
+        "vars": {
+            "temp_file_root": startup_root,
+            "proxy_port": 4444,
+        },
+    }
+    requests = build_requests(hosts)
+
+    send_line(proc.stdin, startup_request)
+    pending = {r["id"]: r for r in requests}
+    for r in requests:
+        send_line(proc.stdin, r)
+
+    read_responses(proc, pending, len(requests), startup_root)
 
     proc.stdin.close()
     try:
