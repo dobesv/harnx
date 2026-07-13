@@ -113,6 +113,18 @@ def print_request_response(resp, pending):
         print(f"[{host}] no injection (request auth passed through unchanged)")
 
 
+def _parse_response_line(line):
+    """Return the decoded response object for a stdout line, or None to skip."""
+    line = line.strip()
+    if not line or line == "READY":
+        return None
+    try:
+        return json.loads(line)
+    except Exception:
+        print(f"  (non-JSON stdout) {line}")
+        return None
+
+
 def read_responses(proc, pending, request_count, startup_root):
     """Read hook responses until the startup reply and all requests are seen."""
     got = 0
@@ -121,24 +133,18 @@ def read_responses(proc, pending, request_count, startup_root):
         line = proc.stdout.readline()
         if not line:
             break
-        line = line.strip()
-        if not line or line == "READY":
-            continue
-        try:
-            resp = json.loads(line)
-        except Exception:
-            print(f"  (non-JSON stdout) {line}")
+        resp = _parse_response_line(line)
+        if resp is None:
             continue
         if "notice" in resp and "id" not in resp:
             notice = resp["notice"]
             print(f"  ⚑ NOTICE [{notice.get('level')}] {notice.get('message')}")
-            continue
-        if resp.get("id") == "probe-startup":
+        elif resp.get("id") == "probe-startup":
             startup_seen = True
             print_startup_response(resp, startup_root)
-            continue
-        got += 1
-        print_request_response(resp, pending)
+        else:
+            got += 1
+            print_request_response(resp, pending)
 
 
 def main():

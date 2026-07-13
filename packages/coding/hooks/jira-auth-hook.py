@@ -416,13 +416,57 @@ def handle_startup(request):
     return {"id": request_id, "env": env}
 
 
+def _maybe_inject_auth(request_id, host, endpoint, is_atlassian):
+    """Return an auth-injection response for target hosts, else None.
+
+    Inject the api_token ONLY for the hosts acli authenticates to with it: the
+    `api.atlassian.com` CLI gateway (GET /cli/<cloud_id>/...) and the site's
+    REST API (TARGET_HOSTS). Do NOT inject for `as.atlassian.com` — acli calls
+    its `/api/v1/batch` endpoint UNAUTHENTICATED (Basic BLANK), and forcing a
+    real token there makes the request fail ("unauthorized"), aborting acli
+    before it reaches the working api.atlassian.com data call.
+    """
+    if host in TARGET_HOSTS:
+        if AUTHORIZATION_HEADER:
+            log(f"injecting auth for {endpoint}")
+            return {"id": request_id, "headers": {"authorization": AUTHORIZATION_HEADER}}
+        log(
+            f"{endpoint} matched a target host but auth is unavailable — NOT injecting"
+            + (f" (init error: {INIT_ERROR})" if INIT_ERROR else "")
+        )
+    elif is_atlassian:
+        # Atlassian host we deliberately don't authenticate (e.g. as.atlassian.com).
+        trace(
+            f"pass-through (atlassian host not in target set {sorted(TARGET_HOSTS)}): {endpoint}"
+        )
+    return None
+
+
+def _debug_response(request_id):
+    ensure_initialized()
+    return {
+        "id": request_id,
+        "respond": {
+            "status": 200,
+            "headers": {"content-type": "application/json"},
+            "body": json.dumps(
+                {
+                    "initialized": AUTHORIZATION_HEADER is not None,
+                    "acli_config_dir": str(SANDBOX_CONFIG_DIR) if SANDBOX_CONFIG_DIR else None,
+                    "target_hosts": sorted(TARGET_HOSTS),
+                    "error": INIT_ERROR,
+                }
+            ),
+        },
+    }
+
+
 def handle_request(request):
     request_id = request.get("id")
     if request_id is None:
         raise ValueError("request missing id")
 
-    vars_block = request.get("vars") or {}
-    capture_temp_root(vars_block)
+    capture_temp_root(request.get("vars") or {})
 
     host = (request.get("host") or "").strip().lower()
     method = (request.get("method") or "?").upper()
@@ -439,43 +483,13 @@ def handle_request(request):
     if is_atlassian:
         ensure_initialized()
 
-    # Inject the api_token ONLY for the hosts acli authenticates to with it: the
-    # `api.atlassian.com` CLI gateway (GET /cli/<cloud_id>/...) and the site's
-    # REST API (TARGET_HOSTS). Do NOT inject for `as.atlassian.com` — acli calls
-    # its `/api/v1/batch` endpoint UNAUTHENTICATED (Basic BLANK), and forcing a
-    # real token there makes the request fail (observed: "unauthorized"), which
-    # aborts acli before it reaches the working api.atlassian.com data call.
-    if host in TARGET_HOSTS:
-        if AUTHORIZATION_HEADER:
-            log(f"injecting auth for {endpoint}")
-            return {"id": request_id, "headers": {"authorization": AUTHORIZATION_HEADER}}
-        log(
-            f"{endpoint} matched a target host but auth is unavailable — NOT injecting"
-            + (f" (init error: {INIT_ERROR})" if INIT_ERROR else "")
-        )
-    elif is_atlassian:
-        # Atlassian host we deliberately don't authenticate (e.g. as.atlassian.com).
-        # Logged so we can see it in the trace and confirm it's expected.
-        trace(
-            f"pass-through (atlassian host not in target set {sorted(TARGET_HOSTS)}): {endpoint}"
-        )
-    if host == "harnx.invalid" and request.get("path") == "/jira-auth-hook/debug":
-        ensure_initialized()
-        return {
-            "id": request_id,
-            "respond": {
-                "status": 200,
-                "headers": {"content-type": "application/json"},
-                "body": json.dumps(
-                    {
-                        "initialized": AUTHORIZATION_HEADER is not None,
-                        "acli_config_dir": str(SANDBOX_CONFIG_DIR) if SANDBOX_CONFIG_DIR else None,
-                        "target_hosts": sorted(TARGET_HOSTS),
-                        "error": INIT_ERROR,
-                    }
-                ),
-            },
-        }
+    injected = _maybe_inject_auth(request_id, host, endpoint, is_atlassian)
+    if injected is not None:
+        return injected
+
+    if host == "harnx.invalid" and path == "/jira-auth-hook/debug":
+        return _debug_response(request_id)
+
     return {"id": request_id}
 
 
