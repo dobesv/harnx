@@ -510,6 +510,10 @@ impl ExecHookProcess {
     pub async fn startup(&self, _vars: Value, _timeout: std::time::Duration) -> Map<String, Value> {
         Map::new()
     }
+
+    pub fn with_request_vars(self, _request_vars: std::sync::Arc<Value>) -> Self {
+        self
+    }
 }
 
 #[cfg(unix)]
