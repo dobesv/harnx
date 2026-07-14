@@ -106,18 +106,14 @@ pub async fn dispatch_hooks_with_count_and_manager(
 
         if hook.async_hook == Some(true) {
             if let Some(manager) = async_manager {
-                manager.spawn_hook(payload.clone(), hook.command.clone(), hook.timeout);
+                manager.spawn_hook(payload.clone(), hook.into());
             }
             continue;
         }
 
         if hook.hook_type == "claude-command-persistent" {
             if let Some(pm) = persistent_manager {
-                let outcome = pm
-                    .lock()
-                    .await
-                    .send_event(&hook.command, &payload, hook.timeout)
-                    .await;
+                let outcome = pm.lock().await.send_event(&payload, &hook.into()).await;
                 let HookOutcome { control, result } = outcome;
 
                 // Extract mutations before branching so Ask/Block also carry them.
@@ -167,7 +163,7 @@ pub async fn dispatch_hooks_with_count_and_manager(
             continue;
         }
 
-        let outcome = execute_command_hook(&payload, &hook.command, hook.timeout).await;
+        let outcome = execute_command_hook(&payload, &hook.into()).await;
         let HookOutcome { control, result } = outcome;
 
         // Extract mutations from this hook before branching on control so that
@@ -340,6 +336,7 @@ mod tests {
             status_message: None,
             async_hook: None,
             hook_type: "claude-command".to_string(),
+            package_dir: None,
         }
     }
 
@@ -896,6 +893,7 @@ done"#,
         let command = persistent_mutate_command(&cwd);
         let hooks = vec![HookConfig {
             hook_type: "claude-command-persistent".to_string(),
+            package_dir: None,
             ..hook_config("PreToolUse", command)
         }];
         let event = pre_tool_use_event("bash_exec");

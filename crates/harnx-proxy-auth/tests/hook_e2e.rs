@@ -245,6 +245,7 @@ async fn dispatch_one_hook_with_env(
         status_message: None,
         async_hook: None,
         hook_type: "claude-command-persistent".to_string(),
+        package_dir: None,
     }];
     let persistent_manager = Arc::new(Mutex::new(PersistentHookManager::new()));
     let outcome = dispatch_hooks_with_count_and_manager(
@@ -355,6 +356,7 @@ fn make_config(proxy_bin: PathBuf, bash_bin: PathBuf) -> GlobalConfig {
             status_message: None,
             async_hook: None,
             hook_type: "claude-command-persistent".to_string(),
+            package_dir: None,
         }],
     });
 

@@ -38,8 +38,10 @@ pub struct Args {
 
     /// jq/jaq filter that must output an object mapping relative file paths to
     /// file contents. Each value may be a string, object/array (written as JSON),
-    /// or null to skip. Files are written under a fresh temporary root and the
-    /// root path is available to `--env` hooks as `$temp_file_root`.
+    /// or null to skip. Files are written under a fresh temporary root (unique
+    /// per proxy instance, auto-deleted on exit) whose path is available to
+    /// `--env`/`--fs`/`--hook` jq filters as `$temp_file_root` and to executable
+    /// hooks as `vars.temp_file_root` on each request.
     /// Multiple `--fs` flags run in order and merge (later keys win).
     #[arg(long, value_name = "JQ_FILTER")]
     pub fs: Vec<String>,

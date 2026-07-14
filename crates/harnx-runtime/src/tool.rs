@@ -351,19 +351,27 @@ fn tool_use_hook_entries(
     mcp_manager: &Arc<McpManager>,
     server_name: &str,
 ) -> Option<Vec<HookConfig>> {
+    let client = mcp_manager.get_client(server_name)?;
+    // Hooks bundled by a package can reference scripts relative to their package
+    // via `$HARNX_PACKAGE_DIR`; stamp the resolved dir onto each entry so the
+    // hook dispatcher can inject it into the hook process environment.
+    let package_dir = client.package().map(harnx_core::config_paths::package_dir);
     Some(
-        mcp_manager
-            .get_client(server_name)
-            .and_then(|client| client.hooks().cloned())?
+        client
+            .hooks()
+            .cloned()?
             .entries
-            .iter()
+            .into_iter()
             .filter(|hook| {
                 matches!(
                     hook.event.as_str(),
                     "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
                 )
             })
-            .cloned()
+            .map(|hook| HookConfig {
+                package_dir: package_dir.clone(),
+                ..hook
+            })
             .collect(),
     )
 }
@@ -968,6 +976,7 @@ mod tests {
             status_message: None,
             async_hook: None,
             hook_type: "claude-command".to_string(),
+            package_dir: None,
         }
     }
 

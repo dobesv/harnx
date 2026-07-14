@@ -155,6 +155,15 @@ pub struct HookConfig {
     /// Unknown types are silently skipped.
     #[serde(rename = "type")]
     pub hook_type: String,
+
+    /// Directory of the package that owns this hook, set at load time when the
+    /// hook was defined by a packaged MCP server. Injected into the hook
+    /// process environment as `HARNX_PACKAGE_DIR` so bundled hook scripts can
+    /// be referenced relative to their package. Not serialized. `None` for
+    /// hooks not owned by a package (global or unpackaged config); those fall
+    /// back to the config dir at spawn time.
+    #[serde(skip)]
+    pub package_dir: Option<PathBuf>,
 }
 
 impl HookConfig {
@@ -261,6 +270,7 @@ entries:
                     status_message: None,
                     async_hook: None,
                     hook_type: "claude-command".to_string(),
+                    package_dir: None,
                 },
                 HookConfig {
                     event: "SessionStart".to_string(),
@@ -270,6 +280,7 @@ entries:
                     status_message: None,
                     async_hook: None,
                     hook_type: "claude-command".to_string(),
+                    package_dir: None,
                 },
             ],
         };
@@ -284,6 +295,7 @@ entries:
                 status_message: None,
                 async_hook: None,
                 hook_type: "claude-command".to_string(),
+                package_dir: None,
             }],
         };
 
@@ -314,6 +326,7 @@ entries:
                 status_message: None,
                 async_hook: None,
                 hook_type: "claude-command".to_string(),
+                package_dir: None,
             }],
         };
 
@@ -327,6 +340,7 @@ entries:
                 status_message: Some("Agent override".to_string()),
                 async_hook: None,
                 hook_type: "claude-command".to_string(),
+                package_dir: None,
             }],
         };
 
@@ -363,6 +377,7 @@ entries:
             status_message: None,
             async_hook: None,
             hook_type: "claude-command".to_string(),
+            package_dir: None,
         };
         assert!(hook1.is_supported_type());
 
@@ -375,6 +390,7 @@ entries:
             status_message: None,
             async_hook: None,
             hook_type: "claude-command".to_string(),
+            package_dir: None,
         };
         assert!(hook2.is_supported_type());
 
@@ -386,6 +402,7 @@ entries:
             status_message: None,
             async_hook: None,
             hook_type: "claude-command-persistent".to_string(),
+            package_dir: None,
         };
         assert!(hook_persistent.is_supported_type());
 
@@ -398,6 +415,7 @@ entries:
             status_message: None,
             async_hook: None,
             hook_type: "future-v2".to_string(),
+            package_dir: None,
         };
         assert!(!hook3.is_supported_type());
     }

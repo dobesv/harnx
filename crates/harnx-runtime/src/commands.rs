@@ -30,11 +30,19 @@ pub enum CommandOutcome {
     OpenSessionPicker,
 }
 
-pub static COMMANDS: LazyLock<[Command; 47]> = LazyLock::new(|| {
+pub static COMMANDS: LazyLock<[Command; 49]> = LazyLock::new(|| {
     [
         Command::new(".help", "Show this help guide"),
         Command::new(".info", "Show system info"),
         Command::new(".info tools", "List all available tools and their status"),
+        Command::new(
+            ".info mcp [server]",
+            "Show an MCP server's command, args, env, roots, hooks, and PID",
+        ),
+        Command::new(
+            ".info env [name]",
+            "List harnx process env var names (or show one var's value)",
+        ),
         Command::new(".use tool", "Add a tool or toolset to the active tools"),
         Command::new(
             ".drop tool",
@@ -154,6 +162,137 @@ pub async fn run_command(
     .await
 }
 
+/// Write the harnx process environment. With `name = None`, lists variable
+/// names only (no values) — this is the environment hooks and MCP servers
+/// inherit, useful for checking e.g. `DBUS_SESSION_BUS_ADDRESS` or whether a
+/// token var is present. With a name, prints that variable's value.
+fn write_env_info(output: &mut (dyn Write + Send), name: Option<&str>) -> Result<()> {
+    match name {
+        Some(name) => match std::env::var(name) {
+            Ok(value) => writeln!(output, "{name}={value}")?,
+            Err(_) => writeln!(output, "{name} is not set")?,
+        },
+        None => {
+            let mut names: Vec<String> = std::env::vars().map(|(key, _)| key).collect();
+            names.sort();
+            writeln!(
+                output,
+                "{} environment variables (values hidden; use `.info env <NAME>`):",
+                names.len()
+            )?;
+            for key in names {
+                writeln!(output, "  {key}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write diagnostic details for MCP servers: resolved command, args, env,
+/// roots, and hooks (with their exact command strings — useful for spotting
+/// YAML-folding or arg-dropping issues), plus connection status and PID.
+/// With `name = None`, lists all running servers with brief status.
+async fn write_mcp_info(
+    output: &mut (dyn Write + Send),
+    config: &GlobalConfig,
+    name: Option<&str>,
+    persistent_manager: &std::sync::Arc<tokio::sync::Mutex<PersistentHookManager>>,
+) -> Result<()> {
+    let Some(manager) = config.read().mcp_manager.clone() else {
+        writeln!(output, "MCP is not configured")?;
+        return Ok(());
+    };
+
+    let name = name.map(str::trim).filter(|s| !s.is_empty());
+    let Some(name) = name else {
+        let names = manager.server_names();
+        if names.is_empty() {
+            writeln!(output, "No MCP servers running")?;
+            return Ok(());
+        }
+        writeln!(output, "MCP servers:")?;
+        for n in names {
+            if let Some(client) = manager.get_client(&n) {
+                let pid = client
+                    .pid()
+                    .map(|p| format!(" pid={p}"))
+                    .unwrap_or_default();
+                writeln!(output, "  {} [{}]{}", n, client.status_label(), pid)?;
+            }
+        }
+        writeln!(output, "\nUse `.info mcp <name>` for full details.")?;
+        return Ok(());
+    };
+
+    let Some(client) = manager.get_client(name) else {
+        writeln!(output, "No running MCP server named '{name}'.")?;
+        let names = manager.server_names();
+        if !names.is_empty() {
+            writeln!(output, "Available: {}", names.join(", "))?;
+        }
+        return Ok(());
+    };
+
+    let cfg = client.config();
+    write!(output, "MCP server: {}", client.name())?;
+    if let Some(pkg) = client.package() {
+        write!(output, "  (package: {pkg})")?;
+    }
+    writeln!(output)?;
+    write!(output, "  status:  {}", client.status_label())?;
+    if let Some(pid) = client.pid() {
+        write!(output, "   pid: {pid}")?;
+    }
+    writeln!(output)?;
+    writeln!(output, "  command: {}", cfg.command)?;
+    if !cfg.args.is_empty() {
+        writeln!(output, "  args:")?;
+        for arg in &cfg.args {
+            writeln!(output, "    {arg}")?;
+        }
+    }
+    if !cfg.env.is_empty() {
+        writeln!(output, "  env:")?;
+        let mut envs: Vec<_> = cfg.env.iter().collect();
+        envs.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in envs {
+            writeln!(output, "    {key}={value}")?;
+        }
+    }
+    let roots = client.live_roots();
+    if !roots.is_empty() {
+        writeln!(output, "  roots:")?;
+        for root in &roots {
+            writeln!(output, "    {root}")?;
+        }
+    }
+    match cfg.hooks.as_ref() {
+        Some(hooks) if !hooks.entries.is_empty() => {
+            writeln!(output, "  hooks:")?;
+            let pm = persistent_manager.lock().await;
+            for (i, hook) in hooks.entries.iter().enumerate() {
+                writeln!(
+                    output,
+                    "    [{}] {} (type: {}, matcher: {})",
+                    i + 1,
+                    hook.event,
+                    hook.hook_type,
+                    hook.matcher.as_deref().unwrap_or("*"),
+                )?;
+                writeln!(output, "        command: {}", hook.command)?;
+                if hook.hook_type == "claude-command-persistent" {
+                    match pm.pid_for(&hook.command) {
+                        Some(pid) => writeln!(output, "        hook pid: {pid} (running)")?,
+                        None => writeln!(output, "        hook pid: (not started)")?,
+                    }
+                }
+            }
+        }
+        _ => writeln!(output, "  hooks: (none)")?,
+    }
+    Ok(())
+}
+
 pub async fn run_command_with_output(
     config: &GlobalConfig,
     abort_signal: AbortSignal,
@@ -262,6 +401,14 @@ pub async fn run_command_with_output(
                     } else {
                         writeln!(output, "highlighting: disabled")?;
                     }
+                }
+                Some(rest) if rest == "mcp" || rest.starts_with("mcp ") => {
+                    let name = rest.strip_prefix("mcp").map(str::trim).filter(|s| !s.is_empty());
+                    write_mcp_info(output, config, name, persistent_manager).await?;
+                }
+                Some(rest) if rest == "env" || rest.starts_with("env ") => {
+                    let name = rest.strip_prefix("env").map(str::trim).filter(|s| !s.is_empty());
+                    write_env_info(output, name)?;
                 }
                 Some(_) => unknown_command()?,
                 None => {
@@ -1214,6 +1361,104 @@ mod tests {
         };
         config.session = Some(config::session::new(&config, "test", None).expect("test session"));
         Arc::new(RwLock::new(config))
+    }
+
+    fn test_config_with_mcp(server_yaml: &str) -> GlobalConfig {
+        let server: harnx_mcp::McpServerConfig =
+            serde_yaml::from_str(server_yaml).expect("parse mcp server config");
+        let manager = harnx_mcp::McpManager::new();
+        manager.initialize(vec![server]);
+        let config: GlobalConfig = Arc::new(RwLock::new(Config {
+            working_mode: WorkingMode::Cmd,
+            ..Default::default()
+        }));
+        config.write().mcp_manager = Some(Arc::new(manager));
+        config
+    }
+
+    #[tokio::test]
+    async fn test_mcp_info_reports_command_args_env_and_hooks() {
+        let config = test_config_with_mcp(
+            r#"
+name: bash
+command: harnx-mcp-bash
+args:
+  - "--extra-rwx"
+  - "$GIT_ROOT"
+env:
+  EDITOR: "true"
+hooks:
+  entries:
+    - event: PreToolUse
+      type: claude-command-persistent
+      matcher: "exec|spawn"
+      command: "harnx-proxy-auth --hook 'if .host == \"api.github.com\" then . end'"
+"#,
+        );
+
+        let pm = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
+        let mut out: Vec<u8> = Vec::new();
+        write_mcp_info(&mut out, &config, Some("bash"), &pm)
+            .await
+            .expect("write mcp info");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(text.contains("MCP server: bash"), "{text}");
+        assert!(text.contains("command: harnx-mcp-bash"), "{text}");
+        assert!(text.contains("--extra-rwx"), "{text}");
+        assert!(text.contains("$GIT_ROOT"), "{text}");
+        assert!(text.contains("EDITOR=true"), "{text}");
+        assert!(text.contains("[1] PreToolUse"), "{text}");
+        // The exact hook command string is preserved — this is what reveals
+        // YAML-folding/arg-dropping problems in a real config.
+        assert!(text.contains("harnx-proxy-auth --hook"), "{text}");
+        assert!(text.contains("api.github.com"), "{text}");
+        // Persistent hook is not spawned in this test → reported as not started.
+        assert!(text.contains("hook pid: (not started)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_mcp_info_unknown_server_lists_available() {
+        let config = test_config_with_mcp("name: bash\ncommand: harnx-mcp-bash\n");
+
+        let pm = Arc::new(tokio::sync::Mutex::new(PersistentHookManager::new()));
+        let mut out: Vec<u8> = Vec::new();
+        write_mcp_info(&mut out, &config, Some("nope"), &pm)
+            .await
+            .expect("write mcp info");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(
+            text.contains("No running MCP server named 'nope'"),
+            "{text}"
+        );
+        assert!(text.contains("Available: bash"), "{text}");
+    }
+
+    #[test]
+    fn test_info_env_lists_names_without_values_and_shows_one() {
+        let key = "HARNX_TEST_ENV_PROBE";
+        let _guard = EnvGuard::new(key, Path::new("secret-value-123"));
+
+        let mut out = Vec::new();
+        write_env_info(&mut out, None).expect("list env");
+        let listing = String::from_utf8(out).expect("utf8");
+        assert!(listing.contains(key), "name missing: {listing}");
+        assert!(
+            !listing.contains("secret-value-123"),
+            "value leaked in listing: {listing}"
+        );
+
+        let mut out = Vec::new();
+        write_env_info(&mut out, Some(key)).expect("show env");
+        assert_eq!(
+            String::from_utf8(out).unwrap().trim(),
+            "HARNX_TEST_ENV_PROBE=secret-value-123"
+        );
+
+        let mut out = Vec::new();
+        write_env_info(&mut out, Some("HARNX_DEFINITELY_UNSET_XYZ")).expect("show unset");
+        assert!(String::from_utf8(out).unwrap().contains("is not set"));
     }
 
     fn model_with_data(

@@ -30,50 +30,63 @@ pub async fn run_jsonl_loop(
     proxy_port: u16,
     ca_cert_path: PathBuf,
     extra_env: Map<String, Value>,
+    mut notice_rx: crate::notice::HookNoticeReceiver,
 ) -> Result<()> {
     let stdin = io::stdin();
-    let stdout = io::stdout();
+    let mut stdout = io::stdout();
     let mut lines = BufReader::new(stdin).lines();
-    let mut stdout = stdout;
     let ca_cert_path = ca_cert_path.to_string_lossy().into_owned();
 
-    while let Some(line) = lines.next_line().await? {
-        if line.is_empty() {
-            continue;
+    // This is the sole writer of proxy-auth's stdout, so hook responses and
+    // async notice lines never interleave mid-line.
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line? else { break };
+                if line.is_empty() {
+                    continue;
+                }
+
+                let request: HookRequest = match serde_json::from_str(&line) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        tracing::warn!("Malformed JSONL input (skipping): {e}");
+                        continue;
+                    }
+                };
+                // Respond to any PreToolUse event with a tool_input — tool name
+                // filtering is the caller's responsibility (the hook matcher).
+                let response = if request.tool_input.is_some() {
+                    HookResponse {
+                        id: request.id,
+                        hook_specific_output: Some(HookSpecificOutput {
+                            tool_input: augment_tool_input(
+                                request.tool_input,
+                                proxy_port,
+                                &ca_cert_path,
+                                &extra_env,
+                            ),
+                        }),
+                    }
+                } else {
+                    HookResponse {
+                        id: request.id,
+                        hook_specific_output: None,
+                    }
+                };
+
+                let encoded = serde_json::to_string(&response)?;
+                stdout.write_all(encoded.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+            Some(hook_notice) = notice_rx.recv() => {
+                let encoded = crate::notice::to_line(&hook_notice);
+                stdout.write_all(encoded.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
         }
-
-        let request: HookRequest = match serde_json::from_str(&line) {
-            Ok(request) => request,
-            Err(e) => {
-                tracing::warn!("Malformed JSONL input (skipping): {e}");
-                continue;
-            }
-        };
-        // Respond to any PreToolUse event with a tool_input — tool name filtering
-        // is the caller's responsibility (configured via the hook's matcher field).
-        let response = if request.tool_input.is_some() {
-            HookResponse {
-                id: request.id,
-                hook_specific_output: Some(HookSpecificOutput {
-                    tool_input: augment_tool_input(
-                        request.tool_input,
-                        proxy_port,
-                        &ca_cert_path,
-                        &extra_env,
-                    ),
-                }),
-            }
-        } else {
-            HookResponse {
-                id: request.id,
-                hook_specific_output: None,
-            }
-        };
-
-        let encoded = serde_json::to_string(&response)?;
-        stdout.write_all(encoded.as_bytes()).await?;
-        stdout.write_all(b"\n").await?;
-        stdout.flush().await?;
     }
 
     Ok(())
