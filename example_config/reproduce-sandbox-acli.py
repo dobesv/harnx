@@ -138,7 +138,7 @@ def build_synthetic(base_dir, hook, host_config_text, nested):
         f"      account_id: {profile.get('account_id', '')}",
         f"      email: {email}",
         "      auth_type: api_token",
-        f"      token: {hook.SENTINEL_TOKEN_BLOB}",
+        f"      token: !!binary {hook.SENTINEL_TOKEN_BLOB}",
         "",
     ])
     (target / "jira_config.yaml").write_text(config_text, encoding="utf-8")

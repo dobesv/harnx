@@ -325,7 +325,13 @@ def write_synthetic_config(current_profile, profile, temp_root):
             f"      account_id: {profile.get('account_id', '')}",
             f"      email: {email}",
             "      auth_type: api_token",
-            f"      token: {SENTINEL_TOKEN_BLOB}",
+            # acli stores the token as an encrypted SecretStore blob that it
+            # expects as a YAML `!!binary` scalar: the YAML parser base64-decodes
+            # it before acli decrypts. Writing it as a plain string makes acli
+            # fail to decrypt and abort ("failed to retrieve authenticated
+            # status") BEFORE it ever calls api.atlassian.com — so the proxy's
+            # on-the-wire token swap never runs. Must stay `!!binary`.
+            f"      token: !!binary {SENTINEL_TOKEN_BLOB}",
             "",
         ]
     )
