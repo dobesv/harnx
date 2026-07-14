@@ -67,20 +67,58 @@ def check_mitmproxy():
         )
 
 
+def summarize_body(body_bytes, limit=400):
+    """Return a short, printable summary of a response body."""
+    if not body_bytes:
+        return "<empty>"
+    try:
+        text = body_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return f"<{len(body_bytes)} bytes, non-text>"
+    text = " ".join(text.split())  # collapse whitespace/newlines
+    if len(text) > limit:
+        return text[:limit] + f"… (+{len(text) - limit} more chars)"
+    return text
+
+
 class AuthRecorder:
-    """mitmproxy addon: record (method, host, path, auth) per request."""
+    """mitmproxy addon: record request auth + response status/body per flow."""
 
     def __init__(self):
         self.rows = []
 
+    def _interesting(self, host):
+        return any(s in host for s in INTERESTING_SUBSTRINGS)
+
     def request(self, flow):
-        host = flow.request.host
-        if not any(s in host for s in INTERESTING_SUBSTRINGS):
+        if not self._interesting(flow.request.host):
             return
         auth = flow.request.headers.get("authorization")
-        self.rows.append(
-            (flow.request.method, host, flow.request.path, mask_auth(auth))
-        )
+        # Stash a mutable dict on the flow so response() can complete the row.
+        row = {
+            "method": flow.request.method,
+            "host": flow.request.host,
+            "path": flow.request.path,
+            "auth": mask_auth(auth),
+            "status": None,
+            "body": None,
+        }
+        self.rows.append(row)
+        flow.metadata["auth_row"] = row
+
+    def response(self, flow):
+        row = flow.metadata.get("auth_row")
+        if row is None:
+            return
+        row["status"] = flow.response.status_code
+        row["body"] = summarize_body(flow.response.get_content() or b"")
+
+    def error(self, flow):
+        row = flow.metadata.get("auth_row") if flow else None
+        if row is None:
+            return
+        row["status"] = "ERROR"
+        row["body"] = str(getattr(flow, "error", "connection error"))
 
 
 def run_proxy(recorder, port, confdir, ready_event, stop_event):
@@ -224,19 +262,26 @@ def main():
         )
     else:
         seen = set()
-        for method, host, path, auth in recorder.rows:
-            # Collapse duplicate (method, host, path, auth) rows.
-            key = (method, host, path, auth)
+        for row in recorder.rows:
+            key = (row["method"], row["host"], row["path"], row["auth"], row["status"])
             if key in seen:
                 continue
             seen.add(key)
-            print(f"  {method:7} https://{host}{path}")
-            print(f"          AUTH: {auth}")
+            print(f"  {row['method']:7} https://{row['host']}{row['path']}")
+            print(f"          AUTH:   {row['auth']}")
+            print(f"          STATUS: {row['status']}")
+            print(f"          BODY:   {row['body']}")
 
     print(
-        "\nWhat to look for: the host+path that carries a real Basic/Bearer token\n"
-        "is the one the hook must inject auth for. Paste this block back to the\n"
-        "agent so the jira-auth-hook TARGET_HOSTS / injection rule can be fixed."
+        "\nWhat to look for:\n"
+        "  - Which host+path carries a real Basic/Bearer token (that's what the\n"
+        "    hook must inject for).\n"
+        "  - Whether the as.atlassian.com/api/v1/batch call SUCCEEDS (status 200)\n"
+        "    and what its body says — acli uses it to discover routing before it\n"
+        "    calls api.atlassian.com. If the batch call errors or returns an\n"
+        "    unexpected body in the sandbox, acli stops before the authenticated\n"
+        "    api.atlassian.com call and reports 'unauthorized'.\n"
+        "Paste this whole block back to the agent."
     )
 
 
