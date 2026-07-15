@@ -7,6 +7,7 @@
 //! command dispatch.
 
 use crate::agent_config::AgentConfig;
+use crate::tool::ToolDeclaration;
 use anyhow::Result;
 use minijinja::{Environment, UndefinedBehavior, Value};
 use std::collections::BTreeMap;
@@ -102,7 +103,11 @@ pub fn now() -> String {
     chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
-pub fn render_template(template: &str, agent: &AgentConfig) -> Result<String> {
+pub fn render_template(
+    template: &str,
+    agent: &AgentConfig,
+    tools: Option<&[ToolDeclaration]>,
+) -> Result<String> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
     env.set_debug(true);
@@ -146,6 +151,10 @@ pub fn render_template(template: &str, agent: &AgentConfig) -> Result<String> {
     ctx.insert("__cwd__".to_string(), Value::from(current_dir));
     ctx.insert("__os_distro__".to_string(), Value::from(os_distro));
     ctx.insert("agent".to_string(), Value::from_serialize(&agent_ctx));
+    ctx.insert(
+        "tools".to_string(),
+        Value::from_serialize(tools.unwrap_or_default()),
+    );
 
     for (k, v) in agent.variables() {
         ctx.insert(k.clone(), Value::from(v.clone()));

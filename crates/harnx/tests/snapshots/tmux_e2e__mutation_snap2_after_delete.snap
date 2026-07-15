@@ -12,7 +12,7 @@ FIRST_RESPONSE_SENTINEL
 THIRD_RESPONSE_SENTINEL
 
 🤖 mutation-test-agent ▸ mock-llm:test ▸ mutation-e2e-session
-Deleted entries 4-5.
+Deleted entries 3-4.
 
 
 
@@ -39,7 +39,7 @@ Deleted entries 4-5.
 
 
 
-* 🤖 mutation-test-agent ▸ mock-llm:test ▸ mutation-e2e-session   Context: 42(0%)
+* 🤖 mutation-test-agent ▸ mock-llm:test ▸ mutation-e2e-session   Context: 25(0%)
 
 
 # snap: 2-after-delete

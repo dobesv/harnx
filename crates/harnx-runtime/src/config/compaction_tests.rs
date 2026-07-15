@@ -421,11 +421,22 @@ async fn test_compact_session_honors_compaction_keep_recent_turns() {
         "the last turn must be kept verbatim, not compacted; transcript: {transcript:?}"
     );
 
-    // The kept-verbatim suffix lands back as [summary_system, U4, A4].
-    let kept = config.read().session.as_ref().unwrap().messages.len();
+    // The kept-verbatim suffix lands back as [U4, A4]; summary stays on runtime field.
+    let guard = config.read();
+    let session = guard.session.as_ref().unwrap();
     assert_eq!(
-        kept, 3,
-        "expected the summary plus the one kept turn (2 messages)"
+        session.messages.len(),
+        2,
+        "expected one kept turn (2 messages)"
+    );
+    let summary = session
+        .compaction_summary
+        .as_deref()
+        .expect("expected runtime compaction summary to be populated");
+    assert!(!summary.is_empty(), "expected non-empty compaction summary");
+    assert!(
+        summary.contains("Compacted"),
+        "expected runtime compaction summary to contain 'Compacted', got {summary:?}"
     );
 }
 

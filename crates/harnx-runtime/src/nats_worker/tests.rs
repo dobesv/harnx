@@ -2323,10 +2323,16 @@ async fn load_remote_transcript_for_render_keeps_tool_rows_and_compressed_prefix
         "compressed prefix must retain assembled tool message rows"
     );
     assert!(
-        transcript.messages.iter().any(|message| message.role
-            == harnx_core::message::MessageRole::System
-            && message.content.to_text() == "summary prompt"),
-        "active transcript must include summary prompt after Compress"
+        transcript
+            .messages
+            .iter()
+            .all(|message| message.role != harnx_core::message::MessageRole::System),
+        "active transcript must not include a synthetic System message after Compress"
+    );
+    assert_eq!(
+        transcript.compaction_summary.as_deref(),
+        Some("summary prompt"),
+        "compaction summary must carry the summary text after Compress"
     );
 
     let active_rows: Vec<(harnx_core::message::MessageRole, String, Option<usize>)> = transcript
@@ -2336,18 +2342,11 @@ async fn load_remote_transcript_for_render_keeps_tool_rows_and_compressed_prefix
         .collect();
     assert_eq!(
         active_rows,
-        vec![
-            (
-                harnx_core::message::MessageRole::System,
-                "summary prompt".to_string(),
-                None,
-            ),
-            (
-                harnx_core::message::MessageRole::User,
-                "after compress user".to_string(),
-                Some(0),
-            ),
-        ]
+        vec![(
+            harnx_core::message::MessageRole::User,
+            "after compress user".to_string(),
+            Some(0),
+        ),]
     );
 
     worker.abort();

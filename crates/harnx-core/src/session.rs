@@ -221,6 +221,8 @@ pub struct Session {
     pub model_fallbacks: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_agent: Option<String>,
+    #[serde(skip)]
+    pub compaction_summary: Option<String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compressed_messages: Vec<Message>,
@@ -412,7 +414,7 @@ impl Session {
         };
         self.agent_prompt = new_prompt;
         self.agent_variables = new_variables;
-        self.agent_instructions = self.agent_prompt.clone();
+        self.agent_instructions = agent.instructions_template().to_string();
         self.dirty = true;
         self.update_tokens();
         Ok(())
@@ -429,7 +431,7 @@ impl Session {
         };
         self.agent_prompt = new_prompt;
         self.agent_variables = new_variables;
-        self.agent_instructions = self.agent_prompt.clone();
+        self.agent_instructions = agent.instructions_template().to_string();
         Ok(())
     }
 
@@ -493,12 +495,13 @@ impl Session {
 impl Session {
     pub fn to_agent_config(&self) -> Result<AgentConfig> {
         let agent_name = self.agent_name.as_deref().unwrap_or(TEMP_AGENT_NAME);
-        let prompt = if self.agent_prompt.is_empty() {
-            self.agent_instructions.as_str()
-        } else {
+        let prompt = if self.agent_instructions.is_empty() {
             self.agent_prompt.as_str()
+        } else {
+            self.agent_instructions.as_str()
         };
-        let mut config = AgentConfig::from_markdown(agent_name, prompt)?;
+        let mut config = AgentConfig::from_prompt(prompt);
+        config.set_name(agent_name);
         config.set_model(self.model.clone());
         config.set_temperature(self.temperature);
         config.set_top_p(self.top_p);
@@ -676,6 +679,20 @@ mod tests {
             }
             other => panic!("expected tool_results, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn to_agent_config_preserves_prompt_starting_with_frontmatter_delimiter() {
+        let mut session = Session::default();
+        session.agent_name = Some("resume-agent".to_string());
+        session.agent_instructions = "---\nModel={{ agent.model }}".to_string();
+        session.model = Model::new("openai", "gpt-4o");
+        session.model_id = session.model.id();
+
+        let config = session.to_agent_config().unwrap();
+        assert_eq!(config.name(), "resume-agent");
+        let rendered = config.system_text().unwrap();
+        assert_eq!(rendered, "---\nModel=openai:gpt-4o");
     }
 
     #[test]

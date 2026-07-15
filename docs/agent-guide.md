@@ -386,6 +386,15 @@ You are a project assistant. Answer questions using the provided
 documentation. If the docs don't cover something, say so clearly.
 ```
 
+
+### Dynamic Variables in Prompts
+
+Agent prompts are rendered using [MiniJinja](https://github.com/mitsuhiko/minijinja). In addition to the custom variables defined in front-matter, several dynamic variables are available:
+
+- `{{ agent.model }}`: The active model ID (e.g., `openai:gpt-4o`). This updates automatically if the agent falls back to a different model.
+- `{{ tools }}`: A list of available tools. You can iterate over them: `{% for t in tools %}- {{ t.name }}: {{ t.description }}{% endfor %}`.
+- `{{ __os__ }}`, `{{ __arch__ }}`, `{{ __shell__ }}`, `{{ __cwd__ }}`, `{{ __now__ }}`, `{{ __locale__ }}`: Environment and system information.
+
 ## Built-in Agents
 
 Harnx includes one internal agent:

@@ -13,6 +13,7 @@ use harnx_core::api_types::CompletionTokenUsage;
 use harnx_core::error::LlmError;
 use harnx_core::event::{AgentEvent, TurnEvent};
 use harnx_core::input::Input;
+use harnx_core::model::Model;
 use harnx_core::model::ModelType;
 use harnx_core::retry_config::{ModelCooldownMap, RetryConfig};
 use harnx_core::tool::ToolCall;
@@ -38,9 +39,10 @@ pub type CallFuture<'a> = Pin<
 /// Type alias for a client-construction callback. Callers (harnx) inject
 /// this so the engine can build clients without knowing about harnx's
 /// test-client override (installed via `TestStateGuard`).
-pub type InitClientFn = Arc<
-    dyn Fn(&[ClientConfig], &harnx_core::model::Model) -> Result<Box<dyn Client>> + Send + Sync,
->;
+pub type InitClientFn =
+    Arc<dyn Fn(&[ClientConfig], &Model) -> Result<Box<dyn Client>> + Send + Sync>;
+
+pub type SelectModelFn = Arc<dyn Fn(&mut Input, &Model) + Send + Sync>;
 
 /// Narrowed config view required by the retry/fallback loop. Callers
 /// (in harnx) construct this from their own `GlobalConfig` and pass it
@@ -64,6 +66,7 @@ pub struct TurnContext {
     pub warn_fn: Arc<dyn Fn(&str) + Send + Sync>,
     pub event_fn: Arc<dyn Fn(AgentEvent) + Send + Sync>,
     pub init_client_fn: InitClientFn,
+    pub select_model_fn: SelectModelFn,
 }
 
 impl TurnContext {
@@ -150,24 +153,25 @@ pub fn is_non_retryable_non_auth(err: &anyhow::Error) -> bool {
 /// allows callers (e.g. the TUI) to supply their own streaming implementation
 /// while still benefiting from the retry/fallback loop.
 pub async fn call_with_retry_and_fallback_custom<F>(
-    input: &Input,
+    input: &mut Input,
     ctx: &TurnContext,
     abort_signal: AbortSignal,
     call_fn: F,
 ) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>
 where
-    F: for<'a> Fn(&'a Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
+    F: for<'a> Fn(&'a mut Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
 {
-    let agent = input.agent();
-    let retry_config = agent.retry_config();
+    let retry_config = input.agent().retry_config();
 
     // Build model list: primary model + fallbacks
-    let primary_model_id = agent
+    let primary_model = input.agent().model().clone();
+    let primary_model_id = input
+        .agent()
         .model_id()
         .unwrap_or(&ctx.default_model_id)
         .to_string();
     let mut model_ids: Vec<String> = vec![primary_model_id];
-    model_ids.extend(agent.model_fallbacks().iter().cloned());
+    model_ids.extend(input.agent().model_fallbacks().iter().cloned());
 
     // Eagerly validate all fallback model IDs so the user gets immediate
     // feedback about typos / missing models instead of a silent skip.
@@ -206,7 +210,7 @@ where
         // For the primary model (idx 0), use the already-resolved model from
         // the input's agent. For fallbacks, resolve from the model catalog.
         let client = if idx == 0 {
-            match ctx.init_client(agent.model()) {
+            match ctx.init_client(&primary_model) {
                 Ok(client) => client,
                 Err(err) => {
                     ctx.warn(&format!(
@@ -232,6 +236,10 @@ where
                 }
             }
         };
+
+        let selected_model = client.model().clone();
+        // ordering: model updated before prompt render so {{ agent.model }} reflects fallback
+        (ctx.select_model_fn)(input, &selected_model);
 
         match try_model_with_retries_custom(
             input,
@@ -374,7 +382,7 @@ fn retry_delay_for_llm_error(
 /// harnx — harnx retains a thin test wrapper that builds a `TurnContext`
 /// from its `GlobalConfig` and calls this function.
 pub async fn try_model_with_retries_custom<F>(
-    input: &Input,
+    input: &mut Input,
     client: &dyn Client,
     ctx: &TurnContext,
     retry_config: &RetryConfig,
@@ -382,7 +390,7 @@ pub async fn try_model_with_retries_custom<F>(
     call_fn: &F,
 ) -> Result<(String, Option<String>, Vec<ToolCall>, CompletionTokenUsage)>
 where
-    F: for<'a> Fn(&'a Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
+    F: for<'a> Fn(&'a mut Input, &'a dyn Client, AbortSignal) -> CallFuture<'a>,
 {
     let mut last_error: Option<anyhow::Error> = None;
     // Ensure at least one attempt even if configured as 0

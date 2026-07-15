@@ -786,31 +786,20 @@ fn build_compaction_marker(
 ///
 /// When `compressed_messages` is non-empty the archived history is rendered
 /// inline first so it stays visible, followed by a single compaction marker
-/// carrying the summary (the leading `System` message of the active window),
-/// then the active/preserved messages. Shared by the local and remote resume
-/// paths to keep their layout in lockstep (#904).
+/// carrying summary text, then the active/preserved messages. Shared by local
+/// and remote resume paths to keep layout in lockstep (#904).
 pub(crate) fn build_transcript_with_compaction(
     compressed_messages: &[Message],
     active_messages: &[Message],
+    compaction_summary: Option<&str>,
     decl_map: &HashMap<String, ToolDeclaration>,
 ) -> Vec<TranscriptItem> {
-    use harnx_core::message::MessageRole;
-
     let mut items = Vec::new();
     if !compressed_messages.is_empty() {
         items.extend(messages_to_transcript_items(compressed_messages, decl_map));
-        // Invariant: `compress_keeping_recent` prepends the compaction summary as
-        // the leading `System` message of the active window, so the summary (when
-        // present) is `active_messages[0]`. If that contract changes, the summary
-        // would silently render empty rather than showing wrong content.
-        let summary_text = active_messages
-            .first()
-            .filter(|msg| msg.role == MessageRole::System)
-            .map(|msg| msg.content.to_text())
-            .unwrap_or_default();
         items.push(build_compaction_marker(
             compressed_messages,
-            summary_text,
+            compaction_summary.unwrap_or_default().to_string(),
             decl_map,
         ));
     }
@@ -885,12 +874,18 @@ pub(crate) fn session_history_transcript_items(config: &GlobalConfig) -> Vec<Tra
         return build_transcript_with_compaction(
             &state.compressed_messages,
             &state.messages,
+            state.compaction_summary.as_deref(),
             &decl_map,
         );
     }
 
     let session = cfg.session.as_ref().expect("checked above");
-    build_transcript_with_compaction(&session.compressed_messages, &session.messages, &decl_map)
+    build_transcript_with_compaction(
+        &session.compressed_messages,
+        &session.messages,
+        session.compaction_summary.as_deref(),
+        &decl_map,
+    )
 }
 
 /// Compact one-line preview of a tool call's arguments for the confirmation

@@ -2074,7 +2074,7 @@ mod tests {
             Some(&serde_json::json!({
                 "content": [{
                     "type": "text",
-                    "text": "[{\"seq\":0,\"type\":\"header\",\"text\":\"model: openai:gpt-4o\"},{\"seq\":1,\"type\":\"message\",\"text\":\"You are plain.\",\"role\":\"system\"},{\"seq\":2,\"type\":\"message\",\"text\":\"batch interrupt\",\"role\":\"user\"},{\"seq\":3,\"type\":\"tool_calls\",\"text\":\"batch approval needed\\nharnx_agent_session_history_read({})\\nharnx_agent_session_history_read({})\",\"tool_names\":[\"harnx_agent_session_history_read\",\"harnx_agent_session_history_read\"]}]"
+                    "text": "[{\"seq\":0,\"type\":\"header\",\"text\":\"model: openai:gpt-4o\"},{\"seq\":1,\"type\":\"message\",\"text\":\"batch interrupt\",\"role\":\"user\"},{\"seq\":2,\"type\":\"tool_calls\",\"text\":\"batch approval needed\\nharnx_agent_session_history_read({})\\nharnx_agent_session_history_read({})\",\"tool_names\":[\"harnx_agent_session_history_read\",\"harnx_agent_session_history_read\"]}]"
                 }]
             })),
             "auto-approved call should execute normally"

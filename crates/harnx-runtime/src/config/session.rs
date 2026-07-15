@@ -233,6 +233,9 @@ pub(crate) fn replay_log_entries_for_external(
 
                     );
                 }
+                if role == MessageRole::System && !session.agent_instructions.is_empty() {
+                    continue;
+                }
                 let mut message = Message::new(role, content).with_log_seq(seq);
                 if let Some(id) = id {
                     message = message.with_id(id);
@@ -292,10 +295,7 @@ pub(crate) fn replay_log_entries_for_external(
                         .push(repair_orphan_tool_calls(pending, name)?);
                 }
                 session.compressed_messages.append(&mut session.messages);
-                session.messages.push(Message::new(
-                    MessageRole::System,
-                    MessageContent::Text(prompt),
-                ));
+                session.compaction_summary = Some(prompt);
             }
             SessionLogEntry::Clear => {
                 pending = None;
@@ -870,23 +870,9 @@ pub fn to_agent(session: &Session) -> Agent {
     )
 }
 
-pub fn compress(session: &mut Session, mut prompt: String) {
-    if let Some(system_prompt) = session.messages.first().and_then(|v| {
-        if MessageRole::System == v.role {
-            let content = v.content.to_text();
-            if !content.is_empty() {
-                return Some(content);
-            }
-        }
-        None
-    }) {
-        prompt = format!("{system_prompt}\n\n{prompt}",);
-    }
+pub fn compress(session: &mut Session, prompt: String) {
     session.compressed_messages.append(&mut session.messages);
-    session.messages.push(Message::new(
-        MessageRole::System,
-        MessageContent::Text(prompt.clone()),
-    ));
+    session.compaction_summary = Some(prompt.clone());
     session.update_tokens();
     if !append_event(session, &SessionLogEntry::Compress { prompt }) {
         session.dirty = true;
@@ -895,31 +881,16 @@ pub fn compress(session: &mut Session, mut prompt: String) {
 
 /// Compact only the prefix `messages[..keep_from]`, keeping `messages[keep_from..]`
 /// verbatim. The prefix moves to `compressed_messages`; the new message list is
-/// `[summary system message, ...kept suffix]`. The original leading system
-/// prompt (if any) is folded into the summary, matching `compress`.
-pub fn compress_keeping_recent(session: &mut Session, mut prompt: String, keep_from: usize) {
+/// just preserved suffix, while summary stays in `session.compaction_summary`.
+pub fn compress_keeping_recent(session: &mut Session, prompt: String, keep_from: usize) {
     let keep_from = keep_from.min(session.messages.len());
-    if let Some(system_prompt) = session.messages.first().and_then(|v| {
-        if MessageRole::System == v.role {
-            let content = v.content.to_text();
-            if !content.is_empty() {
-                return Some(content);
-            }
-        }
-        None
-    }) {
-        prompt = format!("{system_prompt}\n\n{prompt}",);
-    }
     // Split off the recent suffix to keep verbatim; the remainder is the prefix.
     let suffix: Vec<Message> = session.messages.split_off(keep_from);
     session.compressed_messages.append(&mut session.messages);
     // Hard-cut log layout: the Compress event archives the prefix and carries
     // the summary; the preserved suffix is then re-logged as fresh entries so
-    // replay reproduces `[summary, ...suffix]` without any stored index.
-    session.messages.push(Message::new(
-        MessageRole::System,
-        MessageContent::Text(prompt.clone()),
-    ));
+    // replay reproduces active suffix without any stored index.
+    session.compaction_summary = Some(prompt.clone());
     if !append_event(session, &SessionLogEntry::Compress { prompt }) {
         session.dirty = true;
     }
@@ -1362,6 +1333,9 @@ fn append_initial_agent_messages(session: &mut Session, input: &Input) -> Result
     let mut cid_urls = std::collections::HashMap::new();
 
     for mut msg in agent_messages {
+        if msg.role == MessageRole::System {
+            continue;
+        }
         // `externalize_content` only writes files + rewrites `content` in
         // memory (takes `&Session`, cannot append), so `seq` stays correct.
         let seq = session.next_seq();
@@ -1560,21 +1534,29 @@ fn build_messages_inner(session: &Session, input: &Input) -> Result<Vec<Message>
     if need_add_msg && is_tool_continuation(input, &messages) {
         need_add_msg = false;
     }
-    if need_add_msg {
-        // When the agent was swapped after construction (e.g. compaction),
-        // inject_system_prompt is true and we must prepend the agent's
-        // system prompt — session messages won't already contain it.
-        // On normal session turns the system prompt was stored on turn 1
-        // by save_message(), so inject_system_prompt stays false.
-        if input.inject_system_prompt() {
-            let system_text = input.agent().system_text()?;
-            if !system_text.is_empty() {
-                messages.insert(
-                    0,
-                    Message::new(MessageRole::System, MessageContent::Text(system_text)),
-                );
-            }
+    // System prompt is no longer persisted in session transcript.
+    // Inject it fresh here so each turn sees current agent variables,
+    // resolved tools, and active model selection (including fallbacks).
+    // Agent swaps after construction (e.g. compaction) also flow through
+    // this path via inject_system_prompt.
+    if input.inject_system_prompt() {
+        let system_text = input
+            .agent()
+            .system_text_with_tools(input.resolved_tools.as_deref().unwrap_or_default())?;
+        // Drop any leading system message(s) so only the freshly rendered
+        // prompt survives — including the case where a legacy transcript
+        // stored one but the current render is empty.
+        while matches!(messages.first().map(|m| m.role), Some(MessageRole::System)) {
+            messages.remove(0);
         }
+        if !system_text.is_empty() {
+            messages.insert(
+                0,
+                Message::new(MessageRole::System, MessageContent::Text(system_text)),
+            );
+        }
+    }
+    if need_add_msg {
         messages.push(Message::new(MessageRole::User, input.message_content()));
     }
     Ok(messages)
@@ -1702,17 +1684,17 @@ content: recent answer
 
         let session = super::load_from_log_for_test(content);
 
-        // Live messages: summary system message followed by the kept suffix.
+        // Live messages: kept suffix only; summary stays on runtime field.
         assert_eq!(
             message_view(&session.messages),
             vec![
-                (
-                    MessageRole::System,
-                    "summary of earlier conversation".to_string()
-                ),
                 (MessageRole::User, "recent question".to_string()),
                 (MessageRole::Assistant, "recent answer".to_string()),
             ]
+        );
+        assert_eq!(
+            session.compaction_summary.as_deref(),
+            Some("summary of earlier conversation")
         );
 
         // The prefix entries before the compress event must have been archived.
@@ -1749,10 +1731,8 @@ prompt: summary
 
         let session = super::load_from_log_for_test(content);
 
-        assert_eq!(
-            message_view(&session.messages),
-            vec![(MessageRole::System, "summary".to_string())]
-        );
+        assert!(session.messages.is_empty());
+        assert_eq!(session.compaction_summary.as_deref(), Some("summary"));
         assert_eq!(
             message_view(&session.compressed_messages),
             vec![
@@ -3397,11 +3377,278 @@ content: second
         super::compress_keeping_recent(&mut session, "SUMMARY".to_string(), 3);
 
         assert_eq!(session.compressed_messages.len(), 3);
-        assert_eq!(session.messages.len(), 3);
-        assert_eq!(session.messages[0].role, MessageRole::System);
-        assert!(session.messages[0].content.to_text().contains("SUMMARY"));
-        assert!(session.messages[0].content.to_text().contains("sys"));
-        assert_eq!(session.messages[1].content.to_text(), "recent u");
-        assert_eq!(session.messages[2].content.to_text(), "recent a");
+        assert_eq!(session.compaction_summary.as_deref(), Some("SUMMARY"));
+        assert_eq!(session.messages.len(), 2);
+        assert!(session
+            .messages
+            .iter()
+            .all(|message| message.role != MessageRole::System));
+        assert_eq!(session.messages[0].content.to_text(), "recent u");
+        assert_eq!(session.messages[1].content.to_text(), "recent a");
+    }
+
+    #[test]
+    fn first_turn_persists_user_only_and_no_stored_system_message() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+
+        let config = Config::default();
+        let agent = config.extract_agent();
+        let global_config = std::sync::Arc::new(parking_lot::RwLock::new(config));
+        let input = crate::config::input::from_str(&global_config, "hello world", Some(agent));
+
+        super::add_assistant_text(&mut session, &input, "hi there", None).unwrap();
+
+        assert!(
+            session
+                .messages
+                .iter()
+                .all(|message| message.role != MessageRole::System),
+            "session transcript should not store a system message: {:#?}",
+            session.messages
+        );
+        let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(
+            !persisted.contains("role: system"),
+            "persisted log should not contain a stored system message: {persisted}"
+        );
+    }
+
+    #[test]
+    fn compress_keeping_recent_log_stores_summary_only_and_runtime_tracks_it() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let mut session = test_session();
+        session.set_sessions_dir(tmp.path().to_path_buf());
+        session.messages = vec![
+            Message::new(
+                MessageRole::System,
+                MessageContent::Text("agent instructions".to_string()),
+            ),
+            Message::new(MessageRole::User, MessageContent::Text("old u".to_string())),
+            Message::new(
+                MessageRole::Assistant,
+                MessageContent::Text("old a".to_string()),
+            ),
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("recent u".to_string()),
+            ),
+            Message::new(
+                MessageRole::Assistant,
+                MessageContent::Text("recent a".to_string()),
+            ),
+        ];
+        super::save(&mut session, "test", &tmp.path().join("test.yaml"), false).unwrap();
+
+        super::compress_keeping_recent(&mut session, "LLM summary only".to_string(), 3);
+
+        let persisted = std::fs::read_to_string(session.path.as_ref().unwrap()).unwrap();
+        assert!(persisted.contains("type: compress\nprompt: LLM summary only"));
+        assert!(!persisted.contains("prompt: agent instructions"));
+        assert!(session
+            .messages
+            .iter()
+            .all(|message| message.role != MessageRole::System));
+        assert_eq!(
+            session.compaction_summary.as_deref(),
+            Some("LLM summary only")
+        );
+    }
+
+    #[test]
+    fn build_messages_reinjects_system_prompt_after_compaction() {
+        let mut session = test_session();
+        session.agent_instructions = "Agent prompt with {{ agent.model }}".to_string();
+        session.model_id = "openai:gpt-4o-mini".to_string();
+        session.model = harnx_core::model::Model::new("openai", "gpt-4o-mini");
+        session.messages = vec![Message::new(
+            MessageRole::User,
+            MessageContent::Text("recent question".to_string()),
+        )];
+        session.compaction_summary = Some("summary".to_string());
+
+        let input = Input::new(
+            "next question".to_string(),
+            ("next question".to_string(), vec![]),
+            to_agent(&session).into_config(),
+        );
+        let messages = super::build_messages(&session, &input).unwrap();
+
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert_eq!(
+            messages[0].content.to_text(),
+            "Agent prompt with openai:gpt-4o-mini"
+        );
+    }
+
+    #[test]
+    fn to_agent_prefers_raw_agent_instructions_over_stale_agent_prompt_on_resume() {
+        let mut session = test_session();
+        session.agent_instructions = "Model={{ agent.model }}".to_string();
+        session.agent_prompt = "Model=openai:gpt-4o-mini".to_string();
+        session.model_id = "openai:gpt-4o-mini".to_string();
+        session.model = harnx_core::model::Model::new("openai", "gpt-4o-mini");
+
+        let input = Input::new(
+            "question".to_string(),
+            ("question".to_string(), vec![]),
+            to_agent(&session).into_config(),
+        );
+        let messages = super::build_messages(&session, &input).unwrap();
+        assert_eq!(messages[0].content.to_text(), "Model=openai:gpt-4o-mini");
+
+        session.model_id = "openai:gpt-4o".to_string();
+        session.model = harnx_core::model::Model::new("openai", "gpt-4o");
+        let input = Input::new(
+            "question".to_string(),
+            ("question".to_string(), vec![]),
+            to_agent(&session).into_config(),
+        );
+        let messages = super::build_messages(&session, &input).unwrap();
+        assert_eq!(messages[0].content.to_text(), "Model=openai:gpt-4o");
+    }
+
+    #[test]
+    fn load_from_log_drops_legacy_stored_system_message_and_reinjects_prompt() {
+        let content = r#"---
+type: header
+model: openai:gpt-4o
+agent_instructions: Agent prompt for openai:gpt-4o
+agent_prompt: Agent prompt for openai:gpt-4o
+---
+type: message
+role: system
+content: old stored system prompt
+---
+type: message
+role: user
+content: hi
+---
+type: message
+role: assistant
+content: hello
+"#;
+
+        let session = super::load_from_log_for_test(content);
+
+        assert!(
+            session
+                .messages
+                .iter()
+                .all(|message| message.role != MessageRole::System),
+            "legacy stored system message should be dropped: {:#?}",
+            session.messages
+        );
+
+        let input = Input::new(
+            "follow up".to_string(),
+            ("follow up".to_string(), vec![]),
+            to_agent(&session).into_config(),
+        );
+        let messages = super::build_messages(&session, &input).unwrap();
+
+        assert_eq!(messages[0].role, MessageRole::System);
+        assert_eq!(
+            messages[0].content.to_text(),
+            "Agent prompt for openai:gpt-4o"
+        );
+    }
+
+    #[test]
+    fn build_messages_replaces_legacy_stored_system_prompt_with_fresh_render() {
+        let mut session = test_session();
+        session.agent_instructions = String::new();
+        session.agent_name = Some("legacy-agent".to_string());
+        session.messages = vec![
+            Message::new(
+                MessageRole::System,
+                MessageContent::Text("old stored prompt".to_string()),
+            ),
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("earlier user".to_string()),
+            ),
+        ];
+
+        let mut agent = harnx_core::agent_config::AgentConfig::from_prompt("fresh rendered prompt");
+        agent.set_name("legacy-agent");
+        let input = Input::new(
+            "follow up".to_string(),
+            ("follow up".to_string(), vec![]),
+            agent,
+        );
+        let messages = super::build_messages(&session, &input).unwrap();
+
+        let system_messages: Vec<_> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == MessageRole::System)
+            .collect();
+        assert_eq!(system_messages.len(), 1, "messages: {messages:#?}");
+        assert_eq!(system_messages[0].0, 0, "messages: {messages:#?}");
+        assert_eq!(messages[0].content.to_text(), "fresh rendered prompt");
+    }
+
+    #[test]
+    fn build_messages_tool_continuation_still_injects_system_prompt() {
+        use crate::tool::{ToolCall, ToolResult};
+        use serde_json::json;
+
+        let mut session = test_session();
+        session.messages = vec![
+            Message::new(MessageRole::User, MessageContent::Text("q".to_string())),
+            Message::new(
+                MessageRole::Tool,
+                MessageContent::ToolCalls(crate::client::MessageContentToolCalls::new(
+                    vec![ToolResult::new(
+                        ToolCall::new(
+                            "fs_read".to_string(),
+                            json!({"path": "README.md"}),
+                            Some("call_1".to_string()),
+                            None,
+                        ),
+                        json!({"content": "ok"}),
+                    )],
+                    "tool round".to_string(),
+                    None,
+                )),
+            ),
+        ];
+
+        let mut input = Input::new(
+            "follow up".to_string(),
+            ("follow up".to_string(), vec![]),
+            harnx_core::agent_config::AgentConfig::from_prompt("fresh tool continuation prompt"),
+        );
+        input.tool_calls = Some(crate::client::MessageContentToolCalls::new(
+            vec![],
+            "continuation".to_string(),
+            None,
+        ));
+
+        let messages = super::build_messages(&session, &input).unwrap();
+        assert_eq!(
+            messages[0].role,
+            MessageRole::System,
+            "messages: {messages:#?}"
+        );
+        assert_eq!(
+            messages[0].content.to_text(),
+            "fresh tool continuation prompt"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == MessageRole::User)
+                .count(),
+            1,
+            "messages: {messages:#?}"
+        );
+        assert_eq!(messages[1].content.to_text(), "q");
     }
 }
