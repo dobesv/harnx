@@ -546,7 +546,9 @@ The same command applies to other `acli` products: replace `jira` with `confluen
 
 #### Step 2 — Configure the proxy hook
 
-Add the following to your `config.yaml`. The proxy will self-source credentials from your host OS keyring using `--load-exec`. It injects a synthetic `jira_config.yaml` containing a sentinel token into the sandbox via `--fs`, and the `--hook` filter replaces that sentinel with the real token in outbound requests.
+Add the following to your `config.yaml`. The bundled `jira-auth-hook.py` does all the work: it reads your host `acli` profile, sources the real token from the OS keyring, writes a synthetic `jira_config.yaml` — holding only a sentinel token, written as a YAML `!!binary` scalar so `acli` accepts it — into the proxy's per-run temp dir, and replaces the sentinel with the real token on outbound `api.atlassian.com` / site requests. The `--fs`/`--env` lines allocate that temp dir and point `ACLI_CONFIG_DIR` at it.
+
+The hook ships with the `harnx` **pantheon** and **coding** packages at `~/.config/harnx/packages/<pkg>/hooks/jira-auth-hook.py` (swap `pantheon` below for `coding` if that's the package you use). For a standalone `harnx-sandbox-run` install, see the download-and-verify step in [sandbox-run.md](./sandbox-run.md).
 
 No manual environment variables are required as long as you have logged in with an **API token** (Step 1) on your host — OAuth (`--web`) is not supported.
 
@@ -558,26 +560,14 @@ hooks:
     matcher: "bash_exec|bash_spawn"
     command: >-
       harnx-proxy-auth
-      --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
-      --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
-      --fs '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token then
-            . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
-              profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
-                token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
-          end'
-      --env '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
-      --hook '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
-          then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
+      --fs '{"harnx-fs-acli/acli/.keep": ""}'
+      --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+      --hook ~/.config/harnx/packages/pantheon/hooks/jira-auth-hook.py
 ```
 
-> **macOS users:** Change the `--load-exec` command for `atlassian_token` to use `security find-generic-password -s acli -a "jira:$p" -w`.
-> **Security note:** The proxy matches only the site in your active `acli` profile (plus `api.atlassian.com`), preventing credentials from being accidentally forwarded to other Atlassian tenants.
+The hook sources the token from the platform keyring automatically (`secret-tool` on Linux, `security find-generic-password` on macOS); set `HARNX_JIRA_TOKEN_CMD` to use a different secret store.
+
+> **Security note:** The hook injects the token only for the site in your active `acli` profile (plus `api.atlassian.com`), preventing credentials from being accidentally forwarded to other Atlassian tenants.
 
 You can combine Atlassian and GitHub auth in a single `harnx-proxy-auth` invocation:
 
@@ -593,22 +583,9 @@ hooks:
       --hook 'if (.host == "api.github.com") and (.headers.authorization == "Bearer ghs_\($fake_base64_key)")
           then .headers.authorization = bearer(env.GITHUB_TOKEN // env.GH_TOKEN)
           else . end'
-      --load-yaml acli_cfg=~/.config/acli/jira_config.yaml
-      --load-exec 'atlassian_token=p=$(sed -n "s/^current_profile:[[:space:]]*\"\?\([^\"]*\)\"\?[[:space:]]*$/\1/p" ~/.config/acli/jira_config.yaml); test -n "$p" && secret-tool lookup service acli username "jira:$p"'
-      --fs '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token then
-            . + { "acli/jira_config.yaml": ({ version: 1, current_profile: $cp,
-              profiles: [{ site: $p.site, cloud_id: $p.cloud_id, account_id: $p.account_id, auth_type: "api_token",
-                token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA6OjowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDBhNmM2MzI1MzM1NGQxODBiNjkzYWFjYmRkZjlmYjA2YzFkMGI2NmE0MmQ4Mzc1NmJjM2U5ZjM5ODg4MzRhMGZiM2EzYTRhMWY=" }] } | tojson) }
-          end'
-      --env '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token then .ACLI_CONFIG_DIR = $temp_file_root end'
-      --hook '$acli_cfg.current_profile as $cp |
-          (first($acli_cfg.profiles[]? | select("\(.cloud_id):\(.account_id)" == $cp))) as $p |
-          if $p and $atlassian_token and (.host == "api.atlassian.com" or .host == $p.site)
-          then .headers.authorization = basic($p.email // env.ATLASSIAN_EMAIL // ""; $atlassian_token) end'
+      --fs '{"harnx-fs-acli/acli/.keep": ""}'
+      --env '{"ACLI_CONFIG_DIR": "\($temp_file_root)/harnx-fs-acli"}'
+      --hook ~/.config/harnx/packages/pantheon/hooks/jira-auth-hook.py
 ```
 
 ### Injected Environment Variables

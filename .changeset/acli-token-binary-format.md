@@ -13,3 +13,9 @@ the proxy's on-the-wire token swap never ran and the sandboxed `acli` reported
 unauthorized. This restores the `!!binary` format (originally fixed in the
 inline `bash.yaml` config, dropped when the logic moved into the hook) across
 all three `jira-auth-hook.py` copies.
+
+The hook now also sources the token per platform automatically — `secret-tool`
+on Linux and `security find-generic-password` (login keychain) on macOS —
+instead of assuming `secret-tool`; `HARNX_JIRA_TOKEN_CMD` still overrides it.
+The Jira docs recipes now use `jira-auth-hook.py` directly rather than an inline
+config that re-serialized the token as a plain string.
